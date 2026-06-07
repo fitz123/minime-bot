@@ -26,6 +26,8 @@ This is the public `minime-bot` package repository.
 
 - During bootstrap, do not push directly to `main`; open pull requests for
   review.
+- PR commits must use a GitHub `users.noreply.github.com` author email; the
+  author identity workflow rejects other author emails.
 - Keep changes scoped to the package contract and avoid unrelated refactors.
 - Run validation from the package root before opening a pull request:
 

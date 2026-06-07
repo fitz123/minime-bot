@@ -18,7 +18,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -36,7 +35,9 @@ import {
 	isFailedResult,
 	runSubagentChild,
 	type SubagentChildErrorWarn,
+	type SubagentMessage,
 	type SubagentRunResult,
+	type SubagentUsageStats,
 } from "../../../src/pi-extensions/subagent-args.js";
 import {
 	buildPiSubagentChildSpawnEnv,
@@ -150,24 +151,14 @@ function formatToolCall(
 	}
 }
 
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
 interface SingleResult {
 	agent: string;
 	agentSource: AgentSource | "unknown";
 	task: string;
 	exitCode: number;
-	messages: Message[];
+	messages: SubagentMessage[];
 	stderr: string;
-	usage: UsageStats;
+	usage: SubagentUsageStats;
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
@@ -194,13 +185,22 @@ function truncateParallelOutput(output: string): string {
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
-function getDisplayItems(messages: Message[]): DisplayItem[] {
+function getDisplayItems(messages: SubagentMessage[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
 	for (const msg of messages) {
-		if (msg.role === "assistant") {
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
 			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+				if (part.type === "text" && typeof part.text === "string") {
+					items.push({ type: "text", text: part.text });
+				} else if (
+					part.type === "toolCall" &&
+					typeof part.name === "string" &&
+					part.arguments &&
+					typeof part.arguments === "object" &&
+					!Array.isArray(part.arguments)
+				) {
+					items.push({ type: "toolCall", name: part.name, args: part.arguments as Record<string, any> });
+				}
 			}
 		}
 	}
@@ -290,10 +290,10 @@ async function runSingleAgent(
 		agent: agentName,
 		agentSource: agent.source,
 		task,
-		exitCode: r.exitCode,
-		messages: r.messages as unknown as Message[],
-		stderr: r.stderr,
-		usage: r.usage,
+			exitCode: r.exitCode,
+			messages: r.messages,
+			stderr: r.stderr,
+			usage: r.usage,
 		model: r.model ?? agent.model,
 		stopReason: r.stopReason,
 		errorMessage: r.errorMessage,
@@ -442,21 +442,33 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+				if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents) {
+					const requestedAgentNames = new Set<string>();
+					if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+					if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
 				if (params.agent) requestedAgentNames.add(params.agent);
 
 				const projectAgentsRequested = Array.from(requestedAgentNames)
 					.map((name) => agents.find((a) => a.name === name))
 					.filter((a): a is AgentConfig => a?.source === "project");
 
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
+					if (projectAgentsRequested.length > 0) {
+						const names = projectAgentsRequested.map((a) => a.name).join(", ");
+						const dir = discovery.projectAgentsDir ?? "(unknown)";
+						if (!ctx.hasUI) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Canceled: project-local agents require an interactive confirmation. Agents: ${names}. Source: ${dir}`,
+									},
+								],
+								details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+								isError: true,
+							};
+						}
+						const ok = await ctx.ui.confirm(
+							"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
 					);
 					if (!ok)

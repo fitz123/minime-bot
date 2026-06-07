@@ -2,7 +2,7 @@ import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import { writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { loadCronTask, getAgentWorkspace, resolveCronAgentData, buildPiCronAgentConfig, buildDeliverCommand, loadAdminChatId, handleDeliveryFailure, loadDefaultDelivery, resolveCronEngine, runOneShot, classifyPiResult, writeCronHealthMetric, runScript, main } from "../cron-runner.js";
+import { loadCronTask, getAgentWorkspace, resolveCronAgentData, buildPiCronAgentConfig, buildDeliverArgs, loadAdminChatId, handleDeliveryFailure, loadDefaultDelivery, resolveCronEngine, runOneShot, classifyPiResult, writeCronHealthMetric, runScript, main } from "../cron-runner.js";
 import type { CronAgentData, CronRunnerMainDeps, DeliveryDefaults } from "../cron-runner.js";
 import type { CronJob } from "../types.js";
 
@@ -26,24 +26,20 @@ function makeLlmCron(engine?: CronJob["engine"]): CronJob {
 }
 
 describe("cron-runner", () => {
-  describe("buildDeliverCommand", () => {
-    it("builds command without thread", () => {
-      const cmd = buildDeliverCommand(111111111);
-      assert.ok(cmd.includes("deliver.sh"));
-      assert.ok(cmd.endsWith("111111111"));
-      assert.ok(!cmd.includes("--thread"));
+  describe("buildDeliverArgs", () => {
+    it("builds argv without thread", () => {
+      const args = buildDeliverArgs(111111111);
+      assert.deepStrictEqual(args, ["111111111"]);
     });
 
-    it("builds command with thread ID", () => {
-      const cmd = buildDeliverCommand(111111111, 12345);
-      assert.ok(cmd.includes("deliver.sh"));
-      assert.ok(cmd.includes("111111111"));
-      assert.ok(cmd.includes("--thread 12345"));
+    it("builds argv with thread ID", () => {
+      const args = buildDeliverArgs(111111111, 12345);
+      assert.deepStrictEqual(args, ["111111111", "--thread", "12345"]);
     });
 
     it("does not include --thread when threadId is undefined", () => {
-      const cmd = buildDeliverCommand(123456, undefined);
-      assert.ok(!cmd.includes("--thread"));
+      const args = buildDeliverArgs(123456, undefined);
+      assert.ok(!args.includes("--thread"));
     });
   });
 

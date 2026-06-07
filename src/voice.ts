@@ -1,6 +1,6 @@
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { writeFile, unlink, chmod } from "node:fs/promises";
+import { open, writeFile, unlink, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
@@ -10,6 +10,12 @@ const execFileAsync = promisify(execFileCb);
 export const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
 export const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli";
 export const WHISPER_MODEL = process.env.WHISPER_MODEL ?? join(homedir(), ".minime/models/ggml-medium.bin");
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
+
+export interface DownloadFileOptions {
+  maxBytes?: number;
+  timeoutMs?: number;
+}
 
 /**
  * Generate a unique temp file path with given prefix and extension.
@@ -21,13 +27,67 @@ export function tempFilePath(prefix: string, extension: string): string {
 /**
  * Download a file from a URL to a local path.
  */
-export async function downloadFile(url: string, destPath: string): Promise<void> {
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    throw new Error(`Download failed: HTTP ${resp.status}`);
+export async function downloadFile(
+  url: string,
+  destPath: string,
+  options: DownloadFileOptions = {},
+): Promise<void> {
+  const maxBytes = options.maxBytes;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    if (!resp.ok) {
+      throw new Error(`Download failed: HTTP ${resp.status}`);
+    }
+
+    const headers = resp.headers as { get?: (name: string) => string | null } | undefined;
+    const contentLength = headers?.get?.("content-length");
+    if (contentLength && maxBytes !== undefined) {
+      const declaredBytes = Number(contentLength);
+      if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+        throw new Error(`Download too large: ${declaredBytes} bytes exceeds limit ${maxBytes}`);
+      }
+    }
+
+    if (!resp.body) {
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      if (maxBytes !== undefined && buffer.byteLength > maxBytes) {
+        throw new Error(`Download too large: ${buffer.byteLength} bytes exceeds limit ${maxBytes}`);
+      }
+      await writeFile(destPath, buffer, { mode: 0o600 });
+      return;
+    }
+
+    const file = await open(destPath, "w", 0o600);
+    let written = 0;
+    try {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        written += value.byteLength;
+        if (maxBytes !== undefined && written > maxBytes) {
+          throw new Error(`Download too large: ${written} bytes exceeds limit ${maxBytes}`);
+        }
+        await file.write(value);
+      }
+    } finally {
+      await file.close();
+    }
+  } catch (err) {
+    await cleanupTempFile(destPath);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Download timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-  const buffer = Buffer.from(await resp.arrayBuffer());
-  await writeFile(destPath, buffer, { mode: 0o600 });
 }
 
 /**

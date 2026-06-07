@@ -1,9 +1,11 @@
+#!/usr/bin/env node
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
   existsSync,
   lstatSync,
   readFileSync,
+  realpathSync,
   mkdirSync,
   renameSync,
   unlinkSync,
@@ -11,8 +13,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
+import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
 import {
   CODEX_QUOTA_ATTEMPT_FILE_ENV,
   CODEX_QUOTA_STATE_FILE_ENV,
@@ -50,6 +53,7 @@ export function defaultCodexQuotaExtensionPath(botDir: string, moduleDir = __dir
 }
 
 export interface CodexQuotaSamplerCliOptions {
+  workspace?: string;
   model?: string;
   textfileDir?: string;
   stateFile?: string;
@@ -164,6 +168,9 @@ export function parseCodexQuotaSamplerArgs(argv: readonly string[]): CodexQuotaS
       case "--model":
         parsed.model = readFlagValue(argv, ++i, arg);
         break;
+      case "--workspace":
+        parsed.workspace = readFlagValue(argv, ++i, arg);
+        break;
       case "--textfile-dir":
         parsed.textfileDir = readFlagValue(argv, ++i, arg);
         break;
@@ -217,7 +224,11 @@ export function resolveCodexQuotaSamplerConfig(
     resolveConfiguredPath(cli.samplerCwd, cwd) ??
     resolveConfiguredPath(env[CODEX_QUOTA_SAMPLER_CWD_ENV], cwd) ??
     defaultSamplerCwd();
-  assertSamplerCwdIsolated(samplerCwd, botDir, options.forbiddenSamplerCwds ?? readConfiguredAgentWorkspaceCwds(botDir));
+  assertSamplerCwdIsolated(
+    samplerCwd,
+    botDir,
+    options.forbiddenSamplerCwds ?? readConfiguredAgentWorkspaceCwds(botDir, cwd, env, cli.workspace),
+  );
 
   return {
     piBin: nonEmpty(cli.piBin) ?? nonEmpty(env[CODEX_QUOTA_PI_BIN_ENV]) ?? DEFAULT_PI_BIN,
@@ -515,9 +526,10 @@ export async function runCodexQuotaSamplerFromCli(argv: readonly string[] = proc
 
 export function formatCodexQuotaSamplerHelp(): string {
   return [
-    "Usage: npx tsx scripts/codex-quota-sampler.ts [options]",
+    "Usage: minime-codex-quota-sampler [options]",
     "",
     "Options:",
+    "  --workspace <path>       Control/app workspace root for config resolution",
     "  --model <model>          Codex model for the probe",
     "  --textfile-dir <dir>     Prometheus textfile directory",
     "  --state-file <file>      Codex quota JSON state file",
@@ -603,17 +615,32 @@ function defaultSamplerCwd(): string {
   return join(tmpdir(), `codex-quota-sampler-${uid}`);
 }
 
-function readConfiguredAgentWorkspaceCwds(botDir: string): string[] {
-  const configPath = resolve(botDir, "..", "config.yaml");
-  const projectRoot = resolve(botDir, "..");
-  const config = loadConfig(configPath, { resolveSecrets: false });
-  return Object.values(config.agents).flatMap((agent) => {
-    const fromProjectRoot = resolveConfiguredPath(agent.workspaceCwd, projectRoot);
-    const fromProcessCwd = resolveConfiguredPath(agent.workspaceCwd, process.cwd());
-    return [fromProjectRoot, fromProcessCwd].filter((path, index, paths): path is string =>
-      path !== undefined && paths.indexOf(path) === index
-    );
+function readConfiguredAgentWorkspaceCwds(
+  botDir: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  workspace: string | undefined,
+): string[] {
+  const contract = resolveWorkspaceContract({
+    workspace,
+    env,
+    cwd,
+    moduleUrl: samplerModuleUrlForBotDir(botDir),
   });
+  const config = loadConfig(contract.paths.configPath, {
+    resolveSecrets: false,
+    workspaceRoot: contract.paths.workspaceRoot,
+  });
+  return Object.values(config.agents).map((agent) =>
+    resolveAgentWorkspaceCwd(contract.paths.workspaceRoot, agent.workspaceCwd)
+  );
+}
+
+function samplerModuleUrlForBotDir(botDir: string): string {
+  const relpath = basename(__dirname) === "dist"
+    ? join("dist", "codex-quota-sampler.js")
+    : join("src", "codex-quota-sampler.ts");
+  return pathToFileURL(resolve(botDir, relpath)).href;
 }
 
 function assertSamplerCwdIsolated(samplerCwd: string, botDir: string, forbiddenCwds: readonly string[]): void {
@@ -817,5 +844,28 @@ function atomicWriteFile(path: string, content: string): void {
       // Best effort cleanup of a same-directory staging file.
     }
     throw error;
+  }
+}
+
+export function isDirectCodexQuotaSamplerEntrypoint(
+  moduleUrl = import.meta.url,
+  entrypoint = process.argv[1],
+): boolean {
+  return entrypoint !== undefined
+    && realpathOrResolve(entrypoint) === realpathOrResolve(fileURLToPath(moduleUrl));
+}
+
+if (isDirectCodexQuotaSamplerEntrypoint()) {
+  runCodexQuotaSamplerFromCli().catch((err) => {
+    console.error(`[codex-quota-sampler] ${errorMessage(err)}`);
+    process.exitCode = 1;
+  });
+}
+
+function realpathOrResolve(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
   }
 }

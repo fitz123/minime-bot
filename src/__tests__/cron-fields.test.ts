@@ -77,4 +77,33 @@ describe("cron field contract", () => {
     );
     assert.strictEqual(validateCronForPlist(scriptCron), undefined);
   });
+
+  it("rejects unsafe plist names and malformed schedules deterministically", () => {
+    const baseCron: CronPlistDef = {
+      name: "safe-name_1.2",
+      schedule: "*/15 9-17 * * 1-5",
+      type: "llm",
+      engine: "pi",
+      prompt: "Summarize status",
+      agentId: "main",
+    };
+
+    assert.strictEqual(validateCronForPlist(baseCron), undefined);
+    assert.match(
+      validateCronForPlist({ ...baseCron, name: "../escape" }) ?? "",
+      /invalid name/,
+    );
+    assert.match(
+      validateCronForPlist({ ...baseCron, schedule: "*/0 * * * *" }) ?? "",
+      /step must be positive/,
+    );
+    assert.match(
+      validateCronForPlist({ ...baseCron, schedule: "61 * * * *" }) ?? "",
+      /outside allowed range 0-59/,
+    );
+    assert.match(
+      validateCronForPlist({ ...baseCron, schedule: "every nope" }) ?? "",
+      /every interval must be a positive integer/,
+    );
+  });
 });

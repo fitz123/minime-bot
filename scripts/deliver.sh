@@ -61,7 +61,6 @@ if [ -z "$TOKEN" ]; then
 fi
 unset TELEGRAM_BOT_TOKEN
 
-API="https://api.telegram.org/bot${TOKEN}"
 LOG_DIR="${LOG_DIR:-$HOME/.minime/logs}"
 LOG_FILE="${LOG_DIR}/cron-delivery.log"
 mkdir -p "$LOG_DIR"
@@ -110,6 +109,16 @@ build_payload() {
   printf '%s}' "$payload"
 }
 
+telegram_post() {
+  local method="$1" payload="$2"
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    --config - <<EOF
+url = "https://api.telegram.org/bot${TOKEN}/${method}"
+EOF
+}
+
 send_message() {
   local text="$1"
   local response ok
@@ -121,9 +130,7 @@ send_message() {
     if [ -n "$html_text" ]; then
       local html_json
       html_json=$(echo "$html_text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-      response=$(curl -s -X POST "${API}/sendMessage" \
-        -H "Content-Type: application/json" \
-        -d "$(build_payload "$html_json" "HTML")")
+      response=$(telegram_post "sendMessage" "$(build_payload "$html_json" "HTML")")
       ok=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
       if [ "$ok" = "True" ]; then
         echo "[deliver] $(date -Iseconds) OK chat=$CHAT_ID len=${#text}" >> "$LOG_FILE"
@@ -136,9 +143,7 @@ send_message() {
   # Fallback: send original text without parse_mode
   local text_json
   text_json=$(echo "$text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-  response=$(curl -s -X POST "${API}/sendMessage" \
-    -H "Content-Type: application/json" \
-    -d "$(build_payload "$text_json")")
+  response=$(telegram_post "sendMessage" "$(build_payload "$text_json")")
   ok=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
   if [ "$ok" != "True" ]; then
     echo "[deliver] $(date -Iseconds) FAIL chat=$CHAT_ID response=$response" >> "$LOG_FILE"

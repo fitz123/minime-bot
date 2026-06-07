@@ -9,7 +9,6 @@ import {
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
   resolveWorkspaceContract,
-  workspaceContractDiagnostics,
   type WorkspaceContractPaths,
 } from "../workspace-contract.js";
 
@@ -174,7 +173,7 @@ describe("workspace contract resolver", () => {
       },
       homeDir: "/tmp/minime-home",
     });
-    const diagnostics = workspaceContractDiagnostics(contract);
+    const diagnostics = contract.effectivePaths;
     const serialized = JSON.stringify({ diagnostics, warnings: contract.warnings });
 
     assert.strictEqual(diagnostics.configPath.path, join(workspaceRoot, "missing-config.yaml"));

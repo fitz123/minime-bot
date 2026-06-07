@@ -4,7 +4,8 @@
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
   "bin": {
-    "minime-bot": "./dist/cli.js"
+    "minime-bot": "./dist/cli.js",
+    "minime-codex-quota-sampler": "./dist/codex-quota-sampler.js"
   },
   "repository": {
     "type": "git",
@@ -12,10 +13,10 @@
   },
   "scripts": {
     "test": "MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/*.test.ts",
-    "build": "node scripts/clean-package-dist.mjs && tsc && node scripts/build-package-artifacts.mjs",
+    "build": "node scripts/clean-package-dist.mjs && tsc && tsc -p tsconfig.extensions.json --noEmit && node scripts/build-package-artifacts.mjs",
     "check:schema-guard-contract": "node scripts/check-no-active-schema-guard-contract.mjs",
-    "lint": "tsc --noEmit",
-    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc -p tsconfig.extensions.json --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.extensions.json --noEmit",
     "prepare": "npm run build",
     "prepack": "npm run build",
     "workspace:validate": "tsx src/cli.ts workspace validate",

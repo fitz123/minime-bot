@@ -145,6 +145,7 @@ describe("project naming", () => {
 
   it("keeps the public CLI binary name", () => {
     assert.strictEqual(packageJson.bin?.["minime-bot"], "./dist/cli.js");
+    assert.strictEqual(packageJson.bin?.["minime-codex-quota-sampler"], "./dist/codex-quota-sampler.js");
   });
 
   it("package.json has no OpenClaw references in description", () => {

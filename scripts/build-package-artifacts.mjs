@@ -70,3 +70,4 @@ for (const rel of [
 }
 
 chmodSync(join(packageRoot, "dist", "cli.js"), 0o755);
+chmodSync(join(packageRoot, "dist", "codex-quota-sampler.js"), 0o755);

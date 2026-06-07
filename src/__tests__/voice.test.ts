@@ -69,6 +69,25 @@ describe("downloadFile", () => {
     }
   });
 
+  it("aborts when fetched content exceeds the configured byte limit", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      headers: { get: () => null },
+      arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+    })) as unknown as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () => downloadFile("https://example.com/large.oga", testDest, { maxBytes: 3 }),
+        /Download too large/,
+      );
+      assert.ok(!existsSync(testDest));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("throws on fetch network error", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => {

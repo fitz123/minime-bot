@@ -10,6 +10,7 @@ import {
   validateAgent,
 } from "./config.js";
 import {
+  execFileSync,
   execSync,
   spawnSync,
   type SpawnSyncOptionsWithStringEncoding,
@@ -423,12 +424,11 @@ export function handleDeliveryFailure(
   }
 }
 
-function buildDeliverCommand(
+function buildDeliverArgs(
   chatId: number,
   threadId?: number,
-): string {
-  const threadArg = threadId ? ` --thread ${threadId}` : "";
-  return `${DELIVER_SCRIPT} ${chatId}${threadArg}`;
+): string[] {
+  return threadId ? [String(chatId), "--thread", String(threadId)] : [String(chatId)];
 }
 
 let cachedDeliveryTelegramToken: string | undefined;
@@ -457,7 +457,7 @@ function deliver(
 ): void {
   try {
     const telegramToken = loadDeliveryTelegramToken();
-    execSync(buildDeliverCommand(chatId, threadId), {
+    execFileSync(DELIVER_SCRIPT, buildDeliverArgs(chatId, threadId), {
       input: message,
       encoding: "utf8",
       timeout: 30000,
@@ -863,4 +863,4 @@ if (isMain) {
   main();
 }
 
-export { loadCronTask, resolveCronAgentData, buildPiCronAgentConfig, getAgentWorkspace, deliver, buildDeliverCommand, runPi, runOneShot, resolveCronEngine, classifyPiResult, writeCronHealthMetric, runScript, main };
+export { loadCronTask, resolveCronAgentData, buildPiCronAgentConfig, getAgentWorkspace, deliver, buildDeliverArgs, runPi, runOneShot, resolveCronEngine, classifyPiResult, writeCronHealthMetric, runScript, main };

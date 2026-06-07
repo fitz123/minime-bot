@@ -6,6 +6,7 @@ import { relayStream } from "./stream-relay.js";
 import { MessageQueue } from "./message-queue.js";
 import { createDiscordAdapter, type DiscordSendableChannel } from "./discord-adapter.js";
 import { tempFilePath, downloadFile, transcribeAudio, cleanupTempFile } from "./voice.js";
+import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath } from "./media-store.js";
 import { log } from "./logger.js";
 import { messagesReceived } from "./metrics.js";
 import { isImageMimeType } from "./mime.js";
@@ -23,6 +24,13 @@ function isStaleMessage(messageTimestampMs: number, maxAgeMs: number): boolean {
 export function discordSessionKey(channelId: string, threadId?: string): string {
   const base = `discord:${channelId}`;
   return threadId ? `${base}:${threadId}` : base;
+}
+
+function ensureAttachmentWithinLimit(attachment: { size?: number | null; name?: string | null }, maxBytes: number): void {
+  if (typeof attachment.size === "number" && Number.isFinite(attachment.size) && attachment.size > maxBytes) {
+    const name = attachment.name ? ` "${attachment.name}"` : "";
+    throw new Error(`Attachment${name} is too large: ${attachment.size} bytes exceeds limit ${maxBytes}`);
+  }
 }
 
 /**
@@ -325,9 +333,11 @@ export async function createDiscordBot(
           messagesReceived.inc({ type: "photo" });
           let tempPath: string | null = null;
           try {
+            ensureAttachmentWithinLimit(attachment, config.sessionDefaults.maxMediaBytes);
             const ext = attachment.name?.match(/\.(\w+)$/)?.[0] ?? ".jpg";
-            tempPath = tempFilePath("discord-img", ext);
-            await downloadFile(attachment.url, tempPath);
+            tempPath = allocateMediaPath(key, "discord-img", ext);
+            await downloadFile(attachment.url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
+            enforceMediaCap(config.sessionDefaults.maxMediaBytes);
 
             // Only include caption text with the first image to avoid duplication
             const caption = i === 0 ? (message.content ?? "").replace(botMentionRe, "").trim() : "";
@@ -337,12 +347,17 @@ export async function createDiscordBot(
 
             const pathToClean = tempPath;
             tempPath = null;
-            messageQueue.enqueue(key, binding.agentId, messageText, adapter, () => {
-              cleanupTempFile(pathToClean);
-            });
+            messageQueue.enqueue(
+              key,
+              binding.agentId,
+              messageText,
+              adapter,
+              () => { releaseMediaPath(pathToClean); },
+              () => { discardMediaPath(pathToClean); },
+            );
           } catch (err) {
             log.error("discord-bot", `Image attachment error in ${channelId}:`, err);
-            if (tempPath) await cleanupTempFile(tempPath);
+            if (tempPath) discardMediaPath(tempPath);
           }
         }
       } else if (audioAttachments.length > 0) {
@@ -351,9 +366,10 @@ export async function createDiscordBot(
           messagesReceived.inc({ type: "voice" });
           let tempPath: string | null = null;
           try {
+            ensureAttachmentWithinLimit(attachment, config.sessionDefaults.maxMediaBytes);
             const ext = attachment.name?.match(/\.(\w+)$/)?.[0] ?? ".ogg";
             tempPath = tempFilePath("discord-voice", ext);
-            await downloadFile(attachment.url, tempPath);
+            await downloadFile(attachment.url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
 
             const transcript = await transcribeAudio(tempPath);
             if (!transcript) {

@@ -233,6 +233,13 @@ describe("subagent: wrapper spawn environment", () => {
       }
     }
   });
+
+  it("fails closed for project-local agents when no UI can confirm trust", () => {
+    const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
+
+    assert.match(wrapper, /project-local agents require an interactive confirmation/);
+    assert.doesNotMatch(wrapper, /confirmProjectAgents && ctx\.hasUI/);
+  });
 });
 
 describe("subagent: parseSubagentEventLine", () => {

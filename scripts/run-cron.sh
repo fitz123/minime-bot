@@ -1,7 +1,7 @@
 #!/bin/bash
 # run-cron.sh — Shell wrapper for launchd cron plists
 # Usage: run-cron.sh <task-name>
-# Sets up environment and runs cron-runner.ts
+# Sets up environment and runs the compiled cron runner
 
 set -euo pipefail
 
@@ -22,4 +22,4 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$BOT_DIR"
-exec npx tsx src/cron-runner.ts --task "$TASK_NAME"
+exec node "$BOT_DIR/dist/cron-runner.js" --task "$TASK_NAME"

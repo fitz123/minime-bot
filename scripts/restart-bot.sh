@@ -176,7 +176,11 @@ validate_config() {
     fi
     return 0
   fi
-  if ! ( cd "$BOT_DIR" && npx tsx src/config.ts --validate >/dev/null ); then
+  local args=(config validate)
+  if [ -n "${MINIME_WORKSPACE_ROOT:-}" ]; then
+    args+=(--workspace "$MINIME_WORKSPACE_ROOT")
+  fi
+  if ! ( cd "$BOT_DIR" && node "$BOT_DIR/dist/cli.js" "${args[@]}" >/dev/null ); then
     err "config validation failed; refusing to restart"
     return 1
   fi

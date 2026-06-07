@@ -21,6 +21,7 @@ import {
   defaultCodexQuotaExtensionPath,
   ensureSamplerProjectSettings,
   formatCodexQuotaSamplerHelp,
+  isDirectCodexQuotaSamplerEntrypoint,
   parseCodexQuotaSamplerArgs,
   resolveCodexQuotaSamplerConfig,
   runCodexQuotaSampler,
@@ -234,6 +235,8 @@ bindings:
       parseCodexQuotaSamplerArgs([
         "--model",
         "gpt-5.5",
+        "--workspace",
+        "/control/workspace",
         "--textfile-dir",
         "metrics",
         "--state-file",
@@ -250,6 +253,7 @@ bindings:
       ]),
       {
         model: "gpt-5.5",
+        workspace: "/control/workspace",
         textfileDir: "metrics",
         stateFile: "quota.json",
         samplerCwd: "sampler",
@@ -265,9 +269,26 @@ bindings:
     assert.throws(() => parseCodexQuotaSamplerArgs(["--unknown"]), /Unknown argument/);
 
     const help = formatCodexQuotaSamplerHelp();
-    for (const flag of ["--model", "--textfile-dir", "--state-file", "--sampler-cwd", "--timeout", "--timeout-ms", "--pi-bin", "--prompt", "--dry-run", "--help"]) {
+    for (const flag of ["--workspace", "--model", "--textfile-dir", "--state-file", "--sampler-cwd", "--timeout", "--timeout-ms", "--pi-bin", "--prompt", "--dry-run", "--help"]) {
       assert.ok(help.includes(flag), `help should mention ${flag}`);
     }
+  });
+
+  it("recognizes the compiled sampler as a direct entrypoint", () => {
+    assert.equal(
+      isDirectCodexQuotaSamplerEntrypoint(
+        "file:///opt/minime-bot/dist/codex-quota-sampler.js",
+        "/opt/minime-bot/dist/codex-quota-sampler.js",
+      ),
+      true,
+    );
+    assert.equal(
+      isDirectCodexQuotaSamplerEntrypoint(
+        "file:///opt/minime-bot/dist/codex-quota-sampler.js",
+        "/opt/minime-bot/dist/cli.js",
+      ),
+      false,
+    );
   });
 
   it("resolves CLI/env paths and passes only allowlisted values to the child env", () => {

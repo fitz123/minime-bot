@@ -1,5 +1,6 @@
 import { Bot, type Transformer } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
+import { createHash } from "node:crypto";
 import type { BotConfig, TelegramBinding } from "./types.js";
 import { outboxDir, hasExited, type SessionManager } from "./session-manager.js";
 import { relayStream } from "./stream-relay.js";
@@ -51,6 +52,45 @@ export function extractChatContext(payload: unknown): { chatId?: number | string
   if (p.chat_id !== undefined && p.chat_id !== null) out.chatId = p.chat_id;
   if (typeof p.message_thread_id === "number") out.messageThreadId = p.message_thread_id;
   return out;
+}
+
+function shortHash(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
+}
+
+function firstUpdatePayload(update: Record<string, unknown>): { type: string; payload: unknown } {
+  const type = Object.keys(update).find((key) => key !== "update_id") ?? "unknown";
+  return { type, payload: update[type] };
+}
+
+function extractUpdateChatId(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const item = payload as {
+    chat?: { id?: unknown };
+    message?: { chat?: { id?: unknown } };
+  };
+  return item.chat?.id ?? item.message?.chat?.id;
+}
+
+export function describeTelegramUpdateForLog(update: unknown): string {
+  if (!update || typeof update !== "object") {
+    return "type=unknown";
+  }
+  const raw = update as Record<string, unknown>;
+  const { type, payload } = firstUpdatePayload(raw);
+  const updateId = typeof raw.update_id === "number" || typeof raw.update_id === "string"
+    ? raw.update_id
+    : undefined;
+  const chatHash = shortHash(extractUpdateChatId(payload));
+  const parts = [`type=${type}`];
+  if (updateId !== undefined) parts.push(`update_id=${updateId}`);
+  if (chatHash) parts.push(`chat_hash=${chatHash}`);
+  return parts.join(" ");
 }
 
 /**
@@ -879,7 +919,7 @@ export function createTelegramBot(
       if (!file.file_path) throw new Error("Telegram did not return a file path");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       tempPath = tempFilePath("voice", ".oga");
-      await downloadFile(url, tempPath);
+      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
 
       // Transcribe with whisper-cli
       const transcript = await transcribeAudio(tempPath);
@@ -946,7 +986,7 @@ export function createTelegramBot(
       if (!file.file_path) throw new Error("Telegram did not return a file path");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       tempPath = allocateMediaPath(key, "photo", ".jpg");
-      await downloadFile(url, tempPath);
+      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
       enforceMediaCap(config.sessionDefaults.maxMediaBytes);
 
       // Build message: caption (if any) + image file path
@@ -1034,7 +1074,7 @@ export function createTelegramBot(
         ext = extensionForDocument(doc.file_name, doc.mime_type);
       }
       tempPath = allocateMediaPath(key, anim ? "animation" : "doc", ext);
-      await downloadFile(url, tempPath);
+      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
       enforceMediaCap(config.sessionDefaults.maxMediaBytes);
 
       const prefix = buildSourcePrefix(binding, ctx.from, ctx.message.date);
@@ -1120,7 +1160,7 @@ export function createTelegramBot(
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       const ext = extensionForMedia(media, mediaType);
       tempPath = allocateMediaPath(key, mediaType, ext);
-      await downloadFile(url, tempPath);
+      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
       enforceMediaCap(config.sessionDefaults.maxMediaBytes);
 
       const prefix = buildSourcePrefix(binding, ctx.from, ctx.message.date);
@@ -1207,7 +1247,7 @@ export function createTelegramBot(
   // Global error handler
   bot.catch((err) => {
     log.error("telegram-bot", "Unhandled error:", err.error);
-    log.error("telegram-bot", `Update that caused the error: ${JSON.stringify(err.ctx.update)}`);
+    log.error("telegram-bot", `Update metadata: ${describeTelegramUpdateForLog(err.ctx.update)}`);
   });
 
   // Echo watcher: routes deliver.sh echo files as passive context only. Echoes

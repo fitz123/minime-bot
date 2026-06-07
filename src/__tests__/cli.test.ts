@@ -19,6 +19,7 @@ import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
 const CLI_TS = join(BOT_ROOT, "src", "cli.ts");
+const SAMPLER_TS = join(BOT_ROOT, "src", "codex-quota-sampler.ts");
 const TSX_LOADER = createRequire(import.meta.url).resolve("tsx");
 const MINIMAL_WORKSPACE_FIXTURE = join(BOT_ROOT, "test-fixtures", "minimal-workspace");
 
@@ -197,6 +198,8 @@ describe("minime-bot CLI", () => {
       bin?: Record<string, string>;
     };
     assert.equal(packageJson.bin?.["minime-bot"], "./dist/cli.js");
+    assert.equal(packageJson.bin?.["minime-codex-quota-sampler"], "./dist/codex-quota-sampler.js");
     assert.match(readFileSync(CLI_TS, "utf8"), /^#!\/usr\/bin\/env node/);
+    assert.match(readFileSync(SAMPLER_TS, "utf8"), /^#!\/usr\/bin\/env node/);
   });
 });

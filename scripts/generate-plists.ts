@@ -4,21 +4,27 @@
 // Output: ~/Library/LaunchAgents/ai.minime.cron.<name>.plist
 
 import { writeFileSync, mkdirSync } from "node:fs";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { loadMergedCrons } from "../src/cron-runner.js";
-import { validateCronForPlist, type CronPlistDef } from "../src/cron-plist.js";
+import {
+  expandCronField,
+  parseEveryScheduleSeconds,
+  validateCronForPlist,
+  type CronPlistDef,
+} from "../src/cron-plist.js";
+import { resolveWorkspaceContract, MINIME_WORKSPACE_ROOT_ENV } from "../src/workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
-const REPO_ROOT = resolve(BOT_DIR, "..");
 const HOME = homedir();
 const LAUNCH_AGENTS_DIR = join(HOME, "Library", "LaunchAgents");
 const LOG_DIR = process.env.LOG_DIR ?? join(HOME, ".minime", "logs");
 const RUN_CRON_SCRIPT = resolve(BOT_DIR, "scripts", "run-cron.sh");
 
 const dryRun = process.argv.includes("--dry-run");
+const workspace = readOptionalFlag("--workspace");
 
 type CronDef = CronPlistDef;
 
@@ -34,11 +40,11 @@ interface CalendarInterval {
 
 function parseCronToCalendarIntervals(expr: string): CalendarInterval[] | null {
   // Handle "every N" (seconds) → use StartInterval instead
-  if (expr.startsWith("every ")) {
+  if (parseEveryScheduleSeconds(expr) !== undefined) {
     return null; // signals to use StartInterval
   }
 
-  const parts = expr.split(" ");
+  const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) {
     throw new Error(`Invalid cron expression: ${expr}`);
   }
@@ -46,11 +52,11 @@ function parseCronToCalendarIntervals(expr: string): CalendarInterval[] | null {
   const [minute, hour, day, month, weekday] = parts;
 
   // Expand each field
-  const minutes = expandField(minute, 0, 59);
-  const hours = expandField(hour, 0, 23);
-  const days = expandField(day, 1, 31);
-  const months = expandField(month, 1, 12);
-  const weekdays = expandField(weekday, 0, 6); // 0=Sunday in launchd, 1=Monday in cron...
+  const minutes = expandCronField(minute, 0, 59);
+  const hours = expandCronField(hour, 0, 23);
+  const days = expandCronField(day, 1, 31);
+  const months = expandCronField(month, 1, 12);
+  const weekdays = expandCronField(weekday, 0, 7); // 0 or 7 = Sunday
 
   // Convert cron weekdays (0=Sun, 1=Mon..7=Sun) to launchd (0=Sun, 1=Mon..)
   // Actually both use 0=Sunday convention, so no conversion needed
@@ -84,50 +90,6 @@ function parseCronToCalendarIntervals(expr: string): CalendarInterval[] | null {
   return intervals;
 }
 
-// Expand a cron field to array of values. Returns [-1] for wildcard (*)
-function expandField(field: string, min: number, max: number): number[] {
-  if (field === "*") return [-1]; // wildcard
-
-  const values: number[] = [];
-
-  for (const part of field.split(",")) {
-    // Handle step: */N or M-N/S
-    if (part.includes("/")) {
-      const [range, stepStr] = part.split("/");
-      const step = parseInt(stepStr, 10);
-      let start = min;
-      let end = max;
-
-      if (range !== "*") {
-        if (range.includes("-")) {
-          const [s, e] = range.split("-");
-          start = parseInt(s, 10);
-          end = parseInt(e, 10);
-        } else {
-          start = parseInt(range, 10);
-        }
-      }
-
-      for (let i = start; i <= end; i += step) {
-        values.push(i);
-      }
-    }
-    // Handle range: M-N
-    else if (part.includes("-")) {
-      const [start, end] = part.split("-").map((s) => parseInt(s, 10));
-      for (let i = start; i <= end; i++) {
-        values.push(i);
-      }
-    }
-    // Single value
-    else {
-      values.push(parseInt(part, 10));
-    }
-  }
-
-  return values;
-}
-
 function calendarIntervalToPlist(interval: CalendarInterval): string {
   const lines: string[] = [];
   lines.push("        <dict>");
@@ -155,7 +117,40 @@ function calendarIntervalToPlist(interval: CalendarInterval): string {
   return lines.join("\n");
 }
 
-function generatePlist(cron: CronDef): string {
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function pathInside(dir: string, path: string): boolean {
+  const rel = relative(dir, path);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function readOptionalFlag(flag: string): string | undefined {
+  const equalsPrefix = `${flag}=`;
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg.startsWith(equalsPrefix)) {
+      const value = arg.slice(equalsPrefix.length).trim();
+      return value || undefined;
+    }
+    if (arg === flag) {
+      const value = process.argv[i + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error(`${flag} requires a value`);
+      }
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function generatePlist(cron: CronDef, controlWorkspaceRoot: string): string {
   const label = `ai.minime.cron.${cron.name}`;
   const intervals = parseCronToCalendarIntervals(cron.schedule);
 
@@ -163,7 +158,10 @@ function generatePlist(cron: CronDef): string {
 
   if (intervals === null) {
     // "every N" seconds
-    const seconds = parseInt(cron.schedule.replace("every ", ""), 10);
+    const seconds = parseEveryScheduleSeconds(cron.schedule);
+    if (seconds === undefined) {
+      throw new Error(`Invalid every schedule: ${cron.schedule}`);
+    }
     scheduleSection = `    <key>StartInterval</key>
     <integer>${seconds}</integer>`;
   } else if (intervals.length === 1) {
@@ -182,30 +180,34 @@ ${entriesXml}
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>${RUN_CRON_SCRIPT}</string>
-        <string>${cron.name}</string>
-    </array>
+	<dict>
+	    <key>Label</key>
+	    <string>${xmlEscape(label)}</string>
+	    <key>ProgramArguments</key>
+	    <array>
+	        <string>/bin/bash</string>
+	        <string>${xmlEscape(RUN_CRON_SCRIPT)}</string>
+	        <string>${xmlEscape(cron.name)}</string>
+	    </array>
 ${scheduleSection}
     <key>RunAtLoad</key>
-    <false/>
-    <key>WorkingDirectory</key>
-    <string>${REPO_ROOT}</string>
-    <key>StandardOutPath</key>
-    <string>${LOG_DIR}/cron-${cron.name}.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/cron-${cron.name}.stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${HOME}</string>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	    <false/>
+	    <key>WorkingDirectory</key>
+	    <string>${xmlEscape(controlWorkspaceRoot)}</string>
+	    <key>StandardOutPath</key>
+	    <string>${xmlEscape(`${LOG_DIR}/cron-${cron.name}.stdout.log`)}</string>
+	    <key>StandardErrorPath</key>
+	    <string>${xmlEscape(`${LOG_DIR}/cron-${cron.name}.stderr.log`)}</string>
+	    <key>EnvironmentVariables</key>
+	    <dict>
+	        <key>HOME</key>
+	        <string>${xmlEscape(HOME)}</string>
+	        <key>${MINIME_WORKSPACE_ROOT_ENV}</key>
+	        <string>${xmlEscape(controlWorkspaceRoot)}</string>
+	        <key>LOG_DIR</key>
+	        <string>${xmlEscape(LOG_DIR)}</string>
+	        <key>PATH</key>
+	        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>
@@ -214,8 +216,9 @@ ${scheduleSection}
 
 function main(): void {
   let crons: CronDef[];
+  const contract = resolveWorkspaceContract({ workspace });
   try {
-    crons = loadMergedCrons() as unknown as CronDef[];
+    crons = loadMergedCrons(contract.paths.cronsPath) as unknown as CronDef[];
   } catch (err) {
     console.error(`ERROR: ${(err as Error).message}`);
     process.exit(1);
@@ -239,16 +242,20 @@ function main(): void {
       continue;
     }
     try {
-      const plistContent = generatePlist(cron);
+      const plistContent = generatePlist(cron, contract.paths.controlWorkspaceRoot);
       const plistPath = resolve(
         LAUNCH_AGENTS_DIR,
         `ai.minime.cron.${cron.name}.plist`,
       );
+      if (!pathInside(LAUNCH_AGENTS_DIR, plistPath)) {
+        throw new Error(`resolved plist path escapes LaunchAgents dir: ${plistPath}`);
+      }
 
       if (dryRun) {
         console.log(`[DRY-RUN] Would write: ${plistPath}`);
+        const intervals = parseCronToCalendarIntervals(cron.schedule);
         console.log(
-          `  Schedule: ${cron.schedule} → ${parseCronToCalendarIntervals(cron.schedule) === null ? `StartInterval(${cron.schedule.replace("every ", "")}s)` : `${parseCronToCalendarIntervals(cron.schedule)!.length} calendar interval(s)`}`,
+          `  Schedule: ${cron.schedule} → ${intervals === null ? `StartInterval(${parseEveryScheduleSeconds(cron.schedule)}s)` : `${intervals.length} calendar interval(s)`}`,
         );
       } else {
         writeFileSync(plistPath, plistContent, "utf8");

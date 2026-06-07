@@ -30,7 +30,7 @@ describe("start-bot.sh", () => {
     try {
       mkdirSync(binDir, { recursive: true });
       writeFileSync(
-        join(binDir, "npx"),
+        join(binDir, "node"),
         `#!/bin/bash
 {
   printf 'args=%s\\n' "$*"
@@ -41,7 +41,7 @@ describe("start-bot.sh", () => {
 `,
         "utf8",
       );
-      chmodSync(join(binDir, "npx"), 0o755);
+      chmodSync(join(binDir, "node"), 0o755);
 
       const result = spawnSync("/bin/bash", [startBotScript], {
         encoding: "utf8",
@@ -59,7 +59,7 @@ describe("start-bot.sh", () => {
 
       assert.strictEqual(result.status, 0, result.stderr || result.stdout || "start-bot.sh failed");
       const capture = readFileSync(captureFile, "utf8");
-      assert.match(capture, /^args=tsx src\/main\.ts$/m);
+      assert.match(capture, /args=.*\/dist\/main\.js$/m);
       assert.match(capture, /^token=__unset__$/m);
       assert.match(capture, /^anthropic=__unset__$/m);
       assert.match(capture, /^marker=__unset__$/m);
@@ -84,7 +84,7 @@ describe("run-cron.sh", () => {
         "utf8",
       );
       writeFileSync(
-        join(binDir, "npx"),
+        join(binDir, "node"),
         `#!/bin/bash
 {
   printf 'args=%s\\n' "$*"
@@ -102,7 +102,7 @@ describe("run-cron.sh", () => {
         "utf8",
       );
       chmodSync(join(binDir, "security"), 0o755);
-      chmodSync(join(binDir, "npx"), 0o755);
+      chmodSync(join(binDir, "node"), 0o755);
 
       const result = spawnSync("/bin/bash", [runCronScript, "pi-task"], {
         encoding: "utf8",
@@ -127,7 +127,7 @@ describe("run-cron.sh", () => {
       assert.strictEqual(result.status, 0, result.stderr || result.stdout || "run-cron.sh failed");
       assert.strictEqual(existsSync(securityCallsFile), false);
       const capture = readFileSync(captureFile, "utf8");
-      assert.match(capture, /^args=tsx src\/cron-runner\.ts --task pi-task$/m);
+      assert.match(capture, /args=.*\/dist\/cron-runner\.js --task pi-task$/m);
       assert.match(capture, /^token=__unset__$/m);
       assert.match(capture, /^anthropic=__unset__$/m);
       assert.match(capture, /^marker=__unset__$/m);
@@ -151,6 +151,8 @@ describe("deliver.sh", () => {
     assert.doesNotMatch(script, /security find-generic-password/);
     assert.doesNotMatch(script, /Keychain/);
     assert.match(script, /TELEGRAM_BOT_TOKEN/);
-    assert.match(script, /\nTOKEN="\$\{TELEGRAM_BOT_TOKEN:-\}"[\s\S]*\nunset TELEGRAM_BOT_TOKEN\n[\s\S]*\nAPI=/);
+    assert.match(script, /\nTOKEN="\$\{TELEGRAM_BOT_TOKEN:-\}"[\s\S]*\nunset TELEGRAM_BOT_TOKEN/);
+    assert.match(script, /--config -/);
+    assert.doesNotMatch(script, /curl[^\n]*bot\$\{TOKEN\}/);
   });
 });

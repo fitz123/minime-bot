@@ -25,6 +25,12 @@ minime-bot config validate --workspace /path/to/workspace
 minime-bot workspace validate --workspace /path/to/workspace
 ```
 
+The package also exposes a quota sampler for Prometheus textfile collectors:
+
+```bash
+minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/to/textfiles
+```
+
 ## Control Workspace
 
 Runtime config and agent workspace files live outside this package in a control
@@ -51,6 +57,18 @@ By default, the workspace provides:
 Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.
+
+## Running
+
+Build first, then run the compiled runtime with an explicit control workspace:
+
+```bash
+npm run build
+MINIME_WORKSPACE_ROOT=/path/to/workspace node dist/main.js
+```
+
+The launchd example uses separate `PACKAGE_ROOT` and `CONTROL_WORKSPACE`
+placeholders and sets `MINIME_WORKSPACE_ROOT` in the service environment.
 
 ## Repository Boundaries
 

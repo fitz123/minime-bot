@@ -1,7 +1,7 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
@@ -1634,6 +1634,26 @@ describe("formatChatContextForLog", () => {
 
   it("formats string chatId (channel @username)", () => {
     assert.strictEqual(formatChatContextForLog({ chatId: "@somechannel" }), " chat_id=@somechannel");
+  });
+});
+
+describe("describeTelegramUpdateForLog", () => {
+  it("logs bounded update metadata without message payload or user details", () => {
+    const line = describeTelegramUpdateForLog({
+      update_id: 42,
+      message: {
+        text: "private message body",
+        chat: { id: 555000111, username: "private-chat" },
+        from: { id: 777, username: "private-user" },
+      },
+    });
+
+    assert.match(line, /type=message/);
+    assert.match(line, /update_id=42/);
+    assert.match(line, /chat_hash=[a-f0-9]{12}/);
+    assert.doesNotMatch(line, /555000111/);
+    assert.doesNotMatch(line, /private message body/);
+    assert.doesNotMatch(line, /private-user/);
   });
 });
 

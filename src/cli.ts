@@ -11,7 +11,6 @@ import {
 } from "./workspace-validator.js";
 import {
   resolveWorkspaceContract,
-  workspaceContractDiagnostics,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
 
@@ -101,7 +100,7 @@ function resolveForCli(parsed: ParsedArgs, options: CliRunOptions): ResolvedWork
 }
 
 function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
-  const diagnostics = workspaceContractDiagnostics(contract);
+  const diagnostics = contract.effectivePaths;
   return [
     `  control workspace root: ${diagnostics.controlWorkspaceRoot.path} (${diagnostics.controlWorkspaceRoot.source})`,
     `  config path: ${diagnostics.configPath.path} (${diagnostics.configPath.source})`,

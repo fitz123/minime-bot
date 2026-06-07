@@ -1,5 +1,5 @@
 #!/bin/bash
-# start-bot.sh — Launch the Telegram bot daemon
+# start-bot.sh — Launch the bot daemon from a built package checkout
 # Called by launchd plist; must work from non-interactive shell context
 
 set -euo pipefail
@@ -22,4 +22,4 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$BOT_DIR"
-exec npx tsx src/main.ts
+exec node "$BOT_DIR/dist/main.js"

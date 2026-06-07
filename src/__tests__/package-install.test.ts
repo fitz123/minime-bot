@@ -117,6 +117,16 @@ function runInstalledBin(projectDir: string, args: readonly string[], workspace:
   });
 }
 
+function runInstalledSamplerBin(projectDir: string, args: readonly string[], workspace: string): SpawnSyncReturns<string> {
+  return spawnSync(join(projectDir, "node_modules", ".bin", "minime-codex-quota-sampler"), args, {
+    cwd: projectDir,
+    encoding: "utf8",
+    env: commandEnv({
+      MINIME_WORKSPACE_ROOT: workspace,
+    }),
+  });
+}
+
 function assertPackFiles(files: readonly string[]): void {
   for (const expected of [
     "dist/cli.js",
@@ -201,6 +211,10 @@ describe("package artifact install", () => {
       const help = runInstalledBin(projectDir, ["--help"], workspace);
       assert.equal(help.status, 0, help.stderr);
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
+
+      const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
+      assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
+      assert.match(samplerHelp.stdout, /minime-codex-quota-sampler|codex-quota-sampler/);
 
       const configValidate = runInstalledBin(projectDir, ["config", "validate", "--workspace", workspace], workspace);
       assert.equal(configValidate.status, 0, configValidate.stderr);

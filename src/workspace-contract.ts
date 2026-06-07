@@ -256,12 +256,6 @@ export function resolveWorkspaceContract(
   };
 }
 
-export function workspaceContractDiagnostics(
-  contract: ResolvedWorkspaceContract,
-): WorkspaceContractEffectivePaths {
-  return contract.effectivePaths;
-}
-
 export function resolveAgentWorkspaceCwd(controlWorkspaceRoot: string, workspaceCwd: string): string {
   return normalize(isAbsolute(workspaceCwd) ? workspaceCwd : resolve(controlWorkspaceRoot, workspaceCwd));
 }
