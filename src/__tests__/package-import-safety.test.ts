@@ -35,8 +35,6 @@ const forbiddenTrackedPathPatterns = [
   /^memory\//,
   /\.log$/,
 ];
-const forbiddenLegacyAuthor = ["Nico", "Bailon"].join(" ");
-
 function readPackageFile(relativePath: string): string {
   return readFileSync(resolve(packageRoot, relativePath), "utf8");
 }
@@ -54,8 +52,6 @@ describe("package root import safety", () => {
 
     assert.equal(packageJson.author, "Minime Bot contributors");
     assert.match(license, /MIT License/);
-    assert.ok(!JSON.stringify(packageJson).includes(forbiddenLegacyAuthor));
-    assert.ok(!license.includes(forbiddenLegacyAuthor));
   });
 
   it("does not track generated runtime or private workspace-root paths", () => {

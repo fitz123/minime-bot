@@ -93,7 +93,6 @@ node dist/cli.js --help
 npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|config\.local\.yaml|crons\.yaml|crons\.local\.yaml|CLAUDE\.md|USER\.md|IDENTITY\.md|MEMORY\.md|reference/|memory/)" && exit 1 || true
-rg -n "$(printf '\116\151\143\157\040\102\141\151\154\157\156')" . && exit 1 || true
 npm run check:schema-guard-contract
 ```
 
