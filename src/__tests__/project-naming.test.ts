@@ -172,8 +172,8 @@ describe("project naming", () => {
     );
   });
 
-  it("package.json version follows CalVer (YYYY.MM.patch)", () => {
-    assert.match(packageJson.version, /^\d{4}\.\d{2}\.\d+$/);
+  it("package.json version follows SemVer-valid CalVer (YYYY.M.patch)", () => {
+    assert.match(packageJson.version, /^\d{4}\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/);
   });
 
   it("types.ts has no OpenClaw references", () => {
