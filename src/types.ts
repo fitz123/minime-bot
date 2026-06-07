@@ -1,0 +1,216 @@
+// Core types for the Minime bot
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface AgentConfig {
+  id: string;
+  /** Resolved agent workspace root used as the Pi session cwd and context source. */
+  workspaceCwd: string;
+  model: string;
+  systemPrompt?: string;
+  thinking?: PiThinkingLevel;
+  /**
+   * Compatibility field for old provider-aware configs.
+   * Omit it or set "pi"; "claude" is rejected during config validation.
+   */
+  provider?: "pi";
+}
+
+export interface TopicOverride {
+  topicId: number;
+  agentId?: string;
+  requireMention?: boolean;
+}
+
+export interface TelegramBinding {
+  chatId: number;
+  agentId: string;
+  kind: "dm" | "group";
+  topicId?: number;
+  label?: string;
+  requireMention?: boolean;
+  topics?: TopicOverride[];
+  voiceTranscriptEcho?: boolean;
+  typingIndicator?: boolean;
+}
+
+export interface DiscordChannelOverride {
+  channelId: string;
+  agentId?: string;
+  label?: string;
+  requireMention?: boolean;
+  typingIndicator?: boolean;
+}
+
+export interface DiscordBinding {
+  channelId?: string;
+  guildId: string;
+  agentId: string;
+  kind: "dm" | "channel";
+  label?: string;
+  requireMention?: boolean;
+  typingIndicator?: boolean;
+  channels?: DiscordChannelOverride[];
+}
+
+export interface DiscordConfig {
+  token: string;
+  bindings: DiscordBinding[];
+}
+
+export interface CronJob {
+  name: string;
+  schedule: string;
+  type: "llm" | "script";
+  prompt?: string;
+  command?: string;
+  agentId: string;
+  deliveryChatId: number;
+  deliveryThreadId?: number;
+  timeout?: number;
+  enabled?: boolean;
+  engine?: "pi";
+}
+
+export interface SessionState {
+  sessionId: string;
+  chatId: string;
+  agentId: string;
+  lastActivity: number;
+}
+
+export interface SessionDefaults {
+  idleTimeoutMs: number;
+  maxConcurrentSessions: number;
+  maxMessageAgeMs: number;
+  requireMention: boolean;
+  maxMediaBytes: number;
+}
+
+export interface BotConfig {
+  telegramToken?: string;
+  agents: Record<string, AgentConfig>;
+  bindings: TelegramBinding[];
+  sessionDefaults: SessionDefaults;
+  logLevel?: LogLevel;
+  metricsPort?: number;
+  metricsHost?: string;
+  discord?: DiscordConfig;
+  adminChatId?: number;
+  defaultDeliveryChatId?: number;
+  defaultDeliveryThreadId?: number;
+}
+
+/**
+ * Platform-agnostic message I/O interface.
+ * Each platform (Telegram, Discord) provides an adapter implementing this interface.
+ * stream-relay and message-queue depend only on this — no platform-specific imports.
+ */
+export interface PlatformContext {
+  /** Send a new message, returns a platform-specific message ID for later editing. */
+  sendMessage(text: string): Promise<string>;
+
+  /** Delete a previously sent message by its ID. Best-effort — failures are silently ignored by callers. */
+  deleteMessage(messageId: string): Promise<void>;
+
+  /** Send a typing/action indicator. */
+  sendTyping(): Promise<void>;
+
+  /** Send a streaming draft update (cosmetic, fire-and-forget). No-op on platforms without draft support. */
+  sendDraft(draftId: number, text: string): Promise<void>;
+
+  /** Send a file (image or document). */
+  sendFile(filePath: string, isImage: boolean): Promise<void>;
+
+  /** Send an error reply to the user. */
+  replyError(text: string): Promise<void>;
+
+  /** Maximum message length for this platform. */
+  readonly maxMessageLength: number;
+
+  /** Interval between typing indicator resends (ms). */
+  readonly typingIntervalMs: number;
+
+  /** Whether to send typing indicators (default true). */
+  readonly typingIndicator: boolean;
+
+  /** Pre-stream typing timer set by message queue, cleared by relayStream on handoff. */
+  preStreamTypingTimer?: ReturnType<typeof setInterval>;
+}
+
+// Pi-normalized stream event types
+
+export interface SystemInit {
+  type: "system";
+  subtype: "init";
+  session_id: string;
+  [key: string]: unknown;
+}
+
+export interface StreamEvent {
+  type: "stream_event";
+  event: {
+    delta?: {
+      type: string;
+      text?: string;
+    };
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export interface AssistantMessage {
+  type: "assistant";
+  subtype?: undefined;
+  message: {
+    role: "assistant";
+    content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+  };
+  session_id: string;
+  [key: string]: unknown;
+}
+
+export interface ToolProgress {
+  type: "assistant";
+  subtype: "tool_progress";
+  [key: string]: unknown;
+}
+
+export interface ToolUseSummary {
+  type: "assistant";
+  subtype: "tool_use_summary";
+  [key: string]: unknown;
+}
+
+export interface ControlRequest {
+  type: "assistant";
+  subtype: "control_request";
+  [key: string]: unknown;
+}
+
+export interface RateLimitEvent {
+  type: "assistant";
+  subtype: "rate_limit_event";
+  [key: string]: unknown;
+}
+
+export interface ResultMessage {
+  type: "result";
+  result: string;
+  session_id: string;
+  cost_usd?: number;
+  duration_ms?: number;
+  [key: string]: unknown;
+}
+
+export type StreamLine =
+  | SystemInit
+  | StreamEvent
+  | AssistantMessage
+  | ToolProgress
+  | ToolUseSummary
+  | ControlRequest
+  | RateLimitEvent
+  | ResultMessage;
