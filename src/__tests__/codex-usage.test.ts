@@ -201,6 +201,21 @@ describe("codex usage paths and Prometheus formatting", () => {
     );
   });
 
+  it("uses an explicit runtime dir for the default state file", () => {
+    assert.deepEqual(
+      resolveCodexQuotaPaths({
+        cwd: "/tmp/package-root",
+        env: {},
+        defaultStateDir: "/tmp/control-workspace/.tmp",
+        textfileDir: "metrics",
+      }),
+      {
+        stateFile: "/tmp/control-workspace/.tmp/codex-quota-state.json",
+        textfileDir: "/tmp/package-root/metrics",
+      },
+    );
+  });
+
   it("formats ADR-compatible gauges and low-cardinality metadata labels", () => {
     const text = formatCodexQuotaPrometheus({
       ...sampleSnapshot(),

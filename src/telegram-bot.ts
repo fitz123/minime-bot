@@ -660,6 +660,14 @@ export function shouldRespondInGroup(
   return false;
 }
 
+export function shouldRespondToReaction(
+  binding: TelegramBinding,
+  sessionDefaults?: { requireMention?: boolean },
+): boolean {
+  if (binding.kind !== "group") return true;
+  return !(binding.requireMention ?? sessionDefaults?.requireMention ?? true);
+}
+
 /**
  * Check if a chat is authorized based on bindings allowlist.
  */
@@ -1207,6 +1215,7 @@ export function createTelegramBot(
     const topicId = getThread(chatId, messageId);
     const binding = resolveBinding(chatId, config.bindings, topicId);
     if (!binding) return;
+    if (!shouldRespondToReaction(binding, config.sessionDefaults)) return;
 
     try {
       if (isStaleMessage(ctx.messageReaction.date * 1000, maxMessageAgeMs)) {

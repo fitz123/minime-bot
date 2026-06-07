@@ -166,6 +166,24 @@ describe("codex quota sampler command setup", () => {
     assert.notEqual(config.samplerCwd, join(tmpdir(), "codex-quota-sampler"));
   });
 
+  it("defaults quota state to the selected workspace runtime dir", () => {
+    const cwd = tempDir();
+    const workspace = tempDir();
+    const config = resolveCodexQuotaSamplerConfig({
+      cwd,
+      env: {},
+      cli: {
+        workspace,
+        textfileDir: "metrics",
+      },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+
+    assert.equal(config.stateFile, join(workspace, ".tmp", "codex-quota-state.json"));
+    assert.equal(config.textfileDir, join(cwd, "metrics"));
+  });
+
   it("fails loudly when no Prometheus textfile directory is configured or writable", () => {
     const cwd = tempDir();
 

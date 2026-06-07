@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
-import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
+import { resolveAgentWorkspaceCwd, resolveWorkspaceContract, type ResolvedWorkspaceContract } from "./workspace-contract.js";
 import {
   CODEX_QUOTA_ATTEMPT_FILE_ENV,
   CODEX_QUOTA_STATE_FILE_ENV,
@@ -204,11 +204,18 @@ export function resolveCodexQuotaSamplerConfig(
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
   const botDir = options.botDir ?? DEFAULT_BOT_DIR;
+  const workspaceContract = resolveWorkspaceContract({
+    workspace: cli.workspace,
+    env,
+    cwd,
+    moduleUrl: samplerModuleUrlForBotDir(botDir),
+  });
 
   const paths = resolveCodexQuotaPaths({
     cwd,
     env,
     stateFile: cli.stateFile,
+    defaultStateDir: workspaceContract.paths.runtimeDir,
     textfileDir: cli.textfileDir,
     isWritableDir: options.isWritableDir,
   });
@@ -227,7 +234,7 @@ export function resolveCodexQuotaSamplerConfig(
   assertSamplerCwdIsolated(
     samplerCwd,
     botDir,
-    options.forbiddenSamplerCwds ?? readConfiguredAgentWorkspaceCwds(botDir, cwd, env, cli.workspace),
+    options.forbiddenSamplerCwds ?? readConfiguredAgentWorkspaceCwds(workspaceContract),
   );
 
   return {
@@ -615,18 +622,7 @@ function defaultSamplerCwd(): string {
   return join(tmpdir(), `codex-quota-sampler-${uid}`);
 }
 
-function readConfiguredAgentWorkspaceCwds(
-  botDir: string,
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-  workspace: string | undefined,
-): string[] {
-  const contract = resolveWorkspaceContract({
-    workspace,
-    env,
-    cwd,
-    moduleUrl: samplerModuleUrlForBotDir(botDir),
-  });
+function readConfiguredAgentWorkspaceCwds(contract: ResolvedWorkspaceContract): string[] {
   const config = loadConfig(contract.paths.configPath, {
     resolveSecrets: false,
     workspaceRoot: contract.paths.workspaceRoot,

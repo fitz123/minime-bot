@@ -1,7 +1,7 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
@@ -561,6 +561,25 @@ describe("shouldRespondInGroup", () => {
       reply_to_message: { from: { id: botId }, general_forum_topic_unhidden: {} },
     };
     assert.strictEqual(shouldRespondInGroup(groupRequireMention, botId, botUsername, msg), false);
+  });
+});
+
+describe("shouldRespondToReaction", () => {
+  const groupBinding: TelegramBinding = { chatId: -100, agentId: "main", kind: "group" };
+  const groupRequireMention: TelegramBinding = { chatId: -100, agentId: "main", kind: "group", requireMention: true };
+  const groupNoMention: TelegramBinding = { chatId: -100, agentId: "main", kind: "group", requireMention: false };
+  const dmBinding: TelegramBinding = { chatId: 123, agentId: "main", kind: "dm" };
+
+  it("allows DMs and groups where mention is not required", () => {
+    assert.strictEqual(shouldRespondToReaction(dmBinding), true);
+    assert.strictEqual(shouldRespondToReaction(groupNoMention, { requireMention: true }), true);
+    assert.strictEqual(shouldRespondToReaction(groupBinding, { requireMention: false }), true);
+  });
+
+  it("drops group reactions when the effective binding requires a mention", () => {
+    assert.strictEqual(shouldRespondToReaction(groupBinding), false);
+    assert.strictEqual(shouldRespondToReaction(groupBinding, { requireMention: true }), false);
+    assert.strictEqual(shouldRespondToReaction(groupRequireMention, { requireMention: false }), false);
   });
 });
 

@@ -239,6 +239,7 @@ describe("subagent: wrapper spawn environment", () => {
 
     assert.match(wrapper, /project-local agents require an interactive confirmation/);
     assert.doesNotMatch(wrapper, /confirmProjectAgents && ctx\.hasUI/);
+    assert.doesNotMatch(wrapper, /confirmProjectAgents/);
   });
 });
 

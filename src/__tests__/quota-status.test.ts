@@ -11,6 +11,7 @@ import {
   readQuotaStatus,
   resolveQuotaStateFile,
 } from "../quota-status.js";
+import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 
@@ -192,8 +193,9 @@ describe("quota status reader", () => {
     assert.match(status.error, /windows must be an object/);
   });
 
-  it("resolves the state file from CODEX_QUOTA_STATE_FILE or the default path", () => {
+  it("resolves the state file from CODEX_QUOTA_STATE_FILE or the default workspace runtime path", () => {
     const dir = tempDir();
+    const workspace = tempDir();
 
     assert.equal(
       resolveQuotaStateFile({
@@ -203,6 +205,21 @@ describe("quota status reader", () => {
       join(dir, "state", "quota.json"),
     );
     assert.equal(resolveQuotaStateFile({ cwd: dir, env: {} }), join(dir, ".tmp", "codex-quota-state.json"));
+    assert.equal(
+      resolveQuotaStateFile({
+        cwd: dir,
+        env: { [MINIME_WORKSPACE_ROOT_ENV]: workspace },
+      }),
+      join(workspace, ".tmp", "codex-quota-state.json"),
+    );
+    assert.equal(
+      resolveQuotaStateFile({
+        cwd: dir,
+        workspace,
+        env: {},
+      }),
+      join(workspace, ".tmp", "codex-quota-state.json"),
+    );
   });
 });
 

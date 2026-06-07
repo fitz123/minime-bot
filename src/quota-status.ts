@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolveCodexQuotaPaths } from "./pi-extensions/codex-usage.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
 
 export const CODEX_QUOTA_STALE_MS_ENV = "CODEX_QUOTA_STALE_MS";
 export const DEFAULT_CODEX_QUOTA_STALE_MS = 30 * 60 * 1000;
@@ -31,6 +32,8 @@ export interface QuotaSnapshot {
 export interface QuotaStatusOptions {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  workspace?: string;
+  moduleUrl?: string;
   stateFile?: string;
   now?: Date;
   staleMs?: number;
@@ -116,11 +119,20 @@ export function readQuotaStatus(options: QuotaStatusOptions = {}): QuotaStatus {
   }
 }
 
-export function resolveQuotaStateFile(options: Pick<QuotaStatusOptions, "env" | "cwd" | "stateFile"> = {}): string {
+export function resolveQuotaStateFile(options: Pick<QuotaStatusOptions, "env" | "cwd" | "workspace" | "moduleUrl" | "stateFile"> = {}): string {
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const contract = resolveWorkspaceContract({
+    workspace: options.workspace,
+    env,
+    cwd,
+    moduleUrl: options.moduleUrl,
+  });
   return resolveCodexQuotaPaths({
-    env: options.env,
-    cwd: options.cwd,
+    env,
+    cwd,
     stateFile: options.stateFile,
+    defaultStateDir: contract.paths.runtimeDir,
     isWritableDir: () => false,
   }).stateFile;
 }

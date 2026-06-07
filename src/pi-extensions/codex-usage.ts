@@ -15,7 +15,8 @@ export const CODEX_QUOTA_TEXTFILE_DIR_ENV = "CODEX_QUOTA_TEXTFILE_DIR";
 export const NODE_EXPORTER_TEXTFILE_DIR_ENV = "NODE_EXPORTER_TEXTFILE_DIR";
 export const CODEX_QUOTA_ATTEMPT_FILE_ENV = "CODEX_QUOTA_ATTEMPT_FILE";
 export const DEFAULT_NODE_EXPORTER_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
-export const DEFAULT_CODEX_QUOTA_STATE_RELPATH = join(".tmp", "codex-quota-state.json");
+export const DEFAULT_CODEX_QUOTA_STATE_FILENAME = "codex-quota-state.json";
+export const DEFAULT_CODEX_QUOTA_STATE_RELPATH = join(".tmp", DEFAULT_CODEX_QUOTA_STATE_FILENAME);
 export const CODEX_USAGE_TEXTFILE_NAME = "codex_usage.prom";
 
 const HEADER_NAMES = {
@@ -55,6 +56,7 @@ export interface CodexQuotaPathOptions {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   stateFile?: string;
+  defaultStateDir?: string;
   textfileDir?: string;
   isWritableDir?: (path: string) => boolean;
 }
@@ -97,10 +99,13 @@ interface HeaderGetter {
 export function resolveCodexQuotaPaths(options: CodexQuotaPathOptions = {}): CodexQuotaPaths {
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
+  const defaultStateDir = configuredPath(options.defaultStateDir, cwd);
   const stateFile =
     configuredPath(options.stateFile, cwd) ??
     configuredPath(env[CODEX_QUOTA_STATE_FILE_ENV], cwd) ??
-    resolve(cwd, DEFAULT_CODEX_QUOTA_STATE_RELPATH);
+    (defaultStateDir
+      ? resolve(defaultStateDir, DEFAULT_CODEX_QUOTA_STATE_FILENAME)
+      : resolve(cwd, DEFAULT_CODEX_QUOTA_STATE_RELPATH));
 
   const explicitTextfileDir =
     configuredPath(options.textfileDir, cwd) ??
