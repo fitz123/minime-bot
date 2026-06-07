@@ -143,6 +143,10 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
     "scripts/deliver.sh",
+    "scripts/restart-bot.sh",
+    "scripts/run-cron.sh",
+    "scripts/start-bot.sh",
+    "telegram-bot.plist.example",
     ...EXPECTED_BUNDLED_AGENT_FILES.map((file) => `dist/extensions/pi/subagent/agents/${file}`),
     ...EXPECTED_BUNDLED_PROMPT_FILES.map((file) => `dist/extensions/pi/subagent/prompts/${file}`),
   ]) {

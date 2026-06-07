@@ -241,6 +241,16 @@ describe("subagent: wrapper spawn environment", () => {
     assert.doesNotMatch(wrapper, /confirmProjectAgents && ctx\.hasUI/);
     assert.doesNotMatch(wrapper, /confirmProjectAgents/);
   });
+
+  it("does not expose child cwd selection through model-callable params", () => {
+    const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
+
+    assert.doesNotMatch(wrapper, /cwd:\s*Type\.Optional/);
+    assert.doesNotMatch(wrapper, /\bparams\.cwd\b/);
+    assert.doesNotMatch(wrapper, /\bstep\.cwd\b/);
+    assert.doesNotMatch(wrapper, /\bt\.cwd\b/);
+    assert.match(wrapper, /cwd:\s*defaultCwd/);
+  });
 });
 
 describe("subagent: parseSubagentEventLine", () => {

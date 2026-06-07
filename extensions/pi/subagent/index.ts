@@ -260,7 +260,6 @@ async function runSingleAgent(
 	agents: AgentConfig[],
 	agentName: string,
 	task: string,
-	cwd: string | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
@@ -321,7 +320,7 @@ async function runSingleAgent(
 			spawn,
 			command: invocation.command,
 			args: invocation.args,
-			cwd: cwd ?? defaultCwd,
+			cwd: defaultCwd,
 			env: buildPiSubagentChildSpawnEnv(),
 			signal,
 			agentName,
@@ -361,13 +360,11 @@ async function runSingleAgent(
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -381,7 +378,6 @@ const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -504,7 +500,6 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						step.agent,
 						taskWithContext,
-						step.cwd,
 						i + 1,
 						signal,
 						chainUpdate,
@@ -576,7 +571,6 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						t.agent,
 						t.task,
-						t.cwd,
 						undefined,
 						signal,
 						// Per-task update callback
@@ -618,7 +612,6 @@ export default function (pi: ExtensionAPI) {
 					agents,
 					params.agent,
 					params.task,
-					params.cwd,
 					undefined,
 					signal,
 					onUpdate,
