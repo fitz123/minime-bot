@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -96,6 +97,44 @@ function createWorkspace(root: string): string {
   return workspace;
 }
 
+function writeWorkspaceFile(workspace: string, relPath: string, content: string): void {
+  const path = join(workspace, ...relPath.split("/"));
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content, "utf8");
+}
+
+function createKnowledgeFixture(agentWorkspace: string): void {
+  writeWorkspaceFile(agentWorkspace, "wiki/schema.md", generateKnowledgeV2Schema());
+  writeWorkspaceFile(
+    agentWorkspace,
+    "wiki/pages/project/runtime.md",
+    [
+      "---",
+      "name: Runtime",
+      "description: Installed package runtime notes",
+      "type: project",
+      "---",
+      "",
+      "# Runtime",
+      "",
+      "The installed package can search synthetic Knowledge v2 pages.",
+      "",
+    ].join("\n"),
+  );
+  writeWorkspaceFile(
+    agentWorkspace,
+    "wiki/index.md",
+    [
+      "# Knowledge Index",
+      "",
+      "## Project",
+      "",
+      "- [Runtime](pages/project/runtime.md) - Installed package runtime notes",
+      "",
+    ].join("\n"),
+  );
+}
+
 function collectSchemaFiles(root: string): string[] {
   const found: string[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -150,9 +189,11 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
+    "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
     "dist/extensions/pi/codex-usage.js",
+    "dist/extensions/pi/knowledge-tools.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
@@ -173,6 +214,8 @@ function assertPackFiles(files: readonly string[]): void {
   assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("test-fixtures/")), "workspace fixtures should not be packed");
   assert.ok(!files.some((file) => file.startsWith("dist/__tests__/")), "compiled tests should not be packed");
+  assert.ok(!files.includes("schema.md"), "retired root schema contract should not be packed");
+  assert.ok(!files.some((file) => RETIRED_GUARD_WRAPPER_PATTERN.test(file)), "retired guard contract should not be packed");
 }
 
 describe("package artifact install", () => {
@@ -210,7 +253,9 @@ describe("package artifact install", () => {
     mkdirSync(packDir, { recursive: true });
     mkdirSync(projectDir, { recursive: true });
     const workspace = createWorkspace(temp);
+    const agentWorkspace = join(workspace, "agent-workspace");
     assert.deepEqual(collectSchemaFiles(workspace), [], "installed workspace fixture must not contain schema.md");
+    createKnowledgeFixture(agentWorkspace);
 
     try {
       const pack = runNpmPack(["--pack-destination", packDir]);
@@ -229,6 +274,7 @@ describe("package artifact install", () => {
       const help = runInstalledBin(projectDir, ["--help"], workspace);
       assert.equal(help.status, 0, help.stderr);
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
+      assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
 
       const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
@@ -243,6 +289,89 @@ describe("package artifact install", () => {
       assert.equal(workspaceValidate.status, 0, workspaceValidate.stderr);
       assert.match(workspaceValidate.stdout, /Workspace valid\./);
       assert.match(workspaceValidate.stdout, /Pi extension dir: .*node_modules\/minime-bot\/dist\/extensions\/pi/);
+
+      const knowledgeSearch = runInstalledBin(
+        projectDir,
+        ["knowledge", "search", "--workspace", agentWorkspace, "--query", "synthetic", "--json"],
+        workspace,
+      );
+      assert.equal(knowledgeSearch.status, 0, knowledgeSearch.stderr || knowledgeSearch.stdout);
+      const searchJson = JSON.parse(knowledgeSearch.stdout) as {
+        ok: boolean;
+        layoutKind: string;
+        results: Array<{ path: string; title: string }>;
+      };
+      assert.equal(searchJson.ok, true);
+      assert.equal(searchJson.layoutKind, "v2");
+      assert.equal(searchJson.results[0]?.path, "wiki/pages/project/runtime.md");
+
+      const knowledgeGet = runInstalledBin(
+        projectDir,
+        [
+          "knowledge",
+          "get",
+          "--workspace",
+          agentWorkspace,
+          "--path",
+          "wiki/pages/project/runtime.md",
+          "--from",
+          "7",
+          "--lines",
+          "1",
+        ],
+        workspace,
+      );
+      assert.equal(knowledgeGet.status, 0, knowledgeGet.stderr || knowledgeGet.stdout);
+      assert.equal(knowledgeGet.stdout, "# Runtime\n");
+
+      const knowledgeBodyFile = join(temp, "installed-knowledge-body.md");
+      writeFileSync(knowledgeBodyFile, "# Installed Update\n\nInstalled package CLI update is searchable.\n", "utf8");
+      const knowledgeUpdate = runInstalledBin(
+        projectDir,
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "upsert",
+          "--type",
+          "project",
+          "--slug",
+          "installed-update",
+          "--frontmatter",
+          JSON.stringify({
+            name: "Installed Update",
+            description: "Installed package CLI update",
+            type: "project",
+          }),
+          "--body-file",
+          knowledgeBodyFile,
+          "--json",
+        ],
+        workspace,
+      );
+      assert.equal(knowledgeUpdate.status, 0, knowledgeUpdate.stderr || knowledgeUpdate.stdout);
+      const updateJson = JSON.parse(knowledgeUpdate.stdout) as { ok: boolean; path: string; indexPath: string };
+      assert.equal(updateJson.ok, true);
+      assert.equal(updateJson.path, "wiki/pages/project/installed-update.md");
+      assert.equal(updateJson.indexPath, "wiki/index.md");
+
+      const updatedSearch = runInstalledBin(
+        projectDir,
+        ["knowledge", "search", "--workspace", agentWorkspace, "--query", "installed package CLI update", "--json"],
+        workspace,
+      );
+      assert.equal(updatedSearch.status, 0, updatedSearch.stderr || updatedSearch.stdout);
+      const updatedSearchJson = JSON.parse(updatedSearch.stdout) as {
+        ok: boolean;
+        results: Array<{ path: string }>;
+      };
+      assert.equal(updatedSearchJson.ok, true);
+      assert.ok(
+        updatedSearchJson.results.some((result) => result.path === "wiki/pages/project/installed-update.md"),
+        updatedSearch.stdout,
+      );
 
       const fakeBin = join(temp, "fake-bin");
       const payloadPath = join(temp, "telegram-payload.json");
@@ -342,7 +471,7 @@ const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "subagent/index.js"],
+  ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
 );
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -352,7 +481,7 @@ const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["web-tools.js"],
+  ["web-tools.js", "knowledge-tools.js"],
 );
 assertNoGuardContract("subagent child extension args must not load the retired guard", subagentChildExtensionArgs);
 
@@ -360,7 +489,10 @@ const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
   env: {},
   relpaths: piRpc.PI_CRON_WRAPPER_RELPATHS,
 });
-assert.deepEqual(cronExtensionArgs, []);
+assert.deepEqual(
+  extensionPathsFromArgs(cronExtensionArgs).map((path) => relative(artifactDir, path)),
+  ["knowledge-tools.js"],
+);
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
 
 for (const extensionPath of extensionPaths) {
@@ -376,8 +508,9 @@ const loadedConfig = configMod.loadConfig(join(workspace, "config.yaml"), {
   workspaceRoot: workspace,
 });
 assert.equal(loadedConfig.agents.main.workspaceCwd, agentWorkspace);
-const childEnv = piRpc.buildPiSpawnEnv(loadedConfig.agents.main);
+const childEnv = piRpc.buildPiSpawnEnv(loadedConfig.agents.main.workspaceCwd);
 assert.equal(childEnv.MINIME_WORKSPACE_ROOT, workspace);
+assert.equal(childEnv.MINIME_AGENT_WORKSPACE_CWD, agentWorkspace);
 assert.equal(childEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(childEnv.DISCORD_BOT_TOKEN, undefined);
 assert.equal(childEnv.TAVILY_API_KEY, undefined);
@@ -396,10 +529,14 @@ assert.equal(validator.workspaceValidationErrors(defaultResult).length, 0);
 const registeredTools = [];
 const registeredToolDefs = [];
 const resourceHandlers = [];
+const toolCallHandlers = [];
 const fakePi = {
   on(event, handler) {
     if (event === "resources_discover") {
       resourceHandlers.push(handler);
+    }
+    if (event === "tool_call") {
+      toolCallHandlers.push(handler);
     }
   },
   registerTool(tool) {
@@ -428,9 +565,10 @@ process.env.SOPS_ARGV_FILE = sopsArgvFile;
 const callerControlledCwd = join(projectDir, "caller-controlled-subagent-cwd");
 mkdirSync(callerControlledCwd, { recursive: true });
 process.chdir(callerControlledCwd);
-const subagentChildEnv = piRpc.buildPiSubagentChildSpawnEnv();
+const subagentChildEnv = piRpc.buildPiSubagentChildSpawnEnv(callerControlledCwd);
 assert.equal(process.cwd(), callerControlledCwd);
 assert.equal(subagentChildEnv.MINIME_WORKSPACE_ROOT, workspace);
+assert.equal(subagentChildEnv.MINIME_AGENT_WORKSPACE_CWD, callerControlledCwd);
 assert.equal(subagentChildEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.DISCORD_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.TAVILY_API_KEY, undefined);
@@ -451,11 +589,15 @@ globalThis.fetch = async (url, init) => {
 
 const webTools = await importFile(join(artifactDir, "web-tools.js"));
 webTools.default(fakePi);
+const knowledgeTools = await importFile(join(artifactDir, "knowledge-tools.js"));
+knowledgeTools.default(fakePi);
 const subagent = await importFile(join(artifactDir, "subagent", "index.js"));
 subagent.default(fakePi);
 assert.deepEqual(
-  registeredTools.filter((name) => ["web_search", "web_fetch", "subagent"].includes(name)).sort(),
-  ["subagent", "web_fetch", "web_search"],
+  registeredTools
+    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent"].includes(name))
+    .sort(),
+  ["knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
 );
 
 try {
@@ -474,6 +616,46 @@ try {
 } finally {
   globalThis.fetch = oldFetch;
 }
+
+const knowledgeSearchTool = registeredToolDefs.find((tool) => tool.name === "knowledge_search");
+assert.ok(knowledgeSearchTool, "knowledge_search should be registered");
+const knowledgeSearchResult = await knowledgeSearchTool.execute("knowledge-call-1", { query: "synthetic" });
+assert.equal(knowledgeSearchResult.details.ok, true);
+assert.match(knowledgeSearchResult.content[0].text, /wiki\/pages\/project\/runtime\.md/);
+
+const knowledgeGetTool = registeredToolDefs.find((tool) => tool.name === "knowledge_get");
+assert.ok(knowledgeGetTool, "knowledge_get should be registered");
+const knowledgeGetResult = await knowledgeGetTool.execute("knowledge-call-2", {
+  path: "wiki/pages/project/runtime.md",
+  from: 7,
+  lines: 1,
+});
+assert.equal(knowledgeGetResult.details.ok, true);
+assert.match(knowledgeGetResult.content[0].text, /# Runtime/);
+
+const knowledgeUpdateTool = registeredToolDefs.find((tool) => tool.name === "knowledge_update");
+assert.ok(knowledgeUpdateTool, "knowledge_update should be registered");
+const knowledgeUpdateResult = await knowledgeUpdateTool.execute("knowledge-call-3", {
+  op: "upsert",
+  type: "project",
+  slug: "wrapper-update",
+  frontmatter: {
+    name: "Wrapper Update",
+    description: "Installed wrapper update",
+    type: "project",
+  },
+  body: "# Wrapper Update\\n\\nInstalled wrapper update is searchable.\\n",
+});
+assert.equal(knowledgeUpdateResult.details.ok, true);
+assert.match(knowledgeUpdateResult.content[0].text, /wiki\/pages\/project\/wrapper-update\.md/);
+
+assert.equal(toolCallHandlers.length, 1);
+const blockDecision = await toolCallHandlers[0]({
+  toolName: "bash",
+  input: { command: "printf bad > wiki/index.md" },
+});
+assert.equal(blockDecision.block, true);
+assert.match(blockDecision.reason, /knowledge_update/);
 
 const agentsMod = await importFile(join(artifactDir, "subagent", "agents.js"));
 const discovery = agentsMod.discoverAgents(workspace, "project");

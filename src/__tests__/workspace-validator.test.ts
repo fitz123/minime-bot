@@ -10,6 +10,7 @@ import {
   workspaceValidationWarnings,
 } from "../workspace-validator.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
+import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -22,6 +23,21 @@ after(() => {
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+function writeFixtureFile(root: string, relpath: string, content: string): void {
+  const path = join(root, ...relpath.split("/"));
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+}
+
+function agentContextFiles(extraFiles: Record<string, string> = {}): Record<string, string> {
+  return {
+    "agent-workspace/CLAUDE.md": "# Agent Context\n",
+    "agent-workspace/.claude/rules/platform/.gitkeep": "",
+    "agent-workspace/.claude/rules/custom/.gitkeep": "",
+    ...extraFiles,
+  };
+}
 
 function createWorkspace(options: {
   extraFiles?: Record<string, string>;
@@ -59,9 +75,7 @@ function createWorkspace(options: {
   );
 
   for (const [rel, content] of Object.entries(options.extraFiles ?? {})) {
-    const path = join(workspace, rel);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, content);
+    writeFixtureFile(workspace, rel, content);
   }
 
   return workspace;
@@ -205,9 +219,96 @@ describe("workspace validator", () => {
 
     assert.deepStrictEqual(workspaceValidationErrors(result), []);
     assert.match(warnings, /agent "main" context file is not present: .*CLAUDE\.md/);
-    assert.match(warnings, /agent "main" context file is not present: .*MEMORY\.md/);
+    assert.match(warnings, /agent "main" has no supported knowledge layout yet/);
+    assert.doesNotMatch(warnings, /context file is not present: .*MEMORY\.md/);
     assert.match(warnings, /agent "main" rules dir is not present: .*\.claude\/rules\/platform/);
     assert.match(warnings, /agent "main" rules dir is not present: .*\.claude\/rules\/custom/);
+  });
+
+  it("accepts a v2 agent workspace without root MEMORY.md", () => {
+    const workspace = createWorkspace({
+      extraFiles: agentContextFiles({
+        "agent-workspace/wiki/schema.md": generateKnowledgeV2Schema(),
+        "agent-workspace/wiki/index.md": "# Knowledge Index\n",
+      }),
+    });
+
+    const result = validate(workspace);
+    const warnings = warningMessages(result);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.equal(warnings, "");
+    assert.equal(existsSync(join(workspace, "agent-workspace", "MEMORY.md")), false);
+  });
+
+  it("accepts legacy MEMORY.md during compatibility", () => {
+    const workspace = createWorkspace({
+      extraFiles: agentContextFiles({
+        "agent-workspace/MEMORY.md": "# Memory\n",
+      }),
+    });
+
+    const result = validate(workspace);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.equal(warningMessages(result), "");
+  });
+
+  it("reports non-v2 wiki schema and index as a supported pre-migration state", () => {
+    const workspace = createWorkspace({
+      extraFiles: agentContextFiles({
+        "agent-workspace/wiki/schema.md": [
+          "---",
+          "format: karpathy-llm-wiki",
+          "version: 1",
+          "---",
+          "",
+          "# Wiki Schema",
+          "",
+        ].join("\n"),
+        "agent-workspace/wiki/index.md": "# Wiki Index\n",
+      }),
+    });
+
+    const result = validate(workspace);
+    const warnings = warningMessages(result);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.match(warnings, /supported pre-migration wiki layout/);
+    assert.match(warnings, /karpathy-llm-wiki/);
+    assert.doesNotMatch(warnings, /has no supported knowledge layout yet/);
+  });
+
+  it("accepts artifacts as the target namespace without requiring legacy reference", () => {
+    const workspace = createWorkspace({
+      extraFiles: agentContextFiles({
+        "agent-workspace/MEMORY.md": "# Memory\n",
+        "agent-workspace/artifacts/reports/report.md": "# Report\n",
+      }),
+    });
+
+    const result = validate(workspace);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.equal(warningMessages(result), "");
+  });
+
+  it("surfaces symlinked legacy reference paths as migration notes", () => {
+    const referenceTarget = mkdtempSync(join(tmpdir(), "minime-validator-reference-target-"));
+    fixtures.push(referenceTarget);
+    const workspace = createWorkspace({
+      extraFiles: agentContextFiles({
+        "agent-workspace/MEMORY.md": "# Memory\n",
+      }),
+    });
+    symlinkSync(referenceTarget, join(workspace, "agent-workspace", "reference"), "dir");
+
+    const result = validate(workspace);
+    const warnings = warningMessages(result);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.match(warnings, /legacy reference\/ artifacts namespace/);
+    assert.match(warnings, /reference\/ path is a symlink/);
   });
 
   it("validates configured SOPS references without invoking sops", () => {
@@ -283,6 +384,24 @@ describe("workspace validator", () => {
     assert.equal(result.contract.paths.controlWorkspaceRoot, controlWorkspace);
     assert.equal(result.config?.agents.main.workspaceCwd, agentMain);
     assert.equal(result.config?.agents.reviewer.workspaceCwd, agentReviewer);
+  });
+
+  it("validates separate control and agent workspaces with different knowledge layouts", () => {
+    const { controlWorkspace, agentMain, agentReviewer } = createSiblingWorkspaceFixture();
+    writeFixtureFile(agentMain, "CLAUDE.md", "# Main Agent\n");
+    writeFixtureFile(agentMain, ".claude/rules/platform/.gitkeep", "");
+    writeFixtureFile(agentMain, ".claude/rules/custom/.gitkeep", "");
+    writeFixtureFile(agentMain, "wiki/schema.md", generateKnowledgeV2Schema());
+    writeFixtureFile(agentMain, "wiki/index.md", "# Knowledge Index\n");
+    writeFixtureFile(agentReviewer, "CLAUDE.md", "# Reviewer Agent\n");
+    writeFixtureFile(agentReviewer, ".claude/rules/platform/.gitkeep", "");
+    writeFixtureFile(agentReviewer, ".claude/rules/custom/.gitkeep", "");
+    writeFixtureFile(agentReviewer, "MEMORY.md", "# Memory\n");
+
+    const result = validate(controlWorkspace);
+
+    assert.deepStrictEqual(workspaceValidationErrors(result), []);
+    assert.equal(warningMessages(result), "");
   });
 
   it("keeps one bot binding model routed to multiple sibling agent workspaces", () => {

@@ -13,6 +13,7 @@ import type {
 import { log } from "./logger.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
 import {
+  MINIME_AGENT_WORKSPACE_CWD_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
@@ -28,35 +29,39 @@ const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
  *   web-tools (Tavily web_search/web_fetch),
+ *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn).
  * Paths are relative to {@link DEFAULT_PI_EXTENSIONS_DIR}. subagent is a multi-file
  * DIRECTORY whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "web-tools.ts",
+  "knowledge-tools.ts",
   "subagent/index.ts",
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "web-tools.js",
+  "knowledge-tools.js",
   "subagent/index.js",
 ] as const;
 
 /**
  * Wrappers a subagent CHILD `pi` spawn must load. The subagent tool spawns an
- * isolated `pi -p` child to run a delegated task. Children load web tools so
- * delegated research can use web_search/web_fetch, but they do NOT load the
- * subagent wrapper: recursive spawning stays disabled in child sessions.
+ * isolated `pi -p` child to run a delegated task. Children load web tools and
+ * knowledge tools/protection, but they do NOT load the subagent wrapper:
+ * recursive spawning stays disabled in child sessions.
  */
-export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts"] as const;
+export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
 
 /**
- * Wrappers a Pi print-mode cron must load. Crons intentionally do not get
- * interactive web-tools or subagent parity.
+ * Wrappers a Pi print-mode cron must load. Crons need the Knowledge wrapper so
+ * managed wiki writes are protected, but do not get interactive web-tools or
+ * subagent parity.
  */
-export const PI_CRON_WRAPPER_RELPATHS = [] as const;
+export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
 
-export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js"] as const;
+export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "knowledge-tools.js"] as const;
 
 /**
  * Kill-switch env var: set to exactly `"1"` to spawn Pi with no explicit
@@ -88,6 +93,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "HOME",
   "LANG",
   "LOGNAME",
+  MINIME_AGENT_WORKSPACE_CWD_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
@@ -366,15 +372,18 @@ export function buildPiSpawnArgs(
   return args;
 }
 
-export function buildPiSpawnEnv(): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract());
+export function buildPiSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
 }
 
-export function buildPiSubagentChildSpawnEnv(): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract());
+export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
 }
 
-function buildAllowedPiChildEnv(contract: ResolvedWorkspaceContract): Record<string, string> {
+function buildAllowedPiChildEnv(
+  contract: ResolvedWorkspaceContract,
+  agentWorkspaceRoot?: string,
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, val] of Object.entries(process.env)) {
     if (val !== undefined && shouldIncludePiChildEnvKey(key)) {
@@ -396,6 +405,11 @@ function buildAllowedPiChildEnv(contract: ResolvedWorkspaceContract): Record<str
   }
   env.PATH = pathParts.join(":");
   env[MINIME_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
+  delete env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+  const agentRoot = agentWorkspaceRoot?.trim();
+  if (agentRoot) {
+    env[MINIME_AGENT_WORKSPACE_CWD_ENV] = normalize(resolve(agentRoot));
+  }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
 
@@ -432,7 +446,7 @@ const PI_STARTUP_STDERR_CAP = 64 * 1024;
 export function spawnPiRpcSession(agent: AgentConfig, resumeSessionId?: string): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
-  const env = buildPiSpawnEnv();
+  const env = buildPiSpawnEnv(workspaceCwd);
   const child = spawn(PI_BIN, buildPiSpawnArgs(spawnAgent, resumeSessionId), {
     env,
     cwd: workspaceCwd,

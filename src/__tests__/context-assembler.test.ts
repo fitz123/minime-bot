@@ -26,11 +26,20 @@ import {
 } from "../pi-context-assembler.js";
 import { log } from "../logger.js";
 import type { AgentConfig } from "../types.js";
+import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 
-// The verbatim memory directive — pinned here so a wording drift in the module
+// The verbatim knowledge directive — pinned here so a wording drift in the module
 // fails this test (it is part of the deterministic bundle contract, D7).
-const MEMORY_DIRECTIVE =
-  "MEMORY.md above is the index of long-term memory. When a topic matches an entry, use the read tool to load the specific `memory/auto/<name>.md` on demand. (Auto-recall like the legacy harness is not yet available under Pi — read deliberately by index; a memory_search tool is a tracked fast-follow.)";
+const KNOWLEDGE_DIRECTIVE = [
+  "Use `knowledge_search` before answering about prior work, decisions, people, preferences, projects, health, dates, or \"what happened with X?\"",
+  "",
+  "- Use default scope for curated/current facts.",
+  "- Use `diary` or `all` scope for chronology and history.",
+  "- Use `knowledge_get` for exact source lines before important assertions.",
+  "- Use `knowledge_update` for durable Knowledge v2 writes, not arbitrary file editing.",
+  "- Put actionable work in Beads, not wiki pages.",
+  "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
+].join("\n");
 
 const created: string[] = [];
 
@@ -132,7 +141,7 @@ function captureWarn<T>(fn: () => T): { value: T; warnings: string[] } {
 }
 
 describe("buildBundle — deterministic order (D7)", () => {
-  it("assembles body, imports (in order), platform rules, custom rules, memory directive", () => {
+  it("assembles body, imports (in order), platform rules, custom rules, knowledge directive", () => {
     const ws = fullFixture();
     const bundle = buildBundle(ws);
 
@@ -142,9 +151,9 @@ describe("buildBundle — deterministic order (D7)", () => {
     const iSkill = bundle.indexOf("## .claude/skills/workspace-health/SKILL.md");
     const iPlatform = bundle.indexOf("## .claude/rules/platform/x.md");
     const iCustom = bundle.indexOf("## .claude/rules/custom/y.md");
-    const iMemAccess = bundle.indexOf("## Memory access");
+    const iKnowledgeAccess = bundle.indexOf("## Knowledge access");
 
-    for (const [name, idx] of Object.entries({ iBody, iImport, iMemorySection, iSkill, iPlatform, iCustom, iMemAccess })) {
+    for (const [name, idx] of Object.entries({ iBody, iImport, iMemorySection, iSkill, iPlatform, iCustom, iKnowledgeAccess })) {
       assert.ok(idx >= 0, `${name} should be present in the bundle`);
     }
     assert.ok(iBody < iImport, "body precedes the first import section");
@@ -152,7 +161,7 @@ describe("buildBundle — deterministic order (D7)", () => {
     assert.ok(iMemorySection < iSkill, "MEMORY.md precedes later skill imports");
     assert.ok(iSkill < iPlatform, "skill imports precede platform rules");
     assert.ok(iPlatform < iCustom, "platform rules precede custom rules");
-    assert.ok(iCustom < iMemAccess, "custom rules precede the memory directive");
+    assert.ok(iCustom < iKnowledgeAccess, "custom rules precede the knowledge directive");
   });
 
   it("expands import + rule content and removes every @-line from the body", () => {
@@ -173,10 +182,53 @@ describe("buildBundle — deterministic order (D7)", () => {
     assert.ok(!/^[ \t]*@\.claude\/skills\/workspace-health\/SKILL\.md[ \t]*$/m.test(bundle), "skill @-import line removed");
   });
 
-  it("includes the fixed memory-access directive verbatim", () => {
+  it("includes the fixed knowledge-access directive verbatim", () => {
     const ws = fullFixture();
     const bundle = buildBundle(ws);
-    assert.ok(bundle.includes(`## Memory access\n\n${MEMORY_DIRECTIVE}`));
+    assert.ok(bundle.includes(`## Knowledge access\n\n${KNOWLEDGE_DIRECTIVE}`));
+  });
+
+  it("auto-loads v2 schema and index without a root MEMORY.md", () => {
+    const ws = makeWorkspace({
+      claudeMd: "# V2 Workspace\n\nBODY_TOKEN",
+      files: {
+        "wiki/schema.md": generateKnowledgeV2Schema(),
+        "wiki/index.md": "# Knowledge Index\n\nINDEX_TOKEN\n",
+        ".claude/rules/platform/r.md": "RULE_TOKEN",
+      },
+    });
+    const bundle = buildBundle(ws);
+
+    const iBody = bundle.indexOf("BODY_TOKEN");
+    const iSchema = bundle.indexOf("## wiki/schema.md");
+    const iIndex = bundle.indexOf("## wiki/index.md");
+    const iRule = bundle.indexOf("## .claude/rules/platform/r.md");
+    const iDirective = bundle.indexOf("## Knowledge access");
+
+    for (const [name, idx] of Object.entries({ iBody, iSchema, iIndex, iRule, iDirective })) {
+      assert.ok(idx >= 0, `${name} should be present in the v2 bundle`);
+    }
+    assert.ok(iBody < iSchema, "CLAUDE.md body precedes auto-loaded knowledge schema");
+    assert.ok(iSchema < iIndex, "schema precedes the knowledge index");
+    assert.ok(iIndex < iRule, "knowledge context precedes rules");
+    assert.ok(iRule < iDirective, "rules precede the directive");
+    assert.ok(bundle.includes("format: minime-knowledge-v2"));
+    assert.ok(bundle.includes("INDEX_TOKEN"));
+    assert.ok(!bundle.includes("## MEMORY.md"), "v2 does not require or auto-load root MEMORY.md");
+  });
+
+  it("does not auto-load a legacy MEMORY.md unless CLAUDE.md imports it", () => {
+    const ws = makeWorkspace({
+      claudeMd: "# Legacy Workspace\n\nBODY_TOKEN",
+      files: {
+        "MEMORY.md": "LEGACY_MEMORY_TOKEN",
+      },
+    });
+    const bundle = buildBundle(ws);
+
+    assert.ok(bundle.includes("BODY_TOKEN"));
+    assert.ok(!bundle.includes("## MEMORY.md"));
+    assert.ok(!bundle.includes("LEGACY_MEMORY_TOKEN"));
   });
 });
 
@@ -488,7 +540,7 @@ describe("assemblePiContext", () => {
     assert.ok(result.systemPromptPath.endsWith(join(".tmp", "pi-context-main.persona.md")));
 
     const bundle = readFileSync(result.appendSystemPromptPath, "utf8");
-    assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Memory access"));
+    assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Knowledge access"));
     assert.strictEqual(readFileSync(result.systemPromptPath, "utf8"), "PERSONA_TOKEN body");
   });
 
@@ -540,7 +592,7 @@ describe("assemblePiContext", () => {
     assert.ok(result, "escaped CLAUDE.md must still suppress Pi flat context loading");
     const bundle = readFileSync(result.appendSystemPromptPath, "utf8");
     assert.ok(!bundle.includes("CLAUDE_SYMLINK_SECRET_TOKEN"));
-    assert.ok(bundle.includes("## Memory access"));
+    assert.ok(bundle.includes("## Knowledge access"));
     assert.ok(warnings.some((m) => m.includes("CLAUDE.md resolves outside the workspace")));
   });
 
@@ -570,7 +622,58 @@ describe("assemblePiContext", () => {
     const bundle = readFileSync(result.appendSystemPromptPath, "utf8");
     assert.ok(!/^[ \t]*@missing-a\.md[ \t]*$/m.test(bundle), "literal @-import line A stripped");
     assert.ok(!/^[ \t]*@missing-b\.md[ \t]*$/m.test(bundle), "literal @-import line B stripped");
-    assert.ok(bundle.includes("## Memory access"), "the fixed memory directive is present");
+    assert.ok(bundle.includes("## Knowledge access"), "the fixed knowledge directive is present");
+  });
+
+  it("writes v2 schema and index context even when CLAUDE.md is absent", () => {
+    const ws = makeWorkspace({
+      files: {
+        "wiki/schema.md": generateKnowledgeV2Schema(),
+        "wiki/index.md": "# Knowledge Index\n\nINDEX_ONLY_TOKEN\n",
+      },
+    });
+    const { value: result } = captureWarn(() => assemblePiContext(agentFor(ws, { id: "v2only" })));
+
+    assert.ok(result, "v2 knowledge files are enough to produce a bundle");
+    const bundle = readFileSync(result.appendSystemPromptPath, "utf8");
+    assert.ok(bundle.includes("## wiki/schema.md"));
+    assert.ok(bundle.includes("## wiki/index.md"));
+    assert.ok(bundle.includes("INDEX_ONLY_TOKEN"));
+    assert.ok(bundle.includes("## Knowledge access"));
+  });
+
+  it("does not load v2 knowledge context through symlinked schema or index files", () => {
+    const target = makeWorkspace({
+      files: {
+        "schema.md": generateKnowledgeV2Schema(),
+        "private-index.md": "# Private\n\nRAW_INDEX_TOKEN\n",
+      },
+    });
+    const schemaLinkWs = makeWorkspace({
+      claudeMd: "# Context\n",
+      files: {
+        "wiki/index.md": "# Knowledge Index\n",
+      },
+    });
+    symlinkSync(join(target, "schema.md"), join(schemaLinkWs, "wiki", "schema.md"));
+
+    const indexLinkWs = makeWorkspace({
+      claudeMd: "# Context\n",
+      files: {
+        "wiki/schema.md": generateKnowledgeV2Schema(),
+      },
+    });
+    symlinkSync(join(target, "private-index.md"), join(indexLinkWs, "wiki", "index.md"));
+
+    for (const ws of [schemaLinkWs, indexLinkWs]) {
+      const { value: result } = captureWarn(() => assemblePiContext(agentFor(ws, { id: "v2link" })));
+      assert.ok(result);
+      const bundle = readFileSync(result.appendSystemPromptPath, "utf8");
+      assert.ok(!bundle.includes("## wiki/schema.md"));
+      assert.ok(!bundle.includes("## wiki/index.md"));
+      assert.ok(!bundle.includes("RAW_INDEX_TOKEN"));
+      assert.ok(bundle.includes("## Knowledge access"));
+    }
   });
 
   it("cache hit re-writes the artifact, restoring content an external process overwrote", () => {

@@ -64,9 +64,25 @@ describe("project naming", () => {
       "minime-bot --help",
       "minime-bot config validate --workspace /path/to/workspace",
       "minime-bot workspace validate --workspace /path/to/workspace",
+      "minime-bot knowledge search --workspace /path/to/agent-workspace",
+      "minime-bot knowledge update --workspace /path/to/agent-workspace",
       "MINIME_WORKSPACE_ROOT",
+      "agent workspace, not the control workspace",
       "control workspace",
       "test-fixtures/minimal-workspace",
+    ]) {
+      assert.ok(readme.includes(expected), `README.md should document ${expected}`);
+    }
+  });
+
+  it("README documents Knowledge v2 routing boundaries", () => {
+    for (const expected of [
+      "format: minime-knowledge-v2",
+      "`wiki/index.md` is the catalog/discovery file",
+      "`wiki/pages/<type>/**/*.md` contains synthesized durable knowledge pages",
+      "`raw/**` contains external, user-provided, or source inputs",
+      "`artifacts/**` contains process evidence",
+      "`artifacts/` is the target process-artifact namespace",
     ]) {
       assert.ok(readme.includes(expected), `README.md should document ${expected}`);
     }
@@ -98,6 +114,7 @@ describe("project naming", () => {
       "`MEMORY.md`",
       "`reference/`",
       "`memory/`",
+      "`artifacts/`",
     ]) {
       assert.ok(
         readme.includes(privateRootPath),

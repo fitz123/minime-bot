@@ -329,7 +329,7 @@ async function runSingleAgent(
 			command: invocation.command,
 			args: invocation.args,
 			cwd: defaultCwd,
-			env: buildPiSubagentChildSpawnEnv(),
+			env: buildPiSubagentChildSpawnEnv(defaultCwd),
 			signal,
 			agentName,
 			onMessage: onUpdate

@@ -26,7 +26,7 @@ import {
   type SubagentSpawn,
   type SubagentSpawnOptions,
 } from "../pi-extensions/subagent-args.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..", "..");
@@ -147,7 +147,7 @@ describe("subagent: wrapper spawn environment", () => {
   it("uses the scrubbed subagent-child env helper instead of copying process.env", () => {
     const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
 
-    assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(\)/);
+    assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(defaultCwd\)/);
     assert.doesNotMatch(wrapper, /env:\s*\{\s*\.{3}process\.env/);
   });
 
@@ -158,7 +158,7 @@ describe("subagent: wrapper spawn environment", () => {
 
     try {
       process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
-      const env = buildPiSubagentChildSpawnEnv();
+      const env = buildPiSubagentChildSpawnEnv(callerCwd);
       const { child, calls, spawn } = setupRunner();
       const promise = runSubagentChild({
         spawn,
@@ -172,6 +172,7 @@ describe("subagent: wrapper spawn environment", () => {
       await promise;
 
       assert.equal(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.equal(env[MINIME_AGENT_WORKSPACE_CWD_ENV], callerCwd);
       assert.deepEqual(calls, [
         {
           command: "pi",

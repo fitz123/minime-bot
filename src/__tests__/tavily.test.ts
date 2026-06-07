@@ -738,13 +738,9 @@ describe("tavily: warn + tool descriptors", () => {
   });
 
   it("wrapper registers web_search/web_fetch and missing-key executions stay graceful", async () => {
-    const childProcessMock = mock.module("node:child_process", {
-      namedExports: {
-        execFileSync: () => {
-          throw new Error("missing test key");
-        },
-      },
-    });
+    const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-graceful-"));
+    const oldCwd = process.cwd();
+    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
     const moduleUrl = pathToFileURL(resolve(BOT_DIR, "extensions", "pi", "web-tools.ts")).href;
     const mod = await import(moduleUrl) as {
       default: (pi: { registerTool: (tool: RegisteredTool) => void }) => void;
@@ -761,6 +757,8 @@ describe("tavily: warn + tool descriptors", () => {
     };
 
     try {
+      process.chdir(tmpDir);
+      delete process.env[MINIME_WORKSPACE_ROOT_ENV];
       mod.default({ registerTool: (tool) => registered.push(tool) });
 
       assert.deepEqual(registered.map((tool) => tool.name), ["web_search", "web_fetch"]);
@@ -781,7 +779,10 @@ describe("tavily: warn + tool descriptors", () => {
     } finally {
       console.warn = originalWarn;
       globalThis.fetch = originalFetch;
-      childProcessMock.restore();
+      if (oldWorkspace === undefined) delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      else process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      process.chdir(oldCwd);
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

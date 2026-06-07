@@ -1,7 +1,9 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { loadConfig } from "./config.js";
 import { loadMergedCrons } from "./cron-runner.js";
+import { KNOWLEDGE_V2_FORMAT, resolveKnowledgeLayout } from "./knowledge/layout.js";
 import type { BotConfig } from "./types.js";
 import {
   resolveAgentWorkspaceCwd,
@@ -38,6 +40,14 @@ function safeStat(path: string): ReturnType<typeof statSync> | undefined {
   }
 }
 
+function safeLstat(path: string): ReturnType<typeof lstatSync> | undefined {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 function existsAsDirectory(path: string): boolean {
   return safeStat(path)?.isDirectory() === true;
 }
@@ -46,15 +56,113 @@ function existsAsFile(path: string): boolean {
   return safeStat(path)?.isFile() === true;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readSchemaFormat(schemaPath: string): string | undefined {
+  let markdown: string;
+  try {
+    markdown = readFileSync(schemaPath, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  const frontmatterMatch = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
+  if (!frontmatterMatch) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(frontmatterMatch[1]);
+  } catch {
+    return undefined;
+  }
+
+  if (!isRecord(parsed)) {
+    return undefined;
+  }
+  const format = parsed.format;
+  if (typeof format === "string") {
+    return format;
+  }
+  if (typeof format === "number" && Number.isFinite(format)) {
+    return String(format);
+  }
+  return undefined;
+}
+
+function warnIfLegacyReferenceNamespace(
+  issues: WorkspaceValidationIssue[],
+  agentId: string,
+  agentWorkspace: string,
+): void {
+  const referencePath = join(agentWorkspace, "reference");
+  if (!existsSync(referencePath)) {
+    return;
+  }
+
+  const linkNote = safeLstat(referencePath)?.isSymbolicLink() === true
+    ? " The legacy reference/ path is a symlink; verify the target before renaming."
+    : "";
+  issue(
+    issues,
+    "warning",
+    `agent "${agentId}" uses legacy reference/ artifacts namespace: ${referencePath}. ` +
+      `artifacts/ is the target process-artifact namespace; reference/ is tolerated during compatibility, ` +
+      `but rename it before private skill rewrites.${linkNote}`,
+  );
+}
+
 function warnIfMissingAgentContext(
   issues: WorkspaceValidationIssue[],
   agentId: string,
   agentWorkspace: string,
 ): void {
-  for (const fileName of ["CLAUDE.md", "MEMORY.md"] as const) {
-    const path = join(agentWorkspace, fileName);
-    if (!existsAsFile(path)) {
-      issue(issues, "warning", `agent "${agentId}" context file is not present: ${path}`);
+  const claudePath = join(agentWorkspace, "CLAUDE.md");
+  if (!existsAsFile(claudePath)) {
+    issue(issues, "warning", `agent "${agentId}" context file is not present: ${claudePath}`);
+  }
+
+  const layout = resolveKnowledgeLayout(agentWorkspace);
+  const schemaPath = layout.candidatePaths.v2.schemaPath;
+  const indexPath = layout.candidatePaths.v2.indexPath;
+  const hasWikiSchemaAndIndex = existsAsFile(schemaPath) && existsAsFile(indexPath);
+  const schemaFormat = hasWikiSchemaAndIndex ? readSchemaFormat(schemaPath) : undefined;
+  const hasPreMigrationWiki =
+    hasWikiSchemaAndIndex && schemaFormat !== undefined && schemaFormat !== KNOWLEDGE_V2_FORMAT;
+
+  if (hasPreMigrationWiki) {
+    issue(
+      issues,
+      "warning",
+      `agent "${agentId}" has a supported pre-migration wiki layout at ${join(agentWorkspace, "wiki")} ` +
+        `with schema format "${schemaFormat}". It is not Knowledge v2 until migrated or marked ` +
+        `${KNOWLEDGE_V2_FORMAT}.`,
+    );
+  }
+
+  if (layout.kind === "none" && !hasPreMigrationWiki) {
+    if (layout.reason === "v2-index-missing") {
+      issue(
+        issues,
+        "warning",
+        `agent "${agentId}" Knowledge v2 schema marker is present but wiki/index.md is missing: ${indexPath}`,
+      );
+    } else if (layout.reason === "schema-unreadable") {
+      issue(
+        issues,
+        "warning",
+        `agent "${agentId}" knowledge schema cannot be read: ${schemaPath}`,
+      );
+    } else {
+      issue(
+        issues,
+        "warning",
+        `agent "${agentId}" has no supported knowledge layout yet: add Knowledge v2 ` +
+          `wiki/schema.md plus wiki/index.md, or keep legacy MEMORY.md during compatibility.`,
+      );
     }
   }
 
@@ -64,6 +172,8 @@ function warnIfMissingAgentContext(
       issue(issues, "warning", `agent "${agentId}" rules dir is not present: ${path}`);
     }
   }
+
+  warnIfLegacyReferenceNamespace(issues, agentId, agentWorkspace);
 }
 
 function describePathKind(path: string): string {

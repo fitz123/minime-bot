@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:pa
 import { fileURLToPath } from "node:url";
 
 export const MINIME_WORKSPACE_ROOT_ENV = "MINIME_WORKSPACE_ROOT";
+export const MINIME_AGENT_WORKSPACE_CWD_ENV = "MINIME_AGENT_WORKSPACE_CWD";
 export const MINIME_CONFIG_PATH_ENV = "MINIME_CONFIG_PATH";
 export const MINIME_CRONS_PATH_ENV = "MINIME_CRONS_PATH";
 

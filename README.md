@@ -25,6 +25,31 @@ minime-bot config validate --workspace /path/to/workspace
 minime-bot workspace validate --workspace /path/to/workspace
 ```
 
+Knowledge commands operate on an agent workspace, not the control workspace:
+
+```bash
+minime-bot knowledge search --workspace /path/to/agent-workspace --query "runtime notes" --scope default --max-results 10 --json
+minime-bot knowledge get --workspace /path/to/agent-workspace --path wiki/pages/project/runtime.md --from 1 --lines 20
+minime-bot knowledge update --workspace /path/to/agent-workspace --op upsert --type project --slug runtime --frontmatter '{"name":"Runtime","description":"Runtime notes","type":"project"}' --body-file /path/to/body.md --json
+minime-bot knowledge migrate --workspace /path/to/agent-workspace --dry-run --report /path/to/report.json --json
+minime-bot knowledge migrate --workspace /path/to/agent-workspace --apply --allow-dirty --report /path/to/report.json --json
+```
+
+Knowledge commands do not load config secrets. `search` reads the curated corpus
+by default (`wiki/index.md` and `wiki/pages/**/*.md` in v2, or `MEMORY.md` and
+`memory/auto/**/*.md` in legacy workspaces). `--scope default` and `--scope auto`
+both select that curated corpus. Use `--scope diary` for narrative history and
+`--scope all` when both curated pages and diary chronology are needed. If
+`--workspace` is omitted, knowledge commands use `MINIME_AGENT_WORKSPACE_CWD`;
+config and workspace commands still use `MINIME_WORKSPACE_ROOT`.
+
+`update` is the durable Knowledge v2 write path; direct Pi writes to managed v2
+wiki paths are blocked when first-party Pi extensions are enabled. Migration is
+dry-run by default. `--apply` writes planned files only when the agent workspace
+has a clean git worktree and no blocking review items; `--allow-dirty` bypasses
+only the git cleanliness gate after operator review. Migration writes or copies
+files, does not delete legacy sources, and `--report` writes the JSON response.
+
 The package also exposes a quota sampler for Prometheus textfile collectors:
 
 ```bash
@@ -58,6 +83,31 @@ Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.
 
+## Knowledge v2 Layout
+
+Agent workspaces may use the package-owned Knowledge v2 layout:
+
+- `wiki/schema.md` declares `format: minime-knowledge-v2` and the page contract.
+- `wiki/index.md` is the catalog/discovery file maintained by package helpers.
+- `wiki/pages/<type>/**/*.md` contains synthesized durable knowledge pages.
+- `diary/**` contains narrative history and is excluded from default search.
+- `raw/**` contains external, user-provided, or source inputs.
+- `artifacts/**` contains process evidence such as plans, reports, runbooks,
+  retained logs, and task outputs; it is outside the default knowledge corpus.
+
+Route source material to `raw/**`, generated process evidence to `artifacts/**`,
+and durable conclusions to `wiki/pages/**` with links back to source material.
+The legacy `reference/` name is tolerated during compatibility, but
+`artifacts/` is the target process-artifact namespace.
+
+Knowledge pages are Markdown files under `wiki/pages/<type>/**/*.md`, where
+`type` is `user`, `project`, `feedback`, or `reference`. Page frontmatter is
+flat YAML with required `name`, `description`, and `type`; optional fields are
+`confidence`, `revisit_if`, and `originSessionId`. The Markdown body passed to
+`knowledge update` must not include its own frontmatter. `--op create` refuses
+existing pages, `--op update` requires an existing page, and `--op upsert`
+creates or updates as needed while regenerating `wiki/index.md`.
+
 ## Running
 
 Build first, then run the compiled runtime with an explicit control workspace:
@@ -74,7 +124,8 @@ placeholders and sets `MINIME_WORKSPACE_ROOT` in the service environment.
 
 Do not add private workspace files to the package root. In particular, this
 repository should not contain root `config.yaml`, `crons.yaml`, `CLAUDE.md`,
-`.claude`, `USER.md`, `IDENTITY.md`, `MEMORY.md`, `reference/`, or `memory/`.
+`.claude`, `USER.md`, `IDENTITY.md`, `MEMORY.md`, `reference/`, `memory/`, or
+`artifacts/`.
 
 The fixture under `test-fixtures/minimal-workspace` is intentionally minimal and
 contains only public-safe sample paths and placeholder IDs.
@@ -92,7 +143,7 @@ npm run check:schema-guard-contract
 node dist/cli.js --help
 npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
-git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|config\.local\.yaml|crons\.yaml|crons\.local\.yaml|CLAUDE\.md|USER\.md|IDENTITY\.md|MEMORY\.md|reference/|memory/)" && exit 1 || true
+git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|config\.local\.yaml|crons\.yaml|crons\.local\.yaml|CLAUDE\.md|USER\.md|IDENTITY\.md|MEMORY\.md|reference/|memory/|artifacts/)" && exit 1 || true
 npm run check:schema-guard-contract
 ```
 
