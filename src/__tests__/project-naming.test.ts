@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -164,28 +164,6 @@ describe("project naming", () => {
       !types.toLowerCase().includes("openclaw"),
       "types.ts still contains OpenClaw references",
     );
-  });
-
-  it("does not track private workspace template files at the package root", () => {
-    for (const relativePath of [
-      ".claude",
-      "CLAUDE.md",
-      "USER.md",
-      "IDENTITY.md",
-      "MEMORY.md",
-      "config.yaml",
-      "config.local.yaml",
-      "crons.yaml",
-      "crons.local.yaml",
-      "reference",
-      "memory",
-    ]) {
-      assert.equal(
-        existsSync(resolve(packageRoot, relativePath)),
-        false,
-        `${relativePath} should not exist at the package root`,
-      );
-    }
   });
 
   it("config.ts resolves config.yaml through workspace contract defaults", () => {

@@ -83,10 +83,10 @@ npm run check:schema-guard-contract
 
 ### Task 6: Fix root-layout tests and stale references
 
-- [ ] Rewrite `src/__tests__/project-naming.test.ts` for package-root layout.
-- [ ] Remove tests that assert workspace template files at repo root.
-- [ ] Update path split tests from old `.claude/extensions` source paths to `extensions/pi`.
-- [ ] Keep package-install tests proving no schema requirement and no guard extension packaging.
+- [x] Rewrite `src/__tests__/project-naming.test.ts` for package-root layout.
+- [x] Remove tests that assert workspace template files at repo root.
+- [x] Update path split tests from old `.claude/extensions` source paths to `extensions/pi`.
+- [x] Keep package-install tests proving no schema requirement and no guard extension packaging.
 
 ### Task 7: Final public safety and package validation
 

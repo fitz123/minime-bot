@@ -4,8 +4,9 @@ import { EventEmitter } from "node:events";
 import { Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { Readable } from "node:stream";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   existsSync,
   mkdirSync,
@@ -48,6 +49,9 @@ import {
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
 } from "../workspace-contract.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const packageRoot = resolve(__dirname, "..", "..");
 
 const testAgent: AgentConfig = {
   id: "main",
@@ -615,9 +619,11 @@ describe("Pi extension loading (--extension)", () => {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
     }
-    // Paths resolve to the canonical entrypoints, in load order.
+    const sourceExtensionDir = resolve(packageRoot, "extensions", "pi");
+
+    // Paths resolve under the package-owned source extension root, in load order.
     assert.deepStrictEqual(
-      paths.map((p) => p.split("/extensions/pi/")[1]),
+      paths.map((p) => relative(sourceExtensionDir, p)),
       [...PI_EXTENSION_WRAPPER_RELPATHS],
     );
   });
