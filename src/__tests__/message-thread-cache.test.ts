@@ -1,0 +1,252 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import {
+  setThread,
+  getThread,
+  clearThreadCache,
+  threadCacheSize,
+  saveThreadCache,
+  restoreThreadCache,
+  defaultThreadCachePath,
+} from "../message-thread-cache.js";
+import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const BOT_ROOT = resolve(__dirname, "..", "..");
+
+describe("message-thread-cache", () => {
+  beforeEach(() => {
+    clearThreadCache();
+  });
+
+  it("round-trip: stores and retrieves topicId", () => {
+    setThread(-100999, 42, 10);
+    assert.strictEqual(getThread(-100999, 42), 10);
+  });
+
+  it("returns undefined on cache miss", () => {
+    assert.strictEqual(getThread(-100999, 999), undefined);
+  });
+
+  it("skips undefined topicId (does not store)", () => {
+    setThread(-100999, 42, undefined);
+    assert.strictEqual(getThread(-100999, 42), undefined);
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("isolates keys across different chats", () => {
+    setThread(-100, 1, 10);
+    setThread(-200, 1, 20);
+    assert.strictEqual(getThread(-100, 1), 10);
+    assert.strictEqual(getThread(-200, 1), 20);
+  });
+
+  it("isolates keys across different messageIds in same chat", () => {
+    setThread(-100, 1, 10);
+    setThread(-100, 2, 20);
+    assert.strictEqual(getThread(-100, 1), 10);
+    assert.strictEqual(getThread(-100, 2), 20);
+  });
+
+  it("evicts all entries when cache exceeds 10K", () => {
+    // Fill to exactly 10K
+    for (let i = 0; i < 10_000; i++) {
+      setThread(-1, i, 5);
+    }
+    assert.strictEqual(threadCacheSize(), 10_000);
+
+    // The 10_001th entry triggers clear, then adds itself
+    setThread(-1, 99999, 42);
+    assert.strictEqual(threadCacheSize(), 1);
+    assert.strictEqual(getThread(-1, 99999), 42);
+    // Old entries are gone
+    assert.strictEqual(getThread(-1, 0), undefined);
+  });
+
+  it("overwrites existing entry for same key", () => {
+    setThread(-100, 1, 10);
+    setThread(-100, 1, 20);
+    assert.strictEqual(getThread(-100, 1), 20);
+  });
+
+  it("handles topicId 0 (General topic)", () => {
+    setThread(-100, 1, 0);
+    assert.strictEqual(getThread(-100, 1), 0);
+  });
+});
+
+describe("message-thread-cache persistence", () => {
+  let tmpDir: string;
+  let cachePath: string;
+
+  beforeEach(() => {
+    clearThreadCache();
+    tmpDir = mkdtempSync(join(tmpdir(), "thread-cache-test-"));
+    cachePath = join(tmpDir, "thread-cache.json");
+  });
+
+  afterEach(() => {
+    clearThreadCache();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("round-trip: save then restore preserves entries", () => {
+    setThread(-100, 1, 10);
+    setThread(-100, 2, 20);
+    setThread(-200, 5, 30);
+    saveThreadCache(cachePath);
+
+    clearThreadCache();
+    assert.strictEqual(threadCacheSize(), 0);
+
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 3);
+    assert.strictEqual(getThread(-100, 1), 10);
+    assert.strictEqual(getThread(-100, 2), 20);
+    assert.strictEqual(getThread(-200, 5), 30);
+  });
+
+  it("missing file results in empty cache, no crash", () => {
+    restoreThreadCache(join(tmpDir, "nonexistent.json"));
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("corrupt file results in empty cache, no crash", () => {
+    writeFileSync(cachePath, "not valid json {{{", "utf8");
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("corrupt file clears pre-existing cache entries", () => {
+    setThread(-100, 1, 10);
+    setThread(-100, 2, 20);
+    assert.strictEqual(threadCacheSize(), 2);
+    writeFileSync(cachePath, "not valid json {{{", "utf8");
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("non-array JSON results in empty cache, no crash", () => {
+    writeFileSync(cachePath, JSON.stringify({ key: "value" }), "utf8");
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("non-array JSON clears pre-existing cache entries", () => {
+    setThread(-100, 1, 10);
+    setThread(-100, 2, 20);
+    assert.strictEqual(threadCacheSize(), 2);
+    writeFileSync(cachePath, JSON.stringify({ key: "value" }), "utf8");
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 0);
+  });
+
+  it("invalid entries are skipped during restore", () => {
+    const entries = [
+      ["-100:1", 10],       // valid
+      "not-an-array",       // invalid: not an array
+      ["-100:2"],           // invalid: wrong length
+      ["-100:3", "text"],   // invalid: value not a number
+      [42, 10],             // invalid: key not a string
+      ["-200:1", 20],       // valid
+    ];
+    writeFileSync(cachePath, JSON.stringify(entries), "utf8");
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 2);
+    assert.strictEqual(getThread(-100, 1), 10);
+    assert.strictEqual(getThread(-200, 1), 20);
+  });
+
+  it("restore respects 10K cap", () => {
+    // Create a file with 11K entries
+    const entries: [string, number][] = [];
+    for (let i = 0; i < 11_000; i++) {
+      entries.push([`-1:${i}`, 5]);
+    }
+    writeFileSync(cachePath, JSON.stringify(entries), "utf8");
+
+    restoreThreadCache(cachePath);
+    assert.strictEqual(threadCacheSize(), 10_000);
+  });
+
+  it("save creates parent directories if missing", () => {
+    const nestedPath = join(tmpDir, "sub", "dir", "cache.json");
+    setThread(-100, 1, 10);
+    saveThreadCache(nestedPath);
+    assert.ok(existsSync(nestedPath));
+    const data = JSON.parse(readFileSync(nestedPath, "utf8"));
+    assert.strictEqual(data.length, 1);
+  });
+
+  it("default path preserves the source-checkout bot data location", () => {
+    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+
+    try {
+      delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      assert.strictEqual(defaultThreadCachePath(), join(BOT_ROOT, "data", "thread-cache.json"));
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+    }
+  });
+
+  it("default path saves under the resolved workspace data directory when a workspace is explicit", () => {
+    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const workspace = join(tmpDir, "workspace");
+    mkdirSync(workspace, { recursive: true });
+
+    try {
+      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspace;
+      setThread(-100, 1, 10);
+      saveThreadCache();
+
+      const expectedPath = join(workspace, "data", "thread-cache.json");
+      assert.ok(existsSync(expectedPath));
+      assert.strictEqual(JSON.parse(readFileSync(expectedPath, "utf8")).length, 1);
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+    }
+  });
+
+  it("preserves topicId 0 through save/restore", () => {
+    setThread(-100, 1, 0);
+    saveThreadCache(cachePath);
+    clearThreadCache();
+    restoreThreadCache(cachePath);
+    assert.strictEqual(getThread(-100, 1), 0);
+  });
+
+  it("atomic write: .tmp file does not persist after successful save", () => {
+    setThread(-100, 1, 10);
+    saveThreadCache(cachePath);
+    assert.ok(existsSync(cachePath), "final file should exist");
+    assert.ok(!existsSync(cachePath + ".tmp"), ".tmp file should not persist after save");
+  });
+
+  it("file permissions are 0o600 after save", () => {
+    setThread(-100, 1, 10);
+    saveThreadCache(cachePath);
+    const mode = statSync(cachePath).mode & 0o777;
+    assert.strictEqual(mode, 0o600);
+  });
+
+  it("atomic write: final file contains correct data", () => {
+    setThread(-100, 1, 10);
+    setThread(-200, 2, 20);
+    saveThreadCache(cachePath);
+    const data = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.ok(Array.isArray(data));
+    assert.strictEqual(data.length, 2);
+  });
+});

@@ -39,17 +39,17 @@ node dist/cli.js --help
 npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|config\.local\.yaml|crons\.yaml|crons\.local\.yaml|CLAUDE\.md|USER\.md|IDENTITY\.md|MEMORY\.md|reference/|memory/)" && exit 1 || true
-rg -n "Nico Bailon|guardian-protect-files|MINIME_SCHEMA_PATH|PI_GUARD_WORKSPACE_ROOT|write-allowlist|bot/\.claude/extensions|/\.claude/extensions/" . && exit 1 || true
+rg -n "$(printf '\116\151\143\157\040\102\141\151\154\157\156')|guardian-protect-files|MINIME_SCHEMA_PATH|PI_GUARD_WORKSPACE_ROOT|write-allowlist|bot/\.claude/extensions|/\.claude/extensions/" . && exit 1 || true
 ```
 
 ## Tasks
 
 ### Task 1: Import package inputs safely
 
-- [ ] Copy allowed package inputs from `../claude-code-bot/bot` into repo root: `src`, `scripts`, `test-fixtures`, `package.json`, `package-lock.json`, `tsconfig.json`, and `telegram-bot.plist.example`.
-- [ ] Do not copy generated/runtime files: `node_modules`, `dist`, `.tmp`, logs, media/runtime data.
-- [ ] Do not copy private/workspace-root files from the legacy repository.
-- [ ] Keep or rewrite the bootstrap MIT license without real-person metadata.
+- [x] Copy allowed package inputs from `../claude-code-bot/bot` into repo root: `src`, `scripts`, `test-fixtures`, `package.json`, `package-lock.json`, `tsconfig.json`, and `telegram-bot.plist.example`.
+- [x] Do not copy generated/runtime files: `node_modules`, `dist`, `.tmp`, logs, media/runtime data.
+- [x] Do not copy private/workspace-root files from the legacy repository.
+- [x] Keep or rewrite the bootstrap MIT license without real-person metadata.
 
 ### Task 2: Move Pi extension source to package-owned root path
 
