@@ -62,11 +62,11 @@ npm run check:schema-guard-contract
 
 ### Task 3: Rename package metadata and install expectations
 
-- [ ] Set `package.json.name` to `minime-bot` and keep binary `minime-bot`.
-- [ ] Update repository URL to the new repo.
-- [ ] Remove real-person author metadata or replace it with non-PII contributor metadata.
-- [ ] Update package-lock consistently.
-- [ ] Update tests expecting `node_modules/minime` or package basename `minime` to `minime-bot`.
+- [x] Set `package.json.name` to `minime-bot` and keep binary `minime-bot`.
+- [x] Update repository URL to the new repo.
+- [x] Remove real-person author metadata or replace it with non-PII contributor metadata.
+- [x] Update package-lock consistently.
+- [x] Update tests expecting `node_modules/minime` or package basename `minime` to `minime-bot`.
 
 ### Task 4: Rewrite public docs and repo instructions
 

@@ -144,7 +144,7 @@ describe("workspace validator", () => {
   it("validates the tracked fixture from a package-installed-like layout", () => {
     const projectDir = mkdtempSync(join(tmpdir(), "minime-validator-installed-"));
     fixtures.push(projectDir);
-    const packageRoot = join(projectDir, "node_modules", "minime");
+    const packageRoot = join(projectDir, "node_modules", "minime-bot");
     const artifactExtensionDir = join(packageRoot, "dist", "extensions", "pi");
     mkdirSync(artifactExtensionDir, { recursive: true });
     const moduleUrl = pathToFileURL(join(packageRoot, "dist", "workspace-contract.js")).href;

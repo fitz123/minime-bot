@@ -210,7 +210,7 @@ describe("package artifact install", () => {
       const workspaceValidate = runInstalledBin(projectDir, ["workspace", "validate", "--workspace", workspace], workspace);
       assert.equal(workspaceValidate.status, 0, workspaceValidate.stderr);
       assert.match(workspaceValidate.stdout, /Workspace valid\./);
-      assert.match(workspaceValidate.stdout, /Pi extension dir: .*node_modules\/minime\/dist\/extensions\/pi/);
+      assert.match(workspaceValidate.stdout, /Pi extension dir: .*node_modules\/minime-bot\/dist\/extensions\/pi/);
 
       const artifactCheck = spawnSync(
         process.execPath,
@@ -244,7 +244,7 @@ assert.ok(workspace, "FIXTURE_WORKSPACE is required");
 assert.ok(sourceBotRoot, "SOURCE_BOT_ROOT is required");
 
 const projectDir = process.cwd();
-const packageDir = join(projectDir, "node_modules", "minime");
+const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
 const agentWorkspace = join(workspace, "agent-workspace");
 const controlTavilySopsFile = join(workspace, "config", "secrets.sops.yaml");

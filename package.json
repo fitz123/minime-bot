@@ -1,5 +1,5 @@
 {
-  "name": "minime",
+  "name": "minime-bot",
   "version": "2026.03.0",
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
@@ -8,7 +8,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Fitz123/claude-code-bot.git"
+    "url": "https://github.com/fitz123/minime-bot.git"
   },
   "scripts": {
     "test": "MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/*.test.ts",

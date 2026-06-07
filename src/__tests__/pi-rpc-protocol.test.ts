@@ -480,7 +480,7 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("maps source wrapper relpaths to built JS relpaths for package artifact dirs", () => {
-    const artifactDir = resolve("/tmp/project/node_modules/minime/dist/extensions/pi");
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
 
     assert.equal(
       piExtensionRelpathForDir(artifactDir, "subagent/index.ts"),
@@ -494,7 +494,7 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("resolves JS wrappers from a package artifact extension dir", () => {
-    const artifactDir = resolve("/tmp/project/node_modules/minime/dist/extensions/pi");
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
     const args = resolvePiExtensionArgs({
       extensionsDir: artifactDir,
       env: {},

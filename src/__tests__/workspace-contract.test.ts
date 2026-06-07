@@ -68,7 +68,7 @@ describe("workspace contract resolver", () => {
 
   it("uses package artifact Pi wrappers for an installed package", () => {
     const installedModuleUrl = pathToFileURL(
-      join(tmpdir(), "project", "node_modules", "minime", "dist", "workspace-contract.js"),
+      join(tmpdir(), "project", "node_modules", "minime-bot", "dist", "workspace-contract.js"),
     ).href;
     const contract = resolveWorkspaceContract({
       cwd: "/tmp/install-cwd",
@@ -77,10 +77,10 @@ describe("workspace contract resolver", () => {
       homeDir: "/tmp/minime-home",
     });
 
-    assert.strictEqual(basename(contract.paths.packageRoot), "minime");
+    assert.strictEqual(basename(contract.paths.packageRoot), "minime-bot");
     assert.strictEqual(
       contract.paths.piExtensionDir,
-      normalize(join(tmpdir(), "project", "node_modules", "minime", "dist", "extensions", "pi")),
+      normalize(join(tmpdir(), "project", "node_modules", "minime-bot", "dist", "extensions", "pi")),
     );
   });
 
@@ -147,7 +147,7 @@ describe("workspace contract resolver", () => {
   it("does not guess a package install parent directory as the workspace", () => {
     const cwd = mkdtempSync(join(tmpdir(), "minime-contract-install-cwd-"));
     const installedModuleUrl = pathToFileURL(
-      join(tmpdir(), "project", "node_modules", "minime", "dist", "workspace-contract.js"),
+      join(tmpdir(), "project", "node_modules", "minime-bot", "dist", "workspace-contract.js"),
     ).href;
     const contract = resolveWorkspaceContract({
       cwd,
@@ -156,7 +156,7 @@ describe("workspace contract resolver", () => {
       homeDir: "/tmp/minime-home",
     });
 
-    assert.strictEqual(basename(contract.paths.packageRoot), "minime");
+    assert.strictEqual(basename(contract.paths.packageRoot), "minime-bot");
     assert.strictEqual(contract.paths.workspaceRoot, cwd);
     assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "cwd-fallback");
     assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_WORKSPACE_ROOT/);

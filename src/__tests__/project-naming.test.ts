@@ -17,6 +17,15 @@ describe("project naming", () => {
     name: string;
     description: string;
     version: string;
+    bin?: Record<string, string>;
+    repository?: {
+      type?: string;
+      url?: string;
+    };
+  };
+  const packageLock = JSON.parse(readPackageFile("package-lock.json")) as {
+    name: string;
+    packages?: Record<string, { name?: string }>;
   };
 
   it("README has no ~/.openclaw/ path references", () => {
@@ -49,7 +58,21 @@ describe("project naming", () => {
   });
 
   it("package.json name is the current package name", () => {
-    assert.strictEqual(packageJson.name, "minime");
+    assert.strictEqual(packageJson.name, "minime-bot");
+  });
+
+  it("package metadata points at the public package repository", () => {
+    assert.strictEqual(packageJson.repository?.type, "git");
+    assert.strictEqual(packageJson.repository?.url, "https://github.com/fitz123/minime-bot.git");
+  });
+
+  it("package lock root name matches the package name", () => {
+    assert.strictEqual(packageLock.name, packageJson.name);
+    assert.strictEqual(packageLock.packages?.[""]?.name, packageJson.name);
+  });
+
+  it("keeps the public CLI binary name", () => {
+    assert.strictEqual(packageJson.bin?.["minime-bot"], "./dist/cli.js");
   });
 
   it("package.json has no OpenClaw references in description", () => {
