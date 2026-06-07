@@ -77,9 +77,9 @@ npm run check:schema-guard-contract
 
 ### Task 5: Add minimal CI guardrails
 
-- [ ] Add author identity workflow.
-- [ ] Add CI workflow for pull requests: `npm ci`, `npm test`, `npm run build`, `npm pack --dry-run`, and schema-contract check if present.
-- [ ] Do not add gitleaks workflow unless the required config secret exists in this repo.
+- [x] Add author identity workflow.
+- [x] Add CI workflow for pull requests: `npm ci`, `npm test`, `npm run build`, `npm pack --dry-run`, and schema-contract check if present.
+- [x] Do not add gitleaks workflow unless the required config secret exists in this repo.
 
 ### Task 6: Fix root-layout tests and stale references
 
