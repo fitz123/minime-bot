@@ -90,11 +90,11 @@ npm run check:schema-guard-contract
 
 ### Task 7: Final public safety and package validation
 
-- [ ] Run all validation commands.
-- [ ] Confirm no tracked generated/runtime/private/workspace-template paths.
-- [ ] Confirm no known stale guard/schema contract strings outside historical/negative test context.
-- [ ] Commit changes with issue reference.
-- [ ] Push branch and open PR against `main`; do not merge.
+- [x] Run all validation commands.
+- [x] Confirm no tracked generated/runtime/private/workspace-template paths.
+- [x] Confirm no known stale guard/schema contract strings outside historical/negative test context.
+- [x] Commit changes with issue reference.
+- [x] Push branch and open PR against `main`; do not merge.
 
 ## Completion criteria
 
