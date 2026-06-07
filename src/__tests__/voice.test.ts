@@ -107,10 +107,14 @@ describe("downloadFile", () => {
 
 describe("convertToWav", () => {
   it("exports correct ffmpeg path", () => {
-    assert.strictEqual(FFMPEG_BIN, "/opt/homebrew/bin/ffmpeg");
+    const expectedFfmpeg = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
+    assert.strictEqual(FFMPEG_BIN, expectedFfmpeg);
   });
 
-  it("converts a valid audio file to 16kHz mono WAV", async () => {
+  it(
+    "converts a valid audio file to 16kHz mono WAV",
+    { skip: existsSync(FFMPEG_BIN) ? false : `${FFMPEG_BIN} is not available` },
+    async () => {
     // Create a minimal valid WAV: 44-byte RIFF header + 2 bytes of silence
     const header = Buffer.alloc(46);
     header.write("RIFF", 0);
@@ -145,7 +149,8 @@ describe("convertToWav", () => {
     } finally {
       rmSync(inputPath, { force: true });
     }
-  });
+    },
+  );
 
   it("rejects when given a nonexistent input file", async () => {
     await assert.rejects(
