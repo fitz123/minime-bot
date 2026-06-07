@@ -45,13 +45,34 @@ if [ -z "$MESSAGE" ]; then
   exit 1
 fi
 
-# HTML converter setup (same converter as the bot's interactive path)
+# HTML converter setup (same converter as the bot's interactive path).
+# Packed installs do not include src/ or devDependencies, so prefer the built
+# CLI and keep the tsx source path only as a checkout-mode fallback.
+NODE_BIN="${NODE_BIN:-node}"
+CURL_BIN="${CURL_BIN:-curl}"
+DIST_CONVERTER="$BOT_DIR/dist/markdown-html-cli.js"
 TSX_BIN="$BOT_DIR/node_modules/.bin/tsx"
-CONVERTER="$BOT_DIR/src/markdown-html-cli.ts"
-CAN_CONVERT=""
-if [ -x "$TSX_BIN" ] && [ -f "$CONVERTER" ]; then
-  CAN_CONVERT=1
+SOURCE_CONVERTER="$BOT_DIR/src/markdown-html-cli.ts"
+CONVERTER_MODE=""
+if [ -f "$DIST_CONVERTER" ]; then
+  CONVERTER_MODE="dist"
+elif [ -x "$TSX_BIN" ] && [ -f "$SOURCE_CONVERTER" ]; then
+  CONVERTER_MODE="source"
 fi
+
+convert_markdown() {
+  case "$CONVERTER_MODE" in
+    dist)
+      "$NODE_BIN" "$DIST_CONVERTER"
+      ;;
+    source)
+      "$TSX_BIN" "$SOURCE_CONVERTER"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 # Token is supplied by cron-runner after SOPS/env config resolution.
 TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -111,7 +132,7 @@ build_payload() {
 
 telegram_post() {
   local method="$1" payload="$2"
-  curl -s -X POST \
+  "$CURL_BIN" -s -X POST \
     -H "Content-Type: application/json" \
     -d "$payload" \
     --config - <<EOF
@@ -124,9 +145,9 @@ send_message() {
   local response ok
 
   # Try HTML conversion and send (each chunk converted independently)
-  if [ -n "$CAN_CONVERT" ]; then
+  if [ -n "$CONVERTER_MODE" ]; then
     local html_text
-    html_text=$("$TSX_BIN" "$CONVERTER" <<< "$text" 2>>"$LOG_FILE") || html_text=""
+    html_text=$(convert_markdown <<< "$text" 2>>"$LOG_FILE") || html_text=""
     if [ -n "$html_text" ]; then
       local html_json
       html_json=$(echo "$html_text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')

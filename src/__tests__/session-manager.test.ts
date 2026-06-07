@@ -4,6 +4,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node
 import { EventEmitter } from "node:events";
 import { Readable, Writable, PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
+import { resolve } from "node:path";
 import type { BotConfig } from "../types.js";
 import { waitForSpawn, outboxDir, type ActiveSession } from "../session-manager.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
@@ -555,12 +556,12 @@ describe("ActiveSession shape", () => {
 describe("outboxDir", () => {
   it("returns deterministic path for a chatId", () => {
     const path = outboxDir("chat123");
-    assert.strictEqual(path, "/tmp/bot-outbox/chat123");
+    assert.strictEqual(path, resolve(".tmp", "bot-outbox", "chat123"));
   });
 
   it("sanitizes special characters in chatId", () => {
     const path = outboxDir("tg:12345");
-    assert.strictEqual(path, "/tmp/bot-outbox/tg_12345");
+    assert.strictEqual(path, resolve(".tmp", "bot-outbox", "tg_12345"));
   });
 
   it("returns same path for same chatId", () => {

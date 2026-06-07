@@ -1,4 +1,13 @@
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  type Stats,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import type { SessionState } from "./types.js";
 import { resolveWorkspaceContract } from "./workspace-contract.js";
@@ -8,6 +17,58 @@ function defaultStorePath(): string {
 }
 
 export type SessionStoreData = Record<string, SessionState>;
+
+function isMissingErr(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function assertOwnedByCurrentUser(path: string, stat: Stats): void {
+  const getuid = process.getuid;
+  if (typeof getuid === "function" && stat.uid !== getuid.call(process)) {
+    throw new Error(`Refusing to use ${path}: owned by uid ${stat.uid}`);
+  }
+}
+
+function verifyPrivateStoreDir(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Refusing to use session store dir ${path}: it is a symlink`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Refusing to use session store dir ${path}: not a directory`);
+  }
+  assertOwnedByCurrentUser(path, stat);
+  if ((stat.mode & 0o777) !== 0o700) {
+    chmodSync(path, 0o700);
+  }
+}
+
+function ensurePrivateStoreDir(path: string): void {
+  try {
+    verifyPrivateStoreDir(path);
+    return;
+  } catch (err) {
+    if (!isMissingErr(err)) {
+      throw err;
+    }
+  }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  verifyPrivateStoreDir(path);
+}
+
+function removeExistingTempFile(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() && !stat.isSymbolicLink()) {
+      throw new Error(`Refusing to replace session store temp path ${path}: not a file`);
+    }
+    unlinkSync(path);
+  } catch (err) {
+    if (!isMissingErr(err)) {
+      throw err;
+    }
+  }
+}
 
 export class SessionStore {
   private data: SessionStoreData = {};
@@ -34,12 +95,12 @@ export class SessionStore {
   /** Persist store to disk atomically (write .tmp then rename). */
   save(): void {
     const dir = dirname(this.path);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
+    ensurePrivateStoreDir(dir);
     const tmpPath = this.path + ".tmp";
-    writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf8");
+    removeExistingTempFile(tmpPath);
+    writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), { encoding: "utf8", mode: 0o600 });
     renameSync(tmpPath, this.path);
+    chmodSync(this.path, 0o600);
   }
 
   getSession(chatId: string): SessionState | undefined {

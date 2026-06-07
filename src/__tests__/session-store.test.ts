@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionStore } from "../session-store.js";
@@ -57,6 +57,44 @@ describe("SessionStore", () => {
     assert.ok(existsSync(TEST_PATH));
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf8"));
     assert.strictEqual(raw["123"].sessionId, "uuid-1");
+  });
+
+  it("writes session data with private permissions", () => {
+    const store = new SessionStore(TEST_PATH);
+    store.setSession("123", {
+      sessionId: "uuid-1",
+      chatId: "123",
+      agentId: "main",
+      lastActivity: 1000,
+    });
+
+    assert.strictEqual(statSync(TEST_DIR).mode & 0o777, 0o700);
+    assert.strictEqual(statSync(TEST_PATH).mode & 0o777, 0o600);
+  });
+
+  it("refuses to write through a symlinked store directory", () => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+    const target = `${TEST_DIR}-target`;
+    rmSync(target, { recursive: true, force: true });
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, TEST_DIR, "dir");
+
+    try {
+      const store = new SessionStore(TEST_PATH);
+      assert.throws(
+        () => store.setSession("123", {
+          sessionId: "uuid-1",
+          chatId: "123",
+          agentId: "main",
+          lastActivity: 1000,
+        }),
+        /symlink/,
+      );
+      assert.ok(!existsSync(`${target}/sessions.json`));
+    } finally {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      rmSync(target, { recursive: true, force: true });
+    }
   });
 
   it("loads from existing file", () => {

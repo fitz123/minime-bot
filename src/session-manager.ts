@@ -1,5 +1,5 @@
 import { type ChildProcess } from "node:child_process";
-import { createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, rmSync, type Stats, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -11,9 +11,10 @@ import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
 import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia } from "./media-store.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
 
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
-const OUTBOX_BASE = "/tmp/bot-outbox";
+const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
@@ -25,7 +26,71 @@ const OUTBOX_PROMPT_SUFFIX = "Files placed there will be automatically sent to t
 /** Deterministic outbox directory path for a given chat. */
 export function outboxDir(chatId: string): string {
   const safeChatId = chatId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return `${OUTBOX_BASE}/${safeChatId}`;
+  return join(resolveWorkspaceContract().paths.runtimeDir, OUTBOX_DIR_NAME, safeChatId);
+}
+
+function isMissingErr(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function assertOwnedByCurrentUser(path: string, stat: Stats): void {
+  const getuid = process.getuid;
+  if (typeof getuid === "function" && stat.uid !== getuid.call(process)) {
+    throw new Error(`Refusing to use ${path}: owned by uid ${stat.uid}`);
+  }
+}
+
+function verifyPrivateDir(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Refusing to use ${path}: it is a symlink`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Refusing to use ${path}: not a directory`);
+  }
+  assertOwnedByCurrentUser(path, stat);
+  if ((stat.mode & 0o777) !== 0o700) {
+    chmodSync(path, 0o700);
+  }
+}
+
+function ensurePrivateDir(path: string): void {
+  try {
+    verifyPrivateDir(path);
+    return;
+  } catch (err) {
+    if (!isMissingErr(err)) {
+      throw err;
+    }
+  }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  verifyPrivateDir(path);
+}
+
+function removeOutboxDirIfPresent(path: string): void {
+  if (!existsSync(path)) return;
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      unlinkSync(path);
+      return;
+    }
+  } catch (err) {
+    if (isMissingErr(err)) return;
+    throw err;
+  }
+  rmSync(path, { recursive: true, force: true });
+}
+
+function prepareOutboxDir(chatId: string): string {
+  const runtimeDir = resolveWorkspaceContract().paths.runtimeDir;
+  const outboxPath = join(runtimeDir, OUTBOX_DIR_NAME, chatId.replace(/[^a-zA-Z0-9_-]/g, "_"));
+  const outboxBase = join(runtimeDir, OUTBOX_DIR_NAME);
+  ensurePrivateDir(runtimeDir);
+  ensurePrivateDir(outboxBase);
+  removeOutboxDirIfPresent(outboxPath);
+  ensurePrivateDir(outboxPath);
+  return outboxPath;
 }
 
 export function appendOutboxInstruction(text: string, outboxPath: string): string {
@@ -368,9 +433,7 @@ export class SessionManager {
 
     // Clean and recreate outbox directory to prevent stale files from
     // a previous crashed session from leaking into the new session's replies.
-    const outboxPath = outboxDir(chatId);
-    rmSync(outboxPath, { recursive: true, force: true });
-    mkdirSync(outboxPath, { recursive: true });
+    const outboxPath = prepareOutboxDir(chatId);
 
     // Ensure media directory exists (do NOT wipe: a photo may have been
     // downloaded into it moments before this spawn was triggered).
@@ -713,7 +776,7 @@ export class SessionManager {
 
     // Clean up outbox and media directories
     try {
-      rmSync(session.outboxPath, { recursive: true, force: true });
+      removeOutboxDirIfPresent(session.outboxPath);
     } catch {
       // Ignore cleanup errors
     }

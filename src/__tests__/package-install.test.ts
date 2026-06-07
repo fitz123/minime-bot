@@ -2,10 +2,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -127,6 +129,18 @@ function runInstalledSamplerBin(projectDir: string, args: readonly string[], wor
   });
 }
 
+function runInstalledDeliver(
+  projectDir: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): SpawnSyncReturns<string> {
+  return spawnSync("bash", [join(projectDir, "node_modules", "minime-bot", "scripts", "deliver.sh"), ...args], {
+    cwd: projectDir,
+    encoding: "utf8",
+    env: commandEnv(env),
+  });
+}
+
 function assertPackFiles(files: readonly string[]): void {
   for (const expected of [
     "dist/cli.js",
@@ -229,6 +243,43 @@ describe("package artifact install", () => {
       assert.equal(workspaceValidate.status, 0, workspaceValidate.stderr);
       assert.match(workspaceValidate.stdout, /Workspace valid\./);
       assert.match(workspaceValidate.stdout, /Pi extension dir: .*node_modules\/minime-bot\/dist\/extensions\/pi/);
+
+      const fakeBin = join(temp, "fake-bin");
+      const payloadPath = join(temp, "telegram-payload.json");
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(
+        join(fakeBin, "curl"),
+        [
+          "#!/bin/bash",
+          "set -euo pipefail",
+          "payload=''",
+          "while [ \"$#\" -gt 0 ]; do",
+          "  if [ \"$1\" = \"-d\" ]; then",
+          "    shift",
+          "    payload=\"$1\"",
+          "  fi",
+          "  shift || true",
+          "done",
+          "cat >/dev/null",
+          "printf '%s' \"$payload\" > \"$TELEGRAM_PAYLOAD_PATH\"",
+          "printf '{\"ok\":true}'",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      chmodSync(join(fakeBin, "curl"), 0o755);
+      const deliver = runInstalledDeliver(projectDir, ["111", "**bold**"], {
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        CURL_BIN: join(fakeBin, "curl"),
+        TELEGRAM_BOT_TOKEN: "fixture-token",
+        TELEGRAM_PAYLOAD_PATH: payloadPath,
+        LOG_DIR: join(temp, "logs"),
+        ECHO_DIR_BASE: join(temp, "echo"),
+      });
+      assert.equal(deliver.status, 0, deliver.stderr || deliver.stdout || String(deliver.error));
+      const payload = JSON.parse(readFileSync(payloadPath, "utf8")) as { parse_mode?: string; text?: string };
+      assert.equal(payload.parse_mode, "HTML");
+      assert.match(payload.text ?? "", /<b>bold<\/b>/);
 
       const artifactCheck = spawnSync(
         process.execPath,

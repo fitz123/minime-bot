@@ -1,9 +1,10 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
+import { dirname } from "node:path";
 import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
@@ -220,7 +221,7 @@ mock.module("../pi-rpc-protocol.js", {
   },
 });
 
-const { SessionManager } = await import("../session-manager.js");
+const { SessionManager, outboxDir } = await import("../session-manager.js");
 const { SessionStore } = await import("../session-store.js");
 
 // ---------------------------------------------------------------------------
@@ -292,6 +293,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
     assert.strictEqual(session.provider, "pi");
     assert.strictEqual(session.model, "openai-codex/gpt-5.5");
     assert.strictEqual(session.thinking, "xhigh");
+    assert.strictEqual(session.outboxPath, outboxDir("pi-chat"));
+    assert.ok(!session.outboxPath.startsWith("/tmp/bot-outbox"));
+    assert.strictEqual(statSync(dirname(session.outboxPath)).mode & 0o777, 0o700);
+    assert.strictEqual(statSync(session.outboxPath).mode & 0o777, 0o700);
 
     const health = manager.getSessionHealth("pi-chat");
     assert.ok(health);

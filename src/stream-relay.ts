@@ -110,6 +110,11 @@ export function isImageExtension(filePath: string): boolean {
 export async function sendOutboxFiles(outboxPath: string, platform: PlatformContext): Promise<void> {
   let entries: string[];
   try {
+    const outboxStat = lstatSync(outboxPath);
+    if (outboxStat.isSymbolicLink() || !outboxStat.isDirectory()) {
+      log.warn("stream-relay", `Refusing to scan unsafe outbox path: ${outboxPath}`);
+      return;
+    }
     entries = readdirSync(outboxPath);
   } catch {
     return; // Directory doesn't exist or isn't readable
