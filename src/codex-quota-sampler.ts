@@ -42,6 +42,13 @@ const SAMPLER_PROJECT_SETTINGS = { transport: "sse" };
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BOT_DIR = resolve(__dirname, "..");
 
+export function defaultCodexQuotaExtensionPath(botDir: string, moduleDir = __dirname): string {
+  if (basename(moduleDir) === "dist") {
+    return resolve(botDir, "dist", "extensions", "pi", "codex-usage.js");
+  }
+  return resolve(botDir, "extensions", "pi", "codex-usage.ts");
+}
+
 export interface CodexQuotaSamplerCliOptions {
   model?: string;
   textfileDir?: string;
@@ -219,7 +226,7 @@ export function resolveCodexQuotaSamplerConfig(
     stateFile,
     textfileDir,
     samplerCwd,
-    extensionPath: options.extensionPath ?? resolve(botDir, ".claude", "extensions", "codex-usage.ts"),
+    extensionPath: options.extensionPath ?? defaultCodexQuotaExtensionPath(botDir),
     timeoutMs:
       cli.timeoutMs ??
       parseOptionalPositiveInteger(env[CODEX_QUOTA_TIMEOUT_MS_ENV], CODEX_QUOTA_TIMEOUT_MS_ENV) ??

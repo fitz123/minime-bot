@@ -95,7 +95,7 @@ function inferPiExtensionDir(packageRoot: string, moduleUrl: string): WorkspaceP
     };
   }
   return {
-    path: normalize(resolve(packageRoot, ".claude", "extensions")),
+    path: normalize(resolve(packageRoot, "extensions", "pi")),
     source: "package-default",
   };
 }

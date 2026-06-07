@@ -2,7 +2,7 @@
  * A3 — subagent (pure, testable core).
  *
  * Backs the adopted vendor `subagent` Pi extension
- * (`bot/.claude/extensions/subagent/`), which delegates a task to a specialized
+ * (`extensions/pi/subagent/`), which delegates a task to a specialized
  * agent by spawning an ISOLATED `pi` child process and streaming back its result.
  * The vendor example hardcodes non-Codex models; the only behavioral adaptation for
  * this bot is the PROVIDER WIRING — spawned children must run on the same
@@ -478,7 +478,7 @@ export interface NamedAgent {
 /**
  * Merge ordered agent layers by `name`, lowest precedence FIRST.
  *
- * Backs `discoverAgents` in the wrapper (`bot/.claude/extensions/subagent/
+ * Backs `discoverAgents` in the wrapper (`extensions/pi/subagent/
  * agents.ts`), which reads the real dirs (pi-runtime dep) and passes the parsed
  * layers here. Pass layers low→high: `[bundled, user, project]`. Each later
  * layer OVERRIDES an earlier one with the same `name`; novel names are additive.

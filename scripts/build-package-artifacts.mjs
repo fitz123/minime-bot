@@ -6,10 +6,11 @@ import ts from "typescript";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, "..");
-const sourceExtensionDir = join(packageRoot, ".claude", "extensions");
+const sourceExtensionDir = join(packageRoot, "extensions", "pi");
 const artifactExtensionDir = join(packageRoot, "dist", "extensions", "pi");
 
 const wrappers = [
+  ["codex-usage.ts", "codex-usage.js"],
   ["web-tools.ts", "web-tools.js"],
   [join("subagent", "agents.ts"), join("subagent", "agents.js")],
   [join("subagent", "index.ts"), join("subagent", "index.js")],

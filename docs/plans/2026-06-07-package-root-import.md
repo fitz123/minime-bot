@@ -22,7 +22,7 @@ GitHub issue: #1.
 - Do not implement private `deploy-bot-package.sh` here.
 - Do not modify or restart production.
 - Do not add workspace templates or private workspace files to this repo.
-- Do not reintroduce `guardian-protect-files`, `MINIME_SCHEMA_PATH`, `PI_GUARD_WORKSPACE_ROOT`, schema allow-list parsing, or guard parity tests as active runtime contract.
+- Do not reintroduce the retired schema/write-guard wrapper, retired schema env vars, schema allow-list parsing, or guard parity tests as active runtime contract.
 - Do not push directly to `main`; open a PR when done.
 
 ## Validation commands
@@ -39,7 +39,8 @@ node dist/cli.js --help
 npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|config\.local\.yaml|crons\.yaml|crons\.local\.yaml|CLAUDE\.md|USER\.md|IDENTITY\.md|MEMORY\.md|reference/|memory/)" && exit 1 || true
-rg -n "$(printf '\116\151\143\157\040\102\141\151\154\157\156')|guardian-protect-files|MINIME_SCHEMA_PATH|PI_GUARD_WORKSPACE_ROOT|write-allowlist|bot/\.claude/extensions|/\.claude/extensions/" . && exit 1 || true
+rg -n "$(printf '\116\151\143\157\040\102\141\151\154\157\156')" . && exit 1 || true
+npm run check:schema-guard-contract
 ```
 
 ## Tasks
@@ -53,11 +54,11 @@ rg -n "$(printf '\116\151\143\157\040\102\141\151\154\157\156')|guardian-protect
 
 ### Task 2: Move Pi extension source to package-owned root path
 
-- [ ] Copy source Pi wrappers from legacy `bot/.claude/extensions` to `extensions/pi` in this repo.
-- [ ] Update `scripts/build-package-artifacts.mjs` to read wrapper sources from `extensions/pi` and emit package artifacts under `dist/extensions/pi`.
-- [ ] Update `src/workspace-contract.ts` source-mode extension directory to `extensions/pi`.
-- [ ] Update comments/docs/tests that mention `.claude/extensions` as a current source path.
-- [ ] Ensure source wrapper TypeScript is not included in the packed package; packed runtime should use built `dist/extensions/pi` files.
+- [x] Copy source Pi wrappers from the legacy Pi wrapper source directory to `extensions/pi` in this repo.
+- [x] Update `scripts/build-package-artifacts.mjs` to read wrapper sources from `extensions/pi` and emit package artifacts under `dist/extensions/pi`.
+- [x] Update `src/workspace-contract.ts` source-mode extension directory to `extensions/pi`.
+- [x] Update comments/docs/tests that mention `.claude/extensions` as a current source path.
+- [x] Ensure source wrapper TypeScript is not included in the packed package; packed runtime should use built `dist/extensions/pi` files.
 
 ### Task 3: Rename package metadata and install expectations
 

@@ -1,20 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateCronForPlist, type CronPlistDef } from "../cron-plist.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, "../../..");
+const packageRoot = resolve(__dirname, "..", "..");
 
-function readRepoFile(relativePath: string): string {
-  return readFileSync(resolve(repoRoot, relativePath), "utf-8");
+function readPackageFile(relativePath: string): string {
+  return readFileSync(resolve(packageRoot, relativePath), "utf-8");
 }
 
-describe("cron field documentation", () => {
-  const readme = readRepoFile("README.md");
-
+describe("cron field contract", () => {
   const cronFields = [
     "type",
     "engine",
@@ -23,55 +21,30 @@ describe("cron field documentation", () => {
     "enabled",
   ];
 
-  for (const field of cronFields) {
-    it(`README documents cron field: ${field}`, () => {
+  it("types.ts CronJob interface has the supported cron fields", () => {
+    const typesSource = readPackageFile("src/types.ts");
+    const cronJobMatch = typesSource.match(/export interface CronJob \{[\s\S]*?\}/);
+    assert.ok(cronJobMatch, "CronJob interface not found in types.ts");
+
+    for (const field of cronFields) {
       assert.ok(
-        readme.includes(`\`${field}\``),
-        `README.md does not document cron field '${field}'`
+        cronJobMatch[0].includes(field),
+        `CronJob interface does not include '${field}' field`,
       );
-    });
-  }
-
-  it("README has a cron field reference table", () => {
-    assert.ok(
-      readme.includes("Cron field reference"),
-      "README.md missing 'Cron field reference' section"
-    );
+    }
   });
 
-  it("crons.yaml demonstrates deliveryThreadId", () => {
-    const example = readRepoFile("crons.yaml");
-    assert.ok(
-      example.includes("deliveryThreadId"),
-      "crons.yaml does not demonstrate deliveryThreadId"
-    );
-  });
+  it("cron-plist.ts CronPlistDef interface has the supported cron fields", () => {
+    const cronPlistSource = readPackageFile("src/cron-plist.ts");
+    const cronPlistMatch = cronPlistSource.match(/export interface CronPlistDef \{[\s\S]*?\}/);
+    assert.ok(cronPlistMatch, "CronPlistDef interface not found in cron-plist.ts");
 
-  it("crons.yaml demonstrates enabled field", () => {
-    const example = readRepoFile("crons.yaml");
-    assert.ok(
-      example.includes("enabled"),
-      "crons.yaml does not demonstrate enabled field"
-    );
-  });
-
-  it("crons.yaml documents engine and the 15-minute timeout default", () => {
-    const example = readRepoFile("crons.yaml");
-    assert.ok(example.includes("engine"), "crons.yaml does not document engine");
-    assert.ok(example.includes("900000 = 15 min"), "crons.yaml does not document the 15-minute cron timeout default");
-  });
-
-  it("README documents Pi engine behavior and cron health metrics", () => {
-    assert.ok(readme.includes("engine: pi"), "README.md does not document engine: pi");
-    assert.ok(readme.includes("LLM crons only run through Pi"), "README.md does not document Pi-only cron rollback");
-    assert.ok(readme.includes("CRON_HEALTH_TEXTFILE_DIR"), "README.md does not document CRON_HEALTH_TEXTFILE_DIR");
-    assert.ok(readme.includes("minime_cron_last_success_timestamp"), "README.md does not document cron success metric");
-    assert.ok(readme.includes("900000 = 15 min"), "README.md does not document the 15-minute cron timeout default");
-  });
-
-  it("crons.local.yaml.example shows the engine override", () => {
-    const example = readRepoFile("crons.local.yaml.example");
-    assert.ok(example.includes("engine: pi"), "crons.local.yaml.example does not show engine: pi");
+    for (const field of ["type", "engine", "timeout", "enabled"]) {
+      assert.ok(
+        cronPlistMatch[0].includes(field),
+        `CronPlistDef interface does not include '${field}' field`,
+      );
+    }
   });
 
   it("plist generator validates LLM engine values", () => {
@@ -103,20 +76,5 @@ describe("cron field documentation", () => {
       /invalid-pi has invalid engine "bad"/,
     );
     assert.strictEqual(validateCronForPlist(scriptCron), undefined);
-  });
-
-});
-
-describe("CronJob type includes enabled field", () => {
-  it("types.ts CronJob interface has enabled field", () => {
-    const typesSource = readRepoFile("bot/src/types.ts");
-    const cronJobMatch = typesSource.match(
-      /export interface CronJob \{[\s\S]*?\}/
-    );
-    assert.ok(cronJobMatch, "CronJob interface not found in types.ts");
-    assert.ok(
-      cronJobMatch[0].includes("enabled"),
-      "CronJob interface does not include 'enabled' field"
-    );
   });
 });

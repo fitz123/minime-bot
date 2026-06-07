@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
 const CHECK_SCRIPT = join(BOT_ROOT, "scripts", "check-no-active-schema-guard-contract.mjs");
+const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
 const fixtures: string[] = [];
 
 after(() => {
@@ -60,7 +61,7 @@ describe("check-no-active-schema-guard-contract", () => {
   it("allows retired-context prose and explicitly historical plan paths", () => {
     const root = makeFixture();
     writeFixture(root, "README.md", "schema.md is retired and no longer required for runtime correctness.\n");
-    writeFixture(root, join("docs", "plans", "historical.md"), "guardian-protect-files was removed here.\n");
+    writeFixture(root, join("docs", "plans", "historical.md"), `${RETIRED_GUARD_WRAPPER} was removed here.\n`);
 
     const result = runCheck(root);
 

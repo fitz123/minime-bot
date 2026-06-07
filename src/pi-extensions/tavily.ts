@@ -3,7 +3,7 @@
  *
  * Backs the two model-callable Pi tools `web_search` and `web_fetch` with the
  * Tavily API (`api.tavily.com`). The thin Pi wrapper at
- * `bot/.claude/extensions/web-tools.ts` reads the API key from the workspace
+ * `extensions/pi/web-tools.ts` reads the API key from the workspace
  * SOPS file once at load, then
  * `pi.registerTool`s both tools, delegating each `execute` to
  * {@link executeWebSearch} / {@link executeWebFetch} here.

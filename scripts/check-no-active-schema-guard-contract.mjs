@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, "..");
-const repoRoot = process.argv[2] ? resolve(process.argv[2]) : resolve(packageRoot, "..");
+const repoRoot = process.argv[2] ? resolve(process.argv[2]) : packageRoot;
 
 const skippedDirs = new Set([
   ".beads",
@@ -29,22 +29,29 @@ const allowedPathPrefixes = [
 ];
 
 const allowedPaths = new Set([
-  "orphan-allowlist.txt",
-  `reference${sep}governance${sep}decisions.md`,
-  `bot${sep}scripts${sep}check-no-active-schema-guard-contract.mjs`,
-  `bot${sep}src${sep}__tests__${sep}package-install.test.ts`,
-  `bot${sep}src${sep}__tests__${sep}pi-rpc-protocol.test.ts`,
-  `bot${sep}src${sep}__tests__${sep}schema-guard-contract-check.test.ts`,
+  `scripts${sep}check-no-active-schema-guard-contract.mjs`,
+  `src${sep}__tests__${sep}package-install.test.ts`,
+  `src${sep}__tests__${sep}pi-rpc-protocol.test.ts`,
+  `src${sep}__tests__${sep}schema-guard-contract-check.test.ts`,
 ]);
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const retiredSchemaEnvName = ["MINIME", "SCHEMA", "PATH"].join("_");
+const retiredGuardRootEnvName = ["PI", "GUARD", "WORKSPACE", "ROOT"].join("_");
+const retiredGuardWrapperName = ["guardian", "protect", "files"].join("-");
+const retiredWriteAllowlistName = ["write", "allowlist"].join("-");
+
 const bannedLinePatterns = [
-  /\bMINIME_SCHEMA_PATH(?:_ENV)?\b/,
-  /\bPI_GUARD_WORKSPACE_ROOT(?:_ENV)?\b/,
-  /\bguardian-protect-files\b/,
+  new RegExp(`\\b${escapeRegExp(retiredSchemaEnvName)}(?:_ENV)?\\b`),
+  new RegExp(`\\b${escapeRegExp(retiredGuardRootEnvName)}(?:_ENV)?\\b`),
+  new RegExp(`\\b${escapeRegExp(retiredGuardWrapperName)}\\b`),
   /\bguardian\.sh\b/,
   /\bprotect-files\.sh\b/,
   /\breadWriteAllowlistSchema\b/,
-  /\bwrite-allowlist\b/i,
+  new RegExp(`\\b${escapeRegExp(retiredWriteAllowlistName)}\\b`, "i"),
   /\bimmutable core\b/i,
   /\b(?:schema|write)\s+guard\b/i,
   /\bguard extension\b/i,

@@ -5,7 +5,7 @@ Pure, testable helpers for Pi extension wrappers.
 Most helpers here back the live Pi RPC extensions (web-tools and subagent)
 loaded into every `pi --mode rpc` spawn. `codex-usage.ts` is different:
 it is used only by the out-of-band Codex quota sampler via
-`bot/.claude/extensions/codex-usage.ts`, and must not be added to the normal
+`extensions/pi/codex-usage.ts`, and must not be added to the normal
 `PI_EXTENSION_WRAPPER_RELPATHS` list. See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
 
@@ -27,13 +27,13 @@ There are TWO kinds of files in this feature, deliberately split:
    the real helpers (`tavily.ts`, `subagent-args.ts`) made the coverage
    self-evident.
 
-2. **Thin wrappers — `bot/.claude/extensions/<name>.ts`** (or `<name>/index.ts`
+2. **Thin wrappers — `extensions/pi/<name>.ts`** (or `<name>/index.ts`
    for A3). Each is a minimal `export default function (pi) { ... }` that wires a
    Pi `pi.on(...)` / `pi.registerTool(...)` call to the pure helpers above. They
    are jiti-loaded by Pi at spawn via `--extension <abs-path>` in source
    development.
 
-3. **Package artifacts — `bot/dist/extensions/pi/`**. `npm run build` runs
+3. **Package artifacts — `dist/extensions/pi/`**. `npm run build` runs
    `scripts/build-package-artifacts.mjs`, which clears this generated directory,
    transpiles the first-party wrappers to `.js` with imports rewritten to compiled
    `dist/` helpers, and copies A3 bundled `agents/*.md` and `prompts/*.md`
@@ -42,7 +42,7 @@ There are TWO kinds of files in this feature, deliberately split:
 
 ## Lint-coverage decision for the wrappers (Task 0)
 
-**Decision: the source `bot/.claude/extensions/` wrappers are intentionally
+**Decision: the source `extensions/pi/` wrappers are intentionally
 EXCLUDED from `tsc --noEmit` and from the `npm test` glob. No second tsconfig or
 test glob is added for them; package builds transpile them into generated runtime
 artifacts.**

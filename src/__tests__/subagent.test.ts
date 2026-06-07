@@ -30,7 +30,7 @@ import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..", "..");
-const BUNDLED_AGENT_DIR = resolve(BOT_DIR, ".claude", "extensions", "subagent", "agents");
+const BUNDLED_AGENT_DIR = resolve(BOT_DIR, "extensions", "pi", "subagent", "agents");
 
 function readBundledAgentTools(name: string): string[] | undefined {
   const content = readFileSync(resolve(BUNDLED_AGENT_DIR, `${name}.md`), "utf8");
@@ -145,7 +145,7 @@ describe("subagent: bundled agent tool allowlists", () => {
 
 describe("subagent: wrapper spawn environment", () => {
   it("uses the scrubbed subagent-child env helper instead of copying process.env", () => {
-    const wrapper = readFileSync(resolve(BOT_DIR, ".claude", "extensions", "subagent", "index.ts"), "utf8");
+    const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
 
     assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(\)/);
     assert.doesNotMatch(wrapper, /env:\s*\{\s*\.{3}process\.env/);
@@ -572,7 +572,7 @@ describe("subagent: runSubagentChild (mock spawn)", () => {
 
 // ---- agent discovery precedence ---------------------------------------------
 //
-// `discoverAgents` (bot/.claude/extensions/subagent/agents.ts) reads the real
+// `discoverAgents` (extensions/pi/subagent/agents.ts) reads the real
 // dirs via the pi runtime (a jiti-only dep that does NOT resolve under the node
 // test runner), so the load-bearing precedence logic is extracted here as a pure
 // helper and tested directly. The full runtime path (bundled-dir resolution from

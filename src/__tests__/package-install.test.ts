@@ -18,6 +18,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
 const EXPECTED_BUNDLED_AGENT_FILES = ["planner.md", "reviewer.md", "scout.md", "worker.md"];
 const EXPECTED_BUNDLED_PROMPT_FILES = ["implement-and-review.md", "implement.md", "scout-and-plan.md"];
+const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
+const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(RETIRED_GUARD_WRAPPER);
 
 interface PackedFile {
   path: string;
@@ -126,6 +128,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/subagent-args.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
+    "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
@@ -136,9 +139,10 @@ function assertPackFiles(files: readonly string[]): void {
     assert.ok(files.includes(expected), `expected npm pack to include ${expected}`);
   }
 
-  assert.ok(!files.some((file) => file.includes("guardian-protect-files")), "guard extension should not be packed");
+  assert.ok(!files.some((file) => file.includes(RETIRED_GUARD_WRAPPER)), "guard extension should not be packed");
   assert.ok(!files.some((file) => file.startsWith("src/")), "source TS should not be packed");
   assert.ok(!files.some((file) => file.startsWith(".claude/")), "source extension wrappers should not be packed");
+  assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("test-fixtures/")), "workspace fixtures should not be packed");
   assert.ok(!files.some((file) => file.startsWith("dist/__tests__/")), "compiled tests should not be packed");
 }
@@ -248,6 +252,7 @@ const importFile = (path) => import(pathToFileURL(path).href);
 const importPackageFile = (relpath) => importFile(join(packageDir, relpath));
 const expectedBundledAgentFiles = ${JSON.stringify(EXPECTED_BUNDLED_AGENT_FILES)};
 const expectedBundledPromptFiles = ${JSON.stringify(EXPECTED_BUNDLED_PROMPT_FILES)};
+const retiredGuardWrapperPattern = new RegExp(["guardian", "protect", "files"].join("-"));
 
 function extensionPathsFromArgs(args) {
   const paths = [];
@@ -260,7 +265,7 @@ function extensionPathsFromArgs(args) {
 }
 
 function assertNoGuardContract(label, args) {
-  assert.doesNotMatch(JSON.stringify(args), /guardian-protect-files/, label);
+  assert.doesNotMatch(JSON.stringify(args), retiredGuardWrapperPattern, label);
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");

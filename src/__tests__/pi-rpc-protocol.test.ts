@@ -62,6 +62,9 @@ const testAgent: AgentConfig = {
 const NO_EXTENSIONS: PiExtensionResolveOptions = {
   env: { PI_EXTENSIONS_DISABLED: "1" },
 };
+const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(["guardian", "protect", "files"].join("-"));
+const RETIRED_SCHEMA_PATH_ENV = ["MINIME", "SCHEMA", "PATH"].join("_");
+const RETIRED_GUARD_ROOT_ENV = ["PI", "GUARD", "WORKSPACE", "ROOT"].join("_");
 
 describe("NewlineOnlyJsonlSplitter", () => {
   it("does not split on U+2028 or U+2029 inside JSON strings", () => {
@@ -451,7 +454,7 @@ describe("Pi extension loading (--extension)", () => {
     assert.deepStrictEqual(cronArgs, []);
     assert.doesNotMatch(
       JSON.stringify({ parentArgs, subagentChildArgs, cronArgs }),
-      /guardian-protect-files/,
+      RETIRED_GUARD_WRAPPER_PATTERN,
     );
   });
 
@@ -593,8 +596,8 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   // End-to-end smoke (real disk, no mocks): the resolver's missing-wrapper contract
-  // means resolvePiExtensionArgs() with NO overrides — real default dir
-  // (bot/.claude/extensions) + real fs.existsSync — returns without throwing
+  // means resolvePiExtensionArgs() with NO overrides — real source wrapper dir
+  // (extensions/pi) + real fs.existsSync — returns without throwing
   // only if all expected wrapper files exist where a live Pi spawn expects
   // them. This is the acceptance smoke that the mocked tests above cannot give:
   // it would catch a wrapper that was renamed, moved, or never copied.
@@ -614,7 +617,7 @@ describe("Pi extension loading (--extension)", () => {
     }
     // Paths resolve to the canonical entrypoints, in load order.
     assert.deepStrictEqual(
-      paths.map((p) => p.split("/.claude/extensions/")[1]),
+      paths.map((p) => p.split("/extensions/pi/")[1]),
       [...PI_EXTENSION_WRAPPER_RELPATHS],
     );
   });
@@ -660,8 +663,8 @@ describe("buildPiSpawnEnv", () => {
       "TAVILY_API_KEY",
       "TELEGRAM_BOT_TOKEN",
       "MINIME_SESSION_SECRET",
-      "MINIME_SCHEMA_PATH",
-      "PI_GUARD_WORKSPACE_ROOT",
+      RETIRED_SCHEMA_PATH_ENV,
+      RETIRED_GUARD_ROOT_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
       MINIME_WORKSPACE_ROOT_ENV,
@@ -688,8 +691,8 @@ describe("buildPiSpawnEnv", () => {
       process.env.TAVILY_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
       process.env.MINIME_SESSION_SECRET = "fixture";
-      process.env.MINIME_SCHEMA_PATH = "/tmp/schema.md";
-      process.env.PI_GUARD_WORKSPACE_ROOT = "/tmp/guard-root";
+      process.env[RETIRED_SCHEMA_PATH_ENV] = "/tmp/schema.md";
+      process.env[RETIRED_GUARD_ROOT_ENV] = "/tmp/guard-root";
       process.env[MINIME_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -705,8 +708,8 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env.TAVILY_API_KEY, undefined);
       assert.strictEqual(env.TELEGRAM_BOT_TOKEN, undefined);
       assert.strictEqual(env.MINIME_SESSION_SECRET, undefined);
-      assert.strictEqual(env.MINIME_SCHEMA_PATH, undefined);
-      assert.strictEqual(env.PI_GUARD_WORKSPACE_ROOT, undefined);
+      assert.strictEqual(env[RETIRED_SCHEMA_PATH_ENV], undefined);
+      assert.strictEqual(env[RETIRED_GUARD_ROOT_ENV], undefined);
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);

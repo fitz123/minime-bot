@@ -15,7 +15,6 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
-const REPO_ROOT = resolve(BOT_ROOT, "..");
 
 function assertAbsolutePaths(paths: WorkspaceContractPaths): void {
   for (const [name, path] of Object.entries(paths)) {
@@ -25,9 +24,10 @@ function assertAbsolutePaths(paths: WorkspaceContractPaths): void {
 }
 
 describe("workspace contract resolver", () => {
-  it("preserves the current source checkout path layout by default", () => {
+  it("uses package-root source checkout paths by default", () => {
+    const cwd = "/tmp/ignored-cwd";
     const contract = resolveWorkspaceContract({
-      cwd: "/tmp/ignored-cwd",
+      cwd,
       env: {},
       homeDir: "/tmp/minime-home",
       pid: 12345,
@@ -36,19 +36,19 @@ describe("workspace contract resolver", () => {
     assertAbsolutePaths(contract.paths);
     assert.strictEqual(contract.paths.packageRoot, BOT_ROOT);
     assert.strictEqual(contract.paths.botRoot, BOT_ROOT);
-    assert.strictEqual(contract.paths.controlWorkspaceRoot, REPO_ROOT);
-    assert.strictEqual(contract.paths.workspaceRoot, REPO_ROOT);
-    assert.strictEqual(contract.paths.configPath, resolve(REPO_ROOT, "config.yaml"));
-    assert.strictEqual(contract.paths.cronsPath, resolve(REPO_ROOT, "crons.yaml"));
-    assert.strictEqual(contract.paths.piExtensionDir, resolve(BOT_ROOT, ".claude", "extensions"));
-    assert.strictEqual(contract.paths.dataDir, resolve(REPO_ROOT, "data"));
-    assert.strictEqual(contract.paths.sessionStorePath, resolve(BOT_ROOT, "data", "sessions.json"));
-    assert.strictEqual(contract.effectivePaths.sessionStorePath.source, "current-repo-fallback");
+    assert.strictEqual(contract.paths.controlWorkspaceRoot, cwd);
+    assert.strictEqual(contract.paths.workspaceRoot, cwd);
+    assert.strictEqual(contract.paths.configPath, resolve(cwd, "config.yaml"));
+    assert.strictEqual(contract.paths.cronsPath, resolve(cwd, "crons.yaml"));
+    assert.strictEqual(contract.paths.piExtensionDir, resolve(BOT_ROOT, "extensions", "pi"));
+    assert.strictEqual(contract.paths.dataDir, resolve(cwd, "data"));
+    assert.strictEqual(contract.paths.sessionStorePath, resolve(cwd, "data", "sessions.json"));
+    assert.strictEqual(contract.effectivePaths.sessionStorePath.source, "workspace-default");
     assert.strictEqual(contract.paths.logDir, "/tmp/minime-home/.minime/logs");
     assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/bot-media");
-    assert.strictEqual(contract.paths.runtimeDir, resolve(REPO_ROOT, ".tmp"));
-    assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "current-repo-fallback");
-    assert.deepStrictEqual(contract.warnings, []);
+    assert.strictEqual(contract.paths.runtimeDir, resolve(cwd, ".tmp"));
+    assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "cwd-fallback");
+    assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_WORKSPACE_ROOT/);
   });
 
   it("uses package artifact Pi wrappers for a built source checkout", () => {

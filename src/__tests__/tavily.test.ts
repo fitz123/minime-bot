@@ -36,7 +36,7 @@ import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 const KEY = "tvly-test-key";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..", "..");
-const WEB_TOOLS_WRAPPER_PATH = resolve(BOT_DIR, ".claude", "extensions", "web-tools.ts");
+const WEB_TOOLS_WRAPPER_PATH = resolve(BOT_DIR, "extensions", "pi", "web-tools.ts");
 
 interface FetchCall {
   url: string;
@@ -745,7 +745,7 @@ describe("tavily: warn + tool descriptors", () => {
         },
       },
     });
-    const moduleUrl = pathToFileURL(resolve(BOT_DIR, ".claude", "extensions", "web-tools.ts")).href;
+    const moduleUrl = pathToFileURL(resolve(BOT_DIR, "extensions", "pi", "web-tools.ts")).href;
     const mod = await import(moduleUrl) as {
       default: (pi: { registerTool: (tool: RegisteredTool) => void }) => void;
     };

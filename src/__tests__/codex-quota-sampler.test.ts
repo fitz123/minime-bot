@@ -12,12 +12,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import {
   CODEX_QUOTA_PROBE_TEXTFILE_NAME,
   buildCodexQuotaSamplerArgs,
   buildSamplerChildEnv,
+  defaultCodexQuotaExtensionPath,
   ensureSamplerProjectSettings,
   formatCodexQuotaSamplerHelp,
   parseCodexQuotaSamplerArgs,
@@ -127,6 +128,27 @@ describe("codex quota sampler command setup", () => {
       "-p",
       "OK?",
     ]);
+  });
+
+  it("uses source wrapper TypeScript in source mode and built wrapper JavaScript in dist mode", () => {
+    const botDir = "/opt/minime-bot";
+
+    assert.equal(
+      defaultCodexQuotaExtensionPath(botDir, resolve(botDir, "src")),
+      "/opt/minime-bot/extensions/pi/codex-usage.ts",
+    );
+    assert.equal(
+      defaultCodexQuotaExtensionPath(botDir, resolve(botDir, "dist")),
+      "/opt/minime-bot/dist/extensions/pi/codex-usage.js",
+    );
+
+    const config = resolveCodexQuotaSamplerConfig({
+      cwd: tempDir(),
+      botDir,
+      env: { CODEX_QUOTA_TEXTFILE_DIR: "metrics" },
+      forbiddenSamplerCwds: [],
+    });
+    assert.equal(config.extensionPath, "/opt/minime-bot/extensions/pi/codex-usage.ts");
   });
 
   it("uses a private per-user sampler cwd by default", () => {
