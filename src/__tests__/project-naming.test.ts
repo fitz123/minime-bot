@@ -13,6 +13,8 @@ function readPackageFile(relativePath: string): string {
 
 describe("project naming", () => {
   const readme = readPackageFile("README.md");
+  const changelog = readPackageFile("CHANGELOG.md");
+  const agentsDoc = readPackageFile("AGENTS.md");
   const packageJson = JSON.parse(readPackageFile("package.json")) as {
     name: string;
     description: string;
@@ -55,6 +57,76 @@ describe("project naming", () => {
       readme.startsWith("# minime-bot"),
       "README.md title should be '# minime-bot'",
     );
+  });
+
+  it("README documents the package CLI and external control workspace", () => {
+    for (const expected of [
+      "minime-bot --help",
+      "minime-bot config validate --workspace /path/to/workspace",
+      "minime-bot workspace validate --workspace /path/to/workspace",
+      "MINIME_WORKSPACE_ROOT",
+      "control workspace",
+      "test-fixtures/minimal-workspace",
+    ]) {
+      assert.ok(readme.includes(expected), `README.md should document ${expected}`);
+    }
+  });
+
+  it("README documents validation commands", () => {
+    for (const command of [
+      "npm ci",
+      "npm test",
+      "npm run build",
+      "npm pack --dry-run",
+      "npm run check:schema-guard-contract",
+      "node dist/cli.js --help",
+      "npm run workspace:validate -- --workspace test-fixtures/minimal-workspace",
+    ]) {
+      assert.ok(readme.includes(command), `README.md should include ${command}`);
+    }
+  });
+
+  it("README states that private workspace files are not bundled", () => {
+    assert.ok(readme.includes("It does not bundle a private control workspace"));
+    for (const privateRootPath of [
+      "root `config.yaml`",
+      "`crons.yaml`",
+      "`CLAUDE.md`",
+      "`.claude`",
+      "`USER.md`",
+      "`IDENTITY.md`",
+      "`MEMORY.md`",
+      "`reference/`",
+      "`memory/`",
+    ]) {
+      assert.ok(
+        readme.includes(privateRootPath),
+        `README.md should identify ${privateRootPath} as out of scope`,
+      );
+    }
+  });
+
+  it("CHANGELOG describes the current Pi/Codex package architecture", () => {
+    assert.ok(changelog.includes("Pi/Codex"));
+    assert.ok(changelog.includes("external control workspace"));
+    assert.doesNotMatch(changelog, /Claude[- ]CLI[- ]only/i);
+  });
+
+  it("AGENTS.md records public repository rules and validation", () => {
+    for (const expected of [
+      "Do not commit secrets",
+      "PII",
+      "Do not add private workspace artifacts to the package root",
+      "This repository owns package runtime code",
+      "extensions/pi",
+      "do not push directly to `main`",
+      "npm test",
+      "npm run build",
+      "npm pack --dry-run",
+      "npm run check:schema-guard-contract",
+    ]) {
+      assert.ok(agentsDoc.includes(expected), `AGENTS.md should include ${expected}`);
+    }
   });
 
   it("package.json name is the current package name", () => {

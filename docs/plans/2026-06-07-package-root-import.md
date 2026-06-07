@@ -70,10 +70,10 @@ npm run check:schema-guard-contract
 
 ### Task 4: Rewrite public docs and repo instructions
 
-- [ ] Replace README with concise current package docs: purpose, package CLI, external control workspace via `--workspace` or `MINIME_WORKSPACE_ROOT`, validation commands, and no bundled private workspace.
-- [ ] Add/update CHANGELOG so tests pass and current architecture is not described as Claude-CLI-only.
-- [ ] Add AGENTS.md with public repo rules: no PII/secrets, PR-only after bootstrap, validation commands, package repo owns runtime code and Pi extensions only.
-- [ ] Do not add root `CLAUDE.md` or root `.claude`.
+- [x] Replace README with concise current package docs: purpose, package CLI, external control workspace via `--workspace` or `MINIME_WORKSPACE_ROOT`, validation commands, and no bundled private workspace.
+- [x] Add/update CHANGELOG so tests pass and current architecture is not described as Claude-CLI-only.
+- [x] Add AGENTS.md with public repo rules: no PII/secrets, PR-only after bootstrap, validation commands, package repo owns runtime code and Pi extensions only.
+- [x] Do not add root `CLAUDE.md` or root `.claude`.
 
 ### Task 5: Add minimal CI guardrails
 
