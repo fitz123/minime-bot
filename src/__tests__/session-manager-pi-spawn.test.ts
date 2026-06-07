@@ -419,6 +419,41 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
     await manager.closeAll();
   });
+
+  it("rotates a live active session when the requested agent changes", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    nextPiSessionId = "main-live-id";
+    const oldSession = await manager.getOrCreateSession("agent-switch", "main");
+
+    const inflightPath = allocateMediaPath("agent-switch", "photo", ".jpg");
+    writeFileSync(inflightPath, "current turn media");
+    const stalePath = `${sessionMediaDir("agent-switch")}/prior-agent.jpg`;
+    writeFileSync(stalePath, "stale prior agent media");
+
+    nextPiSessionId = "pi-live-id";
+    const newSession = await manager.getOrCreateSession("agent-switch", "pi");
+
+    assert.notStrictEqual(newSession, oldSession, "agent switch must not reuse the old active session");
+    assert.strictEqual(oldSession.child.killed, true, "old agent child should be terminated");
+    assert.strictEqual(newSession.agentId, "pi");
+    assert.strictEqual(newSession.sessionId, "pi-live-id");
+    assert.strictEqual(piSpawnCaptures.length, 2, "old agent spawn + new agent spawn");
+    assert.strictEqual(piSpawnCaptures[1].agent.id, "pi");
+    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "new agent starts fresh");
+
+    const store = new SessionStore(TEST_STORE_PATH);
+    assert.deepEqual(store.getSession("agent-switch"), {
+      sessionId: "pi-live-id",
+      chatId: "agent-switch",
+      agentId: "pi",
+      lastActivity: newSession.lastActivity,
+    });
+    assert.ok(existsSync(inflightPath), "current-turn in-flight media survives active agent rotation");
+    assert.strictEqual(existsSync(stalePath), false, "prior-agent media is purged on active agent rotation");
+
+    releaseMediaPath(inflightPath);
+    await manager.closeAll();
+  });
 });
 
 describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {

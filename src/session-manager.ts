@@ -309,11 +309,19 @@ export class SessionManager {
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
     // Check if session is active in memory
-    const existing = this.active.get(chatId);
+    let existing = this.active.get(chatId);
     if (existing && !hasExited(existing.child) && !existing.child.killed) {
-      existing.lastActivity = Date.now();
-      this.resetIdleTimer(chatId);
-      return existing;
+      if (existing.agentId === agentId) {
+        existing.lastActivity = Date.now();
+        this.resetIdleTimer(chatId);
+        return existing;
+      }
+      log.warn(
+        "session-manager",
+        `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
+      );
+      await this.closeSession(chatId, { mediaCleanup: "stale" });
+      existing = undefined;
     }
 
     // If we had an active entry but child is dead/dying, clean it up
@@ -675,7 +683,13 @@ export class SessionManager {
   }
 
   /** Close a session: persist state, SIGTERM child, clean up. */
-  async closeSession(chatId: string, { persist = true }: { persist?: boolean } = {}): Promise<void> {
+  async closeSession(
+    chatId: string,
+    {
+      persist = true,
+      mediaCleanup = "all",
+    }: { persist?: boolean; mediaCleanup?: "all" | "stale" } = {},
+  ): Promise<void> {
     // Always clear crash count so /reconnect unblocks circuit-broken chats
     this.restartCounts.delete(chatId);
 
@@ -704,7 +718,11 @@ export class SessionManager {
       // Ignore cleanup errors
     }
     try {
-      cleanupSessionMediaDir(chatId);
+      if (mediaCleanup === "stale") {
+        cleanupStaleSessionMedia(chatId);
+      } else {
+        cleanupSessionMediaDir(chatId);
+      }
     } catch {
       // Ignore cleanup errors
     }

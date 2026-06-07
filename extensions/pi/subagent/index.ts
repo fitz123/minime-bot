@@ -46,9 +46,12 @@ import {
 } from "../../../src/pi-rpc-protocol.js";
 
 const MAX_PARALLEL_TASKS = 8;
+const MAX_CHAIN_STEPS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const MAX_DELEGATED_TASK_CHARS = 64 * 1024;
+const MAX_CHAIN_PREVIOUS_OUTPUT_CHARS = 32 * 1024;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -181,6 +184,11 @@ function truncateParallelOutput(output: string): string {
 		truncated = truncated.slice(0, -1);
 	}
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+}
+
+function truncateChainPreviousOutput(output: string): string {
+	if (output.length <= MAX_CHAIN_PREVIOUS_OUTPUT_CHARS) return output;
+	return `${output.slice(0, MAX_CHAIN_PREVIOUS_OUTPUT_CHARS)}\n\n[Previous output truncated at ${MAX_CHAIN_PREVIOUS_OUTPUT_CHARS} characters]`;
 }
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
@@ -359,12 +367,15 @@ async function runSingleAgent(
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
+	task: Type.String({ description: "Task to delegate to the agent", maxLength: MAX_DELEGATED_TASK_CHARS }),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	task: Type.String({
+		description: "Task with optional {previous} placeholder for prior output",
+		maxLength: MAX_DELEGATED_TASK_CHARS,
+	}),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -375,8 +386,14 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	tasks: Type.Optional(Type.Array(TaskItem, {
+		description: "Array of {agent, task} for parallel execution",
+		maxItems: MAX_PARALLEL_TASKS,
+	})),
+	chain: Type.Optional(Type.Array(ChainItem, {
+		description: "Array of {agent, task} for sequential execution",
+		maxItems: MAX_CHAIN_STEPS,
+	})),
 	agentScope: Type.Optional(AgentScopeSchema),
 });
 
@@ -472,59 +489,84 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
+				if (params.chain && params.chain.length > 0) {
+					if (params.chain.length > MAX_CHAIN_STEPS) {
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
+							content: [
+								{
+									type: "text",
+									text: `Too many chain steps (${params.chain.length}). Max is ${MAX_CHAIN_STEPS}.`,
+								},
+							],
+							details: makeDetails("chain")([]),
 							isError: true,
 						};
 					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
 
-			if (params.tasks && params.tasks.length > 0) {
+					const results: SingleResult[] = [];
+					let previousOutput = "";
+
+					for (let i = 0; i < params.chain.length; i++) {
+						const step = params.chain[i];
+						const taskWithContext = step.task.replace(/\{previous\}/g, truncateChainPreviousOutput(previousOutput));
+						if (taskWithContext.length > MAX_DELEGATED_TASK_CHARS) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Chain step ${i + 1} task is too large (${taskWithContext.length} characters). Max is ${MAX_DELEGATED_TASK_CHARS}.`,
+									},
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback | undefined = onUpdate
+							? (partial) => {
+									// Combine completed results with current streaming result
+									const currentResult = partial.details?.results[0];
+									if (currentResult) {
+										const allResults = [...results, currentResult];
+										onUpdate({
+											content: partial.content,
+											details: makeDetails("chain")(allResults),
+										});
+									}
+								}
+							: undefined;
+
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							step.agent,
+							taskWithContext,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
+						);
+						results.push(result);
+
+						const isError = isFailedResult(result);
+						if (isError) {
+							const errorMsg = getResultOutput(result);
+							return {
+								content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						previousOutput = getFinalOutput(result.messages);
+					}
+					return {
+						content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+						details: makeDetails("chain")(results),
+					};
+				}
+
+				if (params.tasks && params.tasks.length > 0) {
 				if (params.tasks.length > MAX_PARALLEL_TASKS)
 					return {
 						content: [

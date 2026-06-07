@@ -47,7 +47,9 @@ async function main(): Promise<void> {
   const shutdownTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS ?? "", 10) || 60_000;
 
   let shuttingDown = false;
-  const shutdown = async (signal: string) => {
+  let requestedExitCode = 0;
+  const shutdown = async (signal: string, exitCode = 0) => {
+    requestedExitCode = Math.max(requestedExitCode, exitCode);
     if (shuttingDown) return;
     shuttingDown = true;
     log.info("main", `Received ${signal}, shutting down...`);
@@ -73,20 +75,26 @@ async function main(): Promise<void> {
     await stopMetricsServer();
     await sessionManager.closeAll();
     log.info("main", "All sessions closed. Exiting.");
-    process.exit(0);
+    process.exit(requestedExitCode);
   };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  const requestShutdown = (signal: string, exitCode = 0) => {
+    void shutdown(signal, exitCode).catch((err) => {
+      log.error("main", `Shutdown after ${signal} failed:`, err);
+      process.exit(1);
+    });
+  };
+  process.on("SIGTERM", () => requestShutdown("SIGTERM"));
+  process.on("SIGINT", () => requestShutdown("SIGINT"));
 
-  // Safety net: catch uncaught exceptions and unhandled rejections.
-  // These should never fire if errors are properly caught, but they
-  // prevent total process failure if something is missed (e.g. a
-  // Discord WebSocket error that somehow bypasses the client handler).
+  // Safety net: log fatal process errors, run best-effort shutdown, then let
+  // the supervisor restart us. Continuing after these can leave corrupted state.
   process.on("uncaughtException", (error) => {
-    log.error("main", "FATAL uncaught exception (process NOT exiting):", error);
+    log.error("main", "FATAL uncaught exception:", error);
+    requestShutdown("uncaughtException", 1);
   });
   process.on("unhandledRejection", (reason) => {
-    log.error("main", "FATAL unhandled rejection (process NOT exiting):", reason);
+    log.error("main", "FATAL unhandled rejection:", reason);
+    requestShutdown("unhandledRejection", 1);
   });
 
   // Start Telegram bot if configured

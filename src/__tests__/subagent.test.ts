@@ -251,6 +251,16 @@ describe("subagent: wrapper spawn environment", () => {
     assert.doesNotMatch(wrapper, /\bt\.cwd\b/);
     assert.match(wrapper, /cwd:\s*defaultCwd/);
   });
+
+  it("caps chain length and substituted previous-output prompt size", () => {
+    const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
+
+    assert.match(wrapper, /const MAX_CHAIN_STEPS = 8;/);
+    assert.match(wrapper, /params\.chain\.length > MAX_CHAIN_STEPS/);
+    assert.match(wrapper, /const MAX_CHAIN_PREVIOUS_OUTPUT_CHARS = 32 \* 1024;/);
+    assert.match(wrapper, /truncateChainPreviousOutput\(previousOutput\)/);
+    assert.match(wrapper, /taskWithContext\.length > MAX_DELEGATED_TASK_CHARS/);
+  });
 });
 
 describe("subagent: parseSubagentEventLine", () => {
