@@ -1,9 +1,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, existsSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { SessionStore } from "../session-store.js";
+import { resolveWorkspaceContract } from "../workspace-contract.js";
 
 const TEST_DIR = "/tmp/minime-test-store";
 const TEST_PATH = `${TEST_DIR}/sessions.json`;
@@ -195,8 +194,7 @@ describe("SessionStore", () => {
 
   it("default path resolves through the workspace contract", () => {
     const store = new SessionStore();
-    const botRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    const expectedPath = resolve(botRoot, "data", "sessions.json");
+    const expectedPath = resolveWorkspaceContract().paths.sessionStorePath;
     assert.strictEqual((store as any).path, expectedPath);
     assert.ok(expectedPath.endsWith("/data/sessions.json"), "Default path must end with data/sessions.json");
   });

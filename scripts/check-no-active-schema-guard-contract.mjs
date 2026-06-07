@@ -11,6 +11,7 @@ const skippedDirs = new Set([
   ".beads",
   ".git",
   ".ralphex",
+  ".tmp",
   "dist",
   "memory",
   "node_modules",
@@ -53,8 +54,6 @@ const bannedLinePatterns = [
   /\breadWriteAllowlistSchema\b/,
   new RegExp(`\\b${escapeRegExp(retiredWriteAllowlistName)}\\b`, "i"),
   /\bimmutable core\b/i,
-  /\b(?:schema|write)\s+guard\b/i,
-  /\bguard extension\b/i,
 ];
 
 const staleSchemaRequirementPatterns = [
@@ -62,7 +61,15 @@ const staleSchemaRequirementPatterns = [
   /\b(required|requires|must exist)\b.*\bschema\.md\b/i,
 ];
 
+const broadRetiredGuardPatterns = [
+  /\b(?:schema|write)\s+guard\b/i,
+  /\bguard extension\b/i,
+];
+
 const retiredContextPattern = /\b(retired|not required|no longer requires|does not require|without any schema\.md|without schema\.md|must not|should not)\b/i;
+const scopedKnowledgeGuardContextPattern = /\bknowledge\b/i;
+const scopedKnowledgeGuardBoundaryPattern =
+  /\b(scoped|integrity|managed[- ]wiki|wiki\/(?:schema|index|log|issues|pages)|knowledge_update)\b/i;
 
 function shouldSkipDir(absPath) {
   const base = absPath.split(sep).pop();
@@ -90,6 +97,9 @@ function* walk(absDir) {
 
 function lineHasBannedContract(line) {
   if (bannedLinePatterns.some((pattern) => pattern.test(line))) return true;
+  if (broadRetiredGuardPatterns.some((pattern) => pattern.test(line))) {
+    return !(scopedKnowledgeGuardContextPattern.test(line) && scopedKnowledgeGuardBoundaryPattern.test(line));
+  }
   if (retiredContextPattern.test(line)) return false;
   return staleSchemaRequirementPatterns.some((pattern) => pattern.test(line));
 }

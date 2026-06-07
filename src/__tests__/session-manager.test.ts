@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import type { BotConfig } from "../types.js";
 import { waitForSpawn, outboxDir, type ActiveSession } from "../session-manager.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
+import { resolveWorkspaceContract } from "../workspace-contract.js";
 import PQueue from "p-queue";
 
 const TEST_DIR = "/tmp/minime-test-session-manager";
@@ -556,12 +557,12 @@ describe("ActiveSession shape", () => {
 describe("outboxDir", () => {
   it("returns deterministic path for a chatId", () => {
     const path = outboxDir("chat123");
-    assert.strictEqual(path, resolve(".tmp", "bot-outbox", "chat123"));
+    assert.strictEqual(path, resolve(resolveWorkspaceContract().paths.runtimeDir, "bot-outbox", "chat123"));
   });
 
   it("sanitizes special characters in chatId", () => {
     const path = outboxDir("tg:12345");
-    assert.strictEqual(path, resolve(".tmp", "bot-outbox", "tg_12345"));
+    assert.strictEqual(path, resolve(resolveWorkspaceContract().paths.runtimeDir, "bot-outbox", "tg_12345"));
   });
 
   it("returns same path for same chatId", () => {

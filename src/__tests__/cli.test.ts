@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,6 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCli } from "../cli.js";
+import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +58,46 @@ crons:
   return workspace;
 }
 
+function writeWorkspaceFile(workspace: string, relPath: string, content: string): void {
+  const path = join(workspace, ...relPath.split("/"));
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+}
+
+function createKnowledgeWorkspace(): string {
+  const workspace = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-"));
+  writeWorkspaceFile(workspace, "wiki/schema.md", generateKnowledgeV2Schema());
+  writeWorkspaceFile(
+    workspace,
+    "wiki/pages/project/runtime.md",
+    [
+      "---",
+      "name: Runtime",
+      "description: Durable runtime notes",
+      "type: project",
+      "---",
+      "",
+      "# Runtime",
+      "",
+      "The runtime uses durable knowledge search.",
+      "",
+    ].join("\n"),
+  );
+  writeWorkspaceFile(
+    workspace,
+    "wiki/index.md",
+    [
+      "# Knowledge Index",
+      "",
+      "## Project",
+      "",
+      "- [Runtime](pages/project/runtime.md) - Durable runtime notes",
+      "",
+    ].join("\n"),
+  );
+  return workspace;
+}
+
 function runWithCapture(args: readonly string[], workspace?: string, env: NodeJS.ProcessEnv = {}): {
   code: number;
   stdout: string;
@@ -90,8 +132,10 @@ describe("minime-bot CLI", () => {
     assert.equal(result.code, 0);
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
+    assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+    assert.match(result.stdout, /Knowledge commands do not resolve config secrets/);
     assert.match(result.stdout, /Control\/app workspace root/);
-    assert.match(result.stdout, /Defaults to MINIME_WORKSPACE_ROOT, then source repo root or package cwd\./);
+    assert.match(result.stdout, /MINIME_WORKSPACE_ROOT, then source repo root or package cwd\./);
     assert.doesNotMatch(result.stdout, /current repo layout/);
     assert.equal(result.stderr, "");
   });
@@ -107,6 +151,187 @@ describe("minime-bot CLI", () => {
       assert.equal(result.stderr, "");
     } finally {
       rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("searches knowledge with JSON output using --workspace as the agent workspace", () => {
+    const controlWorkspace = createWorkspace();
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      writeFileSync(join(controlWorkspace, "config.yaml"), "not valid: [");
+      const result = runWithCapture(
+        ["knowledge", "search", "--workspace", agentWorkspace, "--query", "runtime", "--json"],
+        controlWorkspace,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as {
+        ok: boolean;
+        layoutKind: string;
+        query: string;
+        results: Array<{ path: string; title: string }>;
+      };
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.layoutKind, "v2");
+      assert.equal(parsed.query, "runtime");
+      assert.equal(parsed.results[0]?.path, "wiki/pages/project/runtime.md");
+      assert.equal(parsed.results[0]?.title, "Runtime");
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("reads exact knowledge line ranges from the CLI", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "get",
+          "--workspace",
+          agentWorkspace,
+          "--path",
+          "wiki/pages/project/runtime.md",
+          "--from",
+          "7",
+          "--lines",
+          "1",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "# Runtime\n");
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("updates knowledge pages with JSON output", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    const temp = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-body-"));
+    const bodyFile = join(temp, "body.md");
+    writeFileSync(bodyFile, "# New Project\n\nA durable note from the CLI.\n");
+    try {
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "upsert",
+          "--type",
+          "project",
+          "--slug",
+          "new-project",
+          "--frontmatter",
+          JSON.stringify({
+            name: "New Project",
+            description: "CLI-created project page",
+            type: "project",
+          }),
+          "--body-file",
+          bodyFile,
+          "--json",
+        ],
+        temp,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as {
+        ok: boolean;
+        action: string;
+        path: string;
+        indexPath: string;
+      };
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.action, "created");
+      assert.equal(parsed.path, "wiki/pages/project/new-project.md");
+      assert.equal(parsed.indexPath, "wiki/index.md");
+      assert.match(
+        readFileSync(join(agentWorkspace, "wiki", "index.md"), "utf8"),
+        /\[New Project\]\(pages\/project\/new-project\.md\)/,
+      );
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("reports knowledge command helper errors as JSON when requested", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      const result = runWithCapture(
+        ["knowledge", "search", "--workspace", agentWorkspace, "--json"],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 2);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as { ok: boolean; reason: string };
+      assert.equal(parsed.ok, false);
+      assert.equal(parsed.reason, "invalid-query");
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("reports knowledge CLI parse errors without resolving secrets", () => {
+    const temp = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-parse-"));
+    const bodyFile = join(temp, "body.md");
+    writeFileSync(bodyFile, "# Body\n", "utf8");
+    try {
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "update",
+          "--op",
+          "upsert",
+          "--type",
+          "project",
+          "--slug",
+          "runtime",
+          "--frontmatter",
+          "not-json",
+          "--body-file",
+          bodyFile,
+        ],
+        BOT_ROOT,
+        { [MINIME_WORKSPACE_ROOT_ENV]: "/tmp/private-control-workspace" },
+      );
+
+      assert.equal(result.code, 2);
+      assert.match(result.stderr, /--frontmatter must be valid JSON/);
+      assert.equal(result.stdout, "");
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  it("runs knowledge migration dry-run by default and writes a JSON report", () => {
+    const agentWorkspace = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-migrate-"));
+    const reportPath = join(agentWorkspace, ".tmp", "migration-report.json");
+    writeWorkspaceFile(agentWorkspace, "MEMORY.md", "# Memory\n");
+    try {
+      const result = runWithCapture(
+        ["knowledge", "migrate", "--workspace", agentWorkspace, "--report", reportPath, "--json"],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as { ok: boolean; mode: string; operations: Array<{ targetPath: string }> };
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.mode, "dry-run");
+      assert.ok(parsed.operations.some((operation) => operation.targetPath === "wiki/schema.md"));
+      assert.equal(existsSync(reportPath), true);
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
     }
   });
 

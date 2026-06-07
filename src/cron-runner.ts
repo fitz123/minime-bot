@@ -25,11 +25,13 @@ import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
   buildPiSpawnEnv,
+  PI_CRON_WRAPPER_RELPATHS,
+  resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   shouldIncludePiChildEnvKey,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
-import { resolveWorkspaceContract } from "./workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV, resolveWorkspaceContract } from "./workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -588,8 +590,9 @@ type PiSpawnSync = (
 export interface PiRunDeps {
   spawnSync: PiSpawnSync;
   buildAgentConfig: (cron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => AgentConfig;
-  buildEnv: () => Record<string, string>;
+  buildEnv: (agentWorkspaceRoot?: string) => Record<string, string>;
   assembleContext: typeof assemblePiContext;
+  resolveExtensionArgs?: () => string[];
 }
 
 function buildPiCronAgentConfigForRun(cron: CronJob, workspaceCwd: string, agentData?: CronAgentData): AgentConfig {
@@ -633,7 +636,8 @@ function runPi(
   const validatedWorkspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const thinking = isCronPiThinking(agent.thinking) ? agent.thinking : "medium";
   const systemInstruction = buildCronSystemInstruction();
-  const env = hardenPiCronEnv(deps.buildEnv());
+  const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd));
+  env[MINIME_AGENT_WORKSPACE_CWD_ENV] = validatedWorkspaceCwd;
   // Pi authenticates via ~/.pi/agent/auth.json, not legacy OAuth credentials.
   env.HOME ||= homedir();
   const args: string[] = [
@@ -662,6 +666,7 @@ function runPi(
   }
 
   args.push("--append-system-prompt", systemInstruction);
+  args.push(...(deps.resolveExtensionArgs?.() ?? resolvePiExtensionArgs({ relpaths: PI_CRON_WRAPPER_RELPATHS })));
   const result = deps.spawnSync(PI_BIN, args, {
     cwd: validatedWorkspaceCwd,
     timeout: cron.timeout ?? DEFAULT_TIMEOUT_MS,

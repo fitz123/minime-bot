@@ -58,6 +58,38 @@ describe("check-no-active-schema-guard-contract", () => {
     assert.match(result.stderr, /A1 write guard/);
   });
 
+  it("fails active prose requiring the retired root schema contract", () => {
+    const root = makeFixture();
+    writeFixture(root, "README.md", "schema.md is required for runtime correctness.\n");
+
+    const result = runCheck(root);
+
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stderr, /schema\.md is required/);
+  });
+
+  it("allows scoped Knowledge guard language and implementation comments", () => {
+    const root = makeFixture();
+    writeFixture(
+      root,
+      join("src", "pi-extensions", "knowledge-tools.ts"),
+      "The scoped Knowledge write guard protects managed-wiki paths through knowledge_update.\n",
+    );
+
+    const result = runCheck(root);
+
+    assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+  });
+
+  it("ignores runtime .tmp output when checking the source contract", () => {
+    const root = makeFixture();
+    writeFixture(root, join(".tmp", "session.log"), "A stale log line mentioned an A1 guard extension.\n");
+
+    const result = runCheck(root);
+
+    assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+  });
+
   it("allows retired-context prose and explicitly historical plan paths", () => {
     const root = makeFixture();
     writeFixture(root, "README.md", "schema.md is retired and no longer required for runtime correctness.\n");

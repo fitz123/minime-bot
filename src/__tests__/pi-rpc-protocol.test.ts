@@ -45,6 +45,7 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
+  MINIME_AGENT_WORKSPACE_CWD_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
@@ -312,7 +313,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
     assert.strictEqual(readFileSync(personaPath, "utf8"), "PERSONA_TOKEN body");
     const bundle = readFileSync(bundlePath, "utf8");
-    assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Memory access"));
+    assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Knowledge access"));
   });
 
   it("omits --system-prompt when the agent has no persona (rides Pi base), keeping the bundle + flag", () => {
@@ -359,7 +360,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 2);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -422,18 +423,19 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
       "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
     ]);
   });
 
-  it("defaults the wrapper list to web-tools and subagent", () => {
+  it("defaults the wrapper list to web-tools, knowledge-tools, and subagent", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["web-tools.ts", "subagent/index.ts"],
+      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["web-tools.js", "subagent/index.js"],
+      ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
     );
   });
 
@@ -450,37 +452,44 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(parentArgs, [
       "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
     ]);
     assert.deepStrictEqual(subagentChildArgs, [
       "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
-    assert.deepStrictEqual(cronArgs, []);
+    assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+    ]);
     assert.doesNotMatch(
       JSON.stringify({ parentArgs, subagentChildArgs, cronArgs }),
       RETIRED_GUARD_WRAPPER_PATTERN,
     );
   });
 
-  it("the subagent-child wrapper subset is web-tools only, without subagent recursion", () => {
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS], ["web-tools.ts"]);
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js"]);
+  it("the subagent-child wrapper subset omits subagent recursion", () => {
+    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
+    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js", "knowledge-tools.js"]);
   });
 
-  it("the Pi cron wrapper subset is empty", () => {
-    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], []);
+  it("the Pi cron wrapper subset is knowledge-tools only", () => {
+    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
   });
 
-  it("resolves only the requested relpaths subset (subagent child loads web-tools only)", () => {
+  it("resolves only the requested relpaths subset (subagent child loads web and knowledge tools)", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
       "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
   });
 
-  it("resolves only the requested relpaths subset (Pi cron loads no wrappers)", () => {
+  it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_CRON_WRAPPER_RELPATHS });
-    assert.deepStrictEqual(args, []);
+    assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+    ]);
   });
 
   it("maps source wrapper relpaths to built JS relpaths for package artifact dirs", () => {
@@ -507,6 +516,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", resolve(artifactDir, "web-tools.js"),
+      "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
     ]);
   });
@@ -539,8 +549,9 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 2);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
+    assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
     assert.ok(args.includes(wrapperAbs("subagent/index.ts")));
     // Base args remain intact and precede the first --extension.
     assert.strictEqual(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
@@ -611,10 +622,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 2, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 3, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 2);
+    assert.strictEqual(paths.length, 3);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -671,6 +682,7 @@ describe("buildPiSpawnEnv", () => {
       "MINIME_SESSION_SECRET",
       RETIRED_SCHEMA_PATH_ENV,
       RETIRED_GUARD_ROOT_ENV,
+      MINIME_AGENT_WORKSPACE_CWD_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
       MINIME_WORKSPACE_ROOT_ENV,
@@ -699,6 +711,7 @@ describe("buildPiSpawnEnv", () => {
       process.env.MINIME_SESSION_SECRET = "fixture";
       process.env[RETIRED_SCHEMA_PATH_ENV] = "/tmp/schema.md";
       process.env[RETIRED_GUARD_ROOT_ENV] = "/tmp/guard-root";
+      process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = "/tmp/stale-agent-workspace";
       process.env[MINIME_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -716,6 +729,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env.MINIME_SESSION_SECRET, undefined);
       assert.strictEqual(env[RETIRED_SCHEMA_PATH_ENV], undefined);
       assert.strictEqual(env[RETIRED_GUARD_ROOT_ENV], undefined);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
@@ -780,6 +794,29 @@ describe("buildPiSpawnEnv", () => {
         process.env[MINIME_CRONS_PATH_ENV] = oldCrons;
       }
       rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("sets the explicit agent workspace env separately from the control workspace root", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-spawn-env-control-root-"));
+    const agentWorkspace = mkdtempSync(join(tmpdir(), "pi-spawn-env-agent-root-"));
+    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+
+    try {
+      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+
+      const env = buildPiSpawnEnv(agentWorkspace);
+
+      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
     }
   });
 
@@ -907,6 +944,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       "TELEGRAM_BOT_TOKEN",
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
+      MINIME_AGENT_WORKSPACE_CWD_ENV,
       MINIME_WORKSPACE_ROOT_ENV,
     ];
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
@@ -921,6 +959,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       process.env.SSH_AUTH_SOCK = "/tmp/ssh-agent.sock";
       process.env.TAVILY_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
+      process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = "/tmp/stale-agent-workspace";
       process.env[MINIME_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -931,6 +970,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       assert.strictEqual(env.LC_CTYPE, "UTF-8");
       assert.strictEqual(env.PATH, "/opt/homebrew/bin:/usr/bin");
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], "/tmp");
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
       assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
@@ -959,6 +999,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       "TELEGRAM_BOT_TOKEN",
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
+      MINIME_AGENT_WORKSPACE_CWD_ENV,
       MINIME_WORKSPACE_ROOT_ENV,
     ];
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
@@ -974,6 +1015,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       const env = buildPiSubagentChildSpawnEnv();
 
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], workspaceRoot);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(workspaceRoot, "settings", "bot.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(workspaceRoot, "ops", "crons.yaml"));
       assert.strictEqual(env.DISCORD_BOT_TOKEN, undefined);
@@ -989,6 +1031,29 @@ describe("buildPiSubagentChildSpawnEnv", () => {
         }
       }
       rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("sets subagent child agent workspace env when a child cwd is supplied", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-subagent-env-control-root-"));
+    const agentWorkspace = mkdtempSync(join(tmpdir(), "pi-subagent-env-agent-root-"));
+    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+
+    try {
+      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+
+      const env = buildPiSubagentChildSpawnEnv(agentWorkspace);
+
+      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
     }
   });
 });

@@ -1,8 +1,25 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
+import {
+  executeKnowledgeGet,
+  executeKnowledgeSearch,
+  formatKnowledgeToolResponse,
+  type KnowledgeGetResponse,
+  type KnowledgeSearchResponse,
+} from "./knowledge/tools.js";
+import {
+  executeKnowledgeMigration,
+  formatKnowledgeMigrationResponse,
+  type KnowledgeMigrationResponse,
+} from "./knowledge/migration.js";
+import {
+  executeKnowledgeUpdate,
+  formatKnowledgeUpdateResponse,
+  type KnowledgeUpdateResponse,
+} from "./knowledge/update.js";
 import {
   validateWorkspaceContract,
   workspaceValidationErrors,
@@ -10,6 +27,7 @@ import {
   type WorkspaceValidationResult,
 } from "./workspace-validator.js";
 import {
+  MINIME_AGENT_WORKSPACE_CWD_ENV,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
@@ -47,14 +65,26 @@ const HELP_TEXT = `Usage:
   minime-bot --help
   minime-bot config validate --workspace <path>
   minime-bot workspace validate --workspace <path>
+  minime-bot knowledge search --workspace <agent-workspace> --query <q> [--scope auto|diary|all] [--json]
+  minime-bot knowledge get --workspace <agent-workspace> --path <relpath> [--from N] [--lines N]
+  minime-bot knowledge update --workspace <agent-workspace> --op upsert --type project --slug <slug> --frontmatter <json> --body-file <file> [--json]
+  minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
+  minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
 
 Options:
-  --workspace <path>  Control/app workspace root. Defaults to MINIME_WORKSPACE_ROOT, then source repo root or package cwd.
+  --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
   -h, --help          Show this help text.
+
+Config/workspace defaults: MINIME_WORKSPACE_ROOT, then source repo root or package cwd.
+Knowledge defaults: explicit --workspace, then MINIME_AGENT_WORKSPACE_CWD. Knowledge commands do not resolve config secrets.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
   write(`${text}\n`);
+}
+
+function writeJson(write: WriteFn, value: unknown): void {
+  writeLine(write, JSON.stringify(value, null, 2));
 }
 
 function parseArgs(argv: readonly string[]): ParsedArgs {
@@ -97,6 +127,325 @@ function resolveForCli(parsed: ParsedArgs, options: CliRunOptions): ResolvedWork
     env: options.env ?? process.env,
     cwd: options.cwd ?? process.cwd(),
   });
+}
+
+function cwdForCli(options: CliRunOptions): string {
+  return resolve(options.cwd ?? process.cwd());
+}
+
+function resolveCliPath(path: string, cwd: string): string {
+  return isAbsolute(path) ? path : resolve(cwd, path);
+}
+
+function resolveKnowledgeAgentWorkspace(parsed: ParsedArgs, options: CliRunOptions): string | undefined {
+  const cwd = cwdForCli(options);
+  if (parsed.workspace?.trim()) {
+    return resolveCliPath(parsed.workspace, cwd);
+  }
+  const env = options.env ?? process.env;
+  const envWorkspace = env[MINIME_AGENT_WORKSPACE_CWD_ENV]?.trim();
+  return envWorkspace ? resolveCliPath(envWorkspace, cwd) : undefined;
+}
+
+interface KnowledgeCommandOptions {
+  values: Map<string, string>;
+  flags: Set<string>;
+}
+
+const KNOWLEDGE_VALUE_OPTIONS = new Set([
+  "query",
+  "scope",
+  "max-results",
+  "path",
+  "from",
+  "lines",
+  "op",
+  "type",
+  "slug",
+  "frontmatter",
+  "body-file",
+  "report",
+]);
+
+const KNOWLEDGE_BOOL_OPTIONS = new Set([
+  "json",
+  "dry-run",
+  "apply",
+  "allow-dirty",
+]);
+
+function parseKnowledgeCommandOptions(args: readonly string[]): KnowledgeCommandOptions {
+  const values = new Map<string, string>();
+  const flags = new Set<string>();
+
+  for (let i = 0; i < args.length; i += 1) {
+    const rawArg = args[i];
+    if (!rawArg.startsWith("--")) {
+      throw new CliUsageError(`unexpected argument: ${rawArg}`);
+    }
+
+    const equalsIndex = rawArg.indexOf("=");
+    const name = rawArg.slice(2, equalsIndex >= 0 ? equalsIndex : undefined);
+    if (!name) {
+      throw new CliUsageError(`unexpected argument: ${rawArg}`);
+    }
+
+    if (KNOWLEDGE_BOOL_OPTIONS.has(name)) {
+      if (equalsIndex >= 0) {
+        throw new CliUsageError(`--${name} does not accept a value`);
+      }
+      flags.add(name);
+      continue;
+    }
+
+    if (!KNOWLEDGE_VALUE_OPTIONS.has(name)) {
+      throw new CliUsageError(`unknown knowledge option: --${name}`);
+    }
+
+    let value: string | undefined;
+    if (equalsIndex >= 0) {
+      value = rawArg.slice(equalsIndex + 1);
+    } else {
+      const next = args[i + 1];
+      if (!next || next.startsWith("--")) {
+        throw new CliUsageError(`--${name} requires a value`);
+      }
+      value = next;
+      i += 1;
+    }
+    values.set(name, value);
+  }
+
+  return { values, flags };
+}
+
+function requiredKnowledgeValue(options: KnowledgeCommandOptions, name: string): string {
+  const value = options.values.get(name)?.trim();
+  if (!value) {
+    throw new CliUsageError(`knowledge command requires --${name}`);
+  }
+  return value;
+}
+
+function parsePositiveIntegerOption(
+  options: KnowledgeCommandOptions,
+  name: string,
+): number | undefined {
+  const raw = options.values.get(name);
+  if (raw === undefined) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new CliUsageError(`--${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseFrontmatterJson(raw: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CliUsageError("--frontmatter must be valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new CliUsageError("--frontmatter must be a JSON object");
+  }
+  return parsed;
+}
+
+function knowledgeFailureExitCode(
+  response: KnowledgeSearchResponse | KnowledgeGetResponse | KnowledgeUpdateResponse | KnowledgeMigrationResponse,
+): number {
+  if (response.ok) {
+    return 0;
+  }
+  return response.status === "rejected" ? 2 : 1;
+}
+
+function writeKnowledgeFailure(
+  response: KnowledgeSearchResponse | KnowledgeGetResponse | KnowledgeUpdateResponse | KnowledgeMigrationResponse,
+  json: boolean,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  if (response.ok) {
+    return 0;
+  }
+  if (json) {
+    writeJson(stdout, response);
+  } else {
+    writeLine(stderr, `Error: ${response.message}`);
+  }
+  return knowledgeFailureExitCode(response);
+}
+
+function runKnowledgeSearch(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  const json = commandOptions.flags.has("json");
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const response = executeKnowledgeSearch(
+    {
+      query: commandOptions.values.get("query"),
+      scope: commandOptions.values.get("scope"),
+      maxResults: parsePositiveIntegerOption(commandOptions, "max-results"),
+    },
+    { agentWorkspaceRoot, env: options.env ?? process.env },
+  );
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeToolResponse(response));
+  } else if (response.results.length === 0) {
+    writeLine(stdout, "No results.");
+  } else {
+    for (const result of response.results) {
+      writeLine(stdout, `${result.rank}. ${result.path}:${result.startLine}-${result.endLine} ${result.title}`);
+      writeLine(stdout, `   ${result.snippet}`);
+    }
+  }
+  return 0;
+}
+
+function runKnowledgeGet(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  const json = commandOptions.flags.has("json");
+  const from = parsePositiveIntegerOption(commandOptions, "from");
+  const lineCount = parsePositiveIntegerOption(commandOptions, "lines");
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const response = executeKnowledgeGet(
+    {
+      path: commandOptions.values.get("path"),
+      startLine: from,
+      endLine: from !== undefined && lineCount !== undefined ? from + lineCount - 1 : undefined,
+    },
+    { agentWorkspaceRoot, env: options.env ?? process.env },
+  );
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeToolResponse(response));
+  } else if (response.content.endsWith("\n")) {
+    stdout(response.content);
+  } else {
+    writeLine(stdout, response.content);
+  }
+  return 0;
+}
+
+function runKnowledgeUpdate(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  const json = commandOptions.flags.has("json");
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const bodyFile = requiredKnowledgeValue(commandOptions, "body-file");
+  const bodyPath = resolveCliPath(bodyFile, cwdForCli(options));
+  const response = executeKnowledgeUpdate(
+    {
+      op: requiredKnowledgeValue(commandOptions, "op"),
+      type: requiredKnowledgeValue(commandOptions, "type"),
+      slug: commandOptions.values.get("slug"),
+      path: commandOptions.values.get("path"),
+      frontmatter: parseFrontmatterJson(requiredKnowledgeValue(commandOptions, "frontmatter")),
+      body: readFileSync(bodyPath, "utf8"),
+    },
+    { agentWorkspaceRoot, env: options.env ?? process.env },
+  );
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeUpdateResponse(response));
+  } else {
+    writeLine(stdout, `${response.action} ${response.path}`);
+  }
+  return 0;
+}
+
+function runKnowledgeMigrate(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  const json = commandOptions.flags.has("json");
+  const dryRun = commandOptions.flags.has("dry-run");
+  const apply = commandOptions.flags.has("apply");
+  if (dryRun && apply) {
+    throw new CliUsageError("knowledge migrate accepts --dry-run or --apply, not both");
+  }
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const reportPath = commandOptions.values.get("report");
+  const response = executeKnowledgeMigration(
+    {
+      dryRun: dryRun ? true : undefined,
+      apply,
+      allowDirty: commandOptions.flags.has("allow-dirty"),
+      reportPath: reportPath ? resolveCliPath(reportPath, cwdForCli(options)) : undefined,
+    },
+    { agentWorkspaceRoot, env: options.env ?? process.env },
+  );
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeMigrationResponse(response));
+  } else {
+    writeLine(stdout, response.humanSummary);
+    if (response.reportPath) {
+      writeLine(stdout, `Report: ${response.reportPath}`);
+    }
+  }
+  return 0;
+}
+
+function runKnowledgeCommand(
+  action: string | undefined,
+  args: readonly string[],
+  parsed: ParsedArgs,
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  if (action === "search") {
+    return runKnowledgeSearch(parsed, args, options, stdout, stderr);
+  }
+  if (action === "get") {
+    return runKnowledgeGet(parsed, args, options, stdout, stderr);
+  }
+  if (action === "update") {
+    return runKnowledgeUpdate(parsed, args, options, stdout, stderr);
+  }
+  if (action === "migrate") {
+    return runKnowledgeMigrate(parsed, args, options, stdout, stderr);
+  }
+  throw new CliUsageError(`unknown knowledge command: ${action ?? ""}`.trimEnd());
 }
 
 function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
@@ -191,12 +540,16 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
   }
 
   const [scope, action, ...rest] = parsed.command;
-  if (rest.length > 0) {
-    writeLine(stderr, `Error: unexpected argument: ${rest[0]}`);
-    return 2;
-  }
 
   try {
+    if (scope === "knowledge") {
+      return runKnowledgeCommand(action, rest, parsed, options, stdout, stderr);
+    }
+
+    if (rest.length > 0) {
+      throw new CliUsageError(`unexpected argument: ${rest[0]}`);
+    }
+
     const contract = resolveForCli(parsed, options);
     if (scope === "config" && action === "validate") {
       runConfigValidate(contract, stdout);
@@ -207,6 +560,10 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
       return 0;
     }
   } catch (err) {
+    if (err instanceof CliUsageError) {
+      writeLine(stderr, `Error: ${err.message}`);
+      return 2;
+    }
     writeLine(stderr, `Error: ${(err as Error).message}`);
     return 1;
   }

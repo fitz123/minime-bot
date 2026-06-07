@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { loadConfig } from "../config.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 import type { ExecFileSyncLike } from "../secrets.js";
 
 interface SpawnCapture {
@@ -162,6 +162,14 @@ describe("Pi spawn workspace contract", () => {
           assert.doesNotMatch(serializedChildContract, new RegExp(value));
         }
       }
+      assert.equal(
+        (spawnCaptures[0].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_CWD_ENV],
+        mainWorkspace,
+      );
+      assert.equal(
+        (spawnCaptures[1].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_CWD_ENV],
+        reviewerWorkspace,
+      );
 
       const mainBundle = readFileSync(flagValue(spawnCaptures[0].args, "--append-system-prompt"), "utf8");
       const reviewerBundle = readFileSync(flagValue(spawnCaptures[1].args, "--append-system-prompt"), "utf8");

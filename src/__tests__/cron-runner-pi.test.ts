@@ -19,6 +19,7 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, CronJob } from "../types.js";
 import {
+  MINIME_AGENT_WORKSPACE_CWD_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
@@ -98,6 +99,7 @@ function makeDeps(
     buildAgentConfig: (_cron, cwd) => makeAgent(cwd),
     buildEnv: () => ({}),
     assembleContext: () => null,
+    resolveExtensionArgs: () => ["--extension", "/first-party/knowledge-tools.ts"],
     ...overrides,
   };
 }
@@ -145,7 +147,7 @@ describe("cron-runner runPi", () => {
       "high",
     ]);
     assertCronSystemInstruction(flagValue(capture.args, "--append-system-prompt"));
-    assert.ok(!capture.args.includes("--extension"));
+    assert.deepStrictEqual(flagValues(capture.args, "--extension"), ["/first-party/knowledge-tools.ts"]);
     assert.strictEqual(capture.options.input, undefined);
     assert.strictEqual(capture.options.cwd, ws);
     assert.strictEqual(capture.options.timeout, 1234);
@@ -226,7 +228,8 @@ describe("cron-runner runPi", () => {
     assert.ok(systemIdx < appendIdx);
     assert.ok(appendIdx < noContextIdx);
     assert.ok(noContextIdx < cronInstructionIdx);
-    assert.ok(!args.includes("--extension"));
+    assert.ok(cronInstructionIdx < args.indexOf("--extension"));
+    assert.deepStrictEqual(flagValues(args, "--extension"), ["/first-party/knowledge-tools.ts"]);
   });
 
   it("suppresses flat context loading when context assembly throws", () => {
@@ -377,6 +380,7 @@ describe("cron-runner runPi", () => {
       const env = captures[0].options.env ?? {};
       assert.strictEqual(env.HOME, homedir());
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], ws);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], ws);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(ws, "settings", "config.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(ws, "settings", "crons.yaml"));
       assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
@@ -493,6 +497,7 @@ describe("cron-runner runPi", () => {
 
       const env = captures[0].options.env ?? {};
       assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], workspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
       assert.strictEqual(captures[0].options.cwd, agentWorkspace);
     } finally {
       if (oldWorkspace === undefined) {
@@ -503,10 +508,12 @@ describe("cron-runner runPi", () => {
     }
   });
 
-  it("allows Pi cron spawns with no explicit first-party wrappers", () => {
+  it("allows Pi cron spawns with no explicit first-party wrappers when extensions are disabled", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
-    const deps = makeDeps(captures);
+    const deps = makeDeps(captures, {
+      resolveExtensionArgs: () => [],
+    });
 
     runPi(makeCron(), ws, deps);
 

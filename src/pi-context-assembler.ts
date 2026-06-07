@@ -13,16 +13,17 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
+import { resolveKnowledgeLayout } from "./knowledge/layout.js";
 
 /**
  * Spawn-time context assembler for the Pi (`pi --mode rpc`, OpenAI Codex) path.
  *
- * Pi reads context files as FLAT text — no `@`-import expansion, no
- * `.claude/rules/` auto-load, no memory recall (verified in
- * `@earendil-works/pi-coding-agent` resource-loader/system-prompt). Without help,
- * an agent's CLAUDE.md `@`-imports and rule files silently vanish under Pi. This
- * module assembles the same workspace context convention from the agent's LIVE
- * workspace files (zero drift), and hands it to Pi via CLI args:
+ * Pi reads context files as FLAT text: no `@`-import expansion and no
+ * `.claude/rules/` auto-load (verified in `@earendil-works/pi-coding-agent`
+ * resource-loader/system-prompt). Without help, an agent's CLAUDE.md `@`-imports
+ * and rule files silently vanish under Pi. This module assembles the same
+ * workspace context convention from the agent's LIVE workspace files (zero drift),
+ * and hands it to Pi via CLI args:
  *   --system-prompt          → the persona (REPLACES Pi's base prompt)
  *   --append-system-prompt   → the context bundle (APPENDED)
  *   --no-context-files       → so Pi does not ALSO load CLAUDE.md/AGENTS.md (no double context)
@@ -37,9 +38,10 @@ import { log } from "./logger.js";
  *   2. Each removed `@`-import expanded as a `## <relpath>` section, in the order
  *      the `@`-lines appeared (read relative to the CLAUDE.md dir; 1 level only —
  *      a nested `@`-line in an imported file is NOT recursed, only warned).
- *   3. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
- *   4. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
- *   5. A fixed `## Memory access` directive (verbatim {@link MEMORY_ACCESS_DIRECTIVE}).
+ *   3. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
+ *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
+ *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
+ *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
  */
 
 /** Resolved artifact paths handed to the Pi spawn (paths, not inline content). */
@@ -108,13 +110,21 @@ function ensurePrivateArtifactDir(path: string): void {
 const IMPORT_LINE = /^[ \t]*@(\S+)[ \t]*\r?$/;
 
 /**
- * The fixed `## Memory access` directive (verbatim). MEMORY.md itself reaches the
- * bundle as a `## MEMORY.md` section (it is a CLAUDE.md `@`-import) = the index;
- * the corpus under `memory/auto/*` is read ON DEMAND, not inlined. Auto-recall
- * like the legacy harness is not yet available under Pi (a tracked fast-follow).
+ * The fixed `## Knowledge access` directive (verbatim). In v2 workspaces,
+ * `wiki/schema.md` and `wiki/index.md` are auto-loaded below. During legacy
+ * compatibility, MEMORY.md keeps reaching the bundle only through the existing
+ * CLAUDE.md `@MEMORY.md` import convention.
  */
-const MEMORY_ACCESS_DIRECTIVE =
-  "MEMORY.md above is the index of long-term memory. When a topic matches an entry, use the read tool to load the specific `memory/auto/<name>.md` on demand. (Auto-recall like the legacy harness is not yet available under Pi — read deliberately by index; a memory_search tool is a tracked fast-follow.)";
+const KNOWLEDGE_ACCESS_DIRECTIVE = [
+  "Use `knowledge_search` before answering about prior work, decisions, people, preferences, projects, health, dates, or \"what happened with X?\"",
+  "",
+  "- Use default scope for curated/current facts.",
+  "- Use `diary` or `all` scope for chronology and history.",
+  "- Use `knowledge_get` for exact source lines before important assertions.",
+  "- Use `knowledge_update` for durable Knowledge v2 writes, not arbitrary file editing.",
+  "- Put actionable work in Beads, not wiki pages.",
+  "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
+].join("\n");
 
 /** Read a file, returning null on ANY error (fail-safe: missing/unreadable → skip). */
 function safeReadFile(path: string): string | null {
@@ -144,7 +154,20 @@ function resolveContainedRealPath(targetPath: string, baseDir: string): { realPa
 }
 
 /** Read a file only if its resolved target stays under the intended base dir. */
-function safeReadContainedFile(targetPath: string, baseDir: string): { content: string | null; escaped: boolean } {
+function safeReadContainedFile(
+  targetPath: string,
+  baseDir: string,
+  options: { rejectSymlink?: boolean } = {},
+): { content: string | null; escaped: boolean } {
+  if (options.rejectSymlink) {
+    try {
+      if (lstatSync(targetPath).isSymbolicLink()) {
+        return { content: null, escaped: false };
+      }
+    } catch {
+      return { content: null, escaped: false };
+    }
+  }
   const resolved = resolveContainedRealPath(targetPath, baseDir);
   if (resolved.escaped || resolved.realPath === null) {
     return { content: null, escaped: resolved.escaped };
@@ -330,6 +353,31 @@ export function collectRules(workspaceCwd: string): ContextSection[] {
   return out;
 }
 
+function collectKnowledgeSections(workspaceCwd: string): ContextSection[] {
+  const layout = resolveKnowledgeLayout(workspaceCwd);
+  if (layout.kind !== "v2") {
+    return [];
+  }
+
+  const out: ContextSection[] = [];
+  for (const [relpath, abs] of [
+    ["wiki/schema.md", layout.paths.schemaPath],
+    ["wiki/index.md", layout.paths.indexPath],
+  ] as const) {
+    const { content, escaped } = safeReadContainedFile(abs, workspaceCwd, { rejectSymlink: true });
+    if (escaped) {
+      log.warn("pi-context", `knowledge file resolves outside the workspace, skipping: ${abs}`);
+      continue;
+    }
+    if (content === null) {
+      log.warn("pi-context", `knowledge file not readable, skipping: ${abs}`);
+      continue;
+    }
+    out.push({ relpath, content });
+  }
+  return out;
+}
+
 interface BundleResult {
   bundle: string;
   /**
@@ -350,7 +398,7 @@ interface BundleResult {
   hasContent: boolean;
 }
 
-/** Assemble the deterministic context bundle (order 1-5 above) from live files. */
+/** Assemble the deterministic context bundle (order 1-6 above) from live files. */
 function assembleBundle(workspaceCwd: string): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   const { content: rawBody, escaped } = safeReadContainedFile(claudeMdPath, workspaceCwd);
@@ -365,6 +413,7 @@ function assembleBundle(workspaceCwd: string): BundleResult {
     rawBody ?? "",
     dirname(claudeMdPath),
   );
+  const knowledgeSections = collectKnowledgeSections(workspaceCwd);
   const rules = collectRules(workspaceCwd);
 
   const parts: string[] = [];
@@ -375,20 +424,28 @@ function assembleBundle(workspaceCwd: string): BundleResult {
   for (const section of sections) {
     parts.push(sectionMarkdown(section.relpath, section.content));
   }
+  for (const section of knowledgeSections) {
+    parts.push(sectionMarkdown(section.relpath, section.content));
+  }
   for (const rule of rules) {
     parts.push(sectionMarkdown(rule.relpath, rule.content));
   }
-  parts.push(`## Memory access\n\n${MEMORY_ACCESS_DIRECTIVE}`);
+  parts.push(`## Knowledge access\n\n${KNOWLEDGE_ACCESS_DIRECTIVE}`);
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
   // lines intact, so the stripped bundle + `--no-context-files` is strictly better.
   const hasContent =
-    trimmedBody !== "" || sections.length > 0 || rules.length > 0 || importLineCount > 0 || escaped;
+    trimmedBody !== "" ||
+    sections.length > 0 ||
+    knowledgeSections.length > 0 ||
+    rules.length > 0 ||
+    importLineCount > 0 ||
+    escaped;
   return { bundle: `${parts.join("\n\n")}\n`, hasContent };
 }
 
-/** Build the context bundle markdown string for a workspace (order 1-5 above). */
+/** Build the context bundle markdown string for a workspace (order 1-6 above). */
 export function buildBundle(workspaceCwd: string): string {
   return assembleBundle(workspaceCwd).bundle;
 }
@@ -527,6 +584,9 @@ function computeManifestSignature(agent: AgentConfig): string {
 
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   files.push({ path: claudeMdPath, baseDir: workspaceCwd });
+  files.push({ path: join(workspaceCwd, "wiki", "schema.md"), baseDir: workspaceCwd });
+  files.push({ path: join(workspaceCwd, "wiki", "index.md"), baseDir: workspaceCwd });
+  files.push({ path: join(workspaceCwd, "MEMORY.md"), baseDir: workspaceCwd });
   const { content: body } = safeReadContainedFile(claudeMdPath, workspaceCwd);
   if (body !== null) {
     const baseDir = dirname(claudeMdPath);

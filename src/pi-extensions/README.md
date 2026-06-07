@@ -2,12 +2,27 @@
 
 Pure, testable helpers for Pi extension wrappers.
 
-Most helpers here back the live Pi RPC extensions (web-tools and subagent)
-loaded into every `pi --mode rpc` spawn. `codex-usage.ts` is different:
+Most helpers here back the live Pi extensions:
+
+- `web-tools` for Tavily `web_search` / `web_fetch`.
+- `knowledge-tools` for `knowledge_search`, `knowledge_get`, `knowledge_update`,
+  and scoped protection for managed Knowledge v2 wiki files.
+- `subagent` for delegated child Pi runs.
+
+There are no `memory_*` Pi tool aliases. The package exposes the canonical
+Knowledge tool names only, and the scoped protection exists only to keep managed
+Knowledge v2 wiki files consistent with `knowledge_update`.
+
+`codex-usage.ts` is different:
 it is used only by the out-of-band Codex quota sampler via
 `extensions/pi/codex-usage.ts`, and must not be added to the normal
 `PI_EXTENSION_WRAPPER_RELPATHS` list. See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
+
+`PI_EXTENSIONS_DISABLED=1` disables every first-party wrapper for that spawn.
+That deliberately removes the Knowledge tools and also removes the scoped
+managed-wiki protection; use it only as an operator bypass when a Pi session must
+start without package extensions.
 
 ## Location lock (Task 0)
 
@@ -68,11 +83,11 @@ If a wrapper ever grows logic worth testing, move that logic into a
 ## Context assembler (workspace context parity at spawn)
 
 `bot/src/pi-context-assembler.ts` gives Pi spawns the same workspace context
-bundle. Pi reads context files as FLAT text — no `@`-import expansion, no
-`.claude/rules/` auto-load, no memory recall — so an agent's CLAUDE.md
-`@`-imports and rule files silently vanish under Pi. The assembler reads the
-agent's LIVE workspace files (zero drift, always fresh) and hands the result to Pi
-via CLI args. It is wired into `buildPiSpawnArgs` in
+bundle. Pi reads context files as FLAT text: no `@`-import expansion and no
+`.claude/rules/` auto-load, so an agent's CLAUDE.md `@`-imports and rule files
+silently vanish under Pi. The assembler reads the agent's LIVE workspace files
+(zero drift, always fresh) and hands the result to Pi via CLI args. It is wired into
+`buildPiSpawnArgs` in
 `bot/src/pi-rpc-protocol.ts` for all live Pi RPC sessions, and `cron-runner.ts`
 also calls it directly for LLM print-mode crons where `engine` may be omitted
 or set to `pi`. For crons, the runner
@@ -99,15 +114,18 @@ The `--append-system-prompt` bundle is assembled in this exact order:
 2. Each removed `@`-import expanded as a `## <relpath>` section, in the order the
    `@`-lines appeared (read relative to the CLAUDE.md dir, **1 level only** — a
    nested `@`-line inside an imported file is NOT recursed, only `log.warn`-ed).
-3. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
-4. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
-5. A fixed `## Memory access` directive (verbatim).
+3. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
+4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
+5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
+6. A fixed `## Knowledge access` directive (verbatim).
 
-MEMORY.md reaches the bundle as one of the CLAUDE.md `@`-imports (`@MEMORY.md`) →
-expanded as a `## MEMORY.md` section = the long-term-memory index. The corpus under
-`memory/auto/*` is read ON DEMAND, not inlined. Auto-recall like the legacy harness
-(a `memory_search` RAG tool) is **not yet available under Pi — it is a tracked
-fast-follow**; the fixed directive tells the agent to read the index deliberately.
+In v2 workspaces, the assembler auto-loads `wiki/schema.md` and `wiki/index.md`
+even when root `MEMORY.md` is absent. During legacy compatibility, MEMORY.md keeps
+reaching the bundle through the existing CLAUDE.md `@MEMORY.md` import convention.
+The fixed directive tells agents to use `knowledge_search`, `knowledge_get`, and
+`knowledge_update` when the first-party Knowledge tools are available. If tools are
+unavailable, agents should fall back to the visible index or direct reads and
+report that limitation.
 
 ### Fail-safe & cache
 
