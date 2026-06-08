@@ -2,7 +2,7 @@
 
 ## Goal
 
-Fix the ambiguous workspace environment contract after the package split with a **hard cutover** to explicit canonical names:
+Support the physical split between the Minime control workspace and the `main` agent workspace by fixing the ambiguous workspace environment contract with a **hard cutover** to explicit canonical names:
 
 - `MINIME_CONTROL_WORKSPACE_ROOT` — control/app workspace for config, crons, runtime state, package install, and global secret files.
 - `MINIME_AGENT_WORKSPACE_ROOT` — agent workspace whose context, Knowledge v2 wiki, and guard scope are being operated on.
@@ -18,7 +18,7 @@ Remove package use of the old ambiguous env names instead of accepting or settin
 - remove/stop accepting `MINIME_WORKSPACE_ROOT`
 - remove/stop accepting `MINIME_AGENT_WORKSPACE_CWD`
 
-The currently installed production package can keep running with the old contract until an explicit deploy. The new package version itself must not carry a dual-name compatibility layer.
+The currently installed production package can keep running with the old contract until an explicit deploy. The new package version itself must not carry a dual-name compatibility layer. Final private cutover to `/Users/ninja/.minime/control-workspace` is operator work and is gated on explicit restart/cutover approval.
 
 ## Context
 
