@@ -20,7 +20,9 @@ import {
   formatKnowledgeUpdateResponse,
   type KnowledgeUpdateResponse,
 } from "../knowledge/update.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 const fixtures: string[] = [];
 
@@ -68,8 +70,8 @@ function pageFrontmatter(name: string, type = "project"): Record<string, unknown
 describe("knowledge_update", () => {
   it("treats an explicit empty env as authoritative over the process env", () => {
     const workspace = createV2Workspace();
-    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = workspace;
     try {
       const response = executeKnowledgeUpdate(
         {
@@ -87,11 +89,51 @@ describe("knowledge_update", () => {
       assert.equal(existsSync(join(workspace, "wiki/pages/project/ambient.md")), false);
     } finally {
       if (previous === undefined) {
-        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = previous;
       }
     }
+  });
+
+  it("uses MINIME_AGENT_WORKSPACE_ROOT and ignores the retired agent workspace env", () => {
+    const retiredWorkspace = createV2Workspace();
+    const workspace = createV2Workspace();
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "canonical",
+        frontmatter: pageFrontmatter("Canonical"),
+        body: "# Canonical\n\nWritten through canonical env.\n",
+      },
+      {
+        env: {
+          [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace,
+          [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace,
+        },
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(existsSync(join(workspace, "wiki/pages/project/canonical.md")), true);
+    assert.equal(existsSync(join(retiredWorkspace, "wiki/pages/project/canonical.md")), false);
+
+    const retiredOnly = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "retired",
+        frontmatter: pageFrontmatter("Retired"),
+        body: "# Retired\n\nShould not be written through retired env.\n",
+      },
+      { env: { [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace } },
+    );
+
+    assert.equal(retiredOnly.ok, false);
+    assert.equal(retiredOnly.reason, "agent-workspace-unset");
+    assert.equal(existsSync(join(retiredWorkspace, "wiki/pages/project/retired.md")), false);
   });
 
   it("creates a v2 page, regenerates the index, appends a structural log entry, and makes search see it", () => {

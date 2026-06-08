@@ -104,10 +104,10 @@ Important constraints:
 
 ### Task 3: Knowledge and web extension lookup
 
-- [ ] Update Tavily control workspace lookup to use only canonical control env.
-- [ ] Update Knowledge agent workspace lookup to use only canonical agent env.
-- [ ] Update CLI knowledge command env fallback similarly.
-- [ ] Add/adjust tests proving canonical-only works and old env names are ignored.
+- [x] Update Tavily control workspace lookup to use only canonical control env.
+- [x] Update Knowledge agent workspace lookup to use only canonical agent env.
+- [x] Update CLI knowledge command env fallback similarly.
+- [x] Add/adjust tests proving canonical-only works and old env names are ignored.
 
 ### Task 4: Docs/help/package install smoke
 

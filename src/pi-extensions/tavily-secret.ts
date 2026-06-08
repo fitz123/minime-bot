@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { readSopsSecret, type ExecFileSyncLike } from "../secrets.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 import { TAVILY_SOPS_FILE_RELPATH, TAVILY_SOPS_KEY } from "./tavily-constants.js";
 
 export { TAVILY_SOPS_FILE_RELPATH, TAVILY_SOPS_KEY } from "./tavily-constants.js";
@@ -12,7 +12,7 @@ export interface ReadTavilyApiKeyOptions {
 }
 
 export function tavilyControlWorkspaceRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const root = env[MINIME_WORKSPACE_ROOT_ENV]?.trim();
+  const root = env[MINIME_CONTROL_WORKSPACE_ROOT_ENV]?.trim();
   return root ? resolve(root) : undefined;
 }
 

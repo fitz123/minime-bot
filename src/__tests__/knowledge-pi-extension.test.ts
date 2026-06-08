@@ -12,7 +12,10 @@ import {
   executePiKnowledgeSearch,
   extractBashWriteTargets,
 } from "../pi-extensions/knowledge-tools.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 
 const fixtures: string[] = [];
 
@@ -81,28 +84,30 @@ describe("Knowledge Pi extension helpers", () => {
       "wiki/pages/project/runtime.md": "# Runtime\n\nKnowledge wrapper token.\n",
       "wiki/index.md": "# Knowledge Index\n\n- [Runtime](pages/project/runtime.md)\n",
     });
-    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = staleWorkspace;
+    const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = staleWorkspace;
     try {
       const result = executePiKnowledgeSearch(
         { query: "wrapper token" },
-        { cwd: workspace, env: {} },
+        { cwd: workspace, env: { [RETIRED_AGENT_WORKSPACE_ENV]: staleWorkspace } },
       );
 
       assert.equal(result.ok, true, result.text);
       assert.match(result.text, /wiki\/pages\/project\/runtime\.md/);
       assert.doesNotMatch(result.text, /stale\.md/);
       assert.match(result.text, /falling back to process cwd/);
+      assert.match(result.text, /MINIME_AGENT_WORKSPACE_ROOT/);
+      assert.doesNotMatch(result.text, /MINIME_AGENT_WORKSPACE_CWD/);
     } finally {
       if (previous === undefined) {
-        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = previous;
       }
     }
   });
 
-  it("prefers the explicit agent workspace env over cwd and control workspace env", () => {
+  it("prefers the canonical agent workspace env over cwd and control workspace env", () => {
     const controlWorkspace = createWorkspace({
       "wiki/schema.md": generateKnowledgeV2Schema(),
       "wiki/index.md": "# Knowledge Index\n",
@@ -118,8 +123,10 @@ describe("Knowledge Pi extension helpers", () => {
       {
         cwd: controlWorkspace,
         env: {
-          [MINIME_WORKSPACE_ROOT_ENV]: controlWorkspace,
-          [MINIME_AGENT_WORKSPACE_CWD_ENV]: agentWorkspace,
+          [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlWorkspace,
+          [MINIME_AGENT_WORKSPACE_ROOT_ENV]: agentWorkspace,
+          [RETIRED_CONTROL_WORKSPACE_ENV]: controlWorkspace,
+          [RETIRED_AGENT_WORKSPACE_ENV]: controlWorkspace,
         },
       },
     );

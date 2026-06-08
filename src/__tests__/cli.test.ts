@@ -16,7 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCli } from "../cli.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -24,6 +24,7 @@ const CLI_TS = join(BOT_ROOT, "src", "cli.ts");
 const SAMPLER_TS = join(BOT_ROOT, "src", "codex-quota-sampler.ts");
 const TSX_LOADER = createRequire(import.meta.url).resolve("tsx");
 const MINIMAL_WORKSPACE_FIXTURE = join(BOT_ROOT, "test-fixtures", "minimal-workspace");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 function createWorkspace(): string {
   const workspace = mkdtempSync(join(tmpdir(), "minime-cli-workspace-"));
@@ -135,7 +136,8 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
     assert.match(result.stdout, /Knowledge commands do not resolve config secrets/);
     assert.match(result.stdout, /Control\/app workspace root/);
-    assert.match(result.stdout, /MINIME_WORKSPACE_ROOT, then source repo root or package cwd\./);
+    assert.match(result.stdout, /MINIME_CONTROL_WORKSPACE_ROOT, then source repo root or package cwd\./);
+    assert.match(result.stdout, /MINIME_AGENT_WORKSPACE_ROOT/);
     assert.doesNotMatch(result.stdout, /current repo layout/);
     assert.equal(result.stderr, "");
   });
@@ -179,6 +181,53 @@ describe("minime-bot CLI", () => {
       assert.equal(parsed.results[0]?.title, "Runtime");
     } finally {
       rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("searches knowledge with JSON output using MINIME_AGENT_WORKSPACE_ROOT", () => {
+    const controlWorkspace = createWorkspace();
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      writeFileSync(join(controlWorkspace, "config.yaml"), "not valid: [");
+      const result = runWithCapture(
+        ["knowledge", "search", "--query", "runtime", "--json"],
+        controlWorkspace,
+        { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: agentWorkspace },
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as {
+        ok: boolean;
+        results: Array<{ path: string; title: string }>;
+      };
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.results[0]?.path, "wiki/pages/project/runtime.md");
+      assert.equal(parsed.results[0]?.title, "Runtime");
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores the retired CLI knowledge agent workspace env", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      const result = runWithCapture(
+        ["knowledge", "search", "--query", "runtime", "--json"],
+        BOT_ROOT,
+        { [RETIRED_AGENT_WORKSPACE_ENV]: agentWorkspace },
+      );
+
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, "");
+      const parsed = JSON.parse(result.stdout) as { ok: boolean; reason: string; message: string };
+      assert.equal(parsed.ok, false);
+      assert.equal(parsed.reason, "agent-workspace-unset");
+      assert.match(parsed.message, /MINIME_AGENT_WORKSPACE_ROOT/);
+      assert.doesNotMatch(parsed.message, /MINIME_AGENT_WORKSPACE_CWD/);
+    } finally {
       rmSync(agentWorkspace, { recursive: true, force: true });
     }
   });
@@ -302,7 +351,7 @@ describe("minime-bot CLI", () => {
           bodyFile,
         ],
         BOT_ROOT,
-        { [MINIME_WORKSPACE_ROOT_ENV]: "/tmp/private-control-workspace" },
+        { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: "/tmp/private-control-workspace" },
       );
 
       assert.equal(result.code, 2);
@@ -360,11 +409,11 @@ describe("minime-bot CLI", () => {
     }
   });
 
-  it("validates the tracked fixture through MINIME_WORKSPACE_ROOT", () => {
+  it("validates the tracked fixture through MINIME_CONTROL_WORKSPACE_ROOT", () => {
     const result = runWithCapture(
       ["workspace", "validate"],
       BOT_ROOT,
-      { [MINIME_WORKSPACE_ROOT_ENV]: MINIMAL_WORKSPACE_FIXTURE },
+      { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: MINIMAL_WORKSPACE_FIXTURE },
     );
 
     assert.equal(result.code, 0);

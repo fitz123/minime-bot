@@ -21,7 +21,7 @@ import {
   type ResolvedKnowledgeV2Layout,
   resolveKnowledgeLayout,
 } from "./layout.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 export type KnowledgeUpdateOperation = "create" | "update" | "upsert";
 export type KnowledgeUpdateAction = "created" | "updated";
@@ -165,7 +165,7 @@ function resolveAgentWorkspaceRoot(deps: KnowledgeUpdateDeps): string | undefine
   const env = deps.env ?? process.env;
   const root =
     deps.agentWorkspaceRoot ??
-    env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   return typeof root === "string" && root.trim() ? root : undefined;
 }
 
@@ -175,7 +175,7 @@ function resolveLayoutForDeps(deps: KnowledgeUpdateDeps): ResolvedKnowledgeLayou
     return failure(
       "unavailable",
       "agent-workspace-unset",
-      "knowledge_update is unavailable because MINIME_AGENT_WORKSPACE_CWD was not provided.",
+      "knowledge_update is unavailable because MINIME_AGENT_WORKSPACE_ROOT was not provided.",
     );
   }
 
