@@ -37,10 +37,10 @@ npm run build
 
 ### Task 1: Add regression test
 
-- [ ] Add a fixture with a legacy `memory/auto/*.md` page whose frontmatter type is not `project` but whose body triggers the learning/curriculum target heuristic.
-- [ ] Assert dry-run returns `ok: true` and includes a blocking review item instead of `knowledge-migration-failed`.
-- [ ] Assert the invalid planned wiki page is not included as a normal migrated page operation, or is otherwise guaranteed not to be applied before review.
-- [ ] Assert apply returns `knowledge-migration-review-required` and does not write managed v2 files for the mismatched page.
+- [x] Add a fixture with a legacy `memory/auto/*.md` page whose frontmatter type is not `project` but whose body triggers the learning/curriculum target heuristic.
+- [x] Assert dry-run returns `ok: true` and includes a blocking review item instead of `knowledge-migration-failed`.
+- [x] Assert the invalid planned wiki page is not included as a normal migrated page operation, or is otherwise guaranteed not to be applied before review.
+- [x] Assert apply returns `knowledge-migration-review-required` and does not write managed v2 files for the mismatched page.
 
 ### Task 2: Fix planner behavior
 

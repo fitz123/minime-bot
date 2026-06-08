@@ -254,6 +254,45 @@ describe("knowledge layout migration", () => {
     assert.match(apply.humanSummary ?? "", /not applied/);
   });
 
+  it("reports target/frontmatter type mismatches as blocking review items", () => {
+    const mismatchedTarget = "wiki/pages/project/learning/curriculum-notes-status.md";
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "memory/auto/curriculum_notes.md": [
+        "---",
+        "name: Curriculum Notes",
+        "description: Reference notes for a course plan",
+        "type: reference",
+        "---",
+        "",
+        "# Curriculum Notes",
+        "",
+        "This curriculum should remain reference material until reviewed.",
+        "",
+      ].join("\n"),
+    });
+
+    const dryRun = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(dryRun);
+    assert.ok(dryRun.reviewItems.some((item) => (
+      item.kind === "type_review" &&
+      item.path === "memory/auto/curriculum_notes.md" &&
+      item.reason === "frontmatter_target_type_mismatch" &&
+      item.suggestedTarget === mismatchedTarget &&
+      item.blocking
+    )));
+    assert.equal(operationTargets(dryRun).includes(mismatchedTarget), false);
+
+    const apply = executeKnowledgeMigration({ apply: true, allowDirty: true }, { agentWorkspaceRoot: workspace });
+
+    assert.equal(apply.ok, false);
+    assert.equal(apply.reason, "knowledge-migration-review-required");
+    assert.equal(apply.summary?.applied, false);
+    assert.equal(existsSync(join(workspace, ...mismatchedTarget.split("/"))), false);
+    assert.equal(existsSync(join(workspace, "wiki", "schema.md")), false);
+  });
+
   it("blocks apply when root MEMORY.md has unsplit durable content", () => {
     const workspace = createWorkspace({
       "MEMORY.md": "# Memory\n\nDurable fact that needs typed routing.\n",

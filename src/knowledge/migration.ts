@@ -274,6 +274,51 @@ function isFrontmatterFailure(
   return "ok" in value && value.ok === false;
 }
 
+function expectedPageTypeFromTarget(targetPath: string): KnowledgePageType | undefined {
+  const parts = targetPath.split("/");
+  if (parts[0] !== "wiki" || parts[1] !== "pages") {
+    return undefined;
+  }
+  return PAGE_TYPES.has(parts[2]) ? (parts[2] as KnowledgePageType) : undefined;
+}
+
+function reviewForPlannedPageFrontmatterFailure(
+  sourcePath: string | undefined,
+  targetPath: string,
+  frontmatterFailure: KnowledgeUpdateFailure,
+): KnowledgeMigrationReviewItem {
+  const reason = frontmatterFailure.reason === "frontmatter-type-mismatch"
+    ? "frontmatter_target_type_mismatch"
+    : frontmatterFailure.reason;
+  const message = reason === "frontmatter_target_type_mismatch"
+    ? `Planned wiki page target ${targetPath} disagrees with the page frontmatter type; operator review must choose the target path or page type.`
+    : `Planned wiki page frontmatter failed validation: ${frontmatterFailure.message}`;
+  return {
+    kind: "type_review",
+    path: sourcePath ?? "<generated>",
+    suggestedTarget: targetPath,
+    reason,
+    message,
+    blocking: true,
+  };
+}
+
+function validatePlannedPageFrontmatter(
+  sourcePath: string | undefined,
+  targetPath: string,
+  content: string,
+): { frontmatter: KnowledgePageFrontmatter } | { reviewItem: KnowledgeMigrationReviewItem } {
+  const parsed = parseMarkdown(content);
+  const expectedType = expectedPageTypeFromTarget(targetPath);
+  const frontmatter = validateKnowledgePageFrontmatter(parsed.frontmatter, expectedType);
+  if (isFrontmatterFailure(frontmatter)) {
+    return {
+      reviewItem: reviewForPlannedPageFrontmatterFailure(sourcePath, targetPath, frontmatter),
+    };
+  }
+  return { frontmatter };
+}
+
 function markHandled(plan: MutablePlan, relPath: string): void {
   plan.handledSources.add(relPath);
 }
@@ -360,6 +405,14 @@ function addWrite(
       blocking: true,
     });
     return;
+  }
+
+  if (operation.role === "wiki_page") {
+    const validatedPage = validatePlannedPageFrontmatter(operation.sourcePath, targetPath, content);
+    if ("reviewItem" in validatedPage) {
+      addReview(plan, validatedPage.reviewItem);
+      return;
+    }
   }
 
   const sourceLabel = operation.sourcePath ?? "<generated>";
@@ -1292,22 +1345,28 @@ function classifyUnhandledFile(plan: MutablePlan, relPath: string): void {
 }
 
 function collectPlannedPages(plan: MutablePlan): ParsedPage[] {
-  return plan.operations
-    .filter((operation) => operation.role === "wiki_page")
-    .map((operation) => {
-      const parsed = parseMarkdown(operation.content);
-      const type = operation.targetPath.split("/")[2] as KnowledgePageType | undefined;
-      const frontmatter = validateKnowledgePageFrontmatter(parsed.frontmatter, type);
-      if (isFrontmatterFailure(frontmatter)) {
-        throw new Error(`planned page frontmatter failed validation for ${operation.targetPath}: ${frontmatter.reason}`);
-      }
-      return {
-        absPath: operation.absTargetPath,
-        relPath: operation.targetPath,
-        linkPath: relative(workspacePath(plan.workspaceRoot, "wiki"), operation.absTargetPath).split(sep).join("/"),
-        frontmatter,
-      };
-    })
+  const pages: ParsedPage[] = [];
+  for (const operation of plan.operations) {
+    if (operation.role !== "wiki_page") {
+      continue;
+    }
+    const validatedPage = validatePlannedPageFrontmatter(
+      operation.sourcePath,
+      operation.targetPath,
+      operation.content,
+    );
+    if ("reviewItem" in validatedPage) {
+      addReview(plan, validatedPage.reviewItem);
+      continue;
+    }
+    pages.push({
+      absPath: operation.absTargetPath,
+      relPath: operation.targetPath,
+      linkPath: relative(workspacePath(plan.workspaceRoot, "wiki"), operation.absTargetPath).split(sep).join("/"),
+      frontmatter: validatedPage.frontmatter,
+    });
+  }
+  return pages
     .sort((a, b) => a.relPath.localeCompare(b.relPath));
 }
 
