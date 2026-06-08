@@ -305,6 +305,8 @@ describe("knowledge layout migration", () => {
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "hidden_runtime_state"));
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "domain_client_training_tree"));
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "non_markdown_state"));
+    assert.ok(hasReviewItem(dryRun, "memory/diary/secret.md", "secret_diary_omitted", false));
+    assert.equal(dryRun.operations.some((operation) => operation.sourcePath === "memory/diary/secret.md"), false);
     assert.ok(dryRun.summary.blockers >= 3);
 
     const apply = executeKnowledgeMigration({ apply: true, allowDirty: true }, { agentWorkspaceRoot: workspace });
@@ -324,6 +326,7 @@ describe("knowledge layout migration", () => {
       "STATUS.md": "# Status\n",
       ".beads/README.md": "# Beads\n",
       "nix/runtime.nix": "{ pkgs }: {}\n",
+      "nixos/README.md": "# NixOS Runtime\n",
       "domain/orders/model.md": "# Orders\n",
       "clients/acme/README.md": "# Acme\n",
       "training/onboarding.md": "# Onboarding\n",
@@ -339,11 +342,176 @@ describe("knowledge layout migration", () => {
     assert.ok(hasReviewItem(response, "STATUS.md", "root_status_doc", false));
     assert.ok(hasReviewItem(response, ".beads/README.md", "beads_metadata_doc", false));
     assert.ok(hasReviewItem(response, "nix/runtime.nix", "nix_runtime_tree", false));
+    assert.ok(hasReviewItem(response, "nixos/README.md", "nix_runtime_tree", false));
     assert.ok(hasReviewItem(response, "domain/orders/model.md", "domain_client_training_tree", false));
     assert.ok(hasReviewItem(response, "clients/acme/README.md", "domain_client_training_tree", false));
     assert.ok(hasReviewItem(response, "training/onboarding.md", "domain_client_training_tree", false));
     assert.ok(hasReviewItem(response, "loose-note.md", "unknown_provenance", true));
     assert.equal(response.summary.blockers, 1);
+  });
+
+  it("skips MEMORY index introductions and placeholder-only catalog sections", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": [
+        "# MEMORY.md — Coder Workspace",
+        "",
+        "Long-term memory index for the isolated coder agent.",
+        "",
+        "## Memory Files",
+        "",
+        "(empty — auto-memory will be populated later)",
+        "",
+        "### Auto (`memory/auto/`)",
+        "",
+        "(none yet)",
+        "",
+        "### Diary (`memory/diary/`)",
+        "",
+        "(none yet)",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    assert.equal(response.summary.pages, 0);
+    assert.equal(response.summary.blockers, 0);
+    assert.equal(hasReviewItem(response, "MEMORY.md", "legacy_memory_split_required"), false);
+  });
+
+  it("archives pre-v2 wiki control files before replacing them with Knowledge v2 controls", { skip: !hasGit }, () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "wiki/schema.md": "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n",
+      "wiki/index.md": "# Topic Wiki Index\n",
+      "wiki/log.md": "- old structural event\n",
+      "wiki/runtime/index.md": "# Runtime\n\nCompiled page.\n",
+    });
+    initCleanGitWorkspace(workspace);
+
+    const applied = executeKnowledgeMigration({ apply: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(applied);
+    assert.equal(applied.summary.blockers, 0);
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/schema.md"), "utf8"), "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n");
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/index.md"), "utf8"), "# Topic Wiki Index\n");
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/log.md"), "utf8"), "- old structural event\n");
+    assert.match(readFileSync(join(workspace, "wiki/schema.md"), "utf8"), /format: minime-knowledge-v2/);
+    assert.match(readFileSync(join(workspace, "wiki/index.md"), "utf8"), /\[Runtime\]\(pages\/project\/runtime\/README\.md\)/);
+  });
+
+  it("routes explicit user profile pages under user even when health keywords appear", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "memory/auto/about.md": [
+        "---",
+        "name: Person Profile",
+        "description: Personal health profile",
+        "type: user",
+        "---",
+        "",
+        "# Person Profile",
+        "",
+        "Medical and active health details belong to the person profile here.",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    const targets = operationTargets(response);
+    assert.ok(targets.includes("wiki/pages/user/person-profile.md"));
+    assert.equal(targets.includes("wiki/pages/project/health/person-profile-status.md"), false);
+    assert.equal(response.summary.blockers, 0);
+  });
+
+  it("routes explicit feedback before artifact keyword heuristics and falls back to source filenames for non-ASCII names", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "memory/auto/response_style.md": [
+        "---",
+        "name: Спасибо",
+        "description: Response style feedback",
+        "type: feedback",
+        "---",
+        "",
+        "# Спасибо",
+        "",
+        "This feedback mentions a command-level runbook, deploy script, and one-off plan.",
+        "",
+      ].join("\n"),
+      "memory/auto/review_style.md": [
+        "---",
+        "name: Спасибо",
+        "description: Review style feedback",
+        "type: feedback",
+        "---",
+        "",
+        "# Спасибо",
+        "",
+        "This feedback mentions operational commands but remains durable feedback.",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    const targets = operationTargets(response);
+    assert.ok(targets.includes("wiki/pages/feedback/response-style.md"));
+    assert.ok(targets.includes("wiki/pages/feedback/review-style.md"));
+    assert.equal(targets.includes("wiki/pages/feedback/untitled.md"), false);
+    assert.equal(hasReviewItem(response, "memory/auto/response_style.md", "active_runbook_review"), false);
+    assert.equal(hasReviewItem(response, "memory/auto/response_style.md", "one_off_plan_artifact"), false);
+    assert.equal(response.summary.blockers, 0);
+  });
+
+  it("keeps runbook and one-off plan artifact review heuristics for project and reference pages", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "memory/auto/runtime_runbook.md": [
+        "---",
+        "name: Deploy Commands",
+        "description: Command-level runbook",
+        "type: project",
+        "---",
+        "",
+        "# Deploy Commands",
+        "",
+        "This command-level runbook describes an operational command and deploy script.",
+        "",
+      ].join("\n"),
+      "memory/auto/reference_plan.md": [
+        "---",
+        "name: Release Checklist",
+        "description: One-off execution notes",
+        "type: reference",
+        "---",
+        "",
+        "# Release Checklist",
+        "",
+        "This task plan is a one-off plan for a release.",
+        "",
+      ].join("\n"),
+      "memory/auto/inferred_runtime_runbook.md": [
+        "# Project Runbook",
+        "",
+        "This project runbook describes an operational command for the runtime.",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    assert.ok(hasReviewItem(response, "memory/auto/runtime_runbook.md", "active_runbook_review", true));
+    assert.ok(hasReviewItem(response, "memory/auto/reference_plan.md", "one_off_plan_artifact", true));
+    assert.ok(hasReviewItem(response, "memory/auto/inferred_runtime_runbook.md", "active_runbook_review", true));
+    assert.equal(operationTargets(response).includes("wiki/pages/project/deploy-commands.md"), false);
+    assert.equal(operationTargets(response).includes("wiki/pages/reference/release-checklist.md"), false);
+    assert.equal(response.summary.blockers, 3);
   });
 
   it("reports target/frontmatter type mismatches as blocking review items", () => {
@@ -426,32 +594,36 @@ describe("knowledge layout migration", () => {
     assert.equal(apply.summary?.applied, false);
   });
 
-  it("does not overwrite existing pre-v2 wiki control files during migration apply", () => {
+  it("archives existing pre-v2 wiki control files during migration apply", { skip: !hasGit }, () => {
     const workspace = createWorkspace({
-      "MEMORY.md": "# Memory\n\n## Pending Review\n\n- Existing issue must not overwrite.\n",
+      "MEMORY.md": "# Memory\n",
       "wiki/schema.md": "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n",
       "wiki/index.md": "# Topic Wiki Index\n",
       "wiki/log.md": "# Existing Log\n",
-      "wiki/issues.md": "# Existing Issues\n",
       "wiki/runtime/index.md": "# Runtime Landing\n\nCompiled page.\n",
     });
+    initCleanGitWorkspace(workspace);
 
     const dryRun = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
 
     assertMigrationOk(dryRun);
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "target_exists" && item.suggestedTarget === "wiki/schema.md"));
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "target_exists" && item.suggestedTarget === "wiki/index.md"));
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "target_exists" && item.suggestedTarget === "wiki/log.md"));
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "target_exists" && item.suggestedTarget === "wiki/issues.md"));
+    const targets = operationTargets(dryRun);
+    assert.ok(targets.includes("artifacts/legacy/wiki/schema.md"));
+    assert.ok(targets.includes("artifacts/legacy/wiki/index.md"));
+    assert.ok(targets.includes("artifacts/legacy/wiki/log.md"));
+    assert.ok(targets.includes("wiki/schema.md"));
+    assert.ok(targets.includes("wiki/index.md"));
+    assert.ok(targets.includes("wiki/log.md"));
+    assert.equal(dryRun.summary.blockers, 0);
 
-    const apply = executeKnowledgeMigration({ apply: true, allowDirty: true }, { agentWorkspaceRoot: workspace });
+    const apply = executeKnowledgeMigration({ apply: true }, { agentWorkspaceRoot: workspace });
 
-    assert.equal(apply.ok, false);
-    assert.equal(apply.reason, "knowledge-migration-review-required");
-    assert.equal(readFileSync(join(workspace, "wiki", "schema.md"), "utf8"), "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n");
-    assert.equal(readFileSync(join(workspace, "wiki", "index.md"), "utf8"), "# Topic Wiki Index\n");
-    assert.equal(readFileSync(join(workspace, "wiki", "log.md"), "utf8"), "# Existing Log\n");
-    assert.equal(readFileSync(join(workspace, "wiki", "issues.md"), "utf8"), "# Existing Issues\n");
+    assertMigrationOk(apply);
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/schema.md"), "utf8"), "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n");
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/index.md"), "utf8"), "# Topic Wiki Index\n");
+    assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/log.md"), "utf8"), "# Existing Log\n");
+    assert.match(readFileSync(join(workspace, "wiki", "schema.md"), "utf8"), /format: minime-knowledge-v2/);
+    assert.match(readFileSync(join(workspace, "wiki", "index.md"), "utf8"), /\[Runtime Landing\]\(pages\/project\/runtime\/README\.md\)/);
   });
 
   it("rewrites topic-wiki links to migrated v2 page targets when the target is deterministic", { skip: !hasGit }, () => {

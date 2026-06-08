@@ -255,7 +255,8 @@ function readText(root: string, relPath: string): string {
 }
 
 function contentHasSecret(content: string): boolean {
-  return SECRET_PATTERNS.some((pattern) => pattern.test(content));
+  const normalized = content.replace(/<REDACTED>/gi, "x");
+  return SECRET_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function addReview(plan: MutablePlan, item: KnowledgeMigrationReviewItem): void {
@@ -806,17 +807,12 @@ function classifyLegacyTarget(
 ): string | KnowledgeMigrationReviewItem {
   const slug = basename(sourceRel, extname(sourceRel));
   const lower = `${sourceRel}\n${frontmatter.name}\n${body}`.toLowerCase();
-  const participantTopic = participantTopicFromLegacySlug(slug);
-  if (participantTopic) {
-    return `wiki/pages/project/${participantTopic}/participants.md`;
-  }
-  const projectTopic = projectTopicFromLegacySlug(slug);
-  if (projectTopic) {
-    return uniqueTarget(plan, `wiki/pages/project/${projectTopic}/status.md`);
-  }
   const pageSlug = targetSlug(frontmatter.name, slug);
   if (frontmatter.type === "feedback") {
     return `wiki/pages/feedback/${pageSlug}.md`;
+  }
+  if (frontmatter.type === "user") {
+    return `wiki/pages/user/${pageSlug}.md`;
   }
   if (/\b(runbook|command reference|operational command|deploy script)\b/.test(lower)) {
     return {
@@ -838,6 +834,14 @@ function classifyLegacyTarget(
       blocking: true,
     };
   }
+  const participantTopic = participantTopicFromLegacySlug(slug);
+  if (participantTopic) {
+    return `wiki/pages/project/${participantTopic}/participants.md`;
+  }
+  const projectTopic = projectTopicFromLegacySlug(slug);
+  if (projectTopic) {
+    return uniqueTarget(plan, `wiki/pages/project/${projectTopic}/status.md`);
+  }
   if (/\b(pet|animal)\b/.test(lower)) {
     if (/\b(treatment|medical|medicine|active plan|health)\b/.test(lower)) {
       return `wiki/pages/project/health/${pageSlug}-status.md`;
@@ -846,9 +850,6 @@ function classifyLegacyTarget(
   }
   if (/\b(curriculum|learning plan|course plan)\b/.test(lower)) {
     return `wiki/pages/project/learning/${pageSlug}-status.md`;
-  }
-  if (frontmatter.type === "user") {
-    return `wiki/pages/user/${pageSlug}.md`;
   }
   if (frontmatter.type === "reference") {
     return `wiki/pages/reference/${pageSlug}.md`;
@@ -1517,7 +1518,57 @@ function collectPlannedPages(plan: MutablePlan): ParsedPage[] {
     .sort((a, b) => a.relPath.localeCompare(b.relPath));
 }
 
+function planLegacyWikiControlArchives(plan: MutablePlan): void {
+  for (const relPath of ["wiki/schema.md", "wiki/index.md", "wiki/log.md", "wiki/issues.md"]) {
+    const absPath = workspacePath(plan.workspaceRoot, relPath);
+    if (!existsSync(absPath)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = lstatSync(absPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      addReview(plan, {
+        kind: "operator_review",
+        path: relPath,
+        suggestedTarget: `artifacts/legacy/${relPath}`,
+        reason: "unsafe_legacy_wiki_control",
+        message: "Legacy wiki control files must be regular files before automatic archival and replacement.",
+        blocking: true,
+      });
+      continue;
+    }
+    const content = readText(plan.workspaceRoot, relPath);
+    if (contentHasSecret(content)) {
+      addReview(plan, {
+        kind: "secret_review",
+        path: relPath,
+        suggestedTarget: `artifacts/legacy/${relPath}`,
+        reason: "secret_in_legacy_wiki_control",
+        message: "Legacy wiki control file appears to contain secret material; archive only after redaction/private backup.",
+        blocking: true,
+      });
+      continue;
+    }
+    addWrite(
+      plan,
+      {
+        action: "copy",
+        role: "artifact",
+        sourcePath: relPath,
+        targetPath: `artifacts/legacy/${relPath}`,
+        reason: "archive pre-v2 wiki control file before generating canonical Knowledge v2 controls",
+      },
+      content,
+    );
+  }
+}
+
 function planGeneratedV2Files(plan: MutablePlan): void {
+  const mayReplaceLegacyControls = plan.layout.kind !== "v2";
   addWrite(
     plan,
     {
@@ -1526,6 +1577,7 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "generate canonical Knowledge v2 schema marker and contract",
     },
     generateKnowledgeV2Schema(),
+    { allowOverwrite: mayReplaceLegacyControls },
   );
 
   const pages = collectPlannedPages(plan);
@@ -1537,6 +1589,7 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "generate Knowledge v2 index from migrated pages",
     },
     generateKnowledgeIndex(pages),
+    { allowOverwrite: mayReplaceLegacyControls },
   );
 
   const pageCreates = pages.map((page) => `- ${plan.now.toISOString()} create ${page.relPath}`).join("\n");
@@ -1549,6 +1602,7 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "record structural creates planned by knowledge migration",
     },
     structuralLines,
+    { allowOverwrite: mayReplaceLegacyControls },
   );
 }
 
@@ -1574,6 +1628,7 @@ function planMigration(workspaceRoot: string, deps: KnowledgeMigrationDeps): Mut
 
   const files = walkFiles(workspaceRoot);
   planMemoryFile(plan);
+  planLegacyWikiControlArchives(plan);
 
   for (const relPath of files) {
     if (relPath.startsWith("memory/auto/")) {
