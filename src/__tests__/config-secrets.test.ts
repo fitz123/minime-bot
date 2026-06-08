@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, loadTelegramToken } from "../config.js";
 import type { ExecFileSyncLike } from "../secrets.js";
-import { MINIME_CONFIG_PATH_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 describe("config secret resolution: SOPS and env sources", () => {
   let tmpDir: string;
@@ -21,7 +21,7 @@ describe("config secret resolution: SOPS and env sources", () => {
     delete process.env.TEST_TELEGRAM_TOKEN_ENV;
     delete process.env.TEST_DISCORD_TOKEN_ENV;
     delete process.env[MINIME_CONFIG_PATH_ENV];
-    delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+    delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
   });
 
   const minimalAgentsYaml = `
@@ -93,7 +93,7 @@ secrets:
 telegramTokenSopsKey: telegram.bot_token
 `,
     );
-    process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+    process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
     process.env[MINIME_CONFIG_PATH_ENV] = "settings/bot.yaml";
     const calls: Array<{ file: string; args: readonly string[] }> = [];
 

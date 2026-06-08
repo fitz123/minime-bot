@@ -33,7 +33,7 @@
     <dict>
         <key>HOME</key>
         <string>USER_HOME</string>
-        <key>MINIME_WORKSPACE_ROOT</key>
+        <key>MINIME_CONTROL_WORKSPACE_ROOT</key>
         <string>CONTROL_WORKSPACE</string>
         <key>LOG_DIR</key>
         <string>LOG_DIR</string>

@@ -26,11 +26,13 @@ import {
   type SubagentSpawn,
   type SubagentSpawnOptions,
 } from "../pi-extensions/subagent-args.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..", "..");
 const BUNDLED_AGENT_DIR = resolve(BOT_DIR, "extensions", "pi", "subagent", "agents");
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 function readBundledAgentTools(name: string): string[] | undefined {
   const content = readFileSync(resolve(BUNDLED_AGENT_DIR, `${name}.md`), "utf8");
@@ -152,12 +154,18 @@ describe("subagent: wrapper spawn environment", () => {
   });
 
   it("keeps caller-selected child cwd separate from the control workspace env", async () => {
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldAgentWorkspace = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    const oldRetiredWorkspace = process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+    const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const controlWorkspace = "/control/workspace";
     const callerCwd = "/caller/selected/subagent-cwd";
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/stale/agent/workspace";
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/retired/control/workspace";
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/retired/agent/workspace";
       const env = buildPiSubagentChildSpawnEnv(callerCwd);
       const { child, calls, spawn } = setupRunner();
       const promise = runSubagentChild({
@@ -171,8 +179,10 @@ describe("subagent: wrapper spawn environment", () => {
       child.emitClose(0);
       await promise;
 
-      assert.equal(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
-      assert.equal(env[MINIME_AGENT_WORKSPACE_CWD_ENV], callerCwd);
+      assert.equal(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.equal(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], callerCwd);
+      assert.equal(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
+      assert.equal(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
       assert.deepEqual(calls, [
         {
           command: "pi",
@@ -187,9 +197,24 @@ describe("subagent: wrapper spawn environment", () => {
       ]);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldAgentWorkspace === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = oldAgentWorkspace;
+      }
+      if (oldRetiredWorkspace === undefined) {
+        delete process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_CONTROL_WORKSPACE_ENV] = oldRetiredWorkspace;
+      }
+      if (oldRetiredAgentWorkspace === undefined) {
+        delete process.env[RETIRED_AGENT_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_AGENT_WORKSPACE_ENV] = oldRetiredAgentWorkspace;
       }
     }
   });

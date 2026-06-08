@@ -31,7 +31,7 @@ import {
   shouldIncludePiChildEnvKey,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV, resolveWorkspaceContract } from "./workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV, resolveWorkspaceContract } from "./workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -637,7 +637,7 @@ function runPi(
   const thinking = isCronPiThinking(agent.thinking) ? agent.thinking : "medium";
   const systemInstruction = buildCronSystemInstruction();
   const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd));
-  env[MINIME_AGENT_WORKSPACE_CWD_ENV] = validatedWorkspaceCwd;
+  env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = validatedWorkspaceCwd;
   // Pi authenticates via ~/.pi/agent/auth.json, not legacy OAuth credentials.
   env.HOME ||= homedir();
   const args: string[] = [

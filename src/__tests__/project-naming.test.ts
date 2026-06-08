@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
+const retiredControlWorkspaceEnv = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const retiredAgentWorkspaceEnv = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 function readPackageFile(relativePath: string): string {
   return readFileSync(resolve(packageRoot, relativePath), "utf-8");
@@ -66,12 +68,41 @@ describe("project naming", () => {
       "minime-bot workspace validate --workspace /path/to/workspace",
       "minime-bot knowledge search --workspace /path/to/agent-workspace",
       "minime-bot knowledge update --workspace /path/to/agent-workspace",
-      "MINIME_WORKSPACE_ROOT",
+      "MINIME_CONTROL_WORKSPACE_ROOT",
+      "MINIME_AGENT_WORKSPACE_ROOT",
+      "hard cut to canonical names",
+      "not passed to Pi children",
       "agent workspace, not the control workspace",
       "control workspace",
       "test-fixtures/minimal-workspace",
     ]) {
       assert.ok(readme.includes(expected), `README.md should document ${expected}`);
+    }
+  });
+
+  it("AGENTS documents distinct roots and canonical workspace env names", () => {
+    for (const expected of [
+      "control/app workspace",
+      "agent workspace",
+      "package source checkout",
+      "package runtime install",
+      "MINIME_CONTROL_WORKSPACE_ROOT",
+      "MINIME_AGENT_WORKSPACE_ROOT",
+      "retired ambiguous workspace env names must not be accepted",
+    ]) {
+      assert.ok(agentsDoc.includes(expected), `AGENTS.md should document ${expected}`);
+    }
+  });
+
+  it("README and package examples do not document retired workspace env names", () => {
+    for (const [label, content] of [
+      ["README.md", readme],
+      ["AGENTS.md", agentsDoc],
+      ["CHANGELOG.md", changelog],
+      ["telegram-bot.plist.example", readPackageFile("telegram-bot.plist.example")],
+    ] as const) {
+      assert.ok(!content.includes(retiredControlWorkspaceEnv), `${label} still documents retired control env`);
+      assert.ok(!content.includes(retiredAgentWorkspaceEnv), `${label} still documents retired agent env`);
     }
   });
 

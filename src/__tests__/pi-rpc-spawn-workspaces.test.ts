@@ -13,8 +13,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { loadConfig } from "../config.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 import type { ExecFileSyncLike } from "../secrets.js";
+
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 interface SpawnCapture {
   command: string;
@@ -117,7 +120,10 @@ describe("Pi spawn workspace contract", () => {
       secretReads.push(args[args.length - 1]);
       return "resolved-telegram-token\n";
     };
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldAgentWorkspace = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    const oldRetiredWorkspace = process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+    const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const oldDisabled = process.env[PI_EXTENSIONS_DISABLED_ENV];
     const secretEnvKeys = [
       ["TELEGRAM", "BOT", "TOKEN"].join("_"),
@@ -133,7 +139,10 @@ describe("Pi spawn workspace contract", () => {
     ];
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = join(root, "stale-agent-workspace");
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = join(root, "retired-control-workspace");
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = join(root, "retired-agent-workspace");
       process.env[PI_EXTENSIONS_DISABLED_ENV] = "1";
       process.env[secretEnvKeys[0]] = fixtureValues[0];
       process.env[secretEnvKeys[1]] = fixtureValues[1];
@@ -156,18 +165,20 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(spawnCaptures[1].options.cwd, reviewerWorkspace);
       for (const capture of spawnCaptures) {
         const env = capture.options.env as NodeJS.ProcessEnv;
-        assert.equal(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
+        assert.equal(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+        assert.equal(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
+        assert.equal(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
         const serializedChildContract = JSON.stringify({ env, args: capture.args });
         for (const value of fixtureValues) {
           assert.doesNotMatch(serializedChildContract, new RegExp(value));
         }
       }
       assert.equal(
-        (spawnCaptures[0].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_CWD_ENV],
+        (spawnCaptures[0].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_ROOT_ENV],
         mainWorkspace,
       );
       assert.equal(
-        (spawnCaptures[1].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_CWD_ENV],
+        (spawnCaptures[1].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_ROOT_ENV],
         reviewerWorkspace,
       );
 
@@ -179,9 +190,24 @@ describe("Pi spawn workspace contract", () => {
       assert.doesNotMatch(reviewerBundle, /MAIN_CONTEXT_TOKEN/);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldAgentWorkspace === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = oldAgentWorkspace;
+      }
+      if (oldRetiredWorkspace === undefined) {
+        delete process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_CONTROL_WORKSPACE_ENV] = oldRetiredWorkspace;
+      }
+      if (oldRetiredAgentWorkspace === undefined) {
+        delete process.env[RETIRED_AGENT_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_AGENT_WORKSPACE_ENV] = oldRetiredAgentWorkspace;
       }
       if (oldDisabled === undefined) {
         delete process.env[PI_EXTENSIONS_DISABLED_ENV];

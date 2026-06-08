@@ -11,7 +11,9 @@ import {
   type KnowledgeGetResponse,
   type KnowledgeSearchResponse,
 } from "../knowledge/tools.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 const fixtures: string[] = [];
 
@@ -159,22 +161,52 @@ describe("knowledge tools", () => {
     assert.equal(get.reason, "agent-workspace-unset");
   });
 
+  it("uses MINIME_AGENT_WORKSPACE_ROOT and ignores the retired agent workspace env", () => {
+    const retiredWorkspace = createV2Workspace({
+      "wiki/pages/project/retired.md": "# Retired\n\nRetired-only token.\n",
+      "wiki/index.md": "# Knowledge Index\n\n- [Retired](pages/project/retired.md)\n",
+    });
+    const workspace = createV2Workspace({
+      "wiki/pages/project/runtime.md": "# Runtime\n\nCanonical-only token.\n",
+      "wiki/index.md": "# Knowledge Index\n\n- [Runtime](pages/project/runtime.md)\n",
+    });
+
+    const search = executeKnowledgeSearch(
+      { query: "canonical-only" },
+      {
+        env: {
+          [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace,
+          [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace,
+        },
+      },
+    );
+    assert.equal(search.ok, true, JSON.stringify(search));
+    assert.equal(search.results[0]?.path, "wiki/pages/project/runtime.md");
+
+    const retiredOnly = executeKnowledgeSearch(
+      { query: "retired-only" },
+      { env: { [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace } },
+    );
+    assert.equal(retiredOnly.ok, false);
+    assert.equal(retiredOnly.reason, "agent-workspace-unset");
+  });
+
   it("treats an explicit empty env as authoritative over the process env", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n\nAmbient-only token.\n",
       "wiki/index.md": "# Knowledge Index\n\n- [Runtime](pages/project/runtime.md)\n",
     });
-    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = workspace;
     try {
       const search = executeKnowledgeSearch({ query: "ambient-only" }, { env: {} });
       assert.equal(search.ok, false);
       assert.equal(search.reason, "agent-workspace-unset");
     } finally {
       if (previous === undefined) {
-        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = previous;
       }
     }
   });

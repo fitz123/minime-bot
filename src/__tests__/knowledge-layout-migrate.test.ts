@@ -9,10 +9,11 @@ import {
   executeKnowledgeMigration,
   type KnowledgeMigrationResponse,
 } from "../knowledge/migration.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 const hasGit = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0;
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 after(() => {
   for (const fixture of fixtures) {
@@ -695,8 +696,8 @@ describe("knowledge layout migration", () => {
       "MEMORY.md": "# Memory\n",
       "memory/auto/project_runtime.md": legacyProjectPage(),
     });
-    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = workspace;
     try {
       const response = executeKnowledgeMigration({ dryRun: true }, { env: {} });
 
@@ -704,11 +705,40 @@ describe("knowledge layout migration", () => {
       assert.equal(response.reason, "agent-workspace-unset");
     } finally {
       if (previous === undefined) {
-        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = previous;
       }
     }
+  });
+
+  it("uses MINIME_AGENT_WORKSPACE_ROOT and ignores the retired agent workspace env", () => {
+    const retiredWorkspace = createWorkspace({
+      "MEMORY.md": "# Memory\n\nRetired-only token.\n",
+    });
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n\nCanonical-only token.\n",
+    });
+
+    const response = executeKnowledgeMigration(
+      { dryRun: true },
+      {
+        env: {
+          [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace,
+          [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace,
+        },
+      },
+    );
+
+    assertMigrationOk(response);
+    assert.equal(response.workspace, workspace);
+
+    const retiredOnly = executeKnowledgeMigration(
+      { dryRun: true },
+      { env: { [RETIRED_AGENT_WORKSPACE_ENV]: retiredWorkspace } },
+    );
+    assert.equal(retiredOnly.ok, false);
+    assert.equal(retiredOnly.reason, "agent-workspace-unset");
   });
 
   it("blocks apply when root MEMORY.md has unsplit durable content", () => {

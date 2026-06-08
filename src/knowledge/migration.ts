@@ -30,7 +30,7 @@ import {
   type KnowledgeUpdateFailure,
   type ParsedPage,
 } from "./update.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 export type KnowledgeMigrationMode = "dry-run" | "apply";
 export type KnowledgeMigrationReviewKind =
@@ -210,7 +210,7 @@ function resolveAgentWorkspaceRoot(deps: KnowledgeMigrationDeps): string | undef
   const env = deps.env ?? process.env;
   const root =
     deps.agentWorkspaceRoot ??
-    env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   return typeof root === "string" && root.trim() ? normalize(resolve(root)) : undefined;
 }
 
@@ -1965,7 +1965,7 @@ export function executeKnowledgeMigration(
     return failure(
       "unavailable",
       "agent-workspace-unset",
-      "knowledge migrate requires an agent workspace from --workspace or MINIME_AGENT_WORKSPACE_CWD.",
+      "knowledge migrate requires an agent workspace from --workspace or MINIME_AGENT_WORKSPACE_ROOT.",
       { mode },
     );
   }

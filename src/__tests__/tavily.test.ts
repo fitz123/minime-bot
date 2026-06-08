@@ -31,12 +31,13 @@ import {
   TAVILY_SOPS_KEY,
 } from "../pi-extensions/tavily-secret.js";
 import type { ExecFileSyncLike } from "../secrets.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const KEY = "tvly-test-key";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..", "..");
 const WEB_TOOLS_WRAPPER_PATH = resolve(BOT_DIR, "extensions", "pi", "web-tools.ts");
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 
 interface FetchCall {
   url: string;
@@ -593,7 +594,7 @@ describe("tavily: SOPS API key lookup", () => {
     }
   });
 
-  it("uses MINIME_WORKSPACE_ROOT as the control-workspace secret contract", () => {
+  it("uses MINIME_CONTROL_WORKSPACE_ROOT as the control-workspace secret contract", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-secret-env-control-"));
     const agentWorkspace = mkdtempSync(join(tmpdir(), "tavily-secret-env-agent-"));
     mkdirSync(join(controlWorkspace, "config"));
@@ -608,12 +609,12 @@ describe("tavily: SOPS API key lookup", () => {
     try {
       process.chdir(agentWorkspace);
       const value = readTavilyApiKeyFromSops({
-        env: { [MINIME_WORKSPACE_ROOT_ENV]: controlWorkspace },
+        env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlWorkspace },
         execFileSync,
       });
 
       assert.equal(value, "tvly-from-control-env");
-      assert.equal(tavilyControlWorkspaceRoot({ [MINIME_WORKSPACE_ROOT_ENV]: controlWorkspace }), controlWorkspace);
+      assert.equal(tavilyControlWorkspaceRoot({ [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlWorkspace }), controlWorkspace);
       assert.deepEqual(calls, [{
         file: "sops",
         args: ["-d", "--extract", '["tavily"]["api_key"]', join(controlWorkspace, TAVILY_SOPS_FILE_RELPATH)],
@@ -641,13 +642,13 @@ describe("tavily: SOPS API key lookup", () => {
     try {
       process.chdir(agentOne);
       assert.equal(
-        readTavilyApiKeyFromSops({ env: { [MINIME_WORKSPACE_ROOT_ENV]: controlWorkspace }, execFileSync }),
+        readTavilyApiKeyFromSops({ env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlWorkspace }, execFileSync }),
         "tvly-shared-control",
       );
 
       process.chdir(agentTwo);
       assert.equal(
-        readTavilyApiKeyFromSops({ env: { [MINIME_WORKSPACE_ROOT_ENV]: controlWorkspace }, execFileSync }),
+        readTavilyApiKeyFromSops({ env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlWorkspace }, execFileSync }),
         "tvly-shared-control",
       );
 
@@ -679,7 +680,7 @@ describe("tavily: SOPS API key lookup", () => {
     }
   });
 
-  it("returns undefined without invoking sops when MINIME_WORKSPACE_ROOT is absent", () => {
+  it("returns undefined without invoking sops when MINIME_CONTROL_WORKSPACE_ROOT is absent", () => {
     const calls: Array<{ file: string; args: readonly string[] }> = [];
     const execFileSync: ExecFileSyncLike = (file, args) => {
       calls.push({ file, args });
@@ -689,6 +690,28 @@ describe("tavily: SOPS API key lookup", () => {
     assert.equal(readTavilyApiKeyFromSops({ env: {}, execFileSync }), undefined);
     assert.equal(tavilyControlWorkspaceRoot({}), undefined);
     assert.equal(calls.length, 0);
+  });
+
+  it("ignores the retired control workspace secret contract", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-secret-retired-control-"));
+    mkdirSync(join(controlWorkspace, "config"));
+    writeFileSync(join(controlWorkspace, TAVILY_SOPS_FILE_RELPATH), "placeholder: true\n", "utf8");
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    const execFileSync: ExecFileSyncLike = (file, args) => {
+      calls.push({ file, args });
+      return "should-not-run\n";
+    };
+
+    try {
+      assert.equal(
+        readTavilyApiKeyFromSops({ env: { [RETIRED_CONTROL_WORKSPACE_ENV]: controlWorkspace }, execFileSync }),
+        undefined,
+      );
+      assert.equal(tavilyControlWorkspaceRoot({ [RETIRED_CONTROL_WORKSPACE_ENV]: controlWorkspace }), undefined);
+      assert.equal(calls.length, 0);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
   });
 
   it("does not expose SOPS secret values through lookup failures", () => {
@@ -740,7 +763,7 @@ describe("tavily: warn + tool descriptors", () => {
   it("wrapper registers web_search/web_fetch and missing-key executions stay graceful", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-graceful-"));
     const oldCwd = process.cwd();
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const moduleUrl = pathToFileURL(resolve(BOT_DIR, "extensions", "pi", "web-tools.ts")).href;
     const mod = await import(moduleUrl) as {
       default: (pi: { registerTool: (tool: RegisteredTool) => void }) => void;
@@ -758,7 +781,7 @@ describe("tavily: warn + tool descriptors", () => {
 
     try {
       process.chdir(tmpDir);
-      delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       mod.default({ registerTool: (tool) => registered.push(tool) });
 
       assert.deepEqual(registered.map((tool) => tool.name), ["web_search", "web_fetch"]);
@@ -779,8 +802,8 @@ describe("tavily: warn + tool descriptors", () => {
     } finally {
       console.warn = originalWarn;
       globalThis.fetch = originalFetch;
-      if (oldWorkspace === undefined) delete process.env[MINIME_WORKSPACE_ROOT_ENV];
-      else process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      else process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       process.chdir(oldCwd);
       rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -799,13 +822,13 @@ describe("web-tools Pi wrapper", () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-missing-"));
     const oldCwd = process.cwd();
     const oldWarn = console.warn;
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const warnings: string[] = [];
     const registered: RegisteredTool[] = [];
 
     try {
       process.chdir(tmpDir);
-      delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       console.warn = (message?: unknown) => {
         warnings.push(String(message));
       };
@@ -821,8 +844,8 @@ describe("web-tools Pi wrapper", () => {
       assert.match(result.content[0].text, /SOPS key tavily\.api_key in config\/secrets\.sops\.yaml/);
     } finally {
       console.warn = oldWarn;
-      if (oldWorkspace === undefined) delete process.env[MINIME_WORKSPACE_ROOT_ENV];
-      else process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      else process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       process.chdir(oldCwd);
       rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -836,7 +859,7 @@ describe("web-tools Pi wrapper", () => {
     const sopsLog = join(tmpDir, "sops-argv.txt");
     const oldCwd = process.cwd();
     const oldPath = process.env.PATH;
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const oldFetch = globalThis.fetch;
     const registered: RegisteredTool[] = [];
     const fetchCalls: FetchCall[] = [];
@@ -858,7 +881,7 @@ describe("web-tools Pi wrapper", () => {
       );
       chmodSync(join(binDir, "sops"), 0o755);
       process.env.PATH = `${binDir}:${oldPath ?? ""}`;
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
       process.chdir(childWorkspace);
       globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         fetchCalls.push({ url: String(url), init });
@@ -882,8 +905,8 @@ describe("web-tools Pi wrapper", () => {
       globalThis.fetch = oldFetch;
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
-      if (oldWorkspace === undefined) delete process.env[MINIME_WORKSPACE_ROOT_ENV];
-      else process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      else process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       process.chdir(oldCwd);
       rmSync(tmpDir, { recursive: true, force: true });
     }

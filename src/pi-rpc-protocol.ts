@@ -13,10 +13,10 @@ import type {
 import { log } from "./logger.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
 import {
-  MINIME_AGENT_WORKSPACE_CWD_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
-  MINIME_WORKSPACE_ROOT_ENV,
   resolveAgentWorkspaceCwd,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
@@ -93,10 +93,10 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "HOME",
   "LANG",
   "LOGNAME",
-  MINIME_AGENT_WORKSPACE_CWD_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
-  MINIME_WORKSPACE_ROOT_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -129,6 +129,9 @@ const PI_CHILD_LC_ENV_KEYS = new Set([
   "LC_NUMERIC",
   "LC_TIME",
 ]);
+
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 export function shouldIncludePiChildEnvKey(key: string): boolean {
   return PI_CHILD_ENV_KEY_ALLOWLIST.has(key) || PI_CHILD_LC_ENV_KEYS.has(key);
@@ -404,11 +407,13 @@ function buildAllowedPiChildEnv(
     pathParts.unshift("/opt/homebrew/bin");
   }
   env.PATH = pathParts.join(":");
-  env[MINIME_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
-  delete env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+  delete env[RETIRED_CONTROL_WORKSPACE_ENV];
+  delete env[RETIRED_AGENT_WORKSPACE_ENV];
+  delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+  env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
-    env[MINIME_AGENT_WORKSPACE_CWD_ENV] = normalize(resolve(agentRoot));
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = normalize(resolve(agentRoot));
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");

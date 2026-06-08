@@ -8,7 +8,7 @@ import {
 import { basename, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { type ResolvedKnowledgeLayout, resolveKnowledgeLayout } from "./layout.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 export type KnowledgeSearchScope = "auto" | "default" | "diary" | "all";
 export type KnowledgeSourceKind = "index" | "wiki" | "auto" | "diary";
@@ -141,7 +141,7 @@ function resolveAgentWorkspaceRoot(deps: KnowledgeToolDeps): string | undefined 
   const env = deps.env ?? process.env;
   const root =
     deps.agentWorkspaceRoot ??
-    env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   return typeof root === "string" && root.trim() ? root : undefined;
 }
 
@@ -151,7 +151,7 @@ function resolveLayoutForDeps(deps: KnowledgeToolDeps): ResolvedKnowledgeLayout 
     return failure(
       "unavailable",
       "agent-workspace-unset",
-      "Knowledge tools are unavailable because MINIME_AGENT_WORKSPACE_CWD was not provided.",
+      "Knowledge tools are unavailable because MINIME_AGENT_WORKSPACE_ROOT was not provided.",
     );
   }
 

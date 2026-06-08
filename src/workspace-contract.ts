@@ -2,8 +2,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const MINIME_WORKSPACE_ROOT_ENV = "MINIME_WORKSPACE_ROOT";
-export const MINIME_AGENT_WORKSPACE_CWD_ENV = "MINIME_AGENT_WORKSPACE_CWD";
+export const MINIME_CONTROL_WORKSPACE_ROOT_ENV = "MINIME_CONTROL_WORKSPACE_ROOT";
+export const MINIME_AGENT_WORKSPACE_ROOT_ENV = "MINIME_AGENT_WORKSPACE_ROOT";
 export const MINIME_CONFIG_PATH_ENV = "MINIME_CONFIG_PATH";
 export const MINIME_CRONS_PATH_ENV = "MINIME_CRONS_PATH";
 
@@ -25,9 +25,9 @@ export interface WorkspaceContractPaths {
   /** Installed/source package root that owns runtime code and bundled extensions. */
   packageRoot: string;
   botRoot: string;
-  /** Control/app workspace root selected by --workspace or MINIME_WORKSPACE_ROOT. */
+  /** Control/app workspace root selected by --workspace or MINIME_CONTROL_WORKSPACE_ROOT. */
   controlWorkspaceRoot: string;
-  /** Backwards-compatible alias for controlWorkspaceRoot. */
+  /** Internal alias for controlWorkspaceRoot; the canonical concept is the control workspace. */
   workspaceRoot: string;
   configPath: string;
   cronsPath: string;
@@ -115,7 +115,7 @@ function controlWorkspaceRootFromOptions(
     };
   }
 
-  const envWorkspace = optionalEnvPath(options.env, MINIME_WORKSPACE_ROOT_ENV);
+  const envWorkspace = optionalEnvPath(options.env, MINIME_CONTROL_WORKSPACE_ROOT_ENV);
   if (envWorkspace) {
     return {
       diagnostic: { path: absolutePath(envWorkspace, options.cwd), source: "env" },
@@ -128,7 +128,7 @@ function controlWorkspaceRootFromOptions(
       diagnostic: { path: options.cwd, source: "cwd-fallback" },
       warnings: [
         `No control workspace root was supplied; using cwd (${options.cwd}). Pass --workspace or ` +
-          `${MINIME_WORKSPACE_ROOT_ENV} when running from a package install.`,
+          `${MINIME_CONTROL_WORKSPACE_ROOT_ENV} when running from a package install.`,
       ],
     };
   }

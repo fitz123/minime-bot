@@ -177,8 +177,8 @@ validate_config() {
     return 0
   fi
   local args=(config validate)
-  if [ -n "${MINIME_WORKSPACE_ROOT:-}" ]; then
-    args+=(--workspace "$MINIME_WORKSPACE_ROOT")
+  if [ -n "${MINIME_CONTROL_WORKSPACE_ROOT:-}" ]; then
+    args+=(--workspace "$MINIME_CONTROL_WORKSPACE_ROOT")
   fi
   if ! ( cd "$BOT_DIR" && node "$BOT_DIR/dist/cli.js" "${args[@]}" >/dev/null ); then
     err "config validation failed; refusing to restart"

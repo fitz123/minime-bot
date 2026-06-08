@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { executeKnowledgeGet, executeKnowledgeSearch, formatKnowledgeToolResponse } from "../knowledge/tools.js";
 import { resolveKnowledgeLayout, type ResolvedKnowledgeLayout } from "../knowledge/layout.js";
 import { executeKnowledgeUpdate, formatKnowledgeUpdateResponse } from "../knowledge/update.js";
-import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 export const KNOWLEDGE_SEARCH_TOOL = {
   name: "knowledge_search",
@@ -119,7 +119,7 @@ const MANAGED_EXACT_RELPATHS = [
 ] as const;
 
 const AGENT_WORKSPACE_ENV_FALLBACK_WARNING =
-  `${MINIME_AGENT_WORKSPACE_CWD_ENV} was not provided; falling back to process cwd for this Pi knowledge call.`;
+  `${MINIME_AGENT_WORKSPACE_ROOT_ENV} was not provided; falling back to process cwd for this Pi knowledge call.`;
 
 const KNOWLEDGE_TOOL_NAMES = new Set(["knowledge_search", "knowledge_get", "knowledge_update"]);
 const MUTATING_TOOL_NAMES = new Set(["write", "edit", "bash"]);
@@ -195,7 +195,7 @@ function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefin
 
 function envAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
   const env = deps.env ?? process.env;
-  const root = env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+  const root = env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   return typeof root === "string" && root.trim() ? root : undefined;
 }
 

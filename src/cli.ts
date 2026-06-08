@@ -27,7 +27,8 @@ import {
   type WorkspaceValidationResult,
 } from "./workspace-validator.js";
 import {
-  MINIME_AGENT_WORKSPACE_CWD_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
@@ -75,8 +76,8 @@ Options:
   --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
   -h, --help          Show this help text.
 
-Config/workspace defaults: MINIME_WORKSPACE_ROOT, then source repo root or package cwd.
-Knowledge defaults: explicit --workspace, then MINIME_AGENT_WORKSPACE_CWD. Knowledge commands do not resolve config secrets.
+Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
+Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
@@ -143,7 +144,7 @@ function resolveKnowledgeAgentWorkspace(parsed: ParsedArgs, options: CliRunOptio
     return resolveCliPath(parsed.workspace, cwd);
   }
   const env = options.env ?? process.env;
-  const envWorkspace = env[MINIME_AGENT_WORKSPACE_CWD_ENV]?.trim();
+  const envWorkspace = env[MINIME_AGENT_WORKSPACE_ROOT_ENV]?.trim();
   return envWorkspace ? resolveCliPath(envWorkspace, cwd) : undefined;
 }
 

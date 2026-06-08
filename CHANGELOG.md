@@ -7,5 +7,6 @@
   in this package, while production config and agent workspace state live in an
   external control workspace.
 - Documented the package CLI, workspace selection through `--workspace` or
-  `MINIME_WORKSPACE_ROOT`, and the validation commands for pull requests.
+  `MINIME_CONTROL_WORKSPACE_ROOT`, and the validation commands for pull
+  requests.
 - Clarified that the current runtime path is Pi/Codex based.
