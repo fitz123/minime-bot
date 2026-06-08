@@ -38,8 +38,8 @@ npm pack --dry-run
 - [x] Preserve existing args and semantics (`--provider openai-codex`, `--thinking off`, `--no-context-files`, `--no-skills`, `--no-extensions`, explicit quota extension, `--no-session`, `--no-tools`, `-p`).
 
 ### Task 2: Tests
-- [ ] Update `src/__tests__/codex-quota-sampler.test.ts` to assert the built args include `--approve`.
-- [ ] If there is a dry-run/result assertion that snapshots args, update it too.
+- [x] Update `src/__tests__/codex-quota-sampler.test.ts` to assert the built args include `--approve`.
+- [x] If there is a dry-run/result assertion that snapshots args, update it too.
 
 ### Task 3: Validate and prepare PR
 - [ ] Run the focused test.

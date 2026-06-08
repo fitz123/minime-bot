@@ -423,6 +423,7 @@ describe("codex quota sampler probe execution", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].command, "pi");
     assert.equal(calls[0].cwd, join(dir, "sampler"));
+    assert.equal(calls[0].args[0], "--approve");
     assert.equal(calls[0].args.includes("--no-extensions"), true);
     assert.equal(calls[0].args.includes("--extension"), true);
     assert.ok(result.attemptFile?.startsWith(join(dir, "sampler", ".tmp")));
@@ -635,6 +636,7 @@ describe("codex quota sampler probe execution", () => {
 
     assert.equal(result.status, "dry_run");
     assert.equal(spawned, false);
+    assert.equal(result.args[0], "--approve");
     assert.equal(existsSync(samplerCwd), false);
     assert.equal(existsSync(result.settingsFile), false);
     assert.equal(existsSync(join(dir, "metrics", CODEX_QUOTA_PROBE_TEXTFILE_NAME)), false);
