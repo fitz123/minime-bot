@@ -51,9 +51,12 @@ only the git cleanliness gate after operator review. Migration writes or copies
 files, does not delete legacy sources, and `--report` writes the JSON response.
 Dry-runs skip catalog-only legacy memory indexes and report known active
 runtime docs or package/domain trees as nonblocking `out_of_scope` review items.
-Pre-v2 `wiki/schema.md`, `wiki/index.md`, and `wiki/log.md` controls are
-archived under `artifacts/legacy/wiki/` before canonical Knowledge v2 controls
-are generated. Secret-bearing or unsafe legacy controls still block migration.
+Pre-v2 `wiki/schema.md`, `wiki/index.md`, `wiki/log.md`, and existing
+`wiki/issues.md` controls are archived under `artifacts/legacy/wiki/` before
+replacement or pending-review writes are planned. Secret-bearing legacy
+`memory/auto` pages and unsafe controls still block migration; secret-bearing
+`memory/diary` entries are omitted and reported as nonblocking
+`secret_diary_omitted` review items.
 If a planned wiki page target disagrees with page frontmatter type, migration
 emits a blocking `type_review` item, omits that unsafe page write, still writes
 the dry-run report, and keeps `--apply` blocked until review.

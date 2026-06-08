@@ -645,7 +645,10 @@ function inferPageType(sourceRel: string, frontmatter: Record<string, unknown>, 
   if (slug.startsWith("project_") || /\b(project|status|workstream|initiative)\b/.test(text)) {
     return "project";
   }
-  if (/\b(feedback|correction|critique|do not|should not|preference correction|principle|lesson|operational|critical)\b/.test(text)) {
+  if (/\b(runbook|command reference|operational command|deploy script|one-off plan|execution plan|task plan)\b/.test(text)) {
+    return "project";
+  }
+  if (/\b(feedback|correction|critique|do not|should not|preference correction|principle|lesson)\b/.test(text)) {
     return "feedback";
   }
   if (slug === "facts" || /\bfacts\b/.test(text)) {
@@ -1025,20 +1028,24 @@ function isPlaceholderCatalogLine(line: string): boolean {
   return /^#{3,6}\s+/.test(line) || /^\(?\s*(?:empty|none yet|none|no entries|no memory files)\b/i.test(line);
 }
 
+function isCatalogMemorySectionTitle(title: string): boolean {
+  return /\b(index|catalog|contents|files|memory files|auto|diary|daily notes)\b/i.test(title);
+}
+
 function isCatalogOnlyMemorySection(section: LegacyMemorySection): boolean {
   if (isMemoryIndexIntroSection(section)) {
     return true;
   }
   const lines = section.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!isCatalogMemorySectionTitle(section.title)) {
+    return false;
+  }
   const catalogLike = lines.length === 0 || lines.every(isCatalogLinkLine) || isSimpleCatalogTable(lines);
   if (catalogLike) {
     return true;
   }
-  if (/\b(index|catalog|contents|files|memory files|auto|diary|daily notes|project|reference)\b/i.test(section.title) && lines.every(isPlaceholderCatalogLine)) {
+  if (lines.every(isPlaceholderCatalogLine)) {
     return true;
-  }
-  if (!/\b(index|catalog|contents|files|memory files|auto|diary|daily notes|project|reference)\b/i.test(section.title)) {
-    return false;
   }
   return lines.every(isCatalogLinkLine) || isSimpleCatalogTable(lines);
 }
@@ -1061,11 +1068,11 @@ function frontmatterForMemorySection(
   if (!section.body.trim() && /^legacy\s+memory$|^memory$/i.test(section.title)) {
     return undefined;
   }
-  if (isCatalogOnlyMemorySection(section)) {
+  const explicit = explicitMemorySectionType(section.title);
+  if (!explicit && isCatalogOnlyMemorySection(section)) {
     return undefined;
   }
 
-  const explicit = explicitMemorySectionType(section.title);
   const type = explicit?.type ?? inferPageType("MEMORY.md", {}, `${section.title}\n${section.body}`);
   if (!type) {
     return {
@@ -1169,16 +1176,22 @@ function planMemoryFile(plan: MutablePlan): void {
 
   const pendingReview = extractPendingReview(content);
   if (pendingReview) {
-    addWrite(
-      plan,
-      {
-        role: "issues",
-        sourcePath: relPath,
-        targetPath: "wiki/issues.md",
-        reason: "move existing pending review section into wiki/issues.md",
-      },
-      pendingReview,
-    );
+    const issuesPath = "wiki/issues.md";
+    const issuesExists = existsSync(workspacePath(plan.workspaceRoot, issuesPath));
+    const canOverwriteIssues = !issuesExists || hasLegacyControlArchive(plan, issuesPath);
+    if (canOverwriteIssues) {
+      addWrite(
+        plan,
+        {
+          role: "issues",
+          sourcePath: relPath,
+          targetPath: issuesPath,
+          reason: "move existing pending review section into wiki/issues.md",
+        },
+        pendingReview,
+        { allowOverwrite: issuesExists },
+      );
+    }
   }
   for (const section of splitLegacyMemorySections(removePendingReview(content))) {
     const page = frontmatterForMemorySection(section);
@@ -1689,8 +1702,8 @@ function planMigration(workspaceRoot: string, deps: KnowledgeMigrationDeps): Mut
   }
 
   const files = walkFiles(workspaceRoot);
-  planMemoryFile(plan);
   planLegacyWikiControlArchives(plan);
+  planMemoryFile(plan);
 
   for (const relPath of files) {
     if (relPath.startsWith("memory/auto/")) {
