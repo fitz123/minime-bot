@@ -48,10 +48,10 @@ Private operator validation with real workspaces will be run outside this public
 
 ### Task 2: Preserve explicit feedback and harden slugging
 
-- [ ] Ensure explicit `type: feedback` legacy pages route to feedback pages before broad runbook/artifact keyword checks.
-- [ ] Keep one-off plan/runbook heuristics for untyped or project/reference pages where they still apply.
-- [ ] Add a slug fallback that uses the source filename when the display name slugifies to an empty/`untitled` slug.
-- [ ] Add tests for non-ASCII feedback names avoiding `untitled` collisions.
+- [x] Ensure explicit `type: feedback` legacy pages route to feedback pages before broad runbook/artifact keyword checks.
+- [x] Keep one-off plan/runbook heuristics for untyped or project/reference pages where they still apply.
+- [x] Add a slug fallback that uses the source filename when the display name slugifies to an empty/`untitled` slug.
+- [x] Add tests for non-ASCII feedback names avoiding `untitled` collisions.
 
 ### Task 3: Handle pre-v2 wiki controls safely
 
