@@ -44,10 +44,10 @@ npm run build
 
 ### Task 2: Fix planner behavior
 
-- [ ] Centralize validation that a `wiki/pages/<type>/...` target matches the page frontmatter `type`.
-- [ ] When target/frontmatter mismatch is found during planning, add a blocking `type_review` item with a stable reason such as `frontmatter_target_type_mismatch` and a useful `suggestedTarget`.
-- [ ] Skip adding the unsafe wiki page write operation for that source.
-- [ ] Keep `collectPlannedPages` defensive: it must not hard-throw for recoverable planned-page validation failures in dry-run/apply planning.
+- [x] Centralize validation that a `wiki/pages/<type>/...` target matches the page frontmatter `type`.
+- [x] When target/frontmatter mismatch is found during planning, add a blocking `type_review` item with a stable reason such as `frontmatter_target_type_mismatch` and a useful `suggestedTarget`.
+- [x] Skip adding the unsafe wiki page write operation for that source.
+- [x] Keep `collectPlannedPages` defensive: it must not hard-throw for recoverable planned-page validation failures in dry-run/apply planning.
 
 ### Task 3: Verify no regressions
 
