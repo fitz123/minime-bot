@@ -49,6 +49,11 @@ dry-run by default. `--apply` writes planned files only when the agent workspace
 has a clean git worktree and no blocking review items; `--allow-dirty` bypasses
 only the git cleanliness gate after operator review. Migration writes or copies
 files, does not delete legacy sources, and `--report` writes the JSON response.
+Dry-runs skip catalog-only legacy memory indexes and report known active
+runtime docs or package/domain trees as nonblocking `out_of_scope` review items.
+Pre-v2 `wiki/schema.md`, `wiki/index.md`, and `wiki/log.md` controls are
+archived under `artifacts/legacy/wiki/` before canonical Knowledge v2 controls
+are generated. Secret-bearing or unsafe legacy controls still block migration.
 If a planned wiki page target disagrees with page frontmatter type, migration
 emits a blocking `type_review` item, omits that unsafe page write, still writes
 the dry-run report, and keeps `--apply` blocked until review.

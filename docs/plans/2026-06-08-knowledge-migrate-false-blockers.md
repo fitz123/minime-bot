@@ -62,6 +62,6 @@ Private operator validation with real workspaces will be run outside this public
 
 ### Task 4: Validate and document
 
-- [ ] Run the validation commands.
-- [ ] Update README notes only if behavior needs operator-visible documentation.
-- [ ] Keep issue #7 behavior intact and update PR body to mention issue #9 if this branch remains the same PR.
+- [x] Run the validation commands.
+- [x] Update README notes only if behavior needs operator-visible documentation.
+- [x] Keep issue #7 behavior intact and update PR body to mention issue #9 if this branch remains the same PR.
