@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_WORKSPACE_ROOT_ENV,
@@ -14,6 +15,10 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
+const DEFAULT_PI_EXTENSION_DIR =
+  basename(dirname(__dirname)) === "dist"
+    ? resolve(BOT_ROOT, "dist", "extensions", "pi")
+    : resolve(BOT_ROOT, "extensions", "pi");
 
 function assertAbsolutePaths(paths: WorkspaceContractPaths): void {
   for (const [name, path] of Object.entries(paths)) {
@@ -39,7 +44,7 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.workspaceRoot, cwd);
     assert.strictEqual(contract.paths.configPath, resolve(cwd, "config.yaml"));
     assert.strictEqual(contract.paths.cronsPath, resolve(cwd, "crons.yaml"));
-    assert.strictEqual(contract.paths.piExtensionDir, resolve(BOT_ROOT, "extensions", "pi"));
+    assert.strictEqual(contract.paths.piExtensionDir, DEFAULT_PI_EXTENSION_DIR);
     assert.strictEqual(contract.paths.dataDir, resolve(cwd, "data"));
     assert.strictEqual(contract.paths.sessionStorePath, resolve(cwd, "data", "sessions.json"));
     assert.strictEqual(contract.effectivePaths.sessionStorePath.source, "workspace-default");
@@ -47,7 +52,7 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/bot-media");
     assert.strictEqual(contract.paths.runtimeDir, resolve(cwd, ".tmp"));
     assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "cwd-fallback");
-    assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_WORKSPACE_ROOT/);
+    assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_CONTROL_WORKSPACE_ROOT/);
   });
 
   it("uses package artifact Pi wrappers for a built source checkout", () => {
@@ -83,14 +88,14 @@ describe("workspace contract resolver", () => {
     );
   });
 
-  it("uses an explicit CLI workspace before MINIME_WORKSPACE_ROOT", () => {
+  it("uses an explicit CLI workspace before MINIME_CONTROL_WORKSPACE_ROOT", () => {
     const cwd = mkdtempSync(join(tmpdir(), "minime-contract-cwd-"));
     const cliWorkspace = "cli-workspace";
     const envWorkspace = join(tmpdir(), "ignored-env-workspace");
     const contract = resolveWorkspaceContract({
       cwd,
       workspace: cliWorkspace,
-      env: { [MINIME_WORKSPACE_ROOT_ENV]: envWorkspace },
+      env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: envWorkspace },
       homeDir: "/tmp/minime-home",
     });
 
@@ -101,11 +106,11 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.configPath, resolve(cwd, cliWorkspace, "config.yaml"));
   });
 
-  it("uses MINIME_WORKSPACE_ROOT for workspace-relative defaults", () => {
+  it("uses MINIME_CONTROL_WORKSPACE_ROOT for control workspace-relative defaults", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "minime-contract-workspace-"));
     const contract = resolveWorkspaceContract({
       cwd: "/tmp/ignored-cwd",
-      env: { [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot },
+      env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot },
       homeDir: "/tmp/minime-home",
     });
 
@@ -119,13 +124,30 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.runtimeDir, join(workspaceRoot, ".tmp"));
   });
 
+  it("ignores the old MINIME_WORKSPACE_ROOT env", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "minime-contract-old-env-cwd-"));
+    const oldWorkspaceRoot = mkdtempSync(join(tmpdir(), "minime-contract-old-env-"));
+    const contract = resolveWorkspaceContract({
+      cwd,
+      env: { [MINIME_WORKSPACE_ROOT_ENV]: oldWorkspaceRoot },
+      homeDir: "/tmp/minime-home",
+    });
+
+    assert.strictEqual(contract.paths.controlWorkspaceRoot, cwd);
+    assert.strictEqual(contract.paths.workspaceRoot, cwd);
+    assert.strictEqual(contract.effectivePaths.controlWorkspaceRoot.source, "cwd-fallback");
+    assert.notStrictEqual(contract.paths.configPath, join(oldWorkspaceRoot, "config.yaml"));
+    assert.match(contract.warnings.join("\n"), /MINIME_CONTROL_WORKSPACE_ROOT/);
+    assert.doesNotMatch(contract.warnings.join("\n"), /MINIME_WORKSPACE_ROOT/);
+  });
+
   it("uses explicit config and crons path overrides", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "minime-contract-overrides-"));
     const absoluteCronsPath = join(workspaceRoot, "absolute", "crons.yaml");
     const contract = resolveWorkspaceContract({
       cwd: "/tmp/ignored-cwd",
       env: {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: "custom/config.yaml",
         [MINIME_CRONS_PATH_ENV]: absoluteCronsPath,
         LOG_DIR: "/tmp/minime-logs",
@@ -158,7 +180,7 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(basename(contract.paths.packageRoot), "minime-bot");
     assert.strictEqual(contract.paths.workspaceRoot, cwd);
     assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "cwd-fallback");
-    assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_WORKSPACE_ROOT/);
+    assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_CONTROL_WORKSPACE_ROOT/);
   });
 
   it("returns structured diagnostics without reading or echoing secret env values", () => {
@@ -166,7 +188,7 @@ describe("workspace contract resolver", () => {
     const contract = resolveWorkspaceContract({
       cwd: "/tmp/ignored-cwd",
       env: {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: "missing-config.yaml",
         TELEGRAM_TOKEN: "do-not-print-me",
         SOPS_AGE_KEY: "do-not-print-me-either",

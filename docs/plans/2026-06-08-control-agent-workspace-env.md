@@ -89,10 +89,10 @@ Important constraints:
 
 ### Task 1: Workspace contract constants and resolver
 
-- [ ] Replace old env constants with canonical constants.
-- [ ] Update control workspace resolver to use only `MINIME_CONTROL_WORKSPACE_ROOT`.
-- [ ] Update warnings/comments to say "control workspace" instead of ambiguous "workspace root" where relevant.
-- [ ] Add tests for canonical control env and old-env ignored behavior.
+- [x] Replace old env constants with canonical constants.
+- [x] Update control workspace resolver to use only `MINIME_CONTROL_WORKSPACE_ROOT`.
+- [x] Update warnings/comments to say "control workspace" instead of ambiguous "workspace root" where relevant.
+- [x] Add tests for canonical control env and old-env ignored behavior.
 
 ### Task 2: Pi child env contract
 
