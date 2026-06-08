@@ -39,6 +39,7 @@ const DEFAULT_CODEX_QUOTA_MODEL = "openai-codex/gpt-5.5";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
 const DEFAULT_PROMPT = "Reply with exactly: OK";
+const SAMPLER_SYSTEM_PROMPT = "You are a quota sampler. Follow the user prompt exactly.";
 const OUTPUT_BUFFER_LIMIT = 64 * 1024;
 const SAMPLER_PROJECT_SETTINGS = { transport: "sse" };
 
@@ -265,9 +266,15 @@ export function buildCodexQuotaSamplerArgs(config: Pick<CodexQuotaSamplerConfig,
     "off",
     "--no-context-files",
     "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
     "--no-extensions",
     "--extension",
     config.extensionPath,
+    "--system-prompt",
+    SAMPLER_SYSTEM_PROMPT,
+    "--append-system-prompt",
+    "",
     "--no-session",
     "--no-tools",
     "-p",
