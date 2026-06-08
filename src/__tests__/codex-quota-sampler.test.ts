@@ -212,6 +212,25 @@ describe("codex quota sampler command setup", () => {
     assert.equal(cliOverride.piBin, "/cli/pi");
   });
 
+  it("does not return raw JS fallback paths as default Pi commands on Windows", () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const config = resolveCodexQuotaSamplerConfig({
+        cwd: tempDir(),
+        env: { CODEX_QUOTA_TEXTFILE_DIR: "metrics" },
+        extensionPath: "/abs/ext.ts",
+        forbiddenSamplerCwds: [],
+      });
+
+      assert.doesNotMatch(config.piBin, /[\\/]dist[\\/]cli\.js$/);
+    } finally {
+      if (platformDescriptor) {
+        Object.defineProperty(process, "platform", platformDescriptor);
+      }
+    }
+  });
+
   it("defaults quota state to the selected workspace runtime dir", () => {
     const cwd = tempDir();
     const workspace = tempDir();
