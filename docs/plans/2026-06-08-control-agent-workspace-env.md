@@ -1,5 +1,7 @@
 # Plan: Hard-cut control vs agent workspace environment names
 
+Status: package implementation complete; external deploy cutover remains outside this repository.
+
 ## Goal
 
 Support the physical split between the Minime control workspace and the `main` agent workspace by fixing the ambiguous workspace environment contract with a **hard cutover** to explicit canonical names:
@@ -18,7 +20,7 @@ Remove package use of the old ambiguous env names instead of accepting or settin
 - remove/stop accepting `MINIME_WORKSPACE_ROOT`
 - remove/stop accepting `MINIME_AGENT_WORKSPACE_CWD`
 
-The currently installed production package can keep running with the old contract until an explicit deploy. The new package version itself must not carry a dual-name compatibility layer. Final private cutover to `/Users/ninja/.minime/control-workspace` is operator work and is gated on explicit restart/cutover approval.
+The currently installed production package can keep running with the old contract until an explicit deploy. The new package version itself must not carry a dual-name compatibility layer. Final private cutover is operator work outside this repository and is gated on explicit restart/cutover approval.
 
 ## Context
 
@@ -125,11 +127,11 @@ Important constraints:
   - `npm run build`
   - `npm pack --dry-run`
 
-## Private follow-up after PR merge and explicit deploy approval
+## External follow-up after PR merge and explicit deploy approval
 
-The private TUI env extension must be updated atomically with the package deploy:
+Operator-managed Pi/TUI environment injection outside this repository must be updated atomically with the package deploy:
 
-- `~/.pi/agent/extensions/minime-tui-runtime-env.js` should set `MINIME_CONTROL_WORKSPACE_ROOT` and `MINIME_AGENT_WORKSPACE_ROOT` only.
-- Remove old env names from private Pi/TUI docs and artifacts where they are current operational instructions.
+- Set `MINIME_CONTROL_WORKSPACE_ROOT` and `MINIME_AGENT_WORKSPACE_ROOT` only.
+- Remove retired workspace env names from external operator docs and artifacts where they are current operational instructions.
 
-This follow-up is private workspace work and should be tracked in bead `workspace-841v`; do not deploy or restart without Ninja's explicit confirmation.
+Specific private paths, deployment state, and external task-tracker IDs are intentionally not tracked in this public package repository.

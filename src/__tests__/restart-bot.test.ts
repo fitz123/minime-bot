@@ -5,11 +5,13 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SCRIPT = resolve(__dirname, "../../scripts/restart-bot.sh");
+const CONTROL_WORKSPACE_ENV = "MINIME_CONTROL_WORKSPACE_ROOT";
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 
 // Mock launchctl: writes / reads a key=value state file in $STATE_DIR/state.
 // Supports: list, kill <sig> <svc>, bootout <svc>, bootstrap <domain> <plist>.
@@ -337,6 +339,44 @@ describe("restart-bot.sh", () => {
       assert.ok(!("kill_at" in state), `expected no kill scheduled, got state: ${JSON.stringify(state)}`);
       assert.strictEqual(state.pid, "1111");
       assert.doesNotMatch(stdout, /Sending SIGTERM/);
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("graceful: passes canonical control workspace to the default config validator", () => {
+    const h = createHarness();
+    try {
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 2222, kill_delay: 0 });
+      const controlWorkspace = join(h.dir, "control-workspace");
+      const retiredWorkspace = join(h.dir, "retired-control-workspace");
+      const argvCapturePath = join(h.dir, "node-argv.json");
+      const nodePreloadPath = join(h.dir, "capture-node-argv.mjs");
+      mkdirSync(controlWorkspace, { recursive: true });
+      writeFileSync(
+        nodePreloadPath,
+        [
+          'import { writeFileSync } from "node:fs";',
+          "const capturePath = process.env.NODE_ARGV_CAPTURE;",
+          'if (capturePath) writeFileSync(capturePath, JSON.stringify(process.argv), "utf8");',
+          "process.exit(0);",
+          "",
+        ].join("\n"),
+      );
+
+      const { status, stderr } = h.run([], {
+        CONFIG_VALIDATE_BIN: "",
+        [CONTROL_WORKSPACE_ENV]: controlWorkspace,
+        [RETIRED_CONTROL_WORKSPACE_ENV]: retiredWorkspace,
+        NODE_ARGV_CAPTURE: argvCapturePath,
+        NODE_OPTIONS: `--import=${pathToFileURL(nodePreloadPath).href}`,
+      });
+
+      assert.strictEqual(status, 0, `expected exit 0, got ${status}: ${stderr}`);
+      const argv = JSON.parse(readFileSync(argvCapturePath, "utf8")) as string[];
+      assert.ok(argv[1]?.endsWith("/dist/cli.js"), `expected dist/cli.js argv, got ${JSON.stringify(argv)}`);
+      assert.deepStrictEqual(argv.slice(2), ["config", "validate", "--workspace", controlWorkspace]);
+      assert.ok(!argv.includes(retiredWorkspace), `retired workspace leaked into argv: ${JSON.stringify(argv)}`);
     } finally {
       cleanup(h);
     }

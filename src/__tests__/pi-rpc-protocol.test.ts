@@ -40,6 +40,7 @@ import {
   sendPiGetState,
   sendPiPrompt,
   sendPiSteer,
+  shouldIncludePiChildEnvKey,
   spawnPiRpcSession,
   type PiExtensionResolveOptions,
 } from "../pi-rpc-protocol.js";
@@ -645,6 +646,13 @@ describe("Pi extension loading (--extension)", () => {
 describe("buildPiSpawnEnv", () => {
   beforeEach(() => {
     mkdirSync(testAgent.workspaceCwd, { recursive: true });
+  });
+
+  it("allowlists canonical workspace env keys but excludes retired workspace env keys", () => {
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_CONTROL_WORKSPACE_ROOT_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_AGENT_WORKSPACE_ROOT_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
+    assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
   });
 
   function withWorkspaceRoot<T>(workspaceRoot: string, fn: () => T): T {

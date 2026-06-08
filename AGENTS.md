@@ -20,6 +20,11 @@ This is the public `minime-bot` package repository.
   extension source under `extensions/pi`.
 - Control workspace files are external inputs selected by `--workspace` or
   `MINIME_CONTROL_WORKSPACE_ROOT`.
+- Keep the control/app workspace, agent workspace, package source checkout, and
+  package runtime install as distinct roots. Use only
+  `MINIME_CONTROL_WORKSPACE_ROOT` and `MINIME_AGENT_WORKSPACE_ROOT` for the
+  workspace env contract; retired ambiguous workspace env names must not be accepted
+  or passed to Pi children.
 - Do not add deployment scripts or private production launch state here.
 
 ## Workflow

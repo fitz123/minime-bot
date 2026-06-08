@@ -70,11 +70,27 @@ describe("project naming", () => {
       "minime-bot knowledge update --workspace /path/to/agent-workspace",
       "MINIME_CONTROL_WORKSPACE_ROOT",
       "MINIME_AGENT_WORKSPACE_ROOT",
+      "hard cut to canonical names",
+      "not passed to Pi children",
       "agent workspace, not the control workspace",
       "control workspace",
       "test-fixtures/minimal-workspace",
     ]) {
       assert.ok(readme.includes(expected), `README.md should document ${expected}`);
+    }
+  });
+
+  it("AGENTS documents distinct roots and canonical workspace env names", () => {
+    for (const expected of [
+      "control/app workspace",
+      "agent workspace",
+      "package source checkout",
+      "package runtime install",
+      "MINIME_CONTROL_WORKSPACE_ROOT",
+      "MINIME_AGENT_WORKSPACE_ROOT",
+      "retired ambiguous workspace env names must not be accepted",
+    ]) {
+      assert.ok(agentsDoc.includes(expected), `AGENTS.md should document ${expected}`);
     }
   });
 

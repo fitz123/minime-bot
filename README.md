@@ -17,6 +17,12 @@ The package uses four separate roots:
 - The package runtime install is a built npm install that loads artifacts from
   `dist/`.
 
+The workspace environment contract is a hard cut to canonical names. Config and
+workspace commands read only `MINIME_CONTROL_WORKSPACE_ROOT` when `--workspace`
+is omitted; Knowledge commands and Pi child processes use
+`MINIME_AGENT_WORKSPACE_ROOT` for agent context. Ambiguous pre-cut workspace env
+names are intentionally ignored and are not passed to Pi children.
+
 ## Package CLI
 
 Build the package before running the compiled CLI from this checkout:
