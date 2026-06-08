@@ -11,7 +11,7 @@ import {
   readQuotaStatus,
   resolveQuotaStateFile,
 } from "../quota-status.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 
@@ -208,7 +208,7 @@ describe("quota status reader", () => {
     assert.equal(
       resolveQuotaStateFile({
         cwd: dir,
-        env: { [MINIME_WORKSPACE_ROOT_ENV]: workspace },
+        env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspace },
       }),
       join(workspace, ".tmp", "codex-quota-state.json"),
     );

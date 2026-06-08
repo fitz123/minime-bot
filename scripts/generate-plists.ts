@@ -14,7 +14,7 @@ import {
   validateCronForPlist,
   type CronPlistDef,
 } from "../src/cron-plist.js";
-import { resolveWorkspaceContract, MINIME_WORKSPACE_ROOT_ENV } from "../src/workspace-contract.js";
+import { resolveWorkspaceContract, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../src/workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -202,7 +202,7 @@ ${scheduleSection}
 	    <dict>
 	        <key>HOME</key>
 	        <string>${xmlEscape(HOME)}</string>
-	        <key>${MINIME_WORKSPACE_ROOT_ENV}</key>
+	        <key>${MINIME_CONTROL_WORKSPACE_ROOT_ENV}</key>
 	        <string>${xmlEscape(controlWorkspaceRoot)}</string>
 	        <key>LOG_DIR</key>
 	        <string>${xmlEscape(LOG_DIR)}</string>

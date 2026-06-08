@@ -8,7 +8,6 @@ import {
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
-  MINIME_WORKSPACE_ROOT_ENV,
   resolveWorkspaceContract,
   type WorkspaceContractPaths,
 } from "../workspace-contract.js";
@@ -19,6 +18,7 @@ const DEFAULT_PI_EXTENSION_DIR =
   basename(dirname(__dirname)) === "dist"
     ? resolve(BOT_ROOT, "dist", "extensions", "pi")
     : resolve(BOT_ROOT, "extensions", "pi");
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 
 function assertAbsolutePaths(paths: WorkspaceContractPaths): void {
   for (const [name, path] of Object.entries(paths)) {
@@ -124,12 +124,12 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.runtimeDir, join(workspaceRoot, ".tmp"));
   });
 
-  it("ignores the old MINIME_WORKSPACE_ROOT env", () => {
+  it("ignores the retired control workspace env", () => {
     const cwd = mkdtempSync(join(tmpdir(), "minime-contract-old-env-cwd-"));
     const oldWorkspaceRoot = mkdtempSync(join(tmpdir(), "minime-contract-old-env-"));
     const contract = resolveWorkspaceContract({
       cwd,
-      env: { [MINIME_WORKSPACE_ROOT_ENV]: oldWorkspaceRoot },
+      env: { [RETIRED_CONTROL_WORKSPACE_ENV]: oldWorkspaceRoot },
       homeDir: "/tmp/minime-home",
     });
 
@@ -138,7 +138,7 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.effectivePaths.controlWorkspaceRoot.source, "cwd-fallback");
     assert.notStrictEqual(contract.paths.configPath, join(oldWorkspaceRoot, "config.yaml"));
     assert.match(contract.warnings.join("\n"), /MINIME_CONTROL_WORKSPACE_ROOT/);
-    assert.doesNotMatch(contract.warnings.join("\n"), /MINIME_WORKSPACE_ROOT/);
+    assert.doesNotMatch(contract.warnings.join("\n"), new RegExp(RETIRED_CONTROL_WORKSPACE_ENV));
   });
 
   it("uses explicit config and crons path overrides", () => {

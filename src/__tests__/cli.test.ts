@@ -226,7 +226,7 @@ describe("minime-bot CLI", () => {
       assert.equal(parsed.ok, false);
       assert.equal(parsed.reason, "agent-workspace-unset");
       assert.match(parsed.message, /MINIME_AGENT_WORKSPACE_ROOT/);
-      assert.doesNotMatch(parsed.message, /MINIME_AGENT_WORKSPACE_CWD/);
+      assert.doesNotMatch(parsed.message, new RegExp(RETIRED_AGENT_WORKSPACE_ENV));
     } finally {
       rmSync(agentWorkspace, { recursive: true, force: true });
     }

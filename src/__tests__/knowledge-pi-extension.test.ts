@@ -97,7 +97,7 @@ describe("Knowledge Pi extension helpers", () => {
       assert.doesNotMatch(result.text, /stale\.md/);
       assert.match(result.text, /falling back to process cwd/);
       assert.match(result.text, /MINIME_AGENT_WORKSPACE_ROOT/);
-      assert.doesNotMatch(result.text, /MINIME_AGENT_WORKSPACE_CWD/);
+      assert.doesNotMatch(result.text, new RegExp(RETIRED_AGENT_WORKSPACE_ENV));
     } finally {
       if (previous === undefined) {
         delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];

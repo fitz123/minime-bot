@@ -4,7 +4,7 @@ import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { validateSessionDefaults, validateAgent, loadConfig } from "../config.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "../media-store.js";
-import { MINIME_CONFIG_PATH_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const TEST_DIR = join("/tmp", "config-defaults-test-" + Date.now());
 
@@ -267,7 +267,7 @@ describe("loadConfig workspace contract defaults", () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  it("uses MINIME_WORKSPACE_ROOT config.yaml when no config path is passed", () => {
+  it("uses MINIME_CONTROL_WORKSPACE_ROOT config.yaml when no config path is passed", () => {
     const workspaceRoot = join(TEST_DIR, "workspace-default");
     mkdirSync(workspaceRoot, { recursive: true });
     writeFileSync(
@@ -287,7 +287,7 @@ bindings:
 
     const config = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: undefined,
       },
       () => loadConfig(undefined, { resolveSecrets: false }),
@@ -298,7 +298,7 @@ bindings:
     assert.strictEqual(config.bindings.length, 1);
   });
 
-  it("resolves relative agent workspaceCwd against MINIME_WORKSPACE_ROOT", () => {
+  it("resolves relative agent workspaceCwd against MINIME_CONTROL_WORKSPACE_ROOT", () => {
     const workspaceRoot = join(TEST_DIR, "workspace-agent-cwd");
     mkdirSync(join(workspaceRoot, "agent-workspace"), { recursive: true });
     writeFileSync(
@@ -318,7 +318,7 @@ bindings:
 
     const config = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: undefined,
       },
       () => loadConfig(undefined, { resolveSecrets: false }),
@@ -354,7 +354,7 @@ bindings:
 
     const config = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: "settings/bot.yaml",
       },
       () => loadConfig(undefined, {
@@ -398,7 +398,7 @@ bindings:
 
     const config = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: "settings/bot.yaml",
       },
       () => loadConfig(undefined, { resolveSecrets: false }),

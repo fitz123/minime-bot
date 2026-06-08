@@ -19,7 +19,7 @@ This is the public `minime-bot` package repository.
 - This repository owns package runtime code, tests, packaging scripts, and Pi
   extension source under `extensions/pi`.
 - Control workspace files are external inputs selected by `--workspace` or
-  `MINIME_WORKSPACE_ROOT`.
+  `MINIME_CONTROL_WORKSPACE_ROOT`.
 - Do not add deployment scripts or private production launch state here.
 
 ## Workflow

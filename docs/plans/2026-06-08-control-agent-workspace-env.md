@@ -111,10 +111,10 @@ Important constraints:
 
 ### Task 4: Docs/help/package install smoke
 
-- [ ] Update `README.md` and CLI help text.
-- [ ] Update installed-package smoke assertions to check canonical names and absence of old names.
-- [ ] Update project naming/static tests if they whitelist env names.
-- [ ] Search the package for old env names and remove remaining runtime/doc/test references except historical completed plans if intentionally left archived.
+- [x] Update `README.md` and CLI help text.
+- [x] Update installed-package smoke assertions to check canonical names and absence of old names.
+- [x] Update project naming/static tests if they whitelist env names.
+- [x] Search the package for old env names and remove remaining runtime/doc/test references except historical completed plans if intentionally left archived.
 
 ### Task 5: Validation
 

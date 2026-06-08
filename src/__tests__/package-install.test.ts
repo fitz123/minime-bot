@@ -23,6 +23,8 @@ const EXPECTED_BUNDLED_AGENT_FILES = ["planner.md", "reviewer.md", "scout.md", "
 const EXPECTED_BUNDLED_PROMPT_FILES = ["implement-and-review.md", "implement.md", "scout-and-plan.md"];
 const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(RETIRED_GUARD_WRAPPER);
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 interface PackedFile {
   path: string;
@@ -153,7 +155,7 @@ function runInstalledBin(projectDir: string, args: readonly string[], workspace:
     cwd: projectDir,
     encoding: "utf8",
     env: commandEnv({
-      MINIME_WORKSPACE_ROOT: workspace,
+      MINIME_CONTROL_WORKSPACE_ROOT: workspace,
     }),
   });
 }
@@ -163,7 +165,7 @@ function runInstalledSamplerBin(projectDir: string, args: readonly string[], wor
     cwd: projectDir,
     encoding: "utf8",
     env: commandEnv({
-      MINIME_WORKSPACE_ROOT: workspace,
+      MINIME_CONTROL_WORKSPACE_ROOT: workspace,
     }),
   });
 }
@@ -418,8 +420,10 @@ describe("package artifact install", () => {
           encoding: "utf8",
           env: commandEnv({
             FIXTURE_WORKSPACE: workspace,
-            MINIME_AGENT_WORKSPACE_CWD: agentWorkspace,
-            MINIME_WORKSPACE_ROOT: workspace,
+            MINIME_AGENT_WORKSPACE_ROOT: agentWorkspace,
+            MINIME_CONTROL_WORKSPACE_ROOT: workspace,
+            [RETIRED_AGENT_WORKSPACE_ENV]: join(temp, "stale-agent-workspace"),
+            [RETIRED_CONTROL_WORKSPACE_ENV]: join(temp, "stale-control-workspace"),
             SOURCE_BOT_ROOT: BOT_ROOT,
           }),
         },
@@ -447,6 +451,10 @@ const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
 const agentWorkspace = join(workspace, "agent-workspace");
 const controlTavilySopsFile = join(workspace, "config", "secrets.sops.yaml");
+const controlWorkspaceEnv = "MINIME_CONTROL_WORKSPACE_ROOT";
+const agentWorkspaceEnv = "MINIME_AGENT_WORKSPACE_ROOT";
+const retiredControlWorkspaceEnv = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const retiredAgentWorkspaceEnv = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 const importFile = (path) => import(pathToFileURL(path).href);
 const importPackageFile = (relpath) => importFile(join(packageDir, relpath));
 const expectedBundledAgentFiles = ${JSON.stringify(EXPECTED_BUNDLED_AGENT_FILES)};
@@ -510,8 +518,10 @@ const loadedConfig = configMod.loadConfig(join(workspace, "config.yaml"), {
 });
 assert.equal(loadedConfig.agents.main.workspaceCwd, agentWorkspace);
 const childEnv = piRpc.buildPiSpawnEnv(loadedConfig.agents.main.workspaceCwd);
-assert.equal(childEnv.MINIME_WORKSPACE_ROOT, workspace);
-assert.equal(childEnv.MINIME_AGENT_WORKSPACE_CWD, agentWorkspace);
+assert.equal(childEnv[controlWorkspaceEnv], workspace);
+assert.equal(childEnv[agentWorkspaceEnv], agentWorkspace);
+assert.equal(childEnv[retiredControlWorkspaceEnv], undefined);
+assert.equal(childEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(childEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(childEnv.DISCORD_BOT_TOKEN, undefined);
 assert.equal(childEnv.TAVILY_API_KEY, undefined);
@@ -568,8 +578,10 @@ mkdirSync(callerControlledCwd, { recursive: true });
 process.chdir(callerControlledCwd);
 const subagentChildEnv = piRpc.buildPiSubagentChildSpawnEnv(callerControlledCwd);
 assert.equal(process.cwd(), callerControlledCwd);
-assert.equal(subagentChildEnv.MINIME_WORKSPACE_ROOT, workspace);
-assert.equal(subagentChildEnv.MINIME_AGENT_WORKSPACE_CWD, callerControlledCwd);
+assert.equal(subagentChildEnv[controlWorkspaceEnv], workspace);
+assert.equal(subagentChildEnv[agentWorkspaceEnv], callerControlledCwd);
+assert.equal(subagentChildEnv[retiredControlWorkspaceEnv], undefined);
+assert.equal(subagentChildEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(subagentChildEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.DISCORD_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.TAVILY_API_KEY, undefined);

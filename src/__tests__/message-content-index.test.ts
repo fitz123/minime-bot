@@ -13,7 +13,7 @@ import {
   restoreMessageIndex,
   defaultMessageIndexPath,
 } from "../message-content-index.js";
-import { MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -202,27 +202,27 @@ describe("message-content-index persistence", () => {
   });
 
   it("default path preserves the source-checkout bot data location", () => {
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
 
     try {
-      delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+      delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       assert.strictEqual(defaultMessageIndexPath(), join(BOT_ROOT, "data", "message-content-index.json"));
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
     }
   });
 
   it("default path saves under the resolved workspace data directory when a workspace is explicit", () => {
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const workspace = join(tmpDir, "workspace");
     mkdirSync(workspace, { recursive: true });
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspace;
       recordMessage(-100, 1, "alice", "Hello", "in");
       saveMessageIndex();
 
@@ -231,9 +231,9 @@ describe("message-content-index persistence", () => {
       assert.strictEqual(JSON.parse(readFileSync(expectedPath, "utf8")).length, 1);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
     }
   });

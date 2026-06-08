@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { loadMergedCrons, loadCronTask } from "../cron-runner.js";
-import { MINIME_CRONS_PATH_ENV, MINIME_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
 
 const TEST_DIR = join("/tmp", "cron-merge-test-" + Date.now());
 
@@ -55,7 +55,7 @@ describe("loadMergedCrons", () => {
     assert.strictEqual(crons[0].name, "base-task");
   });
 
-  it("uses MINIME_WORKSPACE_ROOT crons.yaml when no crons path is passed", () => {
+  it("uses MINIME_CONTROL_WORKSPACE_ROOT crons.yaml when no crons path is passed", () => {
     const workspaceRoot = join(TEST_DIR, "workspace-default");
     mkdirSync(workspaceRoot, { recursive: true });
     writeFileSync(join(workspaceRoot, "crons.yaml"), `crons:
@@ -68,7 +68,7 @@ describe("loadMergedCrons", () => {
 
     const crons = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CRONS_PATH_ENV]: undefined,
       },
       () => loadMergedCrons(),
@@ -92,7 +92,7 @@ describe("loadMergedCrons", () => {
 
     const cron = withEnv(
       {
-        [MINIME_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CRONS_PATH_ENV]: "settings/scheduled.yaml",
       },
       () => loadCronTask("override-task"),

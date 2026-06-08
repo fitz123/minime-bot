@@ -7,6 +7,16 @@ The package owns runtime TypeScript, packaging scripts, and Pi extension source.
 It does not bundle a private control workspace, production config, chat IDs,
 private agent memory, or local runtime state.
 
+The package uses four separate roots:
+
+- The control/app workspace contains `config.yaml`, `crons.yaml`, runtime state,
+  logs, media, and global secret-file references.
+- The agent workspace is the project or context tree operated on by Pi/Codex,
+  Knowledge v2, and guard checks.
+- The package source checkout is this repository.
+- The package runtime install is a built npm install that loads artifacts from
+  `dist/`.
+
 ## Package CLI
 
 Build the package before running the compiled CLI from this checkout:
@@ -40,8 +50,9 @@ by default (`wiki/index.md` and `wiki/pages/**/*.md` in v2, or `MEMORY.md` and
 `memory/auto/**/*.md` in legacy workspaces). `--scope default` and `--scope auto`
 both select that curated corpus. Use `--scope diary` for narrative history and
 `--scope all` when both curated pages and diary chronology are needed. If
-`--workspace` is omitted, knowledge commands use `MINIME_AGENT_WORKSPACE_CWD`;
-config and workspace commands still use `MINIME_WORKSPACE_ROOT`.
+`--workspace` is omitted, knowledge commands use
+`MINIME_AGENT_WORKSPACE_ROOT`; config and workspace commands use
+`MINIME_CONTROL_WORKSPACE_ROOT`.
 
 `update` is the durable Knowledge v2 write path; direct Pi writes to managed v2
 wiki paths are blocked when first-party Pi extensions are enabled. Migration is
@@ -76,10 +87,10 @@ workspace. Select it explicitly with `--workspace`:
 minime-bot workspace validate --workspace test-fixtures/minimal-workspace
 ```
 
-For long-running services, set `MINIME_WORKSPACE_ROOT` instead:
+For long-running services, set `MINIME_CONTROL_WORKSPACE_ROOT` instead:
 
 ```bash
-MINIME_WORKSPACE_ROOT=/path/to/workspace minime-bot workspace validate
+MINIME_CONTROL_WORKSPACE_ROOT=/path/to/workspace minime-bot workspace validate
 ```
 
 By default, the workspace provides:
@@ -125,11 +136,12 @@ Build first, then run the compiled runtime with an explicit control workspace:
 
 ```bash
 npm run build
-MINIME_WORKSPACE_ROOT=/path/to/workspace node dist/main.js
+MINIME_CONTROL_WORKSPACE_ROOT=/path/to/workspace node dist/main.js
 ```
 
 The launchd example uses separate `PACKAGE_ROOT` and `CONTROL_WORKSPACE`
-placeholders and sets `MINIME_WORKSPACE_ROOT` in the service environment.
+placeholders and sets `MINIME_CONTROL_WORKSPACE_ROOT` in the service
+environment.
 
 ## Repository Boundaries
 

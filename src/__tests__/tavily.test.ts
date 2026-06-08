@@ -692,7 +692,7 @@ describe("tavily: SOPS API key lookup", () => {
     assert.equal(calls.length, 0);
   });
 
-  it("ignores the retired MINIME_WORKSPACE_ROOT secret contract", () => {
+  it("ignores the retired control workspace secret contract", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-secret-retired-control-"));
     mkdirSync(join(controlWorkspace, "config"));
     writeFileSync(join(controlWorkspace, TAVILY_SOPS_FILE_RELPATH), "placeholder: true\n", "utf8");
