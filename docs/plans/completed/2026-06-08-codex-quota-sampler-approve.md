@@ -1,5 +1,7 @@
 # Plan: Fix codex-quota-sampler after Pi 0.79 project trust change
 
+Status: complete. Addresses GitHub issue #11.
+
 ## Goal
 Fix issue #11: `codex-quota-sampler` must pass `--approve` to its isolated Pi probe so Pi 0.79 trusts the sampler project settings (`.pi/settings.json` with `transport: "sse"`) and emits `after_provider_response` headers to the quota extension.
 
