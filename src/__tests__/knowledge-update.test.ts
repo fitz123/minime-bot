@@ -20,6 +20,7 @@ import {
   formatKnowledgeUpdateResponse,
   type KnowledgeUpdateResponse,
 } from "../knowledge/update.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 
@@ -65,6 +66,34 @@ function pageFrontmatter(name: string, type = "project"): Record<string, unknown
 }
 
 describe("knowledge_update", () => {
+  it("treats an explicit empty env as authoritative over the process env", () => {
+    const workspace = createV2Workspace();
+    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    try {
+      const response = executeKnowledgeUpdate(
+        {
+          op: "create",
+          type: "project",
+          slug: "ambient",
+          frontmatter: pageFrontmatter("Ambient"),
+          body: "# Ambient\n\nShould not be written through ambient env.\n",
+        },
+        { env: {} },
+      );
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "agent-workspace-unset");
+      assert.equal(existsSync(join(workspace, "wiki/pages/project/ambient.md")), false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+      }
+    }
+  });
+
   it("creates a v2 page, regenerates the index, appends a structural log entry, and makes search see it", () => {
     const workspace = createV2Workspace();
 

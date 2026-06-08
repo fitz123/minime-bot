@@ -18,6 +18,7 @@ import {
   KNOWLEDGE_PAGE_TYPES,
   type KnowledgePageType,
   generateKnowledgeV2Schema,
+  parseKnowledgeV2SchemaMarker,
   resolveKnowledgeLayout,
   type ResolvedKnowledgeLayout,
 } from "./layout.js";
@@ -158,8 +159,14 @@ const FRIEND_PROFILE_SLUGS = new Set([
 ]);
 const SKIP_SCAN_DIRS = new Set([".git", "node_modules", "dist"]);
 const HIDDEN_RUNTIME_PREFIXES = [".tmp/", ".playwright-mcp/", ".council/", ".ralphex/"];
-const ACTIVE_CONTEXT_RE = /^(CLAUDE|USER|IDENTITY|MEMORY)\.md$|^\.claude\/|^(config|crons)(\.local)?\.ya?ml$|^scripts\/|^package(-lock)?\.json$/i;
-const DOMAIN_TREE_RE = /^(pilot|cyber-genpodryad|dolt)(\/|$)|(^|\/)docs\/|\.sqlite3$|\.(png|jpe?g|gif|webp|pdf)$/i;
+const ROOT_DOC_RE = /^(README|CHANGELOG|AGENTS|CLAUDE|USER|IDENTITY)(?:\.[^.]+)?\.md$/i;
+const ROOT_STATUS_DOC_RE = /^(?:(?:.+[-_])?status)\.md$/i;
+const BEADS_METADATA_RE = /^(?:\.beads|beads)(?:\/|$)/i;
+const NIX_TREE_RE = /(?:^nix(?:os)?\/|^flake\.(?:nix|lock)$|\.nix$)/i;
+const DOMAIN_CLIENT_TRAINING_TREE_RE = /^(?:pilot|cyber-genpodryad|dolt|domain|domains|client|clients|training|trainings|docs)\//i;
+const ACTIVE_RUNTIME_STATE_RE = /^(?:\.claude\/|(?:config|crons)(?:\.local)?\.ya?ml$|scripts\/|package(?:-lock)?\.json$)/i;
+const MEDIA_OR_STRUCTURED_STATE_RE = /(?:\.sqlite3$|\.(?:png|jpe?g|gif|webp|pdf)$)/i;
+const LEGACY_WIKI_CONTROL_PATHS = ["wiki/schema.md", "wiki/index.md", "wiki/log.md"] as const;
 const SECRET_PATTERNS = [
   /(?:password|secret|token|api[_-]?key|private[_-]?key|pin|payment|card(?: number)?|credential)\s*[:=]\s*\S{4,}/i,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
@@ -200,10 +207,10 @@ function normalizeMode(args: KnowledgeMigrationArgs): KnowledgeMigrationMode | K
 }
 
 function resolveAgentWorkspaceRoot(deps: KnowledgeMigrationDeps): string | undefined {
+  const env = deps.env ?? process.env;
   const root =
     deps.agentWorkspaceRoot ??
-    deps.env?.[MINIME_AGENT_WORKSPACE_CWD_ENV] ??
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    env[MINIME_AGENT_WORKSPACE_CWD_ENV];
   return typeof root === "string" && root.trim() ? normalize(resolve(root)) : undefined;
 }
 
@@ -241,12 +248,17 @@ function isMarkdownRelPath(relPath: string): boolean {
   return extension === ".md" || extension === ".markdown";
 }
 
+function isRootRelPath(relPath: string): boolean {
+  return !relPath.includes("/");
+}
+
 function readText(root: string, relPath: string): string {
   return readFileSync(workspacePath(root, relPath), "utf8");
 }
 
 function contentHasSecret(content: string): boolean {
-  return SECRET_PATTERNS.some((pattern) => pattern.test(content));
+  const normalized = content.replace(/<REDACTED>/gi, "x");
+  return SECRET_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function addReview(plan: MutablePlan, item: KnowledgeMigrationReviewItem): void {
@@ -274,6 +286,69 @@ function isFrontmatterFailure(
   return "ok" in value && value.ok === false;
 }
 
+function expectedPageTypeFromTarget(targetPath: string): KnowledgePageType | undefined {
+  const parts = targetPath.split("/");
+  return parts[0] === "wiki" && parts[1] === "pages" && PAGE_TYPES.has(parts[2])
+    ? (parts[2] as KnowledgePageType)
+    : undefined;
+}
+
+function reviewForInvalidPlannedPageTarget(
+  sourcePath: string | undefined,
+  targetPath: string,
+): KnowledgeMigrationReviewItem {
+  return {
+    kind: "type_review",
+    path: sourcePath ?? "<generated>",
+    suggestedTarget: targetPath,
+    reason: "invalid_wiki_page_target_type",
+    message: `Planned wiki page target ${targetPath} must be under wiki/pages/<type>/ with a known page type.`,
+    blocking: true,
+  };
+}
+
+function reviewForPlannedPageFrontmatterFailure(
+  sourcePath: string | undefined,
+  targetPath: string,
+  frontmatterFailure: KnowledgeUpdateFailure,
+): KnowledgeMigrationReviewItem {
+  const reason = frontmatterFailure.reason === "frontmatter-type-mismatch"
+    ? "frontmatter_target_type_mismatch"
+    : frontmatterFailure.reason;
+  const message = reason === "frontmatter_target_type_mismatch"
+    ? `Planned wiki page target ${targetPath} disagrees with the page frontmatter type; operator review must choose the target path or page type.`
+    : `Planned wiki page frontmatter failed validation: ${frontmatterFailure.message}`;
+  return {
+    kind: "type_review",
+    path: sourcePath ?? "<generated>",
+    suggestedTarget: targetPath,
+    reason,
+    message,
+    blocking: true,
+  };
+}
+
+function validatePlannedPageFrontmatter(
+  sourcePath: string | undefined,
+  targetPath: string,
+  content: string,
+): { frontmatter: KnowledgePageFrontmatter } | { reviewItem: KnowledgeMigrationReviewItem } {
+  const parsed = parseMarkdown(content);
+  const expectedType = expectedPageTypeFromTarget(targetPath);
+  if (!expectedType) {
+    return {
+      reviewItem: reviewForInvalidPlannedPageTarget(sourcePath, targetPath),
+    };
+  }
+  const frontmatter = validateKnowledgePageFrontmatter(parsed.frontmatter, expectedType);
+  if (isFrontmatterFailure(frontmatter)) {
+    return {
+      reviewItem: reviewForPlannedPageFrontmatterFailure(sourcePath, targetPath, frontmatter),
+    };
+  }
+  return { frontmatter };
+}
+
 function markHandled(plan: MutablePlan, relPath: string): void {
   plan.handledSources.add(relPath);
 }
@@ -291,6 +366,16 @@ function publicOperations(operations: readonly InternalOperation[]): KnowledgeMi
 function sameContentIfExists(root: string, relPath: string, content: string): boolean {
   const path = workspacePath(root, relPath);
   return existsSync(path) && readFileSync(path, "utf8") === content;
+}
+
+function sameRegularFileContentIfExists(root: string, relPath: string, content: string): boolean {
+  const path = workspacePath(root, relPath);
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() && !stat.isSymbolicLink() && readFileSync(path, "utf8") === content;
+  } catch {
+    return false;
+  }
 }
 
 function unsafeWriteTargetReason(workspaceRoot: string, absTargetPath: string): string | undefined {
@@ -360,6 +445,14 @@ function addWrite(
       blocking: true,
     });
     return;
+  }
+
+  if (operation.role === "wiki_page") {
+    const validatedPage = validatePlannedPageFrontmatter(operation.sourcePath, targetPath, content);
+    if ("reviewItem" in validatedPage) {
+      addReview(plan, validatedPage.reviewItem);
+      return;
+    }
   }
 
   const sourceLabel = operation.sourcePath ?? "<generated>";
@@ -523,6 +616,11 @@ function slugify(value: string): string {
   return slug || "untitled";
 }
 
+function targetSlug(name: string, fallbackSlug: string): string {
+  const slug = slugify(name);
+  return slug === "untitled" ? slugify(fallbackSlug) : slug;
+}
+
 function rawType(value: unknown): string | undefined {
   return scalarString(value)?.toLowerCase().replace(/[_-]/g, "-");
 }
@@ -547,8 +645,14 @@ function inferPageType(sourceRel: string, frontmatter: Record<string, unknown>, 
   if (slug.startsWith("project_") || /\b(project|status|workstream|initiative)\b/.test(text)) {
     return "project";
   }
-  if (/\b(feedback|correction|critique|do not|should not|preference correction)\b/.test(text)) {
+  if (/\b(runbook|command reference|operational command|deploy script|one-off plan|execution plan|task plan)\b/.test(text)) {
+    return "project";
+  }
+  if (/\b(feedback|correction|critique|do not|should not|never|preference correction|principles?|lessons?)\b/.test(text)) {
     return "feedback";
+  }
+  if (slug === "facts" || /\bfacts\b/.test(text)) {
+    return "user";
   }
   if (/\b(pet|animal|cat|dog|curriculum|learning plan|course)\b/.test(text)) {
     return text.includes("treatment") || text.includes("medical") || text.includes("active plan") ? "project" : "user";
@@ -718,6 +822,13 @@ function classifyLegacyTarget(
 ): string | KnowledgeMigrationReviewItem {
   const slug = basename(sourceRel, extname(sourceRel));
   const lower = `${sourceRel}\n${frontmatter.name}\n${body}`.toLowerCase();
+  const pageSlug = targetSlug(frontmatter.name, slug);
+  if (frontmatter.type === "feedback") {
+    return `wiki/pages/feedback/${pageSlug}.md`;
+  }
+  if (frontmatter.type === "user") {
+    return `wiki/pages/user/${pageSlug}.md`;
+  }
   const participantTopic = participantTopicFromLegacySlug(slug);
   if (participantTopic) {
     return `wiki/pages/project/${participantTopic}/participants.md`;
@@ -730,7 +841,7 @@ function classifyLegacyTarget(
     return {
       kind: "operator_review",
       path: sourceRel,
-      suggestedTarget: `artifacts/runbooks/${slugify(frontmatter.name)}.md`,
+      suggestedTarget: `artifacts/runbooks/${pageSlug}.md`,
       reason: "active_runbook_review",
       message: "Command-level runbooks stay active or move to artifacts only after operator review.",
       blocking: true,
@@ -740,7 +851,7 @@ function classifyLegacyTarget(
     return {
       kind: "operator_review",
       path: sourceRel,
-      suggestedTarget: `artifacts/plans/${slugify(frontmatter.name)}.md`,
+      suggestedTarget: `artifacts/plans/${pageSlug}.md`,
       reason: "one_off_plan_artifact",
       message: "One-off execution plans route to artifacts/plans rather than wiki pages.",
       blocking: true,
@@ -748,23 +859,17 @@ function classifyLegacyTarget(
   }
   if (/\b(pet|animal)\b/.test(lower)) {
     if (/\b(treatment|medical|medicine|active plan|health)\b/.test(lower)) {
-      return `wiki/pages/project/health/${slugify(frontmatter.name)}-status.md`;
+      return `wiki/pages/project/health/${pageSlug}-status.md`;
     }
-    return `wiki/pages/user/pets/${slugify(frontmatter.name)}.md`;
+    return `wiki/pages/user/pets/${pageSlug}.md`;
   }
   if (/\b(curriculum|learning plan|course plan)\b/.test(lower)) {
-    return `wiki/pages/project/learning/${slugify(frontmatter.name)}-status.md`;
-  }
-  if (frontmatter.type === "feedback") {
-    return `wiki/pages/feedback/${slugify(frontmatter.name)}.md`;
-  }
-  if (frontmatter.type === "user") {
-    return `wiki/pages/user/${slugify(frontmatter.name)}.md`;
+    return `wiki/pages/project/learning/${pageSlug}-status.md`;
   }
   if (frontmatter.type === "reference") {
-    return `wiki/pages/reference/${slugify(frontmatter.name)}.md`;
+    return `wiki/pages/reference/${pageSlug}.md`;
   }
-  return `wiki/pages/project/${slugify(frontmatter.name)}.md`;
+  return `wiki/pages/project/${pageSlug}.md`;
 }
 
 function extractPendingReview(memoryMarkdown: string): string | undefined {
@@ -865,15 +970,84 @@ function splitLegacyMemorySections(memoryMarkdown: string): LegacyMemorySection[
   return normalizedSections;
 }
 
-function isCatalogOnlyMemorySection(section: LegacyMemorySection): boolean {
-  if (!/\b(index|catalog|contents)\b/i.test(section.title)) {
+const MARKDOWN_LINK_RE = /\[[^\]]+\]\([^)]+\)/;
+
+function isCatalogLinkLine(line: string): boolean {
+  const item = line
+    .replace(/^[-*]\s+/, "")
+    .replace(/^\[[ xX]\]\s+/, "")
+    .trim();
+  return /^\[[^\]]+\]\([^)]+\)(?:(?:\s*[-:]\s*|\s+).+)?$/.test(item);
+}
+
+function markdownTableCells(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) {
+    return [];
+  }
+  return trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function isMarkdownTableRow(line: string): boolean {
+  return markdownTableCells(line).length >= 2;
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = markdownTableCells(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+}
+
+function isSimpleCatalogTable(lines: readonly string[]): boolean {
+  if (lines.length < 2 || !lines.every(isMarkdownTableRow)) {
     return false;
   }
-  const lines = section.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  return lines.length === 0 || lines.every((line) => (
-    /^[-*]\s+\[[^\]]+\]\([^)]+\)\s*$/.test(line) ||
-    /^\[[^\]]+\]\([^)]+\)\s*$/.test(line)
+  const separatorIndex = lines.findIndex(isMarkdownTableSeparator);
+  if (separatorIndex < 0 || !lines.some((line) => MARKDOWN_LINK_RE.test(line))) {
+    return false;
+  }
+  return lines.every((line, index) => (
+    isMarkdownTableSeparator(line) ||
+    index < separatorIndex ||
+    MARKDOWN_LINK_RE.test(line)
   ));
+}
+
+function isMemoryIndexIntroSection(section: LegacyMemorySection): boolean {
+  if (!/memory|index/i.test(section.title)) {
+    return false;
+  }
+  const body = section.body.trim();
+  return !body || /^(?:long-term\s+)?(?:auto-)?memory (?:files|index)\b/i.test(body) || /\b(?:auto-)?memory index\b/i.test(body) || /memory\/auto\/.*memory\/diary\//is.test(body);
+}
+
+function isPlaceholderCatalogLine(line: string): boolean {
+  return /^#{3,6}\s+/.test(line) || /^\(?\s*(?:empty|none yet|none|no entries|no memory files)\b/i.test(line);
+}
+
+function isCatalogMemorySectionTitle(title: string): boolean {
+  return /\b(index|catalog|contents|files|memory files|auto|diary|daily notes|project|projects|reference|references)\b/i.test(title);
+}
+
+function isCatalogOnlyMemorySection(section: LegacyMemorySection): boolean {
+  if (isMemoryIndexIntroSection(section)) {
+    return true;
+  }
+  const lines = section.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!isCatalogMemorySectionTitle(section.title)) {
+    return false;
+  }
+  const catalogLike = lines.length === 0 || lines.every(isCatalogLinkLine) || isSimpleCatalogTable(lines);
+  if (catalogLike) {
+    return true;
+  }
+  if (lines.every(isPlaceholderCatalogLine)) {
+    return true;
+  }
+  return lines.every(isCatalogLinkLine) || isSimpleCatalogTable(lines);
 }
 
 function explicitMemorySectionType(title: string): { type: KnowledgePageType; name: string } | undefined {
@@ -894,11 +1068,11 @@ function frontmatterForMemorySection(
   if (!section.body.trim() && /^legacy\s+memory$|^memory$/i.test(section.title)) {
     return undefined;
   }
-  if (isCatalogOnlyMemorySection(section)) {
+  const explicit = explicitMemorySectionType(section.title);
+  if (!explicit && isCatalogOnlyMemorySection(section)) {
     return undefined;
   }
 
-  const explicit = explicitMemorySectionType(section.title);
   const type = explicit?.type ?? inferPageType("MEMORY.md", {}, `${section.title}\n${section.body}`);
   if (!type) {
     return {
@@ -931,6 +1105,12 @@ function frontmatterForMemorySection(
   }
 
   return { frontmatter, body };
+}
+
+function memorySectionClassificationSource(name: string, sectionIndex: number): string {
+  const nameSlug = slugify(name);
+  const sourceSlug = nameSlug === "untitled" ? `memory-md-section-${sectionIndex + 1}` : nameSlug;
+  return `MEMORY.md/${sourceSlug}.md`;
 }
 
 function walkFiles(root: string): string[] {
@@ -1002,18 +1182,24 @@ function planMemoryFile(plan: MutablePlan): void {
 
   const pendingReview = extractPendingReview(content);
   if (pendingReview) {
-    addWrite(
-      plan,
-      {
-        role: "issues",
-        sourcePath: relPath,
-        targetPath: "wiki/issues.md",
-        reason: "move existing pending review section into wiki/issues.md",
-      },
-      pendingReview,
-    );
+    const issuesPath = "wiki/issues.md";
+    const issuesExists = existsSync(workspacePath(plan.workspaceRoot, issuesPath));
+    const canOverwriteIssues = !issuesExists || hasLegacyControlArchive(plan, issuesPath);
+    if (canOverwriteIssues) {
+      addWrite(
+        plan,
+        {
+          role: "issues",
+          sourcePath: relPath,
+          targetPath: issuesPath,
+          reason: "move existing pending review section into wiki/issues.md",
+        },
+        pendingReview,
+        { allowOverwrite: issuesExists },
+      );
+    }
   }
-  for (const section of splitLegacyMemorySections(removePendingReview(content))) {
+  for (const [sectionIndex, section] of splitLegacyMemorySections(removePendingReview(content)).entries()) {
     const page = frontmatterForMemorySection(section);
     if (!page) {
       continue;
@@ -1022,7 +1208,7 @@ function planMemoryFile(plan: MutablePlan): void {
       addReview(plan, page);
       continue;
     }
-    const classificationSource = `MEMORY.md/${slugify(page.frontmatter.name)}.md`;
+    const classificationSource = memorySectionClassificationSource(page.frontmatter.name, sectionIndex);
     const target = classifyLegacyTarget(plan, classificationSource, page.frontmatter, page.body);
     if (typeof target !== "string") {
       addReview(plan, { ...target, path: relPath });
@@ -1109,9 +1295,9 @@ function planLegacyDiaryFile(plan: MutablePlan, sourceRel: string): void {
     addReview(plan, {
       kind: "secret_review",
       path: sourceRel,
-      reason: "secret_in_diary",
-      message: "Diary entry appears to contain secret material and will not be migrated.",
-      blocking: true,
+      reason: "secret_diary_omitted",
+      message: "Diary entry appears to contain secret material and is omitted from automatic migration.",
+      blocking: false,
     });
     return;
   }
@@ -1195,6 +1381,52 @@ function planTopicWikiFile(plan: MutablePlan, sourceRel: string): void {
   );
 }
 
+function activeOutOfScopeReview(relPath: string): Omit<KnowledgeMigrationReviewItem, "kind" | "path" | "blocking"> | undefined {
+  if (isRootRelPath(relPath) && ROOT_STATUS_DOC_RE.test(relPath)) {
+    return {
+      reason: "root_status_doc",
+      message: "Root status documents describe active workspace state and need operator promotion before becoming Knowledge pages.",
+    };
+  }
+  if (isRootRelPath(relPath) && ROOT_DOC_RE.test(relPath)) {
+    return {
+      reason: "root_active_doc",
+      message: "Root README, CHANGELOG, and AGENTS-style documents stay as active workspace documentation.",
+    };
+  }
+  if (BEADS_METADATA_RE.test(relPath)) {
+    return {
+      reason: "beads_metadata_doc",
+      message: "Beads metadata is tracker-owned state and is not migrated into Knowledge pages.",
+    };
+  }
+  if (NIX_TREE_RE.test(relPath)) {
+    return {
+      reason: "nix_runtime_tree",
+      message: "Nix files and nix/ trees stay with runtime and development configuration.",
+    };
+  }
+  if (DOMAIN_CLIENT_TRAINING_TREE_RE.test(relPath)) {
+    return {
+      reason: "domain_client_training_tree",
+      message: "Domain, client, docs, and training trees stay in their owning source locations.",
+    };
+  }
+  if (ACTIVE_RUNTIME_STATE_RE.test(relPath)) {
+    return {
+      reason: "active_runtime_state",
+      message: "Active context, config, package, and tooling files are not migrated automatically.",
+    };
+  }
+  if (MEDIA_OR_STRUCTURED_STATE_RE.test(relPath)) {
+    return {
+      reason: "media_or_structured_state",
+      message: "Media, database, and structured runtime artifacts are not migrated automatically.",
+    };
+  }
+  return undefined;
+}
+
 function classifyUnhandledFile(plan: MutablePlan, relPath: string): void {
   if (plan.handledSources.has(relPath)) {
     return;
@@ -1261,12 +1493,12 @@ function classifyUnhandledFile(plan: MutablePlan, relPath: string): void {
     });
     return;
   }
-  if (ACTIVE_CONTEXT_RE.test(relPath) || DOMAIN_TREE_RE.test(relPath)) {
+  const activeReview = activeOutOfScopeReview(relPath);
+  if (activeReview) {
     addReview(plan, {
       kind: "out_of_scope",
       path: relPath,
-      reason: "active_context_or_domain_tree",
-      message: "Active context, config, tooling, domain/app trees, media, and structured state are not migrated automatically.",
+      ...activeReview,
       blocking: false,
     });
     return;
@@ -1292,27 +1524,136 @@ function classifyUnhandledFile(plan: MutablePlan, relPath: string): void {
 }
 
 function collectPlannedPages(plan: MutablePlan): ParsedPage[] {
-  return plan.operations
-    .filter((operation) => operation.role === "wiki_page")
-    .map((operation) => {
-      const parsed = parseMarkdown(operation.content);
-      const type = operation.targetPath.split("/")[2] as KnowledgePageType | undefined;
-      const frontmatter = validateKnowledgePageFrontmatter(parsed.frontmatter, type);
-      if (isFrontmatterFailure(frontmatter)) {
-        throw new Error(`planned page frontmatter failed validation for ${operation.targetPath}: ${frontmatter.reason}`);
-      }
-      return {
-        absPath: operation.absTargetPath,
-        relPath: operation.targetPath,
-        linkPath: relative(workspacePath(plan.workspaceRoot, "wiki"), operation.absTargetPath).split(sep).join("/"),
-        frontmatter,
-      };
-    })
+  const pages: ParsedPage[] = [];
+  for (const operation of plan.operations) {
+    if (operation.role !== "wiki_page") {
+      continue;
+    }
+    const validatedPage = validatePlannedPageFrontmatter(
+      operation.sourcePath,
+      operation.targetPath,
+      operation.content,
+    );
+    if ("reviewItem" in validatedPage) {
+      addReview(plan, validatedPage.reviewItem);
+      continue;
+    }
+    pages.push({
+      absPath: operation.absTargetPath,
+      relPath: operation.targetPath,
+      linkPath: relative(workspacePath(plan.workspaceRoot, "wiki"), operation.absTargetPath).split(sep).join("/"),
+      frontmatter: validatedPage.frontmatter,
+    });
+  }
+  return pages
     .sort((a, b) => a.relPath.localeCompare(b.relPath));
 }
 
-function planGeneratedV2Files(plan: MutablePlan): void {
+function hasExistingV2SchemaMarker(plan: MutablePlan): boolean {
+  const schemaPath = workspacePath(plan.workspaceRoot, "wiki/schema.md");
+  try {
+    const stat = lstatSync(schemaPath);
+    return stat.isFile() && !stat.isSymbolicLink() && parseKnowledgeV2SchemaMarker(readFileSync(schemaPath, "utf8")) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function hasLegacyControlArchive(plan: MutablePlan, relPath: string): boolean {
+  const archivePath = `artifacts/legacy/${relPath}`;
+  if (plan.operations.some((operation) => (
+    operation.action === "copy" &&
+    operation.role === "artifact" &&
+    operation.sourcePath === relPath &&
+    operation.targetPath === archivePath
+  ))) {
+    return true;
+  }
+
+  const absPath = workspacePath(plan.workspaceRoot, relPath);
+  try {
+    const stat = lstatSync(absPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return false;
+    }
+    return sameRegularFileContentIfExists(plan.workspaceRoot, archivePath, readFileSync(absPath, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function planLegacyWikiControlArchives(plan: MutablePlan): void {
+  const existingV2Schema = hasExistingV2SchemaMarker(plan);
+  for (const relPath of [...LEGACY_WIKI_CONTROL_PATHS, "wiki/issues.md"]) {
+    const absPath = workspacePath(plan.workspaceRoot, relPath);
+    if (!existsSync(absPath)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = lstatSync(absPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      addReview(plan, {
+        kind: "operator_review",
+        path: relPath,
+        suggestedTarget: `artifacts/legacy/${relPath}`,
+        reason: "unsafe_legacy_wiki_control",
+        message: "Legacy wiki control files must be regular files before automatic archival and replacement.",
+        blocking: true,
+      });
+      continue;
+    }
+    const content = readText(plan.workspaceRoot, relPath);
+    if (contentHasSecret(content)) {
+      addReview(plan, {
+        kind: "secret_review",
+        path: relPath,
+        suggestedTarget: `artifacts/legacy/${relPath}`,
+        reason: "secret_in_legacy_wiki_control",
+        message: "Legacy wiki control file appears to contain secret material; archive only after redaction/private backup.",
+        blocking: true,
+      });
+      continue;
+    }
+    if (existingV2Schema && LEGACY_WIKI_CONTROL_PATHS.includes(relPath as (typeof LEGACY_WIKI_CONTROL_PATHS)[number])) {
+      continue;
+    }
+    addWrite(
+      plan,
+      {
+        action: "copy",
+        role: "artifact",
+        sourcePath: relPath,
+        targetPath: `artifacts/legacy/${relPath}`,
+        reason: "archive pre-v2 wiki control file before generating canonical Knowledge v2 controls",
+      },
+      content,
+    );
+  }
+}
+
+function planGeneratedV2Control(
+  plan: MutablePlan,
+  operation: Omit<KnowledgeMigrationOperation, "action" | "sourcePath">,
+  content: string,
+): void {
+  const exists = existsSync(workspacePath(plan.workspaceRoot, operation.targetPath));
+  if (exists && !hasLegacyControlArchive(plan, operation.targetPath)) {
+    return;
+  }
   addWrite(
+    plan,
+    operation,
+    content,
+    { allowOverwrite: exists },
+  );
+}
+
+function planGeneratedV2Files(plan: MutablePlan): void {
+  planGeneratedV2Control(
     plan,
     {
       role: "schema",
@@ -1323,7 +1664,7 @@ function planGeneratedV2Files(plan: MutablePlan): void {
   );
 
   const pages = collectPlannedPages(plan);
-  addWrite(
+  planGeneratedV2Control(
     plan,
     {
       role: "index",
@@ -1335,7 +1676,7 @@ function planGeneratedV2Files(plan: MutablePlan): void {
 
   const pageCreates = pages.map((page) => `- ${plan.now.toISOString()} create ${page.relPath}`).join("\n");
   const structuralLines = pageCreates ? `${pageCreates}\n` : "";
-  addWrite(
+  planGeneratedV2Control(
     plan,
     {
       role: "log",
@@ -1367,6 +1708,7 @@ function planMigration(workspaceRoot: string, deps: KnowledgeMigrationDeps): Mut
   }
 
   const files = walkFiles(workspaceRoot);
+  planLegacyWikiControlArchives(plan);
   planMemoryFile(plan);
 
   for (const relPath of files) {

@@ -418,6 +418,7 @@ describe("package artifact install", () => {
           encoding: "utf8",
           env: commandEnv({
             FIXTURE_WORKSPACE: workspace,
+            MINIME_AGENT_WORKSPACE_CWD: agentWorkspace,
             MINIME_WORKSPACE_ROOT: workspace,
             SOURCE_BOT_ROOT: BOT_ROOT,
           }),
