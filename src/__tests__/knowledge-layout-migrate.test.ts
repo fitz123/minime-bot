@@ -232,6 +232,14 @@ describe("knowledge layout migration", () => {
       "| [Runtime](memory/auto/project_runtime.md) | Runtime status context |",
       "| [Diary](memory/diary/2026-06-07.md) | Timeline entries |",
       "",
+      "## Project",
+      "",
+      "- [Runtime](memory/auto/project_runtime.md) — Runtime status context",
+      "",
+      "## Reference",
+      "",
+      "- [Workspace Structure](memory/auto/workspace_structure.md) — Workspace structure reference",
+      "",
     ].join("\n");
     const workspace = createWorkspace({
       "MEMORY.md": legacyMemory,
@@ -247,6 +255,33 @@ describe("knowledge layout migration", () => {
     assert.ok(targets.includes("wiki/pages/project/runtime/status.md"));
     assert.equal(targets.some((target) => /catalog|contents/.test(target)), false);
     assert.equal(hasReviewItem(response, "MEMORY.md", "legacy_memory_split_required"), false);
+  });
+
+  it("infers root MEMORY strategic principles as feedback", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": [
+        "# Memory",
+        "",
+        "## Strategic Principles",
+        "",
+        "- Build for the future model, not only the current one.",
+        "- Lessons should be surfaced as durable guidance.",
+        "",
+        "## Critical (operational)",
+        "",
+        "- NEVER kill the runtime dependency before verifying the replacement works.",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    const targets = operationTargets(response);
+    assert.ok(targets.includes("wiki/pages/feedback/strategic-principles.md"));
+    assert.ok(targets.includes("wiki/pages/feedback/critical-operational.md"));
+    assert.equal(hasReviewItem(response, "MEMORY.md", "legacy_memory_split_required"), false);
+    assert.equal(response.summary.blockers, 0);
   });
 
   it("does not skip explicitly typed MEMORY sections with link-only bodies", () => {
@@ -546,6 +581,18 @@ describe("knowledge layout migration", () => {
         "This task plan is a one-off plan for a release.",
         "",
       ].join("\n"),
+      "memory/auto/project_vps.md": [
+        "---",
+        "name: VPS Migration",
+        "description: Project status with runbook references",
+        "type: project",
+        "---",
+        "",
+        "# VPS Migration",
+        "",
+        "Project status mentions a runbook and startup script, but the project_* source remains project status.",
+        "",
+      ].join("\n"),
       "memory/auto/inferred_runtime_runbook.md": [
         "# Project Runbook",
         "",
@@ -567,6 +614,8 @@ describe("knowledge layout migration", () => {
     assert.ok(hasReviewItem(response, "memory/auto/reference_plan.md", "one_off_plan_artifact", true));
     assert.ok(hasReviewItem(response, "memory/auto/inferred_runtime_runbook.md", "active_runbook_review", true));
     assert.ok(hasReviewItem(response, "memory/auto/operations.md", "active_runbook_review", true));
+    assert.equal(hasReviewItem(response, "memory/auto/project_vps.md", "active_runbook_review", true), false);
+    assert.ok(operationTargets(response).includes("wiki/pages/project/vps/status.md"));
     assert.equal(operationTargets(response).includes("wiki/pages/project/deploy-commands.md"), false);
     assert.equal(operationTargets(response).includes("wiki/pages/reference/release-checklist.md"), false);
     assert.equal(operationTargets(response).includes("wiki/pages/feedback/deploy-notes.md"), false);

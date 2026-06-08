@@ -648,7 +648,7 @@ function inferPageType(sourceRel: string, frontmatter: Record<string, unknown>, 
   if (/\b(runbook|command reference|operational command|deploy script|one-off plan|execution plan|task plan)\b/.test(text)) {
     return "project";
   }
-  if (/\b(feedback|correction|critique|do not|should not|preference correction|principle|lesson)\b/.test(text)) {
+  if (/\b(feedback|correction|critique|do not|should not|never|preference correction|principles?|lessons?)\b/.test(text)) {
     return "feedback";
   }
   if (slug === "facts" || /\bfacts\b/.test(text)) {
@@ -829,6 +829,14 @@ function classifyLegacyTarget(
   if (frontmatter.type === "user") {
     return `wiki/pages/user/${pageSlug}.md`;
   }
+  const participantTopic = participantTopicFromLegacySlug(slug);
+  if (participantTopic) {
+    return `wiki/pages/project/${participantTopic}/participants.md`;
+  }
+  const projectTopic = projectTopicFromLegacySlug(slug);
+  if (projectTopic) {
+    return uniqueTarget(plan, `wiki/pages/project/${projectTopic}/status.md`);
+  }
   if (/\b(runbook|command reference|operational command|deploy script)\b/.test(lower)) {
     return {
       kind: "operator_review",
@@ -848,14 +856,6 @@ function classifyLegacyTarget(
       message: "One-off execution plans route to artifacts/plans rather than wiki pages.",
       blocking: true,
     };
-  }
-  const participantTopic = participantTopicFromLegacySlug(slug);
-  if (participantTopic) {
-    return `wiki/pages/project/${participantTopic}/participants.md`;
-  }
-  const projectTopic = projectTopicFromLegacySlug(slug);
-  if (projectTopic) {
-    return uniqueTarget(plan, `wiki/pages/project/${projectTopic}/status.md`);
   }
   if (/\b(pet|animal)\b/.test(lower)) {
     if (/\b(treatment|medical|medicine|active plan|health)\b/.test(lower)) {
@@ -1021,7 +1021,7 @@ function isMemoryIndexIntroSection(section: LegacyMemorySection): boolean {
     return false;
   }
   const body = section.body.trim();
-  return !body || /^(?:long-term\s+)?memory (?:files|index)\b/i.test(body) || /memory\/auto\/.*memory\/diary\//is.test(body);
+  return !body || /^(?:long-term\s+)?(?:auto-)?memory (?:files|index)\b/i.test(body) || /\b(?:auto-)?memory index\b/i.test(body) || /memory\/auto\/.*memory\/diary\//is.test(body);
 }
 
 function isPlaceholderCatalogLine(line: string): boolean {
@@ -1029,7 +1029,7 @@ function isPlaceholderCatalogLine(line: string): boolean {
 }
 
 function isCatalogMemorySectionTitle(title: string): boolean {
-  return /\b(index|catalog|contents|files|memory files|auto|diary|daily notes)\b/i.test(title);
+  return /\b(index|catalog|contents|files|memory files|auto|diary|daily notes|project|projects|reference|references)\b/i.test(title);
 }
 
 function isCatalogOnlyMemorySection(section: LegacyMemorySection): boolean {
