@@ -34,8 +34,8 @@ npm pack --dry-run
 ## Tasks
 
 ### Task 1: Patch sampler args
-- [ ] Update `buildCodexQuotaSamplerArgs()` so the spawned Pi command includes `--approve`.
-- [ ] Preserve existing args and semantics (`--provider openai-codex`, `--thinking off`, `--no-context-files`, `--no-skills`, `--no-extensions`, explicit quota extension, `--no-session`, `--no-tools`, `-p`).
+- [x] Update `buildCodexQuotaSamplerArgs()` so the spawned Pi command includes `--approve`.
+- [x] Preserve existing args and semantics (`--provider openai-codex`, `--thinking off`, `--no-context-files`, `--no-skills`, `--no-extensions`, explicit quota extension, `--no-session`, `--no-tools`, `-p`).
 
 ### Task 2: Tests
 - [ ] Update `src/__tests__/codex-quota-sampler.test.ts` to assert the built args include `--approve`.

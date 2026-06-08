@@ -113,6 +113,7 @@ describe("codex quota sampler command setup", () => {
     });
 
     assert.deepEqual(args, [
+      "--approve",
       "--provider",
       "openai-codex",
       "--model",

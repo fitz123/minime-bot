@@ -256,6 +256,7 @@ export function resolveCodexQuotaSamplerConfig(
 
 export function buildCodexQuotaSamplerArgs(config: Pick<CodexQuotaSamplerConfig, "model" | "extensionPath" | "prompt">): string[] {
   return [
+    "--approve",
     "--provider",
     PI_PROVIDER,
     "--model",
