@@ -78,6 +78,19 @@ function hasFrontmatterTargetMismatch(
   ));
 }
 
+function hasReviewItem(
+  response: Extract<KnowledgeMigrationResponse, { ok: true }>,
+  path: string,
+  reason: string,
+  blocking?: boolean,
+): boolean {
+  return response.reviewItems.some((item) => (
+    item.path === path &&
+    item.reason === reason &&
+    (blocking === undefined || item.blocking === blocking)
+  ));
+}
+
 function legacyProjectPage(name = "Runtime"): string {
   return [
     "---",
@@ -135,7 +148,7 @@ describe("knowledge layout migration", () => {
     assert.equal(dryRun.summary.diaryEntries, 1);
     assert.equal(dryRun.summary.blockers, 0);
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "reference_draft_artifact"));
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "active_context_or_domain_tree"));
+    assert.ok(dryRun.reviewItems.some((item) => item.reason === "active_runtime_state"));
     assert.equal(existsSync(join(workspace, "wiki", "schema.md")), false);
 
     const applied = executeKnowledgeMigration({ apply: true }, {
@@ -203,6 +216,39 @@ describe("knowledge layout migration", () => {
     assert.equal(readFileSync(join(workspace, "artifacts/legacy/MEMORY.md"), "utf8"), legacyMemory);
   });
 
+  it("skips catalog-only MEMORY link lists with descriptions and simple tables", () => {
+    const legacyMemory = [
+      "# Memory",
+      "",
+      "## Catalog",
+      "",
+      "- [Runtime](memory/auto/project_runtime.md) - Runtime status context",
+      "- [Reports](reference/reports/runtime.md): archived reports",
+      "",
+      "## Contents",
+      "",
+      "| Page | Description |",
+      "| --- | --- |",
+      "| [Runtime](memory/auto/project_runtime.md) | Runtime status context |",
+      "| [Diary](memory/diary/2026-06-07.md) | Timeline entries |",
+      "",
+    ].join("\n");
+    const workspace = createWorkspace({
+      "MEMORY.md": legacyMemory,
+      "memory/auto/project_runtime.md": legacyProjectPage(),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    const targets = operationTargets(response);
+    assert.equal(response.summary.pages, 1);
+    assert.equal(response.summary.blockers, 0);
+    assert.ok(targets.includes("wiki/pages/project/runtime/status.md"));
+    assert.equal(targets.some((target) => /catalog|contents/.test(target)), false);
+    assert.equal(hasReviewItem(response, "MEMORY.md", "legacy_memory_split_required"), false);
+  });
+
   it("treats existing v2 workspaces as a no-op", () => {
     const workspace = createWorkspace({
       "wiki/schema.md": generateKnowledgeV2Schema(),
@@ -257,7 +303,7 @@ describe("knowledge layout migration", () => {
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "missing_or_unknown_type"));
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "profile_reference_type_review"));
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "hidden_runtime_state"));
-    assert.ok(dryRun.reviewItems.some((item) => item.reason === "active_context_or_domain_tree"));
+    assert.ok(dryRun.reviewItems.some((item) => item.reason === "domain_client_training_tree"));
     assert.ok(dryRun.reviewItems.some((item) => item.reason === "non_markdown_state"));
     assert.ok(dryRun.summary.blockers >= 3);
 
@@ -267,6 +313,37 @@ describe("knowledge layout migration", () => {
     assert.equal(apply.reason, "knowledge-migration-review-required");
     assert.equal(apply.summary?.applied, false);
     assert.match(apply.humanSummary ?? "", /not applied/);
+  });
+
+  it("classifies active docs and domain trees as nonblocking while unknown Markdown still blocks", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "README.md": "# Workspace\n",
+      "CHANGELOG.md": "# Changelog\n",
+      "AGENTS.md": "# Agent Instructions\n",
+      "STATUS.md": "# Status\n",
+      ".beads/README.md": "# Beads\n",
+      "nix/runtime.nix": "{ pkgs }: {}\n",
+      "domain/orders/model.md": "# Orders\n",
+      "clients/acme/README.md": "# Acme\n",
+      "training/onboarding.md": "# Onboarding\n",
+      "loose-note.md": "# Loose Note\n\nNo package-level provenance.\n",
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    assert.ok(hasReviewItem(response, "README.md", "root_active_doc", false));
+    assert.ok(hasReviewItem(response, "CHANGELOG.md", "root_active_doc", false));
+    assert.ok(hasReviewItem(response, "AGENTS.md", "root_active_doc", false));
+    assert.ok(hasReviewItem(response, "STATUS.md", "root_status_doc", false));
+    assert.ok(hasReviewItem(response, ".beads/README.md", "beads_metadata_doc", false));
+    assert.ok(hasReviewItem(response, "nix/runtime.nix", "nix_runtime_tree", false));
+    assert.ok(hasReviewItem(response, "domain/orders/model.md", "domain_client_training_tree", false));
+    assert.ok(hasReviewItem(response, "clients/acme/README.md", "domain_client_training_tree", false));
+    assert.ok(hasReviewItem(response, "training/onboarding.md", "domain_client_training_tree", false));
+    assert.ok(hasReviewItem(response, "loose-note.md", "unknown_provenance", true));
+    assert.equal(response.summary.blockers, 1);
   });
 
   it("reports target/frontmatter type mismatches as blocking review items", () => {

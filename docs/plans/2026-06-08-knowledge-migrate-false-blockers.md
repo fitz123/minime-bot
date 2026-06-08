@@ -37,14 +37,14 @@ Private operator validation with real workspaces will be run outside this public
 
 ### Task 1: Improve catalog and active-doc classification
 
-- [ ] Expand catalog-only `MEMORY.md` detection for link lists with descriptions and simple Markdown tables.
-- [ ] Add tests proving catalog/index sections are skipped rather than becoming pages or blockers.
-- [ ] Classify active/runtime docs and domain trees as nonblocking out-of-scope with specific reasons:
+- [x] Expand catalog-only `MEMORY.md` detection for link lists with descriptions and simple Markdown tables.
+- [x] Add tests proving catalog/index sections are skipped rather than becoming pages or blockers.
+- [x] Classify active/runtime docs and domain trees as nonblocking out-of-scope with specific reasons:
   - root README/CHANGELOG/AGENTS-style docs;
   - Beads metadata docs;
   - Nix/domain/client/training trees;
   - root status docs.
-- [ ] Keep genuinely unknown Markdown as blocking `unknown_provenance`.
+- [x] Keep genuinely unknown Markdown as blocking `unknown_provenance`.
 
 ### Task 2: Preserve explicit feedback and harden slugging
 
