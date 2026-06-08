@@ -19,11 +19,14 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, CronJob } from "../types.js";
 import {
-  MINIME_AGENT_WORKSPACE_CWD_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
-  MINIME_WORKSPACE_ROOT_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
 } from "../workspace-contract.js";
+
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 interface SpawnCapture {
   command: string;
@@ -299,11 +302,11 @@ describe("cron-runner runPi", () => {
   it("validates the agent workspace before assembling cron context", () => {
     const workspaceRoot = makeWorkspace();
     const missingWorkspace = join(workspaceRoot, "missing-agent-workspace");
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     let assembled = false;
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       const captures: SpawnCapture[] = [];
       const deps = makeDeps(captures, {
         buildEnv: buildPiSpawnEnv,
@@ -321,9 +324,9 @@ describe("cron-runner runPi", () => {
       assert.strictEqual(captures.length, 0);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
     }
   });
@@ -349,7 +352,10 @@ describe("cron-runner runPi", () => {
     const oldGithubToken = process.env[githubTokenEnv];
     const oldAwsSecret = process.env[awsSecretEnv];
     const oldDiscordToken = process.env[discordTokenEnv];
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldAgentWorkspace = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    const oldRetiredWorkspace = process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+    const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const oldConfigPath = process.env[MINIME_CONFIG_PATH_ENV];
     const oldCronsPath = process.env[MINIME_CRONS_PATH_ENV];
     const fixtureValues = ["cron-telegram-fixture", "cron-discord-fixture", "cron-tavily-fixture"];
@@ -369,7 +375,10 @@ describe("cron-runner runPi", () => {
       process.env[awsSecretEnv] = "fixture";
 
       const ws = makeWorkspace();
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = ws;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = ws;
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = join(ws, "stale-agent-workspace");
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = join(ws, "retired-control-workspace");
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = join(ws, "retired-agent-workspace");
       process.env[MINIME_CONFIG_PATH_ENV] = "settings/config.yaml";
       process.env[MINIME_CRONS_PATH_ENV] = join(ws, "settings", "crons.yaml");
       const captures: SpawnCapture[] = [];
@@ -379,8 +388,10 @@ describe("cron-runner runPi", () => {
 
       const env = captures[0].options.env ?? {};
       assert.strictEqual(env.HOME, homedir());
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], ws);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], ws);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], ws);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], ws);
+      assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
+      assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(ws, "settings", "config.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(ws, "settings", "crons.yaml"));
       assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
@@ -462,9 +473,24 @@ describe("cron-runner runPi", () => {
         process.env[awsSecretEnv] = oldAwsSecret;
       }
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldAgentWorkspace === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = oldAgentWorkspace;
+      }
+      if (oldRetiredWorkspace === undefined) {
+        delete process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_CONTROL_WORKSPACE_ENV] = oldRetiredWorkspace;
+      }
+      if (oldRetiredAgentWorkspace === undefined) {
+        delete process.env[RETIRED_AGENT_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_AGENT_WORKSPACE_ENV] = oldRetiredAgentWorkspace;
       }
       if (oldConfigPath === undefined) {
         delete process.env[MINIME_CONFIG_PATH_ENV];
@@ -480,13 +506,19 @@ describe("cron-runner runPi", () => {
   });
 
   it("keeps only allowed Pi runtime keys in the hardened cron env", () => {
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldAgentWorkspace = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+    const oldRetiredWorkspace = process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+    const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const workspace = makeWorkspace();
     const agentWorkspace = join(workspace, "agent-workspace");
     mkdirSync(agentWorkspace, { recursive: true });
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspace;
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = join(workspace, "stale-agent-workspace");
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = join(workspace, "retired-control-workspace");
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = join(workspace, "retired-agent-workspace");
       const captures: SpawnCapture[] = [];
       const deps = makeDeps(captures, {
         buildEnv: buildPiSpawnEnv,
@@ -496,14 +528,31 @@ describe("cron-runner runPi", () => {
       runPi(makeCron(), agentWorkspace, deps);
 
       const env = captures[0].options.env ?? {};
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], workspace);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], workspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], agentWorkspace);
+      assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
+      assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
       assert.strictEqual(captures[0].options.cwd, agentWorkspace);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldAgentWorkspace === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = oldAgentWorkspace;
+      }
+      if (oldRetiredWorkspace === undefined) {
+        delete process.env[RETIRED_CONTROL_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_CONTROL_WORKSPACE_ENV] = oldRetiredWorkspace;
+      }
+      if (oldRetiredAgentWorkspace === undefined) {
+        delete process.env[RETIRED_AGENT_WORKSPACE_ENV];
+      } else {
+        process.env[RETIRED_AGENT_WORKSPACE_ENV] = oldRetiredAgentWorkspace;
       }
     }
   });

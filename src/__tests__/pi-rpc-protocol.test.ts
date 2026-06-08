@@ -45,10 +45,10 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
-  MINIME_AGENT_WORKSPACE_CWD_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
-  MINIME_WORKSPACE_ROOT_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
 } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -70,6 +70,8 @@ const NO_EXTENSIONS: PiExtensionResolveOptions = {
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(["guardian", "protect", "files"].join("-"));
 const RETIRED_SCHEMA_PATH_ENV = ["MINIME", "SCHEMA", "PATH"].join("_");
 const RETIRED_GUARD_ROOT_ENV = ["PI", "GUARD", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
+const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 describe("NewlineOnlyJsonlSplitter", () => {
   it("does not split on U+2028 or U+2029 inside JSON strings", () => {
@@ -646,15 +648,15 @@ describe("buildPiSpawnEnv", () => {
   });
 
   function withWorkspaceRoot<T>(workspaceRoot: string, fn: () => T): T {
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       return fn();
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
     }
   }
@@ -682,10 +684,12 @@ describe("buildPiSpawnEnv", () => {
       "MINIME_SESSION_SECRET",
       RETIRED_SCHEMA_PATH_ENV,
       RETIRED_GUARD_ROOT_ENV,
-      MINIME_AGENT_WORKSPACE_CWD_ENV,
+      RETIRED_AGENT_WORKSPACE_ENV,
+      RETIRED_CONTROL_WORKSPACE_ENV,
+      MINIME_AGENT_WORKSPACE_ROOT_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
-      MINIME_WORKSPACE_ROOT_ENV,
+      MINIME_CONTROL_WORKSPACE_ROOT_ENV,
     ];
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
 
@@ -711,8 +715,10 @@ describe("buildPiSpawnEnv", () => {
       process.env.MINIME_SESSION_SECRET = "fixture";
       process.env[RETIRED_SCHEMA_PATH_ENV] = "/tmp/schema.md";
       process.env[RETIRED_GUARD_ROOT_ENV] = "/tmp/guard-root";
-      process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = "/tmp/stale-agent-workspace";
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = "/tmp";
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/tmp/retired-agent-workspace";
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/tmp/retired-control-workspace";
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
 
@@ -729,8 +735,10 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env.MINIME_SESSION_SECRET, undefined);
       assert.strictEqual(env[RETIRED_SCHEMA_PATH_ENV], undefined);
       assert.strictEqual(env[RETIRED_GUARD_ROOT_ENV], undefined);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], "/tmp");
+      assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
+      assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
       assert.strictEqual(env.ANTHROPIC_OAUTH_TOKEN, undefined);
@@ -763,25 +771,25 @@ describe("buildPiSpawnEnv", () => {
 
   it("passes the non-secret control workspace contract to Pi children", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-env-control-contract-"));
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const oldConfig = process.env[MINIME_CONFIG_PATH_ENV];
     const oldCrons = process.env[MINIME_CRONS_PATH_ENV];
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       process.env[MINIME_CONFIG_PATH_ENV] = "settings/bot.yaml";
       process.env[MINIME_CRONS_PATH_ENV] = "ops/crons.yaml";
 
       const env = buildPiSpawnEnv();
 
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], workspaceRoot);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], workspaceRoot);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(workspaceRoot, "settings", "bot.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(workspaceRoot, "ops", "crons.yaml"));
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
       if (oldConfig === undefined) {
         delete process.env[MINIME_CONFIG_PATH_ENV];
@@ -800,20 +808,20 @@ describe("buildPiSpawnEnv", () => {
   it("sets the explicit agent workspace env separately from the control workspace root", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-spawn-env-control-root-"));
     const agentWorkspace = mkdtempSync(join(tmpdir(), "pi-spawn-env-agent-root-"));
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
 
       const env = buildPiSpawnEnv(agentWorkspace);
 
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], agentWorkspace);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(agentWorkspace, { recursive: true, force: true });
@@ -909,10 +917,10 @@ describe("spawnPiRpcSession workspace validation", () => {
   it("validates missing workspaceCwd before assembling context artifacts", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-root-"));
     const missingWorkspace = join(workspaceRoot, "missing-agent-workspace");
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
 
       assert.throws(
         () => spawnPiRpcSession({ ...testAgent, id: "missing", workspaceCwd: missingWorkspace }),
@@ -921,9 +929,9 @@ describe("spawnPiRpcSession workspace validation", () => {
       assert.ok(!existsSync(join(missingWorkspace, ".tmp")), "context artifacts must not be written before validation");
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
       rmSync(workspaceRoot, { recursive: true, force: true });
     }
@@ -942,10 +950,12 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       "SSH_AUTH_SOCK",
       "TAVILY_API_KEY",
       "TELEGRAM_BOT_TOKEN",
+      RETIRED_AGENT_WORKSPACE_ENV,
+      RETIRED_CONTROL_WORKSPACE_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
-      MINIME_AGENT_WORKSPACE_CWD_ENV,
-      MINIME_WORKSPACE_ROOT_ENV,
+      MINIME_AGENT_WORKSPACE_ROOT_ENV,
+      MINIME_CONTROL_WORKSPACE_ROOT_ENV,
     ];
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
 
@@ -959,8 +969,10 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       process.env.SSH_AUTH_SOCK = "/tmp/ssh-agent.sock";
       process.env.TAVILY_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
-      process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = "/tmp/stale-agent-workspace";
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = "/tmp";
+      process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/tmp/retired-agent-workspace";
+      process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/tmp/retired-control-workspace";
+      process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
 
@@ -969,8 +981,10 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       assert.strictEqual(env.PI_CODING_AGENT_SESSION_DIR, "/tmp/pi-sessions");
       assert.strictEqual(env.LC_CTYPE, "UTF-8");
       assert.strictEqual(env.PATH, "/opt/homebrew/bin:/usr/bin");
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], "/tmp");
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
+      assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
+      assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
       assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
@@ -999,8 +1013,8 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       "TELEGRAM_BOT_TOKEN",
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
-      MINIME_AGENT_WORKSPACE_CWD_ENV,
-      MINIME_WORKSPACE_ROOT_ENV,
+      MINIME_AGENT_WORKSPACE_ROOT_ENV,
+      MINIME_CONTROL_WORKSPACE_ROOT_ENV,
     ];
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
 
@@ -1008,14 +1022,14 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       process.env.DISCORD_BOT_TOKEN = "fixture";
       process.env.TAVILY_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       process.env[MINIME_CONFIG_PATH_ENV] = "settings/bot.yaml";
       process.env[MINIME_CRONS_PATH_ENV] = "ops/crons.yaml";
 
       const env = buildPiSubagentChildSpawnEnv();
 
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], workspaceRoot);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], undefined);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], workspaceRoot);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(workspaceRoot, "settings", "bot.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(workspaceRoot, "ops", "crons.yaml"));
       assert.strictEqual(env.DISCORD_BOT_TOKEN, undefined);
@@ -1037,20 +1051,20 @@ describe("buildPiSubagentChildSpawnEnv", () => {
   it("sets subagent child agent workspace env when a child cwd is supplied", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-subagent-env-control-root-"));
     const agentWorkspace = mkdtempSync(join(tmpdir(), "pi-subagent-env-agent-root-"));
-    const oldWorkspace = process.env[MINIME_WORKSPACE_ROOT_ENV];
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
 
     try {
-      process.env[MINIME_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
 
       const env = buildPiSubagentChildSpawnEnv(agentWorkspace);
 
-      assert.strictEqual(env[MINIME_WORKSPACE_ROOT_ENV], controlWorkspace);
-      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_CWD_ENV], agentWorkspace);
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], agentWorkspace);
     } finally {
       if (oldWorkspace === undefined) {
-        delete process.env[MINIME_WORKSPACE_ROOT_ENV];
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
-        process.env[MINIME_WORKSPACE_ROOT_ENV] = oldWorkspace;
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(agentWorkspace, { recursive: true, force: true });

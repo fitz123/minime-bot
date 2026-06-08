@@ -96,11 +96,11 @@ Important constraints:
 
 ### Task 2: Pi child env contract
 
-- [ ] Add canonical env names to the Pi child env allowlist.
-- [ ] Remove old env names from the Pi child env allowlist.
-- [ ] Update `buildAllowedPiChildEnv` to delete stale inherited old and canonical agent envs, then set only the canonical current value.
-- [ ] Set only canonical control workspace env from the resolved contract.
-- [ ] Update tests for parent Pi, subagent child Pi, and cron Pi envs.
+- [x] Add canonical env names to the Pi child env allowlist.
+- [x] Remove old env names from the Pi child env allowlist.
+- [x] Update `buildAllowedPiChildEnv` to delete stale inherited old and canonical agent envs, then set only the canonical current value.
+- [x] Set only canonical control workspace env from the resolved contract.
+- [x] Update tests for parent Pi, subagent child Pi, and cron Pi envs.
 
 ### Task 3: Knowledge and web extension lookup
 
