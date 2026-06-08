@@ -55,10 +55,10 @@ Private operator validation with real workspaces will be run outside this public
 
 ### Task 3: Handle pre-v2 wiki controls safely
 
-- [ ] When a legacy/pre-v2 workspace already has non-v2 `wiki/schema.md`, `wiki/index.md`, or `wiki/log.md`, plan archive copies under `artifacts/`.
-- [ ] Generate canonical v2 controls with explicit safe overwrite semantics only after archive copies are planned.
-- [ ] Do not overwrite existing v2 controls, symlinks, or unsafe paths.
-- [ ] Add tests for pre-v2 control archival and canonical v2 control generation.
+- [x] When a legacy/pre-v2 workspace already has non-v2 `wiki/schema.md`, `wiki/index.md`, or `wiki/log.md`, plan archive copies under `artifacts/`.
+- [x] Generate canonical v2 controls with explicit safe overwrite semantics only after archive copies are planned.
+- [x] Do not overwrite existing v2 controls, symlinks, or unsafe paths.
+- [x] Add tests for pre-v2 control archival and canonical v2 control generation.
 
 ### Task 4: Validate and document
 

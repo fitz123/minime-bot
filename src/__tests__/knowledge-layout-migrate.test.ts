@@ -253,6 +253,7 @@ describe("knowledge layout migration", () => {
     const workspace = createWorkspace({
       "wiki/schema.md": generateKnowledgeV2Schema(),
       "wiki/index.md": "# Knowledge Index\n",
+      "wiki/log.md": "- existing v2 log entry\n",
     });
 
     const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
@@ -614,6 +615,15 @@ describe("knowledge layout migration", () => {
     assert.ok(targets.includes("wiki/schema.md"));
     assert.ok(targets.includes("wiki/index.md"));
     assert.ok(targets.includes("wiki/log.md"));
+    assert.ok(dryRun.operations.some((operation) => (
+      operation.action === "copy" &&
+      operation.sourcePath === "wiki/schema.md" &&
+      operation.targetPath === "artifacts/legacy/wiki/schema.md"
+    )));
+    assert.ok(dryRun.operations.some((operation) => (
+      operation.role === "schema" &&
+      operation.targetPath === "wiki/schema.md"
+    )));
     assert.equal(dryRun.summary.blockers, 0);
 
     const apply = executeKnowledgeMigration({ apply: true }, { agentWorkspaceRoot: workspace });
@@ -624,6 +634,41 @@ describe("knowledge layout migration", () => {
     assert.equal(readFileSync(join(workspace, "artifacts/legacy/wiki/log.md"), "utf8"), "# Existing Log\n");
     assert.match(readFileSync(join(workspace, "wiki", "schema.md"), "utf8"), /format: minime-knowledge-v2/);
     assert.match(readFileSync(join(workspace, "wiki", "index.md"), "utf8"), /\[Runtime Landing\]\(pages\/project\/runtime\/README\.md\)/);
+  });
+
+  it("does not generate replacement controls when legacy control archival is blocked", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "wiki/schema.md": "api_key: fixture-secret-value\n",
+      "wiki/index.md": "# Topic Wiki Index\n",
+    });
+
+    const dryRun = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(dryRun);
+    const targets = operationTargets(dryRun);
+    assert.ok(hasReviewItem(dryRun, "wiki/schema.md", "secret_in_legacy_wiki_control", true));
+    assert.equal(targets.includes("artifacts/legacy/wiki/schema.md"), false);
+    assert.equal(targets.includes("wiki/schema.md"), false);
+    assert.ok(targets.includes("artifacts/legacy/wiki/index.md"));
+    assert.ok(targets.includes("wiki/index.md"));
+  });
+
+  it("does not overwrite symlinked legacy wiki controls", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "outside-schema.txt": "legacy schema\n",
+    });
+    mkdirSync(join(workspace, "wiki"), { recursive: true });
+    symlinkSync(join(workspace, "outside-schema.txt"), join(workspace, "wiki", "schema.md"));
+
+    const dryRun = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(dryRun);
+    const targets = operationTargets(dryRun);
+    assert.ok(hasReviewItem(dryRun, "wiki/schema.md", "unsafe_legacy_wiki_control", true));
+    assert.equal(targets.includes("artifacts/legacy/wiki/schema.md"), false);
+    assert.equal(targets.includes("wiki/schema.md"), false);
   });
 
   it("rewrites topic-wiki links to migrated v2 page targets when the target is deterministic", { skip: !hasGit }, () => {

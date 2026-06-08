@@ -18,6 +18,7 @@ import {
   KNOWLEDGE_PAGE_TYPES,
   type KnowledgePageType,
   generateKnowledgeV2Schema,
+  parseKnowledgeV2SchemaMarker,
   resolveKnowledgeLayout,
   type ResolvedKnowledgeLayout,
 } from "./layout.js";
@@ -165,6 +166,7 @@ const NIX_TREE_RE = /(?:^nix(?:os)?\/|^flake\.(?:nix|lock)$|\.nix$)/i;
 const DOMAIN_CLIENT_TRAINING_TREE_RE = /^(?:pilot|cyber-genpodryad|dolt|domain|domains|client|clients|training|trainings|docs)\//i;
 const ACTIVE_RUNTIME_STATE_RE = /^(?:\.claude\/|(?:config|crons)(?:\.local)?\.ya?ml$|scripts\/|package(?:-lock)?\.json$)/i;
 const MEDIA_OR_STRUCTURED_STATE_RE = /(?:\.sqlite3$|\.(?:png|jpe?g|gif|webp|pdf)$)/i;
+const LEGACY_WIKI_CONTROL_PATHS = ["wiki/schema.md", "wiki/index.md", "wiki/log.md"] as const;
 const SECRET_PATTERNS = [
   /(?:password|secret|token|api[_-]?key|private[_-]?key|pin|payment|card(?: number)?|credential)\s*[:=]\s*\S{4,}/i,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
@@ -364,6 +366,16 @@ function publicOperations(operations: readonly InternalOperation[]): KnowledgeMi
 function sameContentIfExists(root: string, relPath: string, content: string): boolean {
   const path = workspacePath(root, relPath);
   return existsSync(path) && readFileSync(path, "utf8") === content;
+}
+
+function sameRegularFileContentIfExists(root: string, relPath: string, content: string): boolean {
+  const path = workspacePath(root, relPath);
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() && !stat.isSymbolicLink() && readFileSync(path, "utf8") === content;
+  } catch {
+    return false;
+  }
 }
 
 function unsafeWriteTargetReason(workspaceRoot: string, absTargetPath: string): string | undefined {
@@ -1518,8 +1530,42 @@ function collectPlannedPages(plan: MutablePlan): ParsedPage[] {
     .sort((a, b) => a.relPath.localeCompare(b.relPath));
 }
 
+function hasExistingV2SchemaMarker(plan: MutablePlan): boolean {
+  const schemaPath = workspacePath(plan.workspaceRoot, "wiki/schema.md");
+  try {
+    const stat = lstatSync(schemaPath);
+    return stat.isFile() && !stat.isSymbolicLink() && parseKnowledgeV2SchemaMarker(readFileSync(schemaPath, "utf8")) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function hasLegacyControlArchive(plan: MutablePlan, relPath: string): boolean {
+  const archivePath = `artifacts/legacy/${relPath}`;
+  if (plan.operations.some((operation) => (
+    operation.action === "copy" &&
+    operation.role === "artifact" &&
+    operation.sourcePath === relPath &&
+    operation.targetPath === archivePath
+  ))) {
+    return true;
+  }
+
+  const absPath = workspacePath(plan.workspaceRoot, relPath);
+  try {
+    const stat = lstatSync(absPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return false;
+    }
+    return sameRegularFileContentIfExists(plan.workspaceRoot, archivePath, readFileSync(absPath, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
 function planLegacyWikiControlArchives(plan: MutablePlan): void {
-  for (const relPath of ["wiki/schema.md", "wiki/index.md", "wiki/log.md", "wiki/issues.md"]) {
+  const existingV2Schema = hasExistingV2SchemaMarker(plan);
+  for (const relPath of [...LEGACY_WIKI_CONTROL_PATHS, "wiki/issues.md"]) {
     const absPath = workspacePath(plan.workspaceRoot, relPath);
     if (!existsSync(absPath)) {
       continue;
@@ -1553,6 +1599,9 @@ function planLegacyWikiControlArchives(plan: MutablePlan): void {
       });
       continue;
     }
+    if (existingV2Schema && LEGACY_WIKI_CONTROL_PATHS.includes(relPath as (typeof LEGACY_WIKI_CONTROL_PATHS)[number])) {
+      continue;
+    }
     addWrite(
       plan,
       {
@@ -1567,9 +1616,25 @@ function planLegacyWikiControlArchives(plan: MutablePlan): void {
   }
 }
 
-function planGeneratedV2Files(plan: MutablePlan): void {
-  const mayReplaceLegacyControls = plan.layout.kind !== "v2";
+function planGeneratedV2Control(
+  plan: MutablePlan,
+  operation: Omit<KnowledgeMigrationOperation, "action" | "sourcePath">,
+  content: string,
+): void {
+  const exists = existsSync(workspacePath(plan.workspaceRoot, operation.targetPath));
+  if (exists && !hasLegacyControlArchive(plan, operation.targetPath)) {
+    return;
+  }
   addWrite(
+    plan,
+    operation,
+    content,
+    { allowOverwrite: exists },
+  );
+}
+
+function planGeneratedV2Files(plan: MutablePlan): void {
+  planGeneratedV2Control(
     plan,
     {
       role: "schema",
@@ -1577,11 +1642,10 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "generate canonical Knowledge v2 schema marker and contract",
     },
     generateKnowledgeV2Schema(),
-    { allowOverwrite: mayReplaceLegacyControls },
   );
 
   const pages = collectPlannedPages(plan);
-  addWrite(
+  planGeneratedV2Control(
     plan,
     {
       role: "index",
@@ -1589,12 +1653,11 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "generate Knowledge v2 index from migrated pages",
     },
     generateKnowledgeIndex(pages),
-    { allowOverwrite: mayReplaceLegacyControls },
   );
 
   const pageCreates = pages.map((page) => `- ${plan.now.toISOString()} create ${page.relPath}`).join("\n");
   const structuralLines = pageCreates ? `${pageCreates}\n` : "";
-  addWrite(
+  planGeneratedV2Control(
     plan,
     {
       role: "log",
@@ -1602,7 +1665,6 @@ function planGeneratedV2Files(plan: MutablePlan): void {
       reason: "record structural creates planned by knowledge migration",
     },
     structuralLines,
-    { allowOverwrite: mayReplaceLegacyControls },
   );
 }
 
