@@ -491,6 +491,34 @@ describe("knowledge layout migration", () => {
     assert.equal(response.summary.blockers, 0);
   });
 
+  it("falls back to stable section slugs for non-ASCII root MEMORY section names", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": [
+        "# Memory",
+        "",
+        "## feedback: Спасибо",
+        "",
+        "Response style feedback.",
+        "",
+        "## feedback: Благодарю",
+        "",
+        "Review style feedback.",
+        "",
+      ].join("\n"),
+    });
+
+    const response = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+
+    assertMigrationOk(response);
+    const targets = operationTargets(response);
+    assert.ok(targets.includes("wiki/pages/feedback/memory-md-section-1.md"));
+    assert.ok(targets.includes("wiki/pages/feedback/memory-md-section-2.md"));
+    assert.equal(targets.includes("wiki/pages/feedback/untitled.md"), false);
+    assert.equal(hasReviewItem(response, "MEMORY.md", "slug_collision"), false);
+    assert.equal(response.summary.pages, 2);
+    assert.equal(response.summary.blockers, 0);
+  });
+
   it("keeps runbook and one-off plan artifact review heuristics for typed and untyped pages", () => {
     const workspace = createWorkspace({
       "MEMORY.md": "# Memory\n",

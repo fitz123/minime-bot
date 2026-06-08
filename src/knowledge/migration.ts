@@ -1107,6 +1107,12 @@ function frontmatterForMemorySection(
   return { frontmatter, body };
 }
 
+function memorySectionClassificationSource(name: string, sectionIndex: number): string {
+  const nameSlug = slugify(name);
+  const sourceSlug = nameSlug === "untitled" ? `memory-md-section-${sectionIndex + 1}` : nameSlug;
+  return `MEMORY.md/${sourceSlug}.md`;
+}
+
 function walkFiles(root: string): string[] {
   const files: string[] = [];
   function walk(dir: string): void {
@@ -1193,7 +1199,7 @@ function planMemoryFile(plan: MutablePlan): void {
       );
     }
   }
-  for (const section of splitLegacyMemorySections(removePendingReview(content))) {
+  for (const [sectionIndex, section] of splitLegacyMemorySections(removePendingReview(content)).entries()) {
     const page = frontmatterForMemorySection(section);
     if (!page) {
       continue;
@@ -1202,7 +1208,7 @@ function planMemoryFile(plan: MutablePlan): void {
       addReview(plan, page);
       continue;
     }
-    const classificationSource = `MEMORY.md/${slugify(page.frontmatter.name)}.md`;
+    const classificationSource = memorySectionClassificationSource(page.frontmatter.name, sectionIndex);
     const target = classifyLegacyTarget(plan, classificationSource, page.frontmatter, page.body);
     if (typeof target !== "string") {
       addReview(plan, { ...target, path: relPath });
