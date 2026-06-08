@@ -42,7 +42,7 @@ npm pack --dry-run
 - [x] If there is a dry-run/result assertion that snapshots args, update it too.
 
 ### Task 3: Validate and prepare PR
-- [ ] Run the focused test.
-- [ ] Run build/lint/package dry-run validation.
-- [ ] Commit with issue reference `(#11)`.
-- [ ] Leave deployment to the operator; do not touch the private workspace package install.
+- [x] Run the focused test.
+- [x] Run build/lint/package dry-run validation.
+- [x] Commit with issue reference `(#11)`.
+- [x] Leave deployment to the operator; do not touch the private workspace package install.
