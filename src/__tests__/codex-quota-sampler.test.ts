@@ -113,6 +113,7 @@ describe("codex quota sampler command setup", () => {
     });
 
     assert.deepEqual(args, [
+      "--approve",
       "--provider",
       "openai-codex",
       "--model",
@@ -121,9 +122,15 @@ describe("codex quota sampler command setup", () => {
       "off",
       "--no-context-files",
       "--no-skills",
+      "--no-prompt-templates",
+      "--no-themes",
       "--no-extensions",
       "--extension",
       "/abs/codex-usage.ts",
+      "--system-prompt",
+      "You are a quota sampler. Follow the user prompt exactly.",
+      "--append-system-prompt",
+      "",
       "--no-session",
       "--no-tools",
       "-p",
@@ -164,6 +171,45 @@ describe("codex quota sampler command setup", () => {
 
     assert.equal(config.samplerCwd, join(tmpdir(), `codex-quota-sampler-${uid}`));
     assert.notEqual(config.samplerCwd, join(tmpdir(), "codex-quota-sampler"));
+  });
+
+  it("defaults to the bundled Pi CLI but preserves explicit overrides", () => {
+    const cwd = tempDir();
+    const config = resolveCodexQuotaSamplerConfig({
+      cwd,
+      env: { CODEX_QUOTA_TEXTFILE_DIR: "metrics" },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+
+    assert.notEqual(config.piBin, "pi");
+    assert.match(
+      config.piBin,
+      /(node_modules[\/\\]\.bin[\/\\]pi(?:\.cmd)?|node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js)$/,
+    );
+
+    const envOverride = resolveCodexQuotaSamplerConfig({
+      cwd,
+      env: {
+        CODEX_QUOTA_TEXTFILE_DIR: "metrics",
+        CODEX_QUOTA_PI_BIN: "/env/pi",
+      },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+    assert.equal(envOverride.piBin, "/env/pi");
+
+    const cliOverride = resolveCodexQuotaSamplerConfig({
+      cwd,
+      cli: { piBin: "/cli/pi" },
+      env: {
+        CODEX_QUOTA_TEXTFILE_DIR: "metrics",
+        CODEX_QUOTA_PI_BIN: "/env/pi",
+      },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+    assert.equal(cliOverride.piBin, "/cli/pi");
   });
 
   it("defaults quota state to the selected workspace runtime dir", () => {
@@ -422,6 +468,7 @@ describe("codex quota sampler probe execution", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].command, "pi");
     assert.equal(calls[0].cwd, join(dir, "sampler"));
+    assert.equal(calls[0].args[0], "--approve");
     assert.equal(calls[0].args.includes("--no-extensions"), true);
     assert.equal(calls[0].args.includes("--extension"), true);
     assert.ok(result.attemptFile?.startsWith(join(dir, "sampler", ".tmp")));
@@ -634,6 +681,7 @@ describe("codex quota sampler probe execution", () => {
 
     assert.equal(result.status, "dry_run");
     assert.equal(spawned, false);
+    assert.equal(result.args[0], "--approve");
     assert.equal(existsSync(samplerCwd), false);
     assert.equal(existsSync(result.settingsFile), false);
     assert.equal(existsSync(join(dir, "metrics", CODEX_QUOTA_PROBE_TEXTFILE_NAME)), false);

@@ -282,6 +282,19 @@ describe("package artifact install", () => {
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
       assert.match(samplerHelp.stdout, /minime-codex-quota-sampler|codex-quota-sampler/);
 
+      const samplerDryRun = runInstalledSamplerBin(
+        projectDir,
+        ["--dry-run", "--workspace", workspace, "--textfile-dir", join(temp, "quota-metrics")],
+        workspace,
+      );
+      assert.equal(samplerDryRun.status, 0, samplerDryRun.stderr || samplerDryRun.stdout || String(samplerDryRun.error));
+      const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { command: string; args: string[] };
+      assert.match(
+        samplerDryRunJson.command,
+        /(node_modules[\/\\]\.bin[\/\\]pi(?:\.cmd)?|node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js)$/,
+      );
+      assert.equal(samplerDryRunJson.args[0], "--approve");
+
       const configValidate = runInstalledBin(projectDir, ["config", "validate", "--workspace", workspace], workspace);
       assert.equal(configValidate.status, 0, configValidate.stderr);
       assert.match(configValidate.stdout, /Config valid\./);
