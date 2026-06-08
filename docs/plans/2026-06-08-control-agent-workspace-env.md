@@ -118,9 +118,9 @@ Important constraints:
 
 ### Task 5: Validation
 
-- [ ] Run focused tests:
+- [x] Run focused tests:
   - `node --test dist/__tests__/workspace-contract.test.js dist/__tests__/pi-rpc-protocol.test.js dist/__tests__/knowledge-pi-extension.test.js dist/__tests__/tavily.test.js dist/__tests__/cli.test.js` after build, or the repo's equivalent focused workflow.
-- [ ] Run full package validation:
+- [x] Run full package validation:
   - `npm test`
   - `npm run build`
   - `npm pack --dry-run`
