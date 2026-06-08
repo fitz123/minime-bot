@@ -640,11 +640,8 @@ function resolveBundledPiBin(): string | undefined {
       return binPath;
     }
 
-    // A raw JS file cannot be spawned directly on Windows when shell=false.
-    // Prefer the npm-generated .cmd shim there; if it is absent, fall back to
-    // ambient `pi` rather than returning an unspawnable dist/cli.js path.
     const cliPath = join(nodeModulesDir, "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-    if (process.platform !== "win32" && existsSync(cliPath)) {
+    if (existsSync(cliPath)) {
       return cliPath;
     }
   }
