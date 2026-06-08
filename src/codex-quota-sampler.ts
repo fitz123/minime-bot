@@ -11,6 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -35,6 +36,7 @@ export const CODEX_QUOTA_PROBE_TEXTFILE_NAME = "codex_usage_probe.prom";
 
 const PI_PROVIDER = "openai-codex";
 const DEFAULT_PI_BIN = "pi";
+const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
 const DEFAULT_CODEX_QUOTA_MODEL = "openai-codex/gpt-5.5";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -44,6 +46,7 @@ const OUTPUT_BUFFER_LIMIT = 64 * 1024;
 const SAMPLER_PROJECT_SETTINGS = { transport: "sse" };
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const requireFromSampler = createRequire(import.meta.url);
 const DEFAULT_BOT_DIR = resolve(__dirname, "..");
 
 export function defaultCodexQuotaExtensionPath(botDir: string, moduleDir = __dirname): string {
@@ -239,7 +242,7 @@ export function resolveCodexQuotaSamplerConfig(
   );
 
   return {
-    piBin: nonEmpty(cli.piBin) ?? nonEmpty(env[CODEX_QUOTA_PI_BIN_ENV]) ?? DEFAULT_PI_BIN,
+    piBin: nonEmpty(cli.piBin) ?? nonEmpty(env[CODEX_QUOTA_PI_BIN_ENV]) ?? defaultPiBin(),
     model: normalizeCodexModel(nonEmpty(cli.model) ?? nonEmpty(env[CODEX_QUOTA_MODEL_ENV])),
     prompt: nonEmpty(cli.prompt) ?? DEFAULT_PROMPT,
     stateFile,
@@ -623,6 +626,26 @@ function prependHomebrewPath(path: string | undefined): string {
     return homebrewPath;
   }
   return path.split(":").includes(homebrewPath) ? path : `${homebrewPath}:${path}`;
+}
+
+function defaultPiBin(): string {
+  return resolveBundledPiBin() ?? DEFAULT_PI_BIN;
+}
+
+function resolveBundledPiBin(): string | undefined {
+  const searchPaths = requireFromSampler.resolve.paths(PI_CODING_AGENT_PACKAGE) ?? [];
+  for (const nodeModulesDir of searchPaths) {
+    const binPath = join(nodeModulesDir, ".bin", process.platform === "win32" ? "pi.cmd" : "pi");
+    if (existsSync(binPath)) {
+      return binPath;
+    }
+
+    const cliPath = join(nodeModulesDir, "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+    if (existsSync(cliPath)) {
+      return cliPath;
+    }
+  }
+  return undefined;
 }
 
 function defaultSamplerCwd(): string {

@@ -173,6 +173,45 @@ describe("codex quota sampler command setup", () => {
     assert.notEqual(config.samplerCwd, join(tmpdir(), "codex-quota-sampler"));
   });
 
+  it("defaults to the bundled Pi CLI but preserves explicit overrides", () => {
+    const cwd = tempDir();
+    const config = resolveCodexQuotaSamplerConfig({
+      cwd,
+      env: { CODEX_QUOTA_TEXTFILE_DIR: "metrics" },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+
+    assert.notEqual(config.piBin, "pi");
+    assert.match(
+      config.piBin,
+      /(node_modules[\/\\]\.bin[\/\\]pi(?:\.cmd)?|node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js)$/,
+    );
+
+    const envOverride = resolveCodexQuotaSamplerConfig({
+      cwd,
+      env: {
+        CODEX_QUOTA_TEXTFILE_DIR: "metrics",
+        CODEX_QUOTA_PI_BIN: "/env/pi",
+      },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+    assert.equal(envOverride.piBin, "/env/pi");
+
+    const cliOverride = resolveCodexQuotaSamplerConfig({
+      cwd,
+      cli: { piBin: "/cli/pi" },
+      env: {
+        CODEX_QUOTA_TEXTFILE_DIR: "metrics",
+        CODEX_QUOTA_PI_BIN: "/env/pi",
+      },
+      extensionPath: "/abs/ext.ts",
+      forbiddenSamplerCwds: [],
+    });
+    assert.equal(cliOverride.piBin, "/cli/pi");
+  });
+
   it("defaults quota state to the selected workspace runtime dir", () => {
     const cwd = tempDir();
     const workspace = tempDir();
