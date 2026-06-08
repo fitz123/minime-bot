@@ -276,10 +276,23 @@ function isFrontmatterFailure(
 
 function expectedPageTypeFromTarget(targetPath: string): KnowledgePageType | undefined {
   const parts = targetPath.split("/");
-  if (parts[0] !== "wiki" || parts[1] !== "pages") {
-    return undefined;
-  }
-  return PAGE_TYPES.has(parts[2]) ? (parts[2] as KnowledgePageType) : undefined;
+  return parts[0] === "wiki" && parts[1] === "pages" && PAGE_TYPES.has(parts[2])
+    ? (parts[2] as KnowledgePageType)
+    : undefined;
+}
+
+function reviewForInvalidPlannedPageTarget(
+  sourcePath: string | undefined,
+  targetPath: string,
+): KnowledgeMigrationReviewItem {
+  return {
+    kind: "type_review",
+    path: sourcePath ?? "<generated>",
+    suggestedTarget: targetPath,
+    reason: "invalid_wiki_page_target_type",
+    message: `Planned wiki page target ${targetPath} must be under wiki/pages/<type>/ with a known page type.`,
+    blocking: true,
+  };
 }
 
 function reviewForPlannedPageFrontmatterFailure(
@@ -310,6 +323,11 @@ function validatePlannedPageFrontmatter(
 ): { frontmatter: KnowledgePageFrontmatter } | { reviewItem: KnowledgeMigrationReviewItem } {
   const parsed = parseMarkdown(content);
   const expectedType = expectedPageTypeFromTarget(targetPath);
+  if (!expectedType) {
+    return {
+      reviewItem: reviewForInvalidPlannedPageTarget(sourcePath, targetPath),
+    };
+  }
   const frontmatter = validateKnowledgePageFrontmatter(parsed.frontmatter, expectedType);
   if (isFrontmatterFailure(frontmatter)) {
     return {

@@ -49,6 +49,9 @@ dry-run by default. `--apply` writes planned files only when the agent workspace
 has a clean git worktree and no blocking review items; `--allow-dirty` bypasses
 only the git cleanliness gate after operator review. Migration writes or copies
 files, does not delete legacy sources, and `--report` writes the JSON response.
+If a planned wiki page target disagrees with page frontmatter type, migration
+emits a blocking `type_review` item, omits that unsafe page write, still writes
+the dry-run report, and keeps `--apply` blocked until review.
 
 The package also exposes a quota sampler for Prometheus textfile collectors:
 

@@ -9,6 +9,7 @@ import {
   executeKnowledgeMigration,
   type KnowledgeMigrationResponse,
 } from "../knowledge/migration.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 const hasGit = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0;
@@ -61,6 +62,20 @@ function initCleanGitWorkspace(workspace: string): void {
 
 function operationTargets(response: Extract<KnowledgeMigrationResponse, { ok: true }>): string[] {
   return response.operations.map((operation) => operation.targetPath).sort();
+}
+
+function hasFrontmatterTargetMismatch(
+  response: Extract<KnowledgeMigrationResponse, { ok: true }>,
+  sourcePath: string,
+  targetPath: string,
+): boolean {
+  return response.reviewItems.some((item) => (
+    item.kind === "type_review" &&
+    item.path === sourcePath &&
+    item.reason === "frontmatter_target_type_mismatch" &&
+    item.suggestedTarget === targetPath &&
+    item.blocking
+  ));
 }
 
 function legacyProjectPage(name = "Runtime"): string {
@@ -255,10 +270,11 @@ describe("knowledge layout migration", () => {
   });
 
   it("reports target/frontmatter type mismatches as blocking review items", () => {
+    const sourcePath = "memory/auto/curriculum_notes.md";
     const mismatchedTarget = "wiki/pages/project/learning/curriculum-notes-status.md";
     const workspace = createWorkspace({
       "MEMORY.md": "# Memory\n",
-      "memory/auto/curriculum_notes.md": [
+      [sourcePath]: [
         "---",
         "name: Curriculum Notes",
         "description: Reference notes for a course plan",
@@ -271,18 +287,19 @@ describe("knowledge layout migration", () => {
         "",
       ].join("\n"),
     });
+    const reportPath = join(workspace, "reports", "migration.json");
 
-    const dryRun = executeKnowledgeMigration({ dryRun: true }, { agentWorkspaceRoot: workspace });
+    const dryRun = executeKnowledgeMigration({ dryRun: true, reportPath }, { agentWorkspaceRoot: workspace });
 
     assertMigrationOk(dryRun);
-    assert.ok(dryRun.reviewItems.some((item) => (
-      item.kind === "type_review" &&
-      item.path === "memory/auto/curriculum_notes.md" &&
-      item.reason === "frontmatter_target_type_mismatch" &&
-      item.suggestedTarget === mismatchedTarget &&
-      item.blocking
-    )));
+    assert.ok(hasFrontmatterTargetMismatch(dryRun, sourcePath, mismatchedTarget));
     assert.equal(operationTargets(dryRun).includes(mismatchedTarget), false);
+    assert.equal(existsSync(reportPath), true);
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as KnowledgeMigrationResponse;
+    assertMigrationOk(report);
+    assert.ok(hasFrontmatterTargetMismatch(report, sourcePath, mismatchedTarget));
+    assert.equal(operationTargets(report).includes(mismatchedTarget), false);
 
     const apply = executeKnowledgeMigration({ apply: true, allowDirty: true }, { agentWorkspaceRoot: workspace });
 
@@ -291,6 +308,27 @@ describe("knowledge layout migration", () => {
     assert.equal(apply.summary?.applied, false);
     assert.equal(existsSync(join(workspace, ...mismatchedTarget.split("/"))), false);
     assert.equal(existsSync(join(workspace, "wiki", "schema.md")), false);
+  });
+
+  it("treats an explicit empty env as authoritative over the process env", () => {
+    const workspace = createWorkspace({
+      "MEMORY.md": "# Memory\n",
+      "memory/auto/project_runtime.md": legacyProjectPage(),
+    });
+    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    try {
+      const response = executeKnowledgeMigration({ dryRun: true }, { env: {} });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "agent-workspace-unset");
+    } finally {
+      if (previous === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+      }
+    }
   });
 
   it("blocks apply when root MEMORY.md has unsplit durable content", () => {

@@ -73,19 +73,33 @@ describe("Knowledge Pi extension helpers", () => {
   });
 
   it("lets Pi knowledge tool execution use the validated cwd with a warning when the agent workspace env is absent", () => {
+    const staleWorkspace = createV2Workspace({
+      "wiki/pages/project/stale.md": "# Stale\n\nStale-only token.\n",
+      "wiki/index.md": "# Knowledge Index\n\n- [Stale](pages/project/stale.md)\n",
+    });
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n\nKnowledge wrapper token.\n",
       "wiki/index.md": "# Knowledge Index\n\n- [Runtime](pages/project/runtime.md)\n",
     });
+    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = staleWorkspace;
+    try {
+      const result = executePiKnowledgeSearch(
+        { query: "wrapper token" },
+        { cwd: workspace, env: {} },
+      );
 
-    const result = executePiKnowledgeSearch(
-      { query: "wrapper token" },
-      { cwd: workspace, env: {} },
-    );
-
-    assert.equal(result.ok, true, result.text);
-    assert.match(result.text, /wiki\/pages\/project\/runtime\.md/);
-    assert.match(result.text, /falling back to process cwd/);
+      assert.equal(result.ok, true, result.text);
+      assert.match(result.text, /wiki\/pages\/project\/runtime\.md/);
+      assert.doesNotMatch(result.text, /stale\.md/);
+      assert.match(result.text, /falling back to process cwd/);
+    } finally {
+      if (previous === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+      }
+    }
   });
 
   it("prefers the explicit agent workspace env over cwd and control workspace env", () => {

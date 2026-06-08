@@ -1,5 +1,7 @@
 # Plan: Knowledge migrate type-mismatch dry-run review item
 
+Status: complete. Addresses GitHub issue #7.
+
 ## Goal
 
 Fix GitHub issue #7: `knowledge migrate --dry-run` must not abort when a routing heuristic plans a Knowledge v2 page path whose type directory disagrees with the page frontmatter. The migrator should emit a blocking review item and still write the dry-run report.
