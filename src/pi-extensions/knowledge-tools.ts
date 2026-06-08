@@ -194,9 +194,8 @@ function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefin
 }
 
 function envAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
-  const root =
-    deps.env?.[MINIME_AGENT_WORKSPACE_CWD_ENV] ??
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+  const env = deps.env ?? process.env;
+  const root = env[MINIME_AGENT_WORKSPACE_CWD_ENV];
   return typeof root === "string" && root.trim() ? root : undefined;
 }
 

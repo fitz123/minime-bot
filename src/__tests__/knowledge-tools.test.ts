@@ -11,6 +11,7 @@ import {
   type KnowledgeGetResponse,
   type KnowledgeSearchResponse,
 } from "../knowledge/tools.js";
+import { MINIME_AGENT_WORKSPACE_CWD_ENV } from "../workspace-contract.js";
 
 const fixtures: string[] = [];
 
@@ -156,6 +157,26 @@ describe("knowledge tools", () => {
     assert.equal(get.ok, false);
     assert.equal(get.status, "unavailable");
     assert.equal(get.reason, "agent-workspace-unset");
+  });
+
+  it("treats an explicit empty env as authoritative over the process env", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/project/runtime.md": "# Runtime\n\nAmbient-only token.\n",
+      "wiki/index.md": "# Knowledge Index\n\n- [Runtime](pages/project/runtime.md)\n",
+    });
+    const previous = process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = workspace;
+    try {
+      const search = executeKnowledgeSearch({ query: "ambient-only" }, { env: {} });
+      assert.equal(search.ok, false);
+      assert.equal(search.reason, "agent-workspace-unset");
+    } finally {
+      if (previous === undefined) {
+        delete process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+      } else {
+        process.env[MINIME_AGENT_WORKSPACE_CWD_ENV] = previous;
+      }
+    }
   });
 
   it("rejects traversal, absolute, non-corpus, non-markdown, and symlink escape reads", () => {

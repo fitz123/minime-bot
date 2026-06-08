@@ -51,7 +51,7 @@ npm run build
 
 ### Task 3: Verify no regressions
 
-- [ ] Existing successful migration tests still pass.
-- [ ] Existing review/blocker behavior still blocks apply.
-- [ ] Build succeeds.
-- [ ] Issue #7 can be closed by the PR.
+- [x] Existing successful migration tests still pass.
+- [x] Existing review/blocker behavior still blocks apply.
+- [x] Build succeeds.
+- [x] Issue #7 can be closed by the PR.

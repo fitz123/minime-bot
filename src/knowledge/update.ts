@@ -162,10 +162,10 @@ function fsForDeps(deps: KnowledgeUpdateDeps): KnowledgeUpdateFs {
 }
 
 function resolveAgentWorkspaceRoot(deps: KnowledgeUpdateDeps): string | undefined {
+  const env = deps.env ?? process.env;
   const root =
     deps.agentWorkspaceRoot ??
-    deps.env?.[MINIME_AGENT_WORKSPACE_CWD_ENV] ??
-    process.env[MINIME_AGENT_WORKSPACE_CWD_ENV];
+    env[MINIME_AGENT_WORKSPACE_CWD_ENV];
   return typeof root === "string" && root.trim() ? root : undefined;
 }
 
