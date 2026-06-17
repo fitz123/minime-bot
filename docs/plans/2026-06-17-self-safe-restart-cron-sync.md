@@ -144,12 +144,12 @@ node dist/cli.js --help
 - Modify: `README.md` or create appropriate docs under `docs/`
 - Create ADR-style docs if the repo has an ADR convention; otherwise add concise docs in `docs/`.
 
-- [ ] Document self-restart via launchd one-shot supervisor and why shell detach is not used.
-- [ ] Document self-safe `restart-bot.sh --plist` default and explicit guarded foreground mode.
-- [ ] Document cron deploy separated from bot restart: timeout/prompt config vs schedule plist sync.
-- [ ] Document package-owned cron sync/prune contract for `ai.minime.cron.*` namespace.
-- [ ] Document fixed helper label cleanup and why custom lock files are deferred out of MVP.
-- [ ] Add examples for `minime-bot launchd crons sync --dry-run`, `--no-prune`, and self-safe restart.
+- [x] Document self-restart via launchd one-shot supervisor and why shell detach is not used.
+- [x] Document self-safe `restart-bot.sh --plist` default and explicit guarded foreground mode.
+- [x] Document cron deploy separated from bot restart: timeout/prompt config vs schedule plist sync.
+- [x] Document package-owned cron sync/prune contract for `ai.minime.cron.*` namespace.
+- [x] Document fixed helper label cleanup and why custom lock files are deferred out of MVP.
+- [x] Add examples for `minime-bot launchd crons sync --dry-run`, `--no-prune`, and self-safe restart.
 
 ### Task 4: Verify acceptance criteria [HIGH]
 

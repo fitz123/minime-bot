@@ -149,6 +149,59 @@ The launchd example uses separate `PACKAGE_ROOT` and `CONTROL_WORKSPACE`
 placeholders and sets `MINIME_CONTROL_WORKSPACE_ROOT` in the service
 environment.
 
+## Launchd Operations
+
+The packaged restart script is self-safe by default when the bot runs under
+launchd:
+
+```bash
+scripts/restart-bot.sh --plist
+```
+
+That command validates the bot plist and current config, writes a fixed
+one-shot restart supervisor plist labeled
+`ai.minime.telegram-bot.restart-supervisor`, bootouts any stale supervisor
+registration, lint-checks the generated plist, bootstraps the supervisor, and
+returns before `ai.minime.telegram-bot` is stopped. The supervisor then runs the
+worker restart outside the original bot/Pi process, records status and logs
+under `~/Library/Logs/minime-bot/restart` by default, and performs the
+launchd `bootout`/`bootstrap` sequence.
+
+Explicit foreground mode is for operator debugging only:
+
+```bash
+scripts/restart-bot.sh --worker --plist
+scripts/restart-bot.sh --foreground --plist
+```
+
+Foreground/worker mode is guarded inside Pi child sessions. If
+`MINIME_BOT_PI_SESSION=1`, it refuses to run unless
+`MINIME_RESTART_UNSAFE_FOREGROUND=1` is also set. The normal in-bot path should
+use `--plist` without `--worker` so the request can return before launchd tears
+down the bot service. The implementation intentionally uses the fixed helper
+label cleanup instead of custom lock files.
+
+Cron schedule deployment is separate from bot restart. Cron prompt and timeout
+changes are read by the cron runner from the merged workspace cron files at
+each execution, so they do not require restarting `ai.minime.telegram-bot`.
+Schedule changes that affect launchd plists are synced with:
+
+```bash
+minime-bot launchd crons sync --workspace /path/to/control-workspace --dry-run
+minime-bot launchd crons sync --workspace /path/to/control-workspace
+minime-bot launchd crons sync --workspace /path/to/control-workspace --no-prune
+```
+
+The sync command owns only the `ai.minime.cron.*` namespace. By default it
+creates or updates active cron plists, lint-checks changed plists, re-bootstraps
+changed active cron labels, and prunes stale or disabled owned cron plists by
+booting them out and deleting the plist without bootstrapping them again.
+`--no-prune` leaves stale owned cron plists in place for emergency/manual
+operation. Cron sync must not bootout, bootstrap, signal, or otherwise restart
+`ai.minime.telegram-bot`.
+
+More detail is in `docs/launchd-operations.md`.
+
 ## Repository Boundaries
 
 Do not add private workspace files to the package root. In particular, this
