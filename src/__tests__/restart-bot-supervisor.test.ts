@@ -405,6 +405,17 @@ describe("restart-bot.sh supervisor mode", () => {
       assert.ok(supervisorPlist, "expected supervisor plist path to be recorded");
       assert.equal(supervisorPlist.startsWith(join(h.dir, "Library", "Logs", "minime-bot", "restart")), true);
       assert.equal(supervisorPlist.includes(`${join("Library", "LaunchAgents")}`), false);
+      assert.equal(
+        supervisorPlist,
+        join(
+          h.dir,
+          "Library",
+          "Logs",
+          "minime-bot",
+          "restart",
+          "request-special.ai.minime.telegram-bot.restart-supervisor.plist",
+        ),
+      );
       const plist = readFileSync(supervisorPlist, "utf8");
 
       assert.match(plist, /<string>ai\.minime\.telegram-bot\.restart-supervisor<\/string>/);

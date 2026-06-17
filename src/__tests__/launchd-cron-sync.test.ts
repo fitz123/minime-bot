@@ -128,6 +128,26 @@ describe("launchd cron plist sync", () => {
     }
   });
 
+  it("rejects cron schedules that restrict both day-of-month and weekday", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("ambiguous-day", "0 9 1 * 1"));
+
+      assert.throws(
+        () =>
+          generateLaunchdCronPlists({
+            workspace: fixture.workspace,
+            launchAgentsDir: fixture.launchAgentsDir,
+            env: fixture.env,
+            homeDir: fixture.home,
+          }),
+        /restricting both day-of-month and weekday is unsupported/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("preserves uppercase cron names supported by the previous generator", () => {
     const fixture = createFixture();
     try {

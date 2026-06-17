@@ -134,6 +134,11 @@ export function parseCronToCalendarIntervals(expr: string): CalendarInterval[] |
   }
 
   const [minute, hour, day, month, weekday] = parts;
+  if (day !== "*" && weekday !== "*") {
+    throw new Error(
+      "restricting both day-of-month and weekday is unsupported for launchd plists; split it into separate crons",
+    );
+  }
   const minutes = expandCronField(minute, 0, 59);
   const hours = expandCronField(hour, 0, 23);
   const days = expandCronField(day, 1, 31);

@@ -73,6 +73,9 @@ export function validateCronScheduleForPlist(schedule: unknown): string | undefi
   if (parts.length !== 5) {
     return "expected five cron fields or 'every N'";
   }
+  if (parts[2] !== "*" && parts[4] !== "*") {
+    return "restricting both day-of-month and weekday is unsupported for launchd plists; split it into separate crons";
+  }
 
   try {
     const counts = [
