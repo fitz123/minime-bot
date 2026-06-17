@@ -119,21 +119,21 @@ node dist/cli.js --help
 - Modify: `src/__tests__/restart-bot.test.ts`
 - Modify: `package.json` only if a new shipped helper file is introduced; prefer keeping all modes in existing `restart-bot.sh`.
 
-- [ ] Add `MINIME_BOT_PI_SESSION=1` to Pi child environment in `src/pi-rpc-protocol.ts`.
-- [ ] Change `restart-bot.sh --plist` default path to request mode: validate target plist/config enough to fail early, generate one-shot supervisor plist, bootstrap helper, print scheduled/status info, and return without booting out the bot.
-- [ ] Add explicit foreground/worker mode, e.g. `--foreground --plist` or `--worker --plist`, that runs the existing bootout/wait/bootstrap/wait-PID sequence.
-- [ ] Foreground/worker mode refuses when `MINIME_BOT_PI_SESSION=1` unless `MINIME_RESTART_UNSAFE_FOREGROUND=1` is set.
-- [ ] Use fixed helper label `ai.minime.telegram-bot.restart-supervisor`.
-- [ ] Before bootstrapping a new supervisor, best-effort `launchctl bootout gui/<uid>/ai.minime.telegram-bot.restart-supervisor` to clean up completed/stale helper registrations.
-- [ ] Generated supervisor plist must serialize required context explicitly via ProgramArguments and/or EnvironmentVariables: `BOT_PLIST`, `MINIME_CONTROL_WORKSPACE_ROOT`, `HOME`, `PATH`, `BOT_LABEL`, `BOT_UID` or domain, request id, status path, log path, and worker args.
-- [ ] `plutil -lint` generated supervisor plist before bootstrap.
-- [ ] Worker mode waits a bounded not-before delay before bot `bootout`; request mode must not wait for worker completion.
-- [ ] Worker mode preserves validation-before-bootout invariant.
-- [ ] Worker mode writes minimal status/log: request id, old PID if observed, new PID, mode, startedAt, finishedAt, success/failure.
-- [ ] Do not add custom lock files/stale-lock recovery in MVP; rely on fixed helper label + bootout cleanup.
-- [ ] Migrate existing `restart-bot.test.ts` assertions that expect inline `--plist` behavior to explicit foreground/worker mode.
-- [ ] Add tests for request scheduling, generated supervisor plist fields, plutil validation, fixed helper cleanup, two consecutive requests, bounded delay, foreground guard marker/override, worker validation failure, bootstrap failure, and success path.
-- [ ] Run targeted restart tests.
+- [x] Add `MINIME_BOT_PI_SESSION=1` to Pi child environment in `src/pi-rpc-protocol.ts`.
+- [x] Change `restart-bot.sh --plist` default path to request mode: validate target plist/config enough to fail early, generate one-shot supervisor plist, bootstrap helper, print scheduled/status info, and return without booting out the bot.
+- [x] Add explicit foreground/worker mode, e.g. `--foreground --plist` or `--worker --plist`, that runs the existing bootout/wait/bootstrap/wait-PID sequence.
+- [x] Foreground/worker mode refuses when `MINIME_BOT_PI_SESSION=1` unless `MINIME_RESTART_UNSAFE_FOREGROUND=1` is set.
+- [x] Use fixed helper label `ai.minime.telegram-bot.restart-supervisor`.
+- [x] Before bootstrapping a new supervisor, best-effort `launchctl bootout gui/<uid>/ai.minime.telegram-bot.restart-supervisor` to clean up completed/stale helper registrations.
+- [x] Generated supervisor plist must serialize required context explicitly via ProgramArguments and/or EnvironmentVariables: `BOT_PLIST`, `MINIME_CONTROL_WORKSPACE_ROOT`, `HOME`, `PATH`, `BOT_LABEL`, `BOT_UID` or domain, request id, status path, log path, and worker args.
+- [x] `plutil -lint` generated supervisor plist before bootstrap.
+- [x] Worker mode waits a bounded not-before delay before bot `bootout`; request mode must not wait for worker completion.
+- [x] Worker mode preserves validation-before-bootout invariant.
+- [x] Worker mode writes minimal status/log: request id, old PID if observed, new PID, mode, startedAt, finishedAt, success/failure.
+- [x] Do not add custom lock files/stale-lock recovery in MVP; rely on fixed helper label + bootout cleanup.
+- [x] Migrate existing `restart-bot.test.ts` assertions that expect inline `--plist` behavior to explicit foreground/worker mode.
+- [x] Add tests for request scheduling, generated supervisor plist fields, plutil validation, fixed helper cleanup, two consecutive requests, bounded delay, foreground guard marker/override, worker validation failure, bootstrap failure, and success path.
+- [x] Run targeted restart tests.
 
 ### Task 3: Document package-level ADRs and usage [HIGH]
 

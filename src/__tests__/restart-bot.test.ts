@@ -34,6 +34,23 @@ del_kv() {
   mv "\$tmp" "\$STATE"
 }
 now() { date +%s; }
+incr() {
+  cur=\$(get "\$1"); [ -z "\$cur" ] && cur=0
+  set_kv "\$1" \$(( cur + 1 ))
+}
+label_from_plist() {
+  file="\$1"
+  if [ -n "\$file" ] && [ -f "\$file" ]; then
+    tr -d '\\n' < "\$file" | sed -n 's|.*<key>[[:space:]]*Label[[:space:]]*</key>[[:space:]]*<string>\\([^<]*\\)</string>.*|\\1|p'
+  fi
+}
+log_cmd() {
+  printf '%s' "\$cmd" >> "\${STATE_DIR}/commands"
+  for arg in "\$@"; do
+    printf '\\t%s' "\$arg" >> "\${STATE_DIR}/commands"
+  done
+  printf '\\n' >> "\${STATE_DIR}/commands"
+}
 
 apply() {
   kat=\$(get kill_at)
@@ -51,6 +68,7 @@ apply() {
 }
 
 cmd="\${1:-}"; shift || true
+log_cmd "\$@"
 case "\$cmd" in
   list)
     apply
@@ -68,16 +86,44 @@ case "\$cmd" in
     ;;
   bootout)
     apply
-    delay=\$(get bootout_delay); [ -z "\$delay" ] && delay=0
-    set_kv bootout_at \$(( \$(now) + delay ))
+    service="\${1:-}"
+    label="\${service##*/}"
+    if [ "\$label" = "ai.minime.telegram-bot.restart-supervisor" ]; then
+      incr supervisor_bootout_count
+      set_kv supervisor_bootout_service "\$service"
+    else
+      incr bot_bootout_count
+      delay=\$(get bootout_delay); [ -z "\$delay" ] && delay=0
+      set_kv bootout_at \$(( \$(now) + delay ))
+    fi
     ;;
   bootstrap)
     apply
+    domain="\${1:-}"
+    plist_path="\${2:-}"
+    label=\$(label_from_plist "\$plist_path")
+    if [ "\$label" = "ai.minime.telegram-bot.restart-supervisor" ]; then
+      if [ "\$(get supervisor_bootstrap_fail)" = "1" ]; then
+        echo "Bootstrap failed: 5: Input/output error" >&2
+        exit 5
+      fi
+      incr supervisor_bootstrap_count
+      set_kv supervisor_bootstrap_domain "\$domain"
+      set_kv supervisor_plist "\$plist_path"
+      if [ -n "\$plist_path" ] && [ -f "\$plist_path" ]; then
+        sig=\$(node -e "const fs=require('fs'),c=require('crypto');process.stdout.write(c.createHash('sha1').update(fs.readFileSync(process.argv[1])).digest('hex'))" "\$plist_path")
+        set_kv supervisor_bootstrapped_sig "\$sig"
+      fi
+      exit 0
+    fi
+    if [ "\$(get bootstrap_fail)" = "1" ]; then
+      echo "Bootstrap failed: 5: Input/output error" >&2
+      exit 5
+    fi
     if [ "\$(get registered)" = "1" ]; then
       echo "Bootstrap failed: 5: Input/output error" >&2
       exit 5
     fi
-    plist_path="\${2:-}"
     if [ -n "\$plist_path" ] && [ -f "\$plist_path" ]; then
       sig=\$(node -e "const fs=require('fs'),c=require('crypto');process.stdout.write(c.createHash('sha1').update(fs.readFileSync(process.argv[1])).digest('hex'))" "\$plist_path")
       set_kv bootstrapped_sig "\$sig"
@@ -97,9 +143,20 @@ const MOCK_PLUTIL = `#!/bin/bash
 set -uo pipefail
 
 cmd="\${1:-}"
+if [ -n "\${STATE_DIR:-}" ]; then
+  printf '%s' "\$cmd" >> "\${STATE_DIR}/plutil-commands"
+  shift || true
+  for arg in "\$@"; do
+    printf '\\t%s' "\$arg" >> "\${STATE_DIR}/plutil-commands"
+  done
+  printf '\\n' >> "\${STATE_DIR}/plutil-commands"
+  set -- "\$@"
+else
+  shift || true
+fi
 case "\$cmd" in
   -lint)
-    file="\${2:-}"
+    file="\${1:-}"
     if [ -z "\$file" ] || [ ! -f "\$file" ]; then
       exit 1
     fi
@@ -110,9 +167,9 @@ case "\$cmd" in
     exit 1
     ;;
   -extract)
-    key="\${2:-}"
-    fmt="\${3:-}"
-    file="\${4:-}"
+    key="\${1:-}"
+    fmt="\${2:-}"
+    file="\${3:-}"
     if [ "\$key" != "Label" ] || [ "\$fmt" != "raw" ] || [ -z "\$file" ] || [ ! -f "\$file" ]; then
       exit 1
     fi
@@ -138,6 +195,8 @@ type Harness = {
   stateDir: string;
   setState(kv: Record<string, string | number>): void;
   readState(): Record<string, string>;
+  readCommands(): string[];
+  readPlutilCommands(): string[];
   writePlist(content: string): void;
   run(args: string[], env?: Record<string, string>): { status: number | null; stdout: string; stderr: string };
 };
@@ -197,12 +256,21 @@ function createHarness(): Harness {
     return out;
   };
 
+  const readLines = (path: string): string[] => {
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8").split("\n").filter(Boolean);
+  };
+
+  const readCommands = () => readLines(join(stateDir, "commands"));
+  const readPlutilCommands = () => readLines(join(stateDir, "plutil-commands"));
+
   const writePlist = (content: string) => writeFileSync(plist, content);
 
   const run = (args: string[], env: Record<string, string> = {}) => {
     const result = spawnSync(SCRIPT, args, {
       env: {
         ...process.env,
+        HOME: dir,
         LAUNCHCTL_BIN: launchctl,
         PLUTIL_BIN: plutil,
         BOT_LABEL: "ai.minime.telegram-bot",
@@ -210,6 +278,8 @@ function createHarness(): Harness {
         BOT_UID: "501",
         STATE_DIR: stateDir,
         POLL_INTERVAL: "0.1",
+        RESTART_WORKER_NOT_BEFORE_DELAY: "0",
+        RESTART_MAX_WORKER_NOT_BEFORE_DELAY: "1",
         SHUTDOWN_TIMEOUT: "30",
         TEARDOWN_TIMEOUT: "30",
         STARTUP_TIMEOUT: "20",
@@ -226,7 +296,7 @@ function createHarness(): Harness {
     };
   };
 
-  return { dir, launchctl, plutil, plist, stateDir, setState, readState, writePlist, run };
+  return { dir, launchctl, plutil, plist, stateDir, setState, readState, readCommands, readPlutilCommands, writePlist, run };
 }
 
 function cleanup(h: Harness) {
@@ -382,7 +452,7 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: new on-disk plist is reflected after success", () => {
+  it("--worker --plist: new on-disk plist is reflected after success", () => {
     const h = createHarness();
     try {
       // Old plist content, bot currently running.
@@ -394,7 +464,7 @@ describe("restart-bot.sh", () => {
       // Capture signature of the NEW plist (matches mock launchctl's sha1 digest).
       const newSig = createHash("sha1").update(readFileSync(h.plist)).digest("hex");
 
-      const { status, stdout, stderr } = h.run(["--plist"]);
+      const { status, stdout, stderr } = h.run(["--worker", "--plist"]);
       assert.strictEqual(status, 0, `expected exit 0, got ${status}: ${stderr}`);
       assert.match(stdout, /New PID: 4444/);
 
@@ -408,14 +478,14 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: does not race bootout teardown (bootstrap waits for unregister)", () => {
+  it("--worker --plist: does not race bootout teardown (bootstrap waits for unregister)", () => {
     const h = createHarness();
     try {
       // bootout takes 4s to drain. If the script didn't wait, bootstrap would
       // fire against a still-registered service and get EIO.
       h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 5555, bootout_delay: 4 });
       const start = Date.now();
-      const { status, stdout, stderr } = h.run(["--plist"]);
+      const { status, stdout, stderr } = h.run(["--worker", "--plist"]);
       const elapsedMs = Date.now() - start;
       assert.strictEqual(status, 0, `expected exit 0, got ${status}: ${stderr}`);
       assert.ok(elapsedMs >= 3500, `expected >= ~4s wait, got ${elapsedMs}ms`);
@@ -426,11 +496,11 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: aborts when config validation fails", () => {
+  it("--worker --plist: aborts when config validation fails", () => {
     const h = createHarness();
     try {
       h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 4444 });
-      const { status, stderr } = h.run(["--plist"], { CONFIG_VALIDATE_BIN: "false" });
+      const { status, stderr } = h.run(["--worker", "--plist"], { CONFIG_VALIDATE_BIN: "false" });
       assert.notStrictEqual(status, 0);
       assert.match(stderr, /config validation failed/);
       const state = h.readState();
@@ -442,13 +512,13 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: aborts before bootout when plist is malformed", () => {
+  it("--worker --plist: aborts before bootout when plist is malformed", () => {
     const h = createHarness();
     try {
       h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 4444 });
       // Syntactically broken plist — plutil -lint must reject before any bootout.
       h.writePlist("<plist>not valid xml");
-      const { status, stderr } = h.run(["--plist"]);
+      const { status, stderr } = h.run(["--worker", "--plist"]);
       assert.notStrictEqual(status, 0);
       assert.match(stderr, /plist is malformed/);
       const state = h.readState();
@@ -461,12 +531,12 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: aborts before bootout when plist Label does not match", () => {
+  it("--worker --plist: aborts before bootout when plist Label does not match", () => {
     const h = createHarness();
     try {
       h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 4444 });
       h.writePlist(VALID_PLIST("ai.minime.WRONG-LABEL", "X"));
-      const { status, stderr } = h.run(["--plist"]);
+      const { status, stderr } = h.run(["--worker", "--plist"]);
       assert.notStrictEqual(status, 0);
       assert.match(stderr, /Label .* does not match/);
       const state = h.readState();
@@ -478,11 +548,11 @@ describe("restart-bot.sh", () => {
     }
   });
 
-  it("--plist: fails cleanly when plist file is missing", () => {
+  it("--worker --plist: fails cleanly when plist file is missing", () => {
     const h = createHarness();
     try {
       rmSync(h.plist);
-      const { status, stderr } = h.run(["--plist"]);
+      const { status, stderr } = h.run(["--worker", "--plist"]);
       assert.notStrictEqual(status, 0);
       assert.match(stderr, /plist not found/);
     } finally {
