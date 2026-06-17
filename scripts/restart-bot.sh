@@ -287,6 +287,13 @@ write_env_entry() {
   write_plist_string "    " "$value"
 }
 
+write_env_entry_if_set() {
+  local key="$1"
+  local value="$2"
+  [ -n "$value" ] || return 0
+  write_env_entry "$key" "$value"
+}
+
 bounded_worker_delay() {
   local delay="$RESTART_WORKER_NOT_BEFORE_DELAY"
   local max_delay="$RESTART_MAX_WORKER_NOT_BEFORE_DELAY"
@@ -374,6 +381,8 @@ generate_supervisor_plist() {
     write_env_entry "BOT_LABEL" "$BOT_LABEL"
     write_env_entry "BOT_UID" "$BOT_UID"
     write_env_entry "MINIME_CONTROL_WORKSPACE_ROOT" "${MINIME_CONTROL_WORKSPACE_ROOT:-}"
+    write_env_entry_if_set "MINIME_CONFIG_PATH" "${MINIME_CONFIG_PATH:-}"
+    write_env_entry_if_set "MINIME_CRONS_PATH" "${MINIME_CRONS_PATH:-}"
     write_env_entry "HOME" "$HOME"
     write_env_entry "PATH" "$PATH"
     write_env_entry "RESTART_REQUEST_ID" "$request_id"
@@ -511,6 +520,7 @@ plist_worker_restart_impl() {
   observed_pid=$(get_pid 2>/dev/null) || rc=$?
   if [ "$rc" -eq 0 ]; then
     RESTART_STATUS_OLD_PID="$observed_pid"
+    _old_pid="$observed_pid"
   fi
 
   local delay

@@ -8,6 +8,7 @@ import {
   syncLaunchdCrons,
   type LaunchdCommandRunner,
 } from "../launchd-cron-plists.js";
+import { MINIME_CONFIG_PATH_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
 
 interface Fixture {
   root: string;
@@ -56,6 +57,10 @@ function cronYaml(name: string, schedule: string, extra = ""): string {
     extra,
     "",
   ].join("\n");
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function captureRunner(calls: CommandCall[], bootoutStatus = 0): LaunchdCommandRunner {
@@ -118,6 +123,41 @@ describe("launchd cron plist sync", () => {
       const plist = result.plists[0].content;
       assert.match(plist, /<key>StartInterval<\/key>\s*<integer>300<\/integer>/);
       assert.doesNotMatch(plist, /<key>StartCalendarInterval<\/key>/);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("persists explicit config and crons path env overrides in rendered plists", () => {
+    const fixture = createFixture();
+    try {
+      const settingsDir = join(fixture.workspace, "settings");
+      mkdirSync(settingsDir, { recursive: true });
+      const configPath = join(settingsDir, "config.yaml");
+      const cronsPath = join(settingsDir, "crons.yaml");
+      writeFileSync(configPath, "agents: {}\n", "utf8");
+      writeFileSync(cronsPath, cronYaml("active", "0 8 * * *"), "utf8");
+
+      const result = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: {
+          ...fixture.env,
+          [MINIME_CONFIG_PATH_ENV]: "settings/config.yaml",
+          [MINIME_CRONS_PATH_ENV]: "settings/crons.yaml",
+        },
+        homeDir: fixture.home,
+      });
+
+      const plist = result.plists[0].content;
+      assert.match(
+        plist,
+        new RegExp(`<key>${MINIME_CONFIG_PATH_ENV}</key>\\s*<string>${escapeRegex(configPath)}</string>`),
+      );
+      assert.match(
+        plist,
+        new RegExp(`<key>${MINIME_CRONS_PATH_ENV}</key>\\s*<string>${escapeRegex(cronsPath)}</string>`),
+      );
     } finally {
       cleanup(fixture);
     }
@@ -312,19 +352,24 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("restores the previous plist when launchctl bootstrap fails", () => {
+  it("restores and re-bootstraps the previous plist when launchctl bootstrap fails", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
       const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
       writeFileSync(activePath, "old active plist", "utf8");
+      let bootstrapCount = 0;
       const runner: LaunchdCommandRunner = (command, args) => {
         calls.push({ command, args: [...args] });
         if (args[0] === "bootout") {
           return { status: 1, stderr: "not loaded" };
         }
         if (args[0] === "bootstrap") {
+          bootstrapCount += 1;
+          if (bootstrapCount > 1) {
+            return { status: 0, stdout: "", stderr: "" };
+          }
           return { status: 5, stderr: "bootstrap failed" };
         }
         return { status: 0, stdout: "", stderr: "" };
@@ -342,7 +387,7 @@ describe("launchd cron plist sync", () => {
         /launchctl bootstrap .* failed: bootstrap failed/,
       );
       assert.equal(readFileSync(activePath, "utf8"), "old active plist");
-      assert.ok(calls.some((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`));
+      assert.equal(calls.filter((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`).length, 2);
     } finally {
       cleanup(fixture);
     }

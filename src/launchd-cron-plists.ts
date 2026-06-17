@@ -19,7 +19,9 @@ import {
   type CronPlistDef,
 } from "./cron-plist.js";
 import {
+  MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_CRONS_PATH_ENV,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
@@ -225,6 +227,7 @@ ${scheduleSection}
       <string>${xmlEscape(context.homeDir)}</string>
       <key>${MINIME_CONTROL_WORKSPACE_ROOT_ENV}</key>
       <string>${xmlEscape(controlWorkspaceRoot)}</string>
+${renderExplicitPathEnvEntries(context.contract)}
       <key>LOG_DIR</key>
       <string>${xmlEscape(context.logDir)}</string>
       <key>PATH</key>
@@ -381,11 +384,22 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       throw new Error(`internal error: missing generated plist for ${item.label}`);
     }
     const previousContent = writeValidatedPlist(planned.context, runner, commands, plist);
+    let bootoutReturned = false;
     try {
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
+      bootoutReturned = true;
       runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
     } catch (err) {
       restorePreviousPlist(plist.plistPath, previousContent);
+      if (bootoutReturned && previousContent !== undefined) {
+        try {
+          runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
+        } catch (rollbackErr) {
+          throw new Error(
+            `${errorMessage(err)}; rollback bootstrap of previous plist failed: ${errorMessage(rollbackErr)}`,
+          );
+        }
+      }
       throw err;
     }
   }
@@ -554,6 +568,27 @@ function restorePreviousPlist(plistPath: string, previousContent: string | undef
     return;
   }
   writeFileSync(plistPath, previousContent, "utf8");
+}
+
+function renderExplicitPathEnvEntries(contract: ResolvedWorkspaceContract): string {
+  const entries: string[] = [];
+  if (contract.effectivePaths.configPath.source === "env") {
+    entries.push(renderEnvEntry(MINIME_CONFIG_PATH_ENV, contract.paths.configPath));
+  }
+  if (contract.effectivePaths.cronsPath.source === "env") {
+    entries.push(renderEnvEntry(MINIME_CRONS_PATH_ENV, contract.paths.cronsPath));
+  }
+  return entries.join("");
+}
+
+function renderEnvEntry(key: string, value: string): string {
+  return `      <key>${xmlEscape(key)}</key>
+      <string>${xmlEscape(value)}</string>
+`;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function readLaunchdPlistLabel(plistPath: string): string {

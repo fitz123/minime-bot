@@ -357,10 +357,14 @@ describe("restart-bot.sh supervisor mode", () => {
       const controlWorkspace = join(h.dir, "control & workspace");
       const statusPath = join(h.dir, "status & logs", "request.status");
       const logPath = join(h.dir, "status & logs", "request.log");
+      const configPath = "settings/config.yaml";
+      const cronsPath = join(controlWorkspace, "settings", "crons.yaml");
       mkdirSync(controlWorkspace, { recursive: true });
 
       const { status, stderr } = h.run(["--plist"], {
         MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
+        MINIME_CONFIG_PATH: configPath,
+        MINIME_CRONS_PATH: cronsPath,
         RESTART_REQUEST_ID: "request-special",
         RESTART_STATUS_PATH: statusPath,
         RESTART_LOG_PATH: logPath,
@@ -393,6 +397,8 @@ describe("restart-bot.sh supervisor mode", () => {
           BOT_LABEL: plistStringDict(plist, "EnvironmentVariables").BOT_LABEL,
           BOT_UID: plistStringDict(plist, "EnvironmentVariables").BOT_UID,
           MINIME_CONTROL_WORKSPACE_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_CONTROL_WORKSPACE_ROOT,
+          MINIME_CONFIG_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CONFIG_PATH,
+          MINIME_CRONS_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CRONS_PATH,
           HOME: plistStringDict(plist, "EnvironmentVariables").HOME,
           RESTART_REQUEST_ID: plistStringDict(plist, "EnvironmentVariables").RESTART_REQUEST_ID,
           RESTART_STATUS_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_STATUS_PATH,
@@ -403,6 +409,8 @@ describe("restart-bot.sh supervisor mode", () => {
           BOT_LABEL: "ai.minime.telegram-bot",
           BOT_UID: "501",
           MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
+          MINIME_CONFIG_PATH: configPath,
+          MINIME_CRONS_PATH: cronsPath,
           HOME: h.dir,
           RESTART_REQUEST_ID: "request-special",
           RESTART_STATUS_PATH: statusPath,
@@ -725,6 +733,28 @@ describe("restart-bot.sh supervisor mode", () => {
       assert.notStrictEqual(status, 0);
       assert.match(stderr, /no running PID/);
       assert.strictEqual(readStatus(statusPath).error, "startup timeout");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker rejects a stale old PID after bootstrap", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-stale-pid.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 1111 });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /no running PID/);
+      const workerStatus = readStatus(statusPath);
+      assert.strictEqual(workerStatus.error, "startup timeout");
+      assert.strictEqual(workerStatus.oldPid, "1111");
+      assert.strictEqual(workerStatus.newPid, "");
     } finally {
       cleanup(h);
     }
