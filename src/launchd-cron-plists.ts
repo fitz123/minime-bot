@@ -384,14 +384,19 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       throw new Error(`internal error: missing generated plist for ${item.label}`);
     }
     const previousContent = writeValidatedPlist(planned.context, runner, commands, plist);
-    let bootoutReturned = false;
+    let bootoutUnloaded = false;
     try {
-      runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
-      bootoutReturned = true;
+      bootoutUnloaded = runLaunchctl(
+        planned.context,
+        runner,
+        commands,
+        ["bootout", `${planned.context.launchdDomain}/${item.label}`],
+        true,
+      );
       runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
     } catch (err) {
       restorePreviousPlist(plist.plistPath, previousContent);
-      if (bootoutReturned && previousContent !== undefined) {
+      if (bootoutUnloaded && previousContent !== undefined) {
         try {
           runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
         } catch (rollbackErr) {
@@ -488,8 +493,8 @@ function runLaunchctl(
   commands: LaunchdCommandRecord[],
   args: string[],
   ignoreFailure: boolean,
-): void {
-  runCommand(context.launchctlBin, args, runner, commands, ignoreFailure);
+): boolean {
+  return runCommand(context.launchctlBin, args, runner, commands, ignoreFailure);
 }
 
 function runCommand(
@@ -498,17 +503,18 @@ function runCommand(
   runner: LaunchdCommandRunner,
   commands: LaunchdCommandRecord[],
   ignoreFailure: boolean,
-): void {
+): boolean {
   const result = runner(command, args);
   const failed = result.error !== undefined || result.status !== 0;
+  const ignoredFailure = ignoreFailure && failed && isIgnorableBootoutFailure(args, result);
   commands.push({
     command,
     args,
     status: result.status,
-    ignoredFailure: ignoreFailure && failed && isIgnorableBootoutFailure(args, result),
+    ignoredFailure,
   });
-  if (ignoreFailure && failed && isIgnorableBootoutFailure(args, result)) {
-    return;
+  if (ignoredFailure) {
+    return false;
   }
   if (result.error && !ignoreFailure) {
     throw result.error;
@@ -521,6 +527,7 @@ function runCommand(
     const stdout = result.stdout?.trim();
     throw new Error(`${basename(command)} ${args.join(" ")} failed${stderr || stdout ? `: ${stderr || stdout}` : ""}`);
   }
+  return true;
 }
 
 function listOwnedCronPlists(launchAgentsDir: string): Map<string, string> {

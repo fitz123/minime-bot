@@ -363,7 +363,7 @@ describe("launchd cron plist sync", () => {
       const runner: LaunchdCommandRunner = (command, args) => {
         calls.push({ command, args: [...args] });
         if (args[0] === "bootout") {
-          return { status: 1, stderr: "not loaded" };
+          return { status: 0, stdout: "", stderr: "" };
         }
         if (args[0] === "bootstrap") {
           bootstrapCount += 1;
@@ -388,6 +388,42 @@ describe("launchd cron plist sync", () => {
       );
       assert.equal(readFileSync(activePath, "utf8"), "old active plist");
       assert.equal(calls.filter((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`).length, 2);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("does not rollback-bootstrap the previous plist when bootout was only an ignored not-loaded failure", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (args[0] === "bootout") {
+          return { status: 1, stderr: "not loaded" };
+        }
+        if (args[0] === "bootstrap") {
+          return { status: 5, stderr: "bootstrap failed" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: runner,
+        }),
+        /launchctl bootstrap .* failed: bootstrap failed/,
+      );
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.equal(calls.filter((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`).length, 1);
     } finally {
       cleanup(fixture);
     }
