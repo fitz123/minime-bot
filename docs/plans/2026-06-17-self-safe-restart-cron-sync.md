@@ -157,11 +157,11 @@ node dist/cli.js --help
 
 **Files:** none expected unless failures require fixes.
 
-- [ ] Run targeted cron sync and CLI tests.
-- [ ] Run targeted restart tests.
-- [ ] Run `npm test`.
-- [ ] Run `npm run build`.
-- [ ] Run `npm pack --dry-run` and confirm required runtime scripts/files are included.
-- [ ] Run `node dist/cli.js --help` and confirm launchd command appears.
-- [ ] Confirm no private config/secret files were read or committed.
-- [ ] Leave private control wrapper integration for a separate follow-up after this package branch is reviewed/merged/deployed.
+- [x] Run targeted cron sync and CLI tests.
+- [x] Run targeted restart tests.
+- [x] Run `npm test`.
+- [x] Run `npm run build`.
+- [x] Run `npm pack --dry-run` and confirm required runtime scripts/files are included.
+- [x] Run `node dist/cli.js --help` and confirm launchd command appears.
+- [x] Confirm no private config/secret files were read or committed.
+- [x] Leave private control wrapper integration for a separate follow-up after this package branch is reviewed/merged/deployed.
