@@ -130,7 +130,7 @@ describe("launchd cron plist sync", () => {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
-      writeFileSync(stalePath, "stale", "utf8");
+      writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
       writeFileSync(botPath, "bot", "utf8");
 
       const result = syncLaunchdCrons({
@@ -139,12 +139,13 @@ describe("launchd cron plist sync", () => {
         dryRun: true,
         env: fixture.env,
         homeDir: fixture.home,
+        uid: 501,
         commandRunner: captureRunner(calls),
       });
 
       assert.equal(calls.length, 0);
       assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.active.plist")), false);
-      assert.equal(readFileSync(stalePath, "utf8"), "stale");
+      assert.match(readFileSync(stalePath, "utf8"), /ai\.minime\.cron\.stale/);
       assert.equal(readFileSync(botPath, "utf8"), "bot");
       assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
         "create:ai.minime.cron.active",
@@ -184,8 +185,8 @@ describe("launchd cron plist sync", () => {
       const disabledPath = join(fixture.launchAgentsDir, "ai.minime.cron.disabled.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
       writeFileSync(activePath, "old active plist", "utf8");
-      writeFileSync(stalePath, "stale", "utf8");
-      writeFileSync(disabledPath, "disabled", "utf8");
+      writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
+      writeFileSync(disabledPath, "<plist><dict><key>Label</key><string>ai.minime.cron.disabled</string></dict></plist>\n", "utf8");
       writeFileSync(botPath, "bot", "utf8");
 
       const result = syncLaunchdCrons({
@@ -193,6 +194,7 @@ describe("launchd cron plist sync", () => {
         launchAgentsDir: fixture.launchAgentsDir,
         env: fixture.env,
         homeDir: fixture.home,
+        uid: 501,
         commandRunner: captureRunner(calls, 3),
       });
 
@@ -206,7 +208,7 @@ describe("launchd cron plist sync", () => {
         "delete:ai.minime.cron.stale:stale",
       ]);
 
-      assert.ok(calls.some((call) => call.command.endsWith("plutil") && call.args.join(" ") === `-lint ${activePath}`));
+      assert.ok(calls.some((call) => call.command.endsWith("plutil") && call.args.join(" ").startsWith(`-lint ${activePath}.tmp-`)));
       assert.ok(calls.some((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.active"));
       assert.ok(calls.some((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`));
       assert.ok(calls.some((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.stale"));
@@ -233,12 +235,150 @@ describe("launchd cron plist sync", () => {
         prune: false,
         env: fixture.env,
         homeDir: fixture.home,
+        uid: 501,
         commandRunner: captureRunner(calls),
       });
 
       assert.equal(existsSync(stalePath), true);
       assert.equal(result.items.some((item) => item.label === "ai.minime.cron.stale"), false);
       assert.equal(calls.some((call) => call.args.some((arg) => arg.includes("ai.minime.cron.stale"))), false);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("does not run commands for unchanged active plists", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(generated.plists[0].plistPath, generated.plists[0].content, "utf8");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "unchanged:ai.minime.cron.active",
+      ]);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("keeps the previous plist when plutil lint fails", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (command.endsWith("plutil")) {
+          return { status: 1, stderr: "lint failed" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: runner,
+        }),
+        /plutil -lint .* failed: lint failed/,
+      );
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.equal(calls.some((call) => call.args[0] === "bootstrap"), false);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("restores the previous plist when launchctl bootstrap fails", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (args[0] === "bootout") {
+          return { status: 1, stderr: "not loaded" };
+        }
+        if (args[0] === "bootstrap") {
+          return { status: 5, stderr: "bootstrap failed" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: runner,
+        }),
+        /launchctl bootstrap .* failed: bootstrap failed/,
+      );
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.ok(calls.some((call) => call.args.join(" ") === `bootstrap gui/501 ${activePath}`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("prunes by plist Label instead of filename prefix", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const misleadingPath = join(fixture.launchAgentsDir, "ai.minime.cron.not-owned.plist");
+      const nonstandardOwnedPath = join(fixture.launchAgentsDir, "manual-name.plist");
+      writeFileSync(
+        misleadingPath,
+        "<plist><dict><key>Label</key><string>com.example.not-owned</string></dict></plist>\n",
+        "utf8",
+      );
+      writeFileSync(
+        nonstandardOwnedPath,
+        "<plist><dict><key>Label</key><string>ai.minime.cron.old</string></dict></plist>\n",
+        "utf8",
+      );
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls, 3),
+      });
+
+      assert.equal(existsSync(misleadingPath), true);
+      assert.equal(existsSync(nonstandardOwnedPath), false);
+      assert.ok(result.items.some((item) => item.action === "delete" && item.label === "ai.minime.cron.old"));
+      assert.equal(result.items.some((item) => item.label === "ai.minime.cron.not-owned"), false);
     } finally {
       cleanup(fixture);
     }

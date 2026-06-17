@@ -4,12 +4,13 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, isAbsolute, join, normalize, relative, resolve } from "node:path";
-import { loadMergedCrons } from "./cron-runner.js";
+import { loadMergedCrons } from "./cron-loader.js";
 import {
   expandCronField,
   parseEveryScheduleSeconds,
@@ -379,10 +380,14 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
     if (!plist) {
       throw new Error(`internal error: missing generated plist for ${item.label}`);
     }
-    writeFileSync(plist.plistPath, plist.content, "utf8");
-    runPlutilLint(planned.context, runner, commands, plist.plistPath);
-    runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
-    runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
+    const previousContent = writeValidatedPlist(planned.context, runner, commands, plist);
+    try {
+      runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
+      runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
+    } catch (err) {
+      restorePreviousPlist(plist.plistPath, previousContent);
+      throw err;
+    }
   }
 
   return { dryRun, prune, context: planned.context, items: planned.items, commands };
@@ -425,7 +430,7 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
     moduleUrl: options.moduleUrl ?? import.meta.url,
   });
   const launchAgentsDir = normalize(resolveCliPath(options.launchAgentsDir ?? join(homeDir, "Library", "LaunchAgents"), cwd));
-  const uid = options.uid ?? resolveUid(env);
+  const uid = options.uid ?? resolveUid();
   const launchctlBin = env.LAUNCHCTL_BIN?.trim() || DEFAULT_LAUNCHCTL_BIN;
   const plutilBin = env.PLUTIL_BIN?.trim() || DEFAULT_PLUTIL_BIN;
   return {
@@ -481,16 +486,23 @@ function runCommand(
   ignoreFailure: boolean,
 ): void {
   const result = runner(command, args);
+  const failed = result.error !== undefined || result.status !== 0;
   commands.push({
     command,
     args,
     status: result.status,
-    ignoredFailure: ignoreFailure && result.status !== 0,
+    ignoredFailure: ignoreFailure && failed && isIgnorableBootoutFailure(args, result),
   });
+  if (ignoreFailure && failed && isIgnorableBootoutFailure(args, result)) {
+    return;
+  }
   if (result.error && !ignoreFailure) {
     throw result.error;
   }
-  if (result.status !== 0 && !ignoreFailure) {
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
     const stderr = result.stderr?.trim();
     const stdout = result.stdout?.trim();
     throw new Error(`${basename(command)} ${args.join(" ")} failed${stderr || stdout ? `: ${stderr || stdout}` : ""}`);
@@ -503,13 +515,72 @@ function listOwnedCronPlists(launchAgentsDir: string): Map<string, string> {
     if (!entry.isFile() || !entry.name.endsWith(".plist")) {
       continue;
     }
-    const label = entry.name.slice(0, -".plist".length);
+    const plistPath = resolve(launchAgentsDir, entry.name);
+    const label = readLaunchdPlistLabel(plistPath);
     if (!isOwnedCronLaunchdLabel(label)) {
       continue;
     }
-    found.set(label, resolve(launchAgentsDir, entry.name));
+    found.set(label, plistPath);
   }
   return found;
+}
+
+function writeValidatedPlist(
+  context: LaunchdCronContext,
+  runner: LaunchdCommandRunner,
+  commands: LaunchdCommandRecord[],
+  plist: RenderedLaunchdCronPlist,
+): string | undefined {
+  const previousContent = existsSync(plist.plistPath) ? readFileSync(plist.plistPath, "utf8") : undefined;
+  const tmpPath = `${plist.plistPath}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmpPath, plist.content, "utf8");
+    runPlutilLint(context, runner, commands, tmpPath);
+    renameSync(tmpPath, plist.plistPath);
+    return previousContent;
+  } catch (err) {
+    if (existsSync(tmpPath)) {
+      unlinkSync(tmpPath);
+    }
+    throw err;
+  }
+}
+
+function restorePreviousPlist(plistPath: string, previousContent: string | undefined): void {
+  if (previousContent === undefined) {
+    if (existsSync(plistPath)) {
+      unlinkSync(plistPath);
+    }
+    return;
+  }
+  writeFileSync(plistPath, previousContent, "utf8");
+}
+
+function readLaunchdPlistLabel(plistPath: string): string {
+  try {
+    const content = readFileSync(plistPath, "utf8");
+    const match = content.match(/<key>\s*Label\s*<\/key>\s*<string>([^<]+)<\/string>/);
+    return match ? xmlUnescape(match[1]) : "";
+  } catch {
+    return "";
+  }
+}
+
+function isIgnorableBootoutFailure(args: readonly string[], result: LaunchdCommandResult): boolean {
+  if (args[0] !== "bootout") {
+    return false;
+  }
+  const message = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+  return /not loaded|no such process|could not find service|service .*not found|no such file/i.test(message);
+}
+
+function xmlUnescape(value: string): string {
+  return value
+    .replaceAll("&apos;", "'")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&gt;", ">")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&amp;", "&");
 }
 
 function countPlanItems(items: readonly LaunchdCronPlanItem[]): Record<LaunchdCronPlanAction, number> {
@@ -579,14 +650,7 @@ function resolveCliPath(path: string, cwd: string): string {
   return isAbsolute(path) ? normalize(path) : normalize(resolve(cwd, path));
 }
 
-function resolveUid(env: NodeJS.ProcessEnv): number {
-  const uidFromEnv = env.UID?.trim();
-  if (uidFromEnv) {
-    const uid = Number(uidFromEnv);
-    if (Number.isInteger(uid) && uid >= 0) {
-      return uid;
-    }
-  }
+function resolveUid(): number {
   if (typeof process.getuid === "function") {
     return process.getuid();
   }

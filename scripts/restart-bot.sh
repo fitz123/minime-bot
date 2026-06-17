@@ -42,10 +42,10 @@ BOT_PLIST="${BOT_PLIST:-$HOME/Library/LaunchAgents/${BOT_LABEL}.plist}"
 BOT_UID="${BOT_UID:-$(id -u)}"
 DOMAIN="gui/${BOT_UID}"
 SERVICE="${DOMAIN}/${BOT_LABEL}"
-RESTART_SUPERVISOR_LABEL="${RESTART_SUPERVISOR_LABEL:-ai.minime.telegram-bot.restart-supervisor}"
-RESTART_SUPERVISOR_SERVICE="${DOMAIN}/${RESTART_SUPERVISOR_LABEL}"
-RESTART_SUPERVISOR_PLIST="${RESTART_SUPERVISOR_PLIST:-$HOME/Library/LaunchAgents/${RESTART_SUPERVISOR_LABEL}.plist}"
 RESTART_RUNTIME_DIR="${RESTART_RUNTIME_DIR:-$HOME/Library/Logs/minime-bot/restart}"
+RESTART_SUPERVISOR_LABEL="ai.minime.telegram-bot.restart-supervisor"
+RESTART_SUPERVISOR_SERVICE="${DOMAIN}/${RESTART_SUPERVISOR_LABEL}"
+RESTART_SUPERVISOR_PLIST="${RESTART_SUPERVISOR_PLIST:-$RESTART_RUNTIME_DIR/${RESTART_SUPERVISOR_LABEL}.plist}"
 RESTART_REQUEST_ID="${RESTART_REQUEST_ID:-}"
 RESTART_STATUS_PATH="${RESTART_STATUS_PATH:-}"
 RESTART_LOG_PATH="${RESTART_LOG_PATH:-}"
@@ -346,7 +346,6 @@ generate_supervisor_plist() {
   local request_id="$1"
   local status_path="$2"
   local log_path="$3"
-  local worker_args="--worker --plist --request-id ${request_id} --status-path ${status_path} --log-path ${log_path}"
 
   ensure_parent_dir "$RESTART_SUPERVISOR_PLIST"
   local tmp="${RESTART_SUPERVISOR_PLIST}.tmp"
@@ -374,14 +373,12 @@ generate_supervisor_plist() {
     write_env_entry "BOT_PLIST" "$BOT_PLIST"
     write_env_entry "BOT_LABEL" "$BOT_LABEL"
     write_env_entry "BOT_UID" "$BOT_UID"
-    write_env_entry "BOT_DOMAIN" "$DOMAIN"
     write_env_entry "MINIME_CONTROL_WORKSPACE_ROOT" "${MINIME_CONTROL_WORKSPACE_ROOT:-}"
     write_env_entry "HOME" "$HOME"
     write_env_entry "PATH" "$PATH"
     write_env_entry "RESTART_REQUEST_ID" "$request_id"
     write_env_entry "RESTART_STATUS_PATH" "$status_path"
     write_env_entry "RESTART_LOG_PATH" "$log_path"
-    write_env_entry "RESTART_WORKER_ARGS" "$worker_args"
     write_env_entry "SHUTDOWN_TIMEOUT" "$SHUTDOWN_TIMEOUT"
     write_env_entry "TEARDOWN_TIMEOUT" "$TEARDOWN_TIMEOUT"
     write_env_entry "STARTUP_TIMEOUT" "$STARTUP_TIMEOUT"
@@ -442,6 +439,8 @@ graceful_restart() {
 
 plist_request_restart() {
   ensure_restart_paths
+  ensure_parent_dir "$RESTART_STATUS_PATH"
+  ensure_parent_dir "$RESTART_LOG_PATH"
   RESTART_STARTED_AT="$(iso_now)"
 
   if [ ! -f "$BOT_PLIST" ]; then
@@ -522,7 +521,10 @@ plist_worker_restart_impl() {
   log "Waiting ${delay}s before launchd bootout so the scheduling process can return…"
   sleep "$delay"
 
-  if is_registered; then
+  local registration_rc=0
+  get_pid >/dev/null 2>&1 || registration_rc=$?
+  case "$registration_rc" in
+  0)
     log "Unregistering $SERVICE (launchctl bootout)…"
     # bootout may return non-zero even when the teardown is in progress;
     # we rely on polling below, not the exit code.
@@ -535,9 +537,16 @@ plist_worker_restart_impl() {
       RESTART_STATUS_ERROR="teardown timeout"
       return 1
     fi
-  else
+    ;;
+  1)
     log "Service not currently registered; skipping bootout."
-  fi
+    ;;
+  *)
+    err "launchctl list failed; refusing to bootstrap over unknown service state"
+    RESTART_STATUS_ERROR="unknown launchd state"
+    return 1
+    ;;
+  esac
 
   log "Bootstrapping from ${BOT_PLIST}…"
   if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$BOT_PLIST"; then

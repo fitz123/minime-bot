@@ -1,10 +1,10 @@
 # Plan: self-safe restart and packaged cron launchd sync
 
-Status: APPROVED — derived from workspace plan `artifacts/plans/2026-06-17-plan-fixes-for-minime-bot-restart-reliab.md`; architecture-simplified 2026-06-17.
+Status: COMPLETE — derived from an external workspace plan; architecture-simplified 2026-06-17. Tasks 1-4 are implemented and validated.
 
 ## Scope for this Ralphex run
 
-This run is for the public package repository only: `/Users/ninja/src/minime-bot`.
+This run is for the public package repository only.
 
 Implement package/runtime changes only:
 
@@ -15,8 +15,8 @@ Implement package/runtime changes only:
 
 Do **not** edit private deployment files in this run:
 
-- `/Users/ninja/.minime/control-workspace/scripts/deploy-bot-package.sh`;
-- `/Users/ninja/.minime/workspace/.claude/skills/bot-operations/SKILL.md`;
+- private control workspace deployment wrapper scripts;
+- private workspace AI-operation skill/docs files;
 - private control/workspace README/wiki files.
 
 Those private wrapper/docs updates happen after the package API is implemented and deployed.

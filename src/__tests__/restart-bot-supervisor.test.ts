@@ -73,6 +73,10 @@ log_cmd "\$@"
 case "\$cmd" in
   list)
     apply
+    if [ "\$(get list_fail)" = "1" ]; then
+      echo "launchctl list failed" >&2
+      exit 42
+    fi
     if [ "\$(get registered)" = "1" ]; then
       label=\$(get label); [ -z "\$label" ] && label="ai.minime.telegram-bot"
       pid=\$(get pid); [ -z "\$pid" ] && pid="-"
@@ -121,6 +125,11 @@ case "\$cmd" in
       echo "Bootstrap failed: 5: Input/output error" >&2
       exit 5
     fi
+    if [ "\$(get bootstrap_no_pid)" = "1" ]; then
+      set_kv registered 1
+      del_kv pid
+      exit 0
+    fi
     np=\$(get next_pid); [ -z "\$np" ] && np=99999
     set_kv pid "\$np"
     set_kv registered 1
@@ -135,6 +144,13 @@ esac
 const MOCK_PLUTIL = `#!/bin/bash
 set -uo pipefail
 
+get() {
+  if [ -z "\${STATE_DIR:-}" ] || [ ! -f "\${STATE_DIR}/state" ]; then
+    return 0
+  fi
+  awk -F= -v k="\$1" 'BEGIN{v=""} $1==k {v=$0; sub(/^[^=]*=/,"",v)} END{print v}' "\${STATE_DIR}/state"
+}
+
 cmd="\${1:-}"; shift || true
 if [ -n "\${STATE_DIR:-}" ]; then
   printf '%s' "\$cmd" >> "\${STATE_DIR}/plutil-commands"
@@ -148,6 +164,10 @@ case "\$cmd" in
   -lint)
     file="\${1:-}"
     if [ -z "\$file" ] || [ ! -f "\$file" ]; then
+      exit 1
+    fi
+    if [ "\$(get supervisor_lint_fail)" = "1" ] && grep -q "ai.minime.telegram-bot.restart-supervisor" "\$file"; then
+      echo "mock-plutil: supervisor lint failed" >&2
       exit 1
     fi
     if grep -q "<plist" "\$file" && grep -q "</plist>" "\$file" && grep -q "<dict>" "\$file" && grep -q "</dict>" "\$file"; then
@@ -283,6 +303,32 @@ function readStatus(path: string): Record<string, string> {
   return status;
 }
 
+function xmlUnescape(value: string): string {
+  return value
+    .replaceAll("&apos;", "'")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&gt;", ">")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&amp;", "&");
+}
+
+function plistStringArray(plist: string, key: string): string[] {
+  const match = plist.match(new RegExp(`<key>\\s*${key}\\s*<\\/key>\\s*<array>([\\s\\S]*?)<\\/array>`));
+  assert.ok(match, `expected ${key} array`);
+  return Array.from(match[1].matchAll(/<string>([\s\S]*?)<\/string>/g), (entry) => xmlUnescape(entry[1]));
+}
+
+function plistStringDict(plist: string, key: string): Record<string, string> {
+  const match = plist.match(new RegExp(`<key>\\s*${key}\\s*<\\/key>\\s*<dict>([\\s\\S]*?)<\\/dict>`));
+  assert.ok(match, `expected ${key} dict`);
+  const dict: Record<string, string> = {};
+  const pairPattern = /<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g;
+  for (const entry of match[1].matchAll(pairPattern)) {
+    dict[xmlUnescape(entry[1])] = xmlUnescape(entry[2]);
+  }
+  return dict;
+}
+
 describe("restart-bot.sh supervisor mode", () => {
   it("--plist schedules the supervisor and leaves the bot service untouched", () => {
     const h = createHarness();
@@ -308,11 +354,16 @@ describe("restart-bot.sh supervisor mode", () => {
   it("generated supervisor plist serializes required context and is linted", () => {
     const h = createHarness();
     try {
-      const controlWorkspace = join(h.dir, "control-workspace");
+      const controlWorkspace = join(h.dir, "control & workspace");
+      const statusPath = join(h.dir, "status & logs", "request.status");
+      const logPath = join(h.dir, "status & logs", "request.log");
       mkdirSync(controlWorkspace, { recursive: true });
 
       const { status, stderr } = h.run(["--plist"], {
         MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
+        RESTART_REQUEST_ID: "request-special",
+        RESTART_STATUS_PATH: statusPath,
+        RESTART_LOG_PATH: logPath,
         RESTART_WORKER_NOT_BEFORE_DELAY: "0.25",
       });
 
@@ -320,27 +371,51 @@ describe("restart-bot.sh supervisor mode", () => {
       const state = h.readState();
       const supervisorPlist = state.supervisor_plist;
       assert.ok(supervisorPlist, "expected supervisor plist path to be recorded");
+      assert.equal(supervisorPlist.startsWith(join(h.dir, "Library", "Logs", "minime-bot", "restart")), true);
+      assert.equal(supervisorPlist.includes(`${join("Library", "LaunchAgents")}`), false);
       const plist = readFileSync(supervisorPlist, "utf8");
 
       assert.match(plist, /<string>ai\.minime\.telegram-bot\.restart-supervisor<\/string>/);
-      assert.match(plist, new RegExp(`<string>${SCRIPT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}</string>`));
-      assert.match(plist, /<string>--worker<\/string>/);
-      assert.match(plist, /<string>--plist<\/string>/);
-      assert.match(plist, /<key>BOT_PLIST<\/key>/);
-      assert.match(plist, /<key>BOT_LABEL<\/key>/);
-      assert.match(plist, /<key>BOT_UID<\/key>/);
-      assert.match(plist, /<key>BOT_DOMAIN<\/key>/);
-      assert.match(plist, /<key>MINIME_CONTROL_WORKSPACE_ROOT<\/key>/);
-      assert.match(plist, /<key>HOME<\/key>/);
-      assert.match(plist, /<key>PATH<\/key>/);
-      assert.match(plist, /<key>RESTART_REQUEST_ID<\/key>/);
-      assert.match(plist, /<key>RESTART_STATUS_PATH<\/key>/);
-      assert.match(plist, /<key>RESTART_LOG_PATH<\/key>/);
-      assert.match(plist, /<key>RESTART_WORKER_ARGS<\/key>/);
+      assert.deepEqual(plistStringArray(plist, "ProgramArguments"), [
+        SCRIPT,
+        "--worker",
+        "--plist",
+        "--request-id",
+        "request-special",
+        "--status-path",
+        statusPath,
+        "--log-path",
+        logPath,
+      ]);
+      assert.deepEqual(
+        {
+          BOT_PLIST: plistStringDict(plist, "EnvironmentVariables").BOT_PLIST,
+          BOT_LABEL: plistStringDict(plist, "EnvironmentVariables").BOT_LABEL,
+          BOT_UID: plistStringDict(plist, "EnvironmentVariables").BOT_UID,
+          MINIME_CONTROL_WORKSPACE_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_CONTROL_WORKSPACE_ROOT,
+          HOME: plistStringDict(plist, "EnvironmentVariables").HOME,
+          RESTART_REQUEST_ID: plistStringDict(plist, "EnvironmentVariables").RESTART_REQUEST_ID,
+          RESTART_STATUS_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_STATUS_PATH,
+          RESTART_LOG_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_LOG_PATH,
+        },
+        {
+          BOT_PLIST: h.plist,
+          BOT_LABEL: "ai.minime.telegram-bot",
+          BOT_UID: "501",
+          MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
+          HOME: h.dir,
+          RESTART_REQUEST_ID: "request-special",
+          RESTART_STATUS_PATH: statusPath,
+          RESTART_LOG_PATH: logPath,
+        },
+      );
+      const env = plistStringDict(plist, "EnvironmentVariables");
+      assert.ok(env.PATH.includes("/usr/bin"));
+      assert.equal("BOT_DOMAIN" in env, false);
+      assert.equal("RESTART_WORKER_ARGS" in env, false);
       assert.match(plist, /<key>StandardOutPath<\/key>/);
       assert.match(plist, /<key>StandardErrorPath<\/key>/);
       assert.doesNotMatch(plist, /MINIME_BOT_PI_SESSION/);
-      assert.ok(plist.includes(controlWorkspace));
 
       assert.ok(
         h.readPlutilCommands().some((line) => line === `-lint\t${supervisorPlist}`),
@@ -373,6 +448,106 @@ describe("restart-bot.sh supervisor mode", () => {
     }
   });
 
+  it("ignores attempts to override the fixed helper label", () => {
+    const h = createHarness();
+    try {
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 2222 });
+
+      const { status, stderr } = h.run(["--plist"], {
+        RESTART_SUPERVISOR_LABEL: "ai.minime.telegram-bot",
+      });
+
+      assert.strictEqual(status, 0, `expected fixed-label request success: ${stderr}`);
+      const state = h.readState();
+      assert.strictEqual(state.supervisor_bootout_service, "gui/501/ai.minime.telegram-bot.restart-supervisor");
+      assert.strictEqual(state.bot_bootout_count, undefined);
+      assert.strictEqual(state.registered, "1");
+      assert.strictEqual(state.pid, "1111");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("--plist creates status and log parents before supervisor bootstrap", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "nested", "status", "request.status");
+      const logPath = join(h.dir, "nested", "logs", "request.log");
+
+      const { status, stderr } = h.run(["--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        RESTART_LOG_PATH: logPath,
+      });
+
+      assert.strictEqual(status, 0, `expected request success: ${stderr}`);
+      assert.equal(existsSync(dirname(statusPath)), true);
+      assert.equal(existsSync(dirname(logPath)), true);
+      assert.strictEqual(readStatus(statusPath).status, "scheduled");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("--plist fails before scheduling when the bot plist is missing", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "missing-plist.status");
+      rmSync(h.plist);
+
+      const { status, stderr } = h.run(["--plist"], { RESTART_STATUS_PATH: statusPath });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /plist not found/);
+      assert.strictEqual(h.readState().supervisor_bootstrap_count, undefined);
+      assert.strictEqual(h.readState().bot_bootout_count, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "plist not found");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("--plist fails before scheduling when plist validation fails", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "invalid-plist.status");
+      writeFileSync(h.plist, VALID_PLIST("ai.minime.wrong-label"));
+
+      const { status, stderr } = h.run(["--plist"], { RESTART_STATUS_PATH: statusPath });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /Label .* does not match/);
+      assert.strictEqual(h.readState().supervisor_bootstrap_count, undefined);
+      assert.strictEqual(h.readState().bot_bootout_count, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "plist validation failed");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("--plist fails before scheduling when config validation fails", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "config-validation.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111 });
+
+      const { status, stderr } = h.run(["--plist"], {
+        CONFIG_VALIDATE_BIN: "false",
+        RESTART_STATUS_PATH: statusPath,
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /config validation failed/);
+      const state = h.readState();
+      assert.strictEqual(state.registered, "1");
+      assert.strictEqual(state.pid, "1111");
+      assert.strictEqual(state.supervisor_bootstrap_count, undefined);
+      assert.strictEqual(state.bot_bootout_count, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "config validation failed");
+    } finally {
+      cleanup(h);
+    }
+  });
+
   it("reports supervisor bootstrap failure without booting out the bot", () => {
     const h = createHarness();
     try {
@@ -389,6 +564,27 @@ describe("restart-bot.sh supervisor mode", () => {
       assert.strictEqual(state.bot_bootout_count, undefined);
       assert.deepStrictEqual(readStatus(statusPath).status, "failure");
       assert.strictEqual(readStatus(statusPath).error, "supervisor bootstrap failed");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("reports supervisor plist lint failure before bootstrap", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "supervisor-lint.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, supervisor_lint_fail: 1 });
+
+      const { status, stderr } = h.run(["--plist"], { RESTART_STATUS_PATH: statusPath });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /restart supervisor plist is malformed/);
+      const state = h.readState();
+      assert.strictEqual(state.registered, "1");
+      assert.strictEqual(state.pid, "1111");
+      assert.strictEqual(state.supervisor_bootstrap_count, undefined);
+      assert.strictEqual(state.bot_bootout_count, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "supervisor plist validation failed");
     } finally {
       cleanup(h);
     }
@@ -469,6 +665,86 @@ describe("restart-bot.sh supervisor mode", () => {
       const workerStatus = readStatus(statusPath);
       assert.strictEqual(workerStatus.status, "failure");
       assert.strictEqual(workerStatus.error, "bot bootstrap failed");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker refuses to bootstrap when launchctl state is unknown", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-unknown-state.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 2222, list_fail: 1 });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], { RESTART_STATUS_PATH: statusPath });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /unknown service state/);
+      const state = h.readState();
+      assert.strictEqual(state.bot_bootout_count, undefined);
+      assert.strictEqual(state.bootstrapped_sig, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "unknown launchd state");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker records teardown timeout without bootstrapping", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-teardown-timeout.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 2222, bootout_delay: 5 });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        TEARDOWN_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /did not unregister/);
+      const state = h.readState();
+      assert.strictEqual(state.bot_bootout_count, "1");
+      assert.strictEqual(state.bootstrapped_sig, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "teardown timeout");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker records startup timeout when bootstrap does not produce a PID", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-startup-timeout.status");
+      h.setState({ registered: 0, label: "ai.minime.telegram-bot", bootstrap_no_pid: 1 });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /no running PID/);
+      assert.strictEqual(readStatus(statusPath).error, "startup timeout");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker records invalid delay before bootout", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-invalid-delay.status");
+      h.setState({ registered: 1, label: "ai.minime.telegram-bot", pid: 1111, next_pid: 2222 });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        RESTART_WORKER_NOT_BEFORE_DELAY: "not-a-number",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /invalid RESTART_WORKER_NOT_BEFORE_DELAY/);
+      assert.strictEqual(h.readState().bot_bootout_count, undefined);
+      assert.strictEqual(readStatus(statusPath).error, "invalid worker delay");
     } finally {
       cleanup(h);
     }

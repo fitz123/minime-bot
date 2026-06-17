@@ -17,7 +17,8 @@ The request path:
 - validates the target bot plist before any service teardown;
 - validates the current control workspace config;
 - writes a one-shot supervisor plist using the fixed label
-  `ai.minime.telegram-bot.restart-supervisor`;
+  `ai.minime.telegram-bot.restart-supervisor` under the restart runtime
+  directory by default, not under `~/Library/LaunchAgents`;
 - serializes the required context into the supervisor plist, including
   `BOT_PLIST`, `BOT_LABEL`, launchd domain details, workspace root, `HOME`,
   `PATH`, request id, status path, log path, and worker arguments;
@@ -41,6 +42,21 @@ The package intentionally does not add custom restart lock files in this MVP.
 The fixed supervisor label plus best-effort supervisor `bootout` is the only
 stale-helper cleanup contract. If a richer concurrency protocol is needed later,
 it should preserve the default self-safe `--plist` behavior.
+
+Operator environment knobs:
+
+- `RESTART_RUNTIME_DIR` changes the default directory for supervisor plist,
+  status, and log files. The default is `~/Library/Logs/minime-bot/restart`.
+- `RESTART_SUPERVISOR_PLIST` overrides only the helper plist path. The helper
+  label remains fixed as `ai.minime.telegram-bot.restart-supervisor`.
+- `RESTART_STATUS_PATH` and `RESTART_LOG_PATH` override the request status and
+  log paths.
+- `RESTART_WORKER_NOT_BEFORE_DELAY` controls the worker's bounded delay before
+  bot `bootout`; `RESTART_MAX_WORKER_NOT_BEFORE_DELAY` caps that delay.
+
+The `--request-id`, `--status-path`, and `--log-path` flags are supervisor
+automation arguments used when request mode launches worker mode. Operators
+should normally call `scripts/restart-bot.sh --plist` without these flags.
 
 ## Foreground worker mode
 

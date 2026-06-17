@@ -2,7 +2,7 @@
 // Usage: npx tsx src/cron-runner.ts --task <name>
 // Loads cron definition from crons.yaml, runs a Pi print-mode one-shot, delivers output to Telegram
 
-import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, renameSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import {
   loadRawMergedConfig,
   loadTelegramToken,
@@ -20,7 +20,6 @@ import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
-import { parse as parseYaml } from "yaml";
 import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
@@ -31,7 +30,9 @@ import {
   shouldIncludePiChildEnvKey,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
-import { MINIME_AGENT_WORKSPACE_ROOT_ENV, resolveWorkspaceContract } from "./workspace-contract.js";
+import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
+import { loadMergedCrons } from "./cron-loader.js";
+export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -158,58 +159,9 @@ function writeCronHealthMetric(cronName: string, exitCode: number, success: bool
   }
 }
 
-interface CronsYaml {
-  crons: Array<Record<string, unknown>>;
-}
-
 export interface DeliveryDefaults {
   defaultDeliveryChatId?: number;
   defaultDeliveryThreadId?: number;
-}
-
-// Derive the .local counterpart path: crons.yaml → crons.local.yaml
-function deriveCronsLocalPath(cronsPath: string): string {
-  return cronsPath.replace(/\.yaml$/, ".local.yaml");
-}
-
-export function resolveCronsPath(cronsPath?: string): string {
-  return cronsPath === undefined
-    ? resolveWorkspaceContract().paths.cronsPath
-    : resolve(cronsPath);
-}
-
-// Load crons.yaml and merge crons.local.yaml on top if it exists.
-// Local crons win on duplicate name. Exported for tests.
-export function loadMergedCrons(cronsPath?: string): Array<Record<string, unknown>> {
-  const path = resolveCronsPath(cronsPath);
-  const raw: CronsYaml = parseYaml(readFileSync(path, "utf8"));
-  if (!raw?.crons || !Array.isArray(raw.crons)) {
-    throw new Error("crons.yaml missing 'crons' array");
-  }
-  const baseCrons = raw.crons as Array<Record<string, unknown>>;
-
-  const localPath = deriveCronsLocalPath(path);
-  if (!existsSync(localPath)) {
-    return [...baseCrons];
-  }
-  const localRaw: CronsYaml = parseYaml(readFileSync(localPath, "utf8"));
-  if (!localRaw?.crons || !Array.isArray(localRaw.crons)) {
-    process.stderr.write(`Warning: ${localPath} found but has no valid 'crons' array — ignoring local overrides\n`);
-    return [...baseCrons];
-  }
-  const localCrons = localRaw.crons as Array<Record<string, unknown>>;
-
-  // Merge: start with base, local wins on duplicate name, new local crons appended
-  const merged = [...baseCrons];
-  for (const localCron of localCrons) {
-    const idx = merged.findIndex((c) => c.name === localCron.name);
-    if (idx >= 0) {
-      merged[idx] = localCron;
-    } else {
-      merged.push(localCron);
-    }
-  }
-  return merged;
 }
 
 function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryDefaults): CronJob {

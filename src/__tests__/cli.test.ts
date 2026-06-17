@@ -200,7 +200,7 @@ describe("minime-bot CLI", () => {
     const launchAgentsDir = join(home, "Library", "LaunchAgents");
     mkdirSync(launchAgentsDir, { recursive: true });
     const stalePath = join(launchAgentsDir, "ai.minime.cron.old.plist");
-    writeFileSync(stalePath, "stale", "utf8");
+    writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.old</string></dict></plist>\n", "utf8");
     try {
       const result = runWithCapture(
         ["launchd", "crons", "sync", "--workspace", workspace, "--launch-agents-dir", launchAgentsDir],
@@ -216,6 +216,33 @@ describe("minime-bot CLI", () => {
       assert.match(result.stdout, /Summary: create 1, update 0, unchanged 0, delete 1/);
       assert.ok(calls.some((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.old"));
       assert.ok(calls.some((call) => call.args[0] === "bootstrap" && call.args.some((arg) => arg.endsWith("ai.minime.cron.smoke.plist"))));
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns exit code 1 when launchd cron sync command execution fails", () => {
+    const workspace = createWorkspace();
+    const home = join(workspace, "home");
+    const launchAgentsDir = join(home, "Library", "LaunchAgents");
+    mkdirSync(launchAgentsDir, { recursive: true });
+    try {
+      const failingRunner: LaunchdCommandRunner = (command, args) => {
+        if (command.endsWith("plutil") && args[0] === "-lint") {
+          return { status: 1, stderr: "lint failed" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+      const result = runWithCapture(
+        ["launchd", "crons", "sync", "--workspace", workspace, "--launch-agents-dir", launchAgentsDir],
+        workspace,
+        { HOME: home, LOG_DIR: join(workspace, "logs") },
+        { launchdCommandRunner: failingRunner, launchdHomeDir: home, launchdUid: 501 },
+      );
+
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /Error: plutil -lint .* failed: lint failed/);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

@@ -84,6 +84,10 @@ The package also exposes a quota sampler for Prometheus textfile collectors:
 minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/to/textfiles
 ```
 
+The sampler uses the packaged Pi CLI by default; override it with `--pi-bin` or
+`CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for Pi 0.79 project trust,
+and `--dry-run` prints the resolved command without executing it.
+
 ## Control Workspace
 
 Runtime config and agent workspace files live outside this package in a control
@@ -190,6 +194,7 @@ Schedule changes that affect launchd plists are synced with:
 minime-bot launchd crons sync --workspace /path/to/control-workspace --dry-run
 minime-bot launchd crons sync --workspace /path/to/control-workspace
 minime-bot launchd crons sync --workspace /path/to/control-workspace --no-prune
+minime-bot launchd crons sync --workspace /path/to/control-workspace --launch-agents-dir /tmp/LaunchAgents
 ```
 
 The sync command owns only the `ai.minime.cron.*` namespace. By default it
@@ -197,8 +202,9 @@ creates or updates active cron plists, lint-checks changed plists, re-bootstraps
 changed active cron labels, and prunes stale or disabled owned cron plists by
 booting them out and deleting the plist without bootstrapping them again.
 `--no-prune` leaves stale owned cron plists in place for emergency/manual
-operation. Cron sync must not bootout, bootstrap, signal, or otherwise restart
-`ai.minime.telegram-bot`.
+operation. `--launch-agents-dir` overrides the default
+`~/Library/LaunchAgents` target. Cron sync must not bootout, bootstrap, signal,
+or otherwise restart `ai.minime.telegram-bot`.
 
 More detail is in `docs/launchd-operations.md`.
 
