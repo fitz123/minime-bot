@@ -89,23 +89,23 @@ node dist/cli.js --help
 - Create/Modify: `src/__tests__/cli.test.ts`
 - Modify as needed: `src/__tests__/generate-plists.test.ts`
 
-- [ ] Extract plist generation/rendering from `scripts/generate-plists.ts` into `src/launchd-cron-plists.ts`, reusing `src/cron-plist.ts` validation.
-- [ ] Resolve package paths module-relatively from `import.meta.url`, so generated `ProgramArguments` points to installed `node_modules/minime-bot/scripts/run-cron.sh`.
-- [ ] Add CLI: `minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]`.
-- [ ] Dispatch `launchd` scope before `src/cli.ts` rejects extra command args.
-- [ ] Add dedicated parser for launchd options: `--dry-run`, `--no-prune`, `--launch-agents-dir`.
-- [ ] Dry-run computes create/update/delete/rebootstrap actions only.
-- [ ] Non-dry-run writes updated plists, prunes stale/disabled owned plists by default, and re-bootstraps affected cron labels.
-- [ ] For active changed labels: `bootout gui/<uid>/<label>` then `bootstrap gui/<uid> <plist>`.
-- [ ] For pruned/disabled labels: `bootout gui/<uid>/<label>`, delete plist, and do not bootstrap.
-- [ ] Ensure cron sync never bootouts/bootstraps/kills/signals `ai.minime.telegram-bot`.
-- [ ] Add synchronous injectable command runner for launchctl/plutil tests; keep `runCli` synchronous.
-- [ ] Preserve or update `scripts/generate-plists.ts` as a thin wrapper and keep existing generator tests green.
-- [ ] Add tests for local schedule override updating `StartCalendarInterval`.
-- [ ] Add tests for `every N` schedule generating `StartInterval`.
-- [ ] Add tests for default prune, `--no-prune`, dry-run, active rebootstrap, pruned bootout-without-bootstrap, and bot-label non-interference.
-- [ ] Add CLI tests for help, option parsing, dry-run output, default prune, `--no-prune`, and test LaunchAgents dir override.
-- [ ] Run targeted cron/CLI tests.
+- [x] Extract plist generation/rendering from `scripts/generate-plists.ts` into `src/launchd-cron-plists.ts`, reusing `src/cron-plist.ts` validation.
+- [x] Resolve package paths module-relatively from `import.meta.url`, so generated `ProgramArguments` points to installed `node_modules/minime-bot/scripts/run-cron.sh`.
+- [x] Add CLI: `minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]`.
+- [x] Dispatch `launchd` scope before `src/cli.ts` rejects extra command args.
+- [x] Add dedicated parser for launchd options: `--dry-run`, `--no-prune`, `--launch-agents-dir`.
+- [x] Dry-run computes create/update/delete/rebootstrap actions only.
+- [x] Non-dry-run writes updated plists, prunes stale/disabled owned plists by default, and re-bootstraps affected cron labels.
+- [x] For active changed labels: `bootout gui/<uid>/<label>` then `bootstrap gui/<uid> <plist>`.
+- [x] For pruned/disabled labels: `bootout gui/<uid>/<label>`, delete plist, and do not bootstrap.
+- [x] Ensure cron sync never bootouts/bootstraps/kills/signals `ai.minime.telegram-bot`.
+- [x] Add synchronous injectable command runner for launchctl/plutil tests; keep `runCli` synchronous.
+- [x] Preserve or update `scripts/generate-plists.ts` as a thin wrapper and keep existing generator tests green.
+- [x] Add tests for local schedule override updating `StartCalendarInterval`.
+- [x] Add tests for `every N` schedule generating `StartInterval`.
+- [x] Add tests for default prune, `--no-prune`, dry-run, active rebootstrap, pruned bootout-without-bootstrap, and bot-label non-interference.
+- [x] Add CLI tests for help, option parsing, dry-run output, default prune, `--no-prune`, and test LaunchAgents dir override.
+- [x] Run targeted cron/CLI tests.
 
 ### Task 2: Make `restart-bot.sh --plist` self-safe by default [HIGH]
 

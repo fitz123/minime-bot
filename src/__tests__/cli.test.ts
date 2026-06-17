@@ -14,7 +14,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCli } from "../cli.js";
+import { runCli, type CliRunOptions } from "../cli.js";
+import type { LaunchdCommandRunner } from "../launchd-cron-plists.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
@@ -99,7 +100,12 @@ function createKnowledgeWorkspace(): string {
   return workspace;
 }
 
-function runWithCapture(args: readonly string[], workspace?: string, env: NodeJS.ProcessEnv = {}): {
+function runWithCapture(
+  args: readonly string[],
+  workspace?: string,
+  env: NodeJS.ProcessEnv = {},
+  cliOptions?: Pick<CliRunOptions, "launchdCommandRunner" | "launchdHomeDir" | "launchdUid">,
+): {
   code: number;
   stdout: string;
   stderr: string;
@@ -109,6 +115,7 @@ function runWithCapture(args: readonly string[], workspace?: string, env: NodeJS
   const code = runCli(args, {
     cwd: workspace,
     env,
+    ...cliOptions,
     stdout: (text) => {
       stdout += text;
     },
@@ -117,6 +124,18 @@ function runWithCapture(args: readonly string[], workspace?: string, env: NodeJS
     },
   });
   return { code, stdout, stderr };
+}
+
+interface CommandCall {
+  command: string;
+  args: string[];
+}
+
+function captureRunner(calls: CommandCall[]): LaunchdCommandRunner {
+  return (command, args) => {
+    calls.push({ command, args: [...args] });
+    return { status: 0, stdout: "", stderr: "" };
+  };
 }
 
 function shellQuote(value: string): string {
@@ -134,12 +153,99 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+    assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
     assert.match(result.stdout, /Knowledge commands do not resolve config secrets/);
     assert.match(result.stdout, /Control\/app workspace root/);
     assert.match(result.stdout, /MINIME_CONTROL_WORKSPACE_ROOT, then source repo root or package cwd\./);
     assert.match(result.stdout, /MINIME_AGENT_WORKSPACE_ROOT/);
     assert.doesNotMatch(result.stdout, /current repo layout/);
     assert.equal(result.stderr, "");
+  });
+
+  it("dry-runs launchd cron sync with option parsing and LaunchAgents override", () => {
+    const workspace = createWorkspace();
+    const home = join(workspace, "home");
+    const launchAgentsDir = join(workspace, "custom-launch-agents");
+    try {
+      const result = runWithCapture(
+        [
+          "launchd",
+          "crons",
+          "sync",
+          `--workspace=${workspace}`,
+          "--dry-run",
+          `--launch-agents-dir=${launchAgentsDir}`,
+        ],
+        workspace,
+        { HOME: home, LOG_DIR: join(workspace, "logs"), UID: "501" },
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, /\[DRY-RUN\] LaunchAgents:/);
+      assert.match(result.stdout, new RegExp(escapeRegExp(launchAgentsDir)));
+      assert.match(result.stdout, /create ai\.minime\.cron\.smoke/);
+      assert.match(result.stdout, /rebootstrap ai\.minime\.cron\.smoke/);
+      assert.match(result.stdout, /Summary: create 1, update 0, unchanged 0, delete 0/);
+      assert.equal(existsSync(join(launchAgentsDir, "ai.minime.cron.smoke.plist")), false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes stale launchd cron plists by default", () => {
+    const workspace = createWorkspace();
+    const calls: CommandCall[] = [];
+    const home = join(workspace, "home");
+    const launchAgentsDir = join(home, "Library", "LaunchAgents");
+    mkdirSync(launchAgentsDir, { recursive: true });
+    const stalePath = join(launchAgentsDir, "ai.minime.cron.old.plist");
+    writeFileSync(stalePath, "stale", "utf8");
+    try {
+      const result = runWithCapture(
+        ["launchd", "crons", "sync", "--workspace", workspace, "--launch-agents-dir", launchAgentsDir],
+        workspace,
+        { HOME: home, LOG_DIR: join(workspace, "logs"), UID: "501" },
+        { launchdCommandRunner: captureRunner(calls), launchdHomeDir: home, launchdUid: 501 },
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      assert.equal(existsSync(stalePath), false);
+      assert.match(result.stdout, /delete ai\.minime\.cron\.old \(stale\)/);
+      assert.match(result.stdout, /Summary: create 1, update 0, unchanged 0, delete 1/);
+      assert.ok(calls.some((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.old"));
+      assert.ok(calls.some((call) => call.args[0] === "bootstrap" && call.args.some((arg) => arg.endsWith("ai.minime.cron.smoke.plist"))));
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("honors --no-prune for launchd cron sync", () => {
+    const workspace = createWorkspace();
+    const calls: CommandCall[] = [];
+    const home = join(workspace, "home");
+    const launchAgentsDir = join(home, "Library", "LaunchAgents");
+    mkdirSync(launchAgentsDir, { recursive: true });
+    const stalePath = join(launchAgentsDir, "ai.minime.cron.old.plist");
+    writeFileSync(stalePath, "stale", "utf8");
+    try {
+      const result = runWithCapture(
+        ["launchd", "crons", "sync", "--workspace", workspace, "--no-prune", "--launch-agents-dir", launchAgentsDir],
+        workspace,
+        { HOME: home, LOG_DIR: join(workspace, "logs"), UID: "501" },
+        { launchdCommandRunner: captureRunner(calls), launchdHomeDir: home, launchdUid: 501 },
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      assert.equal(readFileSync(stalePath, "utf8"), "stale");
+      assert.match(result.stdout, /Prune: disabled/);
+      assert.match(result.stdout, /Summary: create 1, update 0, unchanged 0, delete 0/);
+      assert.equal(calls.some((call) => call.args.some((arg) => arg.includes("ai.minime.cron.old"))), false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   it("validates config with explicit --workspace and does not resolve SOPS secrets", () => {

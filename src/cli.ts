@@ -32,6 +32,11 @@ import {
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
+import {
+  formatLaunchdCronSyncResult,
+  syncLaunchdCrons,
+  type LaunchdCommandRunner,
+} from "./launchd-cron-plists.js";
 
 type WriteFn = (text: string) => void;
 
@@ -40,6 +45,9 @@ export interface CliRunOptions {
   env?: NodeJS.ProcessEnv;
   stdout?: WriteFn;
   stderr?: WriteFn;
+  launchdCommandRunner?: LaunchdCommandRunner;
+  launchdHomeDir?: string;
+  launchdUid?: number;
 }
 
 interface ParsedArgs {
@@ -71,6 +79,7 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge update --workspace <agent-workspace> --op upsert --type project --slug <slug> --frontmatter <json> --body-file <file> [--json]
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
+  minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]
 
 Options:
   --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
@@ -241,6 +250,55 @@ function parsePositiveIntegerOption(
     throw new CliUsageError(`--${name} must be a positive integer`);
   }
   return value;
+}
+
+interface LaunchdCronSyncCliOptions {
+  dryRun: boolean;
+  prune: boolean;
+  launchAgentsDir?: string;
+}
+
+function parseLaunchdCronSyncOptions(args: readonly string[]): LaunchdCronSyncCliOptions {
+  let dryRun = false;
+  let prune = true;
+  let launchAgentsDir: string | undefined;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const rawArg = args[i];
+    if (!rawArg.startsWith("--")) {
+      throw new CliUsageError(`unexpected argument: ${rawArg}`);
+    }
+
+    if (rawArg === "--dry-run") {
+      dryRun = true;
+      continue;
+    }
+    if (rawArg === "--no-prune") {
+      prune = false;
+      continue;
+    }
+    if (rawArg === "--launch-agents-dir") {
+      const value = args[i + 1];
+      if (!value || value.startsWith("--")) {
+        throw new CliUsageError("--launch-agents-dir requires a path");
+      }
+      launchAgentsDir = value;
+      i += 1;
+      continue;
+    }
+    if (rawArg.startsWith("--launch-agents-dir=")) {
+      const value = rawArg.slice("--launch-agents-dir=".length).trim();
+      if (!value) {
+        throw new CliUsageError("--launch-agents-dir requires a path");
+      }
+      launchAgentsDir = value;
+      continue;
+    }
+
+    throw new CliUsageError(`unknown launchd option: ${rawArg}`);
+  }
+
+  return { dryRun, prune, launchAgentsDir };
 }
 
 function parseFrontmatterJson(raw: string): unknown {
@@ -449,6 +507,33 @@ function runKnowledgeCommand(
   throw new CliUsageError(`unknown knowledge command: ${action ?? ""}`.trimEnd());
 }
 
+function runLaunchdCommand(
+  action: string | undefined,
+  args: readonly string[],
+  parsed: ParsedArgs,
+  options: CliRunOptions,
+  stdout: WriteFn,
+): number {
+  if (action !== "crons" || args[0] !== "sync") {
+    throw new CliUsageError(`unknown launchd command: ${["launchd", action, ...args].filter(Boolean).join(" ")}`);
+  }
+
+  const commandOptions = parseLaunchdCronSyncOptions(args.slice(1));
+  const result = syncLaunchdCrons({
+    workspace: parsed.workspace,
+    dryRun: commandOptions.dryRun,
+    prune: commandOptions.prune,
+    launchAgentsDir: commandOptions.launchAgentsDir,
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? process.env,
+    homeDir: options.launchdHomeDir,
+    uid: options.launchdUid,
+    commandRunner: options.launchdCommandRunner,
+  });
+  stdout(formatLaunchdCronSyncResult(result));
+  return 0;
+}
+
 function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
   const diagnostics = contract.effectivePaths;
   return [
@@ -545,6 +630,9 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
   try {
     if (scope === "knowledge") {
       return runKnowledgeCommand(action, rest, parsed, options, stdout, stderr);
+    }
+    if (scope === "launchd") {
+      return runLaunchdCommand(action, rest, parsed, options, stdout);
     }
 
     if (rest.length > 0) {

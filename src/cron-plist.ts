@@ -14,9 +14,17 @@ export interface CronPlistDef {
 const CRON_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/;
 const MAX_LAUNCHD_INTERVALS = 10_000;
 
+export function validateCronNameForPlist(name: string): string | undefined {
+  if (!CRON_NAME_PATTERN.test(name)) {
+    return `${name || "(unnamed)"} has invalid name (use 1-80 letters, numbers, dots, underscores, or hyphens)`;
+  }
+  return undefined;
+}
+
 export function validateCronForPlist(cron: CronPlistDef): string | undefined {
-  if (!CRON_NAME_PATTERN.test(cron.name)) {
-    return `${cron.name || "(unnamed)"} has invalid name (use 1-80 letters, numbers, dots, underscores, or hyphens)`;
+  const nameError = validateCronNameForPlist(cron.name);
+  if (nameError) {
+    return nameError;
   }
   const scheduleError = validateCronScheduleForPlist(cron.schedule);
   if (scheduleError) {
