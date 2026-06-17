@@ -83,6 +83,10 @@ case "\$cmd" in
       printf 'PID\\tStatus\\tLabel\\n'
       printf '%s\\t0\\t%s\\n' "\$pid" "\$label"
     fi
+    if [ "\$(get supervisor_registered)" = "1" ]; then
+      supervisor_pid=\$(get supervisor_pid); [ -z "\$supervisor_pid" ] && supervisor_pid="-"
+      printf '%s\\t0\\t%s\\n' "\$supervisor_pid" "ai.minime.telegram-bot.restart-supervisor"
+    fi
     ;;
   kill)
     apply
@@ -96,6 +100,8 @@ case "\$cmd" in
     if [ "\$label" = "ai.minime.telegram-bot.restart-supervisor" ]; then
       incr supervisor_bootout_count
       set_kv supervisor_bootout_service "\$service"
+      set_kv supervisor_registered 0
+      del_kv supervisor_pid
     else
       incr bot_bootout_count
       delay=\$(get bootout_delay); [ -z "\$delay" ] && delay=0
@@ -115,6 +121,27 @@ case "\$cmd" in
       incr supervisor_bootstrap_count
       set_kv supervisor_bootstrap_domain "\$domain"
       set_kv supervisor_plist "\$plist_path"
+      set_kv supervisor_registered 1
+      supervisor_pid=\$(get supervisor_next_pid)
+      if [ -n "\$supervisor_pid" ]; then
+        set_kv supervisor_pid "\$supervisor_pid"
+      else
+        del_kv supervisor_pid
+      fi
+      if [ "\$(get write_worker_status_on_supervisor_bootstrap)" = "1" ] && [ -n "\${RESTART_STATUS_PATH:-}" ]; then
+        tmp="\${RESTART_STATUS_PATH}.mock-worker.\$\$"
+        {
+          printf 'requestId=%s\\n' "\${RESTART_REQUEST_ID:-}"
+          printf 'mode=worker\\n'
+          printf 'startedAt=mock-start\\n'
+          printf 'finishedAt=mock-finish\\n'
+          printf 'oldPid=\\n'
+          printf 'newPid=\\n'
+          printf 'status=failure\\n'
+          printf 'error=worker failed fast\\n'
+        } > "\$tmp"
+        mv "\$tmp" "\$RESTART_STATUS_PATH"
+      fi
       exit 0
     fi
     if [ "\$(get bootstrap_fail)" = "1" ]; then
@@ -342,8 +369,9 @@ describe("restart-bot.sh supervisor mode", () => {
       const state = h.readState();
       assert.strictEqual(state.registered, "1");
       assert.strictEqual(state.pid, "1111");
-      assert.strictEqual(state.supervisor_bootout_count, "1");
+      assert.strictEqual(state.supervisor_bootout_count, undefined);
       assert.strictEqual(state.supervisor_bootstrap_count, "1");
+      assert.strictEqual(state.supervisor_registered, "1");
       assert.strictEqual(state.bot_bootout_count, undefined);
       assert.strictEqual(state.bootstrapped_sig, undefined);
     } finally {
@@ -434,15 +462,16 @@ describe("restart-bot.sh supervisor mode", () => {
     }
   });
 
-  it("cleans the fixed helper label before every request", () => {
+  it("cleans a stale fixed helper registration before scheduling", () => {
     const h = createHarness();
     try {
-      assert.strictEqual(h.run(["--plist"]).status, 0);
+      h.setState({ supervisor_registered: 1 });
+
       assert.strictEqual(h.run(["--plist"]).status, 0);
 
       const state = h.readState();
-      assert.strictEqual(state.supervisor_bootout_count, "2");
-      assert.strictEqual(state.supervisor_bootstrap_count, "2");
+      assert.strictEqual(state.supervisor_bootout_count, "1");
+      assert.strictEqual(state.supervisor_bootstrap_count, "1");
       assert.strictEqual(state.supervisor_bootout_service, "gui/501/ai.minime.telegram-bot.restart-supervisor");
 
       const commands = h.readCommands();
@@ -451,6 +480,34 @@ describe("restart-bot.sh supervisor mode", () => {
       assert.ok(firstBootout >= 0, `expected supervisor bootout, got ${JSON.stringify(commands)}`);
       assert.ok(firstBootstrap > firstBootout, `expected bootstrap after cleanup, got ${JSON.stringify(commands)}`);
       assert.ok(commands.every((line) => !line.includes("kill\tSIGTERM\tgui/501/ai.minime.telegram-bot")));
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("refuses to replace a running restart supervisor", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "running-supervisor.status");
+      h.setState({
+        registered: 1,
+        label: "ai.minime.telegram-bot",
+        pid: 1111,
+        supervisor_registered: 1,
+        supervisor_pid: 7777,
+      });
+
+      const { status, stderr } = h.run(["--plist"], { RESTART_STATUS_PATH: statusPath });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /restart supervisor is already running/);
+      const state = h.readState();
+      assert.strictEqual(state.supervisor_bootout_count, undefined);
+      assert.strictEqual(state.supervisor_bootstrap_count, undefined);
+      assert.strictEqual(state.bot_bootout_count, undefined);
+      assert.strictEqual(state.registered, "1");
+      assert.strictEqual(state.pid, "1111");
+      assert.strictEqual(readStatus(statusPath).error, "restart supervisor already running");
     } finally {
       cleanup(h);
     }
@@ -467,7 +524,8 @@ describe("restart-bot.sh supervisor mode", () => {
 
       assert.strictEqual(status, 0, `expected fixed-label request success: ${stderr}`);
       const state = h.readState();
-      assert.strictEqual(state.supervisor_bootout_service, "gui/501/ai.minime.telegram-bot.restart-supervisor");
+      assert.strictEqual(state.supervisor_bootout_service, undefined);
+      assert.strictEqual(state.supervisor_bootstrap_count, "1");
       assert.strictEqual(state.bot_bootout_count, undefined);
       assert.strictEqual(state.registered, "1");
       assert.strictEqual(state.pid, "1111");
@@ -491,6 +549,32 @@ describe("restart-bot.sh supervisor mode", () => {
       assert.equal(existsSync(dirname(statusPath)), true);
       assert.equal(existsSync(dirname(logPath)), true);
       assert.strictEqual(readStatus(statusPath).status, "scheduled");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("does not overwrite a fast worker status after supervisor bootstrap", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "fast-worker.status");
+      h.setState({
+        registered: 1,
+        label: "ai.minime.telegram-bot",
+        pid: 1111,
+        write_worker_status_on_supervisor_bootstrap: 1,
+      });
+
+      const { status, stderr } = h.run(["--plist"], {
+        RESTART_REQUEST_ID: "fast-worker-request",
+        RESTART_STATUS_PATH: statusPath,
+      });
+
+      assert.strictEqual(status, 0, `expected request success: ${stderr}`);
+      const finalStatus = readStatus(statusPath);
+      assert.strictEqual(finalStatus.mode, "worker");
+      assert.strictEqual(finalStatus.status, "failure");
+      assert.strictEqual(finalStatus.error, "worker failed fast");
     } finally {
       cleanup(h);
     }

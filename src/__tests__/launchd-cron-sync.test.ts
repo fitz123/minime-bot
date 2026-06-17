@@ -128,7 +128,7 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("rejects uppercase cron names before rendering launchd plist paths", () => {
+  it("preserves uppercase cron names supported by the previous generator", () => {
     const fixture = createFixture();
     try {
       writeFileSync(
@@ -145,15 +145,16 @@ describe("launchd cron plist sync", () => {
         "utf8",
       );
 
-      assert.throws(
-        () => generateLaunchdCronPlists({
-          workspace: fixture.workspace,
-          launchAgentsDir: fixture.launchAgentsDir,
-          env: fixture.env,
-          homeDir: fixture.home,
-        }),
-        /Daily has invalid name \(use 1-80 lowercase letters, numbers, dots, underscores, or hyphens\)/,
-      );
+      const result = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+      });
+
+      assert.equal(result.plists.length, 1);
+      assert.equal(result.plists[0].label, "ai.minime.cron.Daily");
+      assert.match(result.plists[0].content, /<string>Daily<\/string>/);
     } finally {
       cleanup(fixture);
     }

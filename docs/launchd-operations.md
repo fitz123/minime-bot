@@ -23,7 +23,9 @@ The request path:
   `BOT_PLIST`, `BOT_LABEL`, launchd domain details, workspace root, `HOME`,
   `PATH`, request id, status path, log path, and worker arguments;
 - lint-checks the generated supervisor plist with `plutil -lint`;
-- best-effort bootouts any existing supervisor registration for the fixed label;
+- refuses to replace a running supervisor for the fixed label;
+- best-effort bootouts a stale stopped supervisor registration for the fixed
+  label;
 - bootstraps the supervisor and exits after printing request, status, and log
   details.
 
@@ -39,9 +41,10 @@ has an independent lifecycle, gives the restart request a stable label, and
 lets repeated requests clean up stale helper registrations with `bootout`.
 
 The package intentionally does not add custom restart lock files in this MVP.
-The fixed supervisor label plus best-effort supervisor `bootout` is the only
-stale-helper cleanup contract. If a richer concurrency protocol is needed later,
-it should preserve the default self-safe `--plist` behavior.
+The fixed supervisor label plus active-helper refusal and stale-helper
+best-effort `bootout` is the only cleanup contract. If a richer concurrency
+protocol is needed later, it should preserve the default self-safe `--plist`
+behavior.
 
 Operator environment knobs:
 

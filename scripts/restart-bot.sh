@@ -132,13 +132,14 @@ fi
 #   0 — registered (pid may be empty)
 #   1 — not registered (launchctl query succeeded, label absent)
 #   2 — launchctl query itself failed (unknown state)
-get_pid() {
+get_pid_for_label() {
+  local target_label="$1"
   local out
   if ! out=$("$LAUNCHCTL_BIN" list 2>/dev/null); then
     return 2
   fi
   local line
-  line=$(printf '%s\n' "$out" | awk -v L="$BOT_LABEL" '$3==L { print; exit }')
+  line=$(printf '%s\n' "$out" | awk -v L="$target_label" '$3==L { print; exit }')
   if [ -z "$line" ]; then
     return 1
   fi
@@ -150,6 +151,10 @@ get_pid() {
     echo "$pid"
   fi
   return 0
+}
+
+get_pid() {
+  get_pid_for_label "$BOT_LABEL"
 }
 
 # True only when launchctl query succeeded AND the service is registered.
@@ -326,7 +331,7 @@ write_restart_status() {
   [ -n "$RESTART_STATUS_PATH" ] || return 0
   ensure_parent_dir "$RESTART_STATUS_PATH"
 
-  local tmp="${RESTART_STATUS_PATH}.tmp"
+  local tmp="${RESTART_STATUS_PATH}.tmp.$$.$RANDOM"
   {
     printf 'requestId=%s\n' "$RESTART_REQUEST_ID"
     printf 'mode=%s\n' "$mode"
@@ -355,7 +360,7 @@ generate_supervisor_plist() {
   local log_path="$3"
 
   ensure_parent_dir "$RESTART_SUPERVISOR_PLIST"
-  local tmp="${RESTART_SUPERVISOR_PLIST}.tmp"
+  local tmp="${RESTART_SUPERVISOR_PLIST}.tmp.$$.$RANDOM"
   {
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
     printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -476,17 +481,36 @@ plist_request_restart() {
     return 1
   fi
 
-  log "Cleaning up any existing restart supervisor registration (${RESTART_SUPERVISOR_SERVICE})…"
-  "$LAUNCHCTL_BIN" bootout "$RESTART_SUPERVISOR_SERVICE" >/dev/null 2>&1 || true
+  local supervisor_pid supervisor_rc=0
+  supervisor_pid=$(get_pid_for_label "$RESTART_SUPERVISOR_LABEL" 2>/dev/null) || supervisor_rc=$?
+  case "$supervisor_rc" in
+    0)
+      if [ -n "$supervisor_pid" ]; then
+        err "restart supervisor is already running (PID: $supervisor_pid); refusing to replace active helper"
+        write_restart_status "request" "failure" "" "" "restart supervisor already running"
+        return 1
+      fi
+      log "Cleaning up stale restart supervisor registration (${RESTART_SUPERVISOR_SERVICE})…"
+      "$LAUNCHCTL_BIN" bootout "$RESTART_SUPERVISOR_SERVICE" >/dev/null 2>&1 || true
+      ;;
+    1)
+      log "No existing restart supervisor registration found."
+      ;;
+    *)
+      err "launchctl list failed; refusing to replace unknown restart supervisor state"
+      write_restart_status "request" "failure" "" "" "unknown restart supervisor state"
+      return 1
+      ;;
+  esac
 
   log "Scheduling restart supervisor ${RESTART_SUPERVISOR_LABEL}…"
+  write_restart_status "request" "scheduled" "" "" ""
   if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$RESTART_SUPERVISOR_PLIST"; then
     err "launchctl bootstrap failed for restart supervisor"
     write_restart_status "request" "failure" "" "" "supervisor bootstrap failed"
     return 1
   fi
 
-  write_restart_status "request" "scheduled" "" "" ""
   log "Restart scheduled. Request ID: ${RESTART_REQUEST_ID}"
   log "Status path: ${RESTART_STATUS_PATH}"
   log "Log path: ${RESTART_LOG_PATH}"

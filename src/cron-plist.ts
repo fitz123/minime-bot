@@ -11,8 +11,8 @@ export interface CronPlistDef {
   enabled?: boolean;
 }
 
-const CRON_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
-const CRON_NAME_REQUIREMENT = "use 1-80 lowercase letters, numbers, dots, underscores, or hyphens";
+const CRON_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/;
+const CRON_NAME_REQUIREMENT = "use 1-80 letters, numbers, dots, underscores, or hyphens";
 const MAX_LAUNCHD_INTERVALS = 10_000;
 
 export function validateCronNameForPlist(name: unknown): string | undefined {

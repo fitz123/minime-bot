@@ -169,7 +169,9 @@ registration, lint-checks the generated plist, bootstraps the supervisor, and
 returns before `ai.minime.telegram-bot` is stopped. The supervisor then runs the
 worker restart outside the original bot/Pi process, records status and logs
 under `~/Library/Logs/minime-bot/restart` by default, and performs the
-launchd `bootout`/`bootstrap` sequence.
+launchd `bootout`/`bootstrap` sequence. If that fixed supervisor label is
+already running, the request refuses to replace it instead of interrupting an
+in-progress restart.
 
 Explicit foreground mode is for operator debugging only:
 
@@ -183,7 +185,7 @@ Foreground/worker mode is guarded inside Pi child sessions. If
 `MINIME_RESTART_UNSAFE_FOREGROUND=1` is also set. The normal in-bot path should
 use `--plist` without `--worker` so the request can return before launchd tears
 down the bot service. The implementation intentionally uses the fixed helper
-label cleanup instead of custom lock files.
+label for stale-registration cleanup instead of custom lock files.
 
 Cron schedule deployment is separate from bot restart. Cron prompt and timeout
 changes are read by the cron runner from the merged workspace cron files at
