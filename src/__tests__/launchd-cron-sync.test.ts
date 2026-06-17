@@ -128,6 +128,37 @@ describe("launchd cron plist sync", () => {
     }
   });
 
+  it("rejects uppercase cron names before rendering launchd plist paths", () => {
+    const fixture = createFixture();
+    try {
+      writeFileSync(
+        join(fixture.workspace, "crons.yaml"),
+        [
+          "crons:",
+          "  - name: Daily",
+          '    schedule: "0 8 * * *"',
+          '    prompt: "run uppercase"',
+          "    agentId: main",
+          "    deliveryChatId: 111",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      assert.throws(
+        () => generateLaunchdCronPlists({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+        }),
+        /Daily has invalid name \(use 1-80 lowercase letters, numbers, dots, underscores, or hyphens\)/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("persists explicit config and crons path env overrides in rendered plists", () => {
     const fixture = createFixture();
     try {
