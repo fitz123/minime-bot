@@ -2,7 +2,7 @@ import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { loadConfig } from "./config.js";
-import { loadMergedCrons } from "./cron-runner.js";
+import { loadMergedCrons } from "./cron-loader.js";
 import { KNOWLEDGE_V2_FORMAT, resolveKnowledgeLayout } from "./knowledge/layout.js";
 import type { BotConfig } from "./types.js";
 import {

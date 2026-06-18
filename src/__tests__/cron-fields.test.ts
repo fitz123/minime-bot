@@ -105,5 +105,9 @@ describe("cron field contract", () => {
       validateCronForPlist({ ...baseCron, schedule: "every nope" }) ?? "",
       /every interval must be a positive integer/,
     );
+    assert.match(
+      validateCronForPlist({ ...baseCron, schedule: "0 9 1 * 1" }) ?? "",
+      /restricting both day-of-month and weekday is unsupported/,
+    );
   });
 });

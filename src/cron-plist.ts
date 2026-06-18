@@ -12,33 +12,49 @@ export interface CronPlistDef {
 }
 
 const CRON_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/;
+const CRON_NAME_REQUIREMENT = "use 1-80 letters, numbers, dots, underscores, or hyphens";
 const MAX_LAUNCHD_INTERVALS = 10_000;
 
-export function validateCronForPlist(cron: CronPlistDef): string | undefined {
-  if (!CRON_NAME_PATTERN.test(cron.name)) {
-    return `${cron.name || "(unnamed)"} has invalid name (use 1-80 letters, numbers, dots, underscores, or hyphens)`;
+export function validateCronNameForPlist(name: unknown): string | undefined {
+  if (typeof name !== "string") {
+    return `(unnamed) has invalid name (${CRON_NAME_REQUIREMENT})`;
   }
-  const scheduleError = validateCronScheduleForPlist(cron.schedule);
-  if (scheduleError) {
-    return `${cron.name} has invalid schedule: ${scheduleError}`;
-  }
-  const cronType = cron.type ?? "llm";
-  if (cronType !== "llm" && cronType !== "script") {
-    return `${cron.name} has invalid type "${cron.type}" (must be "llm" or "script")`;
-  }
-  if (cronType === "llm" && cron.engine !== undefined && cron.engine !== "pi") {
-    return `${cron.name} has invalid engine "${cron.engine}" (must be "pi" or omitted)`;
-  }
-  if (cronType === "script" && (!cron.command || !cron.command.trim())) {
-    return `${cron.name} is type "script" but missing required "command" field`;
-  }
-  if (cronType === "llm" && (!cron.prompt || !cron.prompt.trim())) {
-    return `${cron.name} is type "llm" but missing required "prompt" field`;
+  if (!CRON_NAME_PATTERN.test(name)) {
+    return `${name || "(unnamed)"} has invalid name (${CRON_NAME_REQUIREMENT})`;
   }
   return undefined;
 }
 
-export function validateCronScheduleForPlist(schedule: string): string | undefined {
+export function validateCronForPlist(cron: CronPlistDef): string | undefined {
+  const nameError = validateCronNameForPlist(cron.name);
+  if (nameError) {
+    return nameError;
+  }
+  const cronName = cron.name;
+  const scheduleError = validateCronScheduleForPlist(cron.schedule);
+  if (scheduleError) {
+    return `${cronName} has invalid schedule: ${scheduleError}`;
+  }
+  const cronType = cron.type ?? "llm";
+  if (cronType !== "llm" && cronType !== "script") {
+    return `${cronName} has invalid type "${cron.type}" (must be "llm" or "script")`;
+  }
+  if (cronType === "llm" && cron.engine !== undefined && cron.engine !== "pi") {
+    return `${cronName} has invalid engine "${cron.engine}" (must be "pi" or omitted)`;
+  }
+  if (cronType === "script" && (typeof cron.command !== "string" || !cron.command.trim())) {
+    return `${cronName} is type "script" but missing required "command" field`;
+  }
+  if (cronType === "llm" && (typeof cron.prompt !== "string" || !cron.prompt.trim())) {
+    return `${cronName} is type "llm" but missing required "prompt" field`;
+  }
+  return undefined;
+}
+
+export function validateCronScheduleForPlist(schedule: unknown): string | undefined {
+  if (typeof schedule !== "string") {
+    return "schedule is required";
+  }
   const trimmed = schedule.trim();
   if (!trimmed) {
     return "schedule is required";
@@ -56,6 +72,9 @@ export function validateCronScheduleForPlist(schedule: string): string | undefin
   const parts = trimmed.split(/\s+/);
   if (parts.length !== 5) {
     return "expected five cron fields or 'every N'";
+  }
+  if (parts[2] !== "*" && parts[4] !== "*") {
+    return "restricting both day-of-month and weekday is unsupported for launchd plists; split it into separate crons";
   }
 
   try {

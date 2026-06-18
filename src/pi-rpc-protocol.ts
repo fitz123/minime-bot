@@ -69,6 +69,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "kno
  * extension discovery remains disabled.
  */
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
+export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
 
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
@@ -94,6 +95,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "LANG",
   "LOGNAME",
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  MINIME_BOT_PI_SESSION_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
@@ -417,6 +419,7 @@ function buildAllowedPiChildEnv(
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
+  env[MINIME_BOT_PI_SESSION_ENV] = "1";
 
   return env;
 }

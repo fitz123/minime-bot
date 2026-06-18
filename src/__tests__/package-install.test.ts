@@ -305,6 +305,16 @@ describe("package artifact install", () => {
       assert.match(workspaceValidate.stdout, /Workspace valid\./);
       assert.match(workspaceValidate.stdout, /Pi extension dir: .*node_modules\/minime-bot\/dist\/extensions\/pi/);
 
+      const launchAgentsDir = join(temp, "LaunchAgents");
+      const launchdDryRun = runInstalledBin(
+        projectDir,
+        ["launchd", "crons", "sync", "--workspace", workspace, "--dry-run", "--launch-agents-dir", launchAgentsDir],
+        workspace,
+      );
+      assert.equal(launchdDryRun.status, 0, launchdDryRun.stderr || launchdDryRun.stdout);
+      assert.match(launchdDryRun.stdout, /\[DRY-RUN\] create ai\.minime\.cron\.smoke/);
+      assert.equal(existsSync(join(launchAgentsDir, "ai.minime.cron.smoke.plist")), false);
+
       const knowledgeSearch = runInstalledBin(
         projectDir,
         ["knowledge", "search", "--workspace", agentWorkspace, "--query", "synthetic", "--json"],
@@ -541,6 +551,7 @@ assert.equal(childEnv.TAVILY_API_KEY, undefined);
 
 const workspaceContract = await importPackageFile("dist/workspace-contract.js");
 const validator = await importPackageFile("dist/workspace-validator.js");
+const launchdCronPlists = await importPackageFile("dist/launchd-cron-plists.js");
 
 const defaultContract = workspaceContract.resolveWorkspaceContract({
   workspace,
@@ -549,6 +560,18 @@ const defaultContract = workspaceContract.resolveWorkspaceContract({
 });
 const defaultResult = validator.validateWorkspaceContract(defaultContract);
 assert.equal(validator.workspaceValidationErrors(defaultResult).length, 0);
+
+const installedLaunchAgentsDir = join(projectDir, "installed-launch-agents");
+const launchdCronResult = launchdCronPlists.generateLaunchdCronPlists({
+  workspace,
+  launchAgentsDir: installedLaunchAgentsDir,
+  env: { MINIME_CONTROL_WORKSPACE_ROOT: workspace, HOME: join(projectDir, "home") },
+  homeDir: join(projectDir, "home"),
+  uid: 501,
+});
+assert.equal(launchdCronResult.context.runCronScript, join(packageDir, "scripts", "run-cron.sh"));
+assert.ok(launchdCronResult.plists[0].content.includes("<string>" + join(packageDir, "scripts", "run-cron.sh") + "</string>"));
+assert.equal(launchdCronResult.plists[0].content.includes(sourceBotRoot), false);
 
 const registeredTools = [];
 const registeredToolDefs = [];
