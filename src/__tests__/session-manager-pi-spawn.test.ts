@@ -9,7 +9,7 @@ import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
 import { log } from "../logger.js";
-import { piSessionResumeDiscarded } from "../metrics.js";
+import { piSessionResumeDiscarded, sessionsActive } from "../metrics.js";
 import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMediaPath } from "../media-store.js";
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
@@ -52,6 +52,15 @@ let suppressGetStateResponse = false;
  * Capture must swallow it and fall back to the local id, never escaping spawn.
  */
 let getStateError: Error | null = null;
+
+/**
+ * Optional hook fired with the child whenever the mocked sendPiGetState is
+ * invoked — lets a test observe the exact moment a startup is parked inside
+ * capturePiSessionId (the window before active.set / store.setSession). Combine
+ * with `suppressGetStateResponse = true` to hold the capture open until the test
+ * pushes the get_state reply manually.
+ */
+let onGetState: ((child: ChildProcess) => void) | null = null;
 
 /** Create a mock ChildProcess that auto-emits 'spawn' on next tick. */
 function createAutoSpawnChild(): ChildProcess {
@@ -193,6 +202,7 @@ mock.module("../pi-rpc-protocol.js", {
     },
     sendPiGetState(child: ChildProcess) {
       if (getStateError) throw getStateError;
+      onGetState?.(child);
       if (suppressGetStateResponse) return;
       // capturePiSessionId reads child.stdout directly (abortable), so model Pi's
       // get_state reply by pushing the real JSONL record onto stdout. `null`
@@ -835,5 +845,89 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     // crash count and could tight-loop).
     const restartCounts = (manager as unknown as Record<string, Map<string, number>>).restartCounts;
     assert.strictEqual(restartCounts.get("pi-real-keep"), 1, "post-spawn startup exit increments the crash count");
+  });
+});
+
+describe("SessionManager /clean in-flight startup race (Task 1)", () => {
+  /** Current sessionsActive gauge value (0 if unset). */
+  async function activeGauge(): Promise<number> {
+    const metric = await sessionsActive.get();
+    return metric.values[0]?.value ?? 0;
+  }
+
+  beforeEach(() => {
+    cleanup();
+    mkdirSync(TEST_DIR, { recursive: true });
+    piSpawnCaptures.length = 0;
+    piSpawnOutcomes = [];
+    nextPiSessionId = "pi-generated-id";
+    suppressGetStateResponse = false;
+    getStateError = null;
+    onGetState = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    onGetState = null;
+  });
+
+  it("destroySession during in-flight startup supersedes it: no store entry, child reaped, no active session", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+
+    // Park the startup inside capturePiSessionId: get_state is invoked but no
+    // reply is pushed, so getOrCreateSession is suspended awaiting the Pi-minted
+    // id — the exact window BEFORE active.set(...) / store.setSession(...).
+    suppressGetStateResponse = true;
+    let capturedChild: ChildProcess | null = null;
+    let signalCaptureStarted: (() => void) | null = null;
+    const captureStarted = new Promise<void>((resolve) => { signalCaptureStarted = resolve; });
+    onGetState = (child) => {
+      capturedChild = child;
+      signalCaptureStarted?.();
+    };
+
+    const before = await activeGauge();
+
+    // Start the spawn but do NOT await — it must remain parked mid-capture.
+    const startup = manager.getOrCreateSession("clean-race", "pi");
+    // Consume the expected supersede rejection here so the floating promise never
+    // surfaces as an unhandled rejection before we assert on the outcome.
+    const settled = startup.then(
+      () => ({ ok: true as const }),
+      (err: Error) => ({ ok: false as const, err }),
+    );
+
+    // Wait until the startup is genuinely parked in the capture window.
+    await captureStarted;
+
+    // /clean lands while the startup is in flight and not yet in `active`.
+    await manager.destroySession("clean-race");
+
+    // Release the parked capture so the startup resumes and reaches the guard.
+    assert.ok(capturedChild, "get_state was invoked during startup");
+    (capturedChild as ChildProcess).stdout!.push(
+      JSON.stringify({ type: "response", success: true, data: { sessionId: "pi-generated-id" } }) + "\n",
+    );
+
+    const result = await settled;
+    assert.strictEqual(result.ok, false, "a superseded startup must not resolve a session");
+    if (!result.ok) {
+      assert.match(result.err.message, /superseded/, "startup fails with the supersede signal");
+    }
+
+    // No stale store entry survives the clean (the in-flight startup did not
+    // re-persist state after destroySession deleted it).
+    const store = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(store.getSession("clean-race"), undefined, "no stale store entry after clean");
+
+    // The superseded child was terminated/reaped.
+    assert.strictEqual((capturedChild as ChildProcess).killed, true, "superseded startup child is terminated");
+
+    // No active session and no net sessionsActive increment from the superseded startup.
+    assert.strictEqual(manager.getActive("clean-race"), undefined, "no active session for the superseded startup");
+    assert.strictEqual(manager.getActiveCount(), 0, "no active sessions remain");
+    assert.strictEqual(await activeGauge(), before, "sessionsActive not incremented by the superseded startup");
+
+    await manager.closeAll();
   });
 });

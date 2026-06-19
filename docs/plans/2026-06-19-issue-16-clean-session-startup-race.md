@@ -123,11 +123,11 @@ If the test runner does not support `--runInBand`, use the existing package test
 
 ### Task 1: Reproduce the `/clean` in-flight startup race
 
-- [ ] Add/extend a `SessionManager` unit test where `getOrCreateSession()` starts a Pi spawn that has not yet reached `active.set(...)`.
-- [ ] Call `destroySession(chatId)` while startup is paused.
-- [ ] Release startup and assert no stale store entry is written for that chat.
-- [ ] Assert the superseded child is terminated/reaped.
-- [ ] Assert no `active` session and no `sessionsActive` increment remains for the superseded startup.
+- [x] Add/extend a `SessionManager` unit test where `getOrCreateSession()` starts a Pi spawn that has not yet reached `active.set(...)`.
+- [x] Call `destroySession(chatId)` while startup is paused.
+- [x] Release startup and assert no stale store entry is written for that chat.
+- [x] Assert the superseded child is terminated/reaped.
+- [x] Assert no `active` session and no `sessionsActive` increment remains for the superseded startup.
 
 ### Task 2: Implement the minimal generation guard
 

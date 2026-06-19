@@ -219,6 +219,12 @@ export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
+  /**
+   * Per-chat startup generation. `destroySession` (/clean) bumps it; an in-flight
+   * `getOrCreateSession` captures it at entry and re-checks before persisting, so
+   * older startup work cannot re-create state a clean just removed.
+   */
+  private sessionGenerations: Map<string, number> = new Map();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
   private logDir: string;
@@ -406,6 +412,12 @@ export class SessionManager {
       sessionsActive.dec();
     }
 
+    // Capture the startup generation for this chat AFTER dead-active cleanup and
+    // BEFORE reading stored state. A concurrent destroySession (/clean) bumps the
+    // generation; if it changes before we persist this startup, the work has been
+    // superseded and must not re-create the state /clean just removed.
+    const generation = this.sessionGenerations.get(chatId) ?? 0;
+
     // Reload config fresh — pick up any changes to agents/sessionDefaults
     const freshConfig = this.getFreshConfig();
     const agent = freshConfig.agents[agentId];
@@ -551,6 +563,20 @@ export class SessionManager {
       restartCount,
       outboxPath,
     };
+
+    // Startup generation guard: if a destroySession (/clean) for this chat ran
+    // while this startup was in flight, the generation has advanced. Abort
+    // WITHOUT persisting so an older startup cannot undo a clean. Reap only the
+    // newly spawned child; leave shared per-chat outbox/media alone (a newer
+    // post-clean startup may already own them) and do NOT count this as a crash —
+    // it is a superseded startup, not a failure.
+    if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
+      if (!hasExited(child) && !child.killed) {
+        child.kill("SIGKILL");
+      }
+      log.warn("session-manager", `Session startup superseded by clean for chat ${chatId}`);
+      throw new Error("Session startup superseded by clean");
+    }
 
     this.active.set(chatId, session);
     sessionsActive.inc();
@@ -874,6 +900,9 @@ export class SessionManager {
    * --resume during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
+    // Bump the startup generation BEFORE deleting store state so any in-flight
+    // getOrCreateSession for this chat is superseded and cannot re-persist state.
+    this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     this.store.deleteSession(chatId);
     await this.closeSession(chatId, { persist: false });
     // closeSession only touches the media dir when an in-memory session exists;
