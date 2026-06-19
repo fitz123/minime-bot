@@ -131,11 +131,11 @@ If the test runner does not support `--runInBand`, use the existing package test
 
 ### Task 2: Implement the minimal generation guard
 
-- [ ] Add the private `sessionGenerations` map.
-- [ ] Capture generation in `getOrCreateSession()` after dead-active cleanup and before reading stored state.
-- [ ] Increment generation in `destroySession()` before deleting store state.
-- [ ] Check generation before `active.set(...)` / `sessionsActive.inc()` / `store.setSession(...)`.
-- [ ] On stale generation, kill/reap only the child; do not persist state, do not bump `restartCounts`, and do not touch shared outbox/media cleanup.
+- [x] Add the private `sessionGenerations` map.
+- [x] Capture generation in `getOrCreateSession()` after dead-active cleanup and before reading stored state.
+- [x] Increment generation in `destroySession()` before deleting store state.
+- [x] Check generation before `active.set(...)` / `sessionsActive.inc()` / `store.setSession(...)`.
+- [x] On stale generation, kill/reap only the child; do not persist state, do not bump `restartCounts`, and do not touch shared outbox/media cleanup.
 
 ### Task 3: Protect newer-generation resources
 
