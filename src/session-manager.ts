@@ -443,13 +443,12 @@ export class SessionManager {
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
 
-    // Clean and recreate outbox directory to prevent stale files from
-    // a previous crashed session from leaking into the new session's replies.
-    const outboxPath = prepareOutboxDir(chatId);
-
     // Ensure media directory exists (do NOT wipe: a photo may have been
     // downloaded into it moments before this spawn was triggered).
     // Cleanup happens on session close, crash recovery, and via the global cap.
+    // It is idempotent and non-destructive, so it is safe even for a startup
+    // that a later generation check supersedes. The destructive
+    // prepareOutboxDir(chatId) is deferred until AFTER the generation guard.
     ensureSessionMediaDir(chatId);
 
     // Spawn the agent subprocess via Pi RPC. Only a genuine resume points
@@ -547,6 +546,27 @@ export class SessionManager {
       this.restartCounts.set(chatId, 0);
     }
 
+    // Startup generation guard: if a destroySession (/clean) for this chat ran
+    // while this startup was in flight, the generation has advanced. Abort
+    // WITHOUT persisting so an older startup cannot undo a clean. Reap only the
+    // newly spawned child; leave shared per-chat outbox/media alone (a newer
+    // post-clean startup may already own them) and do NOT count this as a crash —
+    // it is a superseded startup, not a failure.
+    if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
+      if (!hasExited(child) && !child.killed) {
+        child.kill("SIGKILL");
+      }
+      log.warn("session-manager", `Session startup superseded by clean for chat ${chatId}`);
+      throw new Error("Session startup superseded by clean");
+    }
+
+    // Clean and recreate the outbox directory ONLY after the generation guard
+    // passes, immediately before creating the ActiveSession that owns it. This
+    // is destructive (it wipes the per-chat outbox), so a superseded older
+    // startup must never reach it — otherwise it could blow away an outbox a
+    // newer post-clean startup already owns.
+    const outboxPath = prepareOutboxDir(chatId);
+
     const session: ActiveSession = {
       child,
       sessionId: effectiveSessionId,
@@ -563,20 +583,6 @@ export class SessionManager {
       restartCount,
       outboxPath,
     };
-
-    // Startup generation guard: if a destroySession (/clean) for this chat ran
-    // while this startup was in flight, the generation has advanced. Abort
-    // WITHOUT persisting so an older startup cannot undo a clean. Reap only the
-    // newly spawned child; leave shared per-chat outbox/media alone (a newer
-    // post-clean startup may already own them) and do NOT count this as a crash —
-    // it is a superseded startup, not a failure.
-    if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
-      if (!hasExited(child) && !child.killed) {
-        child.kill("SIGKILL");
-      }
-      log.warn("session-manager", `Session startup superseded by clean for chat ${chatId}`);
-      throw new Error("Session startup superseded by clean");
-    }
 
     this.active.set(chatId, session);
     sessionsActive.inc();

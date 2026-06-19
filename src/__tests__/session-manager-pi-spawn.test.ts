@@ -931,3 +931,98 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     await manager.closeAll();
   });
 });
+
+describe("SessionManager superseded startup resource ownership (Task 3)", () => {
+  /** Current sessionsActive gauge value (0 if unset). */
+  async function activeGauge(): Promise<number> {
+    const metric = await sessionsActive.get();
+    return metric.values[0]?.value ?? 0;
+  }
+
+  beforeEach(() => {
+    cleanup();
+    mkdirSync(TEST_DIR, { recursive: true });
+    piSpawnCaptures.length = 0;
+    piSpawnOutcomes = [];
+    nextPiSessionId = "pi-generated-id";
+    suppressGetStateResponse = false;
+    getStateError = null;
+    onGetState = null;
+    try { rmSync(sessionMediaDir("supersede-res"), { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  afterEach(() => {
+    cleanup();
+    onGetState = null;
+    try { rmSync(sessionMediaDir("supersede-res"), { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it("a superseded startup must not wipe the newer post-clean startup's outbox/media", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const before = await activeGauge();
+
+    // Park the OLD startup in crash backoff — the one window in the legacy
+    // ordering where its DESTRUCTIVE outbox prep (prepareOutboxDir) ran AFTER an
+    // interleaved /clean + fresh post-clean startup had already taken ownership
+    // of the shared per-chat outbox/media. Seed a crash count so the old startup
+    // sleeps in backoff right after capturing generation 0, before it would
+    // reach the outbox prep. The fix moves prepareOutboxDir past the generation
+    // guard so a superseded startup never reaches it.
+    const restartCounts = (manager as unknown as Record<string, Map<string, number>>).restartCounts;
+    restartCounts.set("supersede-res", 1);
+
+    nextPiSessionId = "old-pi-id";
+    const oldStartup = manager.getOrCreateSession("supersede-res", "pi");
+    // Consume the expected supersede rejection so the floating promise never
+    // surfaces as an unhandled rejection before we assert on the outcome.
+    const oldSettled = oldStartup.then(
+      () => ({ ok: true as const }),
+      (err: Error) => ({ ok: false as const, err }),
+    );
+
+    // Let the old startup advance past evictIfNeeded into the crash backoff so it
+    // reads the seeded crash count (and parks on the 5s timer) BEFORE /clean
+    // clears it. One microtask turn is enough to reach the backoff await.
+    await Promise.resolve();
+
+    // /clean lands while the old startup sleeps in backoff: it bumps the
+    // generation (superseding the old startup) and clears the crash count (so the
+    // fresh startup below does not also back off).
+    await manager.destroySession("supersede-res");
+
+    // A fresh post-clean startup begins, succeeds, and takes ownership of the
+    // shared per-chat outbox/media for this chat.
+    nextPiSessionId = "new-pi-id";
+    const newSession = await manager.getOrCreateSession("supersede-res", "pi");
+    assert.strictEqual(newSession.sessionId, "new-pi-id", "fresh post-clean startup owns the session");
+    assert.strictEqual(newSession.outboxPath, outboxDir("supersede-res"), "new owner holds the per-chat outbox");
+
+    // Files the NEW owner placed under the shared outbox/media dirs after taking
+    // ownership. The superseded old startup must not remove these.
+    const outboxSentinel = `${newSession.outboxPath}/owned-by-new.txt`;
+    writeFileSync(outboxSentinel, "new owner outbox file");
+    const mediaSentinel = `${ensureSessionMediaDir("supersede-res")}/owned-by-new.jpg`;
+    writeFileSync(mediaSentinel, "new owner media file");
+
+    // Release the old startup (wakes from backoff): it must be superseded and
+    // must NOT touch the shared outbox/media the new owner now holds.
+    const result = await oldSettled;
+    assert.strictEqual(result.ok, false, "the superseded old startup must not resolve a session");
+    if (!result.ok) {
+      assert.match(result.err.message, /superseded/, "old startup fails with the supersede signal");
+    }
+
+    // The new owner's resources survive the superseded old startup (the fix).
+    assert.ok(existsSync(outboxSentinel), "new owner's outbox file survives the superseded startup");
+    assert.ok(existsSync(mediaSentinel), "new owner's media file survives the superseded startup");
+
+    // The new session is intact and still the sole persisted owner.
+    assert.strictEqual(manager.getActive("supersede-res"), newSession, "new session remains active");
+    assert.strictEqual(manager.getActiveCount(), 1, "only the new session remains active");
+    assert.strictEqual(await activeGauge(), before + 1, "only the new session counts toward sessionsActive");
+    const store = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(store.getSession("supersede-res")?.sessionId, "new-pi-id", "the fresh id stays persisted");
+
+    await manager.closeAll();
+  });
+});

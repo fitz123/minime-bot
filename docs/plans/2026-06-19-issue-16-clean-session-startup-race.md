@@ -139,9 +139,9 @@ If the test runner does not support `--runInBand`, use the existing package test
 
 ### Task 3: Protect newer-generation resources
 
-- [ ] Move `prepareOutboxDir(chatId)` after the generation check.
-- [ ] Leave `ensureSessionMediaDir(chatId)` in place unless tests prove a stronger reason to move it.
-- [ ] Add a regression where old startup is superseded by `/clean`, a new startup begins, then old startup completes and must not remove/corrupt the newer startup's outbox/media resources.
+- [x] Move `prepareOutboxDir(chatId)` after the generation check.
+- [x] Leave `ensureSessionMediaDir(chatId)` in place unless tests prove a stronger reason to move it.
+- [x] Add a regression where old startup is superseded by `/clean`, a new startup begins, then old startup completes and must not remove/corrupt the newer startup's outbox/media resources.
 
 ### Task 4: Reproduce and fix the un-reaped stale-resume window
 
