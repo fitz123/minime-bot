@@ -9,7 +9,7 @@ import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
 import { log } from "../logger.js";
-import { piSessionResumeDiscarded, sessionsActive } from "../metrics.js";
+import { piSessionResumeDiscarded, sessionsActive, sessionCrashes } from "../metrics.js";
 import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMediaPath } from "../media-store.js";
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
@@ -284,6 +284,12 @@ mock.module("../pi-rpc-protocol.js", {
 
 const { SessionManager, outboxDir } = await import("../session-manager.js");
 const { SessionStore } = await import("../session-store.js");
+
+async function crashCount(agentId: string): Promise<number> {
+  const metric = await sessionCrashes.get();
+  const entry = metric.values.find((v) => v.labels.agent_id === agentId);
+  return entry?.value ?? 0;
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -564,6 +570,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     nextPiSessionId = "fresh-pi-id";
 
     const before = await discardedCount("pi");
+    const crashesBefore = await crashCount("pi");
     const warnCalls: unknown[][] = [];
     const warnSpy = mock.method(log, "warn", (...args: unknown[]) => { warnCalls.push(args); });
 
@@ -594,6 +601,11 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
+    assert.strictEqual(
+      await crashCount("pi"),
+      crashesBefore,
+      "resume-recovery does not increment bot_session_crashes_total",
+    );
 
     await manager.closeAll();
   });
@@ -865,6 +877,8 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     ];
     nextPiSessionId = "fresh-pi-id";
 
+    const before = await discardedCount("pi");
+    const crashesBefore = await crashCount("pi");
     const warnCalls: unknown[][] = [];
     const warnSpy = mock.method(log, "warn", (...args: unknown[]) => { warnCalls.push(args); });
 
@@ -891,6 +905,12 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
         (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
+    assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
+    assert.strictEqual(
+      await crashCount("pi"),
+      crashesBefore,
+      "un-reaped resume-recovery does not increment bot_session_crashes_total",
+    );
 
     await manager.closeAll();
   });
@@ -986,6 +1006,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     };
 
     const before = await activeGauge();
+    const crashesBefore = await crashCount("pi");
 
     // Start the spawn but do NOT await — it must remain parked mid-capture.
     const startup = manager.getOrCreateSession("clean-race", "pi");
@@ -1026,6 +1047,11 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     assert.strictEqual(manager.getActive("clean-race"), undefined, "no active session for the superseded startup");
     assert.strictEqual(manager.getActiveCount(), 0, "no active sessions remain");
     assert.strictEqual(await activeGauge(), before, "sessionsActive not incremented by the superseded startup");
+    assert.strictEqual(
+      await crashCount("pi"),
+      crashesBefore,
+      "superseded startup does not increment bot_session_crashes_total",
+    );
 
     await manager.closeAll();
   });

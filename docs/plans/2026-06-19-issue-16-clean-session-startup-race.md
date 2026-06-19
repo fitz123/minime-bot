@@ -152,10 +152,10 @@ If the test runner does not support `--runInBand`, use the existing package test
 
 ### Task 5: Metrics and regression checks
 
-- [ ] Assert recovered stale resume increments `piSessionResumeDiscarded`.
-- [ ] Assert recovered stale resume does not increment `bot_session_crashes_total` / `sessionCrashes`.
-- [ ] Assert superseded startup generation does not increment `sessionCrashes`.
-- [ ] Run focused tests, full tests, and build.
+- [x] Assert recovered stale resume increments `piSessionResumeDiscarded`.
+- [x] Assert recovered stale resume does not increment `bot_session_crashes_total` / `sessionCrashes`.
+- [x] Assert superseded startup generation does not increment `sessionCrashes`.
+- [x] Run focused tests, full tests, and build.
 
 ## Acceptance criteria
 
