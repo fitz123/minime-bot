@@ -230,7 +230,7 @@ export class MessageQueue {
       }
     } catch (err) {
       log.error("message-queue", `Send error for ${chatId}:`, err);
-      if (state.latestPlatform) {
+      if (this.queues.get(chatId) === state && state.latestPlatform) {
         await state.latestPlatform
           .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
           .catch(() => {});
@@ -296,7 +296,7 @@ export class MessageQueue {
         }
       } catch (err) {
         log.error("message-queue", `Collect drain error for ${chatId}:`, err);
-        if (state.latestPlatform) {
+        if (this.queues.get(chatId) === state && state.latestPlatform) {
           await state.latestPlatform
             .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
             .catch(() => {});

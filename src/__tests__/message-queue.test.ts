@@ -409,6 +409,37 @@ describe("MessageQueue error handling", () => {
     queue.clearAll();
   });
 
+  it("does not send an error reply when the queue is cleared before processFn rejects", async () => {
+    let unblock!: () => void;
+    let replyCount = 0;
+    const errorPlatform: PlatformContext = {
+      ...mockPlatform(),
+      async replyError() {
+        replyCount++;
+      },
+    };
+
+    const rejectAfterClear = async () => {
+      await new Promise<void>((resolve) => { unblock = resolve; });
+      throw new Error("Session startup superseded by clean");
+    };
+
+    const queue = new MessageQueue(rejectAfterClear, { debounceMs: 20 });
+    queue.enqueue("chat1", "main", "trigger clean race", errorPlatform);
+
+    await wait(50);
+    assert.ok(queue.isBusy("chat1"), "flush is in progress before clear");
+
+    queue.clear("chat1");
+    unblock();
+    await wait(50);
+
+    assert.strictEqual(replyCount, 0, "cleared queue must not send a stale error reply");
+    assert.strictEqual(queue.isBusy("chat1"), false);
+
+    queue.clearAll();
+  });
+
   it("catches errors during collect buffer drain and sends error reply", async () => {
     let callCount = 0;
     let repliedText = "";

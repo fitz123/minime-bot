@@ -1,5 +1,7 @@
 # Plan: Issue #16 — harden `/clean` and stale Pi startup/resume recovery
 
+Status: complete. Review findings addressed on 2026-06-19.
+
 ## Goal
 
 Fix the Pi session lifecycle so a chat cannot remain wedged on stale startup state:
@@ -20,7 +22,7 @@ Relevant code:
 - `src/session-manager.ts`
   - `getOrCreateSession()` reads persisted state, spawns Pi with `--session` when `resume=true`, and only later calls `active.set(...)` / `store.setSession(...)`.
   - `destroySession()` deletes store state and closes active sessions, but has no way to cancel startup work that is not yet in `active`.
-  - Existing `isPiResumeNotFound()` / `discardUnresumablePiSession()` already implement the normal stale-resume fallback and have tests. Do **not** rebuild this machinery.
+  - Existing stale-resume signal detection / `discardUnresumablePiSession()` already implement the normal stale-resume fallback and have tests. Do **not** rebuild this machinery.
 - `src/pi-rpc-protocol.ts`
   - `spawnPiRpcSession()` buffers startup stderr for classification via `piStartupStderr()`.
 
@@ -93,7 +95,7 @@ Implementation decision:
 
 - In the no-id / child-not-yet-exited branch, if startup stderr already contains `No session found matching`, perform a short bounded settle wait (cap: ≤300ms) for the child exit state to populate, then route into the existing stale-resume recovery path.
 - Preserve current behavior for cases without the stale-resume signal: if no id is captured and there is no `No session found matching` signal, keep the current “session stays usable on local id” behavior.
-- Reuse existing `isPiResumeNotFound()` / `discardUnresumablePiSession()` and the existing at-most-once retry guard.
+- Reuse the existing stale-resume discard machinery and the existing at-most-once retry guard.
 
 ### 4. Metrics/logging
 
@@ -118,6 +120,25 @@ npm run build
 ```
 
 If the test runner does not support `--runInBand`, use the existing package test invocation pattern for focused tests.
+
+## Review validation (2026-06-19)
+
+The package uses Node's test runner rather than Jest, so focused files were run
+directly with the same module-mocking flags as `npm test`.
+
+```bash
+MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/session-manager-pi-spawn.test.ts
+MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/session-manager.test.ts
+MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/metrics.test.ts
+MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/message-queue.test.ts
+env -u MINIME_BOT_PI_SESSION npm test
+npm run build
+git diff --check
+npm pack --dry-run
+npm run check:schema-guard-contract
+node dist/cli.js --help
+npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
+```
 
 ## Tasks
 

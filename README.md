@@ -153,6 +153,18 @@ The launchd example uses separate `PACKAGE_ROOT` and `CONTROL_WORKSPACE`
 placeholders and sets `MINIME_CONTROL_WORKSPACE_ROOT` in the service
 environment.
 
+### Runtime Session Controls
+
+`/clean` clears queued work, deletes the stored session state for that chat, and
+supersedes any in-flight startup for the same chat. The next accepted message for
+that chat starts a fresh Pi session instead of resuming the previous one.
+
+If Pi reports `No session found matching ...` while resuming a stored session id,
+the bot discards that stale resume once and starts a fresh Pi session. These
+graceful stale-resume recoveries increment
+`bot_pi_session_resume_discarded_total`; recovered stale resumes and
+`/clean`-superseded startups do not increment `bot_session_crashes_total`.
+
 ## Launchd Operations
 
 The packaged restart script is self-safe by default when the bot runs under
