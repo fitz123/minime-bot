@@ -498,7 +498,6 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
-    await this.waitForSessionTeardown(chatId);
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
     const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
@@ -508,6 +507,11 @@ export class SessionManager {
       log.warn("session-manager", `Session startup superseded by clean for chat ${chatId}`);
       throw new SessionStartupSupersededError();
     };
+
+    await this.waitForSessionTeardown(chatId);
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup();
+    }
 
     // Check if session is active in memory
     let existing = this.active.get(chatId);

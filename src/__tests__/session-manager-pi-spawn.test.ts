@@ -1387,6 +1387,91 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     await manager.closeAll();
   });
 
+  it("startup that began before clean is superseded after waiting for prior teardown", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const chatId = "preclean-teardown-race";
+    const oldOutbox = outboxDir(chatId);
+    mkdirSync(oldOutbox, { recursive: true });
+
+    let signalKillCalled: (() => void) | null = null;
+    const killCalled = new Promise<void>((resolve) => { signalKillCalled = resolve; });
+    let releaseExit: () => void = () => { throw new Error("kill was not called"); };
+    const oldChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(oldChild, {
+      stdout: new Readable({ read() {} }),
+      stderr: new Readable({ read() {} }),
+      stdin: new Writable({ write(_chunk, _enc, cb) { cb(); } }),
+      pid: 99996,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill(signal?: NodeJS.Signals | number) {
+        (oldChild as unknown as Record<string, unknown>).killed = true;
+        signalKillCalled?.();
+        releaseExit = () => {
+          if ((oldChild as ChildProcess).exitCode !== null || (oldChild as ChildProcess).signalCode !== null) return;
+          const code = signal === "SIGKILL" ? 137 : 0;
+          const signalCode = typeof signal === "string" ? signal : "SIGTERM";
+          (oldChild as unknown as Record<string, unknown>).exitCode = code;
+          (oldChild as unknown as Record<string, unknown>).signalCode = signalCode;
+          oldChild.emit("exit", code, signalCode);
+        };
+        return true;
+      },
+    });
+
+    const fakeSession: ActiveSession = {
+      child: oldChild,
+      sessionId: "old-sid",
+      agentId: "pi",
+      provider: "pi",
+      model: "gpt-5.5",
+      queue: new PQueue({ concurrency: 1 }),
+      idleTimer: null,
+      idleTimeoutMs: 100000,
+      lastActivity: Date.now(),
+      processingStartedAt: null,
+      lastSuccessAt: null,
+      restartCount: 0,
+      outboxPath: oldOutbox,
+    };
+    (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
+    const before = await activeGauge();
+    sessionsActive.inc();
+
+    const priorTeardown = manager.closeSession(chatId, { persist: false });
+    await killCalled;
+
+    const oldStartup = manager.getOrCreateSession(chatId, "pi");
+    const oldSettled = oldStartup.then(
+      () => ({ ok: true as const }),
+      (err: Error) => ({ ok: false as const, err }),
+    );
+    assert.strictEqual(piSpawnCaptures.length, 0, "startup waits behind the prior teardown before spawning");
+
+    const clean = manager.destroySession(chatId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.strictEqual(piSpawnCaptures.length, 0, "startup remains blocked while clean is chained behind teardown");
+
+    releaseExit();
+    await priorTeardown;
+    await clean;
+
+    const result = await oldSettled;
+    assert.strictEqual(result.ok, false, "pre-clean startup must not resolve after clean");
+    if (!result.ok) {
+      assert.match(result.err.message, /superseded/, "pre-clean startup fails with the supersede signal");
+    }
+    assert.strictEqual(piSpawnCaptures.length, 0, "superseded pre-clean startup never spawns Pi");
+    assert.strictEqual(manager.getActive(chatId), undefined, "no active session is created by the old startup");
+    assert.strictEqual(manager.getActiveCount(), 0, "no active sessions remain");
+    assert.strictEqual(await activeGauge(), before, "sessionsActive is restored after teardown and supersede");
+    const store = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(store.getSession(chatId), undefined, "cleaned store is not re-persisted by the old startup");
+
+    await manager.closeAll();
+  });
+
   it("destroySession supersedes an in-flight stale-resume recovery before it can discard newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("clean-resume", {
