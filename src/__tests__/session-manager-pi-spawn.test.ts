@@ -262,18 +262,20 @@ function createSpawnThenDelayedStderrExitChild(
   let stderrBuffer = "";
   let stderrTimer: ReturnType<typeof setTimeout> | null = null;
   let exitTimer: ReturnType<typeof setTimeout> | null = null;
-  const clearTimers = () => {
+  const clearStderrTimer = () => {
     if (stderrTimer) {
       clearTimeout(stderrTimer);
       stderrTimer = null;
     }
+  };
+  const clearExitTimer = () => {
     if (exitTimer) {
       clearTimeout(exitTimer);
       exitTimer = null;
     }
   };
   const finish = (code: number, signal: string | null) => {
-    clearTimers();
+    clearExitTimer();
     if ((child as ChildProcess).exitCode !== null || (child as ChildProcess).signalCode !== null) return;
     (child as unknown as Record<string, unknown>).exitCode = code;
     (child as unknown as Record<string, unknown>).signalCode = signal;
@@ -290,6 +292,7 @@ function createSpawnThenDelayedStderrExitChild(
     killed: false,
     kill(signal?: string) {
       (child as unknown as Record<string, unknown>).killed = true;
+      clearStderrTimer();
       process.nextTick(() => finish(signal === "SIGKILL" ? 137 : 0, signal ?? "SIGTERM"));
       return true;
     },
@@ -300,7 +303,10 @@ function createSpawnThenDelayedStderrExitChild(
 
   process.nextTick(() => {
     child.emit("spawn");
-    stderrTimer = setTimeout(() => { stderrBuffer = failStderr; }, stderrDelayMs);
+    stderrTimer = setTimeout(() => {
+      stderrBuffer = failStderr;
+      stderrTimer = null;
+    }, stderrDelayMs);
     exitTimer = setTimeout(() => finish(1, null), exitDelayMs);
   });
 
@@ -1076,6 +1082,42 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     assert.strictEqual(storeAfter.getSession("pi-delayed-stderr")?.sessionId, "fresh-pi-id", "fresh id persisted");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "resume discard metric incremented once");
     assert.strictEqual(await crashCount("pi"), crashesBefore, "delayed stderr recovery is not a crash");
+
+    await manager.closeAll();
+  });
+
+  it("exit-before-stderr stale resume signal is still recovered fresh", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-exit-before-stderr", {
+      sessionId: "stored-pi-id",
+      chatId: "pi-exit-before-stderr",
+      agentId: "pi",
+      lastActivity: Date.now(),
+    });
+
+    // Node can observe process exit before the stderr data listener has appended
+    // the stale-session message. The settle wait must not treat exit alone as
+    // final while the bounded stderr window is still open.
+    piSpawnOutcomes = [
+      {
+        spawnThenDelayedStderrExitStderr: "No session found matching stored-pi-id",
+        stderrDelayMs: 20,
+        exitDelayMs: 5,
+      },
+    ];
+    nextPiSessionId = "fresh-pi-id";
+
+    const before = await discardedCount("pi");
+    const crashesBefore = await crashCount("pi");
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-exit-before-stderr", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
+    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
+    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh");
+    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the fresh Pi id");
+    assert.strictEqual((await discardedCount("pi")) - before, 1, "resume discard metric incremented once");
+    assert.strictEqual(await crashCount("pi"), crashesBefore, "exit-before-stderr recovery is not a crash");
 
     await manager.closeAll();
   });

@@ -358,18 +358,19 @@ export class SessionManager {
   }
 
   private async waitForPiResumeNotFoundSettle(child: ChildProcess): Promise<void> {
-    if (hasExited(child) && this.hasPiResumeNotFoundSignal(child)) return;
+    if (this.hasPiResumeNotFoundSignal(child)) return;
     await new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
+      let poll: ReturnType<typeof setInterval>;
       const done = () => {
         clearTimeout(timer);
-        child.removeListener("exit", done);
+        clearInterval(poll);
         resolve();
       };
       timer = setTimeout(done, PI_RESUME_NOT_FOUND_SETTLE_MS);
-      if (!hasExited(child)) {
-        child.once("exit", done);
-      }
+      poll = setInterval(() => {
+        if (this.hasPiResumeNotFoundSignal(child)) done();
+      }, 5);
     });
   }
 
