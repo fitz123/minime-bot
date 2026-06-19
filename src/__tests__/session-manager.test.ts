@@ -365,7 +365,7 @@ describe("SessionManager", () => {
     );
   });
 
-  it("destroySession does not remove media created while old active session is terminating", async () => {
+  it("destroySession removes late files written while old active session is terminating", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const { ensureSessionMediaDir } = await import("../media-store.js");
 
@@ -427,14 +427,18 @@ describe("SessionManager", () => {
     await killCalled;
 
     assert.ok(!existsSync(staleFile), "destroySession cleans old media before awaiting child exit");
-    const newDir = ensureSessionMediaDir(chatId);
-    const newFile = `${newDir}/new-owner-media.jpg`;
-    writeFileSync(newFile, "new media");
+    const lateOutboxFile = `${outboxPath}/late-old-output.txt`;
+    mkdirSync(outboxPath, { recursive: true });
+    writeFileSync(lateOutboxFile, "late old outbox");
+    const lateMediaDir = ensureSessionMediaDir(chatId);
+    const lateMediaFile = `${lateMediaDir}/late-old-media.jpg`;
+    writeFileSync(lateMediaFile, "late old media");
 
     releaseExit();
     await destroyPromise;
 
-    assert.ok(existsSync(newFile), "media created by the next owner during old-child shutdown survives");
+    assert.ok(!existsSync(lateOutboxFile), "late old outbox file is removed after child exit");
+    assert.ok(!existsSync(lateMediaFile), "late old media file is removed after child exit");
   });
 
   it("destroySession deletes state that closeSession would preserve", async () => {

@@ -227,6 +227,8 @@ export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
+  /** Per-chat active-session teardown barrier before shared dirs can be reused. */
+  private sessionTeardowns: Map<string, Promise<void>> = new Map();
   /**
    * Per-chat startup generation. `destroySession` (/clean) bumps it; an in-flight
    * `getOrCreateSession` captures it at entry and re-checks before persisting, so
@@ -374,6 +376,84 @@ export class SessionManager {
     });
   }
 
+  private async waitForSessionTeardown(chatId: string): Promise<void> {
+    for (;;) {
+      const teardown = this.sessionTeardowns.get(chatId);
+      if (!teardown) return;
+      await teardown;
+    }
+  }
+
+  private async runSessionTeardown(chatId: string, teardown: () => Promise<void>): Promise<void> {
+    const previous = this.sessionTeardowns.get(chatId);
+    const current = (async () => {
+      if (previous) {
+        await previous;
+      }
+      await teardown();
+    })();
+    this.sessionTeardowns.set(chatId, current);
+    try {
+      await current;
+    } finally {
+      if (this.sessionTeardowns.get(chatId) === current) {
+        this.sessionTeardowns.delete(chatId);
+      }
+    }
+  }
+
+  private cleanupSessionFiles(
+    chatId: string,
+    outboxPath: string,
+    mediaCleanup: "all" | "stale",
+  ): void {
+    try {
+      removeOutboxDirIfPresent(outboxPath);
+    } catch {
+      // Ignore cleanup errors
+    }
+    try {
+      if (mediaCleanup === "stale") {
+        cleanupStaleSessionMedia(chatId);
+      } else {
+        cleanupSessionMediaDir(chatId);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  private async waitForSessionChildExit(session: ActiveSession, chatId: string): Promise<void> {
+    if (hasExited(session.child)) return;
+    if (!session.child.killed) {
+      session.child.kill("SIGTERM");
+    }
+    if (hasExited(session.child)) return;
+
+    await new Promise<void>((resolve) => {
+      let gracefulTimer: ReturnType<typeof setTimeout>;
+      let killTimer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        clearTimeout(gracefulTimer);
+        clearTimeout(killTimer);
+        session.child.removeListener("exit", done);
+        resolve();
+      };
+      gracefulTimer = setTimeout(() => {
+        if (!hasExited(session.child)) {
+          session.child.kill("SIGKILL");
+        }
+      }, 5000);
+      killTimer = setTimeout(() => {
+        if (!hasExited(session.child)) {
+          log.error("session-manager", `Subprocess did not exit after SIGKILL for chat ${chatId}`);
+        }
+        done();
+      }, 6000);
+      session.child.once("exit", done);
+    });
+  }
+
   /**
    * Perform the Pi graceful resume-recovery action: discard the unresumable
    * stored id (deletes the store record so a fresh Pi session is spawned), log,
@@ -418,6 +498,7 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
+    await this.waitForSessionTeardown(chatId);
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
     const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
@@ -861,6 +942,16 @@ export class SessionManager {
       mediaCleanup = "all",
     }: { persist?: boolean; mediaCleanup?: "all" | "stale" } = {},
   ): Promise<void> {
+    await this.runSessionTeardown(chatId, () => this.closeSessionInternal(chatId, { persist, mediaCleanup }));
+  }
+
+  private async closeSessionInternal(
+    chatId: string,
+    {
+      persist = true,
+      mediaCleanup = "all",
+    }: { persist?: boolean; mediaCleanup?: "all" | "stale" } = {},
+  ): Promise<void> {
     // Always clear crash count so /reconnect unblocks circuit-broken chats
     this.restartCounts.delete(chatId);
 
@@ -882,43 +973,13 @@ export class SessionManager {
     this.active.delete(chatId);
     sessionsActive.dec();
 
-    // Clean up outbox and media directories
-    try {
-      removeOutboxDirIfPresent(session.outboxPath);
-    } catch {
-      // Ignore cleanup errors
-    }
-    try {
-      if (mediaCleanup === "stale") {
-        cleanupStaleSessionMedia(chatId);
-      } else {
-        cleanupSessionMediaDir(chatId);
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
+    // Clean before termination so old files are gone immediately, then sweep
+    // again after exit for any last writes the dying child made.
+    this.cleanupSessionFiles(chatId, session.outboxPath, mediaCleanup);
 
     // Gracefully terminate (even if SIGTERM was already sent elsewhere)
-    if (!hasExited(session.child)) {
-      if (!session.child.killed) {
-        session.child.kill("SIGTERM");
-      }
-
-      // Wait up to 5s for graceful exit, then SIGKILL
-      await new Promise<void>((resolve) => {
-        const killTimer = setTimeout(() => {
-          if (!hasExited(session.child)) {
-            session.child.kill("SIGKILL");
-          }
-          resolve();
-        }, 5000);
-
-        session.child.once("exit", () => {
-          clearTimeout(killTimer);
-          resolve();
-        });
-      });
-    }
+    await this.waitForSessionChildExit(session, chatId);
+    this.cleanupSessionFiles(chatId, session.outboxPath, "stale");
   }
 
   /**
@@ -987,9 +1048,8 @@ export class SessionManager {
     // getOrCreateSession for this chat is superseded and cannot re-persist state.
     this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     this.store.deleteSession(chatId);
-    // closeSession cleans media before awaiting an active child exit. If there is
-    // no active session, clean orphaned media now, before a fresh post-clean
-    // startup can own the same per-chat media directory.
+    // If there is no active session, clean orphaned media now, before a fresh
+    // post-clean startup can own the same per-chat media directory.
     if (!hadActiveSession) {
       try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
     }

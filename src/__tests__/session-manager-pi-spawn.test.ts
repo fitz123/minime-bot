@@ -6,6 +6,7 @@ import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname } from "node:path";
 import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
+import type { ActiveSession } from "../session-manager.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
 import { log } from "../logger.js";
@@ -15,6 +16,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
 import { NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord } from "../pi-rpc-protocol.js";
+import PQueue from "p-queue";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -1298,6 +1300,93 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     await manager.closeAll();
   });
 
+  it("post-clean startup waits for active teardown before reusing shared resources", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const chatId = "active-clean-race";
+    const oldOutbox = outboxDir(chatId);
+    mkdirSync(oldOutbox, { recursive: true });
+    const oldMediaDir = ensureSessionMediaDir(chatId);
+    writeFileSync(`${oldMediaDir}/old-media.jpg`, "old media");
+
+    let signalKillCalled: (() => void) | null = null;
+    const killCalled = new Promise<void>((resolve) => { signalKillCalled = resolve; });
+    let releaseExit: () => void = () => { throw new Error("kill was not called"); };
+    const oldChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(oldChild, {
+      stdout: new Readable({ read() {} }),
+      stderr: new Readable({ read() {} }),
+      stdin: new Writable({ write(_chunk, _enc, cb) { cb(); } }),
+      pid: 99997,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill(signal?: NodeJS.Signals | number) {
+        (oldChild as unknown as Record<string, unknown>).killed = true;
+        signalKillCalled?.();
+        releaseExit = () => {
+          if ((oldChild as ChildProcess).exitCode !== null || (oldChild as ChildProcess).signalCode !== null) return;
+          const code = signal === "SIGKILL" ? 137 : 0;
+          const signalCode = typeof signal === "string" ? signal : "SIGTERM";
+          (oldChild as unknown as Record<string, unknown>).exitCode = code;
+          (oldChild as unknown as Record<string, unknown>).signalCode = signalCode;
+          oldChild.emit("exit", code, signalCode);
+        };
+        return true;
+      },
+    });
+
+    const fakeSession: ActiveSession = {
+      child: oldChild,
+      sessionId: "old-sid",
+      agentId: "pi",
+      provider: "pi",
+      model: "gpt-5.5",
+      queue: new PQueue({ concurrency: 1 }),
+      idleTimer: null,
+      idleTimeoutMs: 100000,
+      lastActivity: Date.now(),
+      processingStartedAt: null,
+      lastSuccessAt: null,
+      restartCount: 0,
+      outboxPath: oldOutbox,
+    };
+    (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
+    sessionsActive.inc();
+
+    const destroyPromise = manager.destroySession(chatId);
+    await killCalled;
+
+    const lateOutboxFile = `${oldOutbox}/late-old-output.txt`;
+    mkdirSync(dirname(lateOutboxFile), { recursive: true });
+    writeFileSync(lateOutboxFile, "late old outbox");
+    const lateMediaFile = `${ensureSessionMediaDir(chatId)}/late-old-media.jpg`;
+    writeFileSync(lateMediaFile, "late old media");
+
+    nextPiSessionId = "new-pi-id";
+    let startupDone = false;
+    const startupPromise = manager.getOrCreateSession(chatId, "pi").then((session) => {
+      startupDone = true;
+      return session;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.strictEqual(startupDone, false, "fresh startup is blocked behind active teardown");
+    assert.strictEqual(piSpawnCaptures.length, 0, "fresh Pi child is not spawned while old child can still write");
+
+    releaseExit();
+    await destroyPromise;
+    const newSession = await startupPromise;
+
+    assert.strictEqual(newSession.sessionId, "new-pi-id", "fresh post-clean startup owns the session");
+    assert.strictEqual(piSpawnCaptures.length, 1, "fresh Pi child spawns only after active teardown");
+    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined, "post-clean startup starts fresh");
+    assert.ok(!existsSync(lateOutboxFile), "late old outbox output is removed before resource reuse");
+    assert.ok(!existsSync(lateMediaFile), "late old media is removed before resource reuse");
+    assert.strictEqual(manager.getActive(chatId), newSession, "new session remains active");
+
+    await manager.closeAll();
+  });
+
   it("destroySession supersedes an in-flight stale-resume recovery before it can discard newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("clean-resume", {
@@ -1496,15 +1585,19 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
     const before = await activeGauge();
 
-    // Park the OLD startup in crash backoff — the one window in the legacy
-    // ordering where its DESTRUCTIVE outbox prep (prepareOutboxDir) ran AFTER an
-    // interleaved /clean + fresh post-clean startup had already taken ownership
-    // of the shared per-chat outbox/media. Seed a crash count so the old startup
-    // sleeps in backoff right after capturing generation 0, before it would
-    // reach the outbox prep. The fix moves prepareOutboxDir past the generation
-    // guard so a superseded startup never reaches it.
-    const restartCounts = (manager as unknown as Record<string, Map<string, number>>).restartCounts;
-    restartCounts.set("supersede-res", 1);
+    // Park the OLD startup inside get_state capture, before it can pass the
+    // generation guard or prepare the shared outbox. An interleaved /clean plus a
+    // fresh post-clean startup then takes ownership of the deterministic
+    // outbox/media paths.
+    suppressGetStateResponse = true;
+    let oldChild: ChildProcess | null = null;
+    let signalCaptureStarted: (() => void) | null = null;
+    const captureStarted = new Promise<void>((resolve) => { signalCaptureStarted = resolve; });
+    onGetState = (child) => {
+      if (oldChild) return;
+      oldChild = child;
+      signalCaptureStarted?.();
+    };
 
     nextPiSessionId = "old-pi-id";
     const oldStartup = manager.getOrCreateSession("supersede-res", "pi");
@@ -1522,19 +1615,17 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
       },
     );
 
-    // Let the old startup advance past evictIfNeeded into the crash backoff so it
-    // reads the seeded crash count (and parks on the 5s timer) BEFORE /clean
-    // clears it. One microtask turn is enough to reach the backoff await.
-    await Promise.resolve();
+    await captureStarted;
     assert.strictEqual(oldDone, false, "old startup is still parked before /clean and the new owner");
 
-    // /clean lands while the old startup sleeps in backoff: it bumps the
-    // generation (superseding the old startup) and clears the crash count (so the
-    // fresh startup below does not also back off).
+    // /clean lands while the old startup is parked: it bumps the generation and
+    // supersedes the old startup.
     await manager.destroySession("supersede-res");
 
     // A fresh post-clean startup begins, succeeds, and takes ownership of the
     // shared per-chat outbox/media for this chat.
+    suppressGetStateResponse = false;
+    onGetState = null;
     nextPiSessionId = "new-pi-id";
     const newSession = await manager.getOrCreateSession("supersede-res", "pi");
     assert.strictEqual(newSession.sessionId, "new-pi-id", "fresh post-clean startup owns the session");
@@ -1548,8 +1639,12 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     const mediaSentinel = `${ensureSessionMediaDir("supersede-res")}/owned-by-new.jpg`;
     writeFileSync(mediaSentinel, "new owner media file");
 
-    // Release the old startup (wakes from backoff): it must be superseded and
+    // Release the old startup: it must be superseded and
     // must NOT touch the shared outbox/media the new owner now holds.
+    assert.ok(oldChild, "old startup reached get_state capture");
+    (oldChild as ChildProcess).stdout!.push(
+      JSON.stringify({ type: "response", success: true, data: { sessionId: "old-pi-id" } }) + "\n",
+    );
     const result = await oldSettled;
     assert.strictEqual(result.ok, false, "the superseded old startup must not resolve a session");
     if (!result.ok) {
