@@ -571,6 +571,9 @@ export class SessionManager {
 
         // Ensure child is dead and reaped before inspecting/throwing.
         await this.terminateStartupChild(child);
+        if (isStartupSuperseded()) {
+          await abortSupersededStartup(child);
+        }
 
         // Pi-only graceful resume-recovery. Only when resuming, only on the
         // specific "session not found" stderr signal, and
@@ -973,14 +976,18 @@ export class SessionManager {
    * --resume during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
+    const hadActiveSession = this.active.has(chatId);
     // Bump the startup generation BEFORE deleting store state so any in-flight
     // getOrCreateSession for this chat is superseded and cannot re-persist state.
     this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     this.store.deleteSession(chatId);
+    // closeSession cleans media before awaiting an active child exit. If there is
+    // no active session, clean orphaned media now, before a fresh post-clean
+    // startup can own the same per-chat media directory.
+    if (!hadActiveSession) {
+      try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
+    }
     await this.closeSession(chatId, { persist: false });
-    // closeSession only touches the media dir when an in-memory session exists;
-    // /clean after a bot restart/crash (or before any spawn) must still wipe it.
-    try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
   }
 
   /** Close all sessions gracefully. For shutdown. */

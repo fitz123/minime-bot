@@ -365,6 +365,78 @@ describe("SessionManager", () => {
     );
   });
 
+  it("destroySession does not remove media created while old active session is terminating", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const { ensureSessionMediaDir } = await import("../media-store.js");
+
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+
+    let signalKillCalled: (() => void) | null = null;
+    const killCalled = new Promise<void>((resolve) => { signalKillCalled = resolve; });
+    let releaseExit: () => void = () => { throw new Error("kill was not called"); };
+    const slowChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(slowChild, {
+      stdout: new Readable({ read() {} }),
+      stderr: new Readable({ read() {} }),
+      stdin: new Writable({ write(_c, _e, cb) { cb(); } }),
+      pid: 99998,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill(signal?: NodeJS.Signals | number) {
+        (slowChild as unknown as Record<string, unknown>).killed = true;
+        signalKillCalled?.();
+        releaseExit = () => {
+          if ((slowChild as ChildProcess).exitCode !== null || (slowChild as ChildProcess).signalCode !== null) return;
+          const code = signal === "SIGKILL" ? 137 : 0;
+          const signalCode = typeof signal === "string" ? signal : "SIGTERM";
+          (slowChild as unknown as Record<string, unknown>).exitCode = code;
+          (slowChild as unknown as Record<string, unknown>).signalCode = signalCode;
+          slowChild.emit("exit", code, signalCode);
+        };
+        return true;
+      },
+    });
+
+    const outboxPath = `${TEST_DIR}/outbox-clean-media-race`;
+    mkdirSync(outboxPath, { recursive: true });
+    const chatId = "chat-clean-media-race";
+    const staleDir = ensureSessionMediaDir(chatId);
+    const staleFile = `${staleDir}/old-media.jpg`;
+    writeFileSync(staleFile, "old media");
+
+    const fakeSession: ActiveSession = {
+      child: slowChild,
+      sessionId: "old-sid",
+      agentId: "main",
+      provider: "pi",
+      model: "gpt-5.5",
+      queue: new PQueue({ concurrency: 1 }),
+      idleTimer: null,
+      idleTimeoutMs: 100000,
+      lastActivity: Date.now(),
+      processingStartedAt: null,
+      lastSuccessAt: null,
+      restartCount: 0,
+      outboxPath,
+    };
+
+    (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
+
+    const destroyPromise = manager.destroySession(chatId);
+    await killCalled;
+
+    assert.ok(!existsSync(staleFile), "destroySession cleans old media before awaiting child exit");
+    const newDir = ensureSessionMediaDir(chatId);
+    const newFile = `${newDir}/new-owner-media.jpg`;
+    writeFileSync(newFile, "new media");
+
+    releaseExit();
+    await destroyPromise;
+
+    assert.ok(existsSync(newFile), "media created by the next owner during old-child shutdown survives");
+  });
+
   it("destroySession deletes state that closeSession would preserve", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const { SessionStore } = await import("../session-store.js");

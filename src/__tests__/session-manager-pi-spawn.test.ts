@@ -1215,6 +1215,102 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
     await manager.closeAll();
   });
+
+  it("destroySession during startup child termination prevents stale-resume discard of newer state", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("clean-resume-terminate", {
+      sessionId: "stored-pi-id",
+      chatId: "clean-resume-terminate",
+      agentId: "pi",
+      lastActivity: Date.now(),
+    });
+
+    piSpawnOutcomes = [
+      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 10_000 },
+    ];
+    nextPiSessionId = "old-local-id";
+
+    let oldChild: ChildProcess | null = null;
+    let signalOldCaptureStarted: (() => void) | null = null;
+    const oldCaptureStarted = new Promise<void>((resolve) => { signalOldCaptureStarted = resolve; });
+    let signalKillCalled: (() => void) | null = null;
+    const killCalled = new Promise<void>((resolve) => { signalKillCalled = resolve; });
+    let releaseKillExit: () => void = () => { throw new Error("kill was not called"); };
+
+    onGetState = (child) => {
+      if (oldChild) return;
+      oldChild = child;
+      const mutableChild = child as ChildProcess & {
+        killed: boolean;
+        exitCode: number | null;
+        signalCode: string | null;
+      };
+      mutableChild.kill = (signal?: NodeJS.Signals | number) => {
+        mutableChild.killed = true;
+        signalKillCalled?.();
+        releaseKillExit = () => {
+          if (mutableChild.exitCode !== null || mutableChild.signalCode !== null) return;
+          const code = signal === "SIGKILL" ? 137 : 0;
+          const signalCode = typeof signal === "string" ? signal : "SIGTERM";
+          mutableChild.exitCode = code;
+          mutableChild.signalCode = signalCode;
+          child.emit("exit", code, signalCode);
+        };
+        return true;
+      };
+      signalOldCaptureStarted?.();
+    };
+
+    const before = await activeGauge();
+    const discardedBefore = await discardedCount("pi");
+    const crashesBefore = await crashCount("pi");
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+
+    const oldStartup = manager.getOrCreateSession("clean-resume-terminate", "pi");
+    const oldSettled = oldStartup.then(
+      () => ({ ok: true as const }),
+      (err: Error) => ({ ok: false as const, err }),
+    );
+
+    await oldCaptureStarted;
+    await killCalled;
+
+    await manager.destroySession("clean-resume-terminate");
+
+    nextPiSessionId = "new-pi-id";
+    const newSession = await manager.getOrCreateSession("clean-resume-terminate", "pi");
+    assert.strictEqual(newSession.sessionId, "new-pi-id", "post-clean startup owns the fresh session");
+
+    const outboxSentinel = `${newSession.outboxPath}/owned-after-termination-clean.txt`;
+    writeFileSync(outboxSentinel, "new owner outbox file");
+    const mediaSentinel = `${ensureSessionMediaDir("clean-resume-terminate")}/owned-after-termination-clean.jpg`;
+    writeFileSync(mediaSentinel, "new owner media file");
+
+    releaseKillExit();
+    const result = await oldSettled;
+    assert.strictEqual(result.ok, false, "superseded stale-resume startup must reject");
+    if (!result.ok) {
+      assert.match(result.err.message, /superseded/, "old stale-resume startup fails with the supersede signal");
+    }
+
+    assert.ok(oldChild, "old resume child reached get_state capture");
+    assert.strictEqual((oldChild as ChildProcess).killed, true, "superseded resume child is terminated");
+    assert.strictEqual(hasExited(oldChild as ChildProcess), true, "superseded resume child is reaped");
+    assert.strictEqual(piSpawnCaptures.length, 2, "old resume + new post-clean startup, no stale-resume recovery spawn");
+    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "old startup attempted stored resume");
+    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "new post-clean startup starts fresh");
+    assert.strictEqual(manager.getActive("clean-resume-terminate"), newSession, "new session remains active");
+    assert.strictEqual(await activeGauge(), before + 1, "only the new session counts toward sessionsActive");
+    assert.strictEqual((await discardedCount("pi")) - discardedBefore, 0, "superseded stale resume is not counted as recovery");
+    assert.strictEqual(await crashCount("pi"), crashesBefore, "superseded stale resume is not a crash");
+    assert.ok(existsSync(outboxSentinel), "new outbox survives superseded stale-resume cleanup");
+    assert.ok(existsSync(mediaSentinel), "new media survives superseded stale-resume cleanup");
+
+    const storeAfter = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(storeAfter.getSession("clean-resume-terminate")?.sessionId, "new-pi-id", "new persisted session survives old recovery");
+
+    await manager.closeAll();
+  });
 });
 
 describe("SessionManager superseded startup resource ownership (Task 3)", () => {
