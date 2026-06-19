@@ -16,12 +16,20 @@ import { resolveWorkspaceContract } from "./workspace-contract.js";
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
+const PI_RESUME_NOT_FOUND_SETTLE_MS = 300;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
 const OUTBOX_PROMPT_PREFIX = "To share a file with the user, write or copy it to this outbox directory:";
 const OUTBOX_PROMPT_SUFFIX = "Files placed there will be automatically sent to the user after your response completes.";
+
+class SessionStartupSupersededError extends Error {
+  constructor() {
+    super("Session startup superseded by clean");
+    this.name = "SessionStartupSupersededError";
+  }
+}
 
 /** Deterministic outbox directory path for a given chat. */
 export function outboxDir(chatId: string): string {
@@ -219,6 +227,14 @@ export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
+  /** Per-chat active-session teardown barrier before shared dirs can be reused. */
+  private sessionTeardowns: Map<string, Promise<void>> = new Map();
+  /**
+   * Per-chat startup generation. `destroySession` (/clean) bumps it; an in-flight
+   * `getOrCreateSession` captures it at entry and re-checks before persisting, so
+   * older startup work cannot re-create state a clean just removed.
+   */
+  private sessionGenerations: Map<string, number> = new Map();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
   private logDir: string;
@@ -321,12 +337,121 @@ export class SessionManager {
     }
   }
 
-  /**
-   * True when a Pi child exited with the "stored session not found" signal
-   * (exit 1 + matching stderr) — the trigger for graceful resume-recovery.
-   */
-  private isPiResumeNotFound(child: ChildProcess): boolean {
-    return child.exitCode === 1 && /No session found matching/.test(piStartupStderr(child));
+  private hasPiResumeNotFoundSignal(child: ChildProcess): boolean {
+    return /No session found matching/.test(piStartupStderr(child));
+  }
+
+  private async terminateStartupChild(child: ChildProcess): Promise<void> {
+    if (hasExited(child)) return;
+    if (!child.killed) {
+      child.kill("SIGKILL");
+    }
+    if (hasExited(child)) return;
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        clearTimeout(timer);
+        child.removeListener("exit", done);
+        resolve();
+      };
+      timer = setTimeout(done, 1_000);
+      child.once("exit", done);
+    });
+  }
+
+  private async waitForPiResumeNotFoundSettle(child: ChildProcess): Promise<void> {
+    if (this.hasPiResumeNotFoundSignal(child)) return;
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      let poll: ReturnType<typeof setInterval>;
+      const done = () => {
+        clearTimeout(timer);
+        clearInterval(poll);
+        resolve();
+      };
+      timer = setTimeout(done, PI_RESUME_NOT_FOUND_SETTLE_MS);
+      poll = setInterval(() => {
+        if (this.hasPiResumeNotFoundSignal(child)) done();
+      }, 5);
+    });
+  }
+
+  private async waitForSessionTeardown(chatId: string): Promise<void> {
+    for (;;) {
+      const teardown = this.sessionTeardowns.get(chatId);
+      if (!teardown) return;
+      await teardown;
+    }
+  }
+
+  private async runSessionTeardown(chatId: string, teardown: () => Promise<void>): Promise<void> {
+    const previous = this.sessionTeardowns.get(chatId);
+    const current = (async () => {
+      if (previous) {
+        await previous;
+      }
+      await teardown();
+    })();
+    this.sessionTeardowns.set(chatId, current);
+    try {
+      await current;
+    } finally {
+      if (this.sessionTeardowns.get(chatId) === current) {
+        this.sessionTeardowns.delete(chatId);
+      }
+    }
+  }
+
+  private cleanupSessionFiles(
+    chatId: string,
+    outboxPath: string,
+    mediaCleanup: "all" | "stale",
+  ): void {
+    try {
+      removeOutboxDirIfPresent(outboxPath);
+    } catch {
+      // Ignore cleanup errors
+    }
+    try {
+      if (mediaCleanup === "stale") {
+        cleanupStaleSessionMedia(chatId);
+      } else {
+        cleanupSessionMediaDir(chatId);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  private async waitForSessionChildExit(session: ActiveSession, chatId: string): Promise<void> {
+    if (hasExited(session.child)) return;
+    if (!session.child.killed) {
+      session.child.kill("SIGTERM");
+    }
+    if (hasExited(session.child)) return;
+
+    await new Promise<void>((resolve) => {
+      let gracefulTimer: ReturnType<typeof setTimeout>;
+      let killTimer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        clearTimeout(gracefulTimer);
+        clearTimeout(killTimer);
+        session.child.removeListener("exit", done);
+        resolve();
+      };
+      gracefulTimer = setTimeout(() => {
+        if (!hasExited(session.child)) {
+          session.child.kill("SIGKILL");
+        }
+      }, 5000);
+      killTimer = setTimeout(() => {
+        if (!hasExited(session.child)) {
+          log.error("session-manager", `Subprocess did not exit after SIGKILL for chat ${chatId}`);
+        }
+        done();
+      }, 6000);
+      session.child.once("exit", done);
+    });
   }
 
   /**
@@ -373,6 +498,21 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
+    const generation = this.sessionGenerations.get(chatId) ?? 0;
+    const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
+    const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
+      if (childToTerminate) {
+        await this.terminateStartupChild(childToTerminate);
+      }
+      log.warn("session-manager", `Session startup superseded by clean for chat ${chatId}`);
+      throw new SessionStartupSupersededError();
+    };
+
+    await this.waitForSessionTeardown(chatId);
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup();
+    }
+
     // Check if session is active in memory
     let existing = this.active.get(chatId);
     if (existing && !hasExited(existing.child) && !existing.child.killed) {
@@ -386,6 +526,9 @@ export class SessionManager {
         `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
       );
       await this.closeSession(chatId, { mediaCleanup: "stale" });
+      if (isStartupSuperseded()) {
+        await abortSupersededStartup();
+      }
       existing = undefined;
     }
 
@@ -405,6 +548,9 @@ export class SessionManager {
       this.active.delete(chatId);
       sessionsActive.dec();
     }
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup();
+    }
 
     // Reload config fresh — pick up any changes to agents/sessionDefaults
     const freshConfig = this.getFreshConfig();
@@ -415,6 +561,9 @@ export class SessionManager {
 
     // Check if we need to evict
     await this.evictIfNeeded(freshConfig);
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup();
+    }
 
     // Check if we have a stored session to resume (discards stale sessions)
     const { resume, sessionId } = this.resolveStoredSession(chatId, agentId, freshConfig);
@@ -429,15 +578,17 @@ export class SessionManager {
       const delayMs = Math.min(CRASH_BACKOFF_BASE_MS * 2 ** (prevCrashCount - 1), MAX_CRASH_BACKOFF_MS);
       log.warn("session-manager", `Crash backoff: ${delayMs}ms for chat ${chatId} (crash #${prevCrashCount})`);
       await new Promise(resolve => setTimeout(resolve, delayMs));
+      if (isStartupSuperseded()) {
+        await abortSupersededStartup();
+      }
     }
-
-    // Clean and recreate outbox directory to prevent stale files from
-    // a previous crashed session from leaking into the new session's replies.
-    const outboxPath = prepareOutboxDir(chatId);
 
     // Ensure media directory exists (do NOT wipe: a photo may have been
     // downloaded into it moments before this spawn was triggered).
     // Cleanup happens on session close, crash recovery, and via the global cap.
+    // It is idempotent and non-destructive, so it is safe even for a startup
+    // that a later generation check supersedes. The destructive
+    // prepareOutboxDir(chatId) is deferred until AFTER the generation guard.
     ensureSessionMediaDir(chatId);
 
     // Spawn the agent subprocess via Pi RPC. Only a genuine resume points
@@ -468,6 +619,9 @@ export class SessionManager {
     for (;;) {
       try {
         await waitForSpawn(child, this.startupTimeoutMs);
+        if (isStartupSuperseded()) {
+          throw new SessionStartupSupersededError();
+        }
 
         // Prevent EPIPE from becoming uncaughtException when the subprocess
         // dies — wired before any capture write so a racing child death on the
@@ -480,6 +634,17 @@ export class SessionManager {
         if (piSessionId) {
           // Capture succeeded — the process is alive and answered get_state.
           effectiveSessionId = piSessionId;
+        } else if (effectiveResume && !alreadyRetried) {
+          // A stale resume can close stdout before Node has delivered the stderr
+          // chunk or exit state. Give both streams a short chance to settle before
+          // accepting the local-id fallback for this resumed child.
+          await this.waitForPiResumeNotFoundSettle(child);
+          if (this.hasPiResumeNotFoundSignal(child)) {
+            throw new Error(`Pi resume session not found during startup: ${sessionId}`);
+          }
+          if (hasExited(child)) {
+            throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
+          }
         } else if (hasExited(child)) {
           // No id AND the child already exited: it spawned but died during
           // startup (e.g. a stale --session). Throw into the shared catch for
@@ -491,17 +656,22 @@ export class SessionManager {
         // on its local id (a later resume just can't target it).
         break;
       } catch (err) {
-        // Ensure child is dead before inspecting/throwing.
-        if (!hasExited(child) && !child.killed) {
-          child.kill("SIGKILL");
+        if (err instanceof SessionStartupSupersededError || isStartupSuperseded()) {
+          await abortSupersededStartup(child);
+        }
+
+        // Ensure child is dead and reaped before inspecting/throwing.
+        await this.terminateStartupChild(child);
+        if (isStartupSuperseded()) {
+          await abortSupersededStartup(child);
         }
 
         // Pi-only graceful resume-recovery. Only when resuming, only on the
-        // specific "session not found" signal (exit 1 + matching stderr), and
+        // specific "session not found" stderr signal, and
         // only once: discard the unresumable stored session and start fresh
         // INLINE (no recursion into getOrCreateSession, no --session). Any other
         // failure — and any second failure — falls through to crash-backoff.
-        if (effectiveResume && !alreadyRetried && this.isPiResumeNotFound(child)) {
+        if (effectiveResume && !alreadyRetried && this.hasPiResumeNotFoundSignal(child)) {
           alreadyRetried = true;
           child = await this.discardUnresumablePiSession(chatId, agentId, agent, sessionId);
           effectiveResume = false;
@@ -533,6 +703,29 @@ export class SessionManager {
     const restartCount = this.restartCounts.get(chatId) ?? 0;
     if (!existing && !resume) {
       this.restartCounts.set(chatId, 0);
+    }
+
+    // Startup generation guard: if a destroySession (/clean) for this chat ran
+    // while this startup was in flight, the generation has advanced. Abort
+    // WITHOUT persisting so an older startup cannot undo a clean. Reap only the
+    // newly spawned child; leave shared per-chat outbox/media alone (a newer
+    // post-clean startup may already own them) and do NOT count this as a crash —
+    // it is a superseded startup, not a failure.
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup(child);
+    }
+
+    // Clean and recreate the outbox directory ONLY after the generation guard
+    // passes, immediately before creating the ActiveSession that owns it. This
+    // is destructive (it wipes the per-chat outbox), so a superseded older
+    // startup must never reach it — otherwise it could blow away an outbox a
+    // newer post-clean startup already owns.
+    let outboxPath: string;
+    try {
+      outboxPath = prepareOutboxDir(chatId);
+    } catch (err) {
+      await this.terminateStartupChild(child);
+      throw err;
     }
 
     const session: ActiveSession = {
@@ -753,6 +946,16 @@ export class SessionManager {
       mediaCleanup = "all",
     }: { persist?: boolean; mediaCleanup?: "all" | "stale" } = {},
   ): Promise<void> {
+    await this.runSessionTeardown(chatId, () => this.closeSessionInternal(chatId, { persist, mediaCleanup }));
+  }
+
+  private async closeSessionInternal(
+    chatId: string,
+    {
+      persist = true,
+      mediaCleanup = "all",
+    }: { persist?: boolean; mediaCleanup?: "all" | "stale" } = {},
+  ): Promise<void> {
     // Always clear crash count so /reconnect unblocks circuit-broken chats
     this.restartCounts.delete(chatId);
 
@@ -774,43 +977,13 @@ export class SessionManager {
     this.active.delete(chatId);
     sessionsActive.dec();
 
-    // Clean up outbox and media directories
-    try {
-      removeOutboxDirIfPresent(session.outboxPath);
-    } catch {
-      // Ignore cleanup errors
-    }
-    try {
-      if (mediaCleanup === "stale") {
-        cleanupStaleSessionMedia(chatId);
-      } else {
-        cleanupSessionMediaDir(chatId);
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
+    // Clean before termination so old files are gone immediately, then sweep
+    // again after exit for any last writes the dying child made.
+    this.cleanupSessionFiles(chatId, session.outboxPath, mediaCleanup);
 
     // Gracefully terminate (even if SIGTERM was already sent elsewhere)
-    if (!hasExited(session.child)) {
-      if (!session.child.killed) {
-        session.child.kill("SIGTERM");
-      }
-
-      // Wait up to 5s for graceful exit, then SIGKILL
-      await new Promise<void>((resolve) => {
-        const killTimer = setTimeout(() => {
-          if (!hasExited(session.child)) {
-            session.child.kill("SIGKILL");
-          }
-          resolve();
-        }, 5000);
-
-        session.child.once("exit", () => {
-          clearTimeout(killTimer);
-          resolve();
-        });
-      });
-    }
+    await this.waitForSessionChildExit(session, chatId);
+    this.cleanupSessionFiles(chatId, session.outboxPath, "stale");
   }
 
   /**
@@ -874,11 +1047,17 @@ export class SessionManager {
    * --resume during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
+    const hadActiveSession = this.active.has(chatId);
+    // Bump the startup generation BEFORE deleting store state so any in-flight
+    // getOrCreateSession for this chat is superseded and cannot re-persist state.
+    this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     this.store.deleteSession(chatId);
+    // If there is no active session, clean orphaned media now, before a fresh
+    // post-clean startup can own the same per-chat media directory.
+    if (!hadActiveSession) {
+      try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
+    }
     await this.closeSession(chatId, { persist: false });
-    // closeSession only touches the media dir when an in-memory session exists;
-    // /clean after a bot restart/crash (or before any spawn) must still wipe it.
-    try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
   }
 
   /** Close all sessions gracefully. For shutdown. */
