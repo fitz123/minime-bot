@@ -358,7 +358,7 @@ export class SessionManager {
   }
 
   private async waitForPiResumeNotFoundSettle(child: ChildProcess): Promise<void> {
-    if (hasExited(child)) return;
+    if (hasExited(child) && this.hasPiResumeNotFoundSignal(child)) return;
     await new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       const done = () => {
@@ -367,7 +367,9 @@ export class SessionManager {
         resolve();
       };
       timer = setTimeout(done, PI_RESUME_NOT_FOUND_SETTLE_MS);
-      child.once("exit", done);
+      if (!hasExited(child)) {
+        child.once("exit", done);
+      }
     });
   }
 
@@ -546,19 +548,22 @@ export class SessionManager {
         if (piSessionId) {
           // Capture succeeded — the process is alive and answered get_state.
           effectiveSessionId = piSessionId;
+        } else if (effectiveResume && !alreadyRetried) {
+          // A stale resume can close stdout before Node has delivered the stderr
+          // chunk or exit state. Give both streams a short chance to settle before
+          // accepting the local-id fallback for this resumed child.
+          await this.waitForPiResumeNotFoundSettle(child);
+          if (this.hasPiResumeNotFoundSignal(child)) {
+            throw new Error(`Pi resume session not found during startup: ${sessionId}`);
+          }
+          if (hasExited(child)) {
+            throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
+          }
         } else if (hasExited(child)) {
           // No id AND the child already exited: it spawned but died during
           // startup (e.g. a stale --session). Throw into the shared catch for
           // classification (recovery vs backoff), same as a spawn rejection.
           throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
-        } else if (effectiveResume && !alreadyRetried && this.hasPiResumeNotFoundSignal(child)) {
-          // Pi can close stdout / fail get_state before Node has populated the
-          // exit state, while stderr already contains the stale-resume signal.
-          // Wait briefly for that exit state, then let the existing catch path
-          // recover via discardUnresumablePiSession(). The stderr signal is
-          // decisive even if exitCode is still not populated after the wait.
-          await this.waitForPiResumeNotFoundSettle(child);
-          throw new Error(`Pi resume session not found during startup: ${sessionId}`);
         }
         // Else: no id but the child is still alive — capture timed out or the
         // process went idle without a SystemInit. The session stays functional
