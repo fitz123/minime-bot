@@ -102,10 +102,17 @@ function createAutoSpawnChild(): ChildProcess {
  *    it execs cleanly (emits 'spawn', so waitForSpawn RESOLVES) and only THEN
  *    exits 1. The resume failure surfaces during the get_state capture, not as a
  *    spawn rejection — the production path the recovery must actually cover.
+ *  - `{ spawnThenDelayedExitStderr }` models the narrower window where stderr
+ *    already has the stale-resume signal but exitCode is still null when
+ *    capture returns no id; the exit state settles shortly after.
  * Both expose their stderr via the same piStartupStderr accessor the real
  * spawnPiRpcSession installs (Pi prints `No session found matching <id>`).
  */
-type PiSpawnOutcome = "ok" | { failStderr: string } | { spawnThenExitStderr: string };
+type PiSpawnOutcome =
+  | "ok"
+  | { failStderr: string }
+  | { spawnThenExitStderr: string }
+  | { spawnThenDelayedExitStderr: string; delayMs?: number };
 let piSpawnOutcomes: PiSpawnOutcome[] = [];
 
 /** A Pi child that fails startup (no 'spawn', exit 1) with buffered stderr. */
@@ -186,6 +193,45 @@ function createSpawnThenExitChild(failStderr: string): ChildProcess {
   return child;
 }
 
+/**
+ * A Pi child that has already buffered the stale-resume stderr signal, returns
+ * no session id from get_state, and only reports exit shortly after capture has
+ * returned. This reproduces the un-reaped stale-resume window.
+ */
+function createSpawnThenDelayedExitChild(failStderr: string, delayMs: number = 10): ChildProcess {
+  const child = new EventEmitter() as unknown as ChildProcess;
+  const stdout = new Readable({ read() {} });
+  const stderr = new Readable({ read() {} });
+  const stdin = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+
+  Object.assign(child, {
+    stdout,
+    stderr,
+    stdin,
+    pid: Math.floor(Math.random() * 100000),
+    exitCode: null,
+    signalCode: null,
+    killed: false,
+    kill() {
+      (child as unknown as Record<string, unknown>).killed = true;
+      return true;
+    },
+  });
+
+  (child as unknown as { piStartupStderr: () => string }).piStartupStderr = () => failStderr;
+  (child as unknown as { __closeStdoutOnGetState: boolean }).__closeStdoutOnGetState = true;
+
+  process.nextTick(() => {
+    child.emit("spawn");
+    setTimeout(() => {
+      (child as unknown as Record<string, unknown>).exitCode = 1;
+      child.emit("exit", 1, null);
+    }, delayMs);
+  });
+
+  return child;
+}
+
 // ---------------------------------------------------------------------------
 // Mock the Pi protocol module BEFORE importing session-manager so the mock is
 // in place when session-manager's static imports resolve. The spawn path needs
@@ -198,7 +244,8 @@ mock.module("../pi-rpc-protocol.js", {
       const outcome = piSpawnOutcomes.shift() ?? "ok";
       if (outcome === "ok") return createAutoSpawnChild();
       if ("failStderr" in outcome) return createFailingPiChild(outcome.failStderr);
-      return createSpawnThenExitChild(outcome.spawnThenExitStderr);
+      if ("spawnThenExitStderr" in outcome) return createSpawnThenExitChild(outcome.spawnThenExitStderr);
+      return createSpawnThenDelayedExitChild(outcome.spawnThenDelayedExitStderr, outcome.delayMs);
     },
     sendPiGetState(child: ChildProcess) {
       if (getStateError) throw getStateError;
@@ -210,6 +257,10 @@ mock.module("../pi-rpc-protocol.js", {
       // capture returns promptly (close ends the read) instead of timing out.
       const stdout = child.stdout as Readable | undefined;
       if (!stdout) return;
+      if ((child as unknown as { __closeStdoutOnGetState?: boolean }).__closeStdoutOnGetState) {
+        stdout.push(null);
+        return;
+      }
       if (nextPiSessionId !== null) {
         stdout.push(
           JSON.stringify({ type: "response", success: true, data: { sessionId: nextPiSessionId } }) + "\n",
@@ -792,6 +843,54 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
+
+    await manager.closeAll();
+  });
+
+  it("un-reaped stale resume window: waits for exitCode to settle, then recovers fresh", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-unreaped", {
+      sessionId: "stored-pi-id",
+      chatId: "pi-unreaped",
+      agentId: "pi",
+      lastActivity: Date.now(),
+    });
+
+    // The resume child has already buffered Pi's stale-session stderr, but
+    // get_state closes stdout with no id while exitCode is still null. It exits
+    // shortly after, inside the bounded settle wait; the inline fresh re-spawn
+    // then succeeds.
+    piSpawnOutcomes = [
+      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 20 },
+    ];
+    nextPiSessionId = "fresh-pi-id";
+
+    const warnCalls: unknown[][] = [];
+    const warnSpy = mock.method(log, "warn", (...args: unknown[]) => { warnCalls.push(args); });
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    let session;
+    try {
+      session = await manager.getOrCreateSession("pi-unreaped", "pi");
+    } finally {
+      warnSpy.mock.restore();
+    }
+
+    assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
+    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
+    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh (no --session)");
+    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the new Pi id");
+
+    const storeAfter = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(storeAfter.getSession("pi-unreaped")?.sessionId, "fresh-pi-id", "fresh id persisted");
+
+    const recoveryWarns = warnCalls.filter(
+      (a) =>
+        a[0] === "session-manager" &&
+        typeof a[1] === "string" &&
+        (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
+    );
+    assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
 
     await manager.closeAll();
   });

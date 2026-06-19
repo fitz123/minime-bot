@@ -145,10 +145,10 @@ If the test runner does not support `--runInBand`, use the existing package test
 
 ### Task 4: Reproduce and fix the un-reaped stale-resume window
 
-- [ ] Add/extend a test where a Pi spawn with `--session` buffers `No session found matching ...`, `capturePiSessionId()` returns no id or hits write/stdout close, and `exitCode` is still `null` at classification time but settles shortly after.
-- [ ] Implement the ≤300ms settle wait gated only on the buffered stale-resume signal.
-- [ ] Route the settled stale-resume case into the existing `discardUnresumablePiSession()` path.
-- [ ] Preserve current local-id behavior when there is no stale-resume signal.
+- [x] Add/extend a test where a Pi spawn with `--session` buffers `No session found matching ...`, `capturePiSessionId()` returns no id or hits write/stdout close, and `exitCode` is still `null` at classification time but settles shortly after.
+- [x] Implement the ≤300ms settle wait gated only on the buffered stale-resume signal.
+- [x] Route the settled stale-resume case into the existing `discardUnresumablePiSession()` path.
+- [x] Preserve current local-id behavior when there is no stale-resume signal.
 
 ### Task 5: Metrics and regression checks
 

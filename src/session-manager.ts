@@ -16,6 +16,7 @@ import { resolveWorkspaceContract } from "./workspace-contract.js";
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
+const PI_RESUME_NOT_FOUND_SETTLE_MS = 300;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
@@ -332,7 +333,25 @@ export class SessionManager {
    * (exit 1 + matching stderr) — the trigger for graceful resume-recovery.
    */
   private isPiResumeNotFound(child: ChildProcess): boolean {
-    return child.exitCode === 1 && /No session found matching/.test(piStartupStderr(child));
+    return child.exitCode === 1 && this.hasPiResumeNotFoundSignal(child);
+  }
+
+  private hasPiResumeNotFoundSignal(child: ChildProcess): boolean {
+    return /No session found matching/.test(piStartupStderr(child));
+  }
+
+  private async waitForPiResumeNotFoundSettle(child: ChildProcess): Promise<void> {
+    if (hasExited(child)) return;
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        clearTimeout(timer);
+        child.removeListener("exit", done);
+        resolve();
+      };
+      timer = setTimeout(done, PI_RESUME_NOT_FOUND_SETTLE_MS);
+      child.once("exit", done);
+    });
   }
 
   /**
@@ -496,6 +515,15 @@ export class SessionManager {
           // startup (e.g. a stale --session). Throw into the shared catch for
           // classification (recovery vs backoff), same as a spawn rejection.
           throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
+        } else if (effectiveResume && !alreadyRetried && this.hasPiResumeNotFoundSignal(child)) {
+          // Pi can close stdout / fail get_state before Node has populated the
+          // exit state, while stderr already contains the stale-resume signal.
+          // Wait briefly for that exit state, then let the existing catch path
+          // classify and recover via discardUnresumablePiSession().
+          await this.waitForPiResumeNotFoundSettle(child);
+          if (hasExited(child)) {
+            throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
+          }
         }
         // Else: no id but the child is still alive — capture timed out or the
         // process went idle without a SystemInit. The session stays functional
