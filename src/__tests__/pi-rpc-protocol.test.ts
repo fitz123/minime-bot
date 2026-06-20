@@ -525,6 +525,39 @@ describe("Pi extension loading (--extension)", () => {
     ]);
   });
 
+  it("appends configured extra extensions after first-party wrappers", () => {
+    const extraExtension = resolve("/approved/pi-dynamic-workflows-extension.ts");
+    const args = resolvePiExtensionArgs({
+      ...presentAll,
+      extraExtensions: [extraExtension],
+    });
+
+    assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", extraExtension,
+    ]);
+  });
+
+  it("does not remap configured extra .ts extension paths in package artifact mode", () => {
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
+    const extraExtension = resolve("/approved/external-extension.ts");
+    const args = resolvePiExtensionArgs({
+      extensionsDir: artifactDir,
+      env: {},
+      exists: () => true,
+      extraExtensions: [extraExtension],
+    });
+
+    assert.deepStrictEqual(args, [
+      "--extension", resolve(artifactDir, "web-tools.js"),
+      "--extension", resolve(artifactDir, "knowledge-tools.js"),
+      "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", extraExtension,
+    ]);
+  });
+
   it("the subset still honors the kill-switch (subagent child spawns bare when disabled)", () => {
     const args = resolvePiExtensionArgs({
       extensionsDir: FAKE_DIR,
@@ -562,8 +595,22 @@ describe("Pi extension loading (--extension)", () => {
     assert.ok(args.indexOf("--model") < args.indexOf("--extension"));
   });
 
-  it("kill-switch PI_EXTENSIONS_DISABLED=1 omits explicit wrappers but still disables ambient discovery", () => {
-    const args = buildPiSpawnArgs(testAgent, undefined, {
+  it("buildPiSpawnArgs appends agent-configured extra extensions", () => {
+    const extraExtension = resolve("/approved/interactive-extra.ts");
+    const args = buildPiSpawnArgs({
+      ...testAgent,
+      piExtraExtensions: [extraExtension],
+    }, undefined, presentAll);
+
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
+    assert.deepStrictEqual(args.slice(-2), ["--extension", extraExtension]);
+  });
+
+  it("kill-switch PI_EXTENSIONS_DISABLED=1 omits all explicit extensions but still disables ambient discovery", () => {
+    const args = buildPiSpawnArgs({
+      ...testAgent,
+      piExtraExtensions: [resolve("/approved/interactive-extra.ts")],
+    }, undefined, {
       extensionsDir: FAKE_DIR,
       exists: () => true,
       env: { PI_EXTENSIONS_DISABLED: "1" },
@@ -591,6 +638,28 @@ describe("Pi extension loading (--extension)", () => {
     assert.throws(
       () => resolvePiExtensionArgs({ extensionsDir: FAKE_DIR, env: {}, exists: () => false }),
       /Pi extension wrapper not found[\s\S]*Refusing to spawn without the expected first-party extensions/,
+    );
+  });
+
+  it("fails loudly when a configured extra extension is missing on disk", () => {
+    const extraExtension = resolve("/approved/missing-extension.ts");
+    assert.throws(
+      () => resolvePiExtensionArgs({
+        ...presentAll,
+        exists: (p) => p !== extraExtension,
+        extraExtensions: [extraExtension],
+      }),
+      /Pi extra extension not found[\s\S]*piExtraExtensions/,
+    );
+  });
+
+  it("rejects configured extra extension paths that are not absolute", () => {
+    assert.throws(
+      () => resolvePiExtensionArgs({
+        ...presentAll,
+        extraExtensions: ["relative-extension.ts"],
+      }),
+      /Pi extra extension path must be absolute/,
     );
   });
 

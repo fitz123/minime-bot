@@ -63,11 +63,11 @@ Prefer focused tests if the full suite is slow; at minimum run the changed test 
 
 ### Task 2: Add spawn-arg support
 
-- [ ] Keep `--no-extensions`.
-- [ ] Append first-party wrappers as today.
-- [ ] Append configured extra extensions as explicit `--extension` args.
-- [ ] Do not run the first-party dist `.ts`→`.js` remap on external absolute extension paths.
-- [ ] Preserve `PI_EXTENSIONS_DISABLED=1` as a full explicit-extension kill switch.
+- [x] Keep `--no-extensions`.
+- [x] Append first-party wrappers as today.
+- [x] Append configured extra extensions as explicit `--extension` args.
+- [x] Do not run the first-party dist `.ts`→`.js` remap on external absolute extension paths.
+- [x] Preserve `PI_EXTENSIONS_DISABLED=1` as a full explicit-extension kill switch.
 
 ### Task 3: Tests and docs
 

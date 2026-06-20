@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { existsSync, statSync } from "node:fs";
-import { normalize, resolve } from "node:path";
+import { isAbsolute, normalize, resolve } from "node:path";
 import type {
   AgentConfig,
   StreamLine,
@@ -74,6 +74,8 @@ export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
   extensionsDir?: string;
+  /** Operator-approved external extension entrypoints for interactive bot RPC sessions. */
+  extraExtensions?: readonly string[];
   /** Override env lookup for the kill-switch (default: `process.env`). */
   env?: NodeJS.ProcessEnv;
   /** Override the existence check (default: `fs.existsSync`). */
@@ -144,8 +146,8 @@ export function shouldIncludePiChildEnvKey(key: string): boolean {
  *
  * Loading is DELIBERATELY per-spawn rather than via Pi's auto-discovery dirs.
  * Returns `[]` when `PI_EXTENSIONS_DISABLED=1` so the spawn has no explicit
- * first-party wrappers; callers still pass `--no-extensions` to keep ambient
- * discovery disabled.
+ * first-party wrappers or configured extras; callers still pass
+ * `--no-extensions` to keep ambient discovery disabled.
  *
  * A configured wrapper missing on disk throws loudly instead of silently
  * dropping part of the first-party extension contract. The thrown message names
@@ -172,6 +174,22 @@ export function resolvePiExtensionArgs(options?: PiExtensionResolveOptions): str
       );
     }
     args.push("--extension", abs);
+  }
+
+  for (const extra of options?.extraExtensions ?? []) {
+    if (typeof extra !== "string" || extra.trim() === "") {
+      throw new Error("Pi extra extension paths must be non-empty absolute strings");
+    }
+    if (!isAbsolute(extra)) {
+      throw new Error(`Pi extra extension path must be absolute: ${extra}`);
+    }
+    if (!fileExists(extra)) {
+      throw new Error(
+        `Pi extra extension not found: ${extra}. Remove it from piExtraExtensions, restore the file, ` +
+          `or set ${PI_EXTENSIONS_DISABLED_ENV}=1 to spawn without explicit extensions.`,
+      );
+    }
+    args.push("--extension", extra);
   }
   return args;
 }
@@ -361,10 +379,13 @@ export function buildPiSpawnArgs(
   }
 
   // Keep `--no-extensions` on every spawn to suppress Pi's ambient extension
-  // discovery; load first-party wrappers only as explicit repeatable
-  // `--extension <abs-path>` args. The kill-switch and missing-wrapper check live in
-  // resolvePiExtensionArgs.
-  args.push(...resolvePiExtensionArgs(extensionOptions));
+  // discovery; load first-party wrappers and configured extras only as explicit
+  // repeatable `--extension <abs-path>` args. The kill-switch and missing-path
+  // checks live in resolvePiExtensionArgs.
+  const resolvedExtensionOptions = extensionOptions?.extraExtensions === undefined
+    ? { ...extensionOptions, extraExtensions: agent.piExtraExtensions }
+    : extensionOptions;
+  args.push(...resolvePiExtensionArgs(resolvedExtensionOptions));
 
   // Pi mints its own session id (the bot cannot pre-assign one with
   // --session-id). When resuming a stored session, point Pi at the
