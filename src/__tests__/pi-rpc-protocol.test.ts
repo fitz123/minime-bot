@@ -595,6 +595,16 @@ describe("Pi extension loading (--extension)", () => {
     assert.ok(args.indexOf("--model") < args.indexOf("--extension"));
   });
 
+  it("buildPiSpawnArgs defaults to first-party wrappers only when no extras are configured", () => {
+    const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", wrapperAbs("subagent/index.ts"),
+    ]);
+  });
+
   it("buildPiSpawnArgs appends agent-configured extra extensions", () => {
     const extraExtension = resolve("/approved/interactive-extra.ts");
     const args = buildPiSpawnArgs({
@@ -604,6 +614,27 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
     assert.deepStrictEqual(args.slice(-2), ["--extension", extraExtension]);
+  });
+
+  it("buildPiSpawnArgs keeps approved absolute .ts extra extension paths unchanged", () => {
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
+    const extraExtension = resolve("/approved/interactive-extra.ts");
+    const args = buildPiSpawnArgs({
+      ...testAgent,
+      piExtraExtensions: [extraExtension],
+    }, undefined, {
+      extensionsDir: artifactDir,
+      env: {},
+      exists: () => true,
+    });
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "web-tools.js"),
+      "--extension", resolve(artifactDir, "knowledge-tools.js"),
+      "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", extraExtension,
+    ]);
+    assert.ok(!args.includes(resolve("/approved/interactive-extra.js")));
   });
 
   it("kill-switch PI_EXTENSIONS_DISABLED=1 omits all explicit extensions but still disables ambient discovery", () => {

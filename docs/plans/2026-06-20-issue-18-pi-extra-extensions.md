@@ -71,7 +71,7 @@ Prefer focused tests if the full suite is slow; at minimum run the changed test 
 
 ### Task 3: Tests and docs
 
-- [ ] Add/adjust tests for default no-extra behavior.
-- [ ] Add tests for one approved absolute `.ts` extension path appearing in spawn args unchanged.
-- [ ] Add tests for missing/invalid extra extension errors.
-- [ ] Update config comments/docs with the new field and its scope.
+- [x] Add/adjust tests for default no-extra behavior.
+- [x] Add tests for one approved absolute `.ts` extension path appearing in spawn args unchanged.
+- [x] Add tests for missing/invalid extra extension errors.
+- [x] Update config comments/docs with the new field and its scope.
