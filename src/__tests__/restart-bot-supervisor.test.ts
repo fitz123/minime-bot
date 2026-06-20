@@ -288,9 +288,12 @@ function createHarness(): Harness {
   const readPlutilCommands = () => readLines(join(stateDir, "plutil-commands"));
 
   const run = (args: string[], env: Record<string, string> = {}) => {
+    const baseEnv = { ...process.env };
+    delete baseEnv.MINIME_BOT_PI_SESSION;
+    delete baseEnv.MINIME_RESTART_UNSAFE_FOREGROUND;
     const result = spawnSync(SCRIPT, args, {
       env: {
-        ...process.env,
+        ...baseEnv,
         HOME: dir,
         LAUNCHCTL_BIN: launchctl,
         PLUTIL_BIN: plutil,

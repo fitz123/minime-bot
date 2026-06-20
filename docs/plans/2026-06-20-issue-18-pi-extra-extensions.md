@@ -1,6 +1,6 @@
 # Plan: Issue #18 approved extra Pi extensions for bot RPC sessions
 
-Status: complete. Issue #18 implementation, tests, and public docs completed on 2026-06-20; review findings are tracked in the Ralphex progress log.
+Status: complete. Issue #18 implementation, tests, and public docs completed on 2026-06-20.
 
 ## Goal
 
