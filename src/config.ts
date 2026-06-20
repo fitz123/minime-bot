@@ -1,5 +1,5 @@
 import { readFileSync, existsSync, realpathSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import type { BotConfig, AgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig } from "./types.js";
@@ -78,6 +78,7 @@ interface RawConfig {
   agents?: Record<string, unknown>;
   bindings?: unknown[];
   sessionDefaults?: unknown;
+  piExtraExtensions?: unknown;
   logLevel?: string;
   metricsPort?: number;
   metricsHost?: string;
@@ -391,6 +392,27 @@ export function validateSessionDefaults(raw: unknown): SessionDefaults {
   return { idleTimeoutMs, maxConcurrentSessions, maxMessageAgeMs, requireMention, maxMediaBytes };
 }
 
+export function validatePiExtraExtensions(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error("piExtraExtensions must be an array of absolute path strings");
+  }
+
+  return raw.map((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`piExtraExtensions[${index}] must be a non-empty absolute path string`);
+    }
+    const trimmed = entry.trim();
+    if (trimmed === "") {
+      throw new Error(`piExtraExtensions[${index}] must be a non-empty absolute path string`);
+    }
+    if (!isAbsolute(trimmed)) {
+      throw new Error(`piExtraExtensions[${index}] must be an absolute path`);
+    }
+    return trimmed;
+  });
+}
+
 function optionalConfigString(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") {
@@ -476,6 +498,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     throw new Error(`defaultFallbackModel was removed with the Claude runtime; remove defaultFallbackModel`);
   }
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
+  const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
 
   // Validate agents (needed before validating bindings)
   if (!raw.agents || typeof raw.agents !== "object") {
@@ -483,7 +506,10 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
   const agents: Record<string, AgentConfig> = {};
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
-    agents[id] = validateAgent(agentRaw, id, defaultModel, workspaceRoot);
+    const agent = validateAgent(agentRaw, id, defaultModel, workspaceRoot);
+    agents[id] = piExtraExtensions && piExtraExtensions.length > 0
+      ? { ...agent, piExtraExtensions: [...piExtraExtensions] }
+      : agent;
   }
 
   // Resolve Telegram token from configured non-interactive secret sources.
@@ -596,7 +622,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId };
+  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId };
 }
 
 function realpathOrResolve(path: string): string {

@@ -57,9 +57,9 @@ Prefer focused tests if the full suite is slow; at minimum run the changed test 
 
 ### Task 1: Add config plumbing
 
-- [ ] Add a generic `piExtraExtensions` allowlist field.
-- [ ] Validate it rejects non-arrays, empty/non-string entries, and relative paths if absolute-only is chosen.
-- [ ] Ensure loaded config can reach Pi RPC spawn construction without changing public behavior when unset.
+- [x] Add a generic `piExtraExtensions` allowlist field.
+- [x] Validate it rejects non-arrays, empty/non-string entries, and relative paths if absolute-only is chosen.
+- [x] Ensure loaded config can reach Pi RPC spawn construction without changing public behavior when unset.
 
 ### Task 2: Add spawn-arg support
 

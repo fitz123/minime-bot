@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { validateSessionDefaults, validateAgent, loadConfig } from "../config.js";
+import { validateSessionDefaults, validateAgent, loadConfig, validatePiExtraExtensions } from "../config.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "../media-store.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
@@ -172,6 +172,44 @@ describe("validateSessionDefaults", () => {
   });
 });
 
+describe("validatePiExtraExtensions", () => {
+  it("returns undefined when unset", () => {
+    assert.strictEqual(validatePiExtraExtensions(undefined), undefined);
+  });
+
+  it("accepts absolute path strings and trims entries", () => {
+    assert.deepStrictEqual(
+      validatePiExtraExtensions([" /tmp/approved-extension.ts "]),
+      ["/tmp/approved-extension.ts"],
+    );
+  });
+
+  it("rejects non-arrays", () => {
+    assert.throws(
+      () => validatePiExtraExtensions("/tmp/approved-extension.ts"),
+      /piExtraExtensions must be an array of absolute path strings/,
+    );
+  });
+
+  it("rejects empty and non-string entries", () => {
+    assert.throws(
+      () => validatePiExtraExtensions([""]),
+      /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+    );
+    assert.throws(
+      () => validatePiExtraExtensions([42]),
+      /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+    );
+  });
+
+  it("rejects relative paths", () => {
+    assert.throws(
+      () => validatePiExtraExtensions(["extensions/pi/example.ts"]),
+      /piExtraExtensions\[0\] must be an absolute path/,
+    );
+  });
+});
+
 describe("validateAgent model validation", () => {
   it("does not inherit defaultModel when agent has no model", () => {
     assert.throws(
@@ -294,8 +332,75 @@ bindings:
     );
 
     assert.strictEqual(config.agents.main.workspaceCwd, "/tmp/x");
+    assert.strictEqual(config.piExtraExtensions, undefined);
+    assert.strictEqual(config.agents.main.piExtraExtensions, undefined);
     assert.strictEqual(config.telegramToken, "[configured]");
     assert.strictEqual(config.bindings.length, 1);
+  });
+
+  it("loads top-level piExtraExtensions and copies them to runtime agent config", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-pi-extra-extensions");
+    const extensionPath = join(workspaceRoot, "approved-extension.ts");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, "config.yaml"),
+      `
+piExtraExtensions:
+  - ${extensionPath}
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+telegramTokenEnv: TEST_UNSET_TELEGRAM_TOKEN
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+`,
+    );
+
+    const config = withEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => loadConfig(undefined, { resolveSecrets: false }),
+    );
+
+    assert.deepStrictEqual(config.piExtraExtensions, [extensionPath]);
+    assert.deepStrictEqual(config.agents.main.piExtraExtensions, [extensionPath]);
+  });
+
+  it("rejects relative piExtraExtensions paths during load", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-pi-extra-relative");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, "config.yaml"),
+      `
+piExtraExtensions:
+  - ./extension.ts
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+telegramTokenEnv: TEST_UNSET_TELEGRAM_TOKEN
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+`,
+    );
+
+    assert.throws(
+      () => withEnv(
+        {
+          [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
+          [MINIME_CONFIG_PATH_ENV]: undefined,
+        },
+        () => loadConfig(undefined, { resolveSecrets: false }),
+      ),
+      /piExtraExtensions\[0\] must be an absolute path/,
+    );
   });
 
   it("resolves relative agent workspaceCwd against MINIME_CONTROL_WORKSPACE_ROOT", () => {

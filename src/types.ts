@@ -11,6 +11,8 @@ export interface AgentConfig {
   model: string;
   systemPrompt?: string;
   thinking?: PiThinkingLevel;
+  /** Top-level bot allowlist copied onto interactive Pi RPC spawn configs. */
+  piExtraExtensions?: string[];
   /**
    * Compatibility field for old provider-aware configs.
    * Omit it or set "pi"; "claude" is rejected during config validation.
@@ -94,6 +96,7 @@ export interface BotConfig {
   agents: Record<string, AgentConfig>;
   bindings: TelegramBinding[];
   sessionDefaults: SessionDefaults;
+  piExtraExtensions?: string[];
   logLevel?: LogLevel;
   metricsPort?: number;
   metricsHost?: string;
