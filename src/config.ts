@@ -506,10 +506,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
   const agents: Record<string, AgentConfig> = {};
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
-    const agent = validateAgent(agentRaw, id, defaultModel, workspaceRoot);
-    agents[id] = piExtraExtensions && piExtraExtensions.length > 0
-      ? { ...agent, piExtraExtensions: [...piExtraExtensions] }
-      : agent;
+    agents[id] = validateAgent(agentRaw, id, defaultModel, workspaceRoot);
   }
 
   // Resolve Telegram token from configured non-interactive secret sources.

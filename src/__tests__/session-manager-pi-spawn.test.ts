@@ -15,7 +15,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord } from "../pi-rpc-protocol.js";
+import { NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord, type PiSpawnExtensionOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
@@ -35,6 +35,7 @@ function cleanup() {
 interface PiSpawnCapture {
   agent: AgentConfig;
   resumeSessionId?: string;
+  extensionOptions?: PiSpawnExtensionOptions;
 }
 
 const piSpawnCaptures: PiSpawnCapture[] = [];
@@ -322,8 +323,12 @@ function createSpawnThenDelayedStderrExitChild(
 // ---------------------------------------------------------------------------
 mock.module("../pi-rpc-protocol.js", {
   namedExports: {
-    spawnPiRpcSession(agent: AgentConfig, resumeSessionId?: string) {
-      piSpawnCaptures.push({ agent, resumeSessionId });
+    spawnPiRpcSession(
+      agent: AgentConfig,
+      resumeSessionId?: string,
+      extensionOptions?: PiSpawnExtensionOptions,
+    ) {
+      piSpawnCaptures.push({ agent, resumeSessionId, extensionOptions });
       const outcome = piSpawnOutcomes.shift() ?? "ok";
       if (outcome === "ok") return createAutoSpawnChild();
       if ("failStderr" in outcome) return createFailingPiChild(outcome.failStderr);
@@ -391,7 +396,7 @@ async function discardedCount(agentId: string): Promise<number> {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function makeConfig(): BotConfig {
+function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
     telegramToken: "test-token",
     agents: {
@@ -419,6 +424,7 @@ function makeConfig(): BotConfig {
       requireMention: false,
       maxMediaBytes: 209715200,
     },
+    ...overrides,
   };
 }
 
@@ -512,6 +518,19 @@ describe("SessionManager Pi session-id capture + resume", () => {
     assert.strictEqual((capturedChild as ChildProcess).killed, true, "child is terminated when outbox setup fails");
     assert.strictEqual(hasExited(capturedChild as ChildProcess), true, "child is reaped when outbox setup fails");
     assert.strictEqual(manager.getActive("pi-outbox-fail"), undefined, "failed startup is not registered active");
+
+    await manager.closeAll();
+  });
+
+  it("passes top-level piExtraExtensions to interactive Pi spawns", async () => {
+    const extraExtensions = ["/approved/interactive-a.ts", "/approved/interactive-b.ts"];
+    const manager = new SessionManager(() => makeConfig({ piExtraExtensions: extraExtensions }), TEST_STORE_PATH);
+
+    await manager.getOrCreateSession("pi-extra", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
+    assert.deepStrictEqual(piSpawnCaptures[0].extensionOptions, { extraExtensions });
+    assert.ok(!("piExtraExtensions" in piSpawnCaptures[0].agent));
 
     await manager.closeAll();
   });
@@ -690,6 +709,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
   });
 
   it("missing-session signal: discards once, warns once, increments metric, then starts fresh", async () => {
+    const extraExtensions = ["/approved/recovery-a.ts", "/approved/recovery-b.ts"];
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("pi-stale", {
       sessionId: "stored-pi-id",
@@ -708,7 +728,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const warnCalls: unknown[][] = [];
     const warnSpy = mock.method(log, "warn", (...args: unknown[]) => { warnCalls.push(args); });
 
-    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const manager = new SessionManager(() => makeConfig({ piExtraExtensions: extraExtensions }), TEST_STORE_PATH);
     let session;
     try {
       session = await manager.getOrCreateSession("pi-stale", "pi");
@@ -720,6 +740,11 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
     assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
     assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh (no --session)");
+    assert.deepStrictEqual(
+      piSpawnCaptures.map((capture) => capture.extensionOptions),
+      [{ extraExtensions }, { extraExtensions }],
+      "recovery retry keeps the configured extra extensions",
+    );
 
     // The recovered session is live on the freshly-captured id, and it's persisted.
     assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the new Pi id");

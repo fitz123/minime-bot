@@ -65,8 +65,8 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "kno
 
 /**
  * Kill-switch env var: set to exactly `"1"` to spawn Pi with no explicit
- * first-party extensions. Spawns still pass `--no-extensions` so Pi's ambient
- * extension discovery remains disabled.
+ * extensions. Spawns still pass `--no-extensions` so Pi's ambient extension
+ * discovery remains disabled.
  */
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
 export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
@@ -74,8 +74,6 @@ export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
   extensionsDir?: string;
-  /** Operator-approved external extension entrypoints for interactive bot RPC sessions. */
-  extraExtensions?: readonly string[];
   /** Override env lookup for the kill-switch (default: `process.env`). */
   env?: NodeJS.ProcessEnv;
   /** Override the existence check (default: `fs.existsSync`). */
@@ -87,6 +85,11 @@ export interface PiExtensionResolveOptions {
    * recursive subagent spawning disabled.
    */
   relpaths?: readonly string[];
+}
+
+export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
+  /** Operator-approved external extension entrypoints for interactive bot RPC sessions. */
+  extraExtensions?: readonly string[];
 }
 
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
@@ -146,8 +149,8 @@ export function shouldIncludePiChildEnvKey(key: string): boolean {
  *
  * Loading is DELIBERATELY per-spawn rather than via Pi's auto-discovery dirs.
  * Returns `[]` when `PI_EXTENSIONS_DISABLED=1` so the spawn has no explicit
- * first-party wrappers or configured extras; callers still pass
- * `--no-extensions` to keep ambient discovery disabled.
+ * first-party wrappers; callers still pass `--no-extensions` to keep ambient
+ * discovery disabled.
  *
  * A configured wrapper missing on disk throws loudly instead of silently
  * dropping part of the first-party extension contract. The thrown message names
@@ -176,6 +179,17 @@ export function resolvePiExtensionArgs(options?: PiExtensionResolveOptions): str
     args.push("--extension", abs);
   }
 
+  return args;
+}
+
+function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  const env = options?.env ?? process.env;
+  if (env[PI_EXTENSIONS_DISABLED_ENV] === "1") {
+    return [];
+  }
+
+  const fileExists = options?.exists ?? existsSync;
+  const args: string[] = [];
   for (const extra of options?.extraExtensions ?? []) {
     if (typeof extra !== "string" || extra.trim() === "") {
       throw new Error("Pi extra extension paths must be non-empty absolute strings");
@@ -335,7 +349,7 @@ export function resolveValidatedPiAgentWorkspaceCwd(agent: AgentConfig): string 
 export function buildPiSpawnArgs(
   agent: AgentConfig,
   resumeSessionId?: string,
-  extensionOptions?: PiExtensionResolveOptions,
+  extensionOptions?: PiSpawnExtensionOptions,
 ): string[] {
   const args = [
     "--mode", "rpc",
@@ -381,11 +395,9 @@ export function buildPiSpawnArgs(
   // Keep `--no-extensions` on every spawn to suppress Pi's ambient extension
   // discovery; load first-party wrappers and configured extras only as explicit
   // repeatable `--extension <abs-path>` args. The kill-switch and missing-path
-  // checks live in resolvePiExtensionArgs.
-  const resolvedExtensionOptions = extensionOptions?.extraExtensions === undefined
-    ? { ...extensionOptions, extraExtensions: agent.piExtraExtensions }
-    : extensionOptions;
-  args.push(...resolvePiExtensionArgs(resolvedExtensionOptions));
+  // checks live in the extension resolvers.
+  args.push(...resolvePiExtensionArgs(extensionOptions));
+  args.push(...resolvePiExtraExtensionArgs(extensionOptions));
 
   // Pi mints its own session id (the bot cannot pre-assign one with
   // --session-id). When resuming a stored session, point Pi at the
@@ -472,11 +484,15 @@ export interface PiStartupDiagnostics {
 /** Cap on buffered startup stderr (the classifier only needs the startup tail). */
 const PI_STARTUP_STDERR_CAP = 64 * 1024;
 
-export function spawnPiRpcSession(agent: AgentConfig, resumeSessionId?: string): ChildProcess {
+export function spawnPiRpcSession(
+  agent: AgentConfig,
+  resumeSessionId?: string,
+  extensionOptions?: PiSpawnExtensionOptions,
+): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd);
-  const child = spawn(PI_BIN, buildPiSpawnArgs(spawnAgent, resumeSessionId), {
+  const child = spawn(PI_BIN, buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions), {
     env,
     cwd: workspaceCwd,
     stdio: ["pipe", "pipe", "pipe"],

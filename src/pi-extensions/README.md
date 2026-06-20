@@ -19,10 +19,11 @@ it is used only by the out-of-band Codex quota sampler via
 `PI_EXTENSION_WRAPPER_RELPATHS` list. See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
 
-`PI_EXTENSIONS_DISABLED=1` disables every first-party wrapper for that spawn.
-That deliberately removes the Knowledge tools and also removes the scoped
-managed-wiki protection; use it only as an operator bypass when a Pi session must
-start without package extensions.
+`PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
+first-party wrappers and any configured `piExtraExtensions`. That deliberately
+removes the Knowledge tools and also removes the scoped managed-wiki protection;
+use it only as an operator bypass when a Pi session must start without package
+extensions.
 
 ## Location lock (Task 0)
 

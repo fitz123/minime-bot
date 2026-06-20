@@ -123,11 +123,14 @@ piExtraExtensions:
   - /opt/minime/pi-extensions/approved-extension.ts
 ```
 
-Entries must be absolute paths. The bot still starts Pi with `--no-extensions`,
-loads its first-party wrappers explicitly, then appends each approved extra as a
-repeatable `--extension` argument. `PI_EXTENSIONS_DISABLED=1` disables both
-first-party wrappers and configured extras for a spawn. Cron and subagent-child
-extension subsets keep their existing first-party-only scope.
+Entries are validated as non-empty absolute path strings during config load.
+The bot still starts Pi with `--no-extensions`, loads its first-party wrappers
+explicitly, then appends each approved extra unchanged as a repeatable
+`--extension` argument. Each configured file must exist on the host that starts
+Pi; a missing file fails the interactive spawn with a clear error.
+`PI_EXTENSIONS_DISABLED=1` disables both first-party wrappers and configured
+extras for a spawn. Cron and subagent-child extension subsets keep their
+existing first-party-only scope.
 
 ## Knowledge v2 Layout
 

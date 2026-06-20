@@ -1,5 +1,7 @@
 # Plan: Issue #18 approved extra Pi extensions for bot RPC sessions
 
+Status: complete. Issue #18 implementation, tests, and public docs completed on 2026-06-20; review findings are tracked in the Ralphex progress log.
+
 ## Goal
 
 Fix <https://github.com/fitz123/minime-bot/issues/18>: allow an operator-approved list of extra Pi extension entrypoints to be loaded into bot-created Pi RPC sessions, so packages like `pi-dynamic-workflows` can expose tools while the bot still starts Pi with `--no-extensions`.

@@ -16,6 +16,7 @@ import { runPi, type PiRunDeps } from "../cron-runner.js";
 import { assemblePiContext } from "../pi-context-assembler.js";
 import {
   buildPiSpawnEnv,
+  PI_EXTENSIONS_DISABLED_ENV,
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, CronJob } from "../types.js";
 import {
@@ -168,6 +169,36 @@ describe("cron-runner runPi", () => {
     ]) {
       assert.ok(!capture.args.includes(forbidden), `forbidden Pi cron flag present: ${forbidden}`);
     }
+  });
+
+  it("keeps configured extra extensions out of Pi cron spawns", () => {
+    const ws = makeWorkspace();
+    const captures: SpawnCapture[] = [];
+    const extraExtension = "/approved/cron-extra.ts";
+    const oldDisabled = process.env[PI_EXTENSIONS_DISABLED_ENV];
+    const deps = makeDeps(captures, {
+      buildAgentConfig: (_cron, cwd) => ({
+        ...makeAgent(cwd),
+        piExtraExtensions: [extraExtension],
+      } as AgentConfig),
+      resolveExtensionArgs: undefined,
+    });
+
+    try {
+      delete process.env[PI_EXTENSIONS_DISABLED_ENV];
+      runPi(makeCron(), ws, deps);
+    } finally {
+      if (oldDisabled === undefined) {
+        delete process.env[PI_EXTENSIONS_DISABLED_ENV];
+      } else {
+        process.env[PI_EXTENSIONS_DISABLED_ENV] = oldDisabled;
+      }
+    }
+
+    const extensions = flagValues(captures[0].args, "--extension");
+    assert.strictEqual(extensions.length, 1);
+    assert.ok(extensions[0].endsWith("knowledge-tools.ts"));
+    assert.ok(!extensions.includes(extraExtension));
   });
 
   it("passes option-like cron prompts as safe positional argv", () => {

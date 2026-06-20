@@ -11,8 +11,6 @@ export interface AgentConfig {
   model: string;
   systemPrompt?: string;
   thinking?: PiThinkingLevel;
-  /** Top-level bot allowlist copied onto interactive Pi RPC spawn configs. */
-  piExtraExtensions?: string[];
   /**
    * Compatibility field for old provider-aware configs.
    * Omit it or set "pi"; "claude" is rejected during config validation.
