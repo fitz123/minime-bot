@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { validateSessionDefaults, validateAgent, loadConfig } from "../config.js";
+import { validateSessionDefaults, validateAgent, loadConfig, validatePiExtraExtensions } from "../config.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "../media-store.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
@@ -172,6 +172,44 @@ describe("validateSessionDefaults", () => {
   });
 });
 
+describe("validatePiExtraExtensions", () => {
+  it("returns undefined when unset", () => {
+    assert.strictEqual(validatePiExtraExtensions(undefined), undefined);
+  });
+
+  it("accepts absolute path strings and trims entries", () => {
+    assert.deepStrictEqual(
+      validatePiExtraExtensions([" /tmp/approved-extension.ts "]),
+      ["/tmp/approved-extension.ts"],
+    );
+  });
+
+  it("rejects non-arrays", () => {
+    assert.throws(
+      () => validatePiExtraExtensions("/tmp/approved-extension.ts"),
+      /piExtraExtensions must be an array of absolute path strings/,
+    );
+  });
+
+  it("rejects empty and non-string entries", () => {
+    assert.throws(
+      () => validatePiExtraExtensions([""]),
+      /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+    );
+    assert.throws(
+      () => validatePiExtraExtensions([42]),
+      /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+    );
+  });
+
+  it("rejects relative paths", () => {
+    assert.throws(
+      () => validatePiExtraExtensions(["extensions/pi/example.ts"]),
+      /piExtraExtensions\[0\] must be an absolute path/,
+    );
+  });
+});
+
 describe("validateAgent model validation", () => {
   it("does not inherit defaultModel when agent has no model", () => {
     assert.throws(
@@ -267,6 +305,34 @@ describe("loadConfig workspace contract defaults", () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
+  function writeConfigWithPiExtraExtensions(workspaceRoot: string, piExtraExtensionsYaml: string): void {
+    writeFileSync(
+      join(workspaceRoot, "config.yaml"),
+      `
+${piExtraExtensionsYaml}
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+telegramTokenEnv: TEST_UNSET_TELEGRAM_TOKEN
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+`,
+    );
+  }
+
+  function loadWorkspaceConfig(workspaceRoot: string) {
+    return withEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => loadConfig(undefined, { resolveSecrets: false }),
+    );
+  }
+
   it("uses MINIME_CONTROL_WORKSPACE_ROOT config.yaml when no config path is passed", () => {
     const workspaceRoot = join(TEST_DIR, "workspace-default");
     mkdirSync(workspaceRoot, { recursive: true });
@@ -294,8 +360,67 @@ bindings:
     );
 
     assert.strictEqual(config.agents.main.workspaceCwd, "/tmp/x");
+    assert.strictEqual(config.piExtraExtensions, undefined);
+    assert.ok(!("piExtraExtensions" in config.agents.main));
     assert.strictEqual(config.telegramToken, "[configured]");
     assert.strictEqual(config.bindings.length, 1);
+  });
+
+  it("loads top-level piExtraExtensions in order without copying them to agent config", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-pi-extra-extensions");
+    const extensionA = join(workspaceRoot, "approved-extension-a.ts");
+    const extensionB = join(workspaceRoot, "approved-extension-b.ts");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(
+      workspaceRoot,
+      `
+piExtraExtensions:
+  - ${extensionA}
+  - ${extensionB}
+`,
+    );
+
+    const config = loadWorkspaceConfig(workspaceRoot);
+
+    assert.deepStrictEqual(config.piExtraExtensions, [extensionA, extensionB]);
+    assert.ok(!("piExtraExtensions" in config.agents.main));
+  });
+
+  it("rejects malformed piExtraExtensions shapes during load", () => {
+    const cases: Array<{ name: string; yaml: string; expected: RegExp }> = [
+      {
+        name: "non-array",
+        yaml: "piExtraExtensions: /tmp/approved-extension.ts",
+        expected: /piExtraExtensions must be an array of absolute path strings/,
+      },
+      {
+        name: "empty string",
+        yaml: "piExtraExtensions:\n  - \"\"",
+        expected: /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+      },
+      {
+        name: "non-string entry",
+        yaml: "piExtraExtensions:\n  - 42",
+        expected: /piExtraExtensions\[0\] must be a non-empty absolute path string/,
+      },
+      {
+        name: "relative path",
+        yaml: "piExtraExtensions:\n  - ./extension.ts",
+        expected: /piExtraExtensions\[0\] must be an absolute path/,
+      },
+    ];
+
+    for (const entry of cases) {
+      const workspaceRoot = join(TEST_DIR, `workspace-pi-extra-${entry.name.replace(/\W+/g, "-")}`);
+      mkdirSync(workspaceRoot, { recursive: true });
+      writeConfigWithPiExtraExtensions(workspaceRoot, entry.yaml);
+
+      assert.throws(
+        () => loadWorkspaceConfig(workspaceRoot),
+        entry.expected,
+        entry.name,
+      );
+    }
   });
 
   it("resolves relative agent workspaceCwd against MINIME_CONTROL_WORKSPACE_ROOT", () => {

@@ -3,6 +3,10 @@ agents:
     workspaceCwd: ./agent-workspace
     model: gpt-5.5
 telegramTokenEnv: MINIME_FIXTURE_TELEGRAM_TOKEN
+# Optional for interactive bot Pi RPC sessions only. Keep entries generic,
+# absolute, and operator-approved.
+# piExtraExtensions:
+#   - /opt/minime/pi-extensions/approved-extension.ts
 bindings:
   - chatId: 111
     agentId: main

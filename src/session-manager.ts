@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiRecord, NewlineOnlyJsonlSplitter, normalizePiModel, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiRecord, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -474,6 +474,7 @@ export class SessionManager {
     agentId: string,
     agent: AgentConfig,
     staleSessionId: string,
+    extensionOptions?: PiSpawnExtensionOptions,
   ): Promise<ChildProcess> {
     // Discard ONLY the unresumable stored id so a fresh Pi session is spawned.
     // Deleting the store record directly (instead of destroySession) avoids the
@@ -487,7 +488,7 @@ export class SessionManager {
     try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
     log.warn("session-manager", `could not resume Pi session ${staleSessionId} — starting fresh`);
     piSessionResumeDiscarded.inc({ agent_id: agentId });
-    return spawnPiRpcSession(agent, undefined);
+    return spawnPiRpcSession(agent, undefined, extensionOptions);
   }
 
   /**
@@ -594,7 +595,10 @@ export class SessionManager {
     // Spawn the agent subprocess via Pi RPC. Only a genuine resume points
     // --session at the stored Pi-minted id; a fresh start omits it (an unknown
     // id makes Pi exit with "No session found matching").
-    let child = spawnPiRpcSession(agent, resume ? sessionId : undefined);
+    const extensionOptions: PiSpawnExtensionOptions | undefined = freshConfig.piExtraExtensions === undefined
+      ? undefined
+      : { extraExtensions: freshConfig.piExtraExtensions };
+    let child = spawnPiRpcSession(agent, resume ? sessionId : undefined, extensionOptions);
 
     // Graceful Pi resume-recovery state (signal-matched, inline, at-most-once):
     // Pi flushes a session to disk only after agent_end/SIGTERM, so a restart
@@ -673,7 +677,7 @@ export class SessionManager {
         // failure — and any second failure — falls through to crash-backoff.
         if (effectiveResume && !alreadyRetried && this.hasPiResumeNotFoundSignal(child)) {
           alreadyRetried = true;
-          child = await this.discardUnresumablePiSession(chatId, agentId, agent, sessionId);
+          child = await this.discardUnresumablePiSession(chatId, agentId, agent, sessionId, extensionOptions);
           effectiveResume = false;
           effectiveSessionId = randomUUID();
           continue;

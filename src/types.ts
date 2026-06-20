@@ -94,6 +94,7 @@ export interface BotConfig {
   agents: Record<string, AgentConfig>;
   bindings: TelegramBinding[];
   sessionDefaults: SessionDefaults;
+  piExtraExtensions?: string[];
   logLevel?: LogLevel;
   metricsPort?: number;
   metricsHost?: string;

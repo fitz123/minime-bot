@@ -44,6 +44,7 @@ import {
   shouldIncludePiChildEnvKey,
   spawnPiRpcSession,
   type PiExtensionResolveOptions,
+  type PiSpawnExtensionOptions,
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
@@ -496,6 +497,33 @@ describe("Pi extension loading (--extension)", () => {
     ]);
   });
 
+  it("does not append accidental extraExtensions when resolving first-party subsets", () => {
+    const extraExtension = resolve("/approved/interactive-extra.ts");
+    const optionsWithUnknownExtra = {
+      ...presentAll,
+      extraExtensions: [extraExtension],
+    } as PiExtensionResolveOptions & { extraExtensions: string[] };
+
+    const subagentChildArgs = resolvePiExtensionArgs({
+      ...optionsWithUnknownExtra,
+      relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
+    });
+    const cronArgs = resolvePiExtensionArgs({
+      ...optionsWithUnknownExtra,
+      relpaths: PI_CRON_WRAPPER_RELPATHS,
+    });
+
+    assert.deepStrictEqual(subagentChildArgs, [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+    ]);
+    assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+    ]);
+    assert.ok(!subagentChildArgs.includes(extraExtension));
+    assert.ok(!cronArgs.includes(extraExtension));
+  });
+
   it("maps source wrapper relpaths to built JS relpaths for package artifact dirs", () => {
     const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
 
@@ -522,6 +550,41 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+    ]);
+  });
+
+  it("buildPiSpawnArgs appends configured extra extensions after first-party wrappers", () => {
+    const extraA = resolve("/approved/pi-dynamic-workflows-a.ts");
+    const extraB = resolve("/approved/pi-dynamic-workflows-b.ts");
+    const args = buildPiSpawnArgs(testAgent, undefined, {
+      ...presentAll,
+      extraExtensions: [extraA, extraB],
+    });
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", extraA,
+      "--extension", extraB,
+    ]);
+  });
+
+  it("buildPiSpawnArgs does not remap configured extra .ts extension paths in package artifact mode", () => {
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
+    const extraExtension = resolve("/approved/external-extension.ts");
+    const args = buildPiSpawnArgs(testAgent, undefined, {
+      extensionsDir: artifactDir,
+      env: {},
+      exists: () => true,
+      extraExtensions: [extraExtension],
+    });
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "web-tools.js"),
+      "--extension", resolve(artifactDir, "knowledge-tools.js"),
+      "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", extraExtension,
     ]);
   });
 
@@ -562,11 +625,56 @@ describe("Pi extension loading (--extension)", () => {
     assert.ok(args.indexOf("--model") < args.indexOf("--extension"));
   });
 
-  it("kill-switch PI_EXTENSIONS_DISABLED=1 omits explicit wrappers but still disables ambient discovery", () => {
+  it("buildPiSpawnArgs defaults to first-party wrappers only when no extras are configured", () => {
+    const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", wrapperAbs("subagent/index.ts"),
+    ]);
+  });
+
+  it("buildPiSpawnArgs appends explicitly configured extra extensions", () => {
+    const extraA = resolve("/approved/interactive-a.ts");
+    const extraB = resolve("/approved/interactive-b.ts");
+    const args = buildPiSpawnArgs(testAgent, undefined, {
+      ...presentAll,
+      extraExtensions: [extraA, extraB],
+    });
+
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.deepStrictEqual(args.slice(-4), [
+      "--extension", extraA,
+      "--extension", extraB,
+    ]);
+  });
+
+  it("buildPiSpawnArgs keeps approved absolute .ts extra extension paths unchanged", () => {
+    const artifactDir = resolve("/tmp/project/node_modules/minime-bot/dist/extensions/pi");
+    const extraExtension = resolve("/approved/interactive-extra.ts");
+    const args = buildPiSpawnArgs(testAgent, undefined, {
+      extensionsDir: artifactDir,
+      env: {},
+      exists: () => true,
+      extraExtensions: [extraExtension],
+    });
+
+    assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "web-tools.js"),
+      "--extension", resolve(artifactDir, "knowledge-tools.js"),
+      "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", extraExtension,
+    ]);
+    assert.ok(!args.includes(resolve("/approved/interactive-extra.js")));
+  });
+
+  it("kill-switch PI_EXTENSIONS_DISABLED=1 omits all explicit extensions but still disables ambient discovery", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, {
       extensionsDir: FAKE_DIR,
       exists: () => true,
       env: { PI_EXTENSIONS_DISABLED: "1" },
+      extraExtensions: [resolve("/approved/interactive-extra.ts")],
     });
 
     assert.ok(!args.includes("--extension"));
@@ -594,6 +702,55 @@ describe("Pi extension loading (--extension)", () => {
     );
   });
 
+  it("fails loudly when a configured extra extension is missing on disk", () => {
+    const extraExtension = resolve("/approved/missing-extension.ts");
+    assert.throws(
+      () => buildPiSpawnArgs(testAgent, undefined, {
+        ...presentAll,
+        exists: (p) => p !== extraExtension,
+        extraExtensions: [extraExtension],
+      }),
+      /Pi extra extension not found[\s\S]*piExtraExtensions/,
+    );
+  });
+
+  it("rejects malformed configured extra extension paths at spawn arg build", () => {
+    const cases: Array<{ name: string; extra: unknown; expected: RegExp }> = [
+      {
+        name: "empty string",
+        extra: "",
+        expected: /Pi extra extension paths must be non-empty absolute strings/,
+      },
+      {
+        name: "whitespace string",
+        extra: "   ",
+        expected: /Pi extra extension paths must be non-empty absolute strings/,
+      },
+      {
+        name: "non-string",
+        extra: 42,
+        expected: /Pi extra extension paths must be non-empty absolute strings/,
+      },
+      {
+        name: "relative path",
+        extra: "relative-extension.ts",
+        expected: /Pi extra extension path must be absolute/,
+      },
+    ];
+
+    for (const entry of cases) {
+      const options = {
+        ...presentAll,
+        extraExtensions: [entry.extra],
+      } as unknown as PiSpawnExtensionOptions;
+      assert.throws(
+        () => buildPiSpawnArgs(testAgent, undefined, options),
+        entry.expected,
+        entry.name,
+      );
+    }
+  });
+
   it("names the specific missing wrapper and points at the kill-switch bypass", () => {
     // Only the A3 subagent entrypoint is missing; the others are present.
     const present = (p: string): boolean => !p.includes("subagent");
@@ -604,13 +761,18 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("places all --extension paths before --session on resume", () => {
-    const args = buildPiSpawnArgs(testAgent, "pi-sess-resume", presentAll);
+    const extraExtension = resolve("/approved/resume-extra.ts");
+    const args = buildPiSpawnArgs(testAgent, "pi-sess-resume", {
+      ...presentAll,
+      extraExtensions: [extraExtension],
+    });
     const lastExtension = args.lastIndexOf("--extension");
     const session = args.indexOf("--session");
 
     assert.notStrictEqual(lastExtension, -1);
     assert.notStrictEqual(session, -1);
     assert.ok(lastExtension < session, "--extension args must precede --session");
+    assert.strictEqual(args[lastExtension + 1], extraExtension);
     assert.strictEqual(args[session + 1], "pi-sess-resume");
   });
 

@@ -115,6 +115,23 @@ Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.
 
+Optional top-level `piExtraExtensions` entries allow operator-approved external
+Pi extension entrypoints in normal bot-created interactive RPC sessions:
+
+```yaml
+piExtraExtensions:
+  - /opt/minime/pi-extensions/approved-extension.ts
+```
+
+Entries are validated as non-empty absolute path strings during config load.
+The bot still starts Pi with `--no-extensions`, loads its first-party wrappers
+explicitly, then appends each approved extra unchanged as a repeatable
+`--extension` argument. Each configured file must exist on the host that starts
+Pi; a missing file fails the interactive spawn with a clear error.
+`PI_EXTENSIONS_DISABLED=1` disables both first-party wrappers and configured
+extras for a spawn. Cron and subagent-child extension subsets keep their
+existing first-party-only scope.
+
 ## Knowledge v2 Layout
 
 Agent workspaces may use the package-owned Knowledge v2 layout:
