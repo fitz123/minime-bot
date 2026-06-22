@@ -83,24 +83,6 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
 }
 
-function redactNotificationDiagnostics(value: string): string {
-  return value
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, "$1[redacted]@")
-    .replace(
-      /\b([A-Za-z0-9_.-]*(?:api[_-]?key|token|password|passwd|pwd|secret)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
-      "$1[redacted]",
-    );
-}
-
-function truncateNotificationDiagnostics(value: string): string {
-  if (value.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
-    return value;
-  }
-  const suffix = "... [truncated]";
-  return `${value.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
-}
-
 function formatNotificationDiagnostics(diagnostics: string | undefined): string | undefined {
   if (!diagnostics) {
     return undefined;
@@ -109,20 +91,23 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
   if (!sanitized) {
     return undefined;
   }
-  return truncateNotificationDiagnostics(redactNotificationDiagnostics(sanitized));
-}
 
-function buildCronFailureContext(errMsg: string, diagnostics: string | undefined, errorChars: number): string {
-  const lines = [errMsg.slice(0, errorChars)];
-  const notificationDiagnostics = formatNotificationDiagnostics(diagnostics);
-  if (notificationDiagnostics) {
-    lines.push(`Diagnostics: ${notificationDiagnostics}`);
+  const redacted = sanitized
+    .replace(/\b(Authorization\s*[:=]\s*)(?:Basic|Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi, "$1[redacted]")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
+    .replace(
+      /\b([A-Za-z0-9_.-]*(?:api[_-]?key|authorization|cookie|credential|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/gi, "[redacted]");
+  if (redacted.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
+    return redacted;
   }
-  return lines.join("\n");
-}
 
-function buildCronFailureNotification(taskName: string, errMsg: string, diagnostics: string | undefined): string {
-  return `⚠️ Cron FAIL: ${taskName}\n${buildCronFailureContext(errMsg, diagnostics, FAILURE_NOTIFICATION_ERROR_CHARS)}`;
+  const suffix = "... [truncated]";
+  return `${redacted.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
 }
 
 function log(taskName: string, msg: string): void {
@@ -814,8 +799,16 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     if (diagnostics) {
       deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
     }
-    const failureNotification = buildCronFailureNotification(taskName, errMsg, diagnostics);
-    const failureFallbackContext = buildCronFailureContext(errMsg, diagnostics, FAILURE_FALLBACK_ERROR_CHARS);
+    const notificationDiagnostics = formatNotificationDiagnostics(diagnostics);
+    const failureNotificationLines = [`⚠️ Cron FAIL: ${taskName}`, errMsg.slice(0, FAILURE_NOTIFICATION_ERROR_CHARS)];
+    const failureFallbackLines = [errMsg.slice(0, FAILURE_FALLBACK_ERROR_CHARS)];
+    if (notificationDiagnostics) {
+      const diagnosticsLine = `Diagnostics: ${notificationDiagnostics}`;
+      failureNotificationLines.push(diagnosticsLine);
+      failureFallbackLines.push(diagnosticsLine);
+    }
+    const failureNotification = failureNotificationLines.join("\n");
+    const failureFallbackContext = failureFallbackLines.join("\n");
 
     // Send failure notification to delivery chat; use admin fallback if delivery fails
     try {

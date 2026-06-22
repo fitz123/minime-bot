@@ -1,5 +1,7 @@
 # Plan: Include cron failure diagnostics in notifications (#20)
 
+Status: complete. Addresses GitHub issue #20.
+
 ## Goal
 When a cron fails and `cronErrorDiagnostics(err)` returns useful diagnostics, include a concise bounded diagnostics excerpt in the Telegram failure notification, not only in the local cron log.
 

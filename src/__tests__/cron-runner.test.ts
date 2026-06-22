@@ -1392,8 +1392,6 @@ bindings: []
       assert.strictEqual(calls.deliveries.length, 1);
       assert.strictEqual(calls.deliveries[0].chatId, 111111111);
       assert.strictEqual(calls.deliveries[0].threadId, 42);
-      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
-      assert.match(calls.deliveries[0].message, /runner exploded/);
       assert.strictEqual(
         calls.deliveries[0].message,
         '⚠️ Cron FAIL: main-behavior-task\nCron task "main-behavior-task" failed: runner exploded',
@@ -1458,7 +1456,12 @@ bindings: []
         "API_KEY=secret-api-key",
         "password: secret-password",
         "url=https://user:pass@example.com/path",
+        "mirror=https://ghp_secretsecretsecretsecret@example.org/repo.git",
         "Authorization: Bearer secret-bearer-token",
+        "Authorization: Basic basic-secret-token",
+        "Authorization: token auth-token-secret",
+        "Cookie: sessionid=secret-cookie",
+        "Session: secret-session",
         "x".repeat(500),
       ].join(" ");
       deps.runPi = () => {
@@ -1475,11 +1478,17 @@ bindings: []
       assert.ok(diagnosticsLine, "expected diagnostics line");
       assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
       assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
-      assert.doesNotMatch(calls.deliveries[0].message, /secret-api-key|secret-password|secret-bearer-token|user:pass/);
+      assert.doesNotMatch(
+        calls.deliveries[0].message,
+        /secret-api-key|secret-password|secret-bearer-token|basic-secret-token|auth-token-secret|secret-cookie|secret-session|user:pass|ghp_secret/,
+      );
       assert.match(calls.deliveries[0].message, /API_KEY=\[redacted\]/);
       assert.match(calls.deliveries[0].message, /password: \[redacted\]/);
       assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.com\/path/);
-      assert.match(calls.deliveries[0].message, /Bearer \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.org\/repo\.git/);
+      assert.match(calls.deliveries[0].message, /Authorization: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Cookie: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Session: \[redacted\]/);
       assert.ok(
         calls.logs.some((entry) => entry.message.includes("secret-api-key")),
         "expected local diagnostics log to remain unchanged",
@@ -1514,9 +1523,18 @@ bindings: []
     it("includes diagnostics context in the admin fallback when cron FAIL notification delivery fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
+      const longDiagnostics = [
+        "stderr:",
+        "API_KEY=secret-api-key",
+        "password: secret-password",
+        "url=https://user:pass@example.com/path",
+        "Authorization: Basic basic-secret-token",
+        "Cookie: sessionid=secret-cookie",
+        "x".repeat(500),
+      ].join(" ");
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics: "stderr: fetch failed",
+          diagnostics: longDiagnostics,
         });
       };
       deps.deliver = (chatId: number, message: string, threadId?: number) => {
@@ -1527,12 +1545,25 @@ bindings: []
       await assertMainExits(deps, 1);
 
       assert.strictEqual(calls.deliveryFailures.length, 1);
-      assert.deepStrictEqual(calls.deliveryFailures[0], {
-        cronName: cron.name,
-        targetChatId: 111111111,
-        errorMsg: 'Cron task "main-behavior-task" failed: Pi cron exited with code 1\nDiagnostics: stderr: fetch failed\n(notification delivery failed: bot blocked)',
-        adminChatId: 999999999,
-      });
+      const failure = calls.deliveryFailures[0];
+      assert.strictEqual(failure.cronName, cron.name);
+      assert.strictEqual(failure.targetChatId, 111111111);
+      assert.strictEqual(failure.adminChatId, 999999999);
+      assert.match(failure.errorMsg, /^Cron task "main-behavior-task" failed: Pi cron exited with code 1\nDiagnostics: /);
+      assert.match(failure.errorMsg, /\n\(notification delivery failed: bot blocked\)$/);
+      const diagnosticsLine = failure.errorMsg.split("\n").find((line) => line.startsWith("Diagnostics: "));
+      assert.ok(diagnosticsLine, "expected diagnostics line");
+      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
+      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
+      assert.doesNotMatch(
+        failure.errorMsg,
+        /secret-api-key|secret-password|basic-secret-token|secret-cookie|user:pass/,
+      );
+      assert.match(failure.errorMsg, /API_KEY=\[redacted\]/);
+      assert.match(failure.errorMsg, /password: \[redacted\]/);
+      assert.match(failure.errorMsg, /https:\/\/\[redacted\]@example\.com\/path/);
+      assert.match(failure.errorMsg, /Authorization: \[redacted\]/);
+      assert.match(failure.errorMsg, /Cookie: \[redacted\]/);
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {

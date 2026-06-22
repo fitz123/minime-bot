@@ -237,6 +237,13 @@ operation. `--launch-agents-dir` overrides the default
 `~/Library/LaunchAgents` target. Cron sync must not bootout, bootstrap, signal,
 or otherwise restart `ai.minime.telegram-bot`.
 
+Cron execution failures send `Cron FAIL: <task>` plus the error line to the
+delivery chat. When Pi diagnostics are available, the notification appends a
+`Diagnostics:` excerpt capped at 300 characters after sanitization and
+best-effort redaction of common credential shapes. Full diagnostics remain in
+the local `FAIL diagnostics: ...` cron log, and admin delivery-failure fallback
+uses the same concise failure context.
+
 More detail is in `docs/launchd-operations.md`.
 
 ## Repository Boundaries
