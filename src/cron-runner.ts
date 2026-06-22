@@ -51,7 +51,7 @@ const NOTIFICATION_PRIVATE_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
 const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:[A-Za-z0-9_. -]*(?:(?:api|access|private)[_. -]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_. -]*|key|[A-Za-z0-9_. -]*(?:[_. -]key|key[_. -])[A-Za-z0-9_. -]*)`;
 const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
-  String.raw`(^|[\s{[,])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_. -]+\s*[:=])`,
+  String.raw`(^|[\s{[,:;])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_.-]+\s*[:=])`,
   "gim",
 );
 const NOTIFICATION_SECRET_QUERY_PARAM_PATTERN =

@@ -1595,6 +1595,31 @@ bindings: []
       assert.match(message, /public_detail=visible/);
     });
 
+    it("redacts delimiter-prefixed credential assignments and space-containing passwords", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: Error:OPENAI_API_KEY=colon-secret status=403",
+        "stderr: warning;SESSION_TOKEN=semicolon-secret next=ok",
+        "stderr: password: correct horse battery staple status=401",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(message, /colon-secret|semicolon-secret|correct horse|battery staple/);
+      assert.match(message, /Error:OPENAI_API_KEY=\[redacted\] status=403/);
+      assert.match(message, /warning;SESSION_TOKEN=\[redacted\] next=ok/);
+      assert.match(message, /password: \[redacted\] status=401/);
+      assert.match(message, /public_detail=visible/);
+    });
+
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
