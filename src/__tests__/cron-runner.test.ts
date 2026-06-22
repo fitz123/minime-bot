@@ -1454,14 +1454,13 @@ bindings: []
       const longDiagnostics = [
         "stderr:",
         "API_KEY=secret-api-key",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
         "password: secret-password",
         "url=https://user:pass@example.com/path",
         "mirror=https://ghp_secretsecretsecretsecret@example.org/repo.git",
-        "Authorization: Bearer secret-bearer-token",
-        "Authorization: Basic basic-secret-token",
-        "Authorization: token auth-token-secret",
-        "Cookie: sessionid=secret-cookie",
-        "Session: secret-session",
+        "session_id=secret-session",
         "x".repeat(500),
       ].join(" ");
       deps.runPi = () => {
@@ -1480,19 +1479,55 @@ bindings: []
       assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
       assert.doesNotMatch(
         calls.deliveries[0].message,
-        /secret-api-key|secret-password|secret-bearer-token|basic-secret-token|auth-token-secret|secret-cookie|secret-session|user:pass|ghp_secret/,
+        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|user:pass|ghp_secret/,
       );
       assert.match(calls.deliveries[0].message, /API_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
       assert.match(calls.deliveries[0].message, /password: \[redacted\]/);
       assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.com\/path/);
       assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.org\/repo\.git/);
-      assert.match(calls.deliveries[0].message, /Authorization: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /Cookie: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /Session: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /session_id=\[redacted\]/);
       assert.ok(
         calls.logs.some((entry) => entry.message.includes("secret-api-key")),
         "expected local diagnostics log to remain unchanged",
       );
+    });
+
+    it("redacts full credential headers in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "Authorization: ApiKey authorization-secret",
+        "Cookie: sid=secret-cookie; refresh=secret-refresh",
+        "Set-Cookie: session=secret-set-cookie; Path=/; HttpOnly",
+        "Session: id=secret-session; refresh=secret-session-refresh",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
+        "monkey=visible-monkey-value",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.doesNotMatch(
+        calls.deliveries[0].message,
+        /authorization-secret|secret-cookie|secret-refresh|secret-set-cookie|secret-session|secret-session-refresh|secret-private-key|secret-access-key-id|secret-generic-key/,
+      );
+      assert.match(calls.deliveries[0].message, /Authorization: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Cookie: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Set-Cookie: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Session: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /monkey=visible-monkey-value/);
     });
 
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
@@ -1526,10 +1561,12 @@ bindings: []
       const longDiagnostics = [
         "stderr:",
         "API_KEY=secret-api-key",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
         "password: secret-password",
         "url=https://user:pass@example.com/path",
-        "Authorization: Basic basic-secret-token",
-        "Cookie: sessionid=secret-cookie",
+        "session_id=secret-session",
         "x".repeat(500),
       ].join(" ");
       deps.runPi = () => {
@@ -1557,13 +1594,15 @@ bindings: []
       assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
       assert.doesNotMatch(
         failure.errorMsg,
-        /secret-api-key|secret-password|basic-secret-token|secret-cookie|user:pass/,
+        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|user:pass/,
       );
       assert.match(failure.errorMsg, /API_KEY=\[redacted\]/);
+      assert.match(failure.errorMsg, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(failure.errorMsg, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(failure.errorMsg, /key=\[redacted\]/);
       assert.match(failure.errorMsg, /password: \[redacted\]/);
       assert.match(failure.errorMsg, /https:\/\/\[redacted\]@example\.com\/path/);
-      assert.match(failure.errorMsg, /Authorization: \[redacted\]/);
-      assert.match(failure.errorMsg, /Cookie: \[redacted\]/);
+      assert.match(failure.errorMsg, /session_id=\[redacted\]/);
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {

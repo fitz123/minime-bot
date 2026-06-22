@@ -93,12 +93,16 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
   }
 
   const redacted = sanitized
-    .replace(/\b(Authorization\s*[:=]\s*)(?:Basic|Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")
+    .replace(/\b(Authorization\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi, "$1[redacted]")
+    .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
     .replace(
-      /\b([A-Za-z0-9_.-]*(?:api[_-]?key|authorization|cookie|credential|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+      /\b([A-Za-z0-9_.-]*(?:(?:api|access|private)[_-]?key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(
+      /\b((?:key(?:[_.-][A-Za-z0-9_.-]*)?|[A-Za-z0-9_.-]*[_.-]key(?:[_.-][A-Za-z0-9_.-]*)?)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
       "$1[redacted]",
     )
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/gi, "[redacted]");
