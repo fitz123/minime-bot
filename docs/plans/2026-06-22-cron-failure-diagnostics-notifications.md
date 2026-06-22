@@ -38,11 +38,11 @@ npm run build
 - [x] Ensure fallback `handleDeliveryFailure` message includes the same concise context if delivery fails, without changing `handleDeliveryFailure` signature.
 
 ### Task 2: Add/adjust tests
-- [ ] Deliberately update/replace existing test `keeps subprocess diagnostics out of cron FAIL notifications` to reflect the new bounded/redacted diagnostics policy.
-- [ ] Add or adjust a cron-runner unit test for a Pi/LLM cron failure with diagnostics: delivery message includes diagnostics excerpt.
-- [ ] Add a test proving notification diagnostics are redacted/capped.
-- [ ] Add/adjust a test proving diagnostics absence preserves previous shape.
-- [ ] Add/adjust a delivery-failure fallback test if the implementation changes that path.
+- [x] Deliberately update/replace existing test `keeps subprocess diagnostics out of cron FAIL notifications` to reflect the new bounded/redacted diagnostics policy.
+- [x] Add or adjust a cron-runner unit test for a Pi/LLM cron failure with diagnostics: delivery message includes diagnostics excerpt.
+- [x] Add a test proving notification diagnostics are redacted/capped.
+- [x] Add/adjust a test proving diagnostics absence preserves previous shape.
+- [x] Add/adjust a delivery-failure fallback test if the implementation changes that path.
 
 ### Task 3: Validate and prepare PR
 - [ ] Run focused cron-runner tests.
