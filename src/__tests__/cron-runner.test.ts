@@ -1394,6 +1394,10 @@ bindings: []
       assert.strictEqual(calls.deliveries[0].threadId, 42);
       assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
       assert.match(calls.deliveries[0].message, /runner exploded/);
+      assert.strictEqual(
+        calls.deliveries[0].message,
+        '⚠️ Cron FAIL: main-behavior-task\nCron task "main-behavior-task" failed: runner exploded',
+      );
       assert.deepStrictEqual(calls.deliveryFailures, []);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
@@ -1422,12 +1426,12 @@ bindings: []
       ]);
     });
 
-    it("keeps subprocess diagnostics out of cron FAIL notifications", async () => {
+    it("includes redacted subprocess diagnostics in cron FAIL notifications", async () => {
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron produced stderr without stdout"), {
-          diagnostics: "stderr: secret-token-should-stay-in-local-log",
+          diagnostics: "stderr: fetch failed with Bearer secret-token-should-stay-in-local-log",
         });
       };
 
@@ -1435,6 +1439,7 @@ bindings: []
 
       assert.strictEqual(calls.deliveries.length, 1);
       assert.match(calls.deliveries[0].message, /Pi cron produced stderr without stdout/);
+      assert.match(calls.deliveries[0].message, /Diagnostics: stderr: fetch failed with Bearer \[redacted\]/);
       assert.doesNotMatch(calls.deliveries[0].message, /secret-token/);
       assert.ok(
         calls.logs.some((entry) => entry.message.includes("secret-token-should-stay-in-local-log")),
@@ -1443,6 +1448,42 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
+    });
+
+    it("redacts and caps cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const longDiagnostics = [
+        "stderr:",
+        "API_KEY=secret-api-key",
+        "password: secret-password",
+        "url=https://user:pass@example.com/path",
+        "Authorization: Bearer secret-bearer-token",
+        "x".repeat(500),
+      ].join(" ");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics: longDiagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const diagnosticsLine = calls.deliveries[0].message
+        .split("\n")
+        .find((line) => line.startsWith("Diagnostics: "));
+      assert.ok(diagnosticsLine, "expected diagnostics line");
+      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
+      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
+      assert.doesNotMatch(calls.deliveries[0].message, /secret-api-key|secret-password|secret-bearer-token|user:pass/);
+      assert.match(calls.deliveries[0].message, /API_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /password: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.com\/path/);
+      assert.match(calls.deliveries[0].message, /Bearer \[redacted\]/);
+      assert.ok(
+        calls.logs.some((entry) => entry.message.includes("secret-api-key")),
+        "expected local diagnostics log to remain unchanged",
+      );
     });
 
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
@@ -1468,6 +1509,30 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
+    });
+
+    it("includes diagnostics context in the admin fallback when cron FAIL notification delivery fails", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics: "stderr: fetch failed",
+        });
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("bot blocked");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(calls.deliveryFailures.length, 1);
+      assert.deepStrictEqual(calls.deliveryFailures[0], {
+        cronName: cron.name,
+        targetChatId: 111111111,
+        errorMsg: 'Cron task "main-behavior-task" failed: Pi cron exited with code 1\nDiagnostics: stderr: fetch failed\n(notification delivery failed: bot blocked)',
+        adminChatId: 999999999,
+      });
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {

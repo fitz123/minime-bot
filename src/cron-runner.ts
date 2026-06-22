@@ -44,6 +44,9 @@ const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfi
 const PI_CRON_MODEL = "openai-codex/gpt-5.5";
 const PI_BIN = "pi";
 const PI_ERROR_EXCERPT_CHARS = 1000;
+const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
+const FAILURE_FALLBACK_ERROR_CHARS = 400;
+const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
@@ -78,6 +81,48 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   }
   const diagnostics = (err as { diagnostics?: unknown }).diagnostics;
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
+}
+
+function redactNotificationDiagnostics(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, "$1[redacted]@")
+    .replace(
+      /\b([A-Za-z0-9_.-]*(?:api[_-]?key|token|password|passwd|pwd|secret)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+      "$1[redacted]",
+    );
+}
+
+function truncateNotificationDiagnostics(value: string): string {
+  if (value.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
+    return value;
+  }
+  const suffix = "... [truncated]";
+  return `${value.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
+}
+
+function formatNotificationDiagnostics(diagnostics: string | undefined): string | undefined {
+  if (!diagnostics) {
+    return undefined;
+  }
+  const sanitized = sanitizeCapturedOutput(diagnostics);
+  if (!sanitized) {
+    return undefined;
+  }
+  return truncateNotificationDiagnostics(redactNotificationDiagnostics(sanitized));
+}
+
+function buildCronFailureContext(errMsg: string, diagnostics: string | undefined, errorChars: number): string {
+  const lines = [errMsg.slice(0, errorChars)];
+  const notificationDiagnostics = formatNotificationDiagnostics(diagnostics);
+  if (notificationDiagnostics) {
+    lines.push(`Diagnostics: ${notificationDiagnostics}`);
+  }
+  return lines.join("\n");
+}
+
+function buildCronFailureNotification(taskName: string, errMsg: string, diagnostics: string | undefined): string {
+  return `⚠️ Cron FAIL: ${taskName}\n${buildCronFailureContext(errMsg, diagnostics, FAILURE_NOTIFICATION_ERROR_CHARS)}`;
 }
 
 function log(taskName: string, msg: string): void {
@@ -769,15 +814,17 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     if (diagnostics) {
       deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
     }
+    const failureNotification = buildCronFailureNotification(taskName, errMsg, diagnostics);
+    const failureFallbackContext = buildCronFailureContext(errMsg, diagnostics, FAILURE_FALLBACK_ERROR_CHARS);
 
     // Send failure notification to delivery chat; use admin fallback if delivery fails
     try {
-      deps.deliver(cron.deliveryChatId, `⚠️ Cron FAIL: ${taskName}\n${errMsg.slice(0, 500)}`, cron.deliveryThreadId);
+      deps.deliver(cron.deliveryChatId, failureNotification, cron.deliveryThreadId);
     } catch (deliveryErr) {
       deps.handleDeliveryFailure(
         taskName,
         cron.deliveryChatId,
-        `${errMsg.slice(0, 400)}\n(notification delivery failed: ${(deliveryErr as Error).message})`,
+        `${failureFallbackContext}\n(notification delivery failed: ${(deliveryErr as Error).message})`,
         adminChatId,
       );
     }

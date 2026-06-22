@@ -31,11 +31,11 @@ npm run build
 ## Tasks
 
 ### Task 1: Implement diagnostics in failure notifications
-- [ ] In `src/cron-runner.ts`, build a failure notification string that includes diagnostics when present.
-- [ ] Add notification-only redaction for obvious token/credential shapes before diagnostics leave the host.
-- [ ] Cap notification diagnostics at ~300 chars, separately from existing log diagnostics.
-- [ ] Keep `FAIL diagnostics: ...` local log line unchanged.
-- [ ] Ensure fallback `handleDeliveryFailure` message includes the same concise context if delivery fails, without changing `handleDeliveryFailure` signature.
+- [x] In `src/cron-runner.ts`, build a failure notification string that includes diagnostics when present.
+- [x] Add notification-only redaction for obvious token/credential shapes before diagnostics leave the host.
+- [x] Cap notification diagnostics at ~300 chars, separately from existing log diagnostics.
+- [x] Keep `FAIL diagnostics: ...` local log line unchanged.
+- [x] Ensure fallback `handleDeliveryFailure` message includes the same concise context if delivery fails, without changing `handleDeliveryFailure` signature.
 
 ### Task 2: Add/adjust tests
 - [ ] Deliberately update/replace existing test `keeps subprocess diagnostics out of cron FAIL notifications` to reflect the new bounded/redacted diagnostics policy.
