@@ -54,6 +54,8 @@ const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
   String.raw`(^|[\s{[,])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_. -]+\s*[:=])`,
   "gim",
 );
+const NOTIFICATION_SECRET_QUERY_PARAM_PATTERN =
+  /([?&;])([^=\s&#;]*(?:(?:api|access|private)[_.-]*key|authorization|credentials?|token|password|passwd|pwd|secret|session)[^=\s&#;]*|key)(=)[^&#\s;]*/gi;
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
@@ -105,6 +107,8 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
     .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
+    .replace(NOTIFICATION_SECRET_QUERY_PARAM_PATTERN, "$1$2$3[redacted]")
+    .replace(/\b((?:X-)?API[- ]?Key\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(
       NOTIFICATION_SECRET_ASSIGNMENT_PATTERN,
       (_match, prefix: string, fieldQuote: string, fieldName: string, separator: string, value: string) => {

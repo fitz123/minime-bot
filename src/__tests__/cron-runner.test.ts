@@ -1530,6 +1530,39 @@ bindings: []
       assert.match(calls.deliveries[0].message, /monkey=visible-monkey-value/);
     });
 
+    it("redacts URL query credentials and API key headers in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: POST https://example.com/hook?token=query-token-secret&ok=visible&api_key=query-api-secret",
+        "mirror=https://example.org/path?access_token=query-access-secret;password=query-password-secret#frag",
+        '-H "X-API-Key: header-secret"',
+        "Api-Key: alternate-header-secret",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(
+        message,
+        /query-token-secret|query-api-secret|query-access-secret|query-password-secret|header-secret|alternate-header-secret/,
+      );
+      assert.match(message, /token=\[redacted\]/);
+      assert.match(message, /api_key=\[redacted\]/);
+      assert.match(message, /access_token=\[redacted\]/);
+      assert.match(message, /password=\[redacted\]/);
+      assert.match(message, /ok=visible/);
+      assert.match(message, /X-API-Key: \[redacted\]/);
+      assert.match(message, /Api-Key: \[redacted\]/);
+      assert.match(message, /public_detail=visible/);
+    });
+
     it("redacts JSON credential fields and private key blocks in cron FAIL notification diagnostics", async () => {
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
@@ -1599,6 +1632,7 @@ bindings: []
         "password: secret-password",
         "url=https://user:pass@example.com/path",
         "session_id=secret-session",
+        "callback=https://example.com/hook?token=secret-query-token&safe=1",
         `public_detail=${"x".repeat(500)}`,
       ].join(" ");
       deps.runPi = () => {
@@ -1626,7 +1660,7 @@ bindings: []
       assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
       assert.doesNotMatch(
         failure.errorMsg,
-        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|user:pass/,
+        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|secret-query-token|user:pass/,
       );
       assert.match(failure.errorMsg, /API_KEY=\[redacted\]/);
       assert.match(failure.errorMsg, /PRIVATE_KEY=\[redacted\]/);
@@ -1635,6 +1669,8 @@ bindings: []
       assert.match(failure.errorMsg, /password: \[redacted\]/);
       assert.match(failure.errorMsg, /https:\/\/\[redacted\]@example\.com\/path/);
       assert.match(failure.errorMsg, /session_id=\[redacted\]/);
+      assert.match(failure.errorMsg, /token=\[redacted\]/);
+      assert.match(failure.errorMsg, /safe=1/);
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {
