@@ -1461,7 +1461,7 @@ bindings: []
         "url=https://user:pass@example.com/path",
         "mirror=https://ghp_secretsecretsecretsecret@example.org/repo.git",
         "session_id=secret-session",
-        "x".repeat(500),
+        `public_detail=${"x".repeat(500)}`,
       ].join(" ");
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron exited with code 1"), {
@@ -1530,6 +1530,38 @@ bindings: []
       assert.match(calls.deliveries[0].message, /monkey=visible-monkey-value/);
     });
 
+    it("redacts JSON credential fields and private key blocks in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        'stderr: {"access_token":"json-token-secret","api_key":"json-api-key-secret","password":"json password secret"}',
+        "API Key: correct horse battery staple",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "private-key-material",
+        "-----END OPENSSH PRIVATE KEY-----",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(
+        message,
+        /json-token-secret|json-api-key-secret|json password secret|correct horse|battery staple|private-key-material|BEGIN OPENSSH PRIVATE KEY/,
+      );
+      assert.match(message, /"access_token":"\[redacted\]"/);
+      assert.match(message, /"api_key":"\[redacted\]"/);
+      assert.match(message, /"password":"\[redacted\]"/);
+      assert.match(message, /API Key: \[redacted\]/);
+      assert.match(message, /\[redacted private key\]/);
+      assert.match(message, /public_detail=visible/);
+    });
+
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
@@ -1567,7 +1599,7 @@ bindings: []
         "password: secret-password",
         "url=https://user:pass@example.com/path",
         "session_id=secret-session",
-        "x".repeat(500),
+        `public_detail=${"x".repeat(500)}`,
       ].join(" ");
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron exited with code 1"), {

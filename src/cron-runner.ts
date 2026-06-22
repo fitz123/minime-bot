@@ -47,6 +47,13 @@ const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
+const NOTIFICATION_PRIVATE_KEY_PATTERN =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
+const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:[A-Za-z0-9_. -]*(?:(?:api|access|private)[_. -]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_. -]*|key|[A-Za-z0-9_. -]*(?:[_. -]key|key[_. -])[A-Za-z0-9_. -]*)`;
+const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(^|[\s{[,])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_. -]+\s*[:=])`,
+  "gim",
+);
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
@@ -93,17 +100,17 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
   }
 
   const redacted = sanitized
+    .replace(NOTIFICATION_PRIVATE_KEY_PATTERN, "[redacted private key]")
     .replace(/\b(Authorization\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
     .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
     .replace(
-      /\b([A-Za-z0-9_.-]*(?:(?:api|access|private)[_-]?key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
-      "$1[redacted]",
-    )
-    .replace(
-      /\b((?:key(?:[_.-][A-Za-z0-9_.-]*)?|[A-Za-z0-9_.-]*[_.-]key(?:[_.-][A-Za-z0-9_.-]*)?)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
-      "$1[redacted]",
+      NOTIFICATION_SECRET_ASSIGNMENT_PATTERN,
+      (_match, prefix: string, fieldQuote: string, fieldName: string, separator: string, value: string) => {
+        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+        return `${prefix}${fieldQuote}${fieldName}${fieldQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
+      },
     )
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/gi, "[redacted]");
   if (redacted.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
