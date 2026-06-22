@@ -15,14 +15,16 @@ When a cron fails and `cronErrorDiagnostics(err)` returns useful diagnostics, in
 ## Constraints
 - Keep notification concise and below Telegram limits.
 - Reuse existing sanitization/truncation behavior where possible.
-- Do not include command environment variables or secrets.
-- Preserve current behavior when diagnostics are absent.
-- Preserve existing delivery-failure fallback behavior.
 - Public repo: avoid private data in issue/commit/PR text.
+- Existing diagnostics can include subprocess stderr/stdout. Current test `keeps subprocess diagnostics out of cron FAIL notifications` intentionally prevents leaking diagnostics to Telegram. This plan deliberately changes that policy for bounded diagnostics only.
+- Redaction decision: before adding diagnostics to the notification, apply a small notification-only redaction pass for obvious secret shapes (Bearer tokens, API/key/token/password assignments, URL credentials). Do not claim perfect secret detection; still cap aggressively.
+- Notification diagnostics cap: append at most ~300 chars of redacted diagnostics after the existing error line. Keep existing local `FAIL diagnostics: ...` log unchanged and more detailed.
+- Preserve current notification shape when diagnostics are absent.
+- Preserve existing delivery-failure fallback behavior; build the fallback string at the call site rather than changing `handleDeliveryFailure` signature.
 
 ## Validation Commands
 ```bash
-npm test -- --runTestsByPath src/__tests__/cron-runner.test.ts
+npx tsx --test src/__tests__/cron-runner.test.ts
 npm run build
 ```
 
@@ -30,12 +32,15 @@ npm run build
 
 ### Task 1: Implement diagnostics in failure notifications
 - [ ] In `src/cron-runner.ts`, build a failure notification string that includes diagnostics when present.
-- [ ] Bound/truncate diagnostics separately so long stderr cannot bloat notifications.
+- [ ] Add notification-only redaction for obvious token/credential shapes before diagnostics leave the host.
+- [ ] Cap notification diagnostics at ~300 chars, separately from existing log diagnostics.
 - [ ] Keep `FAIL diagnostics: ...` local log line unchanged.
-- [ ] Ensure fallback `handleDeliveryFailure` message includes the same concise context if delivery fails, without exceeding existing caps.
+- [ ] Ensure fallback `handleDeliveryFailure` message includes the same concise context if delivery fails, without changing `handleDeliveryFailure` signature.
 
 ### Task 2: Add/adjust tests
-- [ ] Add a cron-runner unit test for a Pi/LLM cron failure with diagnostics: delivery message includes diagnostics excerpt.
+- [ ] Deliberately update/replace existing test `keeps subprocess diagnostics out of cron FAIL notifications` to reflect the new bounded/redacted diagnostics policy.
+- [ ] Add or adjust a cron-runner unit test for a Pi/LLM cron failure with diagnostics: delivery message includes diagnostics excerpt.
+- [ ] Add a test proving notification diagnostics are redacted/capped.
 - [ ] Add/adjust a test proving diagnostics absence preserves previous shape.
 - [ ] Add/adjust a delivery-failure fallback test if the implementation changes that path.
 
