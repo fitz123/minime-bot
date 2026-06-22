@@ -45,6 +45,6 @@ npm run build
 - [x] Add/adjust a delivery-failure fallback test if the implementation changes that path.
 
 ### Task 3: Validate and prepare PR
-- [ ] Run focused cron-runner tests.
-- [ ] Run build/typecheck.
-- [ ] Update issue #20 with implementation evidence after success.
+- [x] Run focused cron-runner tests.
+- [x] Run build/typecheck.
+- [x] Update issue #20 with implementation evidence after success.
