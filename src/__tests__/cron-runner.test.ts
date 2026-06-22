@@ -1392,8 +1392,10 @@ bindings: []
       assert.strictEqual(calls.deliveries.length, 1);
       assert.strictEqual(calls.deliveries[0].chatId, 111111111);
       assert.strictEqual(calls.deliveries[0].threadId, 42);
-      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
-      assert.match(calls.deliveries[0].message, /runner exploded/);
+      assert.strictEqual(
+        calls.deliveries[0].message,
+        '⚠️ Cron FAIL: main-behavior-task\nCron task "main-behavior-task" failed: runner exploded',
+      );
       assert.deepStrictEqual(calls.deliveryFailures, []);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
@@ -1422,12 +1424,12 @@ bindings: []
       ]);
     });
 
-    it("keeps subprocess diagnostics out of cron FAIL notifications", async () => {
+    it("includes redacted subprocess diagnostics in cron FAIL notifications", async () => {
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron produced stderr without stdout"), {
-          diagnostics: "stderr: secret-token-should-stay-in-local-log",
+          diagnostics: "stderr: fetch failed with Bearer secret-token-should-stay-in-local-log",
         });
       };
 
@@ -1435,6 +1437,7 @@ bindings: []
 
       assert.strictEqual(calls.deliveries.length, 1);
       assert.match(calls.deliveries[0].message, /Pi cron produced stderr without stdout/);
+      assert.match(calls.deliveries[0].message, /Diagnostics: stderr: fetch failed with Bearer \[redacted\]/);
       assert.doesNotMatch(calls.deliveries[0].message, /secret-token/);
       assert.ok(
         calls.logs.some((entry) => entry.message.includes("secret-token-should-stay-in-local-log")),
@@ -1443,6 +1446,203 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
+    });
+
+    it("redacts and caps cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const longDiagnostics = [
+        "stderr:",
+        "API_KEY=secret-api-key",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
+        "password: secret-password",
+        "url=https://user:pass@example.com/path",
+        "mirror=https://ghp_secretsecretsecretsecret@example.org/repo.git",
+        "session_id=secret-session",
+        `public_detail=${"x".repeat(500)}`,
+      ].join(" ");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics: longDiagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const diagnosticsLine = calls.deliveries[0].message
+        .split("\n")
+        .find((line) => line.startsWith("Diagnostics: "));
+      assert.ok(diagnosticsLine, "expected diagnostics line");
+      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
+      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
+      assert.doesNotMatch(
+        calls.deliveries[0].message,
+        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|user:pass|ghp_secret/,
+      );
+      assert.match(calls.deliveries[0].message, /API_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /password: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.com\/path/);
+      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.org\/repo\.git/);
+      assert.match(calls.deliveries[0].message, /session_id=\[redacted\]/);
+      assert.ok(
+        calls.logs.some((entry) => entry.message.includes("secret-api-key")),
+        "expected local diagnostics log to remain unchanged",
+      );
+    });
+
+    it("redacts full credential headers in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "Authorization: ApiKey authorization-secret",
+        "Cookie: sid=secret-cookie; refresh=secret-refresh",
+        "Set-Cookie: session=secret-set-cookie; Path=/; HttpOnly",
+        "Session: id=secret-session; refresh=secret-session-refresh",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
+        "monkey=visible-monkey-value",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.doesNotMatch(
+        calls.deliveries[0].message,
+        /authorization-secret|secret-cookie|secret-refresh|secret-set-cookie|secret-session|secret-session-refresh|secret-private-key|secret-access-key-id|secret-generic-key/,
+      );
+      assert.match(calls.deliveries[0].message, /Authorization: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Cookie: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Set-Cookie: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /Session: \[redacted\]/);
+      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
+      assert.match(calls.deliveries[0].message, /monkey=visible-monkey-value/);
+    });
+
+    it("redacts URL query credentials and API key headers in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: POST https://example.com/hook?token=query-token-secret&ok=visible&api_key=query-api-secret",
+        "mirror=https://example.org/path?access_token=query-access-secret;password=query-password-secret#frag",
+        '-H "X-API-Key: header-secret"',
+        "Api-Key: alternate-header-secret",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(
+        message,
+        /query-token-secret|query-api-secret|query-access-secret|query-password-secret|header-secret|alternate-header-secret/,
+      );
+      assert.match(message, /token=\[redacted\]/);
+      assert.match(message, /api_key=\[redacted\]/);
+      assert.match(message, /access_token=\[redacted\]/);
+      assert.match(message, /password=\[redacted\]/);
+      assert.match(message, /ok=visible/);
+      assert.match(message, /X-API-Key: \[redacted\]/);
+      assert.match(message, /Api-Key: \[redacted\]/);
+      assert.match(message, /public_detail=visible/);
+    });
+
+    it("redacts JSON credential fields and private key blocks in cron FAIL notification diagnostics", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        'stderr: {"access_token":"json-token-secret","api_key":"json-api-key-secret","password":"json password secret"}',
+        "API Key: correct horse battery staple",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "private-key-material",
+        "-----END OPENSSH PRIVATE KEY-----",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(
+        message,
+        /json-token-secret|json-api-key-secret|json password secret|correct horse|battery staple|private-key-material|BEGIN OPENSSH PRIVATE KEY/,
+      );
+      assert.match(message, /"access_token":"\[redacted\]"/);
+      assert.match(message, /"api_key":"\[redacted\]"/);
+      assert.match(message, /"password":"\[redacted\]"/);
+      assert.match(message, /API Key: \[redacted\]/);
+      assert.match(message, /\[redacted private key\]/);
+      assert.match(message, /public_detail=visible/);
+    });
+
+    it("redacts delimiter-prefixed credential assignments and space-containing passwords", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: Error:OPENAI_API_KEY=colon-secret status=403",
+        "stderr: warning;SESSION_TOKEN=semicolon-secret next=ok",
+        "stderr: password: correct horse battery staple status=401",
+        "public_detail=visible",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(message, /colon-secret|semicolon-secret|correct horse|battery staple|status=\[redacted\]/);
+      assert.match(message, /Error:OPENAI_API_KEY=\[redacted\] status=403/);
+      assert.match(message, /warning;SESSION_TOKEN=\[redacted\] next=ok/);
+      assert.match(message, /password: \[redacted\] status=401/);
+      assert.match(message, /public_detail=visible/);
+    });
+
+    it("redacts space-delimited credential diagnostics without swallowing status fields", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: --token cli-token-secret status=403",
+        "stderr: --password cli-password-secret next=ok",
+        "stderr: token bare-token-secret status=401",
+        "stderr: token expired status=402",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(message, /cli-token-secret|cli-password-secret|bare-token-secret|status=\[redacted\]/);
+      assert.match(message, /--token \[redacted\] status=403/);
+      assert.match(message, /--password \[redacted\] next=ok/);
+      assert.match(message, /token \[redacted\] status=401/);
+      assert.match(message, /token \[redacted\] status=402/);
     });
 
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
@@ -1468,6 +1668,59 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
+    });
+
+    it("includes diagnostics context in the admin fallback when cron FAIL notification delivery fails", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const longDiagnostics = [
+        "stderr:",
+        "API_KEY=secret-api-key",
+        "PRIVATE_KEY=secret-private-key",
+        "AWS_ACCESS_KEY_ID=secret-access-key-id",
+        "key=secret-generic-key",
+        "password: secret-password",
+        "url=https://user:pass@example.com/path",
+        "session_id=secret-session",
+        "callback=https://example.com/hook?token=secret-query-token&safe=1",
+        `public_detail=${"x".repeat(500)}`,
+      ].join(" ");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics: longDiagnostics,
+        });
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("bot blocked");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(calls.deliveryFailures.length, 1);
+      const failure = calls.deliveryFailures[0];
+      assert.strictEqual(failure.cronName, cron.name);
+      assert.strictEqual(failure.targetChatId, 111111111);
+      assert.strictEqual(failure.adminChatId, 999999999);
+      assert.match(failure.errorMsg, /^Cron task "main-behavior-task" failed: Pi cron exited with code 1\nDiagnostics: /);
+      assert.match(failure.errorMsg, /\n\(notification delivery failed: bot blocked\)$/);
+      const diagnosticsLine = failure.errorMsg.split("\n").find((line) => line.startsWith("Diagnostics: "));
+      assert.ok(diagnosticsLine, "expected diagnostics line");
+      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
+      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
+      assert.doesNotMatch(
+        failure.errorMsg,
+        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|secret-query-token|user:pass/,
+      );
+      assert.match(failure.errorMsg, /API_KEY=\[redacted\]/);
+      assert.match(failure.errorMsg, /PRIVATE_KEY=\[redacted\]/);
+      assert.match(failure.errorMsg, /AWS_ACCESS_KEY_ID=\[redacted\]/);
+      assert.match(failure.errorMsg, /key=\[redacted\]/);
+      assert.match(failure.errorMsg, /password: \[redacted\]/);
+      assert.match(failure.errorMsg, /https:\/\/\[redacted\]@example\.com\/path/);
+      assert.match(failure.errorMsg, /session_id=\[redacted\]/);
+      assert.match(failure.errorMsg, /token=\[redacted\]/);
+      assert.match(failure.errorMsg, /safe=1/);
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {

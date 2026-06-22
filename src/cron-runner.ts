@@ -44,6 +44,24 @@ const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfi
 const PI_CRON_MODEL = "openai-codex/gpt-5.5";
 const PI_BIN = "pi";
 const PI_ERROR_EXCERPT_CHARS = 1000;
+const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
+const FAILURE_FALLBACK_ERROR_CHARS = 400;
+const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
+const NOTIFICATION_PRIVATE_KEY_PATTERN =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
+const NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN = String.raw`[A-Za-z0-9_.-]*(?:(?:api|access|private)[_.-]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*`;
+const NOTIFICATION_SECRET_LABEL_FIELD_PATTERN = String.raw`(?:(?:x-)?api[ -]*key|access[ -]*token|private[ -]*key|session[ -]*(?:id|token|key)|authorization|cookie|credentials?|token|password|passwd|pwd|secret)`;
+const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:${NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN}|key|[A-Za-z0-9_.-]*(?:[_.-]key|key[_.-])[A-Za-z0-9_.-]*|${NOTIFICATION_SECRET_LABEL_FIELD_PATTERN})`;
+const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  String.raw`(^|[\s{[,:;])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_.-]+\s*[:=])`,
+  "gim",
+);
+const NOTIFICATION_SECRET_SPACE_VALUE_PATTERN = new RegExp(
+  String.raw`(^|[\s{[,:;])((?:-{1,2})?(?:api[-_]?key|access[-_]?token|private[-_]?key|session[-_]?(?:id|token|key)|auth(?:orization)?|credentials?|token|password|passwd|pwd|secret)|-{1,2}key)(\s+)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\s\r\n,;&}\]]+))`,
+  "gim",
+);
+const NOTIFICATION_SECRET_QUERY_PARAM_PATTERN =
+  /([?&;])([^=\s&#;]*(?:(?:api|access|private)[_.-]*key|authorization|credentials?|token|password|passwd|pwd|secret|session)[^=\s&#;]*|key)(=)[^&#\s;]*/gi;
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
@@ -78,6 +96,46 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   }
   const diagnostics = (err as { diagnostics?: unknown }).diagnostics;
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
+}
+
+function formatNotificationDiagnostics(diagnostics: string | undefined): string | undefined {
+  if (!diagnostics) {
+    return undefined;
+  }
+  const sanitized = sanitizeCapturedOutput(diagnostics);
+  if (!sanitized) {
+    return undefined;
+  }
+
+  const redacted = sanitized
+    .replace(NOTIFICATION_PRIVATE_KEY_PATTERN, "[redacted private key]")
+    .replace(/\b(Authorization\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
+    .replace(NOTIFICATION_SECRET_QUERY_PARAM_PATTERN, "$1$2$3[redacted]")
+    .replace(/\b((?:X-)?API[- ]?Key\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
+    .replace(
+      NOTIFICATION_SECRET_SPACE_VALUE_PATTERN,
+      (_match, prefix: string, fieldName: string, separator: string, value: string) => {
+        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+        return `${prefix}${fieldName}${separator}${valueQuote}[redacted]${valueQuote}`;
+      },
+    )
+    .replace(
+      NOTIFICATION_SECRET_ASSIGNMENT_PATTERN,
+      (_match, prefix: string, fieldQuote: string, fieldName: string, separator: string, value: string) => {
+        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+        return `${prefix}${fieldQuote}${fieldName}${fieldQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
+      },
+    )
+    .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/gi, "[redacted]");
+  if (redacted.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
+    return redacted;
+  }
+
+  const suffix = "... [truncated]";
+  return `${redacted.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
 }
 
 function log(taskName: string, msg: string): void {
@@ -769,15 +827,25 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     if (diagnostics) {
       deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
     }
+    const notificationDiagnostics = formatNotificationDiagnostics(diagnostics);
+    const failureNotificationLines = [`⚠️ Cron FAIL: ${taskName}`, errMsg.slice(0, FAILURE_NOTIFICATION_ERROR_CHARS)];
+    const failureFallbackLines = [errMsg.slice(0, FAILURE_FALLBACK_ERROR_CHARS)];
+    if (notificationDiagnostics) {
+      const diagnosticsLine = `Diagnostics: ${notificationDiagnostics}`;
+      failureNotificationLines.push(diagnosticsLine);
+      failureFallbackLines.push(diagnosticsLine);
+    }
+    const failureNotification = failureNotificationLines.join("\n");
+    const failureFallbackContext = failureFallbackLines.join("\n");
 
     // Send failure notification to delivery chat; use admin fallback if delivery fails
     try {
-      deps.deliver(cron.deliveryChatId, `⚠️ Cron FAIL: ${taskName}\n${errMsg.slice(0, 500)}`, cron.deliveryThreadId);
+      deps.deliver(cron.deliveryChatId, failureNotification, cron.deliveryThreadId);
     } catch (deliveryErr) {
       deps.handleDeliveryFailure(
         taskName,
         cron.deliveryChatId,
-        `${errMsg.slice(0, 400)}\n(notification delivery failed: ${(deliveryErr as Error).message})`,
+        `${failureFallbackContext}\n(notification delivery failed: ${(deliveryErr as Error).message})`,
         adminChatId,
       );
     }
