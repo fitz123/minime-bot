@@ -49,9 +49,15 @@ const FAILURE_FALLBACK_ERROR_CHARS = 400;
 const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
 const NOTIFICATION_PRIVATE_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
-const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:[A-Za-z0-9_. -]*(?:(?:api|access|private)[_. -]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_. -]*|key|[A-Za-z0-9_. -]*(?:[_. -]key|key[_. -])[A-Za-z0-9_. -]*)`;
+const NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN = String.raw`[A-Za-z0-9_.-]*(?:(?:api|access|private)[_.-]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*`;
+const NOTIFICATION_SECRET_LABEL_FIELD_PATTERN = String.raw`(?:(?:x-)?api[ -]*key|access[ -]*token|private[ -]*key|session[ -]*(?:id|token|key)|authorization|cookie|credentials?|token|password|passwd|pwd|secret)`;
+const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:${NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN}|key|[A-Za-z0-9_.-]*(?:[_.-]key|key[_.-])[A-Za-z0-9_.-]*|${NOTIFICATION_SECRET_LABEL_FIELD_PATTERN})`;
 const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
   String.raw`(^|[\s{[,:;])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_.-]+\s*[:=])`,
+  "gim",
+);
+const NOTIFICATION_SECRET_SPACE_VALUE_PATTERN = new RegExp(
+  String.raw`(^|[\s{[,:;])((?:-{1,2})?(?:api[-_]?key|access[-_]?token|private[-_]?key|session[-_]?(?:id|token|key)|auth(?:orization)?|credentials?|token|password|passwd|pwd|secret)|-{1,2}key)(\s+)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\s\r\n,;&}\]]+))`,
   "gim",
 );
 const NOTIFICATION_SECRET_QUERY_PARAM_PATTERN =
@@ -109,6 +115,13 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
     .replace(NOTIFICATION_SECRET_QUERY_PARAM_PATTERN, "$1$2$3[redacted]")
     .replace(/\b((?:X-)?API[- ]?Key\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
+    .replace(
+      NOTIFICATION_SECRET_SPACE_VALUE_PATTERN,
+      (_match, prefix: string, fieldName: string, separator: string, value: string) => {
+        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+        return `${prefix}${fieldName}${separator}${valueQuote}[redacted]${valueQuote}`;
+      },
+    )
     .replace(
       NOTIFICATION_SECRET_ASSIGNMENT_PATTERN,
       (_match, prefix: string, fieldQuote: string, fieldName: string, separator: string, value: string) => {

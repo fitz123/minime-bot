@@ -1613,11 +1613,36 @@ bindings: []
       await assertMainExits(deps, 1);
 
       const message = calls.deliveries[0].message;
-      assert.doesNotMatch(message, /colon-secret|semicolon-secret|correct horse|battery staple/);
+      assert.doesNotMatch(message, /colon-secret|semicolon-secret|correct horse|battery staple|status=\[redacted\]/);
       assert.match(message, /Error:OPENAI_API_KEY=\[redacted\] status=403/);
       assert.match(message, /warning;SESSION_TOKEN=\[redacted\] next=ok/);
       assert.match(message, /password: \[redacted\] status=401/);
       assert.match(message, /public_detail=visible/);
+    });
+
+    it("redacts space-delimited credential diagnostics without swallowing status fields", async () => {
+      const cron = makeMainCron({ engine: "pi" });
+      const { calls, deps } = makeMainHarness(cron);
+      const diagnostics = [
+        "stderr: --token cli-token-secret status=403",
+        "stderr: --password cli-password-secret next=ok",
+        "stderr: token bare-token-secret status=401",
+        "stderr: token expired status=402",
+      ].join("\n");
+      deps.runPi = () => {
+        throw Object.assign(new Error("Pi cron exited with code 1"), {
+          diagnostics,
+        });
+      };
+
+      await assertMainExits(deps, 1);
+
+      const message = calls.deliveries[0].message;
+      assert.doesNotMatch(message, /cli-token-secret|cli-password-secret|bare-token-secret|status=\[redacted\]/);
+      assert.match(message, /--token \[redacted\] status=403/);
+      assert.match(message, /--password \[redacted\] next=ok/);
+      assert.match(message, /token \[redacted\] status=401/);
+      assert.match(message, /token \[redacted\] status=402/);
     });
 
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
