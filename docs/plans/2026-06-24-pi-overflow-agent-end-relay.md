@@ -77,9 +77,9 @@ If targeted npm test argument semantics do not work with Node's test runner, use
 
 ### Task 3: Implement the minimal parser fix
 
-- [ ] Implement helper(s) in `src/pi-rpc-protocol.ts` without changing transport/session-manager behavior.
-- [ ] Use raw Pi fields defensively; unknown event shapes must still not throw.
-- [ ] Keep normal successful multi-turn and single-turn tests passing.
+- [x] Implement helper(s) in `src/pi-rpc-protocol.ts` without changing transport/session-manager behavior.
+- [x] Use raw Pi fields defensively; unknown event shapes must still not throw.
+- [x] Keep normal successful multi-turn and single-turn tests passing.
 
 ### Task 4: Validate and update issue
 
