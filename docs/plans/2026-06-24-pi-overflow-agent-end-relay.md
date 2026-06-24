@@ -65,9 +65,9 @@ If targeted npm test argument semantics do not work with Node's test runner, use
 
 ### Task 1: Reproduce the relay classification bug in tests
 
-- [ ] Add a `parsePiEvent` regression test for a Pi `agent_end` whose final assistant has `stopReason: "error"`, `errorMessage` containing `context_length_exceeded`, empty/no text content, and `willRetry: true`.
-- [ ] Assert the event is ignored (`null`) so the stream is not finalized before compaction/retry output.
-- [ ] Add a sequence-level test where intermediate overflow `agent_end` is followed by a successful final `agent_end`; assert only the final answer becomes a terminal result.
+- [x] Add a `parsePiEvent` regression test for a Pi `agent_end` whose final assistant has `stopReason: "error"`, `errorMessage` containing `context_length_exceeded`, empty/no text content, and `willRetry: true`.
+- [x] Assert the event is ignored (`null`) so the stream is not finalized before compaction/retry output.
+- [x] Add a sequence-level test where intermediate overflow `agent_end` is followed by a successful final `agent_end`; assert only the final answer becomes a terminal result.
 
 ### Task 2: Surface terminal error-only `agent_end`
 

@@ -1496,6 +1496,58 @@ describe("parsePiEvent", () => {
     assert.strictEqual((line as { session_id: string }).session_id, "");
   });
 
+  it("ignores a retryable context-overflow agent_end so compaction can continue", () => {
+    const line = parsePiEvent({
+      type: "agent_end",
+      willRetry: true,
+      messages: [
+        { role: "user", content: "summarize the workspace" },
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage:
+            "context_length_exceeded: input exceeds the context window",
+          content: [],
+        },
+      ],
+    });
+
+    assert.strictEqual(line, null);
+  });
+
+  it("keeps reading after a retryable overflow agent_end until the successful final agent_end", () => {
+    const sequence = [
+      {
+        type: "agent_end",
+        willRetry: true,
+        messages: [
+          { role: "user", content: "summarize the workspace" },
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage:
+              "context_length_exceeded: input exceeds the context window",
+            content: [],
+          },
+        ],
+      },
+      {
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "summarize the workspace" },
+          { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
+        ],
+      },
+    ];
+
+    const lines = sequence.map((event) => parsePiEvent(event));
+    const terminals = lines.filter((line) => line?.type === "result");
+
+    assert.strictEqual(lines[0], null);
+    assert.strictEqual(terminals.length, 1);
+    assert.strictEqual((terminals[0] as { result: string }).result, "post-compaction answer");
+  });
+
   it("multi-turn sequence (2x turn_end + 1x agent_end) terminates exactly once with the FINAL text", () => {
     // Verified live sequence: a tool-using response fires turn_end per turn, then
     // a single agent_end. Only agent_end is terminal, and it carries the final answer.

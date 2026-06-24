@@ -639,6 +639,12 @@ function extractAssistantText(message: unknown): string {
     .join("");
 }
 
+interface FinalAssistantInfo {
+  text: string;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
  * rejection — a second prompt sent mid-turn with no `streamingBehavior`. Pi
@@ -666,8 +672,12 @@ export function isPiAlreadyProcessingRejection(error: string | undefined | null)
  * concatenating the text blocks of the LAST assistant message.
  */
 function extractFinalAssistantText(messages: unknown): string {
+  return extractFinalAssistantInfo(messages).text;
+}
+
+function extractFinalAssistantInfo(messages: unknown): FinalAssistantInfo {
   if (!Array.isArray(messages)) {
-    return "";
+    return { text: "" };
   }
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
@@ -676,10 +686,29 @@ function extractFinalAssistantText(messages: unknown): string {
       typeof msg === "object" &&
       (msg as { role?: unknown }).role === "assistant"
     ) {
-      return extractAssistantText(msg);
+      const stopReason = (msg as { stopReason?: unknown }).stopReason;
+      const errorMessage = (msg as { errorMessage?: unknown }).errorMessage;
+      return {
+        text: extractAssistantText(msg),
+        stopReason: typeof stopReason === "string" ? stopReason : undefined,
+        errorMessage: typeof errorMessage === "string" ? errorMessage : undefined,
+      };
     }
   }
-  return "";
+  return { text: "" };
+}
+
+function isContextOverflowError(message: string | undefined): boolean {
+  if (typeof message !== "string") {
+    return false;
+  }
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("context_length_exceeded") ||
+    normalized.includes("exceeds the context window") ||
+    normalized.includes("maximum context length") ||
+    normalized.includes("too many tokens")
+  );
 }
 
 /**
@@ -693,8 +722,9 @@ function extractFinalAssistantText(messages: unknown): string {
  * - `tool_execution_start` → synthetic `StreamEvent` shaped as a
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
  * - `agent_end` → terminal `ResultMessage`; the result text is the FINAL assistant
- *   message text reconstructed from `agent_end.messages`. `agent_end` fires exactly
- *   once at the very end of a run.
+ *   message text reconstructed from `agent_end.messages`. A retryable context
+ *   overflow `agent_end` returns null so Pi's compaction continuation can produce
+ *   the actual terminal answer.
  * - `turn_end` → `null`. It is a per-turn boundary that fires once PER turn, so a
  *   multi-turn (tool-using) response emits several `turn_end`s before its single
  *   `agent_end`. Treating `turn_end` as terminal truncates such responses at their
@@ -757,9 +787,17 @@ export function parsePiEvent(rawEvent: PiRpcEvent | null | undefined): StreamLin
       return null;
 
     case "agent_end": {
+      const finalAssistant = extractFinalAssistantInfo(rawEvent.messages);
+      if (
+        rawEvent.willRetry === true &&
+        finalAssistant.stopReason?.toLowerCase() === "error" &&
+        isContextOverflowError(finalAssistant.errorMessage)
+      ) {
+        return null;
+      }
       const result: ResultMessage = {
         type: "result",
-        result: extractFinalAssistantText(rawEvent.messages),
+        result: finalAssistant.text,
         session_id: rawEvent.sessionId ?? "",
       };
       return result;
