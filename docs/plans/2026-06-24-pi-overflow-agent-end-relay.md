@@ -71,9 +71,9 @@ If targeted npm test argument semantics do not work with Node's test runner, use
 
 ### Task 2: Surface terminal error-only `agent_end`
 
-- [ ] Add a test for `agent_end` with final assistant `stopReason: "error"`, no assistant text, and no retry/recovery signal.
-- [ ] Assert it returns an error `ResultMessage` with non-empty text and `is_error: true`.
-- [ ] Preserve existing behavior for non-error `agent_end` with no text if tests require it, or update the test intentionally if the old behavior was the silent-drop footgun.
+- [x] Add a test for `agent_end` with final assistant `stopReason: "error"`, no assistant text, and no retry/recovery signal.
+- [x] Assert it returns an error `ResultMessage` with non-empty text and `is_error: true`.
+- [x] Preserve existing behavior for non-error `agent_end` with no text if tests require it, or update the test intentionally if the old behavior was the silent-drop footgun.
 
 ### Task 3: Implement the minimal parser fix
 

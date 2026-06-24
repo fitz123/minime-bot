@@ -1496,6 +1496,28 @@ describe("parsePiEvent", () => {
     assert.strictEqual((line as { session_id: string }).session_id, "");
   });
 
+  it("surfaces a terminal error-only agent_end as a non-empty error result", () => {
+    const line = parsePiEvent({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "summarize the workspace" },
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "Model returned an error before producing final text",
+          content: [],
+        },
+      ],
+    });
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(result.result, "Model returned an error before producing final text");
+    assert.strictEqual(result.is_error, true);
+  });
+
   it("ignores a retryable context-overflow agent_end so compaction can continue", () => {
     const line = parsePiEvent({
       type: "agent_end",

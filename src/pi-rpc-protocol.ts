@@ -795,6 +795,16 @@ export function parsePiEvent(rawEvent: PiRpcEvent | null | undefined): StreamLin
       ) {
         return null;
       }
+      if (finalAssistant.stopReason?.toLowerCase() === "error" && finalAssistant.text.length === 0) {
+        const result: ResultMessage = {
+          type: "result",
+          subtype: "error_during_execution",
+          result: finalAssistant.errorMessage?.trim() || "Pi RPC agent failed",
+          session_id: rawEvent.sessionId ?? "",
+          is_error: true,
+        };
+        return result;
+      }
       const result: ResultMessage = {
         type: "result",
         result: finalAssistant.text,
