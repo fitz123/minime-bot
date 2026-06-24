@@ -2060,6 +2060,59 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("surfaces a standalone context-overflow agent_end while stdout stays open", async () => {
+    const stdout = new Readable({ read() {} });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout });
+    const stream = readPiStream(child);
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const next = stream.next();
+      stdout.push(
+        JSON.stringify({
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage:
+                "context_length_exceeded: input exceeds the context window",
+              content: [],
+            },
+          ],
+        }) + "\n",
+      );
+
+      const line = await Promise.race([
+        next,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("timed out waiting for standalone overflow result")),
+            2_000,
+          );
+        }),
+      ]);
+
+      assert.strictEqual(line.done, false);
+      assert.strictEqual(line.value.type, "result");
+      const result = line.value as unknown as Record<string, unknown>;
+      assert.strictEqual(result.subtype, "error_during_execution");
+      assert.strictEqual(
+        result.result,
+        "context_length_exceeded: input exceeds the context window",
+      );
+      assert.strictEqual(result.is_error, true);
+      assert.strictEqual(stdout.destroyed, false, "open stdout must not be destroyed");
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      await stream.return(undefined);
+      stdout.destroy();
+    }
+  });
+
   it("handles records split across stdout chunks", async () => {
     const child = new EventEmitter() as unknown as ChildProcess;
     const record = JSON.stringify({

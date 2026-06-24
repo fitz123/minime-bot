@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, normalize, resolve } from "node:path";
+import type { Readable } from "node:stream";
 import type {
   AgentConfig,
   StreamLine,
@@ -649,10 +650,12 @@ interface FinalAssistantInfo {
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
   pendingOverflowResetEmitted?: boolean;
+  pendingOverflowAwaitingRecoverySignal?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
+const PI_RPC_OVERFLOW_RECOVERY_SIGNAL_TIMEOUT_MS = 500;
 
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
@@ -743,6 +746,7 @@ function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): Resu
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
     state.pendingOverflowResetEmitted = undefined;
+    state.pendingOverflowAwaitingRecoverySignal = undefined;
   }
   return result;
 }
@@ -756,15 +760,24 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
     PI_RPC_OVERFLOW_FAILURE_MESSAGE;
   state.pendingOverflowErrorMessage = undefined;
   state.pendingOverflowResetEmitted = undefined;
+  state.pendingOverflowAwaitingRecoverySignal = undefined;
   return buildPiRpcErrorResult(message, rawEvent?.sessionId);
 }
 
 function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
+  state.pendingOverflowAwaitingRecoverySignal = false;
   if (state.pendingOverflowResetEmitted) {
     return null;
   }
   state.pendingOverflowResetEmitted = true;
   return buildPiRpcRetryResetEvent();
+}
+
+function shouldFlushPendingOverflowAfterLookahead(state: PiRpcParseState): boolean {
+  return Boolean(
+    state.pendingOverflowErrorMessage &&
+    state.pendingOverflowAwaitingRecoverySignal,
+  );
 }
 
 /**
@@ -862,6 +875,7 @@ export function parsePiEvent(
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
           state.pendingOverflowErrorMessage = overflowMessage;
+          state.pendingOverflowAwaitingRecoverySignal = rawEvent.willRetry !== true;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
           }
@@ -1003,6 +1017,52 @@ export function parsePiEvent(
   }
 }
 
+type PiStdoutWaitResult = "readable" | "end" | "close" | "timeout";
+
+function waitForPiStdout(
+  stdout: Readable,
+  timeoutMs?: number,
+): Promise<PiStdoutWaitResult> {
+  if (stdout.readableEnded) {
+    return Promise.resolve("end");
+  }
+  if (stdout.destroyed) {
+    return Promise.resolve("close");
+  }
+
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      stdout.off("readable", onReadable);
+      stdout.off("end", onEnd);
+      stdout.off("close", onClose);
+      stdout.off("error", onError);
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+    const finish = (result: PiStdoutWaitResult) => {
+      cleanup();
+      resolve(result);
+    };
+    const onReadable = () => finish("readable");
+    const onEnd = () => finish("end");
+    const onClose = () => finish("close");
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    stdout.once("readable", onReadable);
+    stdout.once("end", onEnd);
+    stdout.once("close", onClose);
+    stdout.once("error", onError);
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => finish("timeout"), timeoutMs);
+    }
+  });
+}
+
 /**
  * Async generator yielding translated `StreamLine`s from a Pi RPC child's
  * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. Malformed
@@ -1017,17 +1077,31 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
   const splitter = new NewlineOnlyJsonlSplitter();
   const parseState: PiRpcParseState = {};
 
-  // destroyOnReturn:false honors the single-consumer handoff contract: the
-  // spawn-path get_state capture opens this generator, reads the one SystemInit
-  // record, then calls generator.return() to stop. A default async iterator would
-  // destroy child.stdout on that early return, breaking every later
-  // sendSessionMessage (each opens a fresh readPiStream on the same stdout).
-  for await (const chunk of stdout.iterator({ destroyOnReturn: false })) {
-    for (const record of splitter.push(chunk as Buffer)) {
-      const line = parsePiRecord(record, parseState);
-      if (line) {
-        yield line;
+  for (;;) {
+    let chunk: Buffer | string | null;
+    while ((chunk = stdout.read()) !== null) {
+      for (const record of splitter.push(chunk)) {
+        const line = parsePiRecord(record, parseState);
+        if (line) {
+          yield line;
+        }
       }
+    }
+
+    const waitResult = await waitForPiStdout(
+      stdout,
+      shouldFlushPendingOverflowAfterLookahead(parseState)
+        ? PI_RPC_OVERFLOW_RECOVERY_SIGNAL_TIMEOUT_MS
+        : undefined,
+    );
+    if (waitResult === "timeout") {
+      if (parseState.pendingOverflowErrorMessage) {
+        yield buildPendingOverflowErrorResult(parseState);
+      }
+      continue;
+    }
+    if (waitResult === "end" || waitResult === "close") {
+      break;
     }
   }
 
