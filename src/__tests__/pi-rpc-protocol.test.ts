@@ -2060,6 +2060,58 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("surfaces an explicit non-retryable context-overflow agent_end while stdout stays open", async () => {
+    const stdout = new Readable({ read() {} });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout });
+    const stream = readPiStream(child);
+
+    try {
+      const next = stream.next();
+      stdout.push(
+        JSON.stringify({
+          type: "agent_end",
+          willRetry: false,
+          sessionId: "test-session",
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage:
+                "context_length_exceeded: input exceeds the context window",
+              content: [],
+            },
+          ],
+        }) + "\n",
+      );
+
+      const result = await Promise.race([
+        next,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(
+            () => reject(new Error("timed out waiting for non-retryable overflow result")),
+            1_000,
+          );
+        }),
+      ]);
+
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      const line = result.value as unknown as Record<string, unknown>;
+      assert.strictEqual(line.subtype, "error_during_execution");
+      assert.strictEqual(
+        line.result,
+        "context_length_exceeded: input exceeds the context window",
+      );
+      assert.strictEqual(line.session_id, "test-session");
+      assert.strictEqual(line.is_error, true);
+      assert.strictEqual(stdout.destroyed, false, "open stdout must not be destroyed");
+    } finally {
+      await stream.return(undefined);
+      stdout.destroy();
+    }
+  });
+
   it("waits for delayed overflow recovery while stdout stays open", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;

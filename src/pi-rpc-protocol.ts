@@ -862,6 +862,12 @@ export function parsePiEvent(
         const overflowMessage =
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
+          if (rawEvent.willRetry === false) {
+            return finishPiRpcResult(
+              buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
+              state,
+            );
+          }
           state.pendingOverflowErrorMessage = overflowMessage;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
