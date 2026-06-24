@@ -83,5 +83,5 @@ If targeted npm test argument semantics do not work with Node's test runner, use
 
 ### Task 4: Validate and update issue
 
-- [ ] Run focused tests and typecheck.
-- [ ] Update issue #22 with the fix summary and validation evidence after implementation.
+- [x] Run focused tests and typecheck.
+- [x] Update issue #22 with the fix summary and validation evidence after implementation.
