@@ -4,7 +4,7 @@
 
 Fix issue #22: when Pi emits an `agent_end` for a failed context-overflow assistant before compaction/retry, minime-bot must not treat that intermediate event as the final Telegram answer. The user must either receive the post-compaction answer or a non-empty failure message.
 
-Claude planning validation note: `claude -p` was attempted from the bot/launchd-like environment and failed with `401 Invalid authentication credentials`; proceed with this Codex/Ralphex plan.
+Claude planning validation note: `claude -p` was attempted from the bot/launchd-like environment and failed with `401 Invalid authentication credentials`; proceed with this Codex plan.
 
 ## Context
 

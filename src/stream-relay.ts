@@ -72,6 +72,14 @@ function extractTextDelta(msg: StreamLine): string | null {
   return null;
 }
 
+function shouldResetAccumulatedText(msg: StreamLine): boolean {
+  return (
+    msg.type === "assistant" &&
+    msg.subtype === "control_request" &&
+    (msg as { action?: unknown }).action === "reset_response_text"
+  );
+}
+
 /**
  * Extract text content from a stream line.
  * Returns text delta for streaming events, full text for assistant/result messages.
@@ -226,6 +234,12 @@ export async function relayStream(
       if (!ownershipSignaled) {
         ownershipSignaled = true;
         onAgentOwnership?.();
+      }
+      if (shouldResetAccumulatedText(msg)) {
+        accumulated = "";
+        resultText = null;
+        sawNonTextBlock = false;
+        continue;
       }
       // Detect non-text content blocks (tool_use, etc.) so we can insert a
       // paragraph break when the next text block starts.  Without this,

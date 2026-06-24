@@ -9,6 +9,7 @@ import type {
   SystemInit,
   RateLimitEvent,
   ResultMessage,
+  ControlRequest,
 } from "./types.js";
 import { log } from "./logger.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
@@ -728,6 +729,15 @@ function buildPiRpcErrorResult(message: string, sessionId: string | undefined): 
   };
 }
 
+function buildPiRpcRetryResetEvent(): ControlRequest {
+  return {
+    type: "assistant",
+    subtype: "control_request",
+    action: "reset_response_text",
+    reason: "pi_context_overflow_retry",
+  };
+}
+
 function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): ResultMessage {
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
@@ -758,8 +768,9 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
  * - `agent_end` → terminal `ResultMessage`; the result text is the FINAL assistant
  *   message text reconstructed from `agent_end.messages`. A context overflow
- *   `agent_end` seen in stream state returns null so Pi's compaction continuation
- *   can produce the actual terminal answer.
+ *   `agent_end` with an explicit retry signal emits an internal reset event in
+ *   stream state so Pi's compaction continuation can produce the actual terminal
+ *   answer.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end becomes the visible terminal
  *   error for that deferred overflow.
@@ -835,12 +846,13 @@ export function parsePiEvent(
         finalAssistant.text.length === 0 &&
         isContextOverflowError(finalAssistant.errorMessage)
       ) {
-        if (state) {
-          state.pendingOverflowErrorMessage =
-            nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
-          return null;
-        }
         if (rawEvent.willRetry === true) {
+          const overflowMessage =
+            nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+          if (state) {
+            state.pendingOverflowErrorMessage = overflowMessage;
+            return buildPiRpcRetryResetEvent();
+          }
           return null;
         }
       }

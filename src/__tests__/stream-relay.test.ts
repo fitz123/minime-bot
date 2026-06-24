@@ -950,6 +950,32 @@ describe("relayStream edge cases", () => {
     assert.strictEqual(sends[0].text, "Fallback text from result");
   });
 
+  it("clears stale accumulated deltas after a retry reset signal", async () => {
+    const { platform, sends } = mockPlatform();
+    async function* recoveredStream(): AsyncGenerator<StreamLine> {
+      yield {
+        type: "stream_event",
+        event: { delta: { type: "text_delta", text: "stale pre-retry text" } },
+      } as StreamEvent;
+      yield {
+        type: "assistant",
+        subtype: "control_request",
+        action: "reset_response_text",
+        reason: "pi_context_overflow_retry",
+      };
+      yield {
+        type: "result",
+        result: "post-compaction answer",
+        session_id: "test",
+      } as ResultMessage;
+    }
+
+    await relayStream(recoveredStream(), platform);
+
+    assert.strictEqual(sends.length, 1);
+    assert.strictEqual(sends[0].text, "post-compaction answer");
+  });
+
   it("handles empty stream without sending any messages", async () => {
     const { platform, sends, drafts } = mockPlatform();
     async function* emptyStream(): AsyncGenerator<StreamLine> {
