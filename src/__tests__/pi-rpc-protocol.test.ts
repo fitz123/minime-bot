@@ -1,7 +1,7 @@
 import { describe, it, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { PassThrough, Readable, Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -1586,7 +1586,7 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("does not ignore non-overflow agent_end errors even when willRetry is true", () => {
+  it("does not treat unknown agent_end willRetry fields as recoverable without an overflow", () => {
     const line = parsePiEvent({
       type: "agent_end",
       willRetry: true,
@@ -1915,7 +1915,6 @@ describe("readPiStream", () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "agent_end",
-        willRetry: true,
         messages: [
           { role: "user", content: "summarize the workspace" },
           {
@@ -1961,7 +1960,6 @@ describe("readPiStream", () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "agent_end",
-        willRetry: true,
         messages: [
           {
             role: "assistant",
@@ -1998,7 +1996,6 @@ describe("readPiStream", () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "agent_end",
-        willRetry: true,
         messages: [
           {
             role: "assistant",
@@ -2030,53 +2027,37 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("surfaces a standalone context-overflow agent_end immediately while stdout stays open", async () => {
-    const child = new EventEmitter() as unknown as ChildProcess;
-    const stdout = new PassThrough();
-    Object.assign(child, { stdout });
-    stdout.write(`${JSON.stringify({
-      type: "agent_end",
-      willRetry: false,
-      messages: [
-        {
-          role: "assistant",
-          stopReason: "error",
-          errorMessage:
-            "context_length_exceeded: input exceeds the context window",
-          content: [],
-        },
-      ],
-    })}\n`);
+  it("surfaces a standalone context-overflow agent_end when stdout ends without recovery", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage:
+              "context_length_exceeded: input exceeds the context window",
+            content: [],
+          },
+        ],
+      }),
+    ]);
 
-    const stream = readPiStream(child);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const next = await Promise.race([
-        stream.next(),
-        new Promise<IteratorResult<StreamLine>>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error("timed out waiting for terminal overflow result")),
-            250,
-          );
-        }),
-      ]);
-
-      assert.strictEqual(next.done, false);
-      const result = next.value as unknown as Record<string, unknown>;
-      assert.strictEqual(result.type, "result");
-      assert.strictEqual(result.subtype, "error_during_execution");
-      assert.strictEqual(
-        result.result,
-        "context_length_exceeded: input exceeds the context window",
-      );
-      assert.strictEqual(result.is_error, true);
-    } finally {
-      if (timer) {
-        clearTimeout(timer);
-      }
-      await stream.return(undefined);
-      stdout.destroy();
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
     }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.is_error, true);
   });
 
   it("handles records split across stdout chunks", async () => {

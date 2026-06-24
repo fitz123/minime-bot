@@ -648,6 +648,7 @@ interface FinalAssistantInfo {
 
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
+  pendingOverflowResetEmitted?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
@@ -741,6 +742,7 @@ function buildPiRpcRetryResetEvent(): ControlRequest {
 function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): ResultMessage {
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
+    state.pendingOverflowResetEmitted = undefined;
   }
   return result;
 }
@@ -753,7 +755,16 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
     state.pendingOverflowErrorMessage ??
     PI_RPC_OVERFLOW_FAILURE_MESSAGE;
   state.pendingOverflowErrorMessage = undefined;
+  state.pendingOverflowResetEmitted = undefined;
   return buildPiRpcErrorResult(message, rawEvent?.sessionId);
+}
+
+function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
+  if (state.pendingOverflowResetEmitted) {
+    return null;
+  }
+  state.pendingOverflowResetEmitted = true;
+  return buildPiRpcRetryResetEvent();
 }
 
 /**
@@ -768,9 +779,10 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
  * - `agent_end` → terminal `ResultMessage`; the result text is the FINAL assistant
  *   message text reconstructed from `agent_end.messages`. A context overflow
- *   `agent_end` with an explicit retry signal emits an internal reset event in
- *   stream state so Pi's compaction continuation can produce the actual terminal
- *   answer.
+ *   `agent_end` can be followed by compaction/retry records even though
+ *   `agent_end` itself carries no retry field in Pi's RPC contract, so the
+ *   stateful stream reader defers that overflow-only record until recovery
+ *   succeeds, fails, or stdout ends.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end becomes the visible terminal
  *   error for that deferred overflow.
@@ -846,13 +858,16 @@ export function parsePiEvent(
         finalAssistant.text.length === 0 &&
         isContextOverflowError(finalAssistant.errorMessage)
       ) {
-        if (rawEvent.willRetry === true) {
-          const overflowMessage =
-            nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
-          if (state) {
-            state.pendingOverflowErrorMessage = overflowMessage;
-            return buildPiRpcRetryResetEvent();
+        const overflowMessage =
+          nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+        if (state) {
+          state.pendingOverflowErrorMessage = overflowMessage;
+          if (rawEvent.willRetry === true) {
+            return markPendingOverflowRetry(state);
           }
+          return null;
+        }
+        if (rawEvent.willRetry === true) {
           return null;
         }
       }
@@ -874,6 +889,9 @@ export function parsePiEvent(
     }
 
     case "compaction_start":
+      if (state?.pendingOverflowErrorMessage) {
+        return markPendingOverflowRetry(state);
+      }
       return null;
 
     case "compaction_end":
@@ -881,11 +899,12 @@ export function parsePiEvent(
         return null;
       }
       if (rawEvent.willRetry === true) {
-        return null;
+        return markPendingOverflowRetry(state);
       }
       if (
         rawEvent.willRetry === false ||
         rawEvent.success === false ||
+        rawEvent.aborted === true ||
         nonEmptyText(rawEvent.errorMessage) ||
         nonEmptyText(rawEvent.error) ||
         nonEmptyText(rawEvent.message)
