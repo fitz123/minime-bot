@@ -2060,13 +2060,12 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("surfaces a standalone context-overflow agent_end while stdout stays open", async () => {
+  it("waits for delayed overflow recovery while stdout stays open", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, { stdout });
     const stream = readPiStream(child);
 
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const next = stream.next();
       stdout.push(
@@ -2084,30 +2083,55 @@ describe("readPiStream", () => {
         }) + "\n",
       );
 
-      const line = await Promise.race([
-        next,
+      const early = await Promise.race([
+        next.then(() => "resolved" as const),
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 650);
+        }),
+      ]);
+
+      assert.strictEqual(
+        early,
+        "pending",
+        "overflow recovery must not be finalized before Pi has a chance to emit delayed compaction records",
+      );
+
+      stdout.push(JSON.stringify({ type: "compaction_start", reason: "overflow" }) + "\n");
+      const reset = await next;
+      assert.strictEqual(reset.done, false);
+      assert.strictEqual(reset.value.type, "assistant");
+      assert.strictEqual(reset.value.subtype, "control_request");
+      assert.strictEqual((reset.value as { action?: unknown }).action, "reset_response_text");
+
+      const finalNext = stream.next();
+      stdout.push(JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }) + "\n");
+      stdout.push(
+        JSON.stringify({
+          type: "agent_end",
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "post-compaction answer" }],
+            },
+          ],
+        }) + "\n",
+      );
+
+      const final = await Promise.race([
+        finalNext,
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error("timed out waiting for standalone overflow result")),
+          setTimeout(
+            () => reject(new Error("timed out waiting for delayed overflow recovery")),
             2_000,
           );
         }),
       ]);
-
-      assert.strictEqual(line.done, false);
-      assert.strictEqual(line.value.type, "result");
-      const result = line.value as unknown as Record<string, unknown>;
-      assert.strictEqual(result.subtype, "error_during_execution");
-      assert.strictEqual(
-        result.result,
-        "context_length_exceeded: input exceeds the context window",
-      );
-      assert.strictEqual(result.is_error, true);
+      assert.strictEqual(final.done, false);
+      assert.strictEqual(final.value.type, "result");
+      assert.strictEqual((final.value as { result: string }).result, "post-compaction answer");
+      assert.strictEqual((final.value as { is_error?: boolean }).is_error, undefined);
       assert.strictEqual(stdout.destroyed, false, "open stdout must not be destroyed");
     } finally {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
       await stream.return(undefined);
       stdout.destroy();
     }

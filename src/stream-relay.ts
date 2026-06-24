@@ -275,6 +275,10 @@ export async function relayStream(
       // Track result text as fallback when no streaming deltas arrive
       if (msg.type === "result" && msg.result) {
         resultText = msg.result;
+        if (msg.is_error === true) {
+          accumulated = msg.result;
+          sawNonTextBlock = false;
+        }
       }
 
       if (isFinal) {

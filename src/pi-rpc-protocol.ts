@@ -650,12 +650,10 @@ interface FinalAssistantInfo {
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
   pendingOverflowResetEmitted?: boolean;
-  pendingOverflowAwaitingRecoverySignal?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
-const PI_RPC_OVERFLOW_RECOVERY_SIGNAL_TIMEOUT_MS = 500;
 
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
@@ -746,7 +744,6 @@ function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): Resu
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
     state.pendingOverflowResetEmitted = undefined;
-    state.pendingOverflowAwaitingRecoverySignal = undefined;
   }
   return result;
 }
@@ -760,24 +757,15 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
     PI_RPC_OVERFLOW_FAILURE_MESSAGE;
   state.pendingOverflowErrorMessage = undefined;
   state.pendingOverflowResetEmitted = undefined;
-  state.pendingOverflowAwaitingRecoverySignal = undefined;
   return buildPiRpcErrorResult(message, rawEvent?.sessionId);
 }
 
 function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
-  state.pendingOverflowAwaitingRecoverySignal = false;
   if (state.pendingOverflowResetEmitted) {
     return null;
   }
   state.pendingOverflowResetEmitted = true;
   return buildPiRpcRetryResetEvent();
-}
-
-function shouldFlushPendingOverflowAfterLookahead(state: PiRpcParseState): boolean {
-  return Boolean(
-    state.pendingOverflowErrorMessage &&
-    state.pendingOverflowAwaitingRecoverySignal,
-  );
 }
 
 /**
@@ -875,7 +863,6 @@ export function parsePiEvent(
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
           state.pendingOverflowErrorMessage = overflowMessage;
-          state.pendingOverflowAwaitingRecoverySignal = rawEvent.willRetry !== true;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
           }
@@ -1017,12 +1004,9 @@ export function parsePiEvent(
   }
 }
 
-type PiStdoutWaitResult = "readable" | "end" | "close" | "timeout";
+type PiStdoutWaitResult = "readable" | "end" | "close";
 
-function waitForPiStdout(
-  stdout: Readable,
-  timeoutMs?: number,
-): Promise<PiStdoutWaitResult> {
+function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   if (stdout.readableEnded) {
     return Promise.resolve("end");
   }
@@ -1031,15 +1015,11 @@ function waitForPiStdout(
   }
 
   return new Promise((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
       stdout.off("readable", onReadable);
       stdout.off("end", onEnd);
       stdout.off("close", onClose);
       stdout.off("error", onError);
-      if (timer) {
-        clearTimeout(timer);
-      }
     };
     const finish = (result: PiStdoutWaitResult) => {
       cleanup();
@@ -1057,9 +1037,6 @@ function waitForPiStdout(
     stdout.once("end", onEnd);
     stdout.once("close", onClose);
     stdout.once("error", onError);
-    if (timeoutMs !== undefined) {
-      timer = setTimeout(() => finish("timeout"), timeoutMs);
-    }
   });
 }
 
@@ -1088,18 +1065,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
       }
     }
 
-    const waitResult = await waitForPiStdout(
-      stdout,
-      shouldFlushPendingOverflowAfterLookahead(parseState)
-        ? PI_RPC_OVERFLOW_RECOVERY_SIGNAL_TIMEOUT_MS
-        : undefined,
-    );
-    if (waitResult === "timeout") {
-      if (parseState.pendingOverflowErrorMessage) {
-        yield buildPendingOverflowErrorResult(parseState);
-      }
-      continue;
-    }
+    const waitResult = await waitForPiStdout(stdout);
     if (waitResult === "end" || waitResult === "close") {
       break;
     }
