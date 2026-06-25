@@ -30,29 +30,11 @@ Existing source evidence:
 
 ## Implementation direction
 
-1. Refactor the existing deferred-overflow bookkeeping into a small helper if useful, or keep the code inline if simpler. Avoid a broad abstraction.
-2. In `parsePiEvent`, inside `case "response"` and `rawEvent.success === false && rawEvent.command === "prompt"`:
-   - Preserve the current first check for `isPiAlreadyProcessingRejection(rawEvent.error)` → log + `return null`.
-   - Then check `isContextOverflowError(rawEvent.error)`.
-   - If there is parser state:
-     - if `rawEvent.willRetry === false`, surface a terminal non-empty error result;
-     - otherwise set `state.pendingOverflowErrorMessage` to the non-empty raw error/fallback;
-     - if `rawEvent.willRetry === true`, emit the existing `reset_response_text` control request;
-     - if retry intent is unknown, return `null` and let subsequent `compaction_start` / `compaction_end` / final `agent_end` or EOF decide.
-   - If there is no parser state, keep the conservative terminal error result behavior.
-3. Keep `compaction_start`, `compaction_end`, final successful `agent_end`, and EOF fallback semantics shared with the existing #22 path.
-4. Update comments/docs in `pi-rpc-protocol.ts` so they mention both overflow shapes: `agent_end` and failed prompt `response`.
-
-## Tests
-
-Add focused tests in `src/__tests__/pi-rpc-protocol.test.ts`:
-
-1. `parsePiEvent` unit: failed prompt response with `context_length_exceeded` + parser state returns `null` and records pending overflow instead of returning an error result.
-2. `readPiStream` integration: failed prompt response overflow → `compaction_start` → `compaction_end` with `willRetry=true` → final successful `agent_end`; assert no intermediate `error_during_execution` is yielded and final result text is delivered. Assert one `reset_response_text` control request appears.
-3. Failure path: failed prompt response overflow → `compaction_end` with `success=false` or error text; assert a non-empty `error_during_execution` result is yielded.
-4. EOF fallback: failed prompt response overflow then stdout ends; assert a non-empty `error_during_execution` result is yielded.
-5. Regression: generic non-overflow failed prompt response still returns terminal `error_during_execution` immediately.
-6. Regression: `already processing` prompt rejection remains non-terminal.
+- Keep this fix narrow in `src/pi-rpc-protocol.ts` and `src/__tests__/pi-rpc-protocol.test.ts` unless implementation proves a tiny helper is cleaner.
+- The production event evidence did not show `willRetry` on failed prompt `response` events. Do not rely on that field for correctness. If the field exists and is `false`, surfacing a terminal error is fine; otherwise the default should be “defer and let compaction/final agent_end/EOF decide”.
+- Existing `compaction_start` should emit the `reset_response_text` control request when pending overflow state exists. Do not create tests that only pass because a synthetic response fixture has `willRetry: true`.
+- A subsequent successful final `agent_end` must clear pending overflow state via the existing `finishPiRpcResult` path so EOF cannot later surface a stale overflow error.
+- Guard overflow checks against missing/non-string `rawEvent.error`; malformed or non-overflow prompt failures must fall through to the existing terminal error behavior.
 
 ## Validation commands
 
@@ -64,3 +46,37 @@ npm run build
 git diff --check
 npm pack --dry-run
 ```
+
+## Tasks
+
+### Task 1: Add prompt-response overflow deferral in Pi RPC parser
+
+- In `parsePiEvent`, inside `case "response"` and `rawEvent.success === false && rawEvent.command === "prompt"`, preserve the current first check for `isPiAlreadyProcessingRejection(rawEvent.error)` → log + `return null`.
+- After that, if `isContextOverflowError(rawEvent.error)` and parser `state` exists, set `state.pendingOverflowErrorMessage` to the non-empty raw error or the existing overflow fallback.
+- If `rawEvent.willRetry === false`, surface a terminal non-empty error result; otherwise return `null` and let `compaction_start`, `compaction_end`, final `agent_end`, or EOF determine the outcome.
+- If parser `state` is absent, preserve the conservative terminal error result behavior.
+- Keep generic non-overflow failed prompt responses terminal.
+- Update comments in `pi-rpc-protocol.ts` so failed prompt-response overflow is documented next to the already-handled overflow `agent_end` path.
+
+### Task 2: Cover prompt-response overflow success and pending-state cleanup
+
+- Add `parsePiEvent` unit coverage proving a failed prompt response with `context_length_exceeded` and parser state returns `null` rather than `error_during_execution`.
+- Add `readPiStream` integration coverage for failed prompt-response overflow → `compaction_start` → successful final `agent_end`; assert the intermediate error is not yielded, `reset_response_text` is yielded from `compaction_start`, and the final answer is delivered.
+- Assert pending overflow state is cleared after the successful final result so a later EOF does not yield a stale overflow error.
+
+### Task 3: Cover prompt-response overflow failure paths
+
+- Add coverage for failed prompt-response overflow followed by `compaction_end` with `success=false` or an error string; assert a non-empty `error_during_execution` result is yielded.
+- Add EOF fallback coverage for failed prompt-response overflow followed by stdout end; assert a non-empty `error_during_execution` result is yielded.
+
+### Task 4: Preserve existing prompt-response regressions
+
+- Ensure a generic non-overflow failed prompt response still returns terminal `error_during_execution` immediately.
+- Ensure the `already processing` prompt rejection remains non-terminal.
+- Run the focused Pi RPC protocol test before full validation.
+
+### Task 5: Validate and prepare PR evidence
+
+- Run the validation commands listed above.
+- Keep issue/PR text sanitized: no private chat IDs, local user paths, tokens, or transcript payloads.
+- Update the PR summary to mention that this complements v2026.6.0 / PR #23 by handling the failed prompt `response` overflow shape as well as the prior `agent_end` shape.
