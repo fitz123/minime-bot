@@ -43,6 +43,7 @@ import {
   shouldIncludePiChildEnvKey,
   spawnPiRpcSession,
   type PiExtensionResolveOptions,
+  type PiRpcParseState,
   type PiSpawnExtensionOptions,
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig, StreamLine } from "../types.js";
@@ -1688,6 +1689,73 @@ describe("parsePiEvent", () => {
     );
   });
 
+  it("defers a context-overflow failed prompt response when stream recovery state exists", () => {
+    const state: PiRpcParseState = {};
+    const line = parsePiEvent(
+      {
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "context_length_exceeded: input exceeds the context window",
+      },
+      state,
+    );
+
+    assert.strictEqual(line, null);
+
+    const reset = parsePiEvent({ type: "compaction_start", reason: "overflow" }, state);
+    assert.ok(reset);
+    assert.strictEqual(reset.type, "assistant");
+    assert.strictEqual(reset.subtype, "control_request");
+    assert.strictEqual((reset as { action?: unknown }).action, "reset_response_text");
+  });
+
+  it("surfaces a context-overflow failed prompt response without stream recovery state", () => {
+    const line = parsePiEvent({
+      type: "response",
+      command: "prompt",
+      success: false,
+      error: "context_length_exceeded: input exceeds the context window",
+    });
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("surfaces an explicit non-retryable prompt-response overflow without stale pending state", () => {
+    const state: PiRpcParseState = {};
+    const line = parsePiEvent(
+      {
+        type: "response",
+        command: "prompt",
+        success: false,
+        willRetry: false,
+        sessionId: "test-session",
+        error: "context_length_exceeded: input exceeds the context window",
+      },
+      state,
+    );
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.session_id, "test-session");
+    assert.strictEqual(result.is_error, true);
+    assert.strictEqual(parsePiEvent({ type: "compaction_start", reason: "overflow" }, state), null);
+  });
+
   it("surfaces a failed prompt response (a REAL rejection) as a terminal error ResultMessage", () => {
     const line = parsePiEvent({
       type: "response",
@@ -1773,6 +1841,22 @@ describe("parsePiEvent", () => {
     // rejection (the detector returns false for a missing string), so it stays
     // terminal — falling back to the default message rather than hanging.
     const line = parsePiEvent({ type: "response", command: "prompt", success: false });
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(result.result, "Pi RPC command failed");
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("surfaces a failed prompt response with a non-string error as the default terminal error", () => {
+    const line = parsePiEvent({
+      type: "response",
+      command: "prompt",
+      success: false,
+      error: { code: "context_length_exceeded" },
+    });
 
     assert.ok(line);
     assert.strictEqual(line.type, "result");
@@ -1909,6 +1993,131 @@ describe("readPiStream", () => {
     );
     assert.strictEqual(extractPiTextDelta(lines[1]), "hi");
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
+  });
+
+  it("keeps reading after a prompt-response overflow until the final answer", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "context_length_exceeded: input exceeds the context window",
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "overflow" }),
+      JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "summarize the workspace" },
+          { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
+        ],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    assert.ok(
+      lines.some(
+        (line) =>
+          line.type === "assistant" &&
+          line.subtype === "control_request" &&
+          (line as { action?: unknown }).action === "reset_response_text",
+      ),
+    );
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "post-compaction answer");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
+  });
+
+  it("surfaces compaction failure after a deferred prompt-response overflow", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "context_length_exceeded: input exceeds the context window",
+      }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "overflow",
+        success: false,
+        error: "Unable to compact the conversation",
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(result.result, "Unable to compact the conversation");
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("surfaces a deferred prompt-response overflow if stdout ends before recovery", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "context_length_exceeded: input exceeds the context window",
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("surfaces a non-retryable prompt-response overflow once without EOF fallback duplication", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: false,
+        willRetry: false,
+        sessionId: "test-session",
+        error: "context_length_exceeded: input exceeds the context window",
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.session_id, "test-session");
+    assert.strictEqual(result.is_error, true);
   });
 
   it("keeps reading after a pre-compaction overflow agent_end until the final answer", async () => {

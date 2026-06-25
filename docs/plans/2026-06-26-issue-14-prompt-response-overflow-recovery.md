@@ -39,12 +39,16 @@ Existing source evidence:
 ## Validation commands
 
 ```bash
+npm ci
 MINIME_TEST_MEDIA_BASE=/tmp/bot-media-test node --experimental-test-module-mocks --import tsx --test src/__tests__/pi-rpc-protocol.test.ts
 npm test
 npm run lint
 npm run build
 git diff --check
 npm pack --dry-run
+npm run check:schema-guard-contract
+node dist/cli.js --help
+npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 ```
 
 ## Tasks
@@ -52,8 +56,9 @@ npm pack --dry-run
 ### Task 1: Add prompt-response overflow deferral in Pi RPC parser
 
 - In `parsePiEvent`, inside `case "response"` and `rawEvent.success === false && rawEvent.command === "prompt"`, preserve the current first check for `isPiAlreadyProcessingRejection(rawEvent.error)` → log + `return null`.
-- After that, if `isContextOverflowError(rawEvent.error)` and parser `state` exists, set `state.pendingOverflowErrorMessage` to the non-empty raw error or the existing overflow fallback.
-- If `rawEvent.willRetry === false`, surface a terminal non-empty error result; otherwise return `null` and let `compaction_start`, `compaction_end`, final `agent_end`, or EOF determine the outcome.
+- After that, compute a non-empty prompt error message from the raw error or the existing command-failed fallback.
+- If `isContextOverflowError(rawEvent.error)` and parser `state` exists, first handle `rawEvent.willRetry === false` by returning a terminal non-empty error through `finishPiRpcResult` so pending overflow state is cleared.
+- For retryable/unknown prompt-response overflow with parser `state`, set `state.pendingOverflowErrorMessage` to the non-empty prompt error and return `null`; let `compaction_start`, `compaction_end`, final `agent_end`, or EOF determine the outcome.
 - If parser `state` is absent, preserve the conservative terminal error result behavior.
 - Keep generic non-overflow failed prompt responses terminal.
 - Update comments in `pi-rpc-protocol.ts` so failed prompt-response overflow is documented next to the already-handled overflow `agent_end` path.
@@ -61,6 +66,8 @@ npm pack --dry-run
 ### Task 2: Cover prompt-response overflow success and pending-state cleanup
 
 - Add `parsePiEvent` unit coverage proving a failed prompt response with `context_length_exceeded` and parser state returns `null` rather than `error_during_execution`.
+- Add `parsePiEvent` unit coverage proving a failed prompt response with `context_length_exceeded` and no parser state remains terminal.
+- Add `parsePiEvent` or stream coverage proving a prompt-response overflow with `willRetry: false` is terminal and does not leave stale pending overflow state.
 - Add `readPiStream` integration coverage for failed prompt-response overflow → `compaction_start` → successful final `agent_end`; assert the intermediate error is not yielded, `reset_response_text` is yielded from `compaction_start`, and the final answer is delivered.
 - Assert pending overflow state is cleared after the successful final result so a later EOF does not yield a stale overflow error.
 
@@ -68,6 +75,7 @@ npm pack --dry-run
 
 - Add coverage for failed prompt-response overflow followed by `compaction_end` with `success=false` or an error string; assert a non-empty `error_during_execution` result is yielded.
 - Add EOF fallback coverage for failed prompt-response overflow followed by stdout end; assert a non-empty `error_during_execution` result is yielded.
+- Add malformed prompt-response coverage with a missing or non-string `error`; assert it remains a terminal default error rather than being classified as overflow.
 
 ### Task 4: Preserve existing prompt-response regressions
 

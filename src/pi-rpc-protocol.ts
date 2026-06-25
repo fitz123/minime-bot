@@ -609,7 +609,7 @@ export interface PiRpcEvent {
   command?: string;
   success?: boolean;
   data?: { sessionId?: string; [key: string]: unknown };
-  error?: string;
+  error?: unknown;
   toolName?: string;
   tool?: { name?: string; [key: string]: unknown };
   [key: string]: unknown;
@@ -669,7 +669,7 @@ const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed
  * "agent" subject so an unrelated error that merely contains those words does not
  * get mis-classified as recoverable.
  */
-export function isPiAlreadyProcessingRejection(error: string | undefined | null): boolean {
+export function isPiAlreadyProcessingRejection(error: unknown): boolean {
   if (typeof error !== "string") {
     return false;
   }
@@ -704,7 +704,7 @@ function isErrorStopReason(stopReason: string | undefined): boolean {
   return stopReason?.toLowerCase() === "error";
 }
 
-function isContextOverflowError(message: string | undefined): boolean {
+function isContextOverflowError(message: unknown): boolean {
   if (typeof message !== "string") {
     return false;
   }
@@ -794,13 +794,14 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  * - `response` → a successful `get_state`/`get_session_stats` reply yields a
  *   `SystemInit` capturing `data.sessionId` (the ONLY place Pi exposes the
  *   session id — no event carries it). A failed reply (`success: false`) is
- *   correlated by `command`: a failed `prompt` with a REAL rejection yields an
- *   error `ResultMessage` (the turn cannot proceed), but Pi's "already
- *   processing" concurrency rejection returns null + logs (the in-flight turn is
- *   still alive and will emit its own `agent_end`). A failed side-command
- *   (`steer`, `get_state`, `set_model`, …) likewise returns null + logs —
- *   mapping it to a terminal result would truncate the in-flight prompt turn
- *   whose stdout it shares.
+ *   correlated by `command`: a failed `prompt` with a context-overflow error
+ *   follows the same deferred recovery path as an overflow-only `agent_end`; a
+ *   failed `prompt` with another REAL rejection yields an error `ResultMessage`
+ *   (the turn cannot proceed), while Pi's "already processing" concurrency
+ *   rejection returns null + logs (the in-flight turn is still alive and will
+ *   emit its own `agent_end`). A failed side-command (`steer`, `get_state`,
+ *   `set_model`, …) likewise returns null + logs — mapping it to a terminal
+ *   result would truncate the in-flight prompt turn whose stdout it shares.
  * - `auto_retry_start` / `auto_retry_end` → `RateLimitEvent` (raw error message
  *   preserved for the Task 4 retry classifier).
  * - `error` → error `ResultMessage` (`subtype: "error_during_execution"`).
@@ -926,8 +927,11 @@ export function parsePiEvent(
       // top-level `error`). A `response` shares the same stdout the active turn
       // is reading, so it must be correlated by `command` before being treated
       // as terminal:
-      //  - a failed `prompt` response with a REAL rejection IS terminal — the
-      //    prompt was rejected with no live turn behind it, so no `agent_end`
+      //  - a failed `prompt` response with a context-overflow error can be
+      //    followed by Pi compaction/continuation, so the stateful reader defers
+      //    it just like the overflow-only `agent_end` path above.
+      //  - a failed `prompt` response with another REAL rejection IS terminal —
+      //    the prompt was rejected with no live turn behind it, so no `agent_end`
       //    will ever arrive; surface it as an error result so the turn ends now
       //    instead of hanging until the activity timeout.
       //  - EXCEPT Pi's "already processing" concurrency rejection (a second,
@@ -950,22 +954,29 @@ export function parsePiEvent(
           if (isPiAlreadyProcessingRejection(rawEvent.error)) {
             log.warn(
               "pi-rpc",
-              `Pi rejected a concurrent prompt as "already processing" — NOT terminating the in-flight turn: ${rawEvent.error ?? "(none)"}`,
+              `Pi rejected a concurrent prompt as "already processing" — NOT terminating the in-flight turn: ${nonEmptyText(rawEvent.error) ?? "(none)"}`,
             );
             return null;
           }
-          const result: ResultMessage = {
-            type: "result",
-            subtype: "error_during_execution",
-            result: rawEvent.error ?? "Pi RPC command failed",
-            session_id: "",
-            is_error: true,
-          };
-          return finishPiRpcResult(result, state);
+          const promptErrorMessage = nonEmptyText(rawEvent.error) ?? "Pi RPC command failed";
+          if (isContextOverflowError(rawEvent.error) && state) {
+            if (rawEvent.willRetry === false) {
+              return finishPiRpcResult(
+                buildPiRpcErrorResult(promptErrorMessage, rawEvent.sessionId),
+                state,
+              );
+            }
+            state.pendingOverflowErrorMessage = promptErrorMessage;
+            return null;
+          }
+          return finishPiRpcResult(
+            buildPiRpcErrorResult(promptErrorMessage, rawEvent.sessionId),
+            state,
+          );
         }
         log.warn(
           "pi-rpc",
-          `Pi RPC command failed (ignored in stream): command=${rawEvent.command ?? "unknown"} error=${rawEvent.error ?? "(none)"}`,
+          `Pi RPC command failed (ignored in stream): command=${rawEvent.command ?? "unknown"} error=${nonEmptyText(rawEvent.error) ?? "(none)"}`,
         );
         return null;
       }
