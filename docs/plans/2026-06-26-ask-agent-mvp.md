@@ -32,7 +32,7 @@ npm run build
 npm pack
 ```
 
-All three must pass with no PII in output or fixtures. Latest run: 1646 tests, 0 fail.
+All three must pass with no PII in output or fixtures. Latest run: 1657 tests, 0 fail.
 
 ## Tasks
 
@@ -46,10 +46,10 @@ All three must pass with no PII in output or fixtures. Latest run: 1646 tests, 0
 
 ### Task 2: Trusted caller identity env
 
-- [ ] Add `MINIME_ASK_CALLER_AGENT_ID` to the trusted RPC session spawn path in `session-manager.ts`, sourced from `ActiveSession.agentId`.
-- [ ] Add the key to `PI_CHILD_ENV_KEY_ALLOWLIST` in `pi-rpc-protocol.ts`.
-- [ ] Ensure the value comes from bot/session-manager state, not tool input, prompt text, cwd inference, or model-controlled data.
-- [ ] Add tests for present, missing, and empty caller env.
+- [x] Add `MINIME_ASK_CALLER_AGENT_ID` to the trusted RPC session spawn path in `session-manager.ts`, sourced from `ActiveSession.agentId`.
+- [x] Add the key to `PI_CHILD_ENV_KEY_ALLOWLIST` in `pi-rpc-protocol.ts`.
+- [x] Ensure the value comes from bot/session-manager state, not tool input, prompt text, cwd inference, or model-controlled data.
+- [x] Add tests for present, missing, and empty caller env.
 
 ### Task 3: Ask-agent extension and policy
 
