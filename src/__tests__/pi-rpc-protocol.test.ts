@@ -366,7 +366,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -418,7 +418,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
 describe("Pi extension loading (--extension)", () => {
   const FAKE_DIR = "/fake/ext";
-  // All three wrappers present, extensions enabled.
+  // All parent wrappers present, extensions enabled.
   const presentAll: PiExtensionResolveOptions = {
     extensionsDir: FAKE_DIR,
     env: {},
@@ -431,17 +431,18 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
   });
 
-  it("defaults the wrapper list to web-tools, knowledge-tools, and subagent", () => {
+  it("defaults the wrapper list to web-tools, knowledge-tools, subagent, and ask-agent", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts"],
+      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
+      ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -460,6 +461,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
     assert.deepStrictEqual(subagentChildArgs, [
       "--extension", wrapperAbs("web-tools.ts"),
@@ -551,6 +553,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
     ]);
   });
 
@@ -566,6 +569,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
       "--extension", extraA,
       "--extension", extraB,
     ]);
@@ -585,6 +589,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
       "--extension", extraExtension,
     ]);
   });
@@ -617,10 +622,11 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
     assert.ok(args.includes(wrapperAbs("subagent/index.ts")));
+    assert.ok(args.includes(wrapperAbs("ask-agent/index.ts")));
     // Base args remain intact and precede the first --extension.
     assert.strictEqual(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
     assert.ok(args.indexOf("--model") < args.indexOf("--extension"));
@@ -633,6 +639,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
   });
 
@@ -644,7 +651,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -665,6 +672,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
       "--extension", extraExtension,
     ]);
     assert.ok(!args.includes(resolve("/approved/interactive-extra.js")));
@@ -789,10 +797,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 3, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 4, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 3);
+    assert.strictEqual(paths.length, 4);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);

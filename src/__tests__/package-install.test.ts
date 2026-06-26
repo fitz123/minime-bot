@@ -191,12 +191,14 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
+    "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/knowledge-tools.js",
     "dist/extensions/pi/web-tools.js",
+    "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
     "scripts/deliver.sh",
@@ -503,7 +505,7 @@ const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
+  ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -642,11 +644,13 @@ const knowledgeTools = await importFile(join(artifactDir, "knowledge-tools.js"))
 knowledgeTools.default(fakePi);
 const subagent = await importFile(join(artifactDir, "subagent", "index.js"));
 subagent.default(fakePi);
+const askAgent = await importFile(join(artifactDir, "ask-agent", "index.js"));
+askAgent.default(fakePi);
 assert.deepEqual(
   registeredTools
-    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent"].includes(name))
+    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask-agent"].includes(name))
     .sort(),
-  ["knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
+  ["ask-agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
 );
 
 try {

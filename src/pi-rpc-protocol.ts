@@ -32,20 +32,23 @@ const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
  *   web-tools (Tavily web_search/web_fetch),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
- *   subagent (isolated `pi -p` child spawn).
- * Paths are relative to {@link DEFAULT_PI_EXTENSIONS_DIR}. subagent is a multi-file
- * DIRECTORY whose entrypoint is `index.ts`.
+ *   subagent (isolated `pi -p` child spawn),
+ *   ask-agent (configured full-agent question handoff).
+ * Paths are relative to {@link DEFAULT_PI_EXTENSIONS_DIR}. subagent and
+ * ask-agent are multi-file DIRECTORIES whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
+  "ask-agent/index.ts",
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",
+  "ask-agent/index.js",
 ] as const;
 
 /**

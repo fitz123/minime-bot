@@ -32,7 +32,7 @@ npm run build
 npm pack
 ```
 
-All three must pass with no PII in output or fixtures. Latest run: 1657 tests, 0 fail.
+All three must pass with no PII in output or fixtures. Latest run: 1665 tests, 0 fail.
 
 ## Tasks
 
@@ -53,12 +53,12 @@ All three must pass with no PII in output or fixtures. Latest run: 1657 tests, 0
 
 ### Task 3: Ask-agent extension and policy
 
-- [ ] Add first-party wrapper `extensions/pi/ask-agent/index.ts` registering tool `ask-agent`, delegating to a pure helper `src/pi-extensions/ask-agent-args.ts`.
-- [ ] Read caller only from `MINIME_ASK_CALLER_AGENT_ID`; missing/empty -> structured `caller_unknown` error without spawn.
-- [ ] Resolve target id to `AgentConfig`; unknown -> structured `target_unknown` error without spawn.
-- [ ] Call `assemblePiContext()`; null or thrown assembly error -> structured `context_unavailable` error without spawn.
-- [ ] Enforce enabled/canAsk/deny policy with structured `not_enabled` / `denied` errors.
-- [ ] Return a structured result (`{ answer, truncated, needsClarification }`).
+- [x] Add first-party wrapper `extensions/pi/ask-agent/index.ts` registering tool `ask-agent`, delegating to a pure helper `src/pi-extensions/ask-agent-args.ts`.
+- [x] Read caller only from `MINIME_ASK_CALLER_AGENT_ID`; missing/empty -> structured `caller_unknown` error without spawn.
+- [x] Resolve target id to `AgentConfig`; unknown -> structured `target_unknown` error without spawn.
+- [x] Call `assemblePiContext()`; null or thrown assembly error -> structured `context_unavailable` error without spawn.
+- [x] Enforce enabled/canAsk/deny policy with structured `not_enabled` / `denied` errors.
+- [x] Return a structured result (`{ answer, truncated, needsClarification }`).
 
 ### Task 4: Full target child spawn
 
