@@ -4,7 +4,7 @@ Status: complete. Addresses issue #27.
 
 ## Goal
 
-Implement a first-party `ask-agent` extension for full-agent inter-agent questions. The caller asks a target agent; the extension spawns a one-shot full target child in the target workspace with the target's context/Knowledge/tools and returns the final answer.
+Implement a first-party `ask_agent` extension for full-agent inter-agent questions. The caller asks a target agent; the extension spawns a one-shot full target child in the target workspace with the target's context/Knowledge/tools and returns the final answer.
 
 Public issue: https://github.com/fitz123/minime-bot/issues/27
 
@@ -13,7 +13,7 @@ Public issue: https://github.com/fitz123/minime-bot/issues/27
 - Trusted internal mesh, not a hostile multi-tenant sandbox.
 - Target must be a full agent, not a read-only/limited-context stub.
 - Any enabled agent can ask any other enabled agent unless config denies the pair.
-- No `ask-agent` inside ask children; recursion is out of MVP.
+- No recursive `ask_agent` tool inside ask children; recursion is out of MVP.
 - Do not use personal names, real handles, chat IDs, or local absolute paths in public repo tests/docs.
 - Snapshot spawn only; intercom/live backend is future work.
 
@@ -48,17 +48,17 @@ All three must pass with no PII in output or fixtures. Latest review-fix run: 16
 
 ### Task 2: Trusted caller identity env
 
-- [x] Add `MINIME_ASK_CALLER_AGENT_ID` to the trusted RPC session spawn path in `session-manager.ts`, sourced from `ActiveSession.agentId`.
+- [x] Add `MINIME_BOT_PI_SESSION_AGENT_ID` to the trusted RPC session spawn path in `session-manager.ts`, sourced from `ActiveSession.agentId`.
 - [x] Add the key to `PI_CHILD_ENV_KEY_ALLOWLIST` in `pi-rpc-protocol.ts`.
 - [x] Ensure the value comes from bot/session-manager state, not tool input, prompt text, cwd inference, or model-controlled data.
 - [x] Add tests for present, missing, and empty caller env.
 
 ### Task 3: Ask-agent extension and policy
 
-- [x] Add first-party wrapper `extensions/pi/ask-agent/index.ts` registering tool `ask-agent`, delegating to a pure helper `src/pi-extensions/ask-agent-args.ts`.
-- [x] Read caller only from `MINIME_ASK_CALLER_AGENT_ID`; missing/empty -> structured `caller_unknown` error without spawn.
+- [x] Add first-party wrapper `extensions/pi/ask-agent/index.ts` registering tool `ask_agent`, delegating to a pure helper `src/pi-extensions/ask-agent-args.ts`.
+- [x] Read caller only from `MINIME_BOT_PI_SESSION_AGENT_ID`; missing/empty -> structured `caller_unknown` error without spawn.
 - [x] Resolve target id to `AgentConfig`; unknown -> structured `target_unknown` error without spawn.
-- [x] Call `assemblePiContext()`; null or thrown assembly error -> structured `context_unavailable` error without spawn.
+- [x] Call `assemblePiContext()`; null or thrown assembly error -> structured `context_failed` error without spawn.
 - [x] Enforce enabled/canAsk/deny policy with structured `not_enabled` / `denied` errors.
 - [x] Return a structured result (`{ answer, truncated, needsClarification }`).
 
@@ -67,7 +67,7 @@ All three must pass with no PII in output or fixtures. Latest review-fix run: 16
 - [x] Build ask-agent child extension args from the target's normal RPC extension profile (first-party wrappers plus configured `extraExtensions`), then exclude `subagent` and `ask-agent`.
 - [x] Do not assert this differs from the current minimal subagent child set; with today's built-ins it may be the same (`web-tools` + `knowledge-tools`).
 - [x] Spawn Pi in the target `workspaceCwd` with that cwd, provider `"pi"`, and the normalized target model.
-- [x] Wire target context like a normal RPC spawn: `systemPrompt` when present, `assemblePiContext()` artifacts (`systemPromptPath` / `appendSystemPromptPath`), plus a trusted preamble + fenced untrusted question.
+- [x] Wire target context like a normal RPC spawn: `systemPrompt` when present, `assemblePiContext()` artifacts (`systemPromptPath` / `appendSystemPromptPath`), plus a trusted preamble + fenced untrusted caller context/question.
 - [x] Use a bounded timeout and a direct child `SIGTERM` -> `SIGKILL` kill path; no process-group kill in MVP because `subagent` is excluded.
 - [x] Reuse/extract JSONL final-assistant parsing (`parsePiRecord()` / `getFinalOutput()`) and spawn helpers from subagent where practical.
 

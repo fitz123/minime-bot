@@ -687,9 +687,9 @@ const askAgent = await importFile(join(artifactDir, "ask-agent", "index.js"));
 askAgent.default(fakePi);
 assert.deepEqual(
   registeredTools
-    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask-agent"].includes(name))
+    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
     .sort(),
-  ["ask-agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
+  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
 );
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
@@ -704,7 +704,7 @@ writeFileSync(askAgentContextPath, "# Neutral target context\n", "utf8");
 
 const askAgentChildEnv = piRpc.buildPiAskAgentChildSpawnEnv(askAgentTargetWorkspace);
 assert.equal(askAgentChildEnv[agentWorkspaceEnv], askAgentTargetWorkspace);
-assert.equal(askAgentChildEnv[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+assert.equal(askAgentChildEnv[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
 const askAgentChildExtensionArgs = piRpc.resolvePiAskAgentChildExtensionArgs({
   env: {},
   extensionsDir: artifactDir,
@@ -714,7 +714,7 @@ const askAgentSpawnCalls = [];
 const askAgentExecutionLogs = [];
 let askAgentNow = 1000;
 const askAgentSmoke = askAgentArgs.executeAskAgent(
-  { targetAgentId: "agent-c", question: "neutral package smoke question" },
+  { agent: "agent-c", question: "neutral package smoke question", context: "neutral package smoke context" },
   {
     config: {
       agents: {
@@ -732,7 +732,7 @@ const askAgentSmoke = askAgentArgs.executeAskAgent(
         },
       },
     },
-    env: { [piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV]: "agent-b" },
+    env: { [piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV]: "agent-b" },
     assembleContext(target) {
       assert.equal(target.id, "agent-c");
       return { appendSystemPromptPath: askAgentContextPath };
@@ -791,7 +791,7 @@ assert.deepEqual(askAgentSmokeResult.result, {
 assert.deepEqual(askAgentExecutionLogs, [
   "[ask-agent] caller=agent-b target=agent-c durationMs=10 outcome=success truncated=false needsClarification=false",
 ]);
-assert.doesNotMatch(JSON.stringify(askAgentExecutionLogs), /neutral package smoke question|Package smoke answer/);
+assert.doesNotMatch(JSON.stringify(askAgentExecutionLogs), /neutral package smoke question|neutral package smoke context|Package smoke answer/);
 
 writeFileSync(join(askAgentTargetWorkspace, "CLAUDE.md"), "# Neutral target context\n", "utf8");
 writeFileSync(
@@ -839,7 +839,7 @@ writeFileSync(
     "#!/bin/sh",
     "pwd > " + JSON.stringify(askAgentWrapperCwdPath),
     "printf '%s\\0' \"$@\" > " + JSON.stringify(askAgentWrapperArgvPath),
-    "printf '%s\\n' \"\${MINIME_ASK_CALLER_AGENT_ID-__unset__}\" > " + JSON.stringify(askAgentWrapperCallerEnvPath),
+    "printf '%s\\n' \"\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}\" > " + JSON.stringify(askAgentWrapperCallerEnvPath),
     "printf '%s\\n' " + JSON.stringify(askAgentWrapperJsonl),
     "",
   ].join("\n"),
@@ -848,15 +848,16 @@ writeFileSync(
 chmodSync(join(fakeBinDir, "pi"), 0o755);
 
 const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
-const oldAskAgentCaller = process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV];
+const oldAskAgentCaller = process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
 try {
   process.env[controlWorkspaceEnv] = askAgentSmokeRoot;
-  process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV] = "agent-b";
-  const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask-agent");
-  assert.ok(askAgentTool, "ask-agent should be registered");
+  process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
+  const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask_agent");
+  assert.ok(askAgentTool, "ask_agent should be registered");
   const askAgentWrapperResult = await askAgentTool.execute("ask-wrapper-call", {
-    targetAgentId: "agent-c",
+    agent: "agent-c",
     question: "neutral wrapper smoke question",
+    context: "neutral wrapper smoke context",
   });
   assert.equal(askAgentWrapperResult.details.ok, true, JSON.stringify(askAgentWrapperResult));
   assert.deepEqual(JSON.parse(askAgentWrapperResult.content[0].text), {
@@ -879,7 +880,7 @@ try {
   );
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
-  assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question/);
+  assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);
 } finally {
   if (oldAskAgentWorkspace === undefined) {
     delete process.env[controlWorkspaceEnv];
@@ -887,9 +888,9 @@ try {
     process.env[controlWorkspaceEnv] = oldAskAgentWorkspace;
   }
   if (oldAskAgentCaller === undefined) {
-    delete process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV];
+    delete process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
   } else {
-    process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV] = oldAskAgentCaller;
+    process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldAskAgentCaller;
   }
 }
 

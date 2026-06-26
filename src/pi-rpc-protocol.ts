@@ -94,7 +94,7 @@ export const PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = Object.freeze(
  */
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
 export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
-export const MINIME_ASK_CALLER_AGENT_ID_ENV = "MINIME_ASK_CALLER_AGENT_ID";
+export const MINIME_BOT_PI_SESSION_AGENT_ID_ENV = "MINIME_BOT_PI_SESSION_AGENT_ID";
 
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
@@ -132,7 +132,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "LANG",
   "LOGNAME",
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
-  MINIME_ASK_CALLER_AGENT_ID_ENV,
+  MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -590,7 +590,7 @@ function buildAllowedPiChildEnv(
   delete env[RETIRED_CONTROL_WORKSPACE_ENV];
   delete env[RETIRED_AGENT_WORKSPACE_ENV];
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
-  delete env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+  delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
@@ -598,7 +598,7 @@ function buildAllowedPiChildEnv(
   }
   const askCallerAgentId = runtimeEnvOptions?.askCallerAgentId?.trim();
   if (askCallerAgentId) {
-    env[MINIME_ASK_CALLER_AGENT_ID_ENV] = askCallerAgentId;
+    env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");

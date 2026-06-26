@@ -19,7 +19,7 @@ import {
 import { _resetPiContextCache } from "../pi-context-assembler.js";
 import {
   NewlineOnlyJsonlSplitter,
-  MINIME_ASK_CALLER_AGENT_ID_ENV,
+  MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
   PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
@@ -921,7 +921,7 @@ describe("buildPiSpawnEnv", () => {
   it("allowlists canonical workspace env keys but excludes retired workspace env keys", () => {
     assert.equal(shouldIncludePiChildEnvKey(MINIME_CONTROL_WORKSPACE_ROOT_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_AGENT_WORKSPACE_ROOT_ENV), true);
-    assert.equal(shouldIncludePiChildEnvKey(MINIME_ASK_CALLER_AGENT_ID_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_AGENT_ID_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
@@ -967,7 +967,7 @@ describe("buildPiSpawnEnv", () => {
       RETIRED_AGENT_WORKSPACE_ENV,
       RETIRED_CONTROL_WORKSPACE_ENV,
       MINIME_AGENT_WORKSPACE_ROOT_ENV,
-      MINIME_ASK_CALLER_AGENT_ID_ENV,
+      MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
       MINIME_BOT_PI_SESSION_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
@@ -1000,7 +1000,7 @@ describe("buildPiSpawnEnv", () => {
       process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/tmp/retired-agent-workspace";
       process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/tmp/retired-control-workspace";
       process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
-      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "ambient-agent";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
       process.env[MINIME_BOT_PI_SESSION_ENV] = "ambient";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
@@ -1022,7 +1022,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
-      assert.strictEqual(env[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_ENV], "1");
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
@@ -1056,49 +1056,49 @@ describe("buildPiSpawnEnv", () => {
   });
 
   it("sets the ask-agent caller env only from trusted spawn options", () => {
-    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
 
     try {
-      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "ambient-agent";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
 
       const env = withWorkspaceRoot(
         "/tmp",
         () => buildPiSpawnEnv(undefined, { askCallerAgentId: "agent-b" }),
       );
 
-      assert.strictEqual(env[MINIME_ASK_CALLER_AGENT_ID_ENV], "agent-b");
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], "agent-b");
     } finally {
       if (oldCaller === undefined) {
-        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
-        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
       }
     }
   });
 
   it("omits the ask-agent caller env when no trusted caller is provided", () => {
-    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
 
     try {
-      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "ambient-agent";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
 
       const env = withWorkspaceRoot("/tmp", () => buildPiSpawnEnv());
 
-      assert.strictEqual(env[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
     } finally {
       if (oldCaller === undefined) {
-        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
-        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
       }
     }
   });
 
   it("omits the ask-agent caller env when the trusted caller is empty", () => {
-    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
 
     try {
-      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "ambient-agent";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
 
       const blankEnv = withWorkspaceRoot(
         "/tmp",
@@ -1109,13 +1109,13 @@ describe("buildPiSpawnEnv", () => {
         () => buildPiSpawnEnv(undefined, { askCallerAgentId: "   " }),
       );
 
-      assert.strictEqual(blankEnv[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
-      assert.strictEqual(whitespaceEnv[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+      assert.strictEqual(blankEnv[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+      assert.strictEqual(whitespaceEnv[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
     } finally {
       if (oldCaller === undefined) {
-        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
-        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
       }
     }
   });
@@ -1302,7 +1302,7 @@ describe("spawnPiRpcSession workspace validation", () => {
       join(fakeBin, "pi"),
       [
         "#!/bin/sh",
-        `printf '%s\\n' "\${MINIME_ASK_CALLER_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
+        `printf '%s\\n' "\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
         "",
       ].join("\n"),
       "utf8",
@@ -1476,17 +1476,17 @@ describe("buildPiSubagentChildSpawnEnv", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-control-root-"));
     const targetWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-target-root-"));
     const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
-    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
 
     try {
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
-      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "agent-b";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
 
       const env = buildPiAskAgentChildSpawnEnv(targetWorkspace);
 
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
       assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], targetWorkspace);
-      assert.strictEqual(env[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
     } finally {
       if (oldWorkspace === undefined) {
         delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
@@ -1494,9 +1494,9 @@ describe("buildPiSubagentChildSpawnEnv", () => {
         process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       }
       if (oldCaller === undefined) {
-        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
-        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
       }
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(targetWorkspace, { recursive: true, force: true });

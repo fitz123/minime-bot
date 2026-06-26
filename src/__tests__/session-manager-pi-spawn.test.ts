@@ -15,7 +15,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_ASK_CALLER_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
@@ -538,8 +538,8 @@ describe("SessionManager Pi session-id capture + resume", () => {
   });
 
   it("passes the trusted ask-agent caller id from the requested session agent", async () => {
-    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
-    process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "ambient-agent";
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+    process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
 
     try {
@@ -550,9 +550,9 @@ describe("SessionManager Pi session-id capture + resume", () => {
       assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, { askCallerAgentId: "pi" });
     } finally {
       if (oldCaller === undefined) {
-        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
-        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
       }
       await manager.closeAll();
     }
