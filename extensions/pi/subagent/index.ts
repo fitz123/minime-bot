@@ -39,6 +39,7 @@ import {
 	type SubagentRunResult,
 	type SubagentUsageStats,
 } from "../../../src/pi-extensions/subagent-args.js";
+import { resolvePiInvocation } from "../../../src/pi-extensions/pi-invocation.js";
 import {
 	buildPiSubagentChildSpawnEnv,
 	PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
@@ -245,22 +246,6 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
-}
-
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
@@ -322,7 +307,7 @@ async function runSingleAgent(
 			systemPromptPath: tmpPromptPath ?? undefined,
 			extensionArgs: resolvePiExtensionArgs({ relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS }),
 		});
-		const invocation = getPiInvocation(args);
+		const invocation = resolvePiInvocation(args);
 
 		const result = await runSubagentChild({
 			spawn,

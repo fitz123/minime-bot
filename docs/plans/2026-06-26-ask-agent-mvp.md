@@ -1,5 +1,7 @@
 # Plan: Ask Agent MVP
 
+Status: complete. Addresses issue #27.
+
 ## Goal
 
 Implement a first-party `ask-agent` extension for full-agent inter-agent questions. The caller asks a target agent; the extension spawns a one-shot full target child in the target workspace with the target's context/Knowledge/tools and returns the final answer.
@@ -29,10 +31,10 @@ Public issue: https://github.com/fitz123/minime-bot/issues/27
 ```
 npm test
 npm run build
-npm pack
+npm pack --dry-run
 ```
 
-All three must pass with no PII in output or fixtures. Latest run: 1665 tests, 0 fail.
+All three must pass with no PII in output or fixtures. Latest review-fix run: 1693 tests, 0 fail.
 
 ## Tasks
 

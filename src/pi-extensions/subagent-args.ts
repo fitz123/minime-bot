@@ -224,11 +224,10 @@ export function getFinalOutput(messages: SubagentMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      for (const part of msg.content) {
-        if (part.type === "text" && typeof (part as SubagentTextBlock).text === "string") {
-          return (part as SubagentTextBlock).text;
-        }
-      }
+      return msg.content
+        .filter((part): part is SubagentTextBlock => part.type === "text" && typeof (part as SubagentTextBlock).text === "string")
+        .map((part) => part.text)
+        .join("");
     }
   }
   return "";

@@ -130,7 +130,9 @@ explicitly, then appends each approved extra unchanged as a repeatable
 Pi; a missing file fails the interactive spawn with a clear error.
 `PI_EXTENSIONS_DISABLED=1` disables both first-party wrappers and configured
 extras for a spawn. Cron and subagent-child extension subsets keep their
-existing first-party-only scope.
+existing first-party-only scope. Ask-agent target children load `web-tools`,
+`knowledge-tools`, and approved `piExtraExtensions`, but reject configured extras
+that point back at the first-party `subagent` or `ask-agent` wrappers.
 
 Agents opt into first-party `ask-agent` handoffs with an `askAgent` block. Both
 the caller and target must have `enabled: true`; an omitted `canAsk` on an
@@ -158,6 +160,15 @@ agents:
 The target runs as a one-shot full Pi child in its own `workspaceCwd` with its
 assembled context. Ask-agent children do not load recursive `subagent` or
 `ask-agent` wrappers in the MVP.
+
+The Pi tool is named `ask-agent` and accepts `targetAgentId` plus `question`.
+Questions are capped at 64 KiB. Target children have a bounded 120s run window,
+and returned answers are capped at 32 KiB / 128 KiB with a `…[truncated]`
+marker. Successful tool content is JSON with `answer`, `truncated`, and
+`needsClarification`; tool details also include the caller and target ids.
+Structured errors use stable codes such as `caller_unknown`, `target_unknown`,
+`context_unavailable`, `not_enabled`, `denied`, `invalid_request`,
+`config_unavailable`, and `spawn_unavailable`.
 
 ## Knowledge v2 Layout
 

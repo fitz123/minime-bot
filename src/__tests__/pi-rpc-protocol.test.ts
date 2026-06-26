@@ -1,6 +1,6 @@
 import { describe, it, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -522,6 +523,23 @@ describe("Pi extension loading (--extension)", () => {
     ]);
     assert.ok(!args.includes(wrapperAbs("subagent/index.ts")));
     assert.ok(!args.includes(wrapperAbs("ask-agent/index.ts")));
+  });
+
+  it("rejects ask-agent child extras that reintroduce recursive handoff wrappers", () => {
+    assert.throws(
+      () => resolvePiAskAgentChildExtensionArgs({
+        ...presentAll,
+        extraExtensions: [wrapperAbs("ask-agent/index.ts")],
+      }),
+      /recursive handoff wrapper/,
+    );
+    assert.throws(
+      () => resolvePiAskAgentChildExtensionArgs({
+        ...presentAll,
+        extraExtensions: [wrapperAbs("subagent/index.ts")],
+      }),
+      /recursive handoff wrapper/,
+    );
   });
 
   it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
@@ -1216,6 +1234,56 @@ describe("spawnPiRpcSession workspace validation", () => {
         delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       } else {
         process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("passes trusted ask-agent caller env to the spawned Pi process", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-caller-env-root-"));
+    const agentWorkspace = join(workspaceRoot, "agent-workspace");
+    const fakeBin = join(workspaceRoot, "fake-bin");
+    const capturePath = join(workspaceRoot, "caller-env.txt");
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldPath = process.env.PATH;
+
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "pi"),
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' "\${MINIME_ASK_CALLER_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(join(fakeBin, "pi"), 0o755);
+
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+
+      const child = spawnPiRpcSession(
+        { ...testAgent, workspaceCwd: agentWorkspace },
+        undefined,
+        NO_EXTENSIONS,
+        { askCallerAgentId: "main" },
+      );
+      const [code] = await once(child, "close");
+
+      assert.strictEqual(code, 0);
+      assert.strictEqual(readFileSync(capturePath, "utf8").trim(), "main");
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = oldPath;
       }
       rmSync(workspaceRoot, { recursive: true, force: true });
     }

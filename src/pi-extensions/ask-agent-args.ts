@@ -6,6 +6,7 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import type { AgentConfig, BotConfig } from "../types.js";
+import type { PiInvocation } from "./pi-invocation.js";
 import {
   getFinalOutput,
   isFailedResult,
@@ -109,19 +110,7 @@ export type AskAgentExecutionResult =
       error: AskAgentStructuredError;
     };
 
-export type AskAgentToolDetails =
-  | {
-      ok: true;
-      callerAgentId: string;
-      targetAgentId: string;
-      result: AskAgentStructuredResult;
-    }
-  | {
-      ok: false;
-      callerAgentId?: string;
-      targetAgentId?: string;
-      error: AskAgentStructuredError;
-    };
+export type AskAgentToolDetails = AskAgentExecutionResult;
 
 export interface AskAgentToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -146,6 +135,7 @@ export interface AskAgentTargetChildWarn {
 export interface RunAskAgentTargetChildDeps {
   spawn: SubagentSpawn;
   command?: string;
+  resolveInvocation?: (args: string[]) => PiInvocation;
   extensionArgs?: string[];
   env?: Record<string, string>;
   timeoutMs?: number;
@@ -373,12 +363,15 @@ export async function runAskAgentTargetChild(
     context: request.context,
     extensionArgs: deps.extensionArgs,
   });
+  const invocation = deps.command === undefined && deps.resolveInvocation
+    ? deps.resolveInvocation(args)
+    : { command: deps.command ?? "pi", args };
 
   try {
     const result = await runSubagentChild({
       spawn: deps.spawn,
-      command: deps.command ?? "pi",
-      args,
+      command: invocation.command,
+      args: invocation.args,
       cwd: request.target.workspaceCwd,
       env: deps.env,
       signal: timeout.signal,
@@ -555,23 +548,13 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
 export function formatAskAgentToolResult(result: AskAgentExecutionResult): AskAgentToolResult {
   if (result.ok) {
     return {
-      content: [{ type: "text", text: result.result.answer }],
-      details: {
-        ok: true,
-        callerAgentId: result.callerAgentId,
-        targetAgentId: result.targetAgentId,
-        result: result.result,
-      },
+      content: [{ type: "text", text: JSON.stringify(result.result) }],
+      details: result,
     };
   }
   return {
     content: [{ type: "text", text: `ask-agent error (${result.error.code}): ${result.error.message}` }],
-    details: {
-      ok: false,
-      callerAgentId: result.callerAgentId,
-      targetAgentId: result.targetAgentId,
-      error: result.error,
-    },
+    details: result,
     isError: true,
   };
 }

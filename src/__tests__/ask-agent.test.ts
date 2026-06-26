@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ASK_AGENT_TOOL,
   ASK_AGENT_TRUNCATED_MARKER,
+  MAX_ASK_AGENT_QUESTION_CHARS,
   buildAskAgentTargetPrompt,
   buildAskAgentTargetSpawnArgs,
   buildAskAgentStructuredResult,
@@ -284,6 +285,47 @@ describe("ask-agent helper", () => {
     }
   });
 
+  it("accepts max-size questions and rejects oversized questions before context or spawn", async () => {
+    let acceptedQuestionLength = 0;
+    const accepted = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "x".repeat(MAX_ASK_AGENT_QUESTION_CHARS) },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => CONTEXT,
+        runTarget: async (request) => {
+          acceptedQuestionLength = request.question.length;
+          return { answer: "accepted", truncated: false, needsClarification: false };
+        },
+      },
+    );
+
+    assert.equal(accepted.ok, true);
+    assert.equal(acceptedQuestionLength, MAX_ASK_AGENT_QUESTION_CHARS);
+
+    let assembleCalled = false;
+    let runTargetCalled = false;
+    const oversized = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "x".repeat(MAX_ASK_AGENT_QUESTION_CHARS + 1) },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => {
+          assembleCalled = true;
+          return CONTEXT;
+        },
+        runTarget: async () => {
+          runTargetCalled = true;
+          return { answer: "unexpected", truncated: false, needsClarification: false };
+        },
+      },
+    );
+
+    assertError(oversized, "invalid_request");
+    assert.equal(assembleCalled, false);
+    assert.equal(runTargetCalled, false);
+  });
+
   it("enforces enabled, canAsk, and deny policy without context or spawn", async () => {
     const cases: Array<{
       name: string;
@@ -396,6 +438,33 @@ describe("ask-agent helper", () => {
         needsClarification: true,
       });
     }
+  });
+
+  it("returns spawn_unavailable when target execution is unavailable or throws", async () => {
+    const missingRunner = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "status?" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => CONTEXT,
+      },
+    );
+    assertError(missingRunner, "spawn_unavailable");
+    assert.equal(formatAskAgentToolResult(missingRunner).isError, true);
+
+    const thrown = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "status?" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => CONTEXT,
+        runTarget: async () => {
+          throw new Error("child failed");
+        },
+      },
+    );
+    assertError(thrown, "spawn_unavailable");
+    assert.equal(formatAskAgentToolResult(thrown).isError, true);
   });
 
   it("truncates answers by character and byte caps with the truncated marker", () => {
@@ -518,6 +587,35 @@ describe("ask-agent helper", () => {
     assert.equal(calls[0].args[calls[0].args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
     assert.ok(calls[0].args.includes("--append-system-prompt"));
     assert.ok(calls[0].args.includes("/abs/web-tools.ts"));
+  });
+
+  it("returns all final assistant text blocks from the target child", async () => {
+    const { child, spawn } = setupRunner();
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+    }, { spawn });
+
+    child.stdout.emit(`${JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", name: "read", arguments: {} },
+          { type: "text", text: "part one " },
+          { type: "text", text: "part two" },
+        ],
+      },
+    })}\n`);
+    child.emitClose(0);
+
+    assert.deepEqual(await promise, {
+      answer: "part one part two",
+      truncated: false,
+      needsClarification: false,
+    });
   });
 
   it("returns clarification questions from the child as valid structured results", async () => {
@@ -652,6 +750,51 @@ describe("ask-agent helper", () => {
     await assert.rejects(promise, /timed out or was aborted/);
   });
 
+  it("aborts a target child when the caller signal is already aborted", async () => {
+    const { child, spawn } = setupRunner();
+    const controller = new AbortController();
+    controller.abort();
+
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+      signal: controller.signal,
+    }, {
+      spawn,
+      timeoutMs: 1000,
+      abortGraceMs: 1000,
+    });
+
+    assert.ok(child.killSignals.includes("SIGTERM"));
+    child.emitClose(143);
+    await assert.rejects(promise, /timed out or was aborted/);
+  });
+
+  it("aborts a running target child when the caller signal fires", async () => {
+    const { child, spawn } = setupRunner();
+    const controller = new AbortController();
+
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+      signal: controller.signal,
+    }, {
+      spawn,
+      timeoutMs: 1000,
+      abortGraceMs: 1000,
+    });
+
+    assert.equal(child.killSignals.length, 0);
+    controller.abort();
+    assert.ok(child.killSignals.includes("SIGTERM"));
+    child.emitClose(143);
+    await assert.rejects(promise, /timed out or was aborted/);
+  });
+
   it("formats child warnings without question or answer text", () => {
     const warn: AskAgentTargetChildWarn = {
       callerAgentId: "agent-b",
@@ -673,7 +816,11 @@ describe("ask-agent helper", () => {
       targetAgentId: "agent-c",
       result: { answer: "answer", truncated: false, needsClarification: false },
     });
-    assert.equal(success.content[0].text, "answer");
+    assert.deepEqual(JSON.parse(success.content[0].text), {
+      answer: "answer",
+      truncated: false,
+      needsClarification: false,
+    });
     assert.deepEqual(success.details, {
       ok: true,
       callerAgentId: "agent-b",

@@ -617,7 +617,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const agents: Record<string, AgentConfig> = {};
   const knownAgentIds = new Set(Object.keys(raw.agents));
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
-    agents[id] = validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds);
+    agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
   }
 
   // Resolve Telegram token from configured non-interactive secret sources.

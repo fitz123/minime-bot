@@ -111,6 +111,38 @@ describe("askAgent config validation", () => {
     });
   });
 
+  it("uses config keys as canonical askAgent policy ids", () => {
+    const config = loadTestConfig(
+      "canonical-agent-ids",
+      `
+  agent-b:
+    id: raw-agent-b
+    workspaceCwd: /tmp/agent-b
+    model: gpt-5.5
+    askAgent:
+      enabled: true
+      canAsk:
+        - "*"
+      deny:
+        - agent-c
+  agent-c:
+    id: raw-agent-c
+    workspaceCwd: /tmp/agent-c
+    model: gpt-5.5
+    askAgent:
+      enabled: true
+`,
+    );
+
+    assert.equal(config.agents["agent-b"].id, "agent-b");
+    assert.equal(config.agents["agent-c"].id, "agent-c");
+    assert.deepStrictEqual(resolveAskAgentPolicy(config.agents["agent-b"], config.agents["agent-c"]), {
+      allowed: false,
+      code: "denied",
+      reason: 'Agent "agent-b" is denied from asking "agent-c"',
+    });
+  });
+
   it("supports deny wildcard as deny-all for the asker", () => {
     const config = loadTestConfig(
       "deny-all",

@@ -239,6 +239,38 @@ function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[
   return args;
 }
 
+function extensionArgPaths(args: readonly string[]): string[] {
+  const paths: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--extension" && typeof args[index + 1] === "string") {
+      paths.push(normalize(resolve(args[index + 1])));
+      index++;
+    }
+  }
+  return paths;
+}
+
+function assertNoAskAgentRecursiveExtraExtensions(
+  extraArgs: readonly string[],
+  options?: PiSpawnExtensionOptions,
+): void {
+  if (extraArgs.length === 0) {
+    return;
+  }
+
+  const recursiveWrapperArgs = resolvePiExtensionArgs({
+    ...options,
+    relpaths: ["subagent/index.ts", "ask-agent/index.ts"],
+  });
+  const recursiveWrapperPaths = new Set(extensionArgPaths(recursiveWrapperArgs));
+
+  for (const extraPath of extensionArgPaths(extraArgs)) {
+    if (recursiveWrapperPaths.has(extraPath)) {
+      throw new Error(`Pi extra extension cannot load recursive handoff wrapper in ask-agent children: ${extraPath}`);
+    }
+  }
+}
+
 export function resolvePiSpawnExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
   return [
     ...resolvePiExtensionArgs(options),
@@ -247,12 +279,14 @@ export function resolvePiSpawnExtensionArgs(options?: PiSpawnExtensionOptions): 
 }
 
 export function resolvePiAskAgentChildExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  const extraArgs = resolvePiExtraExtensionArgs(options);
+  assertNoAskAgentRecursiveExtraExtensions(extraArgs, options);
   return [
     ...resolvePiExtensionArgs({
       ...options,
       relpaths: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
     }),
-    ...resolvePiExtraExtensionArgs(options),
+    ...extraArgs,
   ];
 }
 

@@ -192,6 +192,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
     "dist/pi-extensions/ask-agent-args.js",
+    "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
@@ -791,6 +792,106 @@ assert.deepEqual(askAgentExecutionLogs, [
   "[ask-agent] caller=agent-b target=agent-c durationMs=10 outcome=success truncated=false needsClarification=false",
 ]);
 assert.doesNotMatch(JSON.stringify(askAgentExecutionLogs), /neutral package smoke question|Package smoke answer/);
+
+writeFileSync(join(askAgentTargetWorkspace, "CLAUDE.md"), "# Neutral target context\n", "utf8");
+writeFileSync(
+  join(askAgentSmokeRoot, "config.yaml"),
+  [
+    "agents:",
+    "  agent-b:",
+    "    workspaceCwd: ./agent-b-workspace",
+    "    model: gpt-5.5",
+    "    askAgent:",
+    "      enabled: true",
+    "      canAsk:",
+    "        - agent-c",
+    "  agent-c:",
+    "    workspaceCwd: ./agent-c-workspace",
+    "    model: gpt-5.5-mini",
+    "    askAgent:",
+    "      enabled: true",
+    "telegramTokenEnv: TEST_UNSET_PACKAGE_ASK_AGENT_TOKEN",
+    "bindings:",
+    "  - chatId: 111",
+    "    agentId: agent-b",
+    "    kind: dm",
+    "",
+  ].join("\n"),
+  "utf8",
+);
+const askAgentWrapperArgvPath = join(askAgentSmokeRoot, "wrapper-argv.bin");
+const askAgentWrapperCwdPath = join(askAgentSmokeRoot, "wrapper-cwd.txt");
+const askAgentWrapperCallerEnvPath = join(askAgentSmokeRoot, "wrapper-caller-env.txt");
+const askAgentWrapperJsonl = JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [
+      { type: "text", text: "Wrapper " },
+      { type: "text", text: "answer." },
+    ],
+    stopReason: "end",
+  },
+});
+writeFileSync(
+  join(fakeBinDir, "pi"),
+  [
+    "#!/bin/sh",
+    "pwd > " + JSON.stringify(askAgentWrapperCwdPath),
+    "printf '%s\\0' \"$@\" > " + JSON.stringify(askAgentWrapperArgvPath),
+    "printf '%s\\n' \"\${MINIME_ASK_CALLER_AGENT_ID-__unset__}\" > " + JSON.stringify(askAgentWrapperCallerEnvPath),
+    "printf '%s\\n' " + JSON.stringify(askAgentWrapperJsonl),
+    "",
+  ].join("\n"),
+  "utf8",
+);
+chmodSync(join(fakeBinDir, "pi"), 0o755);
+
+const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
+const oldAskAgentCaller = process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV];
+try {
+  process.env[controlWorkspaceEnv] = askAgentSmokeRoot;
+  process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV] = "agent-b";
+  const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask-agent");
+  assert.ok(askAgentTool, "ask-agent should be registered");
+  const askAgentWrapperResult = await askAgentTool.execute("ask-wrapper-call", {
+    targetAgentId: "agent-c",
+    question: "neutral wrapper smoke question",
+  });
+  assert.equal(askAgentWrapperResult.details.ok, true, JSON.stringify(askAgentWrapperResult));
+  assert.deepEqual(JSON.parse(askAgentWrapperResult.content[0].text), {
+    answer: "Wrapper answer.",
+    truncated: false,
+    needsClarification: false,
+  });
+  assert.deepEqual(askAgentWrapperResult.details.result, {
+    answer: "Wrapper answer.",
+    truncated: false,
+    needsClarification: false,
+  });
+  assert.equal(readFileSync(askAgentWrapperCwdPath, "utf8").trim(), askAgentTargetWorkspace);
+  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+  const askAgentWrapperArgv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
+  const askAgentWrapperExtensions = extensionPathsFromSpawnArgs(askAgentWrapperArgv);
+  assert.deepEqual(
+    askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
+    ["web-tools.js", "knowledge-tools.js"],
+  );
+  assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
+  assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
+  assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question/);
+} finally {
+  if (oldAskAgentWorkspace === undefined) {
+    delete process.env[controlWorkspaceEnv];
+  } else {
+    process.env[controlWorkspaceEnv] = oldAskAgentWorkspace;
+  }
+  if (oldAskAgentCaller === undefined) {
+    delete process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV];
+  } else {
+    process.env[piRpc.MINIME_ASK_CALLER_AGENT_ID_ENV] = oldAskAgentCaller;
+  }
+}
 
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");

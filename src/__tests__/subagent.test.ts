@@ -314,11 +314,18 @@ describe("subagent: parseSubagentEventLine", () => {
 });
 
 describe("subagent: result parsing helpers", () => {
-  it("getFinalOutput returns the last assistant text block", () => {
+  it("getFinalOutput returns all text blocks from the last assistant message", () => {
     const messages: SubagentMessage[] = [
       { role: "assistant", content: [{ type: "text", text: "first" }] },
       { role: "tool", content: [{ type: "text", text: "tool noise" }] },
-      { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: {} }, { type: "text", text: "final answer" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", name: "read", arguments: {} },
+          { type: "text", text: "final " },
+          { type: "text", text: "answer" },
+        ],
+      },
     ];
     assert.equal(getFinalOutput(messages), "final answer");
   });
