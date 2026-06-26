@@ -132,6 +132,33 @@ Pi; a missing file fails the interactive spawn with a clear error.
 extras for a spawn. Cron and subagent-child extension subsets keep their
 existing first-party-only scope.
 
+Agents opt into first-party `ask-agent` handoffs with an `askAgent` block. Both
+the caller and target must have `enabled: true`; an omitted `canAsk` on an
+enabled caller means wildcard allow, and `deny` overrides allow rules. Use
+neutral agent ids and workspace placeholders in shared examples:
+
+```yaml
+agents:
+  main:
+    workspaceCwd: ./agent-workspace
+    model: gpt-5.5
+    askAgent:
+      enabled: true
+      canAsk:
+        - helper
+  helper:
+    workspaceCwd: ./helper-workspace
+    model: gpt-5.5-mini
+    askAgent:
+      enabled: true
+      deny:
+        - "*"
+```
+
+The target runs as a one-shot full Pi child in its own `workspaceCwd` with its
+assembled context. Ask-agent children do not load recursive `subagent` or
+`ask-agent` wrappers in the MVP.
+
 ## Knowledge v2 Layout
 
 Agent workspaces may use the package-owned Knowledge v2 layout:

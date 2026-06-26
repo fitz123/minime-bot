@@ -78,6 +78,6 @@ All three must pass with no PII in output or fixtures. Latest run: 1665 tests, 0
 
 ### Task 6: Hermetic package smoke and docs
 
-- [ ] Add a DI/mock-spawn package smoke with temporary neutral workspaces and canned JSONL; do not run real Pi/network/auth in the package smoke.
-- [ ] Update package docs/config examples using neutral placeholders.
-- [ ] Run validation commands and keep the repo free of PII.
+- [x] Add a DI/mock-spawn package smoke with temporary neutral workspaces and canned JSONL; do not run real Pi/network/auth in the package smoke.
+- [x] Update package docs/config examples using neutral placeholders.
+- [x] Run validation commands and keep the repo free of PII.
