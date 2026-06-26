@@ -4,6 +4,12 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export interface AskAgentConfig {
+  enabled: boolean;
+  canAsk?: string[];
+  deny?: string[];
+}
+
 export interface AgentConfig {
   id: string;
   /** Resolved agent workspace root used as the Pi session cwd and context source. */
@@ -16,6 +22,7 @@ export interface AgentConfig {
    * Omit it or set "pi"; "claude" is rejected during config validation.
    */
   provider?: "pi";
+  askAgent?: AskAgentConfig;
 }
 
 export interface TopicOverride {

@@ -2,6 +2,17 @@ agents:
   main:
     workspaceCwd: ./agent-workspace
     model: gpt-5.5
+    askAgent:
+      enabled: true
+      canAsk:
+        - helper
+  helper:
+    workspaceCwd: ./helper-workspace
+    model: gpt-5.5-mini
+    askAgent:
+      enabled: true
+      deny:
+        - "*"
 telegramTokenEnv: MINIME_FIXTURE_TELEGRAM_TOKEN
 # Optional for interactive bot Pi RPC sessions only. Keep entries generic,
 # absolute, and operator-approved.

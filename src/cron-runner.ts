@@ -337,7 +337,8 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
   }
 
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
-  const agent = validateAgent(rawAgent, agentId, defaultModel, workspaceRoot);
+  const knownAgentIds = new Set(Object.keys(raw.agents));
+  const agent = validateAgent(rawAgent, agentId, defaultModel, workspaceRoot, knownAgentIds);
   if (!agent.workspaceCwd.trim()) {
     throw new Error(`Agent "${agentId}" missing workspaceCwd`);
   }

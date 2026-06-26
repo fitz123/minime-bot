@@ -191,12 +191,15 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
+    "dist/pi-extensions/ask-agent-args.js",
+    "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/knowledge-tools.js",
     "dist/extensions/pi/web-tools.js",
+    "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
     "scripts/deliver.sh",
@@ -460,6 +463,7 @@ describe("package artifact install", () => {
 
 const INSTALLED_ARTIFACT_CHECK = String.raw`
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -498,12 +502,49 @@ function assertNoGuardContract(label, args) {
   assert.doesNotMatch(JSON.stringify(args), retiredGuardWrapperPattern, label);
 }
 
+function extensionPathsFromSpawnArgs(args) {
+  const paths = [];
+  for (let idx = 0; idx < args.length; idx++) {
+    if (args[idx] === "--extension") {
+      assert.equal(typeof args[idx + 1], "string");
+      paths.push(args[idx + 1]);
+    }
+  }
+  return paths;
+}
+
+class FakeReadable extends EventEmitter {
+  emitData(text) {
+    this.emit("data", Buffer.from(text));
+  }
+}
+
+class FakeChild extends EventEmitter {
+  constructor() {
+    super();
+    this.stdout = new FakeReadable();
+    this.stderr = new FakeReadable();
+    this.killed = false;
+    this.killSignals = [];
+  }
+
+  kill(signal) {
+    this.killed = true;
+    this.killSignals.push(signal);
+    return true;
+  }
+
+  emitClose(code) {
+    this.emit("close", code);
+  }
+}
+
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
+  ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -642,12 +683,216 @@ const knowledgeTools = await importFile(join(artifactDir, "knowledge-tools.js"))
 knowledgeTools.default(fakePi);
 const subagent = await importFile(join(artifactDir, "subagent", "index.js"));
 subagent.default(fakePi);
+const askAgent = await importFile(join(artifactDir, "ask-agent", "index.js"));
+askAgent.default(fakePi);
 assert.deepEqual(
   registeredTools
-    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent"].includes(name))
+    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
     .sort(),
-  ["knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
+  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
 );
+
+const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
+const askAgentSmokeRoot = join(projectDir, "ask-agent-smoke");
+const askAgentCallerWorkspace = join(askAgentSmokeRoot, "agent-b-workspace");
+const askAgentTargetWorkspace = join(askAgentSmokeRoot, "agent-c-workspace");
+const askAgentTargetTmp = join(askAgentTargetWorkspace, ".tmp");
+mkdirSync(askAgentCallerWorkspace, { recursive: true });
+mkdirSync(askAgentTargetTmp, { recursive: true });
+const askAgentContextPath = join(askAgentTargetTmp, "context.md");
+writeFileSync(askAgentContextPath, "# Neutral target context\n", "utf8");
+
+const askAgentChildEnv = piRpc.buildPiAskAgentChildSpawnEnv(askAgentTargetWorkspace);
+assert.equal(askAgentChildEnv[agentWorkspaceEnv], askAgentTargetWorkspace);
+assert.equal(askAgentChildEnv[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+const askAgentChildExtensionArgs = piRpc.resolvePiAskAgentChildExtensionArgs({
+  env: {},
+  extensionsDir: artifactDir,
+});
+const askAgentSmokeChild = new FakeChild();
+const askAgentSpawnCalls = [];
+const askAgentExecutionLogs = [];
+let askAgentNow = 1000;
+const askAgentSmoke = askAgentArgs.executeAskAgent(
+  { agent: "agent-c", question: "neutral package smoke question", context: "neutral package smoke context" },
+  {
+    config: {
+      agents: {
+        "agent-b": {
+          id: "agent-b",
+          workspaceCwd: askAgentCallerWorkspace,
+          model: "gpt-5.5",
+          askAgent: { enabled: true, canAsk: ["agent-c"] },
+        },
+        "agent-c": {
+          id: "agent-c",
+          workspaceCwd: askAgentTargetWorkspace,
+          model: "gpt-5.5-mini",
+          askAgent: { enabled: true },
+        },
+      },
+    },
+    env: { [piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV]: "agent-b" },
+    assembleContext(target) {
+      assert.equal(target.id, "agent-c");
+      return { appendSystemPromptPath: askAgentContextPath };
+    },
+    runTarget(request) {
+      return askAgentArgs.runAskAgentTargetChild(request, {
+        spawn(command, args, options) {
+          askAgentSpawnCalls.push({ command, args, options });
+          return askAgentSmokeChild;
+        },
+        extensionArgs: askAgentChildExtensionArgs,
+        env: askAgentChildEnv,
+        timeoutMs: 1000,
+        abortGraceMs: 10,
+      });
+    },
+    log(event) {
+      askAgentExecutionLogs.push(askAgentArgs.formatAskAgentExecutionLog(event));
+    },
+    now() {
+      askAgentNow += 10;
+      return askAgentNow;
+    },
+  },
+);
+assert.equal(askAgentSpawnCalls.length, 1);
+assert.equal(askAgentSpawnCalls[0].command, "pi");
+assert.equal(askAgentSpawnCalls[0].options.cwd, askAgentTargetWorkspace);
+assert.equal(askAgentSpawnCalls[0].options.shell, false);
+assert.equal(askAgentSpawnCalls[0].options.env, askAgentChildEnv);
+assert.equal(askAgentSpawnCalls[0].args[askAgentSpawnCalls[0].args.indexOf("--model") + 1], "openai-codex/gpt-5.5-mini");
+assert.equal(askAgentSpawnCalls[0].args[askAgentSpawnCalls[0].args.indexOf("--append-system-prompt") + 1], askAgentContextPath);
+const askAgentLoadedExtensions = extensionPathsFromSpawnArgs(askAgentSpawnCalls[0].args);
+assert.deepEqual(
+  askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
+  ["web-tools.js", "knowledge-tools.js"],
+);
+assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("subagent")));
+assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("ask-agent")));
+askAgentSmokeChild.stdout.emitData(JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "Package smoke answer." }],
+    stopReason: "end",
+  },
+}) + "\n");
+askAgentSmokeChild.emitClose(0);
+const askAgentSmokeResult = await askAgentSmoke;
+assert.equal(askAgentSmokeResult.ok, true, JSON.stringify(askAgentSmokeResult));
+assert.deepEqual(askAgentSmokeResult.result, {
+  answer: "Package smoke answer.",
+  truncated: false,
+  needsClarification: false,
+});
+assert.deepEqual(askAgentExecutionLogs, [
+  "[ask-agent] caller=agent-b target=agent-c durationMs=10 outcome=success truncated=false needsClarification=false",
+]);
+assert.doesNotMatch(JSON.stringify(askAgentExecutionLogs), /neutral package smoke question|neutral package smoke context|Package smoke answer/);
+
+writeFileSync(join(askAgentTargetWorkspace, "CLAUDE.md"), "# Neutral target context\n", "utf8");
+writeFileSync(
+  join(askAgentSmokeRoot, "config.yaml"),
+  [
+    "agents:",
+    "  agent-b:",
+    "    workspaceCwd: ./agent-b-workspace",
+    "    model: gpt-5.5",
+    "    askAgent:",
+    "      enabled: true",
+    "      canAsk:",
+    "        - agent-c",
+    "  agent-c:",
+    "    workspaceCwd: ./agent-c-workspace",
+    "    model: gpt-5.5-mini",
+    "    askAgent:",
+    "      enabled: true",
+    "telegramTokenEnv: TEST_UNSET_PACKAGE_ASK_AGENT_TOKEN",
+    "bindings:",
+    "  - chatId: 111",
+    "    agentId: agent-b",
+    "    kind: dm",
+    "",
+  ].join("\n"),
+  "utf8",
+);
+const askAgentWrapperArgvPath = join(askAgentSmokeRoot, "wrapper-argv.bin");
+const askAgentWrapperCwdPath = join(askAgentSmokeRoot, "wrapper-cwd.txt");
+const askAgentWrapperCallerEnvPath = join(askAgentSmokeRoot, "wrapper-caller-env.txt");
+const askAgentWrapperJsonl = JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [
+      { type: "text", text: "Wrapper " },
+      { type: "text", text: "answer." },
+    ],
+    stopReason: "end",
+  },
+});
+writeFileSync(
+  join(fakeBinDir, "pi"),
+  [
+    "#!/bin/sh",
+    "pwd > " + JSON.stringify(askAgentWrapperCwdPath),
+    "printf '%s\\0' \"$@\" > " + JSON.stringify(askAgentWrapperArgvPath),
+    "printf '%s\\n' \"\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}\" > " + JSON.stringify(askAgentWrapperCallerEnvPath),
+    "printf '%s\\n' " + JSON.stringify(askAgentWrapperJsonl),
+    "",
+  ].join("\n"),
+  "utf8",
+);
+chmodSync(join(fakeBinDir, "pi"), 0o755);
+
+const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
+const oldAskAgentCaller = process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+try {
+  process.env[controlWorkspaceEnv] = askAgentSmokeRoot;
+  process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
+  const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask_agent");
+  assert.ok(askAgentTool, "ask_agent should be registered");
+  const askAgentWrapperResult = await askAgentTool.execute("ask-wrapper-call", {
+    agent: "agent-c",
+    question: "neutral wrapper smoke question",
+    context: "neutral wrapper smoke context",
+  });
+  assert.equal(askAgentWrapperResult.details.ok, true, JSON.stringify(askAgentWrapperResult));
+  assert.deepEqual(JSON.parse(askAgentWrapperResult.content[0].text), {
+    answer: "Wrapper answer.",
+    truncated: false,
+    needsClarification: false,
+  });
+  assert.deepEqual(askAgentWrapperResult.details.result, {
+    answer: "Wrapper answer.",
+    truncated: false,
+    needsClarification: false,
+  });
+  assert.equal(readFileSync(askAgentWrapperCwdPath, "utf8").trim(), askAgentTargetWorkspace);
+  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+  const askAgentWrapperArgv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
+  const askAgentWrapperExtensions = extensionPathsFromSpawnArgs(askAgentWrapperArgv);
+  assert.deepEqual(
+    askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
+    ["web-tools.js", "knowledge-tools.js"],
+  );
+  assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
+  assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
+  assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);
+} finally {
+  if (oldAskAgentWorkspace === undefined) {
+    delete process.env[controlWorkspaceEnv];
+  } else {
+    process.env[controlWorkspaceEnv] = oldAskAgentWorkspace;
+  }
+  if (oldAskAgentCaller === undefined) {
+    delete process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+  } else {
+    process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldAskAgentCaller;
+  }
+}
 
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");

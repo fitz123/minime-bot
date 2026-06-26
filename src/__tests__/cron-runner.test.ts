@@ -824,6 +824,24 @@ bindings: []
       });
     });
 
+    it("validates askAgent references on the cron agent config path", () => {
+      writeFileSync(CONFIG_FILE, `agents:
+  main:
+    workspaceCwd: /tmp/main-workspace
+    model: openai-codex/gpt-5.5
+    askAgent:
+      enabled: true
+      canAsk:
+        - missing-agent
+bindings: []
+`);
+
+      assert.throws(
+        () => buildPiCronAgentConfig("main", CONFIG_FILE),
+        /Agent "main" askAgent\.canAsk\[0\] references unknown agent "missing-agent"/,
+      );
+    });
+
     it("ignores non-string systemPrompt", () => {
       writeFileSync(CONFIG_FILE, `agents:
   main:

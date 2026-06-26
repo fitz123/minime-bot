@@ -8,6 +8,7 @@ Most helpers here back the live Pi extensions:
 - `knowledge-tools` for `knowledge_search`, `knowledge_get`, `knowledge_update`,
   and scoped protection for managed Knowledge v2 wiki files.
 - `subagent` for delegated child Pi runs.
+- `ask-agent` for configured full-agent inter-agent questions.
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
@@ -30,8 +31,8 @@ extensions.
 There are TWO kinds of files in this feature, deliberately split:
 
 1. **Pure helpers — `bot/src/pi-extensions/*.ts`** (this directory).
-   All real logic lives here: Tavily request/parse, subagent spawn-arg/result
-   helpers, and the sampler-only Codex
+   All real logic lives here: Tavily request/parse, ask-agent policy/result
+   helpers, subagent spawn-arg/result helpers, and the sampler-only Codex
    quota cache/export helper. These files are:
    - **Type-checked by `tsc --noEmit`** (the `npm run lint` command) because the
      bot `tsconfig.json` `include` is `["src/**/*.ts"]`, which matches this path.

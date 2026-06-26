@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute, normalize, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, normalize, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import type {
   AgentConfig,
@@ -25,27 +25,30 @@ import {
 } from "./workspace-contract.js";
 
 const PI_BIN = "pi";
-const PI_PROVIDER = "openai-codex";
-const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
+export const PI_PROVIDER = "openai-codex";
+export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
  *   web-tools (Tavily web_search/web_fetch),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
- *   subagent (isolated `pi -p` child spawn).
- * Paths are relative to {@link DEFAULT_PI_EXTENSIONS_DIR}. subagent is a multi-file
- * DIRECTORY whose entrypoint is `index.ts`.
+ *   subagent (isolated `pi -p` child spawn),
+ *   ask-agent (configured full-agent question handoff).
+ * Paths are relative to {@link DEFAULT_PI_EXTENSIONS_DIR}. subagent and
+ * ask-agent are multi-file DIRECTORIES whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
+  "ask-agent/index.ts",
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",
+  "ask-agent/index.js",
 ] as const;
 
 /**
@@ -57,6 +60,16 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
 export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
 
 /**
+ * Wrappers an ask-agent target CHILD `pi` spawn must load. The child runs as a
+ * full target agent with the target's normal first-party tool surface, except
+ * recursive handoff tools stay disabled for MVP.
+ */
+const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>(["subagent/index.ts", "ask-agent/index.ts"]);
+export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
+  PI_EXTENSION_WRAPPER_RELPATHS.filter((relpath) => !PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS.has(relpath)),
+);
+
+/**
  * Wrappers a Pi print-mode cron must load. Crons need the Knowledge wrapper so
  * managed wiki writes are protected, but do not get interactive web-tools or
  * subagent parity.
@@ -64,6 +77,15 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-to
 export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
 
 export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "knowledge-tools.js"] as const;
+const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
+  "subagent/index.js",
+  "ask-agent/index.js",
+]);
+export const PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = Object.freeze(
+  PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS.filter(
+    (relpath) => !PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS.has(relpath),
+  ),
+);
 
 /**
  * Kill-switch env var: set to exactly `"1"` to spawn Pi with no explicit
@@ -72,6 +94,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "kno
  */
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
 export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
+export const MINIME_BOT_PI_SESSION_AGENT_ID_ENV = "MINIME_BOT_PI_SESSION_AGENT_ID";
 
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
@@ -80,6 +103,8 @@ export interface PiExtensionResolveOptions {
   env?: NodeJS.ProcessEnv;
   /** Override the existence check (default: `fs.existsSync`). */
   exists?: (path: string) => boolean;
+  /** Override realpath resolution (default: `fs.realpathSync`). */
+  realpath?: (path: string) => string;
   /**
    * Which wrapper relpaths to resolve (default: the full interactive
    * {@link PI_EXTENSION_WRAPPER_RELPATHS}). A subagent child passes
@@ -94,6 +119,11 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
   extraExtensions?: readonly string[];
 }
 
+export interface PiSpawnRuntimeEnvOptions {
+  /** Trusted current agent id supplied by SessionManager for first-party tools. */
+  askCallerAgentId?: string;
+}
+
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "CI",
   "COLORTERM",
@@ -102,6 +132,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "LANG",
   "LOGNAME",
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -208,6 +239,111 @@ function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[
     args.push("--extension", extra);
   }
   return args;
+}
+
+function extensionArgPaths(args: readonly string[]): string[] {
+  const paths: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--extension" && typeof args[index + 1] === "string") {
+      paths.push(normalize(resolve(args[index + 1])));
+      index++;
+    }
+  }
+  return paths;
+}
+
+function addPathAndRealpath(
+  paths: Set<string>,
+  path: string,
+  options?: PiExtensionResolveOptions,
+): void {
+  const normalized = normalize(resolve(path));
+  paths.add(normalized);
+
+  try {
+    paths.add(normalize(resolve((options?.realpath ?? realpathSync)(normalized))));
+  } catch (err) {
+    if (options?.exists === undefined && options?.realpath === undefined) {
+      throw err;
+    }
+    // Tests may use synthetic paths with a mocked exists() predicate. Keep those
+    // checks path-based while production resolves real symlink targets.
+  }
+}
+
+function recursiveWrapperBaseDirs(baseDir: string): string[] {
+  const normalizedBase = normalize(baseDir).replace(/[\\/]+$/, "");
+  const dirs = new Set<string>([normalizedBase]);
+  const sourceSuffix = normalize("extensions/pi");
+  const artifactSuffix = normalize("dist/extensions/pi");
+
+  if (normalizedBase.endsWith(sourceSuffix) && !normalizedBase.endsWith(artifactSuffix)) {
+    dirs.add(normalize(resolve(normalizedBase, "..", "..", "dist", "extensions", "pi")));
+  } else if (normalizedBase.endsWith(artifactSuffix)) {
+    dirs.add(normalize(resolve(normalizedBase, "..", "..", "..", "extensions", "pi")));
+  }
+
+  return [...dirs];
+}
+
+function recursiveWrapperDeniedPaths(options?: PiSpawnExtensionOptions): Set<string> {
+  const baseDir = options?.extensionsDir ?? resolveWorkspaceContract().paths.piExtensionDir;
+  const fileExists = options?.exists ?? existsSync;
+  const paths = new Set<string>();
+
+  for (const candidateBaseDir of recursiveWrapperBaseDirs(baseDir)) {
+    for (const relpath of ["subagent/index.ts", "subagent/index.js", "ask-agent/index.ts", "ask-agent/index.js"]) {
+      const abs = normalize(resolve(candidateBaseDir, relpath));
+      if (fileExists(abs)) {
+        addPathAndRealpath(paths, abs, options);
+      }
+
+      const wrapperDir = dirname(abs);
+      if (fileExists(wrapperDir)) {
+        addPathAndRealpath(paths, wrapperDir, options);
+      }
+    }
+  }
+
+  return paths;
+}
+
+function assertNoAskAgentRecursiveExtraExtensions(
+  extraArgs: readonly string[],
+  options?: PiSpawnExtensionOptions,
+): void {
+  if (extraArgs.length === 0) {
+    return;
+  }
+
+  const recursiveWrapperPaths = recursiveWrapperDeniedPaths(options);
+
+  for (const extraPath of extensionArgPaths(extraArgs)) {
+    const candidatePaths = new Set<string>();
+    addPathAndRealpath(candidatePaths, extraPath, options);
+    if ([...candidatePaths].some((candidatePath) => recursiveWrapperPaths.has(candidatePath))) {
+      throw new Error(`Pi extra extension cannot load recursive handoff wrapper in ask-agent children: ${extraPath}`);
+    }
+  }
+}
+
+export function resolvePiSpawnExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  return [
+    ...resolvePiExtensionArgs(options),
+    ...resolvePiExtraExtensionArgs(options),
+  ];
+}
+
+export function resolvePiAskAgentChildExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  const extraArgs = resolvePiExtraExtensionArgs(options);
+  assertNoAskAgentRecursiveExtraExtensions(extraArgs, options);
+  return [
+    ...resolvePiExtensionArgs({
+      ...options,
+      relpaths: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
+    }),
+    ...extraArgs,
+  ];
 }
 
 export function piExtensionRelpathForDir(baseDir: string, relpath: string): string {
@@ -398,8 +534,7 @@ export function buildPiSpawnArgs(
   // discovery; load first-party wrappers and configured extras only as explicit
   // repeatable `--extension <abs-path>` args. The kill-switch and missing-path
   // checks live in the extension resolvers.
-  args.push(...resolvePiExtensionArgs(extensionOptions));
-  args.push(...resolvePiExtraExtensionArgs(extensionOptions));
+  args.push(...resolvePiSpawnExtensionArgs(extensionOptions));
 
   // Pi mints its own session id (the bot cannot pre-assign one with
   // --session-id). When resuming a stored session, point Pi at the
@@ -412,17 +547,25 @@ export function buildPiSpawnArgs(
   return args;
 }
 
-export function buildPiSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+export function buildPiSpawnEnv(
+  agentWorkspaceRoot?: string,
+  runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, runtimeEnvOptions);
 }
 
 export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
   return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
 }
 
+export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+}
+
 function buildAllowedPiChildEnv(
   contract: ResolvedWorkspaceContract,
   agentWorkspaceRoot?: string,
+  runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, val] of Object.entries(process.env)) {
@@ -447,10 +590,15 @@ function buildAllowedPiChildEnv(
   delete env[RETIRED_CONTROL_WORKSPACE_ENV];
   delete env[RETIRED_AGENT_WORKSPACE_ENV];
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
+  delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
     env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = normalize(resolve(agentRoot));
+  }
+  const askCallerAgentId = runtimeEnvOptions?.askCallerAgentId?.trim();
+  if (askCallerAgentId) {
+    env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
@@ -490,10 +638,11 @@ export function spawnPiRpcSession(
   agent: AgentConfig,
   resumeSessionId?: string,
   extensionOptions?: PiSpawnExtensionOptions,
+  runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
-  const env = buildPiSpawnEnv(workspaceCwd);
+  const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
   const child = spawn(PI_BIN, buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions), {
     env,
     cwd: workspaceCwd,

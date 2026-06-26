@@ -15,16 +15,15 @@ const wrappers = [
   ["knowledge-tools.ts", "knowledge-tools.js"],
   [join("subagent", "agents.ts"), join("subagent", "agents.js")],
   [join("subagent", "index.ts"), join("subagent", "index.js")],
+  [join("ask-agent", "index.ts"), join("ask-agent", "index.js")],
 ];
 
 rmSync(artifactExtensionDir, { recursive: true, force: true });
 
 function rewriteImports(source) {
   return source
-    .replaceAll("../../src/pi-extensions/", "../../pi-extensions/")
-    .replaceAll("../../src/pi-rpc-protocol.js", "../../pi-rpc-protocol.js")
-    .replaceAll("../../../src/pi-extensions/", "../../../pi-extensions/")
-    .replaceAll("../../../src/pi-rpc-protocol.js", "../../../pi-rpc-protocol.js")
+    .replaceAll("../../src/", "../../")
+    .replaceAll("../../../src/", "../../../")
     .replaceAll('from "./agents.ts"', 'from "./agents.js"');
 }
 

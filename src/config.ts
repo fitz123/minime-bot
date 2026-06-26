@@ -2,7 +2,7 @@ import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import type { BotConfig, AgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig } from "./types.js";
+import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig } from "./types.js";
 import { log, parseLogLevel } from "./logger.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "./media-store.js";
 import { resolveSecret, sopsExtractExpression, type ExecFileSyncLike } from "./secrets.js";
@@ -12,6 +12,55 @@ const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] 
 const CONFIGURED_SECRET_PLACEHOLDER = "[configured]";
 const LEGACY_TELEGRAM_SERVICE_KEY_RE = /^telegramToken[Ss]ervice$/;
 const LEGACY_DISCORD_SERVICE_KEY_RE = /^token[Ss]ervice$/;
+const ASK_AGENT_WILDCARD = "*";
+
+export type AskAgentPolicyDecision =
+  | { allowed: true }
+  | { allowed: false; code: "not_enabled" | "denied"; reason: string };
+
+function askAgentListMatches(list: readonly string[] | undefined, agentId: string): boolean {
+  return list?.includes(ASK_AGENT_WILDCARD) === true || list?.includes(agentId) === true;
+}
+
+export function resolveAskAgentPolicy(
+  caller: AgentConfig,
+  target: AgentConfig,
+): AskAgentPolicyDecision {
+  if (caller.askAgent?.enabled !== true) {
+    return {
+      allowed: false,
+      code: "not_enabled",
+      reason: `Agent "${caller.id}" does not have askAgent enabled`,
+    };
+  }
+  if (target.askAgent?.enabled !== true) {
+    return {
+      allowed: false,
+      code: "not_enabled",
+      reason: `Target agent "${target.id}" does not have askAgent enabled`,
+    };
+  }
+
+  const deny = caller.askAgent.deny ?? [];
+  if (askAgentListMatches(deny, target.id)) {
+    return {
+      allowed: false,
+      code: "denied",
+      reason: `Agent "${caller.id}" is denied from asking "${target.id}"`,
+    };
+  }
+
+  const canAsk = caller.askAgent.canAsk ?? [ASK_AGENT_WILDCARD];
+  if (!askAgentListMatches(canAsk, target.id)) {
+    return {
+      allowed: false,
+      code: "denied",
+      reason: `Agent "${caller.id}" is not allowed to ask "${target.id}"`,
+    };
+  }
+
+  return { allowed: true };
+}
 
 export function resolveConfigPath(configPath?: string): string {
   return configPath === undefined
@@ -111,16 +160,76 @@ export function resolveConfigWorkspaceRoot(configPath?: string, workspaceRoot?: 
   return dirname(resolveConfigPath(configPath));
 }
 
+function validateAskAgentList(
+  raw: unknown,
+  agentId: string,
+  fieldName: "canAsk" | "deny",
+  knownAgentIds?: ReadonlySet<string>,
+): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error(`Agent "${agentId}" askAgent.${fieldName} must be an array`);
+  }
+
+  const values = raw.map((entry, index) => {
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new Error(`Agent "${agentId}" askAgent.${fieldName}[${index}] must be a non-empty agent id or "*"`);
+    }
+    return entry.trim();
+  });
+
+  if (values.includes(ASK_AGENT_WILDCARD) && values.length > 1) {
+    throw new Error(`Agent "${agentId}" askAgent.${fieldName} cannot combine "*" with agent ids`);
+  }
+
+  if (knownAgentIds) {
+    for (const [index, value] of values.entries()) {
+      if (value !== ASK_AGENT_WILDCARD && !knownAgentIds.has(value)) {
+        throw new Error(`Agent "${agentId}" askAgent.${fieldName}[${index}] references unknown agent "${value}"`);
+      }
+    }
+  }
+
+  return values;
+}
+
+function validateAskAgentConfig(
+  raw: unknown,
+  agentId: string,
+  knownAgentIds?: ReadonlySet<string>,
+): AskAgentConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Agent "${agentId}" askAgent must be an object`);
+  }
+
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.enabled !== "boolean") {
+    throw new Error(`Agent "${agentId}" askAgent.enabled must be a boolean`);
+  }
+
+  const canAsk = validateAskAgentList(obj.canAsk, agentId, "canAsk", knownAgentIds);
+  const deny = validateAskAgentList(obj.deny, agentId, "deny", knownAgentIds);
+
+  return {
+    enabled: obj.enabled,
+    canAsk: obj.enabled ? (canAsk ?? [ASK_AGENT_WILDCARD]) : canAsk,
+    deny,
+  };
+}
+
 export function validateAgent(
   raw: unknown,
   id: string,
   defaultModel?: string,
   workspaceRoot?: string,
+  knownAgentIds?: ReadonlySet<string>,
 ): AgentConfig {
   if (typeof raw !== "object" || raw === null) {
     throw new Error(`Agent "${id}" must be an object`);
   }
   const obj = raw as Record<string, unknown>;
+  const askAgent = validateAskAgentConfig(obj.askAgent, id, knownAgentIds);
   if (typeof obj.workspaceCwd !== "string") {
     throw new Error(`Agent "${id}" missing workspaceCwd`);
   }
@@ -179,6 +288,7 @@ export function validateAgent(
     systemPrompt: typeof obj.systemPrompt === "string" ? obj.systemPrompt : undefined,
     thinking: obj.thinking as AgentConfig["thinking"] | undefined,
     provider: "pi",
+    askAgent,
   };
 }
 
@@ -505,8 +615,9 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     throw new Error("Missing agents in config");
   }
   const agents: Record<string, AgentConfig> = {};
+  const knownAgentIds = new Set(Object.keys(raw.agents));
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
-    agents[id] = validateAgent(agentRaw, id, defaultModel, workspaceRoot);
+    agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
   }
 
   // Resolve Telegram token from configured non-interactive secret sources.

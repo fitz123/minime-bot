@@ -1,6 +1,6 @@
 import { describe, it, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,13 +19,17 @@ import {
 import { _resetPiContextCache } from "../pi-context-assembler.js";
 import {
   NewlineOnlyJsonlSplitter,
+  MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
+  PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+  PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
   PI_CRON_WRAPPER_RELPATHS,
   PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
   PI_EXTENSION_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
+  buildPiAskAgentChildSpawnEnv,
   buildPiPromptCommand,
   buildPiSpawnArgs,
   buildPiSpawnEnv,
@@ -35,6 +40,7 @@ import {
   parsePiEvent,
   piExtensionRelpathForDir,
   readPiStream,
+  resolvePiAskAgentChildExtensionArgs,
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   sendPiGetState,
@@ -365,7 +371,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -417,7 +423,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
 describe("Pi extension loading (--extension)", () => {
   const FAKE_DIR = "/fake/ext";
-  // All three wrappers present, extensions enabled.
+  // All parent wrappers present, extensions enabled.
   const presentAll: PiExtensionResolveOptions = {
     extensionsDir: FAKE_DIR,
     env: {},
@@ -430,17 +436,18 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
   });
 
-  it("defaults the wrapper list to web-tools, knowledge-tools, and subagent", () => {
+  it("defaults the wrapper list to web-tools, knowledge-tools, subagent, and ask-agent", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts"],
+      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["web-tools.js", "knowledge-tools.js", "subagent/index.js"],
+      ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -459,6 +466,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
     assert.deepStrictEqual(subagentChildArgs, [
       "--extension", wrapperAbs("web-tools.ts"),
@@ -478,6 +486,15 @@ describe("Pi extension loading (--extension)", () => {
     assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js", "knowledge-tools.js"]);
   });
 
+  it("the ask-agent child wrapper subset omits recursive handoff wrappers", () => {
+    const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
+    const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
+    assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
+    assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
+    assert.ok(!artifactRelpaths.includes("subagent/index.js"));
+    assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
+  });
+
   it("the Pi cron wrapper subset is knowledge-tools only", () => {
     assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
   });
@@ -488,6 +505,90 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
+  });
+
+  it("resolves ask-agent child wrappers plus configured extras while excluding recursive handoff wrappers", () => {
+    const extraA = resolve("/approved/ask-extra-a.ts");
+    const extraB = resolve("/approved/ask-extra-b.ts");
+    const args = resolvePiAskAgentChildExtensionArgs({
+      ...presentAll,
+      extraExtensions: [extraA, extraB],
+    });
+
+    assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", extraA,
+      "--extension", extraB,
+    ]);
+    assert.ok(!args.includes(wrapperAbs("subagent/index.ts")));
+    assert.ok(!args.includes(wrapperAbs("ask-agent/index.ts")));
+  });
+
+  it("rejects ask-agent child extras that reintroduce recursive handoff wrappers", () => {
+    assert.throws(
+      () => resolvePiAskAgentChildExtensionArgs({
+        ...presentAll,
+        extraExtensions: [wrapperAbs("ask-agent/index.ts")],
+      }),
+      /recursive handoff wrapper/,
+    );
+    assert.throws(
+      () => resolvePiAskAgentChildExtensionArgs({
+        ...presentAll,
+        extraExtensions: [wrapperAbs("subagent/index.ts")],
+      }),
+      /recursive handoff wrapper/,
+    );
+  });
+
+  it("rejects symlink, directory, and source/dist aliases for recursive ask-agent child extras", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ask-agent-recursive-extra-"));
+    try {
+      const sourceDir = join(root, "extensions", "pi");
+      const distDir = join(root, "dist", "extensions", "pi");
+      for (const dir of [
+        sourceDir,
+        distDir,
+        join(sourceDir, "ask-agent"),
+        join(sourceDir, "subagent"),
+        join(distDir, "ask-agent"),
+        join(distDir, "subagent"),
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      for (const file of [
+        join(sourceDir, "web-tools.ts"),
+        join(sourceDir, "knowledge-tools.ts"),
+        join(sourceDir, "ask-agent", "index.ts"),
+        join(sourceDir, "subagent", "index.ts"),
+        join(distDir, "ask-agent", "index.js"),
+        join(distDir, "subagent", "index.js"),
+      ]) {
+        writeFileSync(file, "export default function noop() {}\n", "utf8");
+      }
+
+      const symlinkedAskAgent = join(root, "approved-ask-agent.ts");
+      symlinkSync(join(sourceDir, "ask-agent", "index.ts"), symlinkedAskAgent);
+
+      for (const extraExtension of [
+        symlinkedAskAgent,
+        join(sourceDir, "subagent"),
+        join(distDir, "ask-agent", "index.js"),
+      ]) {
+        assert.throws(
+          () => resolvePiAskAgentChildExtensionArgs({
+            extensionsDir: sourceDir,
+            env: {},
+            extraExtensions: [extraExtension],
+          }),
+          /recursive handoff wrapper/,
+          extraExtension,
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
@@ -550,6 +651,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
     ]);
   });
 
@@ -565,6 +667,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
       "--extension", extraA,
       "--extension", extraB,
     ]);
@@ -584,6 +687,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
       "--extension", extraExtension,
     ]);
   });
@@ -616,10 +720,11 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 3);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
     assert.ok(args.includes(wrapperAbs("subagent/index.ts")));
+    assert.ok(args.includes(wrapperAbs("ask-agent/index.ts")));
     // Base args remain intact and precede the first --extension.
     assert.strictEqual(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
     assert.ok(args.indexOf("--model") < args.indexOf("--extension"));
@@ -632,6 +737,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
+      "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
   });
 
@@ -643,7 +749,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -664,6 +770,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
+      "--extension", resolve(artifactDir, "ask-agent/index.js"),
       "--extension", extraExtension,
     ]);
     assert.ok(!args.includes(resolve("/approved/interactive-extra.js")));
@@ -788,10 +895,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 3, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 4, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 3);
+    assert.strictEqual(paths.length, 4);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -814,6 +921,7 @@ describe("buildPiSpawnEnv", () => {
   it("allowlists canonical workspace env keys but excludes retired workspace env keys", () => {
     assert.equal(shouldIncludePiChildEnvKey(MINIME_CONTROL_WORKSPACE_ROOT_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_AGENT_WORKSPACE_ROOT_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_AGENT_ID_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
@@ -859,6 +967,7 @@ describe("buildPiSpawnEnv", () => {
       RETIRED_AGENT_WORKSPACE_ENV,
       RETIRED_CONTROL_WORKSPACE_ENV,
       MINIME_AGENT_WORKSPACE_ROOT_ENV,
+      MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
       MINIME_BOT_PI_SESSION_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
@@ -891,6 +1000,7 @@ describe("buildPiSpawnEnv", () => {
       process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/tmp/retired-agent-workspace";
       process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/tmp/retired-control-workspace";
       process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
       process.env[MINIME_BOT_PI_SESSION_ENV] = "ambient";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
@@ -912,6 +1022,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env[RETIRED_AGENT_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[RETIRED_CONTROL_WORKSPACE_ENV], undefined);
       assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_ENV], "1");
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
@@ -942,6 +1053,71 @@ describe("buildPiSpawnEnv", () => {
     const env = withWorkspaceRoot("/tmp", () => buildPiSpawnEnv());
 
     assert.ok(env.PATH?.includes("/opt/homebrew/bin"));
+  });
+
+  it("sets the ask-agent caller env only from trusted spawn options", () => {
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+
+    try {
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
+
+      const env = withWorkspaceRoot(
+        "/tmp",
+        () => buildPiSpawnEnv(undefined, { askCallerAgentId: "agent-b" }),
+      );
+
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], "agent-b");
+    } finally {
+      if (oldCaller === undefined) {
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+      } else {
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+    }
+  });
+
+  it("omits the ask-agent caller env when no trusted caller is provided", () => {
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+
+    try {
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
+
+      const env = withWorkspaceRoot("/tmp", () => buildPiSpawnEnv());
+
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+    } finally {
+      if (oldCaller === undefined) {
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+      } else {
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+    }
+  });
+
+  it("omits the ask-agent caller env when the trusted caller is empty", () => {
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+
+    try {
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
+
+      const blankEnv = withWorkspaceRoot(
+        "/tmp",
+        () => buildPiSpawnEnv(undefined, { askCallerAgentId: "" }),
+      );
+      const whitespaceEnv = withWorkspaceRoot(
+        "/tmp",
+        () => buildPiSpawnEnv(undefined, { askCallerAgentId: "   " }),
+      );
+
+      assert.strictEqual(blankEnv[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+      assert.strictEqual(whitespaceEnv[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+    } finally {
+      if (oldCaller === undefined) {
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+      } else {
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+    }
   });
 
   it("passes the non-secret control workspace contract to Pi children", () => {
@@ -1111,6 +1287,56 @@ describe("spawnPiRpcSession workspace validation", () => {
       rmSync(workspaceRoot, { recursive: true, force: true });
     }
   });
+
+  it("passes trusted ask-agent caller env to the spawned Pi process", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-caller-env-root-"));
+    const agentWorkspace = join(workspaceRoot, "agent-workspace");
+    const fakeBin = join(workspaceRoot, "fake-bin");
+    const capturePath = join(workspaceRoot, "caller-env.txt");
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldPath = process.env.PATH;
+
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "pi"),
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' "\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(join(fakeBin, "pi"), 0o755);
+
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+
+      const child = spawnPiRpcSession(
+        { ...testAgent, workspaceCwd: agentWorkspace },
+        undefined,
+        NO_EXTENSIONS,
+        { askCallerAgentId: "main" },
+      );
+      const [code] = await once(child, "close");
+
+      assert.strictEqual(code, 0);
+      assert.strictEqual(readFileSync(capturePath, "utf8").trim(), "main");
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = oldPath;
+      }
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildPiSubagentChildSpawnEnv", () => {
@@ -1243,6 +1469,37 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       }
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("sets ask-agent target workspace env without propagating the caller identity", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-control-root-"));
+    const targetWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-target-root-"));
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldCaller = process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
+
+      const env = buildPiAskAgentChildSpawnEnv(targetWorkspace);
+
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], targetWorkspace);
+      assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldCaller === undefined) {
+        delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+      } else {
+        process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(targetWorkspace, { recursive: true, force: true });
     }
   });
 });
