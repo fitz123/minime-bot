@@ -2,15 +2,20 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   ASK_AGENT_TOOL,
+  ASK_AGENT_TRUNCATED_MARKER,
   buildAskAgentTargetPrompt,
   buildAskAgentTargetSpawnArgs,
+  buildAskAgentStructuredResult,
   executeAskAgent,
   formatAskAgentChildWarn,
+  formatAskAgentExecutionLog,
   formatAskAgentToolResult,
   makeAskAgentError,
   readAskAgentCallerAgentId,
   runAskAgentTargetChild,
+  truncateAskAgentAnswer,
   type AskAgentExecutionResult,
+  type AskAgentExecutionLogEvent,
   type AskAgentTargetChildWarn,
 } from "../pi-extensions/ask-agent-args.js";
 import { MINIME_ASK_CALLER_AGENT_ID_ENV } from "../pi-rpc-protocol.js";
@@ -393,6 +398,94 @@ describe("ask-agent helper", () => {
     }
   });
 
+  it("truncates answers by character and byte caps with the truncated marker", () => {
+    const byChars = truncateAskAgentAnswer("abcdefghijklmnopqrstuvwxyz", {
+      maxChars: 16,
+      maxBytes: 100,
+    });
+    assert.equal(byChars.truncated, true);
+    assert.equal(byChars.answer, `abcd${ASK_AGENT_TRUNCATED_MARKER}`);
+    assert.equal(byChars.answer.length, 16);
+
+    const byBytes = truncateAskAgentAnswer("ééééééééééé", {
+      maxChars: 100,
+      maxBytes: 20,
+    });
+    assert.equal(byBytes.truncated, true);
+    assert.equal(byBytes.answer, `ééé${ASK_AGENT_TRUNCATED_MARKER}`);
+    assert.equal(Buffer.byteLength(byBytes.answer, "utf8"), 20);
+
+    assert.deepEqual(truncateAskAgentAnswer("short"), {
+      answer: "short",
+      truncated: false,
+    });
+  });
+
+  it("marks final target questions as clarification results", () => {
+    assert.deepEqual(buildAskAgentStructuredResult("Which environment should I inspect?"), {
+      answer: "Which environment should I inspect?",
+      truncated: false,
+      needsClarification: true,
+    });
+    assert.equal(buildAskAgentStructuredResult("The system is ready.").needsClarification, false);
+    assert.equal(buildAskAgentStructuredResult("Please clarify", "clarification").needsClarification, true);
+  });
+
+  it("emits metadata-only execution logs with duration, outcome, and error code", async () => {
+    const events: AskAgentExecutionLogEvent[] = [];
+    const times = [100, 125, 200, 245];
+
+    const success = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "private-question-text" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => CONTEXT,
+        runTarget: async () => ({ answer: "private-answer-text", truncated: false, needsClarification: false }),
+        log: (event) => events.push(event),
+        now: () => times.shift() ?? 245,
+      },
+    );
+    assert.equal(success.ok, true);
+
+    const failure = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => CONTEXT,
+        log: (event) => events.push(event),
+        now: () => times.shift() ?? 245,
+      },
+    );
+    assert.equal(failure.ok, false);
+
+    assert.deepEqual(events, [
+      {
+        callerAgentId: "agent-b",
+        targetAgentId: "agent-c",
+        durationMs: 25,
+        outcome: "success",
+        truncated: false,
+        needsClarification: false,
+      },
+      {
+        callerAgentId: "agent-b",
+        targetAgentId: "agent-c",
+        durationMs: 45,
+        outcome: "error",
+        errorCode: "invalid_request",
+      },
+    ]);
+
+    const lines = events.map(formatAskAgentExecutionLog);
+    assert.equal(lines[0], "[ask-agent] caller=agent-b target=agent-c durationMs=25 outcome=success truncated=false needsClarification=false");
+    assert.equal(lines[1], "[ask-agent] caller=agent-b target=agent-c durationMs=45 outcome=error errorCode=invalid_request");
+    for (const line of lines) {
+      assert.doesNotMatch(line, /private-question-text|private-answer-text/);
+    }
+  });
+
   it("runs the target child in the target workspace and returns the final assistant text", async () => {
     const { child, calls, spawn } = setupRunner();
     const request = {
@@ -427,6 +520,115 @@ describe("ask-agent helper", () => {
     assert.ok(calls[0].args.includes("/abs/web-tools.ts"));
   });
 
+  it("returns clarification questions from the child as valid structured results", async () => {
+    const { child, spawn } = setupRunner();
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+    }, { spawn });
+
+    child.stdout.emit(assistantLine("Which workspace should I inspect?"));
+    child.emitClose(0);
+
+    assert.deepEqual(await promise, {
+      answer: "Which workspace should I inspect?",
+      truncated: false,
+      needsClarification: true,
+    });
+  });
+
+  it("returns an empty answer without inventing content", async () => {
+    const { child, spawn } = setupRunner();
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+    }, { spawn });
+
+    child.stdout.emit(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [] } }) + "\n");
+    child.emitClose(0);
+
+    assert.deepEqual(await promise, {
+      answer: "",
+      truncated: false,
+      needsClarification: false,
+    });
+  });
+
+  it("truncates long child answers in the structured result", async () => {
+    const { child, spawn } = setupRunner();
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+    }, { spawn });
+
+    child.stdout.emit(assistantLine("x".repeat(40_000)));
+    child.emitClose(0);
+
+    const result = await promise;
+    assert.equal(result.truncated, true);
+    assert.equal(result.needsClarification, false);
+    assert.ok(result.answer.endsWith(ASK_AGENT_TRUNCATED_MARKER));
+    assert.ok(result.answer.length <= 32 * 1024);
+  });
+
+  it("rejects child errors and emits metadata-only child warnings", async () => {
+    const { child, spawn } = setupRunner();
+    const warnings: AskAgentTargetChildWarn[] = [];
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "private question",
+      context: CONTEXT,
+    }, {
+      spawn,
+      warn: (event) => warnings.push(event),
+    });
+
+    child.stderr.emit("private answer diagnostics");
+    child.emitClose(2);
+
+    await assert.rejects(promise, /target child failed/);
+    assert.deepEqual(warnings, [
+      {
+        callerAgentId: "agent-b",
+        targetAgentId: "agent-c",
+        exitCode: 2,
+        stopReason: undefined,
+        timedOut: false,
+      },
+    ]);
+    assert.doesNotMatch(formatAskAgentChildWarn(warnings[0]), /private question|private answer/);
+  });
+
+  it("ignores malformed JSONL and still parses the final buffered assistant answer", async () => {
+    const { child, spawn } = setupRunner();
+    const promise = runAskAgentTargetChild({
+      caller: agent("agent-b"),
+      target: agent("agent-c"),
+      question: "status?",
+      context: CONTEXT,
+    }, { spawn });
+    const finalLine = assistantLine("final from split JSONL").trimEnd();
+
+    child.stdout.emit("\nnot json\n");
+    child.stdout.emit(JSON.stringify({ type: "turn_end" }) + "\n");
+    child.stdout.emit(finalLine.slice(0, 24));
+    child.stdout.emit(finalLine.slice(24));
+    child.emitClose(0);
+
+    assert.deepEqual(await promise, {
+      answer: "final from split JSONL",
+      truncated: false,
+      needsClarification: false,
+    });
+  });
+
   it("aborts a target child on timeout with direct SIGTERM then SIGKILL", async () => {
     const { child, spawn } = setupRunner();
     const request = {
@@ -441,7 +643,9 @@ describe("ask-agent helper", () => {
       abortGraceMs: 5,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    for (let i = 0; i < 20 && !child.killSignals.includes("SIGKILL"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.ok(child.killSignals.includes("SIGTERM"));
     assert.ok(child.killSignals.includes("SIGKILL"));
     child.emitClose(137);

@@ -18,6 +18,7 @@ import {
   ASK_AGENT_TOOL,
   executeAskAgent,
   formatAskAgentChildWarn,
+  formatAskAgentExecutionLog,
   formatAskAgentToolResult,
   makeAskAgentError,
   runAskAgentTargetChild,
@@ -28,6 +29,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     ...ASK_AGENT_TOOL,
     execute: async (_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) => {
+      const startedAt = Date.now();
       try {
         const config = loadConfig(undefined, { resolveSecrets: false });
         return formatAskAgentToolResult(
@@ -47,9 +49,19 @@ export default function (pi: ExtensionAPI): void {
               },
             }),
             signal,
+            log: (event) => {
+              // eslint-disable-next-line no-console -- structured metadata-only ask-agent execution log
+              console.warn(formatAskAgentExecutionLog(event));
+            },
           }),
         ) as AgentToolResult<AskAgentToolDetails>;
       } catch {
+        // eslint-disable-next-line no-console -- structured metadata-only ask-agent execution log
+        console.warn(formatAskAgentExecutionLog({
+          durationMs: Date.now() - startedAt,
+          outcome: "error",
+          errorCode: "config_unavailable",
+        }));
         return formatAskAgentToolResult(
           makeAskAgentError("config_unavailable", "ask-agent configuration is unavailable"),
         ) as AgentToolResult<AskAgentToolDetails>;

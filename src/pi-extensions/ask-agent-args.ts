@@ -18,6 +18,9 @@ import {
 export const MAX_ASK_AGENT_QUESTION_CHARS = 64 * 1024;
 export const ASK_AGENT_CHILD_TIMEOUT_MS = 120_000;
 export const ASK_AGENT_CHILD_ABORT_GRACE_MS = 5_000;
+export const MAX_ASK_AGENT_ANSWER_CHARS = 32 * 1024;
+export const MAX_ASK_AGENT_ANSWER_BYTES = 128 * 1024;
+export const ASK_AGENT_TRUNCATED_MARKER = "…[truncated]";
 
 export const ASK_AGENT_TOOL = {
   name: "ask-agent",
@@ -72,12 +75,24 @@ export interface AskAgentPreparedRequest {
 
 export type RunAskAgentTarget = (request: AskAgentPreparedRequest) => Promise<AskAgentStructuredResult>;
 
+export interface AskAgentExecutionLogEvent {
+  callerAgentId?: string;
+  targetAgentId?: string;
+  durationMs: number;
+  outcome: "success" | "error";
+  errorCode?: AskAgentErrorCode;
+  truncated?: boolean;
+  needsClarification?: boolean;
+}
+
 export interface ExecuteAskAgentDeps {
   config: Pick<BotConfig, "agents" | "piExtraExtensions">;
   env?: NodeJS.ProcessEnv;
   assembleContext: (agent: AgentConfig) => PiContextArtifacts | null;
   runTarget?: RunAskAgentTarget;
   signal?: AbortSignal;
+  log?: (event: AskAgentExecutionLogEvent) => void;
+  now?: () => number;
 }
 
 export type AskAgentExecutionResult =
@@ -215,6 +230,25 @@ export function formatAskAgentChildWarn(event: AskAgentTargetChildWarn): string 
   return parts.join(" ");
 }
 
+export function formatAskAgentExecutionLog(event: AskAgentExecutionLogEvent): string {
+  const parts = [
+    `[ask-agent] caller=${event.callerAgentId ?? "unknown"}`,
+    `target=${event.targetAgentId ?? "unknown"}`,
+    `durationMs=${Math.max(0, Math.round(event.durationMs))}`,
+    `outcome=${event.outcome}`,
+  ];
+  if (event.errorCode) {
+    parts.push(`errorCode=${event.errorCode}`);
+  }
+  if (event.truncated !== undefined) {
+    parts.push(`truncated=${event.truncated}`);
+  }
+  if (event.needsClarification !== undefined) {
+    parts.push(`needsClarification=${event.needsClarification}`);
+  }
+  return parts.join(" ");
+}
+
 function combineAbortWithTimeout(
   parentSignal: AbortSignal | undefined,
   timeoutMs: number,
@@ -272,6 +306,60 @@ function assertSuccessfulAskAgentChild(result: SubagentRunResult, timedOut: bool
   }
 }
 
+function takeFittingPrefix(value: string, maxChars: number, maxBytes: number): string {
+  let output = "";
+  let chars = 0;
+  let bytes = 0;
+  for (const char of value) {
+    const charLength = char.length;
+    const byteLength = Buffer.byteLength(char, "utf8");
+    if (chars + charLength > maxChars || bytes + byteLength > maxBytes) {
+      break;
+    }
+    output += char;
+    chars += charLength;
+    bytes += byteLength;
+  }
+  return output;
+}
+
+export function truncateAskAgentAnswer(
+  answer: string,
+  options?: { maxChars?: number; maxBytes?: number },
+): { answer: string; truncated: boolean } {
+  const maxChars = options?.maxChars ?? MAX_ASK_AGENT_ANSWER_CHARS;
+  const maxBytes = options?.maxBytes ?? MAX_ASK_AGENT_ANSWER_BYTES;
+  if (answer.length <= maxChars && Buffer.byteLength(answer, "utf8") <= maxBytes) {
+    return { answer, truncated: false };
+  }
+
+  const markerBytes = Buffer.byteLength(ASK_AGENT_TRUNCATED_MARKER, "utf8");
+  const prefixMaxChars = Math.max(0, maxChars - ASK_AGENT_TRUNCATED_MARKER.length);
+  const prefixMaxBytes = Math.max(0, maxBytes - markerBytes);
+  const prefix = takeFittingPrefix(answer, prefixMaxChars, prefixMaxBytes);
+  return {
+    answer: `${prefix}${ASK_AGENT_TRUNCATED_MARKER}`,
+    truncated: true,
+  };
+}
+
+export function isAskAgentClarificationQuestion(answer: string, stopReason?: string): boolean {
+  const normalizedStopReason = stopReason?.trim().toLowerCase();
+  if (normalizedStopReason === "clarification" || normalizedStopReason === "question") {
+    return true;
+  }
+  return /[?？]\s*$/u.test(answer.trim());
+}
+
+export function buildAskAgentStructuredResult(answer: string, stopReason?: string): AskAgentStructuredResult {
+  const truncated = truncateAskAgentAnswer(answer);
+  return {
+    answer: truncated.answer,
+    truncated: truncated.truncated,
+    needsClarification: isAskAgentClarificationQuestion(answer, stopReason),
+  };
+}
+
 export async function runAskAgentTargetChild(
   request: AskAgentPreparedRequest,
   deps: RunAskAgentTargetChildDeps,
@@ -300,11 +388,7 @@ export async function runAskAgentTargetChild(
     });
 
     assertSuccessfulAskAgentChild(result, timeout.timedOut());
-    return {
-      answer: getFinalOutput(result.messages),
-      truncated: false,
-      needsClarification: false,
-    };
+    return buildAskAgentStructuredResult(getFinalOutput(result.messages), result.stopReason);
   } finally {
     timeout.cleanup();
   }
@@ -351,71 +435,99 @@ function normalizeQuestion(params: Record<string, unknown>): string | undefined 
 }
 
 export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgentDeps): Promise<AskAgentExecutionResult> {
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
+  const finish = (result: AskAgentExecutionResult): AskAgentExecutionResult => {
+    if (deps.log) {
+      try {
+        deps.log(result.ok
+          ? {
+              callerAgentId: result.callerAgentId,
+              targetAgentId: result.targetAgentId,
+              durationMs: now() - startedAt,
+              outcome: "success",
+              truncated: result.result.truncated,
+              needsClarification: result.result.needsClarification,
+            }
+          : {
+              callerAgentId: result.callerAgentId,
+              targetAgentId: result.targetAgentId,
+              durationMs: now() - startedAt,
+              outcome: "error",
+              errorCode: result.error.code,
+            });
+      } catch {
+        // Logging must not change tool behavior.
+      }
+    }
+    return result;
+  };
+
   const params = asParams(paramsLike);
   const callerAgentId = readAskAgentCallerAgentId(deps.env);
   if (!callerAgentId) {
-    return makeAskAgentError("caller_unknown", "ask-agent caller identity is unavailable");
+    return finish(makeAskAgentError("caller_unknown", "ask-agent caller identity is unavailable"));
   }
 
   const caller = deps.config.agents[callerAgentId];
   if (!caller) {
-    return makeAskAgentError("caller_unknown", "ask-agent caller identity is not a configured agent", {
+    return finish(makeAskAgentError("caller_unknown", "ask-agent caller identity is not a configured agent", {
       callerAgentId,
-    });
+    }));
   }
 
   const targetAgentId = normalizeTargetAgentId(params);
   if (!targetAgentId) {
-    return makeAskAgentError("target_unknown", "ask-agent target agent is missing or unknown", {
+    return finish(makeAskAgentError("target_unknown", "ask-agent target agent is missing or unknown", {
       callerAgentId,
-    });
+    }));
   }
 
   const target = deps.config.agents[targetAgentId];
   if (!target) {
-    return makeAskAgentError("target_unknown", "ask-agent target agent is not configured", {
+    return finish(makeAskAgentError("target_unknown", "ask-agent target agent is not configured", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 
   const question = normalizeQuestion(params);
   if (!question) {
-    return makeAskAgentError("invalid_request", "ask-agent question is missing, empty, or too large", {
+    return finish(makeAskAgentError("invalid_request", "ask-agent question is missing, empty, or too large", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 
   const policy = resolveAskAgentPolicy(caller, target);
   if (!policy.allowed) {
-    return makeAskAgentError(policy.code, policy.reason, {
+    return finish(makeAskAgentError(policy.code, policy.reason, {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 
   let context: PiContextArtifacts | null;
   try {
     context = deps.assembleContext(target);
   } catch {
-    return makeAskAgentError("context_unavailable", "ask-agent target context is unavailable", {
+    return finish(makeAskAgentError("context_unavailable", "ask-agent target context is unavailable", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
   if (!context) {
-    return makeAskAgentError("context_unavailable", "ask-agent target context is unavailable", {
+    return finish(makeAskAgentError("context_unavailable", "ask-agent target context is unavailable", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 
   if (!deps.runTarget) {
-    return makeAskAgentError("spawn_unavailable", "ask-agent target spawning is not available in this build", {
+    return finish(makeAskAgentError("spawn_unavailable", "ask-agent target spawning is not available in this build", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 
   try {
@@ -426,17 +538,17 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
       context,
       signal: deps.signal,
     });
-    return {
+    return finish({
       ok: true,
       callerAgentId,
       targetAgentId,
       result,
-    };
+    });
   } catch {
-    return makeAskAgentError("spawn_unavailable", "ask-agent target spawning failed before producing a result", {
+    return finish(makeAskAgentError("spawn_unavailable", "ask-agent target spawning failed before producing a result", {
       callerAgentId,
       targetAgentId,
-    });
+    }));
   }
 }
 

@@ -71,10 +71,10 @@ All three must pass with no PII in output or fixtures. Latest run: 1665 tests, 0
 
 ### Task 5: Result handling, logging, and limits
 
-- [ ] Implement answer truncation with a max char length, a byte cap, and a `…[truncated]` marker.
-- [ ] Treat a child clarification question as a valid result with `needsClarification: true`.
-- [ ] Ensure common logs contain only metadata: caller, target, duration, outcome/error code — never question or answer text.
-- [ ] Add tests for timeout, child error, empty answer, truncation, and JSONL parse edge cases.
+- [x] Implement answer truncation with a max char length, a byte cap, and a `…[truncated]` marker.
+- [x] Treat a child clarification question as a valid result with `needsClarification: true`.
+- [x] Ensure common logs contain only metadata: caller, target, duration, outcome/error code — never question or answer text.
+- [x] Add tests for timeout, child error, empty answer, truncation, and JSONL parse edge cases.
 
 ### Task 6: Hermetic package smoke and docs
 
