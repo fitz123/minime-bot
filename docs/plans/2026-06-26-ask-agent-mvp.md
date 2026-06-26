@@ -38,11 +38,11 @@ All three must pass with no PII in output or fixtures. Latest run: 1646 tests, 0
 
 ### Task 1: Config schema and validation
 
-- [ ] Add `askAgent` config to `AgentConfig` with `enabled: boolean`, optional `canAsk?: string[]`, optional `deny?: string[]`.
-- [ ] Treat absent `canAsk` as wildcard allow (`["*"]`) for enabled targets.
-- [ ] Make `deny` override allow; support `deny: ["*"]` as deny-all for that asker.
-- [ ] Validate referenced agent IDs and wildcard usage in `validateAgent()`.
-- [ ] Add neutral unit tests for the new fields and policy resolution (use `agent-b`/`agent-c`-style ids).
+- [x] Add `askAgent` config to `AgentConfig` with `enabled: boolean`, optional `canAsk?: string[]`, optional `deny?: string[]`.
+- [x] Treat absent `canAsk` as wildcard allow (`["*"]`) for enabled targets.
+- [x] Make `deny` override allow; support `deny: ["*"]` as deny-all for that asker.
+- [x] Validate referenced agent IDs and wildcard usage in `validateAgent()`.
+- [x] Add neutral unit tests for the new fields and policy resolution (use `agent-b`/`agent-c`-style ids).
 
 ### Task 2: Trusted caller identity env
 
