@@ -25,8 +25,8 @@ import {
 } from "./workspace-contract.js";
 
 const PI_BIN = "pi";
-const PI_PROVIDER = "openai-codex";
-const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
+export const PI_PROVIDER = "openai-codex";
+export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
@@ -60,6 +60,16 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
 export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
 
 /**
+ * Wrappers an ask-agent target CHILD `pi` spawn must load. The child runs as a
+ * full target agent with the target's normal first-party tool surface, except
+ * recursive handoff tools stay disabled for MVP.
+ */
+const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>(["subagent/index.ts", "ask-agent/index.ts"]);
+export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
+  PI_EXTENSION_WRAPPER_RELPATHS.filter((relpath) => !PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS.has(relpath)),
+);
+
+/**
  * Wrappers a Pi print-mode cron must load. Crons need the Knowledge wrapper so
  * managed wiki writes are protected, but do not get interactive web-tools or
  * subagent parity.
@@ -67,6 +77,15 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-to
 export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
 
 export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "knowledge-tools.js"] as const;
+const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
+  "subagent/index.js",
+  "ask-agent/index.js",
+]);
+export const PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = Object.freeze(
+  PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS.filter(
+    (relpath) => !PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS.has(relpath),
+  ),
+);
 
 /**
  * Kill-switch env var: set to exactly `"1"` to spawn Pi with no explicit
@@ -218,6 +237,23 @@ function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[
     args.push("--extension", extra);
   }
   return args;
+}
+
+export function resolvePiSpawnExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  return [
+    ...resolvePiExtensionArgs(options),
+    ...resolvePiExtraExtensionArgs(options),
+  ];
+}
+
+export function resolvePiAskAgentChildExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
+  return [
+    ...resolvePiExtensionArgs({
+      ...options,
+      relpaths: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
+    }),
+    ...resolvePiExtraExtensionArgs(options),
+  ];
 }
 
 export function piExtensionRelpathForDir(baseDir: string, relpath: string): string {
@@ -408,8 +444,7 @@ export function buildPiSpawnArgs(
   // discovery; load first-party wrappers and configured extras only as explicit
   // repeatable `--extension <abs-path>` args. The kill-switch and missing-path
   // checks live in the extension resolvers.
-  args.push(...resolvePiExtensionArgs(extensionOptions));
-  args.push(...resolvePiExtraExtensionArgs(extensionOptions));
+  args.push(...resolvePiSpawnExtensionArgs(extensionOptions));
 
   // Pi mints its own session id (the bot cannot pre-assign one with
   // --session-id). When resuming a stored session, point Pi at the
@@ -430,6 +465,10 @@ export function buildPiSpawnEnv(
 }
 
 export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+}
+
+export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
   return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
 }
 

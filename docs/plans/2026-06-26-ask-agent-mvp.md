@@ -62,12 +62,12 @@ All three must pass with no PII in output or fixtures. Latest run: 1665 tests, 0
 
 ### Task 4: Full target child spawn
 
-- [ ] Build ask-agent child extension args from the target's normal RPC extension profile (first-party wrappers plus configured `extraExtensions`), then exclude `subagent` and `ask-agent`.
-- [ ] Do not assert this differs from the current minimal subagent child set; with today's built-ins it may be the same (`web-tools` + `knowledge-tools`).
-- [ ] Spawn Pi in the target `workspaceCwd` with that cwd, provider `"pi"`, and the normalized target model.
-- [ ] Wire target context like a normal RPC spawn: `systemPrompt` when present, `assemblePiContext()` artifacts (`systemPromptPath` / `appendSystemPromptPath`), plus a trusted preamble + fenced untrusted question.
-- [ ] Use a bounded timeout and a direct child `SIGTERM` -> `SIGKILL` kill path; no process-group kill in MVP because `subagent` is excluded.
-- [ ] Reuse/extract JSONL final-assistant parsing (`parsePiRecord()` / `getFinalOutput()`) and spawn helpers from subagent where practical.
+- [x] Build ask-agent child extension args from the target's normal RPC extension profile (first-party wrappers plus configured `extraExtensions`), then exclude `subagent` and `ask-agent`.
+- [x] Do not assert this differs from the current minimal subagent child set; with today's built-ins it may be the same (`web-tools` + `knowledge-tools`).
+- [x] Spawn Pi in the target `workspaceCwd` with that cwd, provider `"pi"`, and the normalized target model.
+- [x] Wire target context like a normal RPC spawn: `systemPrompt` when present, `assemblePiContext()` artifacts (`systemPromptPath` / `appendSystemPromptPath`), plus a trusted preamble + fenced untrusted question.
+- [x] Use a bounded timeout and a direct child `SIGTERM` -> `SIGKILL` kill path; no process-group kill in MVP because `subagent` is excluded.
+- [x] Reuse/extract JSONL final-assistant parsing (`parsePiRecord()` / `getFinalOutput()`) and spawn helpers from subagent where practical.
 
 ### Task 5: Result handling, logging, and limits
 

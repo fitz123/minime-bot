@@ -20,12 +20,15 @@ import {
   NewlineOnlyJsonlSplitter,
   MINIME_ASK_CALLER_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
+  PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+  PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
   PI_CRON_WRAPPER_RELPATHS,
   PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
   PI_EXTENSION_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
+  buildPiAskAgentChildSpawnEnv,
   buildPiPromptCommand,
   buildPiSpawnArgs,
   buildPiSpawnEnv,
@@ -36,6 +39,7 @@ import {
   parsePiEvent,
   piExtensionRelpathForDir,
   readPiStream,
+  resolvePiAskAgentChildExtensionArgs,
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   sendPiGetState,
@@ -481,6 +485,15 @@ describe("Pi extension loading (--extension)", () => {
     assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js", "knowledge-tools.js"]);
   });
 
+  it("the ask-agent child wrapper subset omits recursive handoff wrappers", () => {
+    const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
+    const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
+    assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
+    assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
+    assert.ok(!artifactRelpaths.includes("subagent/index.js"));
+    assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
+  });
+
   it("the Pi cron wrapper subset is knowledge-tools only", () => {
     assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
   });
@@ -491,6 +504,24 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
+  });
+
+  it("resolves ask-agent child wrappers plus configured extras while excluding recursive handoff wrappers", () => {
+    const extraA = resolve("/approved/ask-extra-a.ts");
+    const extraB = resolve("/approved/ask-extra-b.ts");
+    const args = resolvePiAskAgentChildExtensionArgs({
+      ...presentAll,
+      extraExtensions: [extraA, extraB],
+    });
+
+    assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("web-tools.ts"),
+      "--extension", wrapperAbs("knowledge-tools.ts"),
+      "--extension", extraA,
+      "--extension", extraB,
+    ]);
+    assert.ok(!args.includes(wrapperAbs("subagent/index.ts")));
+    assert.ok(!args.includes(wrapperAbs("ask-agent/index.ts")));
   });
 
   it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
@@ -1321,6 +1352,37 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       }
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("sets ask-agent target workspace env without propagating the caller identity", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-control-root-"));
+    const targetWorkspace = mkdtempSync(join(tmpdir(), "pi-ask-agent-env-target-root-"));
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldCaller = process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = "agent-b";
+
+      const env = buildPiAskAgentChildSpawnEnv(targetWorkspace);
+
+      assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
+      assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], targetWorkspace);
+      assert.strictEqual(env[MINIME_ASK_CALLER_AGENT_ID_ENV], undefined);
+    } finally {
+      if (oldWorkspace === undefined) {
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      }
+      if (oldCaller === undefined) {
+        delete process.env[MINIME_ASK_CALLER_AGENT_ID_ENV];
+      } else {
+        process.env[MINIME_ASK_CALLER_AGENT_ID_ENV] = oldCaller;
+      }
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(targetWorkspace, { recursive: true, force: true });
     }
   });
 });
