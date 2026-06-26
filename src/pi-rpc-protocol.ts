@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute, normalize, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, normalize, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import type {
   AgentConfig,
@@ -103,6 +103,8 @@ export interface PiExtensionResolveOptions {
   env?: NodeJS.ProcessEnv;
   /** Override the existence check (default: `fs.existsSync`). */
   exists?: (path: string) => boolean;
+  /** Override realpath resolution (default: `fs.realpathSync`). */
+  realpath?: (path: string) => string;
   /**
    * Which wrapper relpaths to resolve (default: the full interactive
    * {@link PI_EXTENSION_WRAPPER_RELPATHS}). A subagent child passes
@@ -250,6 +252,62 @@ function extensionArgPaths(args: readonly string[]): string[] {
   return paths;
 }
 
+function addPathAndRealpath(
+  paths: Set<string>,
+  path: string,
+  options?: PiExtensionResolveOptions,
+): void {
+  const normalized = normalize(resolve(path));
+  paths.add(normalized);
+
+  try {
+    paths.add(normalize(resolve((options?.realpath ?? realpathSync)(normalized))));
+  } catch (err) {
+    if (options?.exists === undefined && options?.realpath === undefined) {
+      throw err;
+    }
+    // Tests may use synthetic paths with a mocked exists() predicate. Keep those
+    // checks path-based while production resolves real symlink targets.
+  }
+}
+
+function recursiveWrapperBaseDirs(baseDir: string): string[] {
+  const normalizedBase = normalize(baseDir).replace(/[\\/]+$/, "");
+  const dirs = new Set<string>([normalizedBase]);
+  const sourceSuffix = normalize("extensions/pi");
+  const artifactSuffix = normalize("dist/extensions/pi");
+
+  if (normalizedBase.endsWith(sourceSuffix) && !normalizedBase.endsWith(artifactSuffix)) {
+    dirs.add(normalize(resolve(normalizedBase, "..", "..", "dist", "extensions", "pi")));
+  } else if (normalizedBase.endsWith(artifactSuffix)) {
+    dirs.add(normalize(resolve(normalizedBase, "..", "..", "..", "extensions", "pi")));
+  }
+
+  return [...dirs];
+}
+
+function recursiveWrapperDeniedPaths(options?: PiSpawnExtensionOptions): Set<string> {
+  const baseDir = options?.extensionsDir ?? resolveWorkspaceContract().paths.piExtensionDir;
+  const fileExists = options?.exists ?? existsSync;
+  const paths = new Set<string>();
+
+  for (const candidateBaseDir of recursiveWrapperBaseDirs(baseDir)) {
+    for (const relpath of ["subagent/index.ts", "subagent/index.js", "ask-agent/index.ts", "ask-agent/index.js"]) {
+      const abs = normalize(resolve(candidateBaseDir, relpath));
+      if (fileExists(abs)) {
+        addPathAndRealpath(paths, abs, options);
+      }
+
+      const wrapperDir = dirname(abs);
+      if (fileExists(wrapperDir)) {
+        addPathAndRealpath(paths, wrapperDir, options);
+      }
+    }
+  }
+
+  return paths;
+}
+
 function assertNoAskAgentRecursiveExtraExtensions(
   extraArgs: readonly string[],
   options?: PiSpawnExtensionOptions,
@@ -258,14 +316,12 @@ function assertNoAskAgentRecursiveExtraExtensions(
     return;
   }
 
-  const recursiveWrapperArgs = resolvePiExtensionArgs({
-    ...options,
-    relpaths: ["subagent/index.ts", "ask-agent/index.ts"],
-  });
-  const recursiveWrapperPaths = new Set(extensionArgPaths(recursiveWrapperArgs));
+  const recursiveWrapperPaths = recursiveWrapperDeniedPaths(options);
 
   for (const extraPath of extensionArgPaths(extraArgs)) {
-    if (recursiveWrapperPaths.has(extraPath)) {
+    const candidatePaths = new Set<string>();
+    addPathAndRealpath(candidatePaths, extraPath, options);
+    if ([...candidatePaths].some((candidatePath) => recursiveWrapperPaths.has(candidatePath))) {
       throw new Error(`Pi extra extension cannot load recursive handoff wrapper in ask-agent children: ${extraPath}`);
     }
   }

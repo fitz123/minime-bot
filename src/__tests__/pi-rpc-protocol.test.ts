@@ -542,6 +542,55 @@ describe("Pi extension loading (--extension)", () => {
     );
   });
 
+  it("rejects symlink, directory, and source/dist aliases for recursive ask-agent child extras", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ask-agent-recursive-extra-"));
+    try {
+      const sourceDir = join(root, "extensions", "pi");
+      const distDir = join(root, "dist", "extensions", "pi");
+      for (const dir of [
+        sourceDir,
+        distDir,
+        join(sourceDir, "ask-agent"),
+        join(sourceDir, "subagent"),
+        join(distDir, "ask-agent"),
+        join(distDir, "subagent"),
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      for (const file of [
+        join(sourceDir, "web-tools.ts"),
+        join(sourceDir, "knowledge-tools.ts"),
+        join(sourceDir, "ask-agent", "index.ts"),
+        join(sourceDir, "subagent", "index.ts"),
+        join(distDir, "ask-agent", "index.js"),
+        join(distDir, "subagent", "index.js"),
+      ]) {
+        writeFileSync(file, "export default function noop() {}\n", "utf8");
+      }
+
+      const symlinkedAskAgent = join(root, "approved-ask-agent.ts");
+      symlinkSync(join(sourceDir, "ask-agent", "index.ts"), symlinkedAskAgent);
+
+      for (const extraExtension of [
+        symlinkedAskAgent,
+        join(sourceDir, "subagent"),
+        join(distDir, "ask-agent", "index.js"),
+      ]) {
+        assert.throws(
+          () => resolvePiAskAgentChildExtensionArgs({
+            extensionsDir: sourceDir,
+            env: {},
+            extraExtensions: [extraExtension],
+          }),
+          /recursive handoff wrapper/,
+          extraExtension,
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_CRON_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [

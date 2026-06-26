@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ASK_AGENT_TOOL,
   ASK_AGENT_TRUNCATED_MARKER,
+  MAX_ASK_AGENT_QUESTION_BYTES,
   MAX_ASK_AGENT_QUESTION_CHARS,
   buildAskAgentTargetPrompt,
   buildAskAgentTargetSpawnArgs,
@@ -324,6 +325,28 @@ describe("ask-agent helper", () => {
     assertError(oversized, "invalid_request");
     assert.equal(assembleCalled, false);
     assert.equal(runTargetCalled, false);
+
+    assembleCalled = false;
+    runTargetCalled = false;
+    const byteOversized = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "é".repeat((MAX_ASK_AGENT_QUESTION_BYTES / 2) + 1) },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        assembleContext: () => {
+          assembleCalled = true;
+          return CONTEXT;
+        },
+        runTarget: async () => {
+          runTargetCalled = true;
+          return { answer: "unexpected", truncated: false, needsClarification: false };
+        },
+      },
+    );
+
+    assertError(byteOversized, "invalid_request");
+    assert.equal(assembleCalled, false);
+    assert.equal(runTargetCalled, false);
   });
 
   it("enforces enabled, canAsk, and deny policy without context or spawn", async () => {
@@ -408,6 +431,55 @@ describe("ask-agent helper", () => {
       assertError(result, "context_unavailable");
       assert.equal(runTargetCalled, false);
     }
+  });
+
+  it("validates the target workspace before context assembly and target spawn", async () => {
+    const validatedWorkspace = "/tmp/validated-target-workspace";
+    const success = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "status?" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        validateTargetWorkspace: (target) => {
+          assert.equal(target.id, "agent-c");
+          return validatedWorkspace;
+        },
+        assembleContext: (target) => {
+          assert.equal(target.workspaceCwd, validatedWorkspace);
+          return CONTEXT;
+        },
+        runTarget: async (request) => {
+          assert.equal(request.target.workspaceCwd, validatedWorkspace);
+          return { answer: "validated", truncated: false, needsClarification: false };
+        },
+      },
+    );
+    assert.equal(success.ok, true);
+
+    let assembleCalled = false;
+    let runTargetCalled = false;
+    const failure = await executeAskAgent(
+      { targetAgentId: "agent-c", question: "status?" },
+      {
+        config: config(agent("agent-b"), agent("agent-c")),
+        env: env("agent-b"),
+        validateTargetWorkspace: () => {
+          throw new Error("workspace missing");
+        },
+        assembleContext: () => {
+          assembleCalled = true;
+          return CONTEXT;
+        },
+        runTarget: async () => {
+          runTargetCalled = true;
+          return { answer: "unexpected", truncated: false, needsClarification: false };
+        },
+      },
+    );
+
+    assertError(failure, "context_unavailable");
+    assert.equal(assembleCalled, false);
+    assert.equal(runTargetCalled, false);
   });
 
   it("returns the injected target result in the structured answer shape", async () => {

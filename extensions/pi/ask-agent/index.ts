@@ -12,6 +12,7 @@ import { loadConfig } from "../../../src/config.js";
 import { assemblePiContext } from "../../../src/pi-context-assembler.js";
 import {
   buildPiAskAgentChildSpawnEnv,
+  resolveValidatedPiAgentWorkspaceCwd,
   resolvePiAskAgentChildExtensionArgs,
 } from "../../../src/pi-rpc-protocol.js";
 import {
@@ -49,6 +50,7 @@ export default function (pi: ExtensionAPI): void {
         await executeAskAgent(params ?? {}, {
           config,
           env: process.env,
+          validateTargetWorkspace: resolveValidatedPiAgentWorkspaceCwd,
           assembleContext: assemblePiContext,
           runTarget: (request) => runAskAgentTargetChild(request, {
             spawn,

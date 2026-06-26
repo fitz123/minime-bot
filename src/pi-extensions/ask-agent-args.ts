@@ -17,6 +17,7 @@ import {
 } from "./subagent-args.js";
 
 export const MAX_ASK_AGENT_QUESTION_CHARS = 64 * 1024;
+export const MAX_ASK_AGENT_QUESTION_BYTES = 64 * 1024;
 export const ASK_AGENT_CHILD_TIMEOUT_MS = 120_000;
 export const ASK_AGENT_CHILD_ABORT_GRACE_MS = 5_000;
 export const MAX_ASK_AGENT_ANSWER_CHARS = 32 * 1024;
@@ -89,6 +90,7 @@ export interface AskAgentExecutionLogEvent {
 export interface ExecuteAskAgentDeps {
   config: Pick<BotConfig, "agents" | "piExtraExtensions">;
   env?: NodeJS.ProcessEnv;
+  validateTargetWorkspace?: (agent: AgentConfig) => string;
   assembleContext: (agent: AgentConfig) => PiContextArtifacts | null;
   runTarget?: RunAskAgentTarget;
   signal?: AbortSignal;
@@ -422,7 +424,7 @@ function normalizeQuestion(params: Record<string, unknown>): string | undefined 
   if (raw === undefined || raw.trim() === "") {
     return undefined;
   }
-  return raw.length > MAX_ASK_AGENT_QUESTION_CHARS
+  return raw.length > MAX_ASK_AGENT_QUESTION_CHARS || Buffer.byteLength(raw, "utf8") > MAX_ASK_AGENT_QUESTION_BYTES
     ? undefined
     : raw;
 }
@@ -500,9 +502,24 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
     }));
   }
 
+  let validatedTarget = target;
+  if (deps.validateTargetWorkspace) {
+    try {
+      validatedTarget = {
+        ...target,
+        workspaceCwd: deps.validateTargetWorkspace(target),
+      };
+    } catch {
+      return finish(makeAskAgentError("context_unavailable", "ask-agent target workspace is unavailable", {
+        callerAgentId,
+        targetAgentId,
+      }));
+    }
+  }
+
   let context: PiContextArtifacts | null;
   try {
-    context = deps.assembleContext(target);
+    context = deps.assembleContext(validatedTarget);
   } catch {
     return finish(makeAskAgentError("context_unavailable", "ask-agent target context is unavailable", {
       callerAgentId,
@@ -526,7 +543,7 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
   try {
     const result = await deps.runTarget({
       caller,
-      target,
+      target: validatedTarget,
       question,
       context,
       signal: deps.signal,
