@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.6.2
+
+- Add first-party `ask_agent` Pi extension for trusted full-agent inter-agent questions.
+- Add `askAgent` config, trusted Pi session agent identity env propagation, target context spawn, bounded timeout/error handling, and regression coverage.
+
 ## 2026.6.1
 
 - Fix Pi RPC prompt-response context-overflow recovery: failed prompt responses with `context_length_exceeded` now defer to Pi compaction/continuation instead of surfacing the intermediate provider error.
