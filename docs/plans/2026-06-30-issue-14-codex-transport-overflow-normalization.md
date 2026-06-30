@@ -83,7 +83,7 @@ npm pack --dry-run
 npm run check:schema-guard-contract
 ```
 
-- [ ] Open/update PR against `main`, run `gh pr checks`, and keep issue #14 open only if another transport-overflow variant remains unfixed.
+- [x] Open/update PR against `main`, run `gh pr checks`, and keep issue #14 open only if another transport-overflow variant remains unfixed.
 
 ## Non-goals
 
