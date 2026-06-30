@@ -194,9 +194,11 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
+    "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
     "dist/extensions/pi/codex-usage.js",
+    "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/ask-agent/index.js",
@@ -544,7 +546,7 @@ const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -768,7 +770,7 @@ assert.equal(askAgentSpawnCalls[0].args[askAgentSpawnCalls[0].args.indexOf("--ap
 const askAgentLoadedExtensions = extensionPathsFromSpawnArgs(askAgentSpawnCalls[0].args);
 assert.deepEqual(
   askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js"],
+  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("subagent")));
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("ask-agent")));
@@ -876,7 +878,7 @@ try {
   const askAgentWrapperExtensions = extensionPathsFromSpawnArgs(askAgentWrapperArgv);
   assert.deepEqual(
     askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
-    ["web-tools.js", "knowledge-tools.js"],
+    ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
   );
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));

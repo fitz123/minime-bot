@@ -45,12 +45,12 @@ Why `message_end`, not only the bot relay parser: Pi must see the normalized err
 
 ### Task 2: Add wrapper and package wiring
 
-- [ ] Add `extensions/pi/codex-transport-overflow.ts` registering `pi.on("message_end", ...)`.
-- [ ] Add the wrapper to:
+- [x] Add `extensions/pi/codex-transport-overflow.ts` registering `pi.on("message_end", ...)`.
+- [x] Add the wrapper to:
   - `PI_EXTENSION_WRAPPER_RELPATHS`;
   - `PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS`;
   - `scripts/build-package-artifacts.mjs` wrapper list.
-- [ ] Load it for normal interactive bot sessions. It does not need to be model-callable and should not register tools.
+- [x] Load it for normal interactive bot sessions. It does not need to be model-callable and should not register tools.
 
 ### Task 3: Ensure user-visible error text is diagnostic, not misleading
 

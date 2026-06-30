@@ -130,9 +130,10 @@ explicitly, then appends each approved extra unchanged as a repeatable
 Pi; a missing file fails the interactive spawn with a clear error.
 `PI_EXTENSIONS_DISABLED=1` disables both first-party wrappers and configured
 extras for a spawn. Cron and subagent-child extension subsets keep their
-existing first-party-only scope. Ask-agent target children load `web-tools`,
-`knowledge-tools`, and approved `piExtraExtensions`, but reject configured extras
-that point back at the first-party `subagent` or `ask-agent` wrappers.
+existing first-party-only scope. Ask-agent target children load the non-recursive
+first-party wrappers, including the Codex transport overflow normalizer, plus
+approved `piExtraExtensions`, but reject configured extras that point back at the
+first-party `subagent` or `ask-agent` wrappers.
 
 Agents opt into first-party `ask_agent` handoffs with an `askAgent` block. Both
 the caller and target must have `enabled: true`; an omitted `canAsk` on an

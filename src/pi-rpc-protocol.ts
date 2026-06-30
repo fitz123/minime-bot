@@ -30,6 +30,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
+ *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (Tavily web_search/web_fetch),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn),
@@ -38,6 +39,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * ask-agent are multi-file DIRECTORIES whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
@@ -45,6 +47,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.js",
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",

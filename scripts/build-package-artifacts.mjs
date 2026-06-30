@@ -11,6 +11,7 @@ const artifactExtensionDir = join(packageRoot, "dist", "extensions", "pi");
 
 const wrappers = [
   ["codex-usage.ts", "codex-usage.js"],
+  ["codex-transport-overflow.ts", "codex-transport-overflow.js"],
   ["web-tools.ts", "web-tools.js"],
   ["knowledge-tools.ts", "knowledge-tools.js"],
   [join("subagent", "agents.ts"), join("subagent", "agents.js")],
