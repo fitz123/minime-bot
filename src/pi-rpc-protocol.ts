@@ -1174,6 +1174,9 @@ export function parsePiEvent(
     }
 
     case "error": {
+      if (state?.pendingOverflowErrorMessage) {
+        return buildPendingOverflowErrorResult(state, rawEvent);
+      }
       const fallbackMessage =
         typeof rawEvent.message === "string" ? rawEvent.message : undefined;
       const result: ResultMessage = {

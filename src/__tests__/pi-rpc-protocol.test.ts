@@ -2211,6 +2211,49 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("preserves the original overflow cause when a pending recovery emits a top-level error", () => {
+    const state: PiRpcParseState = {};
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    assert.strictEqual(
+      parsePiEvent(
+        {
+          type: "agent_end",
+          sessionId: "test-session",
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage: overflowMessage,
+              content: [],
+            },
+          ],
+        },
+        state,
+      ),
+      null,
+    );
+
+    const line = parsePiEvent(
+      {
+        type: "error",
+        errorMessage: "Unable to compact the conversation",
+      },
+      state,
+    );
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.strictEqual(result.session_id, "test-session");
+    assert.strictEqual(result.is_error, true);
+  });
+
   it("falls back to the message field, then a default, for error result text", () => {
     const fromMessage = parsePiEvent({ type: "error", message: "no errorMessage here" });
     assert.ok(fromMessage);
