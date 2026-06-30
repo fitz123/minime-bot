@@ -27,6 +27,7 @@ import {
 import { log } from "../logger.js";
 import type { AgentConfig } from "../types.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 // The verbatim knowledge directive — pinned here so a wording drift in the module
 // fails this test (it is part of the deterministic bundle contract, D7).
@@ -59,6 +60,31 @@ function withPatchedGetuid<T>(uid: number, fn: () => T): T {
         value: original,
         configurable: true,
       });
+    }
+  }
+}
+
+function withPatchedEnv<T>(updates: Record<string, string | undefined>, fn: () => T): T {
+  const originals = new Map<string, string | undefined>();
+  for (const key of Object.keys(updates)) {
+    originals.set(key, process.env[key]);
+  }
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    return fn();
+  } finally {
+    for (const [key, value] of originals) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
   }
 }
@@ -362,6 +388,40 @@ describe("collectRules", () => {
     const ws = makeWorkspace({ files: { ".claude/rules/platform/only.md": "ONLY" } });
     const rules = collectRules(ws);
     assert.deepStrictEqual(rules.map((r) => r.relpath), [".claude/rules/platform/only.md"]);
+  });
+
+  it("loads configured main platform rules through a trusted satellite platform symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-trusted-platform-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const satellite = join(root, "satellite");
+    const mainPlatformRules = join(main, ".claude", "rules", "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(mainPlatformRules, "shared.md"), "SHARED_PLATFORM_RULE", "utf8");
+    writeFileSync(join(satellite, "CLAUDE.md"), "# Satellite\n\nSATELLITE_BODY", "utf8");
+    symlinkSync(mainPlatformRules, join(satelliteRules, "platform"));
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const rules = collectRules(satellite);
+        assert.deepStrictEqual(rules, [
+          { relpath: ".claude/rules/platform/shared.md", content: "SHARED_PLATFORM_RULE" },
+        ]);
+
+        const bundle = buildBundle(satellite);
+        assert.ok(bundle.includes("## .claude/rules/platform/shared.md\n\nSHARED_PLATFORM_RULE"));
+      },
+    );
   });
 
   it("skips rule files whose symlink target resolves outside the workspace", () => {

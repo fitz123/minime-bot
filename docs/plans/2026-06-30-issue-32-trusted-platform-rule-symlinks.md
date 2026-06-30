@@ -27,10 +27,10 @@ Claude/Opus plan validation was attempted from the bot/Pi launch context before 
 
 ### Task 1: Add trusted platform-rules allowlist to assembler
 
-- [ ] Add a helper in `src/pi-context-assembler.ts` that identifies a rules directory request for `.claude/rules/platform` whose resolved realpath equals the configured main workspace platform rules directory.
-- [ ] Use the configured workspace contract / config surface already available to the package; avoid hardcoded private paths.
-- [ ] Let `collectRules()` include markdown files from that trusted directory while preserving relpaths as `.claude/rules/platform/<file>.md` in the satellite bundle.
-- [ ] Keep warnings/skips for all other escaped markdown directories.
+- [x] Add a helper in `src/pi-context-assembler.ts` that identifies a rules directory request for `.claude/rules/platform` whose resolved realpath equals the configured main workspace platform rules directory.
+- [x] Use the configured workspace contract / config surface already available to the package; avoid hardcoded private paths.
+- [x] Let `collectRules()` include markdown files from that trusted directory while preserving relpaths as `.claude/rules/platform/<file>.md` in the satellite bundle.
+- [x] Keep warnings/skips for all other escaped markdown directories.
 
 ### Task 2: Preserve containment for unsafe symlinks
 

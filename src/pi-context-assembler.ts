@@ -14,6 +14,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
 import { resolveKnowledgeLayout } from "./knowledge/layout.js";
+import { loadRawMergedConfig, resolveConfigWorkspaceRoot } from "./config.js";
+import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
 
 /**
  * Spawn-time context assembler for the Pi (`pi --mode rpc`, OpenAI Codex) path.
@@ -196,26 +198,77 @@ function sourceSignature(path: string, baseDir: string): string {
   }
 }
 
-/** List `*.md` files in a dir as absolute paths, sorted by name. Missing dir → []. */
-function listMarkdown(dir: string, baseDir: string): string[] {
-  const resolved = resolveContainedRealPath(dir, baseDir);
-  if (resolved.escaped) {
-    log.warn("pi-context", `markdown directory resolves outside the workspace, skipping: ${dir}`);
-    return [];
+interface MarkdownSourceFile {
+  path: string;
+  baseDir: string;
+}
+
+function configuredMainPlatformRulesDir(): string | null {
+  try {
+    const raw = loadRawMergedConfig();
+    const agents = raw.agents;
+    if (typeof agents !== "object" || agents === null || Array.isArray(agents)) {
+      return null;
+    }
+    const mainAgent = (agents as Record<string, unknown>).main;
+    if (typeof mainAgent !== "object" || mainAgent === null || Array.isArray(mainAgent)) {
+      return null;
+    }
+    const workspaceCwd = (mainAgent as Record<string, unknown>).workspaceCwd;
+    if (typeof workspaceCwd !== "string" || workspaceCwd.trim() === "") {
+      return null;
+    }
+    const mainWorkspace = resolveAgentWorkspaceCwd(resolveConfigWorkspaceRoot(), workspaceCwd);
+    return join(mainWorkspace, ".claude", "rules", "platform");
+  } catch {
+    return null;
   }
-  if (resolved.realPath === null) {
+}
+
+function trustedPlatformRulesRealPathForDirectoryRequest(dir: string, workspaceCwd: string): string | null {
+  if (resolve(dir) !== resolve(workspaceCwd, ".claude", "rules", "platform")) {
+    return null;
+  }
+  const configuredPlatformDir = configuredMainPlatformRulesDir();
+  if (configuredPlatformDir === null) {
+    return null;
+  }
+  try {
+    const targetReal = realpathSync(dir);
+    const configuredReal = realpathSync(configuredPlatformDir);
+    return targetReal === configuredReal ? configuredReal : null;
+  } catch {
+    return null;
+  }
+}
+
+/** List `*.md` files in a dir as absolute paths, sorted by name. Missing dir → []. */
+function listMarkdown(dir: string, baseDir: string): MarkdownSourceFile[] {
+  const resolved = resolveContainedRealPath(dir, baseDir);
+  let realPath = resolved.realPath;
+  let readBaseDir = baseDir;
+  if (resolved.escaped) {
+    const trustedRealPath = trustedPlatformRulesRealPathForDirectoryRequest(dir, baseDir);
+    if (trustedRealPath === null) {
+      log.warn("pi-context", `markdown directory resolves outside the workspace, skipping: ${dir}`);
+      return [];
+    }
+    realPath = trustedRealPath;
+    readBaseDir = trustedRealPath;
+  }
+  if (realPath === null) {
     return [];
   }
   let names: string[];
   try {
-    names = readdirSync(resolved.realPath);
+    names = readdirSync(realPath);
   } catch {
     return [];
   }
   return names
     .filter((name) => name.endsWith(".md"))
     .sort()
-    .map((name) => join(dir, name));
+    .map((name) => ({ path: join(dir, name), baseDir: readBaseDir }));
 }
 
 /**
@@ -337,17 +390,17 @@ export function collectRules(workspaceCwd: string): ContextSection[] {
   const out: ContextSection[] = [];
   for (const sub of ["platform", "custom"] as const) {
     const dir = join(workspaceCwd, ".claude", "rules", sub);
-    for (const abs of listMarkdown(dir, workspaceCwd)) {
-      const { content, escaped } = safeReadContainedFile(abs, workspaceCwd);
+    for (const source of listMarkdown(dir, workspaceCwd)) {
+      const { content, escaped } = safeReadContainedFile(source.path, source.baseDir);
       if (escaped) {
-        log.warn("pi-context", `rule file resolves outside the workspace, skipping: ${abs}`);
+        log.warn("pi-context", `rule file resolves outside the workspace, skipping: ${source.path}`);
         continue;
       }
       if (content === null) {
-        log.warn("pi-context", `rule file not readable, skipping: ${abs}`);
+        log.warn("pi-context", `rule file not readable, skipping: ${source.path}`);
         continue;
       }
-      out.push({ relpath: relative(workspaceCwd, abs), content });
+      out.push({ relpath: relative(workspaceCwd, source.path), content });
     }
   }
   return out;
@@ -605,9 +658,9 @@ function computeManifestSignature(agent: AgentConfig): string {
     const dir = join(workspaceCwd, ".claude", "rules", sub);
     files.push({ path: dir, baseDir: workspaceCwd });
     files.push(
-      ...listMarkdown(dir, workspaceCwd).map((path) => ({
-        path,
-        baseDir: workspaceCwd,
+      ...listMarkdown(dir, workspaceCwd).map((source) => ({
+        path: source.path,
+        baseDir: source.baseDir,
       })),
     );
   }
