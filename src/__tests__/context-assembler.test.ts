@@ -424,20 +424,95 @@ describe("collectRules", () => {
     );
   });
 
+  it("skips an escaped platform directory symlink that does not target configured main rules", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-untrusted-platform-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const roguePlatform = join(root, "rogue-platform");
+    const satellite = join(root, "satellite");
+    const satelliteRules = join(satellite, ".claude", "rules");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(join(main, ".claude", "rules", "platform"), { recursive: true });
+    mkdirSync(roguePlatform, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(roguePlatform, "rogue.md"), "ROGUE_PLATFORM_RULE", "utf8");
+    symlinkSync(roguePlatform, join(satelliteRules, "platform"));
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const { value: rules, warnings } = captureWarn(() => collectRules(satellite));
+
+        assert.ok(!rules.some((rule) => rule.content.includes("ROGUE_PLATFORM_RULE")));
+        assert.deepStrictEqual(rules, []);
+        assert.ok(warnings.some((m) => m.includes("markdown directory resolves outside the workspace")));
+      },
+    );
+  });
+
+  it("skips escaped files inside a trusted satellite platform symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-trusted-platform-file-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const satellite = join(root, "satellite");
+    const mainPlatformRules = join(main, ".claude", "rules", "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+    const secretRule = join(root, "secret-rule.md");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(mainPlatformRules, "shared.md"), "SHARED_PLATFORM_RULE", "utf8");
+    writeFileSync(secretRule, "TRUSTED_PLATFORM_ESCAPE_TOKEN", "utf8");
+    symlinkSync(secretRule, join(mainPlatformRules, "leak.md"));
+    symlinkSync(mainPlatformRules, join(satelliteRules, "platform"));
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const { value: rules, warnings } = captureWarn(() => collectRules(satellite));
+
+        assert.deepStrictEqual(rules, [
+          { relpath: ".claude/rules/platform/shared.md", content: "SHARED_PLATFORM_RULE" },
+        ]);
+        assert.ok(!rules.some((rule) => rule.content.includes("TRUSTED_PLATFORM_ESCAPE_TOKEN")));
+        assert.ok(
+          warnings.some((m) => m.includes("rule file resolves outside the workspace") && m.includes("leak.md")),
+        );
+      },
+    );
+  });
+
   it("skips rule files whose symlink target resolves outside the workspace", () => {
     const parent = mkdtempSync(join(tmpdir(), "pi-ctx-rule-symlink-"));
     created.push(parent);
     writeFileSync(join(parent, "secret-rule.md"), "RULE_SECRET_TOKEN", "utf8");
     const ws = mkdtempSync(join(parent, "ws-"));
-    const ruleDir = join(ws, ".claude", "rules", "platform");
-    mkdirSync(ruleDir, { recursive: true });
-    writeFileSync(join(ruleDir, "ok.md"), "RULE_OK_TOKEN", "utf8");
-    symlinkSync(join(parent, "secret-rule.md"), join(ruleDir, "leak.md"));
+    const platformRuleDir = join(ws, ".claude", "rules", "platform");
+    const customRuleDir = join(ws, ".claude", "rules", "custom");
+    mkdirSync(platformRuleDir, { recursive: true });
+    mkdirSync(customRuleDir, { recursive: true });
+    writeFileSync(join(platformRuleDir, "ok.md"), "PLATFORM_RULE_OK_TOKEN", "utf8");
+    writeFileSync(join(customRuleDir, "ok.md"), "CUSTOM_RULE_OK_TOKEN", "utf8");
+    symlinkSync(join(parent, "secret-rule.md"), join(platformRuleDir, "leak.md"));
+    symlinkSync(join(parent, "secret-rule.md"), join(customRuleDir, "leak.md"));
 
     const { value: rules, warnings } = captureWarn(() => collectRules(ws));
 
     assert.deepStrictEqual(rules, [
-      { relpath: ".claude/rules/platform/ok.md", content: "RULE_OK_TOKEN" },
+      { relpath: ".claude/rules/platform/ok.md", content: "PLATFORM_RULE_OK_TOKEN" },
+      { relpath: ".claude/rules/custom/ok.md", content: "CUSTOM_RULE_OK_TOKEN" },
     ]);
     assert.ok(!rules.some((rule) => rule.content.includes("RULE_SECRET_TOKEN")));
     assert.ok(warnings.some((m) => m.includes("rule file resolves outside the workspace")));

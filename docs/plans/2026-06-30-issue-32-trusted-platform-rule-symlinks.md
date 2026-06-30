@@ -34,8 +34,8 @@ Claude/Opus plan validation was attempted from the bot/Pi launch context before 
 
 ### Task 2: Preserve containment for unsafe symlinks
 
-- [ ] Keep `@` imports, output styles, knowledge files, custom rules, arbitrary symlinked platform dirs, and individual rule-file symlinks outside allowed roots blocked.
-- [ ] If a platform directory is trusted but a file inside it resolves outside the trusted target, skip that file and warn.
+- [x] Keep `@` imports, output styles, knowledge files, custom rules, arbitrary symlinked platform dirs, and individual rule-file symlinks outside allowed roots blocked.
+- [x] If a platform directory is trusted but a file inside it resolves outside the trusted target, skip that file and warn.
 
 ### Task 3: Tests
 
