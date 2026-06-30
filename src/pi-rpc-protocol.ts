@@ -56,11 +56,16 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
 
 /**
  * Wrappers a subagent CHILD `pi` spawn must load. The subagent tool spawns an
- * isolated `pi -p` child to run a delegated task. Children load web tools and
- * knowledge tools/protection, but they do NOT load the subagent wrapper:
- * recursive spawning stays disabled in child sessions.
+ * isolated `pi -p` child to run a delegated task. Children load the transport
+ * overflow normalizer, web tools, and knowledge tools/protection, but they do
+ * NOT load the subagent wrapper: recursive spawning stays disabled in child
+ * sessions.
  */
-export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
+export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.ts",
+  "web-tools.ts",
+  "knowledge-tools.ts",
+] as const;
 
 /**
  * Wrappers an ask-agent target CHILD `pi` spawn must load. The child runs as a
@@ -79,7 +84,11 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
  */
 export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
 
-export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "knowledge-tools.js"] as const;
+export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.js",
+  "web-tools.js",
+  "knowledge-tools.js",
+] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
   "subagent/index.js",
   "ask-agent/index.js",
@@ -111,8 +120,8 @@ export interface PiExtensionResolveOptions {
   /**
    * Which wrapper relpaths to resolve (default: the full interactive
    * {@link PI_EXTENSION_WRAPPER_RELPATHS}). A subagent child passes
-   * {@link PI_SUBAGENT_CHILD_WRAPPER_RELPATHS} to load web tools while leaving
-   * recursive subagent spawning disabled.
+   * {@link PI_SUBAGENT_CHILD_WRAPPER_RELPATHS} to load non-recursive first-party
+   * child wrappers while leaving recursive subagent spawning disabled.
    */
   relpaths?: readonly string[];
 }
@@ -802,6 +811,7 @@ interface FinalAssistantInfo {
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
   pendingOverflowSessionId?: string;
+  pendingOverflowRecoveryStarted?: boolean;
   pendingOverflowResetEmitted?: boolean;
 }
 
@@ -898,6 +908,7 @@ function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): Resu
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
     state.pendingOverflowSessionId = undefined;
+    state.pendingOverflowRecoveryStarted = undefined;
     state.pendingOverflowResetEmitted = undefined;
   }
   return result;
@@ -916,6 +927,7 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
   const sessionId = rawEvent?.sessionId ?? state.pendingOverflowSessionId;
   state.pendingOverflowErrorMessage = undefined;
   state.pendingOverflowSessionId = undefined;
+  state.pendingOverflowRecoveryStarted = undefined;
   state.pendingOverflowResetEmitted = undefined;
   return buildPiRpcErrorResult(message, sessionId);
 }
@@ -1053,6 +1065,7 @@ export function parsePiEvent(
 
     case "compaction_start":
       if (state?.pendingOverflowErrorMessage) {
+        state.pendingOverflowRecoveryStarted = true;
         return markPendingOverflowRetry(state);
       }
       return null;
@@ -1061,6 +1074,7 @@ export function parsePiEvent(
       if (!state?.pendingOverflowErrorMessage) {
         return null;
       }
+      state.pendingOverflowRecoveryStarted = true;
       if (rawEvent.willRetry === true) {
         return markPendingOverflowRetry(state);
       }
@@ -1250,7 +1264,9 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
 
     const waitResult = await waitForPiStdout(
       stdout,
-      parseState.pendingOverflowErrorMessage ? PI_RPC_PENDING_OVERFLOW_GRACE_MS : undefined,
+      parseState.pendingOverflowErrorMessage && !parseState.pendingOverflowRecoveryStarted
+        ? PI_RPC_PENDING_OVERFLOW_GRACE_MS
+        : undefined,
     );
     if (waitResult === "end" || waitResult === "close") {
       break;

@@ -556,7 +556,7 @@ const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js"],
+  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertNoGuardContract("subagent child extension args must not load the retired guard", subagentChildExtensionArgs);
 

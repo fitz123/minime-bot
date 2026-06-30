@@ -471,6 +471,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
     assert.deepStrictEqual(subagentChildArgs, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -484,8 +485,14 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("the subagent-child wrapper subset omits subagent recursion", () => {
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js", "knowledge-tools.js"]);
+    assert.deepStrictEqual(
+      [...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS],
+      ["codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts"],
+    );
+    assert.deepStrictEqual(
+      [...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS],
+      ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+    );
   });
 
   it("the ask-agent child wrapper subset omits recursive handoff wrappers", () => {
@@ -501,9 +508,10 @@ describe("Pi extension loading (--extension)", () => {
     assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
   });
 
-  it("resolves only the requested relpaths subset (subagent child loads web and knowledge tools)", () => {
+  it("resolves only the requested relpaths subset for subagent children", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -619,6 +627,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(subagentChildArgs, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -2767,6 +2776,18 @@ describe("readPiStream", () => {
       assert.strictEqual((reset.value as { action?: unknown }).action, "reset_response_text");
 
       const finalNext = stream.next();
+      const activeCompaction = await Promise.race([
+        finalNext.then(() => "resolved" as const),
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 1_200);
+        }),
+      ]);
+      assert.strictEqual(
+        activeCompaction,
+        "pending",
+        "active overflow compaction must not be finalized by the pre-recovery grace timer",
+      );
+
       stdout.push(JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }) + "\n");
       stdout.push(
         JSON.stringify({
