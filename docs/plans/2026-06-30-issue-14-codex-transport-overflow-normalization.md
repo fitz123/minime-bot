@@ -36,12 +36,12 @@ Why `message_end`, not only the bot relay parser: Pi must see the normalized err
 
 ### Task 1: Add pure normalizer helper
 
-- [ ] Add `src/pi-extensions/codex-transport-overflow.ts` with small testable helpers:
+- [x] Add `src/pi-extensions/codex-transport-overflow.ts` with small testable helpers:
   - `isCodexTransportMessageTooBigDiagnostic(...)`.
   - `normalizeCodexTransportOverflowAssistantMessage(...)`.
-- [ ] Require assistant role + `stopReason === "error"`.
-- [ ] Require a diagnostic signal, not the generic timeout string alone, so ordinary transient timeouts remain retryable.
-- [ ] Preserve diagnostics and content; only replace `errorMessage` when normalization applies.
+- [x] Require assistant role + `stopReason === "error"`.
+- [x] Require a diagnostic signal, not the generic timeout string alone, so ordinary transient timeouts remain retryable.
+- [x] Preserve diagnostics and content; only replace `errorMessage` when normalization applies.
 
 ### Task 2: Add wrapper and package wiring
 
