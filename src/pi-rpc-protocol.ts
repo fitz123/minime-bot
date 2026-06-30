@@ -1246,6 +1246,39 @@ function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdout
   });
 }
 
+function markPiChildUnusable(child: ChildProcess): void {
+  try {
+    (child as { killed: boolean }).killed = true;
+  } catch {
+    // Best effort: the caller also destroys stdout so stale records cannot be reused.
+  }
+}
+
+function terminatePiChildAfterOverflowGrace(child: ChildProcess, stdout: Readable): void {
+  if (!child.killed) {
+    const kill = (child as { kill?: (signal?: NodeJS.Signals | number) => boolean }).kill;
+    if (typeof kill === "function") {
+      try {
+        if (!kill.call(child, "SIGTERM")) {
+          markPiChildUnusable(child);
+        }
+      } catch (err) {
+        markPiChildUnusable(child);
+        log.warn(
+          "pi-rpc",
+          `Failed to terminate Pi child after pending overflow timeout: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      markPiChildUnusable(child);
+    }
+  }
+
+  if (!stdout.destroyed) {
+    stdout.destroy();
+  }
+}
+
 /**
  * Async generator yielding translated `StreamLine`s from a Pi RPC child's
  * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. Malformed
@@ -1281,6 +1314,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
       break;
     }
     if (waitResult === "timeout" && parseState.pendingOverflowErrorMessage) {
+      terminatePiChildAfterOverflowGrace(child, stdout);
       yield buildPendingOverflowErrorResult(parseState);
       return;
     }

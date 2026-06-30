@@ -517,7 +517,7 @@ export class SessionManager {
 
     // Check if session is active in memory
     let existing = this.active.get(chatId);
-    if (existing && !hasExited(existing.child) && !existing.child.killed) {
+    if (existing && !hasExited(existing.child) && !existing.child.killed && !existing.child.stdout?.destroyed) {
       if (existing.agentId === agentId) {
         existing.lastActivity = Date.now();
         this.resetIdleTimer(chatId);

@@ -2768,10 +2768,20 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("surfaces a willRetry-false context-overflow agent_end after a bounded grace while stdout stays open", async () => {
+  it("terminates a willRetry-false context-overflow agent_end after a bounded grace", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
-    Object.assign(child, { stdout });
+    const killSignals: Array<NodeJS.Signals | number | undefined> = [];
+    Object.assign(child, {
+      stdout,
+      killed: false,
+      exitCode: null,
+      kill(signal?: NodeJS.Signals | number): boolean {
+        (child as unknown as { killed: boolean }).killed = true;
+        killSignals.push(signal);
+        return true;
+      },
+    });
     const stream = readPiStream(child);
 
     try {
@@ -2817,6 +2827,13 @@ describe("readPiStream", () => {
       );
       assert.strictEqual(line.session_id, "test-session");
       assert.strictEqual(line.is_error, true);
+      assert.strictEqual((child as unknown as { killed: boolean }).killed, true);
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      assert.strictEqual(stdout.destroyed, true, "late overflow records must not remain readable");
+
+      const second = readPiStream(child);
+      const stale = await second.next();
+      assert.strictEqual(stale.done, true, "a fresh stream must not read records from the timed-out turn");
     } finally {
       await stream.return(undefined);
       stdout.destroy();
