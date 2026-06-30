@@ -86,6 +86,23 @@ describe("Codex transport overflow normalization", () => {
     assert.strictEqual(normalizeCodexTransportOverflowAssistantMessage(message), message);
   });
 
+  it("formats normalized error text with the root cause for user-facing fallbacks", () => {
+    const normalized = normalizeCodexTransportOverflowAssistantMessage({
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Codex SSE response headers timed out after 20000ms",
+      diagnostics: "phase=before_message_stream_start WebSocket closed 1009 message too big requestBytes=24800000",
+      content: [],
+    });
+
+    assert.equal(
+      normalized.errorMessage,
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.match(String(normalized.errorMessage), /1009 message too big/);
+    assert.doesNotMatch(String(normalized.errorMessage), /SSE response headers timed out/);
+  });
+
   it("leaves non-assistant and non-error messages unchanged", () => {
     const diagnostic = {
       error: {

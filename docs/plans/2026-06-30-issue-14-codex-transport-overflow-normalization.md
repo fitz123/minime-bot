@@ -61,14 +61,14 @@ Why `message_end`, not only the bot relay parser: Pi must see the normalized err
 
 ### Task 4: Tests
 
-- [ ] Unit-test normalization for:
+- [x] Unit-test normalization for:
   - code `1009` + `message too big` + `phase=before_message_stream_start` + `requestBytes`.
   - string-only diagnostic with WebSocket 1009/message-too-big wording.
   - generic `Codex SSE response headers timed out` with no diagnostic stays unchanged.
   - transient WebSocket/network errors without message-too-big stay unchanged.
   - non-assistant / non-error messages stay unchanged.
-- [ ] Test that the normalized error text is suitable for user-facing fallback if recovery fails.
-- [ ] Existing Pi RPC overflow tests should continue to pass.
+- [x] Test that the normalized error text is suitable for user-facing fallback if recovery fails.
+- [x] Existing Pi RPC overflow tests should continue to pass.
 
 ### Task 5: Validation and PR
 
