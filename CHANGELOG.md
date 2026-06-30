@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.6.3
+
+- Normalize Codex WebSocket 1009/message-too-big transport failures into Pi-recognized context overflow recovery so oversized Codex requests trigger compaction instead of retry loops.
+- Preserve real request-too-large diagnostics in fallback errors and avoid stale Pi child/stdout reuse after overflow fallback.
+
 ## 2026.6.2
 
 - Add first-party `ask_agent` Pi extension for trusted full-agent inter-agent questions.
