@@ -39,10 +39,10 @@ Claude/Opus plan validation was attempted from the bot/Pi launch context before 
 
 ### Task 3: Tests
 
-- [ ] Add regression coverage in `src/__tests__/context-assembler.test.ts` for a satellite workspace whose `.claude/rules/platform` symlinks to a main workspace `.claude/rules/platform`; assert the platform rule appears in `collectRules()` and `buildBundle()`.
-- [ ] Add/keep negative coverage for an escaped `.claude/rules/platform` symlink to an untrusted directory; assert it is skipped.
-- [ ] Add/keep negative coverage for a malicious rule-file symlink inside a trusted platform rules dir escaping the trusted dir.
-- [ ] Ensure source-manifest/cache signatures notice trusted shared rule content changes.
+- [x] Add regression coverage in `src/__tests__/context-assembler.test.ts` for a satellite workspace whose `.claude/rules/platform` symlinks to a main workspace `.claude/rules/platform`; assert the platform rule appears in `collectRules()` and `buildBundle()`.
+- [x] Add/keep negative coverage for an escaped `.claude/rules/platform` symlink to an untrusted directory; assert it is skipped.
+- [x] Add/keep negative coverage for a malicious rule-file symlink inside a trusted platform rules dir escaping the trusted dir.
+- [x] Ensure source-manifest/cache signatures notice trusted shared rule content changes.
 
 ### Task 4: Validation and PR
 

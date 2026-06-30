@@ -877,6 +877,52 @@ describe("assemblePiContext", () => {
     );
   });
 
+  it("re-assembles when trusted shared platform rule content changes", () => {
+    _resetPiContextCache();
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-trusted-platform-cache-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const satellite = join(root, "satellite");
+    const mainPlatformRules = join(main, ".claude", "rules", "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+    const sharedRulePath = join(mainPlatformRules, "shared.md");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(satellite, "CLAUDE.md"), "# Satellite\n\nBODY", "utf8");
+    writeFileSync(sharedRulePath, "TRUSTED_RULE_AAA", "utf8");
+    symlinkSync(mainPlatformRules, join(satelliteRules, "platform"));
+
+    const pinned = new Date(1_700_000_000_000);
+    utimesSync(sharedRulePath, pinned, pinned);
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const agent = agentFor(satellite, { id: "trustedplatformcache" });
+        const first = assemblePiContext(agent);
+        assert.ok(first);
+        assert.ok(readFileSync(first.appendSystemPromptPath, "utf8").includes("TRUSTED_RULE_AAA"));
+
+        writeFileSync(sharedRulePath, "TRUSTED_RULE_BBB", "utf8");
+        const later = new Date(1_700_000_005_000);
+        utimesSync(sharedRulePath, later, later);
+
+        const second = assemblePiContext(agent);
+        assert.ok(second);
+        const bundle = readFileSync(second.appendSystemPromptPath, "utf8");
+        assert.ok(bundle.includes("TRUSTED_RULE_BBB"), "trusted shared rule content invalidates the cache");
+        assert.ok(!bundle.includes("TRUSTED_RULE_AAA"));
+      },
+    );
+  });
+
   it("re-assembles when only the config systemPrompt changes (the cache folds it in)", () => {
     // The systemPrompt is the one non-file input to the manifest signature — verify
     // it actually invalidates the cache (a regression dropping it would serve a
