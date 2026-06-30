@@ -901,12 +901,15 @@ function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): Resu
 }
 
 function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRpcEvent): ResultMessage {
-  const message =
+  const recoveryFailureMessage =
     nonEmptyText(rawEvent?.errorMessage) ??
     nonEmptyText(rawEvent?.error) ??
-    nonEmptyText(rawEvent?.message) ??
-    state.pendingOverflowErrorMessage ??
-    PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+    nonEmptyText(rawEvent?.message);
+  const overflowMessage = nonEmptyText(state.pendingOverflowErrorMessage);
+  const message =
+    recoveryFailureMessage && overflowMessage && !recoveryFailureMessage.includes(overflowMessage)
+      ? `${recoveryFailureMessage}; original overflow: ${overflowMessage}`
+      : recoveryFailureMessage ?? overflowMessage ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
   state.pendingOverflowErrorMessage = undefined;
   state.pendingOverflowResetEmitted = undefined;
   return buildPiRpcErrorResult(message, rawEvent?.sessionId);

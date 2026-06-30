@@ -54,10 +54,10 @@ Why `message_end`, not only the bot relay parser: Pi must see the normalized err
 
 ### Task 3: Ensure user-visible error text is diagnostic, not misleading
 
-- [ ] When normalization applies, set `errorMessage` to a sanitized string that contains the real cause, e.g. `context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=...)`.
-- [ ] If compaction succeeds, the user should see the recovered answer, not the intermediate transport error.
-- [ ] If compaction/recovery fails, the user-visible fallback must include the real `1009/message too big/request too large` signal, not only `Codex SSE response headers timed out after 20000ms`.
-- [ ] Do not treat the generic SSE timeout alone as the root cause; it is a wrapper/secondary symptom unless paired with diagnostics.
+- [x] When normalization applies, set `errorMessage` to a sanitized string that contains the real cause, e.g. `context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=...)`.
+- [x] If compaction succeeds, the user should see the recovered answer, not the intermediate transport error.
+- [x] If compaction/recovery fails, the user-visible fallback must include the real `1009/message too big/request too large` signal, not only `Codex SSE response headers timed out after 20000ms`.
+- [x] Do not treat the generic SSE timeout alone as the root cause; it is a wrapper/secondary symptom unless paired with diagnostics.
 
 ### Task 4: Tests
 
