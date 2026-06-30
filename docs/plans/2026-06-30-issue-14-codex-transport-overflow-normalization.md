@@ -36,33 +36,41 @@ Why `message_end`, not only the bot relay parser: Pi must see the normalized err
 
 ### Task 1: Add pure normalizer helper
 
-- Add `src/pi-extensions/codex-transport-overflow.ts` with small testable helpers:
+- [ ] Add `src/pi-extensions/codex-transport-overflow.ts` with small testable helpers:
   - `isCodexTransportMessageTooBigDiagnostic(...)`.
   - `normalizeCodexTransportOverflowAssistantMessage(...)`.
-- Require assistant role + `stopReason === "error"`.
-- Require a diagnostic signal, not the generic timeout string alone, so ordinary transient timeouts remain retryable.
-- Preserve diagnostics and content; only replace `errorMessage` when normalization applies.
+- [ ] Require assistant role + `stopReason === "error"`.
+- [ ] Require a diagnostic signal, not the generic timeout string alone, so ordinary transient timeouts remain retryable.
+- [ ] Preserve diagnostics and content; only replace `errorMessage` when normalization applies.
 
 ### Task 2: Add wrapper and package wiring
 
-- Add `extensions/pi/codex-transport-overflow.ts` registering `pi.on("message_end", ...)`.
-- Add the wrapper to:
+- [ ] Add `extensions/pi/codex-transport-overflow.ts` registering `pi.on("message_end", ...)`.
+- [ ] Add the wrapper to:
   - `PI_EXTENSION_WRAPPER_RELPATHS`;
   - `PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS`;
   - `scripts/build-package-artifacts.mjs` wrapper list.
-- Load it for normal interactive bot sessions. It does not need to be model-callable and should not register tools.
+- [ ] Load it for normal interactive bot sessions. It does not need to be model-callable and should not register tools.
 
-### Task 3: Tests
+### Task 3: Ensure user-visible error text is diagnostic, not misleading
 
-- Unit-test normalization for:
+- [ ] When normalization applies, set `errorMessage` to a sanitized string that contains the real cause, e.g. `context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=...)`.
+- [ ] If compaction succeeds, the user should see the recovered answer, not the intermediate transport error.
+- [ ] If compaction/recovery fails, the user-visible fallback must include the real `1009/message too big/request too large` signal, not only `Codex SSE response headers timed out after 20000ms`.
+- [ ] Do not treat the generic SSE timeout alone as the root cause; it is a wrapper/secondary symptom unless paired with diagnostics.
+
+### Task 4: Tests
+
+- [ ] Unit-test normalization for:
   - code `1009` + `message too big` + `phase=before_message_stream_start` + `requestBytes`.
   - string-only diagnostic with WebSocket 1009/message-too-big wording.
   - generic `Codex SSE response headers timed out` with no diagnostic stays unchanged.
   - transient WebSocket/network errors without message-too-big stay unchanged.
   - non-assistant / non-error messages stay unchanged.
-- Existing Pi RPC overflow tests should continue to pass.
+- [ ] Test that the normalized error text is suitable for user-facing fallback if recovery fails.
+- [ ] Existing Pi RPC overflow tests should continue to pass.
 
-### Task 4: Validation and PR
+### Task 5: Validation and PR
 
 Run:
 
@@ -75,7 +83,7 @@ npm pack --dry-run
 npm run check:schema-guard-contract
 ```
 
-Open/update PR against `main`, run `gh pr checks`, and keep issue #14 open only if another transport-overflow variant remains unfixed.
+- [ ] Open/update PR against `main`, run `gh pr checks`, and keep issue #14 open only if another transport-overflow variant remains unfixed.
 
 ## Non-goals
 
