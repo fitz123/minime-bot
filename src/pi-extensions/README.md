@@ -121,6 +121,14 @@ The `--append-system-prompt` bundle is assembled in this exact order:
 5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
 6. A fixed `## Knowledge access` directive (verbatim).
 
+The only out-of-workspace rules exception is a satellite
+`.claude/rules/platform` symlink whose realpath exactly matches the configured
+main agent workspace's contained `.claude/rules/platform` realpath. For that
+case, rule-file reads and source-manifest signatures use the trusted platform
+directory as the containment base. Do not generalize this to custom rules,
+imports, output styles, knowledge files, arbitrary platform symlinks, or files
+inside the trusted platform directory that resolve outside it.
+
 In v2 workspaces, the assembler auto-loads `wiki/schema.md` and `wiki/index.md`
 even when root `MEMORY.md` is absent. During legacy compatibility, MEMORY.md keeps
 reaching the bundle through the existing CLAUDE.md `@MEMORY.md` import convention.

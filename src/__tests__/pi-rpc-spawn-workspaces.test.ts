@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,12 +85,16 @@ describe("Pi spawn workspace contract", () => {
     const mainWorkspace = join(root, "agent-workspace-main");
     const reviewerWorkspace = join(root, "agent-workspace-reviewer");
     const controlSecretsFile = join(controlWorkspace, "config", "secrets.sops.yaml");
+    const mainPlatformRules = join(mainWorkspace, ".claude", "rules", "platform");
+    const reviewerRules = join(reviewerWorkspace, ".claude", "rules");
     mkdirSync(dirname(controlSecretsFile), { recursive: true });
-    mkdirSync(mainWorkspace, { recursive: true });
-    mkdirSync(reviewerWorkspace, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(reviewerRules, { recursive: true });
     writeFileSync(controlSecretsFile, "telegram:\n  bot_token: ENC[AES256_GCM,data:test]\n", "utf8");
     writeFileSync(join(mainWorkspace, "CLAUDE.md"), "# Main\n\nMAIN_CONTEXT_TOKEN", "utf8");
     writeFileSync(join(reviewerWorkspace, "CLAUDE.md"), "# Reviewer\n\nREVIEWER_CONTEXT_TOKEN", "utf8");
+    writeFileSync(join(mainPlatformRules, "shared.md"), "SHARED_PLATFORM_RULE_TOKEN", "utf8");
+    symlinkSync(mainPlatformRules, join(reviewerRules, "platform"));
     writeFileSync(
       join(controlWorkspace, "config.yaml"),
       [
@@ -187,6 +192,7 @@ describe("Pi spawn workspace contract", () => {
       assert.match(mainBundle, /MAIN_CONTEXT_TOKEN/);
       assert.doesNotMatch(mainBundle, /REVIEWER_CONTEXT_TOKEN/);
       assert.match(reviewerBundle, /REVIEWER_CONTEXT_TOKEN/);
+      assert.match(reviewerBundle, /SHARED_PLATFORM_RULE_TOKEN/);
       assert.doesNotMatch(reviewerBundle, /MAIN_CONTEXT_TOKEN/);
     } finally {
       if (oldWorkspace === undefined) {
