@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.0
+
+- Allow satellite agent workspaces to load trusted shared platform rules through a narrow `.claude/rules/platform` symlink to the configured main workspace platform rules directory.
+- Keep arbitrary out-of-workspace symlinks blocked and add regression coverage for trusted, untrusted, and cache invalidation paths.
+
 ## 2026.6.3
 
 - Normalize Codex WebSocket 1009/message-too-big transport failures into Pi-recognized context overflow recovery so oversized Codex requests trigger compaction instead of retry loops.
