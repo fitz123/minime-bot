@@ -2668,7 +2668,7 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("defers a willRetry-false context-overflow agent_end while stdout stays open", async () => {
+  it("surfaces a willRetry-false context-overflow agent_end after a bounded grace while stdout stays open", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, { stdout });
@@ -2701,11 +2701,10 @@ describe("readPiStream", () => {
       ]);
       assert.strictEqual(early, "pending");
 
-      stdout.push(null);
       const result = await Promise.race([
         next,
         new Promise<never>((_resolve, reject) => {
-          setTimeout(() => reject(new Error("timed out waiting for overflow EOF fallback")), 2_000);
+          setTimeout(() => reject(new Error("timed out waiting for overflow grace fallback")), 2_500);
         }),
       ]);
       assert.strictEqual(result.done, false);
@@ -2716,6 +2715,7 @@ describe("readPiStream", () => {
         line.result,
         "context_length_exceeded: input exceeds the context window",
       );
+      assert.strictEqual(line.session_id, "test-session");
       assert.strictEqual(line.is_error, true);
     } finally {
       await stream.return(undefined);

@@ -13,6 +13,8 @@ interface DiagnosticSignals {
   hasMessageTooBig: boolean;
   hasWebSocketSignal: boolean;
   hasBeforeStreamStartSignal: boolean;
+  hasAfterStreamStartSignal: boolean;
+  hasEventsEmittedSignal: boolean;
   requestBytes?: number;
 }
 
@@ -22,6 +24,7 @@ const WEBSOCKET_RE = /\bweb[\s_-]*socket\b/i;
 const CODE_1009_RE = /\b1009\b/;
 const REQUEST_BYTES_RE = /\brequest[\s_-]*bytes\s*[:=]\s*(\d+)\b/i;
 const BEFORE_STREAM_START_RE = /\bbefore(?:[\s_-]*message)?[\s_-]*stream[\s_-]*start\b/i;
+const AFTER_STREAM_START_RE = /\bafter(?:[\s_-]*message)?[\s_-]*stream[\s_-]*start\b/i;
 const MAX_DIAGNOSTIC_DEPTH = 6;
 
 const CODE_KEYS = new Set([
@@ -86,7 +89,8 @@ function isCodexTransportMessageTooBigSignals(signals: DiagnosticSignals): boole
     signals.hasStructuredCode1009 ||
     (signals.hasMessageTooBig && (signals.hasWebSocketSignal || signals.hasText1009));
   const hasRequestSideSignal = signals.hasBeforeStreamStartSignal || signals.requestBytes !== undefined;
-  return hasTransportOverflow && hasRequestSideSignal;
+  const hasExplicitPostStreamSignal = signals.hasAfterStreamStartSignal || signals.hasEventsEmittedSignal;
+  return hasTransportOverflow && hasRequestSideSignal && !hasExplicitPostStreamSignal;
 }
 
 function formatCodexTransportOverflowErrorMessage(signals: DiagnosticSignals): string {
@@ -104,6 +108,8 @@ function collectDiagnosticSignals(diagnostic: unknown): DiagnosticSignals {
     hasMessageTooBig: false,
     hasWebSocketSignal: false,
     hasBeforeStreamStartSignal: false,
+    hasAfterStreamStartSignal: false,
+    hasEventsEmittedSignal: false,
   };
   collectDiagnosticValue(diagnostic, signals, undefined, new Set<object>(), 0);
   return signals;
@@ -126,6 +132,12 @@ function collectDiagnosticValue(
   }
   if (normalizedKey === "phase" && isBeforeStreamStartPhase(value)) {
     signals.hasBeforeStreamStartSignal = true;
+  }
+  if (normalizedKey === "phase" && isAfterStreamStartPhase(value)) {
+    signals.hasAfterStreamStartSignal = true;
+  }
+  if (normalizedKey === "eventsemitted" && value === true) {
+    signals.hasEventsEmittedSignal = true;
   }
   if (normalizedKey && REQUEST_BYTES_KEYS.has(normalizedKey)) {
     const requestBytes = requestBytesValue(value);
@@ -180,6 +192,9 @@ function collectDiagnosticText(value: string, signals: DiagnosticSignals): void 
   if (BEFORE_STREAM_START_RE.test(value)) {
     signals.hasBeforeStreamStartSignal = true;
   }
+  if (AFTER_STREAM_START_RE.test(value)) {
+    signals.hasAfterStreamStartSignal = true;
+  }
   const requestBytes = REQUEST_BYTES_RE.exec(value)?.[1];
   if (requestBytes !== undefined && signals.requestBytes === undefined) {
     signals.requestBytes = Number(requestBytes);
@@ -202,6 +217,10 @@ function isCode1009Value(value: unknown): boolean {
 
 function isBeforeStreamStartPhase(value: unknown): boolean {
   return typeof value === "string" && BEFORE_STREAM_START_RE.test(value);
+}
+
+function isAfterStreamStartPhase(value: unknown): boolean {
+  return typeof value === "string" && AFTER_STREAM_START_RE.test(value);
 }
 
 function requestBytesValue(value: unknown): number | undefined {

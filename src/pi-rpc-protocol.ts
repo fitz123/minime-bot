@@ -801,11 +801,13 @@ interface FinalAssistantInfo {
 
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
+  pendingOverflowSessionId?: string;
   pendingOverflowResetEmitted?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
+const PI_RPC_PENDING_OVERFLOW_GRACE_MS = 1_000;
 
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
@@ -895,6 +897,7 @@ function buildPiRpcRetryResetEvent(): ControlRequest {
 function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): ResultMessage {
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
+    state.pendingOverflowSessionId = undefined;
     state.pendingOverflowResetEmitted = undefined;
   }
   return result;
@@ -910,9 +913,11 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
     recoveryFailureMessage && overflowMessage && !recoveryFailureMessage.includes(overflowMessage)
       ? `${recoveryFailureMessage}; original overflow: ${overflowMessage}`
       : recoveryFailureMessage ?? overflowMessage ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+  const sessionId = rawEvent?.sessionId ?? state.pendingOverflowSessionId;
   state.pendingOverflowErrorMessage = undefined;
+  state.pendingOverflowSessionId = undefined;
   state.pendingOverflowResetEmitted = undefined;
-  return buildPiRpcErrorResult(message, rawEvent?.sessionId);
+  return buildPiRpcErrorResult(message, sessionId);
 }
 
 function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
@@ -1015,6 +1020,7 @@ export function parsePiEvent(
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
           state.pendingOverflowErrorMessage = overflowMessage;
+          state.pendingOverflowSessionId = rawEvent.sessionId;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
           }
@@ -1116,6 +1122,7 @@ export function parsePiEvent(
               );
             }
             state.pendingOverflowErrorMessage = promptErrorMessage;
+            state.pendingOverflowSessionId = rawEvent.sessionId;
             return null;
           }
           return finishPiRpcResult(
@@ -1170,9 +1177,9 @@ export function parsePiEvent(
   }
 }
 
-type PiStdoutWaitResult = "readable" | "end" | "close";
+type PiStdoutWaitResult = "readable" | "end" | "close" | "timeout";
 
-function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
+function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdoutWaitResult> {
   if (stdout.readableEnded) {
     return Promise.resolve("end");
   }
@@ -1181,7 +1188,12 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   }
 
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
       stdout.off("readable", onReadable);
       stdout.off("end", onEnd);
       stdout.off("close", onClose);
@@ -1198,11 +1210,16 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
       cleanup();
       reject(err);
     };
+    const onTimeout = () => finish("timeout");
 
     stdout.once("readable", onReadable);
     stdout.once("end", onEnd);
     stdout.once("close", onClose);
     stdout.once("error", onError);
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(onTimeout, timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    }
   });
 }
 
@@ -1231,9 +1248,16 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
       }
     }
 
-    const waitResult = await waitForPiStdout(stdout);
+    const waitResult = await waitForPiStdout(
+      stdout,
+      parseState.pendingOverflowErrorMessage ? PI_RPC_PENDING_OVERFLOW_GRACE_MS : undefined,
+    );
     if (waitResult === "end" || waitResult === "close") {
       break;
+    }
+    if (waitResult === "timeout" && parseState.pendingOverflowErrorMessage) {
+      yield buildPendingOverflowErrorResult(parseState);
+      return;
     }
   }
 

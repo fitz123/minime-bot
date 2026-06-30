@@ -73,6 +73,50 @@ describe("Codex transport overflow normalization", () => {
     );
   });
 
+  it("leaves explicit post-stream WebSocket 1009 request-size diagnostics unchanged", () => {
+    const message = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Codex SSE response headers timed out after 20000ms",
+      diagnostics: {
+        phase: "after_message_stream_start",
+        error: {
+          closeCode: "1009",
+          message: "WebSocket closed 1009 message too big",
+        },
+        details: {
+          requestBytes: 24800000,
+        },
+      },
+      content: [],
+    };
+
+    assert.equal(isCodexTransportMessageTooBigDiagnostic(message.diagnostics), false);
+    assert.strictEqual(normalizeCodexTransportOverflowAssistantMessage(message), message);
+  });
+
+  it("leaves WebSocket 1009 request-size diagnostics unchanged after events were emitted", () => {
+    const message = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Codex SSE response headers timed out after 20000ms",
+      diagnostics: {
+        eventsEmitted: true,
+        error: {
+          code: 1009,
+          message: "WebSocket closed 1009 message too big",
+        },
+        details: {
+          requestBytes: "24800000",
+        },
+      },
+      content: [],
+    };
+
+    assert.equal(isCodexTransportMessageTooBigDiagnostic(message.diagnostics), false);
+    assert.strictEqual(normalizeCodexTransportOverflowAssistantMessage(message), message);
+  });
+
   it("recognizes string-only WebSocket 1009 message-too-big diagnostics", () => {
     assert.equal(
       isCodexTransportMessageTooBigDiagnostic("WebSocket closed 1009 message too big before stream start"),
