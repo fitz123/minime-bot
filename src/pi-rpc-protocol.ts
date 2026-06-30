@@ -1047,6 +1047,12 @@ export function parsePiEvent(
         );
       }
       if (isFinalAssistantError && finalAssistant.text.length === 0) {
+        if (state?.pendingOverflowErrorMessage) {
+          return buildPendingOverflowErrorResult(state, {
+            ...rawEvent,
+            errorMessage: nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
+          });
+        }
         return finishPiRpcResult(
           buildPiRpcErrorResult(
             nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,

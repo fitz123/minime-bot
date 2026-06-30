@@ -2613,6 +2613,54 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("preserves the normalized Codex transport overflow cause when the recovery retry fails", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const retryFailure = "Codex SSE response headers timed out after 20000ms";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [],
+          },
+        ],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "overflow" }),
+      JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: retryFailure,
+            content: [],
+          },
+        ],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "Codex SSE response headers timed out after 20000ms; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
   it("does not duplicate the original overflow when a compaction failure already includes it", async () => {
     const overflowMessage =
       "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
