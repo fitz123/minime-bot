@@ -203,7 +203,7 @@ interface MarkdownSourceFile {
   baseDir: string;
 }
 
-function configuredMainPlatformRulesDir(): string | null {
+function configuredMainPlatformRulesRealPath(): string | null {
   try {
     const raw = loadRawMergedConfig();
     const agents = raw.agents;
@@ -219,27 +219,27 @@ function configuredMainPlatformRulesDir(): string | null {
       return null;
     }
     const mainWorkspace = resolveAgentWorkspaceCwd(resolveConfigWorkspaceRoot(), workspaceCwd);
-    return join(mainWorkspace, ".claude", "rules", "platform");
+    const mainWorkspaceReal = realpathSync(mainWorkspace);
+    const platformRulesReal = realpathSync(join(mainWorkspace, ".claude", "rules", "platform"));
+    return isResolvedPathContained(mainWorkspaceReal, platformRulesReal) ? platformRulesReal : null;
   } catch {
     return null;
   }
 }
 
-function trustedPlatformRulesRealPathForDirectoryRequest(dir: string, workspaceCwd: string): string | null {
+function trustedPlatformRulesRealPathForDirectoryRequest(
+  dir: string,
+  workspaceCwd: string,
+  targetReal: string | null,
+): string | null {
   if (resolve(dir) !== resolve(workspaceCwd, ".claude", "rules", "platform")) {
     return null;
   }
-  const configuredPlatformDir = configuredMainPlatformRulesDir();
-  if (configuredPlatformDir === null) {
+  const configuredPlatformReal = configuredMainPlatformRulesRealPath();
+  if (targetReal === null || configuredPlatformReal === null) {
     return null;
   }
-  try {
-    const targetReal = realpathSync(dir);
-    const configuredReal = realpathSync(configuredPlatformDir);
-    return targetReal === configuredReal ? configuredReal : null;
-  } catch {
-    return null;
-  }
+  return targetReal === configuredPlatformReal ? configuredPlatformReal : null;
 }
 
 /** List `*.md` files in a dir as absolute paths, sorted by name. Missing dir → []. */
@@ -248,7 +248,7 @@ function listMarkdown(dir: string, baseDir: string): MarkdownSourceFile[] {
   let realPath = resolved.realPath;
   let readBaseDir = baseDir;
   if (resolved.escaped) {
-    const trustedRealPath = trustedPlatformRulesRealPathForDirectoryRequest(dir, baseDir);
+    const trustedRealPath = trustedPlatformRulesRealPathForDirectoryRequest(dir, baseDir, resolved.realPath);
     if (trustedRealPath === null) {
       log.warn("pi-context", `markdown directory resolves outside the workspace, skipping: ${dir}`);
       return [];
@@ -657,12 +657,7 @@ function computeManifestSignature(agent: AgentConfig): string {
   for (const sub of ["platform", "custom"] as const) {
     const dir = join(workspaceCwd, ".claude", "rules", sub);
     files.push({ path: dir, baseDir: workspaceCwd });
-    files.push(
-      ...listMarkdown(dir, workspaceCwd).map((source) => ({
-        path: source.path,
-        baseDir: source.baseDir,
-      })),
-    );
+    files.push(...listMarkdown(dir, workspaceCwd));
   }
 
   const settingsPath = join(workspaceCwd, ".claude", "settings.local.json");

@@ -456,6 +456,112 @@ describe("collectRules", () => {
     );
   });
 
+  it("fails closed for escaped platform symlinks when trusted config is unavailable", () => {
+    const cases: Array<{ name: string; config?: string }> = [
+      { name: "missing config" },
+      { name: "malformed config", config: "agents: [\n" },
+      { name: "missing main", config: "agents:\n  reviewer:\n    workspaceCwd: ../main\n" },
+      { name: "blank main workspace", config: "agents:\n  main:\n    workspaceCwd: ''\n" },
+    ];
+
+    for (const entry of cases) {
+      const root = mkdtempSync(join(tmpdir(), "pi-ctx-platform-config-fail-"));
+      created.push(root);
+      const control = join(root, "control");
+      const roguePlatform = join(root, "rogue-platform");
+      const satellite = join(root, "satellite");
+      const satelliteRules = join(satellite, ".claude", "rules");
+
+      mkdirSync(control, { recursive: true });
+      mkdirSync(roguePlatform, { recursive: true });
+      mkdirSync(satelliteRules, { recursive: true });
+      if (entry.config !== undefined) {
+        writeFileSync(join(control, "config.yaml"), entry.config, "utf8");
+      }
+      writeFileSync(join(roguePlatform, "rogue.md"), `ROGUE_PLATFORM_RULE_${entry.name}`, "utf8");
+      symlinkSync(roguePlatform, join(satelliteRules, "platform"));
+
+      withPatchedEnv(
+        {
+          [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+          [MINIME_CONFIG_PATH_ENV]: undefined,
+        },
+        () => {
+          const { value: rules, warnings } = captureWarn(() => collectRules(satellite));
+
+          assert.equal(rules.length, 0);
+          assert.ok(warnings.some((m) => m.includes("markdown directory resolves outside the workspace")));
+        },
+      );
+    }
+  });
+
+  it("skips a configured main platform directory that itself resolves outside the main workspace", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-main-platform-escape-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const roguePlatform = join(root, "rogue-platform");
+    const satellite = join(root, "satellite");
+    const mainRules = join(main, ".claude", "rules");
+    const mainPlatformRules = join(mainRules, "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainRules, { recursive: true });
+    mkdirSync(roguePlatform, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(roguePlatform, "rogue.md"), "MAIN_PLATFORM_ESCAPE_TOKEN", "utf8");
+    symlinkSync(roguePlatform, mainPlatformRules);
+    symlinkSync(mainPlatformRules, join(satelliteRules, "platform"));
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const { value: rules, warnings } = captureWarn(() => collectRules(satellite));
+
+        assert.equal(rules.length, 0);
+        assert.ok(!rules.some((rule) => rule.content.includes("MAIN_PLATFORM_ESCAPE_TOKEN")));
+        assert.ok(warnings.some((m) => m.includes("markdown directory resolves outside the workspace")));
+      },
+    );
+  });
+
+  it("does not apply trusted platform symlink allowance to custom rule directories", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-custom-dir-symlink-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const satellite = join(root, "satellite");
+    const mainPlatformRules = join(main, ".claude", "rules", "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(mainPlatformRules, "shared.md"), "CUSTOM_DIR_TRUST_BYPASS_TOKEN", "utf8");
+    symlinkSync(mainPlatformRules, join(satelliteRules, "custom"));
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const { value: rules, warnings } = captureWarn(() => collectRules(satellite));
+
+        assert.equal(rules.length, 0);
+        assert.ok(!rules.some((rule) => rule.content.includes("CUSTOM_DIR_TRUST_BYPASS_TOKEN")));
+        assert.ok(warnings.some((m) => m.includes("markdown directory resolves outside the workspace")));
+      },
+    );
+  });
+
   it("skips escaped files inside a trusted satellite platform symlink", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-ctx-trusted-platform-file-"));
     created.push(root);
@@ -919,6 +1025,52 @@ describe("assemblePiContext", () => {
         const bundle = readFileSync(second.appendSystemPromptPath, "utf8");
         assert.ok(bundle.includes("TRUSTED_RULE_BBB"), "trusted shared rule content invalidates the cache");
         assert.ok(!bundle.includes("TRUSTED_RULE_AAA"));
+      },
+    );
+  });
+
+  it("re-assembles when a trusted shared platform symlink becomes untrusted", () => {
+    _resetPiContextCache();
+    const root = mkdtempSync(join(tmpdir(), "pi-ctx-trusted-platform-revoke-"));
+    created.push(root);
+    const control = join(root, "control");
+    const main = join(root, "main");
+    const roguePlatform = join(root, "rogue-platform");
+    const satellite = join(root, "satellite");
+    const mainPlatformRules = join(main, ".claude", "rules", "platform");
+    const satelliteRules = join(satellite, ".claude", "rules");
+    const satellitePlatformLink = join(satelliteRules, "platform");
+
+    mkdirSync(control, { recursive: true });
+    mkdirSync(mainPlatformRules, { recursive: true });
+    mkdirSync(roguePlatform, { recursive: true });
+    mkdirSync(satelliteRules, { recursive: true });
+    writeFileSync(join(control, "config.yaml"), "agents:\n  main:\n    workspaceCwd: ../main\n", "utf8");
+    writeFileSync(join(satellite, "CLAUDE.md"), "# Satellite\n\nBODY", "utf8");
+    writeFileSync(join(mainPlatformRules, "shared.md"), "TRUSTED_REVOKED_RULE", "utf8");
+    writeFileSync(join(roguePlatform, "rogue.md"), "ROGUE_AFTER_REVOKE_RULE", "utf8");
+    symlinkSync(mainPlatformRules, satellitePlatformLink);
+
+    withPatchedEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: control,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+      },
+      () => {
+        const agent = agentFor(satellite, { id: "trustedplatformrevoke" });
+        const first = assemblePiContext(agent);
+        assert.ok(first);
+        assert.ok(readFileSync(first.appendSystemPromptPath, "utf8").includes("TRUSTED_REVOKED_RULE"));
+
+        rmSync(satellitePlatformLink);
+        symlinkSync(roguePlatform, satellitePlatformLink);
+
+        const second = assemblePiContext(agent);
+        assert.ok(second);
+        const bundle = readFileSync(second.appendSystemPromptPath, "utf8");
+        assert.ok(bundle.includes("BODY"));
+        assert.ok(!bundle.includes("TRUSTED_REVOKED_RULE"));
+        assert.ok(!bundle.includes("ROGUE_AFTER_REVOKE_RULE"));
       },
     );
   });

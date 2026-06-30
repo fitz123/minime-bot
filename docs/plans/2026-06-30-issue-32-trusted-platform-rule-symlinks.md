@@ -56,4 +56,4 @@ npm run build
 npm pack --dry-run
 ```
 
-Then open/update PR for #32, run `gh pr checks`, and report the result. Do not release/deploy unless Ninja explicitly asks for a full release flow.
+Then open/update PR for #32, run `gh pr checks`, and report the result. Do not release/deploy unless the maintainer explicitly asks for a full release flow.

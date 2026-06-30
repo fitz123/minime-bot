@@ -115,6 +115,13 @@ Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.
 
+Satellite agent workspaces may symlink `.claude/rules/platform` to the
+configured `agents.main.workspaceCwd` `.claude/rules/platform`. Pi context
+assembly includes that exact contained realpath match and keeps bundle headings
+under the satellite `.claude/rules/platform/<file>.md` path. Other
+out-of-workspace rule directories, custom rules, imports, output styles, and
+escaping rule-file symlinks remain skipped.
+
 Optional top-level `piExtraExtensions` entries allow operator-approved external
 Pi extension entrypoints in normal bot-created interactive RPC sessions:
 
