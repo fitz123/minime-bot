@@ -488,6 +488,23 @@ describe("SessionManager Pi session-id capture + resume", () => {
     await manager.closeAll();
   });
 
+  it("does not reuse an active Pi session whose stdout was destroyed", async () => {
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const first = await manager.getOrCreateSession("pi-closed-stdout", "pi");
+    const firstChild = first.child;
+
+    firstChild.stdout?.destroy();
+    (firstChild as unknown as { killed: boolean }).killed = false;
+
+    const second = await manager.getOrCreateSession("pi-closed-stdout", "pi");
+
+    assert.notStrictEqual(second.child, firstChild, "closed stdout child must not be reused");
+    assert.strictEqual(piSpawnCaptures.length, 2, "a replacement Pi child is spawned");
+    assert.strictEqual(firstChild.killed, true, "closed stdout child is terminated during replacement");
+
+    await manager.closeAll();
+  });
+
   it("terminates the spawned child if outbox setup fails before active registration", async () => {
     let capturedChild: ChildProcess | null = null;
     onGetState = (child) => {

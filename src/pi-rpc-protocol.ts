@@ -30,6 +30,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
+ *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (Tavily web_search/web_fetch),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn),
@@ -38,6 +39,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * ask-agent are multi-file DIRECTORIES whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
@@ -45,6 +47,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.js",
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",
@@ -53,11 +56,16 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
 
 /**
  * Wrappers a subagent CHILD `pi` spawn must load. The subagent tool spawns an
- * isolated `pi -p` child to run a delegated task. Children load web tools and
- * knowledge tools/protection, but they do NOT load the subagent wrapper:
- * recursive spawning stays disabled in child sessions.
+ * isolated `pi -p` child to run a delegated task. Children load the transport
+ * overflow normalizer, web tools, and knowledge tools/protection, but they do
+ * NOT load the subagent wrapper: recursive spawning stays disabled in child
+ * sessions.
  */
-export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
+export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.ts",
+  "web-tools.ts",
+  "knowledge-tools.ts",
+] as const;
 
 /**
  * Wrappers an ask-agent target CHILD `pi` spawn must load. The child runs as a
@@ -76,7 +84,11 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
  */
 export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
 
-export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = ["web-tools.js", "knowledge-tools.js"] as const;
+export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
+  "codex-transport-overflow.js",
+  "web-tools.js",
+  "knowledge-tools.js",
+] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
   "subagent/index.js",
   "ask-agent/index.js",
@@ -108,8 +120,8 @@ export interface PiExtensionResolveOptions {
   /**
    * Which wrapper relpaths to resolve (default: the full interactive
    * {@link PI_EXTENSION_WRAPPER_RELPATHS}). A subagent child passes
-   * {@link PI_SUBAGENT_CHILD_WRAPPER_RELPATHS} to load web tools while leaving
-   * recursive subagent spawning disabled.
+   * {@link PI_SUBAGENT_CHILD_WRAPPER_RELPATHS} to load non-recursive first-party
+   * child wrappers while leaving recursive subagent spawning disabled.
    */
   relpaths?: readonly string[];
 }
@@ -798,11 +810,14 @@ interface FinalAssistantInfo {
 
 export interface PiRpcParseState {
   pendingOverflowErrorMessage?: string;
+  pendingOverflowSessionId?: string;
+  pendingOverflowRecoveryStarted?: boolean;
   pendingOverflowResetEmitted?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
+const PI_RPC_PENDING_OVERFLOW_GRACE_MS = 1_000;
 
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
@@ -892,21 +907,29 @@ function buildPiRpcRetryResetEvent(): ControlRequest {
 function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): ResultMessage {
   if (state) {
     state.pendingOverflowErrorMessage = undefined;
+    state.pendingOverflowSessionId = undefined;
+    state.pendingOverflowRecoveryStarted = undefined;
     state.pendingOverflowResetEmitted = undefined;
   }
   return result;
 }
 
 function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRpcEvent): ResultMessage {
-  const message =
+  const recoveryFailureMessage =
     nonEmptyText(rawEvent?.errorMessage) ??
     nonEmptyText(rawEvent?.error) ??
-    nonEmptyText(rawEvent?.message) ??
-    state.pendingOverflowErrorMessage ??
-    PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+    nonEmptyText(rawEvent?.message);
+  const overflowMessage = nonEmptyText(state.pendingOverflowErrorMessage);
+  const message =
+    recoveryFailureMessage && overflowMessage && !recoveryFailureMessage.includes(overflowMessage)
+      ? `${recoveryFailureMessage}; original overflow: ${overflowMessage}`
+      : recoveryFailureMessage ?? overflowMessage ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
+  const sessionId = rawEvent?.sessionId ?? state.pendingOverflowSessionId;
   state.pendingOverflowErrorMessage = undefined;
+  state.pendingOverflowSessionId = undefined;
+  state.pendingOverflowRecoveryStarted = undefined;
   state.pendingOverflowResetEmitted = undefined;
-  return buildPiRpcErrorResult(message, rawEvent?.sessionId);
+  return buildPiRpcErrorResult(message, sessionId);
 }
 
 function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
@@ -931,7 +954,7 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   message text reconstructed from `agent_end.messages`. A context overflow
  *   `agent_end` can be followed by compaction/retry records even though
  *   `agent_end` itself carries no retry field in Pi's RPC contract, so the
- *   stateful stream reader defers that overflow-only record until recovery
+ *   stateful stream reader defers that overflow error record until recovery
  *   succeeds, fails, or stdout ends.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end becomes the visible terminal
@@ -944,7 +967,7 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   `SystemInit` capturing `data.sessionId` (the ONLY place Pi exposes the
  *   session id — no event carries it). A failed reply (`success: false`) is
  *   correlated by `command`: a failed `prompt` with a context-overflow error
- *   follows the same deferred recovery path as an overflow-only `agent_end`; a
+ *   follows the same deferred recovery path as an overflow `agent_end`; a
  *   failed `prompt` with another REAL rejection yields an error `ResultMessage`
  *   (the turn cannot proceed), while Pi's "already processing" concurrency
  *   rejection returns null + logs (the in-flight turn is still alive and will
@@ -1004,21 +1027,12 @@ export function parsePiEvent(
     case "agent_end": {
       const finalAssistant = extractFinalAssistantInfo(rawEvent.messages);
       const isFinalAssistantError = isErrorStopReason(finalAssistant.stopReason);
-      if (
-        isFinalAssistantError &&
-        finalAssistant.text.length === 0 &&
-        isContextOverflowError(finalAssistant.errorMessage)
-      ) {
+      if (isFinalAssistantError && isContextOverflowError(finalAssistant.errorMessage)) {
         const overflowMessage =
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
-          if (rawEvent.willRetry === false) {
-            return finishPiRpcResult(
-              buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
-              state,
-            );
-          }
           state.pendingOverflowErrorMessage = overflowMessage;
+          state.pendingOverflowSessionId = rawEvent.sessionId;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
           }
@@ -1027,8 +1041,18 @@ export function parsePiEvent(
         if (rawEvent.willRetry === true) {
           return null;
         }
+        return finishPiRpcResult(
+          buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
+          state,
+        );
       }
       if (isFinalAssistantError && finalAssistant.text.length === 0) {
+        if (state?.pendingOverflowErrorMessage) {
+          return buildPendingOverflowErrorResult(state, {
+            ...rawEvent,
+            errorMessage: nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
+          });
+        }
         return finishPiRpcResult(
           buildPiRpcErrorResult(
             nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
@@ -1047,6 +1071,7 @@ export function parsePiEvent(
 
     case "compaction_start":
       if (state?.pendingOverflowErrorMessage) {
+        state.pendingOverflowRecoveryStarted = true;
         return markPendingOverflowRetry(state);
       }
       return null;
@@ -1055,6 +1080,7 @@ export function parsePiEvent(
       if (!state?.pendingOverflowErrorMessage) {
         return null;
       }
+      state.pendingOverflowRecoveryStarted = true;
       if (rawEvent.willRetry === true) {
         return markPendingOverflowRetry(state);
       }
@@ -1116,6 +1142,7 @@ export function parsePiEvent(
               );
             }
             state.pendingOverflowErrorMessage = promptErrorMessage;
+            state.pendingOverflowSessionId = rawEvent.sessionId;
             return null;
           }
           return finishPiRpcResult(
@@ -1153,6 +1180,9 @@ export function parsePiEvent(
     }
 
     case "error": {
+      if (state?.pendingOverflowErrorMessage) {
+        return buildPendingOverflowErrorResult(state, rawEvent);
+      }
       const fallbackMessage =
         typeof rawEvent.message === "string" ? rawEvent.message : undefined;
       const result: ResultMessage = {
@@ -1170,9 +1200,9 @@ export function parsePiEvent(
   }
 }
 
-type PiStdoutWaitResult = "readable" | "end" | "close";
+type PiStdoutWaitResult = "readable" | "end" | "close" | "timeout";
 
-function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
+function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdoutWaitResult> {
   if (stdout.readableEnded) {
     return Promise.resolve("end");
   }
@@ -1181,7 +1211,12 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   }
 
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
       stdout.off("readable", onReadable);
       stdout.off("end", onEnd);
       stdout.off("close", onClose);
@@ -1198,12 +1233,50 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
       cleanup();
       reject(err);
     };
+    const onTimeout = () => finish("timeout");
 
     stdout.once("readable", onReadable);
     stdout.once("end", onEnd);
     stdout.once("close", onClose);
     stdout.once("error", onError);
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(onTimeout, timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    }
   });
+}
+
+function markPiChildUnusable(child: ChildProcess): void {
+  try {
+    (child as { killed: boolean }).killed = true;
+  } catch {
+    // Best effort: the caller also destroys stdout so stale records cannot be reused.
+  }
+}
+
+function terminatePiChildAfterOverflowGrace(child: ChildProcess, stdout: Readable): void {
+  if (!child.killed) {
+    const kill = (child as { kill?: (signal?: NodeJS.Signals | number) => boolean }).kill;
+    if (typeof kill === "function") {
+      try {
+        if (!kill.call(child, "SIGTERM")) {
+          markPiChildUnusable(child);
+        }
+      } catch (err) {
+        markPiChildUnusable(child);
+        log.warn(
+          "pi-rpc",
+          `Failed to terminate Pi child after pending overflow timeout: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      markPiChildUnusable(child);
+    }
+  }
+
+  if (!stdout.destroyed) {
+    stdout.destroy();
+  }
 }
 
 /**
@@ -1231,9 +1304,19 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
       }
     }
 
-    const waitResult = await waitForPiStdout(stdout);
+    const waitResult = await waitForPiStdout(
+      stdout,
+      parseState.pendingOverflowErrorMessage && !parseState.pendingOverflowRecoveryStarted
+        ? PI_RPC_PENDING_OVERFLOW_GRACE_MS
+        : undefined,
+    );
     if (waitResult === "end" || waitResult === "close") {
       break;
+    }
+    if (waitResult === "timeout" && parseState.pendingOverflowErrorMessage) {
+      terminatePiChildAfterOverflowGrace(child, stdout);
+      yield buildPendingOverflowErrorResult(parseState);
+      return;
     }
   }
 

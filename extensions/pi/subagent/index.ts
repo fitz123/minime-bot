@@ -301,8 +301,9 @@ async function runSingleAgent(
 
 		// Provider wiring lives in the pure helper: --provider openai-codex +
 		// the normalized codex model (agent.model is left provider-agnostic). The
-		// child loads web-tools only, and its env is allowlisted so web-capable
-		// child agents never inherit ambient secrets from the parent.
+		// child loads only non-recursive first-party wrappers, and its env is
+		// allowlisted so web-capable child agents never inherit ambient secrets
+		// from the parent.
 		const args = buildSubagentSpawnArgs(agent, task, {
 			systemPromptPath: tmpPromptPath ?? undefined,
 			extensionArgs: resolvePiExtensionArgs({ relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS }),

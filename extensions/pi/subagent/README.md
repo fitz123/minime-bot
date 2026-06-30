@@ -29,11 +29,11 @@ from upstream:
    bundled `agents/` dir first regardless of `agentScope`; the bundled `prompts/`
    dir is registered via a `resources_discover` handler in `index.ts`.
 3. **Child extension subset**: each child `pi -p` spawn passes `--no-extensions`,
-   then explicitly loads web-tools plus knowledge-tools/protection via
-   `PI_SUBAGENT_CHILD_WRAPPER_RELPATHS`. Children do not load
-   `subagent/index.ts`, so recursive subagent spawning stays disabled. Missing
-   wrappers fail during spawn arg resolution; a missing Tavily key leaves web
-   tools registered but returning graceful unavailable results.
+   then explicitly loads the Codex transport overflow normalizer, web-tools, and
+   knowledge-tools/protection via `PI_SUBAGENT_CHILD_WRAPPER_RELPATHS`. Children
+   do not load `subagent/index.ts`, so recursive subagent spawning stays
+   disabled. Missing wrappers fail during spawn arg resolution; a missing Tavily
+   key leaves web tools registered but returning graceful unavailable results.
 
 **Tool/param contract:** the registered tool is named `subagent`; modes are
 `single` (`{ agent, task }`), `parallel` (`{ tasks: [...] }`), and `chain`

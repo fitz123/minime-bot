@@ -129,9 +129,10 @@ explicitly, then appends each approved extra unchanged as a repeatable
 `--extension` argument. Each configured file must exist on the host that starts
 Pi; a missing file fails the interactive spawn with a clear error.
 `PI_EXTENSIONS_DISABLED=1` disables both first-party wrappers and configured
-extras for a spawn. Cron and subagent-child extension subsets keep their
-existing first-party-only scope. Ask-agent target children load `web-tools`,
-`knowledge-tools`, and approved `piExtraExtensions`, but reject configured extras
+extras for a spawn. Cron extension subsets keep their existing first-party-only
+scope. Subagent and ask-agent child spawns load the non-recursive first-party
+wrappers, including the Codex transport overflow normalizer; ask-agent target
+children also load approved `piExtraExtensions`, but reject configured extras
 that point back at the first-party `subagent` or `ask-agent` wrappers.
 
 Agents opt into first-party `ask_agent` handoffs with an `askAgent` block. Both
@@ -220,6 +221,15 @@ the bot discards that stale resume once and starts a fresh Pi session. These
 graceful stale-resume recoveries increment
 `bot_pi_session_resume_discarded_total`; recovered stale resumes and
 `/clean`-superseded startups do not increment `bot_session_crashes_total`.
+
+Pi interactive sessions normalize Codex/OpenAI request-byte transport overflows
+before Pi decides retry versus compaction. When diagnostics include a WebSocket
+1009/message-too-big signal with a pre-stream or `requestBytes` marker, the bot
+treats the failure as context overflow so Pi can compact and retry. A generic
+`Codex SSE response headers timed out` message alone is not treated as overflow.
+If recovery fails, the delivered error includes the original 1009/message-too-big
+cause. `PI_EXTENSIONS_DISABLED=1` disables this normalizer with the other
+first-party wrappers.
 
 ## Launchd Operations
 

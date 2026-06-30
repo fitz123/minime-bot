@@ -371,7 +371,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -433,6 +433,7 @@ describe("Pi extension loading (--extension)", () => {
 
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -440,14 +441,14 @@ describe("Pi extension loading (--extension)", () => {
     ]);
   });
 
-  it("defaults the wrapper list to web-tools, knowledge-tools, subagent, and ask-agent", () => {
+  it("defaults the wrapper list to codex overflow normalization, web-tools, knowledge-tools, subagent, and ask-agent", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -463,12 +464,14 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(parentArgs, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
       "--extension", wrapperAbs("ask-agent/index.ts"),
     ]);
     assert.deepStrictEqual(subagentChildArgs, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -482,8 +485,14 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("the subagent-child wrapper subset omits subagent recursion", () => {
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
-    assert.deepStrictEqual([...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS], ["web-tools.js", "knowledge-tools.js"]);
+    assert.deepStrictEqual(
+      [...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS],
+      ["codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts"],
+    );
+    assert.deepStrictEqual(
+      [...PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS],
+      ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+    );
   });
 
   it("the ask-agent child wrapper subset omits recursive handoff wrappers", () => {
@@ -499,9 +508,10 @@ describe("Pi extension loading (--extension)", () => {
     assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
   });
 
-  it("resolves only the requested relpaths subset (subagent child loads web and knowledge tools)", () => {
+  it("resolves only the requested relpaths subset for subagent children", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -516,6 +526,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", extraA,
@@ -559,6 +570,7 @@ describe("Pi extension loading (--extension)", () => {
       }
       for (const file of [
         join(sourceDir, "web-tools.ts"),
+        join(sourceDir, "codex-transport-overflow.ts"),
         join(sourceDir, "knowledge-tools.ts"),
         join(sourceDir, "ask-agent", "index.ts"),
         join(sourceDir, "subagent", "index.ts"),
@@ -615,6 +627,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(subagentChildArgs, [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -648,6 +661,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args, [
+      "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -664,6 +678,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -684,6 +699,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -720,7 +736,8 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 4);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
     assert.ok(args.includes(wrapperAbs("subagent/index.ts")));
@@ -734,6 +751,7 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -749,7 +767,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -767,6 +785,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -895,10 +914,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 4, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 5, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 4);
+    assert.strictEqual(paths.length, 5);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -2192,6 +2211,49 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("preserves the original overflow cause when a pending recovery emits a top-level error", () => {
+    const state: PiRpcParseState = {};
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    assert.strictEqual(
+      parsePiEvent(
+        {
+          type: "agent_end",
+          sessionId: "test-session",
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage: overflowMessage,
+              content: [],
+            },
+          ],
+        },
+        state,
+      ),
+      null,
+    );
+
+    const line = parsePiEvent(
+      {
+        type: "error",
+        errorMessage: "Unable to compact the conversation",
+      },
+      state,
+    );
+
+    assert.ok(line);
+    assert.strictEqual(line.type, "result");
+    const result = line as unknown as Record<string, unknown>;
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.strictEqual(result.session_id, "test-session");
+    assert.strictEqual(result.is_error, true);
+  });
+
   it("falls back to the message field, then a default, for error result text", () => {
     const fromMessage = parsePiEvent({ type: "error", message: "no errorMessage here" });
     assert.ok(fromMessage);
@@ -2316,7 +2378,10 @@ describe("readPiStream", () => {
     const result = results[0] as unknown as Record<string, unknown>;
     assert.strictEqual(result.type, "result");
     assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(result.result, "Unable to compact the conversation");
+    assert.strictEqual(
+      result.result,
+      "Unable to compact the conversation; original overflow: context_length_exceeded: input exceeds the context window",
+    );
     assert.strictEqual(result.is_error, true);
   });
 
@@ -2422,6 +2487,53 @@ describe("readPiStream", () => {
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
   });
 
+  it("keeps a normalized Codex transport overflow with partial text hidden when compaction recovers", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        willRetry: false,
+        messages: [
+          { role: "user", content: "summarize the workspace" },
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [{ type: "text", text: "stale partial answer" }],
+          },
+        ],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "overflow" }),
+      JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "summarize the workspace" },
+          { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
+        ],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    assert.ok(
+      lines.some(
+        (line) =>
+          line.type === "assistant" &&
+          line.subtype === "control_request" &&
+          (line as { action?: unknown }).action === "reset_response_text",
+      ),
+    );
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "post-compaction answer");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
+  });
+
   it("surfaces compaction failure after a deferred overflow agent_end", async () => {
     const child = childWithStdout([
       JSON.stringify({
@@ -2454,7 +2566,137 @@ describe("readPiStream", () => {
     const result = results[0] as unknown as Record<string, unknown>;
     assert.strictEqual(result.type, "result");
     assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(result.result, "Unable to compact the conversation");
+    assert.strictEqual(
+      result.result,
+      "Unable to compact the conversation; original overflow: context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("surfaces the normalized Codex transport overflow cause when recovery fails", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [],
+          },
+        ],
+      }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "overflow",
+        success: false,
+        errorMessage: "Unable to compact the conversation",
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("preserves the normalized Codex transport overflow cause when the recovery retry fails", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const retryFailure = "Codex SSE response headers timed out after 20000ms";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [],
+          },
+        ],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "overflow" }),
+      JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: retryFailure,
+            content: [],
+          },
+        ],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(
+      result.result,
+      "Codex SSE response headers timed out after 20000ms; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
+    );
+    assert.strictEqual(result.is_error, true);
+  });
+
+  it("does not duplicate the original overflow when a compaction failure already includes it", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const recoveryFailure =
+      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [],
+          },
+        ],
+      }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "overflow",
+        success: false,
+        errorMessage: recoveryFailure,
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(result.result, recoveryFailure);
     assert.strictEqual(result.is_error, true);
   });
 
@@ -2526,10 +2768,20 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("surfaces an explicit non-retryable context-overflow agent_end while stdout stays open", async () => {
+  it("terminates a willRetry-false context-overflow agent_end after a bounded grace", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
-    Object.assign(child, { stdout });
+    const killSignals: Array<NodeJS.Signals | number | undefined> = [];
+    Object.assign(child, {
+      stdout,
+      killed: false,
+      exitCode: null,
+      kill(signal?: NodeJS.Signals | number): boolean {
+        (child as unknown as { killed: boolean }).killed = true;
+        killSignals.push(signal);
+        return true;
+      },
+    });
     const stream = readPiStream(child);
 
     try {
@@ -2551,16 +2803,20 @@ describe("readPiStream", () => {
         }) + "\n",
       );
 
+      const early = await Promise.race([
+        next.then(() => "resolved" as const),
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 100);
+        }),
+      ]);
+      assert.strictEqual(early, "pending");
+
       const result = await Promise.race([
         next,
         new Promise<never>((_resolve, reject) => {
-          setTimeout(
-            () => reject(new Error("timed out waiting for non-retryable overflow result")),
-            1_000,
-          );
+          setTimeout(() => reject(new Error("timed out waiting for overflow grace fallback")), 2_500);
         }),
       ]);
-
       assert.strictEqual(result.done, false);
       assert.strictEqual(result.value.type, "result");
       const line = result.value as unknown as Record<string, unknown>;
@@ -2571,7 +2827,13 @@ describe("readPiStream", () => {
       );
       assert.strictEqual(line.session_id, "test-session");
       assert.strictEqual(line.is_error, true);
-      assert.strictEqual(stdout.destroyed, false, "open stdout must not be destroyed");
+      assert.strictEqual((child as unknown as { killed: boolean }).killed, true);
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      assert.strictEqual(stdout.destroyed, true, "late overflow records must not remain readable");
+
+      const second = readPiStream(child);
+      const stale = await second.next();
+      assert.strictEqual(stale.done, true, "a fresh stream must not read records from the timed-out turn");
     } finally {
       await stream.return(undefined);
       stdout.destroy();
@@ -2622,6 +2884,18 @@ describe("readPiStream", () => {
       assert.strictEqual((reset.value as { action?: unknown }).action, "reset_response_text");
 
       const finalNext = stream.next();
+      const activeCompaction = await Promise.race([
+        finalNext.then(() => "resolved" as const),
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 1_200);
+        }),
+      ]);
+      assert.strictEqual(
+        activeCompaction,
+        "pending",
+        "active overflow compaction must not be finalized by the pre-recovery grace timer",
+      );
+
       stdout.push(JSON.stringify({ type: "compaction_end", reason: "overflow", willRetry: true }) + "\n");
       stdout.push(
         JSON.stringify({
