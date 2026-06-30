@@ -1,5 +1,8 @@
 # Plan: Issue #14 Codex transport byte-size overflow normalization
 
+Status: Completed on 2026-06-30. Addresses issue #14's Codex transport byte-size
+overflow variant.
+
 ## Goal
 
 Make Pi-backed bot sessions recover when Codex/OpenAI fails before streaming with `WebSocket closed 1009 message too big` and large `requestBytes`, instead of retrying/resuming forever and showing users only `Codex SSE response headers timed out after 20000ms`.

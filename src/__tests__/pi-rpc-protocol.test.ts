@@ -2435,19 +2435,20 @@ describe("readPiStream", () => {
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
   });
 
-  it("keeps a normalized Codex transport overflow hidden when compaction recovers", async () => {
+  it("keeps a normalized Codex transport overflow with partial text hidden when compaction recovers", async () => {
     const overflowMessage =
       "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
     const child = childWithStdout([
       JSON.stringify({
         type: "agent_end",
+        willRetry: false,
         messages: [
           { role: "user", content: "summarize the workspace" },
           {
             role: "assistant",
             stopReason: "error",
             errorMessage: overflowMessage,
-            content: [],
+            content: [{ type: "text", text: "stale partial answer" }],
           },
         ],
       }),
@@ -2467,6 +2468,14 @@ describe("readPiStream", () => {
       lines.push(line);
     }
 
+    assert.ok(
+      lines.some(
+        (line) =>
+          line.type === "assistant" &&
+          line.subtype === "control_request" &&
+          (line as { action?: unknown }).action === "reset_response_text",
+      ),
+    );
     const results = lines.filter((line) => line.type === "result");
     assert.strictEqual(results.length, 1);
     assert.strictEqual((results[0] as { result: string }).result, "post-compaction answer");
@@ -2552,6 +2561,45 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
+  it("does not duplicate the original overflow when a compaction failure already includes it", async () => {
+    const overflowMessage =
+      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const recoveryFailure =
+      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: overflowMessage,
+            content: [],
+          },
+        ],
+      }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "overflow",
+        success: false,
+        errorMessage: recoveryFailure,
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) {
+      lines.push(line);
+    }
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    const result = results[0] as unknown as Record<string, unknown>;
+    assert.strictEqual(result.type, "result");
+    assert.strictEqual(result.subtype, "error_during_execution");
+    assert.strictEqual(result.result, recoveryFailure);
+    assert.strictEqual(result.is_error, true);
+  });
+
   it("surfaces a deferred overflow error if stdout ends before recovery", async () => {
     const child = childWithStdout([
       JSON.stringify({
@@ -2620,7 +2668,7 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("surfaces an explicit non-retryable context-overflow agent_end while stdout stays open", async () => {
+  it("defers a willRetry-false context-overflow agent_end while stdout stays open", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, { stdout });
@@ -2645,16 +2693,21 @@ describe("readPiStream", () => {
         }) + "\n",
       );
 
+      const early = await Promise.race([
+        next.then(() => "resolved" as const),
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 100);
+        }),
+      ]);
+      assert.strictEqual(early, "pending");
+
+      stdout.push(null);
       const result = await Promise.race([
         next,
         new Promise<never>((_resolve, reject) => {
-          setTimeout(
-            () => reject(new Error("timed out waiting for non-retryable overflow result")),
-            1_000,
-          );
+          setTimeout(() => reject(new Error("timed out waiting for overflow EOF fallback")), 2_000);
         }),
       ]);
-
       assert.strictEqual(result.done, false);
       assert.strictEqual(result.value.type, "result");
       const line = result.value as unknown as Record<string, unknown>;
@@ -2663,9 +2716,7 @@ describe("readPiStream", () => {
         line.result,
         "context_length_exceeded: input exceeds the context window",
       );
-      assert.strictEqual(line.session_id, "test-session");
       assert.strictEqual(line.is_error, true);
-      assert.strictEqual(stdout.destroyed, false, "open stdout must not be destroyed");
     } finally {
       await stream.return(undefined);
       stdout.destroy();

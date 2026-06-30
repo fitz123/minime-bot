@@ -937,7 +937,7 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   message text reconstructed from `agent_end.messages`. A context overflow
  *   `agent_end` can be followed by compaction/retry records even though
  *   `agent_end` itself carries no retry field in Pi's RPC contract, so the
- *   stateful stream reader defers that overflow-only record until recovery
+ *   stateful stream reader defers that overflow error record until recovery
  *   succeeds, fails, or stdout ends.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end becomes the visible terminal
@@ -950,7 +950,7 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   `SystemInit` capturing `data.sessionId` (the ONLY place Pi exposes the
  *   session id — no event carries it). A failed reply (`success: false`) is
  *   correlated by `command`: a failed `prompt` with a context-overflow error
- *   follows the same deferred recovery path as an overflow-only `agent_end`; a
+ *   follows the same deferred recovery path as an overflow `agent_end`; a
  *   failed `prompt` with another REAL rejection yields an error `ResultMessage`
  *   (the turn cannot proceed), while Pi's "already processing" concurrency
  *   rejection returns null + logs (the in-flight turn is still alive and will
@@ -1010,20 +1010,10 @@ export function parsePiEvent(
     case "agent_end": {
       const finalAssistant = extractFinalAssistantInfo(rawEvent.messages);
       const isFinalAssistantError = isErrorStopReason(finalAssistant.stopReason);
-      if (
-        isFinalAssistantError &&
-        finalAssistant.text.length === 0 &&
-        isContextOverflowError(finalAssistant.errorMessage)
-      ) {
+      if (isFinalAssistantError && isContextOverflowError(finalAssistant.errorMessage)) {
         const overflowMessage =
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
         if (state) {
-          if (rawEvent.willRetry === false) {
-            return finishPiRpcResult(
-              buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
-              state,
-            );
-          }
           state.pendingOverflowErrorMessage = overflowMessage;
           if (rawEvent.willRetry === true) {
             return markPendingOverflowRetry(state);
@@ -1033,6 +1023,10 @@ export function parsePiEvent(
         if (rawEvent.willRetry === true) {
           return null;
         }
+        return finishPiRpcResult(
+          buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
+          state,
+        );
       }
       if (isFinalAssistantError && finalAssistant.text.length === 0) {
         return finishPiRpcResult(

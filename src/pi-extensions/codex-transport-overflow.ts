@@ -12,6 +12,7 @@ interface DiagnosticSignals {
   hasText1009: boolean;
   hasMessageTooBig: boolean;
   hasWebSocketSignal: boolean;
+  hasBeforeStreamStartSignal: boolean;
   requestBytes?: number;
 }
 
@@ -19,15 +20,14 @@ const OVERFLOW_ERROR_PREFIX = "context_length_exceeded: Codex request too large"
 const MESSAGE_TOO_BIG_RE = /\bmessage[\s_-]*too[\s_-]*big\b/i;
 const WEBSOCKET_RE = /\bweb[\s_-]*socket\b/i;
 const CODE_1009_RE = /\b1009\b/;
-const REQUEST_BYTES_RE = /\brequestBytes\s*[:=]\s*(\d+)\b/;
-const MAX_DIAGNOSTIC_DEPTH = 8;
+const REQUEST_BYTES_RE = /\brequest[\s_-]*bytes\s*[:=]\s*(\d+)\b/i;
+const BEFORE_STREAM_START_RE = /\bbefore(?:[\s_-]*message)?[\s_-]*stream[\s_-]*start\b/i;
+const MAX_DIAGNOSTIC_DEPTH = 6;
 
 const CODE_KEYS = new Set([
   "code",
   "closecode",
   "close_code",
-  "statuscode",
-  "status_code",
   "websocketcode",
   "websocket_code",
   "websocketclosecode",
@@ -38,7 +38,9 @@ const CODE_KEYS = new Set([
   "ws_close_code",
 ]);
 
-const SKIPPED_MESSAGE_KEYS = new Set([
+const REQUEST_BYTES_KEYS = new Set(["requestbytes", "request_bytes"]);
+
+const SKIPPED_DIAGNOSTIC_KEYS = new Set([
   "content",
   "messages",
   "prompt",
@@ -49,10 +51,7 @@ const SKIPPED_MESSAGE_KEYS = new Set([
 
 export function isCodexTransportMessageTooBigDiagnostic(diagnostic: unknown): boolean {
   const signals = collectDiagnosticSignals(diagnostic);
-  return (
-    signals.hasStructuredCode1009 ||
-    (signals.hasMessageTooBig && (signals.hasWebSocketSignal || signals.hasText1009))
-  );
+  return isCodexTransportMessageTooBigSignals(signals);
 }
 
 export function normalizeCodexTransportOverflowAssistantMessage<T extends CodexTransportOverflowAssistantMessage>(
@@ -62,14 +61,14 @@ export function normalizeCodexTransportOverflowAssistantMessage<T extends CodexT
     return message;
   }
 
-  const diagnosticSource = diagnosticSourceFromMessage(message);
-  if (!isCodexTransportMessageTooBigDiagnostic(diagnosticSource)) {
+  const signals = collectDiagnosticSignals([message.errorMessage, message.diagnostics]);
+  if (!isCodexTransportMessageTooBigSignals(signals)) {
     return message;
   }
 
   return {
     ...message,
-    errorMessage: formatCodexTransportOverflowErrorMessage(diagnosticSource),
+    errorMessage: formatCodexTransportOverflowErrorMessage(signals),
   };
 }
 
@@ -82,22 +81,18 @@ function isAssistantErrorMessage(message: CodexTransportOverflowAssistantMessage
   );
 }
 
-function diagnosticSourceFromMessage(message: CodexTransportOverflowAssistantMessage): Record<string, unknown> {
-  const source: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(message)) {
-    if (SKIPPED_MESSAGE_KEYS.has(normalizeKey(key))) {
-      continue;
-    }
-    source[key] = value;
-  }
-  return source;
+function isCodexTransportMessageTooBigSignals(signals: DiagnosticSignals): boolean {
+  const hasTransportOverflow =
+    signals.hasStructuredCode1009 ||
+    (signals.hasMessageTooBig && (signals.hasWebSocketSignal || signals.hasText1009));
+  const hasRequestSideSignal = signals.hasBeforeStreamStartSignal || signals.requestBytes !== undefined;
+  return hasTransportOverflow && hasRequestSideSignal;
 }
 
-function formatCodexTransportOverflowErrorMessage(diagnostic: unknown): string {
-  const requestBytes = collectDiagnosticSignals(diagnostic).requestBytes;
+function formatCodexTransportOverflowErrorMessage(signals: DiagnosticSignals): string {
   const details = ["WebSocket 1009 message too big"];
-  if (requestBytes !== undefined) {
-    details.push(`requestBytes=${Math.trunc(requestBytes)}`);
+  if (signals.requestBytes !== undefined) {
+    details.push(`requestBytes=${Math.trunc(signals.requestBytes)}`);
   }
   return `${OVERFLOW_ERROR_PREFIX} (${details.join("; ")})`;
 }
@@ -108,6 +103,7 @@ function collectDiagnosticSignals(diagnostic: unknown): DiagnosticSignals {
     hasText1009: false,
     hasMessageTooBig: false,
     hasWebSocketSignal: false,
+    hasBeforeStreamStartSignal: false,
   };
   collectDiagnosticValue(diagnostic, signals, undefined, new Set<object>(), 0);
   return signals;
@@ -128,7 +124,10 @@ function collectDiagnosticValue(
   if (normalizedKey && CODE_KEYS.has(normalizedKey) && isCode1009Value(value)) {
     signals.hasStructuredCode1009 = true;
   }
-  if (normalizedKey === "requestbytes") {
+  if (normalizedKey === "phase" && isBeforeStreamStartPhase(value)) {
+    signals.hasBeforeStreamStartSignal = true;
+  }
+  if (normalizedKey && REQUEST_BYTES_KEYS.has(normalizedKey)) {
     const requestBytes = requestBytesValue(value);
     if (requestBytes !== undefined && signals.requestBytes === undefined) {
       signals.requestBytes = requestBytes;
@@ -150,7 +149,6 @@ function collectDiagnosticValue(
   if (value instanceof Error) {
     collectDiagnosticValue(value.name, signals, "name", seen, depth + 1);
     collectDiagnosticValue(value.message, signals, "message", seen, depth + 1);
-    collectDiagnosticValue(value.stack, signals, "stack", seen, depth + 1);
     collectDiagnosticValue((value as { cause?: unknown }).cause, signals, "cause", seen, depth + 1);
   }
 
@@ -162,7 +160,7 @@ function collectDiagnosticValue(
   }
 
   for (const [childKey, childValue] of Object.entries(value)) {
-    if (SKIPPED_MESSAGE_KEYS.has(normalizeKey(childKey))) {
+    if (SKIPPED_DIAGNOSTIC_KEYS.has(normalizeKey(childKey))) {
       continue;
     }
     collectDiagnosticValue(childValue, signals, childKey, seen, depth + 1);
@@ -178,6 +176,9 @@ function collectDiagnosticText(value: string, signals: DiagnosticSignals): void 
   }
   if (CODE_1009_RE.test(value)) {
     signals.hasText1009 = true;
+  }
+  if (BEFORE_STREAM_START_RE.test(value)) {
+    signals.hasBeforeStreamStartSignal = true;
   }
   const requestBytes = REQUEST_BYTES_RE.exec(value)?.[1];
   if (requestBytes !== undefined && signals.requestBytes === undefined) {
@@ -197,6 +198,10 @@ function isCode1009Value(value: unknown): boolean {
     return value.trim() === "1009";
   }
   return false;
+}
+
+function isBeforeStreamStartPhase(value: unknown): boolean {
+  return typeof value === "string" && BEFORE_STREAM_START_RE.test(value);
 }
 
 function requestBytesValue(value: unknown): number | undefined {
