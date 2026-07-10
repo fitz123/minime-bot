@@ -37,7 +37,7 @@ fi
 if [ $# -gt 0 ]; then
   MESSAGE="$*"
 else
-  MESSAGE="$(cat)"
+  IFS= read -r -d '' MESSAGE || true
 fi
 
 if [ -z "$MESSAGE" ]; then

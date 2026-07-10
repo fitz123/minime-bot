@@ -33,11 +33,11 @@ npm pack --dry-run
 
 ### Task 2: Replace mixed-unit Bash splitting
 
-- [ ] Move long-message boundary selection into one locale-independent Unicode-aware splitter available to the packaged script.
-- [ ] Preserve the current preference order: paragraph boundary, newline, then hard split.
-- [ ] Preserve intentional boundary consumption semantics and extra-newline behavior.
-- [ ] Feed complete chunks back to `send_message` without line-based truncation or trailing-newline loss.
-- [ ] Preserve the short-message fast path and the delay/order between continuation sends.
+- [x] Move long-message boundary selection into one locale-independent Unicode-aware splitter available to the packaged script.
+- [x] Preserve the current preference order: paragraph boundary, newline, then hard split.
+- [x] Preserve intentional boundary consumption semantics and extra-newline behavior.
+- [x] Feed complete chunks back to `send_message` without line-based truncation or trailing-newline loss.
+- [x] Preserve the short-message fast path and the delay/order between continuation sends.
 
 ### Task 3: Validate and finalize
 

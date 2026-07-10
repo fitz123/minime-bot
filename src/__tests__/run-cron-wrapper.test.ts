@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,7 +33,7 @@ function hasUnpairedSurrogate(text: string): boolean {
   return false;
 }
 
-function runDeliverWithFakeTelegram(message: string): {
+function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownConverter?: boolean } = {}): {
   payloads: TelegramPayload[];
   status: number | null;
   stdout: string;
@@ -43,9 +43,17 @@ function runDeliverWithFakeTelegram(message: string): {
   const fixture = mkdtempSync(join(tmpdir(), "deliver-unicode-"));
   const binDir = join(fixture, "bin");
   const payloadPath = join(fixture, "telegram-payloads.jsonl");
+  let scriptPath = deliverScript;
 
   try {
     mkdirSync(binDir, { recursive: true });
+    if (options.withoutMarkdownConverter) {
+      const isolatedScriptDir = join(fixture, "package", "scripts");
+      mkdirSync(isolatedScriptDir, { recursive: true });
+      scriptPath = join(isolatedScriptDir, "deliver.sh");
+      copyFileSync(deliverScript, scriptPath);
+    }
+
     writeFileSync(
       join(binDir, "curl"),
       [
@@ -70,7 +78,7 @@ function runDeliverWithFakeTelegram(message: string): {
     chmodSync(join(binDir, "curl"), 0o755);
     chmodSync(join(binDir, "sleep"), 0o755);
 
-    const result = spawnSync("/bin/bash", [deliverScript, "123"], {
+    const result = spawnSync("/bin/bash", [scriptPath, "123"], {
       input: message,
       encoding: "utf8",
       env: {
@@ -297,6 +305,20 @@ describe("deliver.sh", () => {
       run.payloads.map((payload) => payload.text).join(""),
       message,
     );
+  });
+
+  it("preserves trailing newlines when split stdin payloads are delivered", () => {
+    const message = `${"c".repeat(4097)}\n\n`;
+    const run = runDeliverWithFakeTelegram(message, { withoutMarkdownConverter: true });
+
+    assertDeliverSucceeded(run);
+    assert.equal(run.payloads.length, 2);
+    assertChunksWithinTelegramLimit(run.payloads);
+    assert.equal(
+      run.payloads.map((payload) => payload.text).join(""),
+      message,
+    );
+    assert.equal(run.payloads.at(-1)?.text.endsWith("\n\n"), true);
   });
 
   it("prefers paragraph and newline boundaries with non-ASCII text within Telegram limits", () => {
