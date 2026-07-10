@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.4
+
+- Reject saturated debounce/collect queue input with bounded user-visible notices and queue-rejection metrics instead of silently dropping messages.
+- Retry transient media downloads with bounded backoff, cleanup, redacted stage-specific diagnostics, and consistent Telegram/Discord failure replies.
+- Coalesce and throttle Telegram DM drafts with one in-flight request, `retry_after` pauses, typing coordination, bounded cleanup, and separate cosmetic-throttling metrics.
+
 ## 2026.7.3
 
 - Make long-message delivery splitting Unicode-safe and locale-independent, preserving Cyrillic and non-BMP characters while enforcing Telegram's UTF-16 message limit.
