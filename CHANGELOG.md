@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.2
+
+- Log and notify bounded diagnostics for failing script-mode crons by wrapping captured stdout/stderr and process metadata in cron failure diagnostics.
+
 ## 2026.7.1
 
 - Auto-reconnect active Pi sessions when an agent's configured model or thinking level changes, while preserving the stored Pi session id/context.
