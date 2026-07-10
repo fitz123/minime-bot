@@ -3,7 +3,8 @@
 # Usage: deliver.sh <chat_id> [message]
 # Or:    deliver.sh <chat_id> --thread <thread_id> [message]
 # Or:    echo "message" | deliver.sh <chat_id> [--thread <thread_id>]
-# Handles >4096 char messages by splitting at paragraph boundaries.
+# Handles messages over 4096 UTF-16 code units by preferring paragraph/newline
+# boundaries and otherwise hard-splitting without breaking Unicode code points.
 # After each successful send, writes an echo JSON file to the private echo spool
 # so the bot can route the message to active agent sessions as context.
 
@@ -37,7 +38,7 @@ fi
 if [ $# -gt 0 ]; then
   MESSAGE="$*"
 else
-  MESSAGE="$(cat)"
+  IFS= read -r -d '' MESSAGE || true
 fi
 
 if [ -z "$MESSAGE" ]; then
@@ -150,9 +151,9 @@ send_message() {
     html_text=$(convert_markdown <<< "$text" 2>>"$LOG_FILE") || html_text=""
     if [ -n "$html_text" ]; then
       local html_json
-      html_json=$(echo "$html_text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+      html_json=$(printf '%s' "$html_text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
       response=$(telegram_post "sendMessage" "$(build_payload "$html_json" "HTML")")
-      ok=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
+      ok=$(printf '%s' "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
       if [ "$ok" = "True" ]; then
         echo "[deliver] $(date -Iseconds) OK chat=$CHAT_ID len=${#text}" >> "$LOG_FILE"
         write_echo "$CHAT_ID" "$THREAD_ID" "$text" || true
@@ -163,9 +164,9 @@ send_message() {
 
   # Fallback: send original text without parse_mode
   local text_json
-  text_json=$(echo "$text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+  text_json=$(printf '%s' "$text" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
   response=$(telegram_post "sendMessage" "$(build_payload "$text_json")")
-  ok=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
+  ok=$(printf '%s' "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
   if [ "$ok" != "True" ]; then
     echo "[deliver] $(date -Iseconds) FAIL chat=$CHAT_ID response=$response" >> "$LOG_FILE"
     echo "[deliver] Error: sendMessage failed: $response" >&2
@@ -179,42 +180,104 @@ send_message() {
 
 MAX_LEN=4096
 
-if [ ${#MESSAGE} -le $MAX_LEN ]; then
+message_fits() {
+  printf '%s' "$1" | python3 -c '
+import sys
+
+max_units = int(sys.argv[1])
+message = sys.stdin.buffer.read().decode("utf-8")
+sys.exit(0 if len(message.encode("utf-16-le")) // 2 <= max_units else 10)
+' "$MAX_LEN"
+}
+
+split_message() {
+  printf '%s' "$1" | python3 -c '
+import sys
+
+max_units = int(sys.argv[1])
+message = sys.stdin.buffer.read().decode("utf-8")
+
+
+def utf16_units(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def prefix_end_for_units(text, limit):
+    units = 0
+    for index, char in enumerate(text):
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if units + char_units > limit:
+            return index
+        units += char_units
+    return len(text)
+
+
+remaining = message
+while remaining:
+    if utf16_units(remaining) <= max_units:
+        sys.stdout.buffer.write(remaining.encode("utf-8") + b"\0")
+        break
+
+    end = prefix_end_for_units(remaining, max_units)
+    chunk = remaining[:end]
+    split_pos = chunk.rfind("\n\n")
+
+    if split_pos != -1:
+        while split_pos > 0 and remaining[split_pos - 1] == "\n":
+            split_pos -= 1
+        if utf16_units(remaining[:split_pos]) > 100 and remaining[:split_pos].strip():
+            sys.stdout.buffer.write(remaining[:split_pos].encode("utf-8") + b"\0")
+            remaining = remaining[split_pos + 2:]
+            continue
+
+    split_pos = chunk.rfind("\n")
+    if (
+        split_pos != -1
+        and utf16_units(remaining[:split_pos]) > 100
+        and remaining[:split_pos].strip()
+    ):
+        sys.stdout.buffer.write(remaining[:split_pos].encode("utf-8") + b"\0")
+        remaining = remaining[split_pos + 1:]
+        continue
+
+    sys.stdout.buffer.write(chunk.encode("utf-8") + b"\0")
+    remaining = remaining[end:]
+' "$MAX_LEN"
+}
+
+fit_status=0
+message_fits "$MESSAGE" || fit_status=$?
+
+if [ "$fit_status" -eq 0 ]; then
   send_message "$MESSAGE"
+elif [ "$fit_status" -eq 10 ]; then
+  split_output=$(mktemp "${TMPDIR:-/tmp}/minime-deliver.XXXXXX")
+  trap 'rm -f "$split_output"' EXIT
+  if ! split_message "$MESSAGE" > "$split_output"; then
+    echo "[deliver] Error: failed to split message" >&2
+    exit 1
+  fi
+
+  first_chunk=1
+  chunk_count=0
+  while IFS= read -r -d '' chunk; do
+    if [ "$first_chunk" -eq 0 ]; then
+      # Brief pause between split messages to maintain order
+      sleep 0.3
+    fi
+    send_message "$chunk"
+    first_chunk=0
+    chunk_count=$((chunk_count + 1))
+  done < "$split_output"
+
+  if [ "$chunk_count" -eq 0 ]; then
+    echo "[deliver] Error: splitter produced no message chunks" >&2
+    exit 1
+  fi
+
+  rm -f "$split_output"
+  trap - EXIT
 else
-  # Split at paragraph boundaries (double newline), respecting max length
-  remaining="$MESSAGE"
-  while [ ${#remaining} -gt 0 ]; do
-    if [ ${#remaining} -le $MAX_LEN ]; then
-      send_message "$remaining"
-      break
-    fi
-
-    # Find last double-newline within limit
-    chunk="${remaining:0:$MAX_LEN}"
-    split_pos=$(echo "$chunk" | grep -b -o $'\n\n' | tail -1 | cut -d: -f1 || echo "")
-
-    if [ -n "$split_pos" ] && [ "$split_pos" -gt 100 ]; then
-      # Walk back to start of newline run (matches stream-relay.ts behavior)
-      while [ "$split_pos" -gt 0 ] && [ "${remaining:$((split_pos - 1)):1}" = $'\n' ]; do
-        split_pos=$((split_pos - 1))
-      done
-      send_message "${remaining:0:$split_pos}"
-      remaining="${remaining:$((split_pos + 2))}"
-    else
-      # No good split point — split at last newline
-      split_pos=$(echo "$chunk" | grep -b -o $'\n' | tail -1 | cut -d: -f1 || echo "")
-      if [ -n "$split_pos" ] && [ "$split_pos" -gt 100 ]; then
-        send_message "${remaining:0:$split_pos}"
-        remaining="${remaining:$((split_pos + 1))}"
-      else
-        # Hard split at max length
-        send_message "${remaining:0:$MAX_LEN}"
-        remaining="${remaining:$MAX_LEN}"
-      fi
-    fi
-
-    # Brief pause between split messages to maintain order
-    sleep 0.3
-  done
+  echo "[deliver] Error: failed to measure message length" >&2
+  exit 1
 fi
