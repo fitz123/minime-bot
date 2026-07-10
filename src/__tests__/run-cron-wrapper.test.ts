@@ -49,15 +49,22 @@ function runDeliverWithFakeTelegram(
   const eventsPath = join(fixture, "delivery-events.txt");
   const payloadPath = join(fixture, "telegram-payloads.jsonl");
   const requestCountPath = join(fixture, "telegram-request-count.txt");
-  let scriptPath = deliverScript;
+  const isolatedPackageDir = join(fixture, "package");
+  const isolatedScriptDir = join(isolatedPackageDir, "scripts");
+  const scriptPath = join(isolatedScriptDir, "deliver.sh");
 
   try {
     mkdirSync(binDir, { recursive: true });
-    if (options.withoutMarkdownConverter) {
-      const isolatedScriptDir = join(fixture, "package", "scripts");
-      mkdirSync(isolatedScriptDir, { recursive: true });
-      scriptPath = join(isolatedScriptDir, "deliver.sh");
-      copyFileSync(deliverScript, scriptPath);
+    mkdirSync(isolatedScriptDir, { recursive: true });
+    copyFileSync(deliverScript, scriptPath);
+    if (!options.withoutMarkdownConverter) {
+      const isolatedDistDir = join(isolatedPackageDir, "dist");
+      mkdirSync(isolatedDistDir, { recursive: true });
+      writeFileSync(
+        join(isolatedDistDir, "markdown-html-cli.js"),
+        'const fs = require("node:fs"); process.stdout.write(fs.readFileSync(0, "utf8").replace(/\\n$/, ""));\n',
+        "utf8",
+      );
     }
 
     writeFileSync(
@@ -111,6 +118,7 @@ function runDeliverWithFakeTelegram(
         LANG: "C",
         LC_ALL: "C",
         LOG_DIR: join(fixture, "logs"),
+        NODE_BIN: process.execPath,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         TELEGRAM_BOT_TOKEN: "fixture-token",
         TELEGRAM_FAIL_REQUEST: String(options.failTelegramRequest ?? 0),
