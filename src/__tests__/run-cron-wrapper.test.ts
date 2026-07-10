@@ -33,7 +33,11 @@ function hasUnpairedSurrogate(text: string): boolean {
   return false;
 }
 
-function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownConverter?: boolean } = {}): {
+function runDeliverWithFakeTelegram(
+  message: string | Buffer,
+  options: { failTelegramRequest?: number; withoutMarkdownConverter?: boolean } = {},
+): {
+  events: string[];
   payloads: TelegramPayload[];
   status: number | null;
   stdout: string;
@@ -42,7 +46,9 @@ function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownC
 } {
   const fixture = mkdtempSync(join(tmpdir(), "deliver-unicode-"));
   const binDir = join(fixture, "bin");
+  const eventsPath = join(fixture, "delivery-events.txt");
   const payloadPath = join(fixture, "telegram-payloads.jsonl");
+  const requestCountPath = join(fixture, "telegram-request-count.txt");
   let scriptPath = deliverScript;
 
   try {
@@ -68,13 +74,28 @@ function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownC
         "  shift || true",
         "done",
         "cat >/dev/null",
+        "request_count=0",
+        'if [ -f "$TELEGRAM_REQUEST_COUNT_PATH" ]; then',
+        '  read -r request_count < "$TELEGRAM_REQUEST_COUNT_PATH"',
+        "fi",
+        "request_count=$((request_count + 1))",
+        'printf "%s\\n" "$request_count" > "$TELEGRAM_REQUEST_COUNT_PATH"',
+        'printf "send:%s\\n" "$request_count" >> "$DELIVERY_EVENTS_PATH"',
         'printf "%s\\n" "$payload" >> "$TELEGRAM_PAYLOAD_PATH"',
+        'if [ "${TELEGRAM_FAIL_REQUEST:-0}" = "$request_count" ]; then',
+        '  printf \'{"ok":false}\'',
+        "  exit 0",
+        "fi",
         'printf \'{"ok":true}\'',
         "",
       ].join("\n"),
       "utf8",
     );
-    writeFileSync(join(binDir, "sleep"), "#!/bin/bash\nexit 0\n", "utf8");
+    writeFileSync(
+      join(binDir, "sleep"),
+      '#!/bin/bash\nprintf "sleep:%s\\n" "$*" >> "$DELIVERY_EVENTS_PATH"\n',
+      "utf8",
+    );
     chmodSync(join(binDir, "curl"), 0o755);
     chmodSync(join(binDir, "sleep"), 0o755);
 
@@ -84,6 +105,7 @@ function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownC
       env: {
         ...process.env,
         CURL_BIN: join(binDir, "curl"),
+        DELIVERY_EVENTS_PATH: eventsPath,
         ECHO_DIR_BASE: join(fixture, "echo"),
         HOME: fixture,
         LANG: "C",
@@ -91,7 +113,9 @@ function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownC
         LOG_DIR: join(fixture, "logs"),
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         TELEGRAM_BOT_TOKEN: "fixture-token",
+        TELEGRAM_FAIL_REQUEST: String(options.failTelegramRequest ?? 0),
         TELEGRAM_PAYLOAD_PATH: payloadPath,
+        TELEGRAM_REQUEST_COUNT_PATH: requestCountPath,
       },
     });
 
@@ -102,8 +126,12 @@ function runDeliverWithFakeTelegram(message: string, options: { withoutMarkdownC
           .filter(Boolean)
           .map((line) => JSON.parse(line) as TelegramPayload)
       : [];
+    const events = existsSync(eventsPath)
+      ? readFileSync(eventsPath, "utf8").trimEnd().split("\n").filter(Boolean)
+      : [];
 
     return {
+      events,
       payloads,
       status: result.status,
       stdout: result.stdout,
@@ -286,11 +314,26 @@ describe("deliver.sh", () => {
 
     assertDeliverSucceeded(run);
     assert.equal(run.payloads.length, 2);
+    assert.ok(run.payloads.every((payload) => payload.parse_mode === "HTML"));
     assertNoReplacementOrUnpairedSurrogates(run.payloads);
     assert.equal(
       run.payloads.map((payload) => payload.text).join(""),
       message,
     );
+  });
+
+  it("sends exact 4096 UTF-16-unit BMP and non-BMP payloads without splitting", () => {
+    const messages = ["d".repeat(4096), `${"d".repeat(4094)}🚀`];
+
+    for (const message of messages) {
+      const run = runDeliverWithFakeTelegram(message);
+      assertDeliverSucceeded(run);
+      assert.deepEqual(
+        run.payloads.map((payload) => payload.text),
+        [message],
+      );
+      assert.deepEqual(run.events, ["send:1"]);
+    }
   });
 
   it("does not split a non-BMP character into an invalid surrogate at a hard boundary", () => {
@@ -321,6 +364,19 @@ describe("deliver.sh", () => {
     assert.equal(run.payloads.at(-1)?.text.endsWith("\n\n"), true);
   });
 
+  it("does not emit empty chunks for leading newline runs", () => {
+    const message = `${"\n".repeat(104)}${"x".repeat(4096)}`;
+    const run = runDeliverWithFakeTelegram(message, { withoutMarkdownConverter: true });
+
+    assertDeliverSucceeded(run);
+    assert.equal(run.payloads.length, 2);
+    assert.ok(run.payloads.every((payload) => payload.text.length > 0));
+    assert.equal(
+      run.payloads.map((payload) => payload.text).join(""),
+      message,
+    );
+  });
+
   it("prefers paragraph and newline boundaries with non-ASCII text within Telegram limits", () => {
     const paragraphLead = "Ж".repeat(3000);
     const paragraphTail = "д".repeat(1200);
@@ -343,5 +399,44 @@ describe("deliver.sh", () => {
       [newlineLead, newlineTail],
     );
     assertChunksWithinTelegramLimit(newlineRun.payloads);
+
+    const extraNewlineRun = runDeliverWithFakeTelegram(`${paragraphLead}\n\n\n${paragraphTail}`);
+    assertDeliverSucceeded(extraNewlineRun);
+    assert.deepEqual(
+      extraNewlineRun.payloads.map((payload) => payload.text),
+      [paragraphLead, `\n${paragraphTail}`],
+    );
+  });
+
+  it("repeats paragraph splitting with one delay between each ordered send", () => {
+    const paragraphs = ["甲".repeat(2500), "乙".repeat(2500), "丙".repeat(2500)];
+    const run = runDeliverWithFakeTelegram(paragraphs.join("\n\n"));
+
+    assertDeliverSucceeded(run);
+    assert.deepEqual(
+      run.payloads.map((payload) => payload.text),
+      paragraphs,
+    );
+    assert.deepEqual(run.events, ["send:1", "sleep:0.3", "send:2", "sleep:0.3", "send:3"]);
+  });
+
+  it("stops and fails when a continuation send is rejected", () => {
+    const message = ["a".repeat(2500), "b".repeat(2500), "c".repeat(2500)].join("\n\n");
+    const run = runDeliverWithFakeTelegram(message, {
+      failTelegramRequest: 2,
+      withoutMarkdownConverter: true,
+    });
+
+    assert.notEqual(run.status, 0);
+    assert.equal(run.payloads.length, 2);
+    assert.deepEqual(run.events, ["send:1", "sleep:0.3", "send:2"]);
+  });
+
+  it("fails instead of silently dropping input when Unicode inspection fails", () => {
+    const run = runDeliverWithFakeTelegram(Buffer.concat([Buffer.from([0xff]), Buffer.alloc(4097, "x")]));
+
+    assert.notEqual(run.status, 0);
+    assert.deepEqual(run.payloads, []);
+    assert.deepEqual(run.events, []);
   });
 });

@@ -3,7 +3,8 @@
 # Usage: deliver.sh <chat_id> [message]
 # Or:    deliver.sh <chat_id> --thread <thread_id> [message]
 # Or:    echo "message" | deliver.sh <chat_id> [--thread <thread_id>]
-# Handles >4096 char messages by splitting at paragraph boundaries.
+# Handles messages over 4096 UTF-16 code units by preferring paragraph/newline
+# boundaries and otherwise hard-splitting without breaking Unicode code points.
 # After each successful send, writes an echo JSON file to the private echo spool
 # so the bot can route the message to active agent sessions as context.
 
@@ -185,7 +186,7 @@ import sys
 
 max_units = int(sys.argv[1])
 message = sys.stdin.buffer.read().decode("utf-8")
-sys.exit(0 if len(message.encode("utf-16-le")) // 2 <= max_units else 1)
+sys.exit(0 if len(message.encode("utf-16-le")) // 2 <= max_units else 10)
 ' "$MAX_LEN"
 }
 
@@ -221,15 +222,20 @@ while remaining:
     chunk = remaining[:end]
     split_pos = chunk.rfind("\n\n")
 
-    if split_pos != -1 and utf16_units(remaining[:split_pos]) > 100:
+    if split_pos != -1:
         while split_pos > 0 and remaining[split_pos - 1] == "\n":
             split_pos -= 1
-        sys.stdout.buffer.write(remaining[:split_pos].encode("utf-8") + b"\0")
-        remaining = remaining[split_pos + 2:]
-        continue
+        if utf16_units(remaining[:split_pos]) > 100 and remaining[:split_pos].strip():
+            sys.stdout.buffer.write(remaining[:split_pos].encode("utf-8") + b"\0")
+            remaining = remaining[split_pos + 2:]
+            continue
 
     split_pos = chunk.rfind("\n")
-    if split_pos != -1 and utf16_units(remaining[:split_pos]) > 100:
+    if (
+        split_pos != -1
+        and utf16_units(remaining[:split_pos]) > 100
+        and remaining[:split_pos].strip()
+    ):
         sys.stdout.buffer.write(remaining[:split_pos].encode("utf-8") + b"\0")
         remaining = remaining[split_pos + 1:]
         continue
@@ -239,10 +245,21 @@ while remaining:
 ' "$MAX_LEN"
 }
 
-if message_fits "$MESSAGE"; then
+fit_status=0
+message_fits "$MESSAGE" || fit_status=$?
+
+if [ "$fit_status" -eq 0 ]; then
   send_message "$MESSAGE"
-else
+elif [ "$fit_status" -eq 10 ]; then
+  split_output=$(mktemp "${TMPDIR:-/tmp}/minime-deliver.XXXXXX")
+  trap 'rm -f "$split_output"' EXIT
+  if ! split_message "$MESSAGE" > "$split_output"; then
+    echo "[deliver] Error: failed to split message" >&2
+    exit 1
+  fi
+
   first_chunk=1
+  chunk_count=0
   while IFS= read -r -d '' chunk; do
     if [ "$first_chunk" -eq 0 ]; then
       # Brief pause between split messages to maintain order
@@ -250,5 +267,17 @@ else
     fi
     send_message "$chunk"
     first_chunk=0
-  done < <(split_message "$MESSAGE")
+    chunk_count=$((chunk_count + 1))
+  done < "$split_output"
+
+  if [ "$chunk_count" -eq 0 ]; then
+    echo "[deliver] Error: splitter produced no message chunks" >&2
+    exit 1
+  fi
+
+  rm -f "$split_output"
+  trap - EXIT
+else
+  echo "[deliver] Error: failed to measure message length" >&2
+  exit 1
 fi

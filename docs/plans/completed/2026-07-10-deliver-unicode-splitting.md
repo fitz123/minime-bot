@@ -1,5 +1,7 @@
 # Plan: Make long Telegram delivery splitting Unicode-safe
 
+Status: complete. Addresses GitHub issue #40.
+
 ## Goal
 
 Fix GitHub issue #40 so `scripts/deliver.sh` continues splitting messages above Telegram's 4096-character limit while preserving every Unicode character under launchd's locale-free environment.
