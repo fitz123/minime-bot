@@ -581,6 +581,9 @@ describe("SessionManager Pi session-id capture + resume", () => {
       sessionId: "stored-pi-id",
       chatId: "pi-resume",
       agentId: "pi",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
+      thinking: "xhigh",
       lastActivity: Date.now(),
     });
     // On resume, Pi re-confirms the same id through get_state.
@@ -596,6 +599,43 @@ describe("SessionManager Pi session-id capture + resume", () => {
       "resume passes the stored Pi id as --session",
     );
     assert.strictEqual(session.sessionId, "stored-pi-id", "resumed session keeps its id");
+
+    await manager.closeAll();
+  });
+
+  it("resumes stored Pi sessions with the current configured model after a model change", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-model-change", {
+      sessionId: "stored-model-change-id",
+      chatId: "pi-model-change",
+      agentId: "pi",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
+      thinking: "xhigh",
+      lastActivity: Date.now(),
+    });
+    nextPiSessionId = "stored-model-change-id";
+
+    const updatedConfig = makeConfig({
+      agents: {
+        ...makeConfig().agents,
+        pi: {
+          ...makeConfig().agents.pi,
+          model: "gpt-5.6-sol",
+        },
+      },
+    });
+    const manager = new SessionManager(() => updatedConfig, TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-model-change", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
+    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-model-change-id");
+    assert.strictEqual(piSpawnCaptures[0].agent.model, "gpt-5.6-sol");
+    assert.strictEqual(session.sessionId, "stored-model-change-id", "context-preserving resume keeps the id");
+    assert.strictEqual(session.model, "openai-codex/gpt-5.6-sol", "active session records current model");
+
+    const storeAfter = new SessionStore(TEST_STORE_PATH);
+    assert.strictEqual(storeAfter.getSession("pi-model-change")?.model, "openai-codex/gpt-5.6-sol");
 
     await manager.closeAll();
   });
@@ -711,6 +751,9 @@ describe("SessionManager Pi session-id capture + resume", () => {
       sessionId: "pi-live-id",
       chatId: "agent-switch",
       agentId: "pi",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
+      thinking: "xhigh",
       lastActivity: newSession.lastActivity,
     });
     assert.ok(existsSync(inflightPath), "current-turn in-flight media survives active agent rotation");

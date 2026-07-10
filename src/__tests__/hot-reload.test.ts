@@ -165,6 +165,33 @@ describe("Hot-reload: mutable config loader", () => {
     await manager.closeAll();
   });
 
+  it("active session reconnects automatically when agent model changes", async () => {
+    let currentModel = "gpt-5.5";
+    const manager = new SessionManager(
+      () => makeConfig(currentModel),
+      TEST_STORE_PATH,
+    );
+
+    const first = await manager.getOrCreateSession("chat-live-model", "main");
+    assert.strictEqual(spawnCaptures.length, 1, "first call spawns once");
+    assert.strictEqual(spawnCaptures[0].agent.model, "gpt-5.5");
+
+    currentModel = "gpt-5.6-sol";
+
+    const second = await manager.getOrCreateSession("chat-live-model", "main");
+    assert.notStrictEqual(second, first, "runtime mismatch creates a new ActiveSession");
+    assert.strictEqual(spawnCaptures.length, 2, "model change triggers a second spawn");
+    assert.strictEqual(spawnCaptures[1].agent.model, "gpt-5.6-sol");
+    assert.strictEqual(
+      spawnCaptures[1].resumeSessionId,
+      first.sessionId,
+      "automatic reconnect preserves the Pi session id/context",
+    );
+    assert.strictEqual(second.model, "openai-codex/gpt-5.6-sol");
+
+    await manager.closeAll();
+  });
+
   it("different chats in sequence reflect config changes", async () => {
     let currentModel = "gpt-5.5";
     const manager = new SessionManager(

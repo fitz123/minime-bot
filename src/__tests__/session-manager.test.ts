@@ -410,7 +410,7 @@ describe("SessionManager", () => {
       sessionId: "old-sid",
       agentId: "main",
       provider: "pi",
-      model: "gpt-5.5",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 100000,
@@ -688,6 +688,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       child,
       sessionId: "test-session",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -757,6 +759,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       child,
       sessionId: "test-session-err",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -810,6 +814,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       child,
       sessionId: "test-session-dead",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -881,6 +887,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       child,
       sessionId: "test-session-epipe",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1151,6 +1159,8 @@ describe("setupStderrLogging", () => {
       child,
       sessionId: "crash-test-session",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1483,6 +1493,8 @@ describe("ActiveSession health fields tracked in sendSessionMessage", () => {
       child,
       sessionId: "proc-track-test",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1578,6 +1590,8 @@ describe("SessionManager crash backoff", () => {
       child,
       sessionId: "crash-count-test",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1643,6 +1657,8 @@ describe("SessionManager crash backoff", () => {
       child,
       sessionId: "sigterm-test",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1697,6 +1713,8 @@ describe("SessionManager crash backoff", () => {
       child,
       sessionId: "success-session",
       agentId: "main",
+      provider: "pi",
+      model: "openai-codex/gpt-5.5",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -1987,7 +2005,6 @@ describe("SessionManager Pi dispatch", () => {
       agentId,
       provider: "pi",
       model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: 60_000,
@@ -2141,10 +2158,8 @@ describe("SessionManager Pi dispatch", () => {
     await manager.closeAll();
   });
 
-  it("does not re-read changed config before dispatching an active Pi session", async () => {
+  it("reuses an active Pi session when config changes do not alter its runtime signature", async () => {
     const { SessionManager } = await import("../session-manager.js");
-    // A mutable config the manager reloads on demand. The active session should
-    // dispatch through its existing Pi child without reading the changed config.
     let liveConfig: BotConfig = dispatchConfig;
     const manager = new SessionManager(() => liveConfig, TEST_STORE_PATH);
 
@@ -2153,7 +2168,7 @@ describe("SessionManager Pi dispatch", () => {
 
     liveConfig = {
       ...dispatchConfig,
-      agents: { ...dispatchConfig.agents, main: { id: "main", workspaceCwd: "/tmp/test-workspace", model: "gpt-5.6" } },
+      sessionDefaults: { ...dispatchConfig.sessionDefaults, maxConcurrentSessions: 4 },
     };
 
     const gen = manager.sendSessionMessage("flip-chat", "main", "hello");
@@ -2167,11 +2182,9 @@ describe("SessionManager Pi dispatch", () => {
       lines.push(line as { type: string; result?: string });
     }
 
-    // Send routed via Pi (a "prompt" command), proving no config dispatch switch.
     const sent = JSON.parse(stdinWrites[0]);
-    assert.strictEqual(sent.type, "prompt", "must dispatch via Pi without reading the changed config");
+    assert.strictEqual(sent.type, "prompt", "same runtime signature reuses the existing Pi child");
 
-    // Read routed via readPiStream: the Pi agent_end became the terminal result.
     const results = lines.filter((l) => l.type === "result");
     assert.strictEqual(results.length, 1, "Pi agent_end terminated the turn");
     assert.strictEqual(results[0].result, "pi answer");
