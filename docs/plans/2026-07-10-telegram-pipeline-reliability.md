@@ -28,7 +28,7 @@ Produce three separately reviewable commits, preserve existing successful behavi
 
 ## Tasks
 
-### Task 1 — Reject saturated queue input visibly (#46)
+### Task 1: Reject saturated queue input visibly (#46)
 
 - Keep both debounce and mid-turn collect queues bounded; do not merely raise the cap or make them unbounded.
 - Replace silent overflow with a user-visible, rate-bounded rejection that clearly says the affected input was not processed and must be resent later.
@@ -37,7 +37,7 @@ Produce three separately reviewable commits, preserve existing successful behavi
 - Replace existing “drop is terminal” expectations with deterministic tests for both buffers, bursts beyond the cap, concurrent arrivals, visible rejection, accepted-input non-duplication, media cleanup, clear/reconnect, rejection-notification failure, and no leaked timers.
 - Commit separately with `#46` in the message.
 
-### Task 2 — Retry transient media downloads and report the failing stage (#43)
+### Task 2: Retry transient media downloads and report the failing stage (#43)
 
 - Trace all Telegram and Discord users of the shared media downloader. Keep retry logic inside the shared idempotent download path, not in individual handlers.
 - Add a bounded transient policy with fresh timeout state per attempt, bounded backoff, partial-file cleanup before retry, preserved `0600` destination permissions, and existing size limits on every attempt.
@@ -47,7 +47,7 @@ Produce three separately reviewable commits, preserve existing successful behavi
 - Add deterministic fetch/stream tests for transient recovery, exhausted retries, permanent failures, 429 handling, per-attempt timeout reset, corrupt partial cleanup, max-size enforcement, permissions, redaction, and Telegram/Discord handler mapping.
 - Add bounded recovered/exhausted retry metrics. Commit separately with `#43` in the message.
 
-### Task 3 — Coalesce and throttle Telegram DM drafts (#44)
+### Task 3: Coalesce and throttle Telegram DM drafts (#44)
 
 - Introduce one bounded per-stream draft scheduler/state machine. Keep at most one draft request in flight and only one latest pending text snapshot; stale intermediate snapshots are discarded.
 - Enforce a Telegram-safe minimum send interval and use structured 429 `retry_after` feedback to pause future drafts. Do not retry the rejected stale draft or burst queued drafts after the pause.
