@@ -26,10 +26,10 @@ npm pack --dry-run
 
 ### Task 1: Add failing delivery regressions
 
-- [ ] Add an integration test that runs `deliver.sh` with `LC_ALL=C` and fake Telegram transport.
-- [ ] Place a Cyrillic character across the old byte-4096 boundary; assert two ordered payloads reconstruct the original text and contain no `U+FFFD`.
-- [ ] Cover a non-BMP character at a hard boundary so no unpaired surrogate/replacement character is emitted.
-- [ ] Cover paragraph/newline boundary preference with non-ASCII text and assert every chunk stays within 4096 UTF-16 code units.
+- [x] Add an integration test that runs `deliver.sh` with `LC_ALL=C` and fake Telegram transport.
+- [x] Place a Cyrillic character across the old byte-4096 boundary; assert two ordered payloads reconstruct the original text and contain no `U+FFFD`.
+- [x] Cover a non-BMP character at a hard boundary so no unpaired surrogate/replacement character is emitted.
+- [x] Cover paragraph/newline boundary preference with non-ASCII text and assert every chunk stays within 4096 UTF-16 code units.
 
 ### Task 2: Replace mixed-unit Bash splitting
 
