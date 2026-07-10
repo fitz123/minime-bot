@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.3
+
+- Make long-message delivery splitting Unicode-safe and locale-independent, preserving Cyrillic and non-BMP characters while enforcing Telegram's UTF-16 message limit.
+
 ## 2026.7.2
 
 - Log and notify bounded diagnostics for failing script-mode crons by wrapping captured stdout/stderr and process metadata in cron failure diagnostics.
