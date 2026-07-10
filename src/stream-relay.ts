@@ -1,8 +1,12 @@
 import { readdirSync, lstatSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import type { StreamLine, PlatformContext } from "./types.js";
+import type { DraftSendResult, StreamLine, PlatformContext } from "./types.js";
 import { log } from "./logger.js";
-import { messagesSent } from "./metrics.js";
+import {
+  messagesSent,
+  recordDraftSchedulerEvent,
+  recordFinalDeliveryFailure,
+} from "./metrics.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 
 /**
@@ -142,23 +146,135 @@ export async function sendOutboxFiles(outboxPath: string, platform: PlatformCont
   }
 }
 
-/**
- * Debounce interval for draft updates (ms). Drafts ARE subject to Telegram's
- * per-chat ~1/sec rate limit (issue #117). Retries for sendMessageDraft are
- * suppressed via createDraftSkipAutoRetryTransformer in telegram-bot.ts, so a
- * 429 here surfaces once and is swallowed by the fire-and-forget caller.
- */
-const DRAFT_DEBOUNCE_MS = 300;
+/** Telegram drafts share the per-chat send budget; keep starts at least 1s apart. */
+export const DRAFT_MIN_INTERVAL_MS = 1000;
+const MAX_DRAFT_PAUSE_MS = 60_000;
 
 /** Max time (ms) to wait for in-flight drafts before final delivery. */
-const DRAFT_SETTLE_TIMEOUT_MS = 3000;
+export const DRAFT_SETTLE_TIMEOUT_MS = 3000;
+
+/**
+ * O(1) per-stream draft scheduler: one request in flight and one replaceable
+ * pending snapshot. Draft failures are cosmetic and never escape this class.
+ */
+class DraftScheduler {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private inFlight: Promise<void> | null = null;
+  private pendingText: string | null = null;
+  private lastStartedAt: number | null = null;
+  private pauseUntil = 0;
+  private cancelled = false;
+  private unsupported = false;
+  private inFlightController: AbortController | null = null;
+
+  constructor(
+    private readonly platform: PlatformContext,
+    private readonly draftId: number,
+    private readonly onFirstVisibleDraft: () => void,
+  ) {}
+
+  enqueue(text: string): void {
+    if (this.cancelled || this.unsupported || !text) return;
+    if (this.pendingText !== null) recordDraftSchedulerEvent("coalesced");
+    this.pendingText = text;
+    if (this.inFlight === null) this.startOrSchedule();
+  }
+
+  clearPending(): void {
+    this.pendingText = null;
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  cancel(): void {
+    this.cancelled = true;
+    this.clearPending();
+    this.inFlightController?.abort();
+  }
+
+  async closeAndWait(): Promise<void> {
+    this.cancel();
+    const active = this.inFlight;
+    if (active === null) return;
+
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(finish, DRAFT_SETTLE_TIMEOUT_MS);
+      void active.then(finish, finish);
+    });
+  }
+
+  private startOrSchedule(): void {
+    if (this.cancelled || this.unsupported || this.inFlight !== null || this.pendingText === null) return;
+    const now = Date.now();
+    const intervalUntil = this.lastStartedAt === null
+      ? now
+      : this.lastStartedAt + DRAFT_MIN_INTERVAL_MS;
+    const dueAt = Math.max(intervalUntil, this.pauseUntil);
+    if (dueAt > now) {
+      if (this.timer === null) {
+        recordDraftSchedulerEvent("throttled");
+        this.timer = setTimeout(() => {
+          this.timer = null;
+          this.startOrSchedule();
+        }, dueAt - now);
+      }
+      return;
+    }
+
+    const text = this.pendingText;
+    this.pendingText = null;
+    this.lastStartedAt = now;
+    const controller = new AbortController();
+    this.inFlightController = controller;
+    this.inFlight = Promise.resolve()
+      .then(() => this.platform.sendDraft(this.draftId, text, controller.signal))
+      .then((result) => this.handleResult(result))
+      .catch(() => this.handleResult({ status: "failed" }))
+      .finally(() => {
+        if (this.inFlightController === controller) this.inFlightController = null;
+        this.inFlight = null;
+        if (!this.cancelled) this.startOrSchedule();
+      });
+  }
+
+  private handleResult(result: DraftSendResult): void {
+    switch (result.status) {
+      case "sent":
+        if (!this.cancelled) this.onFirstVisibleDraft();
+        break;
+      case "unsupported":
+        this.unsupported = true;
+        this.clearPending();
+        break;
+      case "rate_limited":
+        this.pauseUntil = Math.max(
+          this.pauseUntil,
+          Date.now() + Math.min(MAX_DRAFT_PAUSE_MS, Math.max(0, result.retryAfterMs)),
+        );
+        recordDraftSchedulerEvent("rate_limited");
+        break;
+      case "failed":
+        recordDraftSchedulerEvent("failed");
+        break;
+    }
+  }
+}
 
 /**
  * Relay agent stream output to a chat using the platform-agnostic interface.
  *
  * Strategy:
  * 1. Accumulate streaming text deltas
- * 2. Send draft updates via sendDraft (debounced, cosmetic, fire-and-forget)
+ * 2. Send coalesced, rate-aware draft updates via sendDraft
  * 3. On completion, sendMessage with final text (guaranteed delivery)
  * 4. If text exceeds maxMessageLength, send continuation chunks via sendMessage
  *
@@ -173,13 +289,17 @@ export async function relayStream(
 ): Promise<void> {
   let accumulated = "";
   let typingTimer: ReturnType<typeof setInterval> | null = null;
-  let draftTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastDraftTime = 0;
-  const draftPromises: Promise<void>[] = [];
   let sawNonTextBlock = false;
 
   // Generate a stable draft_id for this entire response
   const draftId = Math.floor(Math.random() * 2147483647) + 1;
+  const stopPeriodicTyping = () => {
+    if (typingTimer !== null) {
+      clearInterval(typingTimer);
+      typingTimer = null;
+    }
+  };
+  const draftScheduler = new DraftScheduler(platform, draftId, stopPeriodicTyping);
 
   // Take over pre-stream typing if active (clean handoff from message queue)
   if (platform.preStreamTypingTimer) {
@@ -197,29 +317,14 @@ export async function relayStream(
     await platform.sendTyping().catch(() => {});
   }
 
-  /** Send a draft update with the current accumulated text. Fire-and-forget. */
-  const sendDraftNow = () => {
+  /** Queue the latest display snapshot; stale pending snapshots are replaced. */
+  const scheduleDraft = () => {
     if (!accumulated) return;
     const collapsed = collapseNewlines(accumulated);
     const displayText = collapsed.length > platform.maxMessageLength
       ? collapsed.slice(0, platform.maxMessageLength - 3) + "..."
       : collapsed;
-    draftPromises.push(platform.sendDraft(draftId, displayText).catch(() => {}));
-    lastDraftTime = Date.now();
-  };
-
-  /** Schedule a debounced draft update. */
-  const scheduleDraft = () => {
-    if (draftTimer) return;
-    const elapsed = Date.now() - lastDraftTime;
-    if (elapsed >= DRAFT_DEBOUNCE_MS) {
-      sendDraftNow();
-    } else {
-      draftTimer = setTimeout(() => {
-        draftTimer = null;
-        sendDraftNow();
-      }, DRAFT_DEBOUNCE_MS - elapsed);
-    }
+    draftScheduler.enqueue(displayText);
   };
 
   try {
@@ -239,6 +344,7 @@ export async function relayStream(
         accumulated = "";
         resultText = null;
         sawNonTextBlock = false;
+        draftScheduler.clearPending();
         continue;
       }
       // Detect non-text content blocks (tool_use, etc.) so we can insert a
@@ -292,19 +398,9 @@ export async function relayStream(
       accumulated = resultText;
     }
 
-    // Clean up pending draft timer
-    if (draftTimer) {
-      clearTimeout(draftTimer);
-      draftTimer = null;
-    }
-
-    // Wait for ALL in-flight drafts to settle before final delivery,
-    // so a late-arriving draft can't overwrite the sent message in the composer.
-    // Timeout ensures a stuck draft can't block final message delivery.
-    await Promise.race([
-      Promise.all(draftPromises),
-      new Promise<void>((resolve) => setTimeout(resolve, DRAFT_SETTLE_TIMEOUT_MS)),
-    ]);
+    // Discard pending cosmetic work and wait only a bounded time for the sole
+    // in-flight request, so final delivery remains authoritative and prompt.
+    await draftScheduler.closeAndWait();
 
     // NO_REPLY: agent explicitly signals "no response needed" — suppress delivery.
     // Drafts auto-disappear when no sendMessage follows.
@@ -321,6 +417,7 @@ export async function relayStream(
           await platform.sendMessage(chunks[i]);
           messagesSent.inc();
         } catch (err) {
+          recordFinalDeliveryFailure();
           log.error("stream-relay", `Failed to send message chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : err}`);
           // If the first chunk fails, skip remaining — partial output missing
           // the beginning would be confusing.  Throw so the queue's error
@@ -335,11 +432,7 @@ export async function relayStream(
       await sendOutboxFiles(outboxPath, platform);
     }
   } finally {
-    if (typingTimer) {
-      clearInterval(typingTimer);
-    }
-    if (draftTimer) {
-      clearTimeout(draftTimer);
-    }
+    stopPeriodicTyping();
+    draftScheduler.cancel();
   }
 }

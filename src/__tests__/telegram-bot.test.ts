@@ -1374,6 +1374,7 @@ describe("command handler wiring", () => {
       activeCount: () => 0,
       getActiveSession: () => undefined,
       isActive: () => false,
+      touchActivity: () => {},
     } as unknown as SessionManager & { calls: string[] };
   }
 
@@ -1460,6 +1461,34 @@ describe("command handler wiring", () => {
     assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 0);
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+
+  it("makes metadata failures visible from every Telegram media handler", async () => {
+    const mediaMessages = [
+      { voice: { file_id: "voice-1", duration: 1 } },
+      { photo: [{ file_id: "photo-1", file_unique_id: "photo-u1", width: 1, height: 1 }] },
+      { document: { file_id: "doc-1", file_unique_id: "doc-u1" } },
+      { video: { file_id: "video-1", file_unique_id: "video-u1", width: 1, height: 1, duration: 1 } },
+    ];
+
+    for (const [index, media] of mediaMessages.entries()) {
+      const apiCalls: Array<{ method: string; payload: any }> = [];
+      const bot = initBot(createMockSessionManager(), apiCalls);
+      await bot.handleUpdate({
+        update_id: 100 + index,
+        message: {
+          message_id: 100 + index,
+          from: { id: testChatId, is_bot: false, first_name: "Test" },
+          chat: { id: testChatId, type: "private", first_name: "Test" },
+          date: Math.floor(Date.now() / 1000),
+          ...media,
+        },
+      } as never);
+
+      const reply = apiCalls.find((call) => call.method === "sendMessage");
+      assert.ok(reply, `media handler ${index} must send a visible reply`);
+      assert.match(String(reply.payload.text), /metadata/i);
+    }
   });
 });
 

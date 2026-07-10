@@ -7,7 +7,17 @@ import { relayStream } from "./stream-relay.js";
 import { MessageQueue } from "./message-queue.js";
 import { sendPiSteer } from "./pi-rpc-protocol.js";
 import { createTelegramAdapter } from "./telegram-adapter.js";
-import { tempFilePath, downloadFile, transcribeAudio, cleanupTempFile } from "./voice.js";
+import {
+  MediaPipelineError,
+  tempFilePath,
+  downloadFile,
+  transcribeAudio,
+  cleanupTempFile,
+  mediaPipelineFailureMessage,
+  mediaPipelineStage,
+  requireTranscript,
+  toMediaPipelineError,
+} from "./voice.js";
 import { allocateMediaPath, enforceMediaCap, releaseMediaPath, discardMediaPath } from "./media-store.js";
 import { isImageMimeType, imageExtensionForMime } from "./mime.js";
 import { log } from "./logger.js";
@@ -923,18 +933,16 @@ export function createTelegramBot(
     try {
       // Download voice file from Telegram
       const fileId = ctx.msg.voice.file_id;
-      const file = await ctx.api.getFile(fileId);
-      if (!file.file_path) throw new Error("Telegram did not return a file path");
+      const file = await ctx.api.getFile(fileId).catch((error) => {
+        throw toMediaPipelineError(error, "metadata");
+      });
+      if (!file.file_path) throw new MediaPipelineError("metadata");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       tempPath = tempFilePath("voice", ".oga");
       await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
 
       // Transcribe with whisper-cli
-      const transcript = await transcribeAudio(tempPath);
-      if (!transcript) {
-        await ctx.reply("Could not transcribe voice message (empty result).");
-        return;
-      }
+      const transcript = requireTranscript(await transcribeAudio(tempPath));
 
       // Update index with actual transcript content
       recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), transcript, "in");
@@ -952,8 +960,9 @@ export function createTelegramBot(
         });
       }
     } catch (err) {
-      log.error("telegram-bot", `Voice transcription error for chat ${chatId}:`, err);
-      await ctx.reply("Failed to transcribe voice message. Please try again or send text.").catch(() => {});
+      const stage = mediaPipelineStage(err, "transcription");
+      log.error("telegram-bot", `Voice media pipeline failed stage=${stage}`);
+      await ctx.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
     } finally {
       if (tempPath) {
         await cleanupTempFile(tempPath);
@@ -990,8 +999,10 @@ export function createTelegramBot(
       // Get largest photo size (last element in array)
       const photos = ctx.msg.photo;
       const largest = photos[photos.length - 1];
-      const file = await ctx.api.getFile(largest.file_id);
-      if (!file.file_path) throw new Error("Telegram did not return a file path");
+      const file = await ctx.api.getFile(largest.file_id).catch((error) => {
+        throw toMediaPipelineError(error, "metadata");
+      });
+      if (!file.file_path) throw new MediaPipelineError("metadata");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       tempPath = allocateMediaPath(key, "photo", ".jpg");
       await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
@@ -1022,8 +1033,9 @@ export function createTelegramBot(
         () => { discardMediaPath(trackedPath); },
       );
     } catch (err) {
-      log.error("telegram-bot", `Photo handling error for chat ${chatId}:`, err);
-      await ctx.reply("Failed to process photo. Please try again.").catch(() => {});
+      const stage = mediaPipelineStage(err, "download");
+      log.error("telegram-bot", `Photo media pipeline failed stage=${stage}`);
+      await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {
         discardMediaPath(tempPath);
       }
@@ -1070,8 +1082,10 @@ export function createTelegramBot(
     sessionManager.touchActivity(key);
 
     try {
-      const file = await ctx.api.getFile(anim ? anim.file_id : doc.file_id);
-      if (!file.file_path) throw new Error("Telegram did not return a file path");
+      const file = await ctx.api.getFile(anim ? anim.file_id : doc.file_id).catch((error) => {
+        throw toMediaPipelineError(error, "metadata");
+      });
+      if (!file.file_path) throw new MediaPipelineError("metadata");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       let ext: string;
       if (anim) {
@@ -1120,8 +1134,9 @@ export function createTelegramBot(
         () => { discardMediaPath(trackedPath); },
       );
     } catch (err) {
-      log.error("telegram-bot", `${anim ? "Animation" : "Document"} handling error for chat ${chatId}:`, err);
-      await ctx.reply(`Failed to process ${anim ? "animation" : "document"}. Please try again.`).catch(() => {});
+      const stage = mediaPipelineStage(err, "download");
+      log.error("telegram-bot", `${anim ? "Animation" : "Document"} media pipeline failed stage=${stage}`);
+      await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {
         discardMediaPath(tempPath);
       }
@@ -1163,8 +1178,10 @@ export function createTelegramBot(
     sessionManager.touchActivity(key);
 
     try {
-      const file = await ctx.api.getFile(media.file_id);
-      if (!file.file_path) throw new Error("Telegram did not return a file path");
+      const file = await ctx.api.getFile(media.file_id).catch((error) => {
+        throw toMediaPipelineError(error, "metadata");
+      });
+      if (!file.file_path) throw new MediaPipelineError("metadata");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       const ext = extensionForMedia(media, mediaType);
       tempPath = allocateMediaPath(key, mediaType, ext);
@@ -1196,8 +1213,9 @@ export function createTelegramBot(
         () => { discardMediaPath(trackedPath); },
       );
     } catch (err) {
-      log.error("telegram-bot", `${typeLabel} handling error for chat ${chatId}:`, err);
-      await ctx.reply(`Failed to process ${typeLabel.toLowerCase()}. Please try again.`).catch(() => {});
+      const stage = mediaPipelineStage(err, "download");
+      log.error("telegram-bot", `${typeLabel} media pipeline failed stage=${stage}`);
+      await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {
         discardMediaPath(tempPath);
       }

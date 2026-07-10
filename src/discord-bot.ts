@@ -5,7 +5,16 @@ import { outboxDir, type SessionManager } from "./session-manager.js";
 import { relayStream } from "./stream-relay.js";
 import { MessageQueue } from "./message-queue.js";
 import { createDiscordAdapter, type DiscordSendableChannel } from "./discord-adapter.js";
-import { tempFilePath, downloadFile, transcribeAudio, cleanupTempFile } from "./voice.js";
+import {
+  MediaPipelineError,
+  tempFilePath,
+  downloadFile,
+  transcribeAudio,
+  cleanupTempFile,
+  mediaPipelineFailureMessage,
+  mediaPipelineStage,
+  requireTranscript,
+} from "./voice.js";
 import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath } from "./media-store.js";
 import { log } from "./logger.js";
 import { messagesReceived } from "./metrics.js";
@@ -28,8 +37,7 @@ export function discordSessionKey(channelId: string, threadId?: string): string 
 
 function ensureAttachmentWithinLimit(attachment: { size?: number | null; name?: string | null }, maxBytes: number): void {
   if (typeof attachment.size === "number" && Number.isFinite(attachment.size) && attachment.size > maxBytes) {
-    const name = attachment.name ? ` "${attachment.name}"` : "";
-    throw new Error(`Attachment${name} is too large: ${attachment.size} bytes exceeds limit ${maxBytes}`);
+    throw new MediaPipelineError("size-limit");
   }
 }
 
@@ -356,7 +364,9 @@ export async function createDiscordBot(
               () => { discardMediaPath(pathToClean); },
             );
           } catch (err) {
-            log.error("discord-bot", `Image attachment error in ${channelId}:`, err);
+            const stage = mediaPipelineStage(err, "download");
+            log.error("discord-bot", `Image media pipeline failed stage=${stage}`);
+            await message.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
             if (tempPath) discardMediaPath(tempPath);
           }
         }
@@ -371,11 +381,7 @@ export async function createDiscordBot(
             tempPath = tempFilePath("discord-voice", ext);
             await downloadFile(attachment.url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
 
-            const transcript = await transcribeAudio(tempPath);
-            if (!transcript) {
-              await message.reply("Could not transcribe voice message (empty result).").catch(() => {});
-              continue;
-            }
+            const transcript = requireTranscript(await transcribeAudio(tempPath));
 
             messageQueue.enqueue(
               key,
@@ -384,8 +390,9 @@ export async function createDiscordBot(
               adapter,
             );
           } catch (err) {
-            log.error("discord-bot", `Voice transcription error in ${channelId}:`, err);
-            await message.reply("Failed to transcribe voice message. Please try again or send text.").catch(() => {});
+            const stage = mediaPipelineStage(err, "transcription");
+            log.error("discord-bot", `Voice media pipeline failed stage=${stage}`);
+            await message.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
           } finally {
             if (tempPath) await cleanupTempFile(tempPath);
           }

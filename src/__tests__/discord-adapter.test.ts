@@ -74,7 +74,8 @@ describe("createDiscordAdapter", () => {
       const channel = mockChannel();
       const adapter = createDiscordAdapter(channel, defaultBinding);
       // Should not throw, should not send anything
-      await adapter.sendDraft(42, "streaming text");
+      const result = await adapter.sendDraft(42, "streaming text");
+      assert.deepStrictEqual(result, { status: "unsupported" });
       assert.strictEqual(channel.sentMessages.length, 0);
     });
   });

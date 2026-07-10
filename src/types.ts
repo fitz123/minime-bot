@@ -117,6 +117,13 @@ export interface BotConfig {
   defaultDeliveryThreadId?: number;
 }
 
+/** Bounded outcome from a cosmetic streaming-draft request. */
+export type DraftSendResult =
+  | { status: "sent" }
+  | { status: "unsupported" }
+  | { status: "rate_limited"; retryAfterMs: number }
+  | { status: "failed" };
+
 /**
  * Platform-agnostic message I/O interface.
  * Each platform (Telegram, Discord) provides an adapter implementing this interface.
@@ -132,8 +139,8 @@ export interface PlatformContext {
   /** Send a typing/action indicator. */
   sendTyping(): Promise<void>;
 
-  /** Send a streaming draft update (cosmetic, fire-and-forget). No-op on platforms without draft support. */
-  sendDraft(draftId: number, text: string): Promise<void>;
+  /** Send a cosmetic streaming draft update and report a bounded transport outcome. */
+  sendDraft(draftId: number, text: string, signal?: AbortSignal): Promise<DraftSendResult>;
 
   /** Send a file (image or document). */
   sendFile(filePath: string, isImage: boolean): Promise<void>;

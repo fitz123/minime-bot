@@ -136,6 +136,48 @@ export const messagesSent = new client.Counter({
   help: "Total messages sent by the bot",
 });
 
+// --- Message queue saturation ---
+
+export type MessageQueueBuffer = "debounce" | "collect";
+export type MessageQueueRejectionNoticeResult = "sent" | "failed" | "rate_limited";
+
+export const messageQueueSaturation = new client.Counter({
+  name: "bot_message_queue_saturation_total",
+  help: "Total inputs rejected because a bounded message queue buffer was full",
+  labelNames: ["buffer"] as const,
+});
+
+export const messageQueueRejectionNotices = new client.Counter({
+  name: "bot_message_queue_rejection_notices_total",
+  help: "Total user-visible queue rejection notices by bounded result",
+  labelNames: ["buffer", "result"] as const,
+});
+
+// --- Media download retries ---
+
+export type MediaDownloadRetryResult = "recovered" | "exhausted";
+
+export const mediaDownloadRetries = new client.Counter({
+  name: "bot_media_download_retries_total",
+  help: "Total media downloads that recovered after a retry or exhausted retry attempts",
+  labelNames: ["result"] as const,
+});
+
+// --- Streaming draft and final delivery reliability ---
+
+export type DraftSchedulerEvent = "throttled" | "coalesced" | "rate_limited" | "failed";
+
+export const draftSchedulerEvents = new client.Counter({
+  name: "bot_draft_scheduler_events_total",
+  help: "Total cosmetic streaming draft scheduler events by bounded outcome",
+  labelNames: ["event"] as const,
+});
+
+export const finalDeliveryFailures = new client.Counter({
+  name: "bot_final_delivery_failures_total",
+  help: "Total user-visible final response delivery failures",
+});
+
 // --- Helpers ---
 
 /**
@@ -257,6 +299,34 @@ export function recordTelegramApiError(method: string, errorCode: number | strin
  */
 export function recordTelegramApiCall(method: string, binding: string): void {
   telegramApiCalls.inc({ method, binding });
+}
+
+/** Record a rejected input without adding a chat identifier label. */
+export function recordMessageQueueSaturation(buffer: MessageQueueBuffer): void {
+  messageQueueSaturation.inc({ buffer });
+}
+
+/** Record the bounded outcome of a user-visible queue rejection notice. */
+export function recordMessageQueueRejectionNotice(
+  buffer: MessageQueueBuffer,
+  result: MessageQueueRejectionNoticeResult,
+): void {
+  messageQueueRejectionNotices.inc({ buffer, result });
+}
+
+/** Record the bounded final outcome of a media download retry sequence. */
+export function recordMediaDownloadRetry(result: MediaDownloadRetryResult): void {
+  mediaDownloadRetries.inc({ result });
+}
+
+/** Record a bounded cosmetic draft scheduler event. */
+export function recordDraftSchedulerEvent(event: DraftSchedulerEvent): void {
+  draftSchedulerEvents.inc({ event });
+}
+
+/** Record a user-visible final response delivery failure. */
+export function recordFinalDeliveryFailure(): void {
+  finalDeliveryFailures.inc();
 }
 
 // --- HTTP server ---

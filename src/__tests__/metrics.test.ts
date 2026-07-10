@@ -26,6 +26,16 @@ import {
   sessionCrashes,
   messagesReceived,
   messagesSent,
+  messageQueueSaturation,
+  messageQueueRejectionNotices,
+  recordMessageQueueSaturation,
+  recordMessageQueueRejectionNotice,
+  mediaDownloadRetries,
+  recordMediaDownloadRetry,
+  draftSchedulerEvents,
+  finalDeliveryFailures,
+  recordDraftSchedulerEvent,
+  recordFinalDeliveryFailure,
   startMetricsServer,
   stopMetricsServer,
 } from "../metrics.js";
@@ -245,6 +255,110 @@ describe("message flow metrics", () => {
 
     const val = await messagesSent.get();
     assert.strictEqual(val.values[0].value, 3);
+  });
+});
+
+describe("message queue saturation metrics", () => {
+  it("distinguishes bounded debounce and collect rejection labels without chat identity", async () => {
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueSaturation("collect");
+    recordMessageQueueRejectionNotice("debounce", "sent");
+    recordMessageQueueRejectionNotice("collect", "failed");
+    recordMessageQueueRejectionNotice("collect", "rate_limited");
+
+    const saturation = await messageQueueSaturation.get();
+    assert.deepStrictEqual(
+      saturation.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { buffer: "debounce" }, value: 2 },
+        { labels: { buffer: "collect" }, value: 1 },
+      ],
+    );
+
+    const notices = await messageQueueRejectionNotices.get();
+    assert.deepStrictEqual(
+      notices.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { buffer: "debounce", result: "sent" }, value: 1 },
+        { labels: { buffer: "collect", result: "failed" }, value: 1 },
+        { labels: { buffer: "collect", result: "rate_limited" }, value: 1 },
+      ],
+    );
+    assert.ok(saturation.values.every(({ labels }) => !("chat_id" in labels)));
+    assert.ok(notices.values.every(({ labels }) => !("chat_id" in labels)));
+  });
+
+  it("registers and exposes both queue reliability counters", async () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_message_queue_saturation_total"));
+    assert.ok(names.includes("bot_message_queue_rejection_notices_total"));
+
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueRejectionNotice("debounce", "sent");
+    const body = await client.register.metrics();
+    assert.match(body, /bot_message_queue_saturation_total\{buffer="debounce"\} 1/);
+    assert.match(
+      body,
+      /bot_message_queue_rejection_notices_total\{buffer="debounce",result="sent"\} 1/,
+    );
+  });
+});
+
+describe("media download retry metrics", () => {
+  it("records only bounded recovered and exhausted outcomes", async () => {
+    recordMediaDownloadRetry("recovered");
+    recordMediaDownloadRetry("recovered");
+    recordMediaDownloadRetry("exhausted");
+
+    const values = await mediaDownloadRetries.get();
+    assert.deepStrictEqual(
+      values.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { result: "recovered" }, value: 2 },
+        { labels: { result: "exhausted" }, value: 1 },
+      ],
+    );
+    assert.ok(values.values.every(({ labels }) => Object.keys(labels).length === 1));
+  });
+
+  it("registers the retry outcome counter", async () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_media_download_retries_total"));
+    recordMediaDownloadRetry("recovered");
+    assert.match(await client.register.metrics(), /bot_media_download_retries_total\{result="recovered"\} 1/);
+  });
+});
+
+describe("draft and final delivery reliability metrics", () => {
+  it("uses bounded cosmetic draft event labels and a separate final failure counter", async () => {
+    recordDraftSchedulerEvent("throttled");
+    recordDraftSchedulerEvent("coalesced");
+    recordDraftSchedulerEvent("rate_limited");
+    recordDraftSchedulerEvent("failed");
+    recordFinalDeliveryFailure();
+
+    const drafts = await draftSchedulerEvents.get();
+    assert.deepStrictEqual(
+      drafts.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { event: "throttled" }, value: 1 },
+        { labels: { event: "coalesced" }, value: 1 },
+        { labels: { event: "rate_limited" }, value: 1 },
+        { labels: { event: "failed" }, value: 1 },
+      ],
+    );
+    assert.ok(drafts.values.every(({ labels }) => Object.keys(labels).length === 1));
+
+    const finalFailures = await finalDeliveryFailures.get();
+    assert.strictEqual(finalFailures.values[0].value, 1);
+    assert.deepStrictEqual(finalFailures.values[0].labels, {});
+  });
+
+  it("registers both reliability counters", () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_draft_scheduler_events_total"));
+    assert.ok(names.includes("bot_final_delivery_failures_total"));
   });
 });
 
