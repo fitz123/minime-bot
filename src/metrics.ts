@@ -163,6 +163,21 @@ export const mediaDownloadRetries = new client.Counter({
   labelNames: ["result"] as const,
 });
 
+// --- Streaming draft and final delivery reliability ---
+
+export type DraftSchedulerEvent = "throttled" | "coalesced" | "rate_limited" | "failed";
+
+export const draftSchedulerEvents = new client.Counter({
+  name: "bot_draft_scheduler_events_total",
+  help: "Total cosmetic streaming draft scheduler events by bounded outcome",
+  labelNames: ["event"] as const,
+});
+
+export const finalDeliveryFailures = new client.Counter({
+  name: "bot_final_delivery_failures_total",
+  help: "Total user-visible final response delivery failures",
+});
+
 // --- Helpers ---
 
 /**
@@ -302,6 +317,16 @@ export function recordMessageQueueRejectionNotice(
 /** Record the bounded final outcome of a media download retry sequence. */
 export function recordMediaDownloadRetry(result: MediaDownloadRetryResult): void {
   mediaDownloadRetries.inc({ result });
+}
+
+/** Record a bounded cosmetic draft scheduler event. */
+export function recordDraftSchedulerEvent(event: DraftSchedulerEvent): void {
+  draftSchedulerEvents.inc({ event });
+}
+
+/** Record a user-visible final response delivery failure. */
+export function recordFinalDeliveryFailure(): void {
+  finalDeliveryFailures.inc();
 }
 
 // --- HTTP server ---

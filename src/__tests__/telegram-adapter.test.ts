@@ -109,7 +109,8 @@ describe("createTelegramAdapter", () => {
       };
       const binding: TelegramBinding = { ...defaultBinding, kind: "dm" };
       const adapter = createTelegramAdapter(ctx, binding);
-      await adapter.sendDraft(42, "streaming text");
+      const result = await adapter.sendDraft(42, "streaming text");
+      assert.deepStrictEqual(result, { status: "sent" });
       assert.strictEqual(draftCalls.length, 1);
       assert.strictEqual(draftCalls[0].chatId, 12345);
       assert.strictEqual(draftCalls[0].draftId, 42);
@@ -122,17 +123,37 @@ describe("createTelegramAdapter", () => {
       ctx.api.sendMessageDraft = async () => { draftCalls.push(1); return true; };
       const binding: TelegramBinding = { ...defaultBinding, kind: "group" };
       const adapter = createTelegramAdapter(ctx, binding);
-      await adapter.sendDraft(42, "streaming text");
+      const result = await adapter.sendDraft(42, "streaming text");
+      assert.deepStrictEqual(result, { status: "unsupported" });
       assert.strictEqual(draftCalls.length, 0);
     });
 
-    it("silently ignores errors", async () => {
+    it("returns a bounded cosmetic failure without exposing error contents", async () => {
       const ctx = mockContext();
       ctx.api.sendMessageDraft = async () => { throw new Error("rate limited"); };
       const binding: TelegramBinding = { ...defaultBinding, kind: "dm" };
       const adapter = createTelegramAdapter(ctx, binding);
-      // Should not throw
-      await adapter.sendDraft(42, "text");
+      assert.deepStrictEqual(await adapter.sendDraft(42, "text"), { status: "failed" });
+    });
+
+    it("returns structured and bounded 429 retry-after feedback", async () => {
+      const ctx = mockContext();
+      ctx.api.sendMessageDraft = async () => {
+        throw { error_code: 429, parameters: { retry_after: 3 } };
+      };
+      const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
+      assert.deepStrictEqual(
+        await adapter.sendDraft(42, "text"),
+        { status: "rate_limited", retryAfterMs: 3000 },
+      );
+
+      ctx.api.sendMessageDraft = async () => {
+        throw { error_code: 429, parameters: { retry_after: 999 } };
+      };
+      assert.deepStrictEqual(
+        await adapter.sendDraft(42, "text"),
+        { status: "rate_limited", retryAfterMs: 60_000 },
+      );
     });
 
     it("is a no-op when chatId is undefined", async () => {
@@ -142,7 +163,8 @@ describe("createTelegramAdapter", () => {
       ctx.api.sendMessageDraft = async () => { draftCalls.push(1); return true; };
       const binding: TelegramBinding = { ...defaultBinding, kind: "dm" };
       const adapter = createTelegramAdapter(ctx, binding);
-      await adapter.sendDraft(42, "text");
+      const result = await adapter.sendDraft(42, "text");
+      assert.deepStrictEqual(result, { status: "unsupported" });
       assert.strictEqual(draftCalls.length, 0);
     });
 

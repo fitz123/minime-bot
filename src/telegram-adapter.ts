@@ -1,5 +1,5 @@
 import { type Context, InputFile } from "grammy";
-import type { PlatformContext, SessionDefaults, TelegramBinding } from "./types.js";
+import type { DraftSendResult, PlatformContext, SessionDefaults, TelegramBinding } from "./types.js";
 import { markdownToHtml } from "./markdown-html.js";
 import { setThread } from "./message-thread-cache.js";
 import { recordMessage } from "./message-content-index.js";
@@ -7,6 +7,23 @@ import { recordMessage } from "./message-content-index.js";
 /** Telegram platform constants. */
 const TELEGRAM_MAX_MSG_LENGTH = 4096;
 const TELEGRAM_TYPING_INTERVAL_MS = 5000;
+const MAX_DRAFT_RETRY_AFTER_MS = 60_000;
+
+/** Convert Telegram's structured 429 response into bounded scheduler feedback. */
+function draftFailureResult(err: unknown): DraftSendResult {
+  if (typeof err !== "object" || err === null) return { status: "failed" };
+  const apiError = err as {
+    error_code?: unknown;
+    parameters?: { retry_after?: unknown };
+  };
+  if (apiError.error_code !== 429) return { status: "failed" };
+
+  const retryAfter = apiError.parameters?.retry_after;
+  const retryAfterMs = typeof retryAfter === "number" && Number.isFinite(retryAfter)
+    ? Math.min(MAX_DRAFT_RETRY_AFTER_MS, Math.max(0, retryAfter * 1000))
+    : 1000;
+  return { status: "rate_limited", retryAfterMs };
+}
 
 /** Bot username for outgoing message recording. Set at startup via setBotUsername(). */
 let _botUsername = "bot";
@@ -57,16 +74,17 @@ export function createTelegramAdapter(
       }
     },
 
-    async sendDraft(draftId: number, text: string): Promise<void> {
-      if (!chatId || !isDm) return;
+    async sendDraft(draftId: number, text: string): Promise<DraftSendResult> {
+      if (!chatId || !isDm) return { status: "unsupported" };
       const html = markdownToHtml(text);
       try {
         await ctx.api.sendMessageDraft(chatId, draftId, html, {
           parse_mode: "HTML",
           ...threadOpts,
         });
-      } catch {
-        // Draft failures are cosmetic — silently ignore
+        return { status: "sent" };
+      } catch (err) {
+        return draftFailureResult(err);
       }
     },
 

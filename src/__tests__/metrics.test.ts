@@ -32,6 +32,10 @@ import {
   recordMessageQueueRejectionNotice,
   mediaDownloadRetries,
   recordMediaDownloadRetry,
+  draftSchedulerEvents,
+  finalDeliveryFailures,
+  recordDraftSchedulerEvent,
+  recordFinalDeliveryFailure,
   startMetricsServer,
   stopMetricsServer,
 } from "../metrics.js";
@@ -323,6 +327,38 @@ describe("media download retry metrics", () => {
     assert.ok(names.includes("bot_media_download_retries_total"));
     recordMediaDownloadRetry("recovered");
     assert.match(await client.register.metrics(), /bot_media_download_retries_total\{result="recovered"\} 1/);
+  });
+});
+
+describe("draft and final delivery reliability metrics", () => {
+  it("uses bounded cosmetic draft event labels and a separate final failure counter", async () => {
+    recordDraftSchedulerEvent("throttled");
+    recordDraftSchedulerEvent("coalesced");
+    recordDraftSchedulerEvent("rate_limited");
+    recordDraftSchedulerEvent("failed");
+    recordFinalDeliveryFailure();
+
+    const drafts = await draftSchedulerEvents.get();
+    assert.deepStrictEqual(
+      drafts.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { event: "throttled" }, value: 1 },
+        { labels: { event: "coalesced" }, value: 1 },
+        { labels: { event: "rate_limited" }, value: 1 },
+        { labels: { event: "failed" }, value: 1 },
+      ],
+    );
+    assert.ok(drafts.values.every(({ labels }) => Object.keys(labels).length === 1));
+
+    const finalFailures = await finalDeliveryFailures.get();
+    assert.strictEqual(finalFailures.values[0].value, 1);
+    assert.deepStrictEqual(finalFailures.values[0].labels, {});
+  });
+
+  it("registers both reliability counters", () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_draft_scheduler_events_total"));
+    assert.ok(names.includes("bot_final_delivery_failures_total"));
   });
 });
 

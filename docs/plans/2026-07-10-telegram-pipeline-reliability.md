@@ -49,14 +49,14 @@ Produce three separately reviewable commits, preserve existing successful behavi
 
 ### Task 3: Coalesce and throttle Telegram DM drafts (#44)
 
-- [ ] Introduce one bounded per-stream draft scheduler/state machine. Keep at most one draft request in flight and only one latest pending text snapshot; stale intermediate snapshots are discarded.
-- [ ] Enforce a Telegram-safe minimum send interval and use structured 429 `retry_after` feedback to pause future drafts. Do not retry the rejected stale draft or burst queued drafts after the pause.
-- [ ] Final `sendMessage` remains authoritative and must not wait indefinitely for a draft. All final, error, abort, shutdown, and `NO_REPLY` paths must cancel timers and settle/abandon bounded draft state safely.
-- [ ] Coordinate typing with drafts: after the first successful visible draft, stop periodic `sendChatAction` for that stream; preserve current typing behavior where drafts are unsupported.
-- [ ] Preserve the existing rule that `sendMessageDraft` bypasses generic autoRetry while final delivery keeps its current retry behavior.
-- [ ] Add metrics that distinguish cosmetic draft throttling/429 pauses from user-visible final-delivery failures, using bounded labels only.
-- [ ] Add deterministic fake-timer/controlled-promise tests for one-in-flight behavior, minimum interval, latest-text coalescing, retry-after pause, no post-pause burst, hung/rejected drafts, prompt final delivery, typing coordination, `NO_REPLY`/error/abort cleanup, and non-draft platforms.
-- [ ] Commit separately with `#44` in the message.
+- [x] Introduce one bounded per-stream draft scheduler/state machine. Keep at most one draft request in flight and only one latest pending text snapshot; stale intermediate snapshots are discarded.
+- [x] Enforce a Telegram-safe minimum send interval and use structured 429 `retry_after` feedback to pause future drafts. Do not retry the rejected stale draft or burst queued drafts after the pause.
+- [x] Final `sendMessage` remains authoritative and must not wait indefinitely for a draft. All final, error, abort, shutdown, and `NO_REPLY` paths must cancel timers and settle/abandon bounded draft state safely.
+- [x] Coordinate typing with drafts: after the first successful visible draft, stop periodic `sendChatAction` for that stream; preserve current typing behavior where drafts are unsupported.
+- [x] Preserve the existing rule that `sendMessageDraft` bypasses generic autoRetry while final delivery keeps its current retry behavior.
+- [x] Add metrics that distinguish cosmetic draft throttling/429 pauses from user-visible final-delivery failures, using bounded labels only.
+- [x] Add deterministic fake-timer/controlled-promise tests for one-in-flight behavior, minimum interval, latest-text coalescing, retry-after pause, no post-pause burst, hung/rejected drafts, prompt final delivery, typing coordination, `NO_REPLY`/error/abort cleanup, and non-draft platforms.
+- [x] Commit separately with `#44` in the message.
 
 ## Scope and review boundaries
 

@@ -1,5 +1,5 @@
 import type { Message } from "discord.js";
-import type { PlatformContext, DiscordBinding, SessionDefaults } from "./types.js";
+import type { DraftSendResult, PlatformContext, DiscordBinding, SessionDefaults } from "./types.js";
 
 /** Discord platform constants. */
 const DISCORD_MAX_MSG_LENGTH = 2000;
@@ -33,8 +33,8 @@ export function createDiscordAdapter(
       return msg.id;
     },
 
-    async sendDraft(_draftId: number, _text: string): Promise<void> {
-      // Discord has no equivalent of Telegram's sendMessageDraft — no-op
+    async sendDraft(_draftId: number, _text: string): Promise<DraftSendResult> {
+      return { status: "unsupported" };
     },
 
     async deleteMessage(messageId: string): Promise<void> {

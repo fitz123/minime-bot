@@ -229,6 +229,13 @@ graceful stale-resume recoveries increment
 `bot_pi_session_resume_discarded_total`; recovered stale resumes and
 `/clean`-superseded startups do not increment `bot_session_crashes_total`.
 
+Streaming draft backpressure is reported by
+`bot_draft_scheduler_events_total`; its bounded `event` label is one of
+`throttled`, `coalesced`, `rate_limited`, or `failed`. These cosmetic outcomes
+are kept separate from user-visible final response failures, which increment
+`bot_final_delivery_failures_total`; neither metric uses chat identifiers or
+message content as labels.
+
 Pi interactive sessions normalize Codex/OpenAI request-byte transport overflows
 before Pi decides retry versus compaction. When diagnostics include a WebSocket
 1009/message-too-big signal with a pre-stream or `requestBytes` marker, the bot
