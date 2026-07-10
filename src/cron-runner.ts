@@ -485,6 +485,52 @@ function deliver(
   }
 }
 
+interface ScriptExecFailure extends Error {
+  stdout?: string | Buffer | null;
+  stderr?: string | Buffer | null;
+  status?: number | null;
+  signal?: NodeJS.Signals | string | null;
+  code?: string | number;
+}
+
+function isScriptExecFailure(err: Error): err is ScriptExecFailure {
+  return "stdout" in err || "stderr" in err || "status" in err || "signal" in err || "code" in err;
+}
+
+function formatScriptFailureSummary(err: ScriptExecFailure, timeoutMs: number): string {
+  const code = typeof err.code === "string" ? err.code : undefined;
+  if (code === "ETIMEDOUT" || /\b(?:ETIMEDOUT|timed out|timeout)\b/i.test(err.message)) {
+    return `Script cron timed out after ${timeoutMs}ms`;
+  }
+  if (err.signal) {
+    return `Script cron exited with signal ${err.signal}`;
+  }
+  if (typeof err.status === "number") {
+    return `Script cron exited with code ${err.status}`;
+  }
+
+  const sanitizedMessage = sanitizeCapturedOutput(err.message);
+  return sanitizedMessage
+    ? `Script cron failed: ${sanitizedMessage.slice(0, FAILURE_FALLBACK_ERROR_CHARS)}`
+    : "Script cron failed";
+}
+
+function formatScriptFailureDiagnostics(err: ScriptExecFailure): string | undefined {
+  const stdout = normalizeSpawnOutput(err.stdout);
+  const stderr = normalizeSpawnOutput(err.stderr);
+  const metadata = [
+    typeof err.status === "number" ? `status: ${err.status}` : undefined,
+    err.signal ? `signal: ${err.signal}` : undefined,
+    typeof err.code === "string" && err.code ? `code: ${sanitizeCapturedOutput(err.code)}` : undefined,
+  ];
+  const details = [
+    formatCapturedOutputExcerpt("stderr", stderr),
+    formatCapturedOutputExcerpt("stdout", stdout),
+    ...metadata,
+  ].filter((line): line is string => line !== undefined);
+  return details.length > 0 ? details.join("; ") : undefined;
+}
+
 function runScript(cron: CronJob): string {
   if (!cron.command) {
     throw new Error(`Script-mode cron "${cron.name}" has no command`);
@@ -493,16 +539,27 @@ function runScript(cron: CronJob): string {
 
   const env = scrubLegacyRuntimeEnv(process.env);
 
-  const output = execSync(cron.command, {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    shell: "/bin/bash",
-    env,
-    maxBuffer: 10 * 1024 * 1024, // 10MB
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  try {
+    const output = execSync(cron.command, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      shell: "/bin/bash",
+      env,
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+      stdio: ["pipe", "pipe", "pipe"],
+    });
 
-  return output.trim();
+    return output.trim();
+  } catch (err) {
+    const error = errorFromUnknown(err);
+    if (isScriptExecFailure(error)) {
+      throw new CronRunError(
+        formatScriptFailureSummary(error, timeoutMs),
+        formatScriptFailureDiagnostics(error),
+      );
+    }
+    throw error;
+  }
 }
 
 function scrubLegacyRuntimeEnv(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

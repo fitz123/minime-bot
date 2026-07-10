@@ -1291,6 +1291,33 @@ bindings: []
       assert.ok(calls.logs.some((entry) => entry.message === "DONE"));
     });
 
+    it("logs and sends diagnostics from failing script crons", async () => {
+      const cron = makeMainCron({
+        type: "script",
+        prompt: undefined,
+        command: "printf 'script-stdout'; printf 'script-stderr' >&2; exit 7",
+        engine: "pi",
+      });
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runScript = runScript;
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.workspaces, []);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.strictEqual(calls.deliveries.length, 1);
+      assert.strictEqual(calls.deliveries[0].chatId, 111111111);
+      assert.strictEqual(calls.deliveries[0].threadId, 42);
+      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
+      assert.match(calls.deliveries[0].message, /Script cron exited with code 7/);
+      assert.match(calls.deliveries[0].message, /Diagnostics: stderr: script-stderr; stdout: script-stdout; status: 7/);
+      assert.ok(calls.logs.some((entry) => entry.message === "FAIL diagnostics: stderr: script-stderr; stdout: script-stdout; status: 7"));
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.deepStrictEqual(calls.exits, [1]);
+    });
+
     it("resolves workspace and uses one-shot LLM dispatch for LLM crons", async () => {
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
@@ -1782,6 +1809,55 @@ bindings: []
       assert.strictEqual(output, "hello from script");
     });
 
+    it("throws CronRunError diagnostics with captured stderr/stdout on non-zero exit", () => {
+      const cron: CronJob = {
+        name: "failing-script",
+        schedule: "0 * * * *",
+        type: "script",
+        command: "printf 'script-stdout'; printf 'script-stderr' >&2; exit 7",
+        agentId: "main",
+        deliveryChatId: 111111111,
+      };
+
+      assert.throws(
+        () => runScript(cron),
+        (err: unknown) => {
+          const error = err as { name?: unknown; message?: unknown; diagnostics?: unknown };
+          assert.strictEqual(error.name, "CronRunError");
+          assert.match(String(error.message), /Script cron exited with code 7/);
+          assert.match(String(error.diagnostics), /stderr: script-stderr/);
+          assert.match(String(error.diagnostics), /stdout: script-stdout/);
+          assert.match(String(error.diagnostics), /status: 7/);
+          assert.doesNotMatch(String(error.message), /script-stderr|script-stdout/);
+          return true;
+        },
+      );
+    });
+
+    it("sanitizes and truncates script failure diagnostics", () => {
+      const longOutput = "x".repeat(1100);
+      const cron: CronJob = {
+        name: "noisy-script",
+        schedule: "0 * * * *",
+        type: "script",
+        command: `printf '\\001\\033[31m${longOutput}\\033[0m' >&2; exit 2`,
+        agentId: "main",
+        deliveryChatId: 111111111,
+      };
+
+      assert.throws(
+        () => runScript(cron),
+        (err: unknown) => {
+          const diagnostics = String((err as { diagnostics?: unknown }).diagnostics);
+          assert.match(diagnostics, /stderr \(first 1000 chars\):/);
+          assert.match(diagnostics, /\[truncated 101 chars\]/);
+          assert.doesNotMatch(diagnostics, /\u001b|\x1B|\[31m|\[0m/);
+          assert.match(diagnostics, /\?/);
+          return true;
+        },
+      );
+    });
+
     it("respects timeout", () => {
       const cron: CronJob = {
         name: "slow-script",
@@ -1792,7 +1868,17 @@ bindings: []
         deliveryChatId: 111111111,
         timeout: 100, // 100ms — will timeout
       };
-      assert.throws(() => runScript(cron), /TIMEOUT|ETIMEDOUT|timed out|killed/i);
+      assert.throws(
+        () => runScript(cron),
+        (err: unknown) => {
+          const error = err as { name?: unknown; message?: unknown; diagnostics?: unknown };
+          assert.strictEqual(error.name, "CronRunError");
+          assert.match(String(error.message), /timed out after 100ms/);
+          assert.match(String(error.diagnostics), /signal: SIGTERM/);
+          assert.match(String(error.diagnostics), /code: ETIMEDOUT/);
+          return true;
+        },
+      );
     });
 
     it("throws when command is missing", () => {
