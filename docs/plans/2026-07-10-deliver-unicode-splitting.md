@@ -41,6 +41,6 @@ npm pack --dry-run
 
 ### Task 3: Validate and finalize
 
-- [ ] Run focused wrapper/package tests while iterating.
-- [ ] Run the full test suite, build, and package dry-run.
-- [ ] Confirm the diff is limited to the plan, delivery script, and relevant regression tests/package metadata if required.
+- [x] Run focused wrapper/package tests while iterating.
+- [x] Run the full test suite, build, and package dry-run.
+- [x] Confirm the diff is limited to the plan, delivery script, and relevant regression tests/package metadata if required.
