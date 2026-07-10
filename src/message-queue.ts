@@ -1,8 +1,16 @@
 import type { PlatformContext } from "./types.js";
 import { log } from "./logger.js";
+import {
+  recordMessageQueueRejectionNotice,
+  recordMessageQueueSaturation,
+  type MessageQueueBuffer,
+} from "./metrics.js";
 
 export const DEFAULT_DEBOUNCE_MS = 3000;
 export const DEFAULT_QUEUE_CAP = 20;
+export const DEFAULT_REJECTION_NOTICE_COOLDOWN_MS = 30_000;
+export const QUEUE_REJECTION_MESSAGE =
+  "Message queue full: messages received while it is full are not processed. Please resend them later.";
 
 /**
  * Callback that sends combined text to the active agent and relays the response.
@@ -31,7 +39,7 @@ interface ChatQueueState {
   pendingCleanups: CleanupFn[];
   /**
    * Drop-only cleanup callbacks for pending messages. Fire when the message
-   * is dropped (cap exceeded) or the queue is cleared (/reconnect, /clean).
+   * is rejected (cap exceeded) or the queue is cleared (/reconnect, /clean).
    * Discarded on successful flush — the session will own the file and clean
    * it up on close. Used for persistent media that must outlive the turn.
    */
@@ -54,6 +62,10 @@ interface ChatQueueState {
   /** Agent ID for this chat */
   agentId: string;
 
+  /** Earliest time another user-visible saturation notice may be sent. */
+  nextRejectionNoticeAt: number;
+  /** A microtask notice waiting to be dispatched; clear() can cancel it. */
+  rejectionNoticeScheduled: boolean;
 }
 
 /**
@@ -87,10 +99,7 @@ export class MessageQueue {
   private queueCap: number;
   private processFn: ProcessFn;
 
-  constructor(
-    processFn: ProcessFn,
-    options?: { debounceMs?: number; queueCap?: number },
-  ) {
+  constructor(processFn: ProcessFn, options?: { debounceMs?: number; queueCap?: number }) {
     this.processFn = processFn;
     this.debounceMs = options?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.queueCap = options?.queueCap ?? DEFAULT_QUEUE_CAP;
@@ -110,6 +119,8 @@ export class MessageQueue {
         busy: false,
         latestPlatform: null,
         agentId,
+        nextRejectionNoticeAt: 0,
+        rejectionNoticeScheduled: false,
       };
       this.queues.set(chatId, state);
     }
@@ -121,10 +132,10 @@ export class MessageQueue {
    * Enqueue a message for a chat. Handles debouncing and mid-turn collect.
    * Fire-and-forget: returns immediately, processing happens in background.
    *
-   * `cleanup` runs when the message is consumed (successful delivery or drop)
+   * `cleanup` runs when the message is consumed (successful delivery or rejection)
    * and is the right hook for turn-scoped temp files.
    *
-   * `dropCleanup` runs only on drop/clear paths (cap exceeded, /reconnect,
+   * `dropCleanup` runs only on rejection/clear paths (cap exceeded, /reconnect,
    * /clean). It is discarded on successful delivery so the callee can own the
    * file for the session lifetime (persistent media). Use this for downloads
    * that must survive the turn but be reclaimed if the message never reaches
@@ -156,24 +167,14 @@ export class MessageQueue {
           `Queued mid-turn message for ${chatId} (${state.collectBuffer.length} in buffer)`,
         );
       } else {
-        if (cleanup) cleanup();
-        if (dropCleanup) dropCleanup();
-        log.warn(
-          "message-queue",
-          `Collect buffer full for ${chatId}, dropping message`,
-        );
+        this.rejectSaturatedInput(chatId, state, "collect", platform, cleanup, dropCleanup);
       }
       return;
     }
 
     // Pre-send debounce: add to pending and reset timer
     if (state.pendingTexts.length >= this.queueCap) {
-      if (cleanup) cleanup();
-      if (dropCleanup) dropCleanup();
-      log.warn(
-        "message-queue",
-        `Debounce buffer full for ${chatId}, dropping message`,
-      );
+      this.rejectSaturatedInput(chatId, state, "debounce", platform, cleanup, dropCleanup);
       return;
     }
     state.pendingTexts.push(text);
@@ -237,7 +238,7 @@ export class MessageQueue {
       }
     } finally {
       this.stopPreStreamTyping(state.latestPlatform);
-      for (const fn of cleanups) fn();
+      this.runCleanups(cleanups);
     }
 
     // If transferOwnership() fired, liveDropCleanups is null and we skip — the
@@ -247,7 +248,7 @@ export class MessageQueue {
     // agent never claimed the media, reclaim it.
     const queueCleared = this.queues.get(chatId) !== state;
     if (liveDropCleanups) {
-      for (const fn of liveDropCleanups) fn();
+      this.runCleanups(liveDropCleanups);
     }
     if (queueCleared) return;
 
@@ -303,12 +304,12 @@ export class MessageQueue {
         }
       } finally {
         this.stopPreStreamTyping(state.latestPlatform);
-        for (const fn of cleanups) fn();
+        this.runCleanups(cleanups);
       }
 
       const queueCleared = this.queues.get(chatId) !== state;
       if (liveDropCleanups) {
-        for (const fn of liveDropCleanups) fn();
+        this.runCleanups(liveDropCleanups);
       }
       if (queueCleared) return;
 
@@ -338,10 +339,11 @@ export class MessageQueue {
       if (state.debounceTimer) {
         clearTimeout(state.debounceTimer);
       }
-      for (const fn of state.pendingCleanups) fn();
-      for (const fn of state.pendingDropCleanups) fn();
-      for (const fn of state.collectCleanups) fn();
-      for (const fn of state.collectDropCleanups) fn();
+      state.rejectionNoticeScheduled = false;
+      this.runCleanups(state.pendingCleanups);
+      this.runCleanups(state.pendingDropCleanups);
+      this.runCleanups(state.collectCleanups);
+      this.runCleanups(state.collectDropCleanups);
       this.queues.delete(chatId);
     }
   }
@@ -366,10 +368,11 @@ export class MessageQueue {
       if (state.debounceTimer) {
         clearTimeout(state.debounceTimer);
       }
-      for (const fn of state.pendingCleanups) fn();
-      for (const fn of state.pendingDropCleanups) fn();
-      for (const fn of state.collectCleanups) fn();
-      for (const fn of state.collectDropCleanups) fn();
+      state.rejectionNoticeScheduled = false;
+      this.runCleanups(state.pendingCleanups);
+      this.runCleanups(state.pendingDropCleanups);
+      this.runCleanups(state.collectCleanups);
+      this.runCleanups(state.collectDropCleanups);
     }
     this.queues.clear();
   }
@@ -388,6 +391,56 @@ export class MessageQueue {
     if (platform?.preStreamTypingTimer) {
       clearInterval(platform.preStreamTypingTimer);
       platform.preStreamTypingTimer = undefined;
+    }
+  }
+
+  /** Reject one over-cap input and coalesce burst notifications per chat. */
+  private rejectSaturatedInput(
+    chatId: string,
+    state: ChatQueueState,
+    buffer: MessageQueueBuffer,
+    platform: PlatformContext,
+    cleanup?: CleanupFn,
+    dropCleanup?: CleanupFn,
+  ): void {
+    this.runCleanups([cleanup, dropCleanup]);
+    recordMessageQueueSaturation(buffer);
+    log.warn("message-queue", `Rejected input because the ${buffer} buffer is full`);
+
+    const now = Date.now();
+    if (state.rejectionNoticeScheduled || now < state.nextRejectionNoticeAt) {
+      recordMessageQueueRejectionNotice(buffer, "rate_limited");
+      return;
+    }
+
+    state.rejectionNoticeScheduled = true;
+    state.nextRejectionNoticeAt = now + DEFAULT_REJECTION_NOTICE_COOLDOWN_MS;
+
+    queueMicrotask(() => {
+      if (this.queues.get(chatId) !== state || !state.rejectionNoticeScheduled) return;
+      state.rejectionNoticeScheduled = false;
+
+      Promise.resolve()
+        .then(() => platform.replyError(QUEUE_REJECTION_MESSAGE))
+        .then(
+          () => recordMessageQueueRejectionNotice(buffer, "sent"),
+          () => {
+            recordMessageQueueRejectionNotice(buffer, "failed");
+            log.warn("message-queue", "Failed to send queue rejection notice");
+          },
+        );
+    });
+  }
+
+  /** Run each provided cleanup once and isolate failures from sibling cleanup. */
+  private runCleanups(cleanups: Array<CleanupFn | undefined>): void {
+    for (const cleanup of cleanups) {
+      if (!cleanup) continue;
+      try {
+        cleanup();
+      } catch {
+        log.warn("message-queue", "Message cleanup failed");
+      }
     }
   }
 

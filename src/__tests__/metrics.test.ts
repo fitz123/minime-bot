@@ -26,6 +26,10 @@ import {
   sessionCrashes,
   messagesReceived,
   messagesSent,
+  messageQueueSaturation,
+  messageQueueRejectionNotices,
+  recordMessageQueueSaturation,
+  recordMessageQueueRejectionNotice,
   startMetricsServer,
   stopMetricsServer,
 } from "../metrics.js";
@@ -245,6 +249,53 @@ describe("message flow metrics", () => {
 
     const val = await messagesSent.get();
     assert.strictEqual(val.values[0].value, 3);
+  });
+});
+
+describe("message queue saturation metrics", () => {
+  it("distinguishes bounded debounce and collect rejection labels without chat identity", async () => {
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueSaturation("collect");
+    recordMessageQueueRejectionNotice("debounce", "sent");
+    recordMessageQueueRejectionNotice("collect", "failed");
+    recordMessageQueueRejectionNotice("collect", "rate_limited");
+
+    const saturation = await messageQueueSaturation.get();
+    assert.deepStrictEqual(
+      saturation.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { buffer: "debounce" }, value: 2 },
+        { labels: { buffer: "collect" }, value: 1 },
+      ],
+    );
+
+    const notices = await messageQueueRejectionNotices.get();
+    assert.deepStrictEqual(
+      notices.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { buffer: "debounce", result: "sent" }, value: 1 },
+        { labels: { buffer: "collect", result: "failed" }, value: 1 },
+        { labels: { buffer: "collect", result: "rate_limited" }, value: 1 },
+      ],
+    );
+    assert.ok(saturation.values.every(({ labels }) => !("chat_id" in labels)));
+    assert.ok(notices.values.every(({ labels }) => !("chat_id" in labels)));
+  });
+
+  it("registers and exposes both queue reliability counters", async () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_message_queue_saturation_total"));
+    assert.ok(names.includes("bot_message_queue_rejection_notices_total"));
+
+    recordMessageQueueSaturation("debounce");
+    recordMessageQueueRejectionNotice("debounce", "sent");
+    const body = await client.register.metrics();
+    assert.match(body, /bot_message_queue_saturation_total\{buffer="debounce"\} 1/);
+    assert.match(
+      body,
+      /bot_message_queue_rejection_notices_total\{buffer="debounce",result="sent"\} 1/,
+    );
   });
 });
 

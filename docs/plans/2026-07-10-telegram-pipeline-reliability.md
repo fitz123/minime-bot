@@ -30,12 +30,12 @@ Produce three separately reviewable commits, preserve existing successful behavi
 
 ### Task 1: Reject saturated queue input visibly (#46)
 
-- [ ] Keep both debounce and mid-turn collect queues bounded; do not merely raise the cap or make them unbounded.
-- [ ] Replace silent overflow with a user-visible, rate-bounded rejection that clearly says the affected input was not processed and must be resent later.
-- [ ] Preserve media/text parity and exactly-once `cleanup`/`dropCleanup` behavior. Clearing or reconnecting a queue must cancel any pending rejection-notification state/timer.
-- [ ] Add bounded metrics distinguishing debounce vs collect saturation/rejection without identifying the chat.
-- [ ] Replace existing “drop is terminal” expectations with deterministic tests for both buffers, bursts beyond the cap, concurrent arrivals, visible rejection, accepted-input non-duplication, media cleanup, clear/reconnect, rejection-notification failure, and no leaked timers.
-- [ ] Commit separately with `#46` in the message.
+- [x] Keep both debounce and mid-turn collect queues bounded; do not merely raise the cap or make them unbounded.
+- [x] Replace silent overflow with a user-visible, rate-bounded rejection that clearly says the affected input was not processed and must be resent later.
+- [x] Preserve media/text parity and exactly-once `cleanup`/`dropCleanup` behavior. Clearing or reconnecting a queue must cancel any pending rejection-notification state/timer.
+- [x] Add bounded metrics distinguishing debounce vs collect saturation/rejection without identifying the chat.
+- [x] Replace existing “drop is terminal” expectations with deterministic tests for both buffers, bursts beyond the cap, concurrent arrivals, visible rejection, accepted-input non-duplication, media cleanup, clear/reconnect, rejection-notification failure, and no leaked timers.
+- [x] Commit separately with `#46` in the message.
 
 ### Task 2: Retry transient media downloads and report the failing stage (#43)
 

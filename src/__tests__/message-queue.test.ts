@@ -6,20 +6,25 @@ import {
   buildCollectPrompt,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_QUEUE_CAP,
+  DEFAULT_REJECTION_NOTICE_COOLDOWN_MS,
+  QUEUE_REJECTION_MESSAGE,
 } from "../message-queue.js";
 
 /** Minimal mock PlatformContext — the queue never inspects it deeply, only passes it through. */
-function mockPlatform(): PlatformContext {
+function mockPlatform(
+  onReplyError?: (message: string) => void | Promise<void>,
+  typingIndicator = true,
+): PlatformContext {
   return {
     maxMessageLength: 4096,
     typingIntervalMs: 4000,
-    typingIndicator: true,
+    typingIndicator,
     async sendMessage() { return "1"; },
     async deleteMessage() {},
     async sendDraft() {},
     async sendTyping() {},
     async sendFile() {},
-    async replyError() {},
+    async replyError(message: string) { await onReplyError?.(message); },
   };
 }
 
@@ -74,6 +79,11 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Flush promise and queueMicrotask callbacks without advancing real time. */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+}
+
 // -------------------------------------------------------------------
 // buildCollectPrompt
 // -------------------------------------------------------------------
@@ -114,6 +124,7 @@ describe("MessageQueue defaults", () => {
   it("exports expected default constants", () => {
     assert.strictEqual(DEFAULT_DEBOUNCE_MS, 3000);
     assert.strictEqual(DEFAULT_QUEUE_CAP, 20);
+    assert.strictEqual(DEFAULT_REJECTION_NOTICE_COOLDOWN_MS, 30_000);
   });
 });
 
@@ -264,61 +275,172 @@ describe("MessageQueue mid-turn collect", () => {
 // -------------------------------------------------------------------
 
 describe("MessageQueue queue cap", () => {
-  it("drops messages beyond queue cap", async () => {
-    const mock = createMockProcess();
-    const queue = new MessageQueue(mock.processFn, { debounceMs: 30, queueCap: 3 });
-    const platform = mockPlatform();
+  it("rejects a concurrent debounce burst visibly while processing each accepted input once", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { processFn, calls } = createMockProcess();
+    const notices: string[] = [];
+    const platform = mockPlatform((message) => { notices.push(message); }, false);
+    const queue = new MessageQueue(processFn, { debounceMs: 50, queueCap: 3 });
+    const rejectedCleanups = Array.from({ length: 5 }, () => ({ cleanup: 0, drop: 0 }));
 
-    mock.setBlocking(true);
-    queue.enqueue("chat1", "main", "first", platform);
-    await wait(60);
+    await Promise.all([
+      "accepted-1",
+      "accepted-2",
+      "accepted-3",
+      ...rejectedCleanups.map((_, index) => `rejected-${index}`),
+    ].map(async (text, index) => {
+      await Promise.resolve();
+      const rejected = rejectedCleanups[index - 3];
+      queue.enqueue(
+        "chat1",
+        "main",
+        text,
+        platform,
+        rejected ? () => { rejected.cleanup++; } : undefined,
+        rejected ? () => { rejected.drop++; } : undefined,
+      );
+    }));
+    await flushMicrotasks();
 
-    // Fill collect buffer to cap
-    queue.enqueue("chat1", "main", "c1", platform);
-    queue.enqueue("chat1", "main", "c2", platform);
-    queue.enqueue("chat1", "main", "c3", platform);
-    assert.strictEqual(queue.getCollectCount("chat1"), 3);
+    assert.strictEqual(queue.getPendingCount("chat1"), 3, "debounce buffer remains bounded");
+    assert.deepStrictEqual(notices, [QUEUE_REJECTION_MESSAGE], "a burst gets one visible rejection");
+    for (const counts of rejectedCleanups) {
+      assert.deepStrictEqual(counts, { cleanup: 1, drop: 1 }, "rejected media cleanup runs once");
+    }
 
-    // This should be dropped
-    queue.enqueue("chat1", "main", "c4-dropped", platform);
-    assert.strictEqual(queue.getCollectCount("chat1"), 3);
-
-    mock.setBlocking(false);
-    mock.unblock();
-    await wait(50);
-
-    // Verify drain used only the 3 capped messages
-    assert.strictEqual(mock.calls.length, 2);
-    assert.ok(mock.calls[1].text.includes("c1"));
-    assert.ok(mock.calls[1].text.includes("c2"));
-    assert.ok(mock.calls[1].text.includes("c3"));
-    assert.ok(!mock.calls[1].text.includes("c4-dropped"));
+    t.mock.timers.tick(50);
+    await flushMicrotasks();
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].text, "accepted-1\n\naccepted-2\n\naccepted-3");
+    assert.ok(!calls[0].text.includes("rejected"));
 
     queue.clearAll();
   });
 
-  it("drops messages beyond queue cap during debounce", async () => {
+  it("keeps one collect request in flight, rejects overflow visibly, and does not duplicate accepted media", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const calls: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      calls.push(text);
+      onAgentOwnership();
+      if (calls.length === 1) await initialBlocked;
+    };
+    const notices: string[] = [];
+    const platform = mockPlatform((message) => { notices.push(message); }, false);
+    const queue = new MessageQueue(processFn, { debounceMs: 10, queueCap: 2 });
+    const acceptedCleanups = [0, 0];
+    const acceptedDrops = [0, 0];
+    let rejectedCleanup = 0;
+    let rejectedDrop = 0;
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.strictEqual(queue.isBusy("chat1"), true);
+
+    queue.enqueue("chat1", "main", "media-1", platform,
+      () => { acceptedCleanups[0]++; }, () => { acceptedDrops[0]++; });
+    queue.enqueue("chat1", "main", "media-2", platform,
+      () => { acceptedCleanups[1]++; }, () => { acceptedDrops[1]++; });
+    queue.enqueue("chat1", "main", "rejected-media", platform,
+      () => { rejectedCleanup++; }, () => { rejectedDrop++; });
+    await flushMicrotasks();
+
+    assert.strictEqual(queue.getCollectCount("chat1"), 2, "collect buffer remains bounded");
+    assert.deepStrictEqual(notices, [QUEUE_REJECTION_MESSAGE]);
+    assert.strictEqual(rejectedCleanup, 1);
+    assert.strictEqual(rejectedDrop, 1);
+
+    releaseInitial();
+    await flushMicrotasks();
+    assert.strictEqual(calls.length, 2, "initial and one combined followup are processed");
+    assert.ok(calls[1].includes("media-1"));
+    assert.ok(calls[1].includes("media-2"));
+    assert.ok(!calls[1].includes("rejected-media"));
+    assert.deepStrictEqual(acceptedCleanups, [1, 1]);
+    assert.deepStrictEqual(acceptedDrops, [0, 0], "accepted persistent media transfers ownership");
+
+    queue.clearAll();
+  });
+
+  it("rate-bounds notices, sends again after cooldown, and creates no rejection timer", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { processFn } = createMockProcess();
+    const notices: string[] = [];
+    const platform = mockPlatform((message) => { notices.push(message); }, false);
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 60_000,
+      queueCap: 1,
+    });
+
+    queue.enqueue("chat1", "main", "accepted", platform);
+    for (let i = 0; i < 20; i++) queue.enqueue("chat1", "main", `rejected-${i}`, platform);
+    await flushMicrotasks();
+    assert.strictEqual(notices.length, 1);
+
+    t.mock.timers.setTime(31_001);
+    queue.enqueue("chat1", "main", "rejected-after-cooldown", platform);
+    await flushMicrotasks();
+    assert.strictEqual(notices.length, 2, "one later rejection is visible after the cooldown");
+
+    queue.clear("chat1");
+    t.mock.timers.runAll();
+    await flushMicrotasks();
+    assert.strictEqual(notices.length, 2, "no rejection timer leaks or fires after clear");
+  });
+
+  it("clear/reconnect cancels a scheduled rejection notice and cleans accepted and rejected media once", async () => {
     const { processFn, calls } = createMockProcess();
-    const queue = new MessageQueue(processFn, { debounceMs: 50, queueCap: 3 });
-    const platform = mockPlatform();
+    const notices: string[] = [];
+    const platform = mockPlatform((message) => { notices.push(message); });
+    let acceptedCleanup = 0;
+    let acceptedDrop = 0;
+    let rejectedCleanup = 0;
+    let rejectedDrop = 0;
+    const queue = new MessageQueue(processFn, { debounceMs: 10_000, queueCap: 1 });
 
-    // Fill debounce buffer to cap
-    queue.enqueue("chat1", "main", "d1", platform);
-    queue.enqueue("chat1", "main", "d2", platform);
-    queue.enqueue("chat1", "main", "d3", platform);
-    assert.strictEqual(queue.getPendingCount("chat1"), 3);
+    queue.enqueue("chat1", "main", "accepted", platform,
+      () => { acceptedCleanup++; }, () => { acceptedDrop++; });
+    queue.enqueue("chat1", "main", "rejected", platform,
+      () => { rejectedCleanup++; }, () => { rejectedDrop++; });
+    queue.clear("chat1");
+    await flushMicrotasks();
 
-    // This should be dropped
-    queue.enqueue("chat1", "main", "d4-dropped", platform);
-    assert.strictEqual(queue.getPendingCount("chat1"), 3);
+    assert.deepStrictEqual(notices, [], "clear cancels the not-yet-dispatched notice");
+    assert.strictEqual(calls.length, 0);
+    assert.deepStrictEqual(
+      { acceptedCleanup, acceptedDrop, rejectedCleanup, rejectedDrop },
+      { acceptedCleanup: 1, acceptedDrop: 1, rejectedCleanup: 1, rejectedDrop: 1 },
+    );
+  });
 
-    await wait(100);
+  it("contains rejection-notification failures without retrying or affecting cleanup", async () => {
+    const { processFn } = createMockProcess();
+    let attempts = 0;
+    const platform = mockPlatform(async () => {
+      attempts++;
+      throw new Error("notification unavailable");
+    });
+    let cleanup = 0;
+    let dropCleanup = 0;
+    const queue = new MessageQueue(processFn, { debounceMs: 10_000, queueCap: 1 });
 
-    assert.strictEqual(calls.length, 1);
-    assert.ok(calls[0].text.includes("d1"));
-    assert.ok(calls[0].text.includes("d3"));
-    assert.ok(!calls[0].text.includes("d4-dropped"));
+    queue.enqueue("chat1", "main", "accepted", platform);
+    queue.enqueue("chat1", "main", "rejected", platform,
+      () => { cleanup++; }, () => { dropCleanup++; });
+    await flushMicrotasks();
 
+    assert.strictEqual(attempts, 1, "a failed cosmetic notice is not retried");
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 1);
     queue.clearAll();
   });
 });
@@ -723,7 +845,7 @@ describe("MessageQueue drop cleanups", () => {
     queue.clearAll();
   });
 
-  it("runs drop cleanups when message is dropped by cap", () => {
+  it("runs drop cleanups when message is rejected by cap", () => {
     let dropFired = 0;
     const { processFn } = createMockProcess();
     const queue = new MessageQueue(processFn, { debounceMs: 1000, queueCap: 1 });
@@ -736,7 +858,7 @@ describe("MessageQueue drop cleanups", () => {
       () => { dropFired++; },
     );
 
-    assert.strictEqual(dropFired, 1, "cap-dropped message runs its drop cleanup");
+    assert.strictEqual(dropFired, 1, "cap-rejected message runs its drop cleanup");
 
     queue.clearAll();
   });
@@ -803,10 +925,11 @@ describe("MessageQueue mid-turn buffering", () => {
     queue.clearAll();
   });
 
-  it("caps the mid-turn collect buffer at queueCap, drops overflow, and runs overflow cleanup", async () => {
+  it("caps the mid-turn collect buffer, rejects overflow visibly, and runs overflow cleanup", async () => {
     const mock = createMockProcess();
     const queue = new MessageQueue(mock.processFn, { debounceMs: 30, queueCap: 2 });
-    const platform = mockPlatform();
+    const notices: string[] = [];
+    const platform = mockPlatform((message) => { notices.push(message); });
     let overflowCleanup = 0;
     let overflowDropCleanup = 0;
 
@@ -826,17 +949,19 @@ describe("MessageQueue mid-turn buffering", () => {
     );
 
     assert.strictEqual(queue.getCollectCount(INJECT_CHAT), 2, "collect buffer capped at queueCap");
-    assert.strictEqual(overflowCleanup, 1, "overflow cleanup runs immediately for the dropped message");
-    assert.strictEqual(overflowDropCleanup, 1, "overflow drop cleanup runs immediately for the dropped message");
+    assert.strictEqual(overflowCleanup, 1, "overflow cleanup runs immediately for the rejected message");
+    assert.strictEqual(overflowDropCleanup, 1, "overflow drop cleanup runs for the rejected message");
+    await flushMicrotasks();
+    assert.deepStrictEqual(notices, [QUEUE_REJECTION_MESSAGE]);
 
     mock.setBlocking(false);
     mock.unblock();
     await wait(80);
 
-    assert.strictEqual(mock.calls.length, 2, "buffered messages drain as one followup; overflow is gone");
+    assert.strictEqual(mock.calls.length, 2, "buffered messages drain as one followup; rejected input is gone");
     assert.ok(mock.calls[1].text.includes("b1"));
     assert.ok(mock.calls[1].text.includes("b2"));
-    assert.ok(!mock.calls[1].text.includes("drop"), "the over-cap message was dropped, not delivered");
+    assert.ok(!mock.calls[1].text.includes("drop"), "the over-cap message was rejected, not delivered");
     assert.strictEqual(overflowCleanup, 1, "overflow cleanup is not repeated during drain");
     assert.strictEqual(overflowDropCleanup, 1, "overflow drop cleanup is not repeated during drain");
 

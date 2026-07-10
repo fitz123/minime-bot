@@ -136,6 +136,23 @@ export const messagesSent = new client.Counter({
   help: "Total messages sent by the bot",
 });
 
+// --- Message queue saturation ---
+
+export type MessageQueueBuffer = "debounce" | "collect";
+export type MessageQueueRejectionNoticeResult = "sent" | "failed" | "rate_limited";
+
+export const messageQueueSaturation = new client.Counter({
+  name: "bot_message_queue_saturation_total",
+  help: "Total inputs rejected because a bounded message queue buffer was full",
+  labelNames: ["buffer"] as const,
+});
+
+export const messageQueueRejectionNotices = new client.Counter({
+  name: "bot_message_queue_rejection_notices_total",
+  help: "Total user-visible queue rejection notices by bounded result",
+  labelNames: ["buffer", "result"] as const,
+});
+
 // --- Helpers ---
 
 /**
@@ -257,6 +274,19 @@ export function recordTelegramApiError(method: string, errorCode: number | strin
  */
 export function recordTelegramApiCall(method: string, binding: string): void {
   telegramApiCalls.inc({ method, binding });
+}
+
+/** Record a rejected input without adding a chat identifier label. */
+export function recordMessageQueueSaturation(buffer: MessageQueueBuffer): void {
+  messageQueueSaturation.inc({ buffer });
+}
+
+/** Record the bounded outcome of a user-visible queue rejection notice. */
+export function recordMessageQueueRejectionNotice(
+  buffer: MessageQueueBuffer,
+  result: MessageQueueRejectionNoticeResult,
+): void {
+  messageQueueRejectionNotices.inc({ buffer, result });
 }
 
 // --- HTTP server ---
