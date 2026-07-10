@@ -85,6 +85,12 @@ export interface SessionState {
   sessionId: string;
   chatId: string;
   agentId: string;
+  /** Runtime provider used when this session state was last persisted. Optional for legacy stores. */
+  provider?: "pi";
+  /** Normalized Pi model used when this session state was last persisted. Optional for legacy stores. */
+  model?: string;
+  /** Pi thinking level used when this session state was last persisted. Optional for legacy stores. */
+  thinking?: PiThinkingLevel;
   lastActivity: number;
 }
 

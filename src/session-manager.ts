@@ -179,8 +179,35 @@ export interface SessionHealth {
   restartCount: number;
 }
 
+interface SessionRuntimeSignature {
+  provider: "pi";
+  model: string;
+  thinking?: AgentConfig["thinking"];
+}
+
+function sessionRuntimeSignature(agent: AgentConfig): SessionRuntimeSignature {
+  return {
+    provider: "pi",
+    model: normalizePiModel(agent.model),
+    thinking: agent.thinking,
+  };
+}
+
 function normalizedSessionModel(agent: AgentConfig): string {
-  return normalizePiModel(agent.model);
+  return sessionRuntimeSignature(agent).model;
+}
+
+function runtimeSignatureChanged(session: ActiveSession, agent: AgentConfig): boolean {
+  const current = sessionRuntimeSignature(agent);
+  return (
+    session.provider !== current.provider ||
+    session.model !== current.model ||
+    session.thinking !== current.thinking
+  );
+}
+
+function formatRuntimeSignature(signature: Pick<SessionRuntimeSignature, "provider" | "model" | "thinking">): string {
+  return `provider=${signature.provider} model=${signature.model} thinking=${signature.thinking ?? "default"}`;
 }
 
 /**
@@ -275,6 +302,9 @@ export class SessionManager {
       sessionId: session.sessionId,
       chatId,
       agentId: session.agentId,
+      provider: session.provider,
+      model: session.model,
+      thinking: session.thinking,
       lastActivity: session.lastActivity,
     };
   }
@@ -515,23 +545,53 @@ export class SessionManager {
       await abortSupersededStartup();
     }
 
+    let freshConfig: BotConfig | undefined;
+    const getFreshConfig = (): BotConfig => {
+      freshConfig ??= this.getFreshConfig();
+      return freshConfig;
+    };
+    const tryGetFreshConfigForActiveSession = (): BotConfig | undefined => {
+      try {
+        return getFreshConfig();
+      } catch {
+        // A broken config must not strand an already-live session. Reuse it until
+        // the config becomes valid again; new sessions still fail closed below.
+        return undefined;
+      }
+    };
+
     // Check if session is active in memory
     let existing = this.active.get(chatId);
     if (existing && !hasExited(existing.child) && !existing.child.killed && !existing.child.stdout?.destroyed) {
       if (existing.agentId === agentId) {
-        existing.lastActivity = Date.now();
-        this.resetIdleTimer(chatId);
-        return existing;
+        const activeConfig = tryGetFreshConfigForActiveSession();
+        const activeAgent = activeConfig?.agents[agentId];
+        if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
+          existing.lastActivity = Date.now();
+          this.resetIdleTimer(chatId);
+          return existing;
+        }
+        const currentSignature = activeAgent ? sessionRuntimeSignature(activeAgent) : undefined;
+        const reason = activeAgent
+          ? `runtime config changed from ${formatRuntimeSignature(existing)} to ${formatRuntimeSignature(currentSignature!)}`
+          : `agent "${agentId}" no longer exists in config`;
+        log.warn("session-manager", `Closing active session for chat ${chatId}: ${reason}`);
+        await this.closeSession(chatId, { mediaCleanup: "stale" });
+        if (isStartupSuperseded()) {
+          await abortSupersededStartup();
+        }
+        existing = undefined;
+      } else {
+        log.warn(
+          "session-manager",
+          `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
+        );
+        await this.closeSession(chatId, { mediaCleanup: "stale" });
+        if (isStartupSuperseded()) {
+          await abortSupersededStartup();
+        }
+        existing = undefined;
       }
-      log.warn(
-        "session-manager",
-        `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
-      );
-      await this.closeSession(chatId, { mediaCleanup: "stale" });
-      if (isStartupSuperseded()) {
-        await abortSupersededStartup();
-      }
-      existing = undefined;
     }
 
     // If we had an active entry but child is dead/dying, clean it up
@@ -555,7 +615,7 @@ export class SessionManager {
     }
 
     // Reload config fresh — pick up any changes to agents/sessionDefaults
-    const freshConfig = this.getFreshConfig();
+    freshConfig = getFreshConfig();
     const agent = freshConfig.agents[agentId];
     if (!agent) {
       throw new Error(`Unknown agent: ${agentId}`);
@@ -1132,6 +1192,22 @@ export class SessionManager {
       // process — is wiped.
       try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
       return { resume: false, sessionId: randomUUID() };
+    }
+
+    const currentAgent = agents[agentId];
+    if (currentAgent && stored.provider && stored.model) {
+      const currentSignature = sessionRuntimeSignature(currentAgent);
+      if (
+        stored.provider !== currentSignature.provider ||
+        stored.model !== currentSignature.model ||
+        stored.thinking !== currentSignature.thinking
+      ) {
+        log.warn(
+          "session-manager",
+          `Resuming stored session for chat ${chatId} with updated runtime config: ` +
+            `${formatRuntimeSignature(stored as SessionRuntimeSignature)} -> ${formatRuntimeSignature(currentSignature)}`,
+        );
+      }
     }
 
     return { resume: true, sessionId: stored.sessionId };
