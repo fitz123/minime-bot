@@ -153,6 +153,16 @@ export const messageQueueRejectionNotices = new client.Counter({
   labelNames: ["buffer", "result"] as const,
 });
 
+// --- Media download retries ---
+
+export type MediaDownloadRetryResult = "recovered" | "exhausted";
+
+export const mediaDownloadRetries = new client.Counter({
+  name: "bot_media_download_retries_total",
+  help: "Total media downloads that recovered after a retry or exhausted retry attempts",
+  labelNames: ["result"] as const,
+});
+
 // --- Helpers ---
 
 /**
@@ -287,6 +297,11 @@ export function recordMessageQueueRejectionNotice(
   result: MessageQueueRejectionNoticeResult,
 ): void {
   messageQueueRejectionNotices.inc({ buffer, result });
+}
+
+/** Record the bounded final outcome of a media download retry sequence. */
+export function recordMediaDownloadRetry(result: MediaDownloadRetryResult): void {
+  mediaDownloadRetries.inc({ result });
 }
 
 // --- HTTP server ---

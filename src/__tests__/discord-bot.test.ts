@@ -9,10 +9,12 @@ import {
   buildDiscordSourcePrefix,
   handleDiscordChatInputCommand,
   installDiscordErrorHandlers,
+  discordMediaFailureMessage,
 } from "../discord-bot.js";
 import { validateDiscordBinding } from "../config.js";
 import type { BotConfig, DiscordBinding, DiscordConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
+import { MediaPipelineError } from "../voice.js";
 
 // --- discordSessionKey ---
 
@@ -41,6 +43,16 @@ describe("discordSessionKey", () => {
     // Telegram keys are just "123456" or "123456:topicId"
     assert.ok(discordKey.startsWith("discord:"));
     assert.notStrictEqual(discordKey, "123456");
+  });
+});
+
+describe("Discord media failure mapping", () => {
+  it("makes image download failures visible and distinguishes audio stages", () => {
+    assert.match(discordMediaFailureMessage(new MediaPipelineError("download"), "download"), /download/);
+    assert.match(discordMediaFailureMessage(new MediaPipelineError("size-limit"), "download"), /too large/);
+    assert.match(discordMediaFailureMessage(new MediaPipelineError("conversion"), "transcription"), /convert/);
+    assert.match(discordMediaFailureMessage(new MediaPipelineError("transcription"), "transcription"), /transcribe/);
+    assert.match(discordMediaFailureMessage(new MediaPipelineError("empty-transcript"), "transcription"), /empty result/);
   });
 });
 

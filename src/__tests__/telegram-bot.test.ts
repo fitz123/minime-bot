@@ -1,9 +1,10 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn, telegramMediaFailureMessage } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
+import { MediaPipelineError } from "../voice.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -1460,6 +1461,22 @@ describe("command handler wiring", () => {
     assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 0);
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+});
+
+describe("Telegram media failure mapping", () => {
+  it("reports metadata, download, size, conversion, transcription, and empty stages accurately", () => {
+    const cases = [
+      ["metadata", /metadata/],
+      ["download", /download/],
+      ["size-limit", /too large/],
+      ["conversion", /convert/],
+      ["transcription", /transcribe/],
+      ["empty-transcript", /empty result/],
+    ] as const;
+    for (const [stage, expected] of cases) {
+      assert.match(telegramMediaFailureMessage(new MediaPipelineError(stage), "download"), expected);
+    }
   });
 });
 

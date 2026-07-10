@@ -39,13 +39,13 @@ Produce three separately reviewable commits, preserve existing successful behavi
 
 ### Task 2: Retry transient media downloads and report the failing stage (#43)
 
-- [ ] Trace all Telegram and Discord users of the shared media downloader. Keep retry logic inside the shared idempotent download path, not in individual handlers.
-- [ ] Add a bounded transient policy with fresh timeout state per attempt, bounded backoff, partial-file cleanup before retry, preserved `0600` destination permissions, and existing size limits on every attempt.
-- [ ] Retry only transient network/stream failures and explicitly retryable HTTP responses (408/429/5xx, honoring bounded `Retry-After`). Do not retry permanent 4xx, size-limit failures, conversion, transcription, or empty-transcript failures.
-- [ ] Preserve the useful final cause internally while exposing a typed/bounded stage (`metadata`, `download`, `size-limit`, `conversion`, `transcription`, `empty-transcript`) without URL/token/path leakage.
-- [ ] Make Telegram voice/photo/document/other-media and Discord audio/image callers produce accurate user-visible stage messages; Discord image failures must no longer be log-only.
-- [ ] Add deterministic fetch/stream tests for transient recovery, exhausted retries, permanent failures, 429 handling, per-attempt timeout reset, corrupt partial cleanup, max-size enforcement, permissions, redaction, and Telegram/Discord handler mapping.
-- [ ] Add bounded recovered/exhausted retry metrics. Commit separately with `#43` in the message.
+- [x] Trace all Telegram and Discord users of the shared media downloader. Keep retry logic inside the shared idempotent download path, not in individual handlers.
+- [x] Add a bounded transient policy with fresh timeout state per attempt, bounded backoff, partial-file cleanup before retry, preserved `0600` destination permissions, and existing size limits on every attempt.
+- [x] Retry only transient network/stream failures and explicitly retryable HTTP responses (408/429/5xx, honoring bounded `Retry-After`). Do not retry permanent 4xx, size-limit failures, conversion, transcription, or empty-transcript failures.
+- [x] Preserve the useful final cause internally while exposing a typed/bounded stage (`metadata`, `download`, `size-limit`, `conversion`, `transcription`, `empty-transcript`) without URL/token/path leakage.
+- [x] Make Telegram voice/photo/document/other-media and Discord audio/image callers produce accurate user-visible stage messages; Discord image failures must no longer be log-only.
+- [x] Add deterministic fetch/stream tests for transient recovery, exhausted retries, permanent failures, 429 handling, per-attempt timeout reset, corrupt partial cleanup, max-size enforcement, permissions, redaction, and Telegram/Discord handler mapping.
+- [x] Add bounded recovered/exhausted retry metrics. Commit separately with `#43` in the message.
 
 ### Task 3: Coalesce and throttle Telegram DM drafts (#44)
 

@@ -30,6 +30,8 @@ import {
   messageQueueRejectionNotices,
   recordMessageQueueSaturation,
   recordMessageQueueRejectionNotice,
+  mediaDownloadRetries,
+  recordMediaDownloadRetry,
   startMetricsServer,
   stopMetricsServer,
 } from "../metrics.js";
@@ -296,6 +298,31 @@ describe("message queue saturation metrics", () => {
       body,
       /bot_message_queue_rejection_notices_total\{buffer="debounce",result="sent"\} 1/,
     );
+  });
+});
+
+describe("media download retry metrics", () => {
+  it("records only bounded recovered and exhausted outcomes", async () => {
+    recordMediaDownloadRetry("recovered");
+    recordMediaDownloadRetry("recovered");
+    recordMediaDownloadRetry("exhausted");
+
+    const values = await mediaDownloadRetries.get();
+    assert.deepStrictEqual(
+      values.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        { labels: { result: "recovered" }, value: 2 },
+        { labels: { result: "exhausted" }, value: 1 },
+      ],
+    );
+    assert.ok(values.values.every(({ labels }) => Object.keys(labels).length === 1));
+  });
+
+  it("registers the retry outcome counter", async () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("bot_media_download_retries_total"));
+    recordMediaDownloadRetry("recovered");
+    assert.match(await client.register.metrics(), /bot_media_download_retries_total\{result="recovered"\} 1/);
   });
 });
 

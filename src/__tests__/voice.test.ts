@@ -1,9 +1,21 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, rmSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { tempFilePath, downloadFile, cleanupTempFile, transcribeAudio, convertToWav, FFMPEG_BIN, WHISPER_BIN, WHISPER_MODEL } from "../voice.js";
+import {
+  MediaPipelineError,
+  tempFilePath,
+  downloadFile,
+  cleanupTempFile,
+  transcribeAudio,
+  convertToWav,
+  mediaPipelineFailureMessage,
+  requireTranscript,
+  FFMPEG_BIN,
+  WHISPER_BIN,
+  WHISPER_MODEL,
+} from "../voice.js";
 
 describe("tempFilePath", () => {
   it("generates path with correct prefix and extension", () => {
@@ -53,16 +65,18 @@ describe("downloadFile", () => {
 
   it("throws on HTTP error response", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => ({
-      ok: false,
-      status: 404,
-    })) as unknown as typeof fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return { ok: false, status: 404 };
+    }) as unknown as typeof fetch;
 
     try {
       await assert.rejects(
         () => downloadFile("https://example.com/missing.oga", testDest),
-        { message: "Download failed: HTTP 404" },
+        (error: Error) => error instanceof MediaPipelineError && error.stage === "download",
       );
+      assert.strictEqual(calls, 1);
       assert.ok(!existsSync(testDest));
     } finally {
       globalThis.fetch = originalFetch;
@@ -80,7 +94,7 @@ describe("downloadFile", () => {
     try {
       await assert.rejects(
         () => downloadFile("https://example.com/large.oga", testDest, { maxBytes: 3 }),
-        /Download too large/,
+        (error: Error) => error instanceof MediaPipelineError && error.stage === "size-limit",
       );
       assert.ok(!existsSync(testDest));
     } finally {
@@ -88,19 +102,255 @@ describe("downloadFile", () => {
     }
   });
 
-  it("throws on fetch network error", async () => {
+  it("recovers from a transient fetch failure without duplicating content", async () => {
     const originalFetch = globalThis.fetch;
+    let calls = 0;
     globalThis.fetch = (async () => {
-      throw new Error("Network error");
+      calls += 1;
+      if (calls === 1) throw new Error("temporary network failure");
+      return new Response(new Uint8Array([1, 2, 3]));
+    }) as unknown as typeof fetch;
+
+    try {
+      await downloadFile("https://example.com/file.oga", testDest);
+      assert.strictEqual(calls, 2);
+      assert.deepStrictEqual([...readFileSync(testDest)], [1, 2, 3]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("exhausts bounded retries and retains the final cause internally", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      throw new Error(`transient-${calls}`);
     }) as unknown as typeof fetch;
 
     try {
       await assert.rejects(
         () => downloadFile("https://example.com/file.oga", testDest),
-        { message: "Network error" },
+        (error: Error) => {
+          assert.ok(error instanceof MediaPipelineError);
+          assert.strictEqual(error.stage, "download");
+          assert.strictEqual((error.cause as Error).message, "transient-3");
+          return true;
+        },
+      );
+      assert.strictEqual(calls, 3);
+      assert.ok(!existsSync(testDest));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("retries 408, 429, and 5xx responses but not permanent 4xx", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const status of [408, 429, 503]) {
+        let calls = 0;
+        globalThis.fetch = (async () => {
+          calls += 1;
+          if (calls === 1) {
+            return new Response(null, {
+              status,
+              headers: status === 429 ? { "Retry-After": "0" } : undefined,
+            });
+          }
+          return new Response(new Uint8Array([status % 256]));
+        }) as unknown as typeof fetch;
+        await downloadFile("https://example.com/retryable", testDest);
+        assert.strictEqual(calls, 2, `expected HTTP ${status} to retry once`);
+      }
+
+      let permanentCalls = 0;
+      globalThis.fetch = (async () => {
+        permanentCalls += 1;
+        return new Response(null, { status: 403 });
+      }) as unknown as typeof fetch;
+      await assert.rejects(() => downloadFile("https://example.com/permanent", testDest));
+      assert.strictEqual(permanentCalls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("honors Retry-After while bounding an excessive pause", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(null, { status: 429, headers: { "Retry-After": "999" } });
+      }
+      return new Response(new Uint8Array([1]));
+    }) as unknown as typeof fetch;
+
+    try {
+      const pending = downloadFile("https://example.com/rate-limited", testDest);
+      while (calls === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(4_999);
+      await Promise.resolve();
+      assert.strictEqual(calls, 1);
+      t.mock.timers.tick(1);
+      await pending;
+      assert.strictEqual(calls, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("creates fresh timeout state for every attempt", async () => {
+    const originalFetch = globalThis.fetch;
+    const signals: AbortSignal[] = [];
+    let calls = 0;
+    globalThis.fetch = ((_url, init) => {
+      calls += 1;
+      const signal = init?.signal as AbortSignal;
+      signals.push(signal);
+      if (calls === 1) {
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+        });
+      }
+      return Promise.resolve(new Response(new Uint8Array([7])));
+    }) as typeof fetch;
+
+    try {
+      await downloadFile("https://example.com/timeout", testDest, { timeoutMs: 5 });
+      assert.strictEqual(calls, 2);
+      assert.notStrictEqual(signals[0], signals[1]);
+      assert.strictEqual(signals[0].aborted, true);
+      assert.strictEqual(signals[1].aborted, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("removes a corrupt partial file before retrying a failed stream", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 2) {
+        assert.strictEqual(existsSync(testDest), false, "partial file must be removed before retry");
+        return new Response(new Uint8Array([9, 8]));
+      }
+      let pulled = false;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!pulled) {
+            pulled = true;
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+          } else {
+            controller.error(new Error("stream reset"));
+          }
+        },
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      await downloadFile("https://example.com/stream", testDest);
+      assert.deepStrictEqual([...readFileSync(testDest)], [9, 8]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("enforces declared and streamed size limits on every attempt without retry", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    try {
+      globalThis.fetch = (async () => {
+        calls += 1;
+        return new Response(new Uint8Array([1]), { headers: { "Content-Length": "10" } });
+      }) as unknown as typeof fetch;
+      await assert.rejects(
+        () => downloadFile("https://example.com/declared-large", testDest, { maxBytes: 3 }),
+        (error: Error) => error instanceof MediaPipelineError && error.stage === "size-limit",
+      );
+      assert.strictEqual(calls, 1);
+
+      calls = 0;
+      globalThis.fetch = (async () => {
+        calls += 1;
+        return new Response(new Uint8Array([1, 2, 3, 4]));
+      }) as unknown as typeof fetch;
+      await assert.rejects(
+        () => downloadFile("https://example.com/stream-large", testDest, { maxBytes: 3 }),
+        (error: Error) => error instanceof MediaPipelineError && error.stage === "size-limit",
+      );
+      assert.strictEqual(calls, 1);
+      assert.strictEqual(existsSync(testDest), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("sets destination permissions to 0600 even when replacing an existing file", async () => {
+    writeFileSync(testDest, "old", { mode: 0o644 });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(new Uint8Array([4, 5]))) as unknown as typeof fetch;
+    try {
+      await downloadFile("https://example.com/private", testDest);
+      assert.strictEqual(statSync(testDest).mode & 0o777, 0o600);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("exposes a bounded redacted error while retaining a sensitive cause internally", async () => {
+    const originalFetch = globalThis.fetch;
+    const secretUrl = "https://example.com/file?token=super-secret";
+    globalThis.fetch = (async () => {
+      throw new Error(`network failed for ${secretUrl} at ${testDest}`);
+    }) as unknown as typeof fetch;
+    try {
+      await assert.rejects(
+        () => downloadFile(secretUrl, testDest),
+        (error: Error) => {
+          assert.ok(error instanceof MediaPipelineError);
+          assert.strictEqual(error.message, "Media download failed");
+          assert.doesNotMatch(error.message, /super-secret|example\.com|\/tmp\//);
+          assert.match((error.cause as Error).message, /super-secret/);
+          return true;
+        },
       );
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("media pipeline stages", () => {
+  it("uses typed conversion and empty-transcript failures", async () => {
+    await assert.rejects(
+      () => convertToWav("/tmp/minime-nonexistent-audio-99999.oga"),
+      (error: Error) => error instanceof MediaPipelineError && error.stage === "conversion",
+    );
+    assert.throws(
+      () => requireTranscript(""),
+      (error: Error) => error instanceof MediaPipelineError && error.stage === "empty-transcript",
+    );
+  });
+
+  it("maps every bounded stage to an accurate user-visible message", () => {
+    const expected = new Map([
+      ["metadata", /metadata/],
+      ["download", /download/],
+      ["size-limit", /too large/],
+      ["conversion", /convert/],
+      ["transcription", /transcribe/],
+      ["empty-transcript", /empty result/],
+    ] as const);
+    for (const [stage, pattern] of expected) {
+      const message = mediaPipelineFailureMessage(new MediaPipelineError(stage), "download");
+      assert.match(message, pattern);
+      assert.ok(message.length < 120);
     }
   });
 });
