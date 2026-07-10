@@ -30,33 +30,33 @@ Produce three separately reviewable commits, preserve existing successful behavi
 
 ### Task 1: Reject saturated queue input visibly (#46)
 
-- Keep both debounce and mid-turn collect queues bounded; do not merely raise the cap or make them unbounded.
-- Replace silent overflow with a user-visible, rate-bounded rejection that clearly says the affected input was not processed and must be resent later.
-- Preserve media/text parity and exactly-once `cleanup`/`dropCleanup` behavior. Clearing or reconnecting a queue must cancel any pending rejection-notification state/timer.
-- Add bounded metrics distinguishing debounce vs collect saturation/rejection without identifying the chat.
-- Replace existing “drop is terminal” expectations with deterministic tests for both buffers, bursts beyond the cap, concurrent arrivals, visible rejection, accepted-input non-duplication, media cleanup, clear/reconnect, rejection-notification failure, and no leaked timers.
-- Commit separately with `#46` in the message.
+- [ ] Keep both debounce and mid-turn collect queues bounded; do not merely raise the cap or make them unbounded.
+- [ ] Replace silent overflow with a user-visible, rate-bounded rejection that clearly says the affected input was not processed and must be resent later.
+- [ ] Preserve media/text parity and exactly-once `cleanup`/`dropCleanup` behavior. Clearing or reconnecting a queue must cancel any pending rejection-notification state/timer.
+- [ ] Add bounded metrics distinguishing debounce vs collect saturation/rejection without identifying the chat.
+- [ ] Replace existing “drop is terminal” expectations with deterministic tests for both buffers, bursts beyond the cap, concurrent arrivals, visible rejection, accepted-input non-duplication, media cleanup, clear/reconnect, rejection-notification failure, and no leaked timers.
+- [ ] Commit separately with `#46` in the message.
 
 ### Task 2: Retry transient media downloads and report the failing stage (#43)
 
-- Trace all Telegram and Discord users of the shared media downloader. Keep retry logic inside the shared idempotent download path, not in individual handlers.
-- Add a bounded transient policy with fresh timeout state per attempt, bounded backoff, partial-file cleanup before retry, preserved `0600` destination permissions, and existing size limits on every attempt.
-- Retry only transient network/stream failures and explicitly retryable HTTP responses (408/429/5xx, honoring bounded `Retry-After`). Do not retry permanent 4xx, size-limit failures, conversion, transcription, or empty-transcript failures.
-- Preserve the useful final cause internally while exposing a typed/bounded stage (`metadata`, `download`, `size-limit`, `conversion`, `transcription`, `empty-transcript`) without URL/token/path leakage.
-- Make Telegram voice/photo/document/other-media and Discord audio/image callers produce accurate user-visible stage messages; Discord image failures must no longer be log-only.
-- Add deterministic fetch/stream tests for transient recovery, exhausted retries, permanent failures, 429 handling, per-attempt timeout reset, corrupt partial cleanup, max-size enforcement, permissions, redaction, and Telegram/Discord handler mapping.
-- Add bounded recovered/exhausted retry metrics. Commit separately with `#43` in the message.
+- [ ] Trace all Telegram and Discord users of the shared media downloader. Keep retry logic inside the shared idempotent download path, not in individual handlers.
+- [ ] Add a bounded transient policy with fresh timeout state per attempt, bounded backoff, partial-file cleanup before retry, preserved `0600` destination permissions, and existing size limits on every attempt.
+- [ ] Retry only transient network/stream failures and explicitly retryable HTTP responses (408/429/5xx, honoring bounded `Retry-After`). Do not retry permanent 4xx, size-limit failures, conversion, transcription, or empty-transcript failures.
+- [ ] Preserve the useful final cause internally while exposing a typed/bounded stage (`metadata`, `download`, `size-limit`, `conversion`, `transcription`, `empty-transcript`) without URL/token/path leakage.
+- [ ] Make Telegram voice/photo/document/other-media and Discord audio/image callers produce accurate user-visible stage messages; Discord image failures must no longer be log-only.
+- [ ] Add deterministic fetch/stream tests for transient recovery, exhausted retries, permanent failures, 429 handling, per-attempt timeout reset, corrupt partial cleanup, max-size enforcement, permissions, redaction, and Telegram/Discord handler mapping.
+- [ ] Add bounded recovered/exhausted retry metrics. Commit separately with `#43` in the message.
 
 ### Task 3: Coalesce and throttle Telegram DM drafts (#44)
 
-- Introduce one bounded per-stream draft scheduler/state machine. Keep at most one draft request in flight and only one latest pending text snapshot; stale intermediate snapshots are discarded.
-- Enforce a Telegram-safe minimum send interval and use structured 429 `retry_after` feedback to pause future drafts. Do not retry the rejected stale draft or burst queued drafts after the pause.
-- Final `sendMessage` remains authoritative and must not wait indefinitely for a draft. All final, error, abort, shutdown, and `NO_REPLY` paths must cancel timers and settle/abandon bounded draft state safely.
-- Coordinate typing with drafts: after the first successful visible draft, stop periodic `sendChatAction` for that stream; preserve current typing behavior where drafts are unsupported.
-- Preserve the existing rule that `sendMessageDraft` bypasses generic autoRetry while final delivery keeps its current retry behavior.
-- Add metrics that distinguish cosmetic draft throttling/429 pauses from user-visible final-delivery failures, using bounded labels only.
-- Add deterministic fake-timer/controlled-promise tests for one-in-flight behavior, minimum interval, latest-text coalescing, retry-after pause, no post-pause burst, hung/rejected drafts, prompt final delivery, typing coordination, `NO_REPLY`/error/abort cleanup, and non-draft platforms.
-- Commit separately with `#44` in the message.
+- [ ] Introduce one bounded per-stream draft scheduler/state machine. Keep at most one draft request in flight and only one latest pending text snapshot; stale intermediate snapshots are discarded.
+- [ ] Enforce a Telegram-safe minimum send interval and use structured 429 `retry_after` feedback to pause future drafts. Do not retry the rejected stale draft or burst queued drafts after the pause.
+- [ ] Final `sendMessage` remains authoritative and must not wait indefinitely for a draft. All final, error, abort, shutdown, and `NO_REPLY` paths must cancel timers and settle/abandon bounded draft state safely.
+- [ ] Coordinate typing with drafts: after the first successful visible draft, stop periodic `sendChatAction` for that stream; preserve current typing behavior where drafts are unsupported.
+- [ ] Preserve the existing rule that `sendMessageDraft` bypasses generic autoRetry while final delivery keeps its current retry behavior.
+- [ ] Add metrics that distinguish cosmetic draft throttling/429 pauses from user-visible final-delivery failures, using bounded labels only.
+- [ ] Add deterministic fake-timer/controlled-promise tests for one-in-flight behavior, minimum interval, latest-text coalescing, retry-after pause, no post-pause burst, hung/rejected drafts, prompt final delivery, typing coordination, `NO_REPLY`/error/abort cleanup, and non-draft platforms.
+- [ ] Commit separately with `#44` in the message.
 
 ## Scope and review boundaries
 
