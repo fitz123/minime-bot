@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.1
+
+- Auto-reconnect active Pi sessions when an agent's configured model or thinking level changes, while preserving the stored Pi session id/context.
+- Persist session runtime metadata (`provider`, `model`, `thinking`) for observability and log stored-session resumes under updated runtime config.
+
 ## 2026.7.0
 
 - Allow satellite agent workspaces to load trusted shared platform rules through a narrow `.claude/rules/platform` symlink to the configured main workspace platform rules directory.
