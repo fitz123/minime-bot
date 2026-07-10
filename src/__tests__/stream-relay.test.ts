@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:
 import { join } from "node:path";
 import { splitMessage, extractText, isImageExtension, sendOutboxFiles, relayStream, collapseNewlines } from "../stream-relay.js";
 import type { DraftSendResult, StreamLine, StreamEvent, AssistantMessage, ResultMessage, ToolProgress, PlatformContext } from "../types.js";
+import { draftSchedulerEvents, finalDeliveryFailures } from "../metrics.js";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -602,6 +603,82 @@ describe("relayStream bounded draft scheduler", () => {
     await relay;
   });
 
+  it("contains rejected and failed draft outcomes, keeps typing, and records production metrics", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+
+    for (const outcome of ["rejected", "failed"] as const) {
+      const { platform, sends, typings } = mockPlatform({ typingIntervalMs: 100 });
+      const failedBefore = (await draftSchedulerEvents.get()).values
+        .find(({ labels }) => labels.event === "failed")?.value ?? 0;
+      let calls = 0;
+      platform.sendDraft = async () => {
+        calls += 1;
+        if (calls === 1 && outcome === "rejected") throw new Error("cosmetic failure");
+        if (calls === 1) return { status: "failed" };
+        return { status: "sent" };
+      };
+      const addSecond = deferred<void>();
+      const finish = deferred<void>();
+      async function* stream(): AsyncGenerator<StreamLine> {
+        yield { type: "stream_event", event: { delta: { type: "text_delta", text: "first" } } } as StreamEvent;
+        await addSecond.promise;
+        yield { type: "stream_event", event: { delta: { type: "text_delta", text: " second" } } } as StreamEvent;
+        await finish.promise;
+        yield { type: "result", result: "first second", session_id: "test" } as ResultMessage;
+      }
+
+      const relay = relayStream(stream(), platform);
+      await flushMicrotasks();
+      t.mock.timers.tick(500);
+      await flushMicrotasks();
+      assert.ok(typings.length > 1, `${outcome} draft must not stop periodic typing`);
+      addSecond.resolve();
+      await flushMicrotasks();
+      t.mock.timers.tick(500);
+      await flushMicrotasks();
+      assert.strictEqual(calls, 2, `${outcome} draft must not stop later coalesced progress`);
+      finish.resolve();
+      await relay;
+      assert.deepStrictEqual(sends, [{ text: "first second" }]);
+      const failedAfter = (await draftSchedulerEvents.get()).values
+        .find(({ labels }) => labels.event === "failed")?.value ?? 0;
+      assert.strictEqual(failedAfter, failedBefore + 1);
+    }
+  });
+
+  it("aborts an in-flight draft before authoritative final delivery", async () => {
+    const { platform, sends } = mockPlatform({ typingIndicator: false });
+    const visibleDrafts: string[] = [];
+    let releaseDraft!: () => void;
+    let draftSignal: AbortSignal | undefined;
+    platform.sendDraft = async (_draftId, text, signal) => new Promise<DraftSendResult>((resolve, reject) => {
+      draftSignal = signal;
+      releaseDraft = () => {
+        if (signal?.aborted) return;
+        visibleDrafts.push(text);
+        resolve({ status: "sent" });
+      };
+      signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    });
+    const finish = deferred<void>();
+    async function* stream(): AsyncGenerator<StreamLine> {
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "final answer" } } } as StreamEvent;
+      await finish.promise;
+      yield { type: "result", result: "final answer", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(stream(), platform);
+    await flushMicrotasks();
+    assert.ok(draftSignal && !draftSignal.aborted);
+    finish.resolve();
+    await relay;
+    assert.strictEqual(draftSignal.aborted, true);
+    assert.deepStrictEqual(sends, [{ text: "final answer" }]);
+    releaseDraft();
+    await flushMicrotasks();
+    assert.deepStrictEqual(visibleDrafts, [], "an aborted stale draft cannot become visible after final delivery");
+  });
+
   it("bounds waiting for a hung cosmetic draft before authoritative final delivery", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const { platform, sends } = mockPlatform({ typingIndicator: false });
@@ -951,7 +1028,10 @@ describe("relayStream sendMessage error handling", () => {
     const stream = fakeStream([text]);
 
     // First chunk fails — throws so the queue's error handler can notify the user
+    const failuresBefore = (await finalDeliveryFailures.get()).values[0]?.value ?? 0;
     await assert.rejects(() => relayStream(stream, platform), /Failed to deliver response/);
+    const failuresAfter = (await finalDeliveryFailures.get()).values[0]?.value ?? 0;
+    assert.strictEqual(failuresAfter, failuresBefore + 1, "production failure wiring increments the final-delivery metric");
 
     // No chunks should have been sent
     assert.strictEqual(sends.length, 0, "Should not send any chunks when first fails");

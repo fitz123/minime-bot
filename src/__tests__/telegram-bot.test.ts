@@ -1,10 +1,9 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn, telegramMediaFailureMessage } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
-import { MediaPipelineError } from "../voice.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -1375,6 +1374,7 @@ describe("command handler wiring", () => {
       activeCount: () => 0,
       getActiveSession: () => undefined,
       isActive: () => false,
+      touchActivity: () => {},
     } as unknown as SessionManager & { calls: string[] };
   }
 
@@ -1462,20 +1462,32 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
   });
-});
 
-describe("Telegram media failure mapping", () => {
-  it("reports metadata, download, size, conversion, transcription, and empty stages accurately", () => {
-    const cases = [
-      ["metadata", /metadata/],
-      ["download", /download/],
-      ["size-limit", /too large/],
-      ["conversion", /convert/],
-      ["transcription", /transcribe/],
-      ["empty-transcript", /empty result/],
-    ] as const;
-    for (const [stage, expected] of cases) {
-      assert.match(telegramMediaFailureMessage(new MediaPipelineError(stage), "download"), expected);
+  it("makes metadata failures visible from every Telegram media handler", async () => {
+    const mediaMessages = [
+      { voice: { file_id: "voice-1", duration: 1 } },
+      { photo: [{ file_id: "photo-1", file_unique_id: "photo-u1", width: 1, height: 1 }] },
+      { document: { file_id: "doc-1", file_unique_id: "doc-u1" } },
+      { video: { file_id: "video-1", file_unique_id: "video-u1", width: 1, height: 1, duration: 1 } },
+    ];
+
+    for (const [index, media] of mediaMessages.entries()) {
+      const apiCalls: Array<{ method: string; payload: any }> = [];
+      const bot = initBot(createMockSessionManager(), apiCalls);
+      await bot.handleUpdate({
+        update_id: 100 + index,
+        message: {
+          message_id: 100 + index,
+          from: { id: testChatId, is_bot: false, first_name: "Test" },
+          chat: { id: testChatId, type: "private", first_name: "Test" },
+          date: Math.floor(Date.now() / 1000),
+          ...media,
+        },
+      } as never);
+
+      const reply = apiCalls.find((call) => call.method === "sendMessage");
+      assert.ok(reply, `media handler ${index} must send a visible reply`);
+      assert.match(String(reply.payload.text), /metadata/i);
     }
   });
 });

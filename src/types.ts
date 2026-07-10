@@ -140,7 +140,7 @@ export interface PlatformContext {
   sendTyping(): Promise<void>;
 
   /** Send a cosmetic streaming draft update and report a bounded transport outcome. */
-  sendDraft(draftId: number, text: string): Promise<DraftSendResult>;
+  sendDraft(draftId: number, text: string, signal?: AbortSignal): Promise<DraftSendResult>;
 
   /** Send a file (image or document). */
   sendFile(filePath: string, isImage: boolean): Promise<void>;

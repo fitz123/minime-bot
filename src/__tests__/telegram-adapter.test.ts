@@ -117,6 +117,26 @@ describe("createTelegramAdapter", () => {
       assert.strictEqual(draftCalls[0].opts?.parse_mode, "HTML");
     });
 
+    it("forwards cancellation to the Telegram request", async () => {
+      const ctx = mockContext();
+      let receivedSignal: AbortSignal | undefined;
+      ctx.api.sendMessageDraft = async (
+        _cId: number,
+        _dId: number,
+        _text: string,
+        _opts?: any,
+        signal?: AbortSignal,
+      ) => {
+        receivedSignal = signal;
+        throw new DOMException("aborted", "AbortError");
+      };
+      const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
+      const controller = new AbortController();
+      controller.abort();
+      assert.deepStrictEqual(await adapter.sendDraft(42, "text", controller.signal), { status: "failed" });
+      assert.strictEqual(receivedSignal, controller.signal);
+    });
+
     it("is a no-op for group bindings", async () => {
       const ctx = mockContext();
       const draftCalls: unknown[] = [];

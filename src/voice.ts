@@ -130,9 +130,12 @@ async function downloadAttempt(
     }
 
     if (!resp.ok) {
+      controller.abort();
+      void resp.body?.cancel().catch(() => {});
+      const retryable = isRetryableStatus(resp.status);
       throw new DownloadAttemptError(
-        isRetryableStatus(resp.status),
-        resp.status === 429 ? retryAfterMs(resp.headers) : undefined,
+        retryable,
+        retryable ? retryAfterMs(resp.headers) : undefined,
         new Error(`HTTP ${resp.status}`),
       );
     }
@@ -141,6 +144,8 @@ async function downloadAttempt(
     if (contentLength && maxBytes !== undefined) {
       const declaredBytes = Number(contentLength);
       if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+        controller.abort();
+        void resp.body?.cancel().catch(() => {});
         throw new MediaPipelineError("size-limit");
       }
     }
@@ -153,6 +158,7 @@ async function downloadAttempt(
         throw new DownloadAttemptError(true, undefined, error);
       }
       if (maxBytes !== undefined && buffer.byteLength > maxBytes) {
+        controller.abort();
         throw new MediaPipelineError("size-limit");
       }
       await writeFile(destPath, buffer, { mode: 0o600 });
@@ -175,6 +181,8 @@ async function downloadAttempt(
         if (chunk.done) break;
         written += chunk.value.byteLength;
         if (maxBytes !== undefined && written > maxBytes) {
+          controller.abort();
+          void reader.cancel().catch(() => {});
           throw new MediaPipelineError("size-limit");
         }
         await file.write(chunk.value);

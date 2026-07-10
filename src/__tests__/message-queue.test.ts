@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { PlatformContext } from "../types.js";
+import { messageQueueRejectionNotices, messageQueueSaturation } from "../metrics.js";
 import {
   MessageQueue,
   buildCollectPrompt,
@@ -282,6 +283,10 @@ describe("MessageQueue queue cap", () => {
     const platform = mockPlatform((message) => { notices.push(message); }, false);
     const queue = new MessageQueue(processFn, { debounceMs: 50, queueCap: 3 });
     const rejectedCleanups = Array.from({ length: 5 }, () => ({ cleanup: 0, drop: 0 }));
+    const saturationBefore = (await messageQueueSaturation.get()).values
+      .find(({ labels }) => labels.buffer === "debounce")?.value ?? 0;
+    const noticesBefore = (await messageQueueRejectionNotices.get()).values
+      .find(({ labels }) => labels.buffer === "debounce" && labels.result === "sent")?.value ?? 0;
 
     await Promise.all([
       "accepted-1",
@@ -313,6 +318,12 @@ describe("MessageQueue queue cap", () => {
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].text, "accepted-1\n\naccepted-2\n\naccepted-3");
     assert.ok(!calls[0].text.includes("rejected"));
+    const saturationAfter = (await messageQueueSaturation.get()).values
+      .find(({ labels }) => labels.buffer === "debounce")?.value ?? 0;
+    const noticesAfter = (await messageQueueRejectionNotices.get()).values
+      .find(({ labels }) => labels.buffer === "debounce" && labels.result === "sent")?.value ?? 0;
+    assert.strictEqual(saturationAfter - saturationBefore, 5, "production saturation wiring records each rejection");
+    assert.strictEqual(noticesAfter - noticesBefore, 1, "production notice wiring records the visible outcome");
 
     queue.clearAll();
   });
@@ -371,22 +382,34 @@ describe("MessageQueue queue cap", () => {
     queue.clearAll();
   });
 
-  it("rate-bounds notices, sends again after cooldown, and creates no rejection timer", async (t) => {
+  it("preserves the notice cooldown across idle eviction and clears its expiry timer", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
-    const { processFn } = createMockProcess();
+    const { processFn, calls } = createMockProcess();
     const notices: string[] = [];
     const platform = mockPlatform((message) => { notices.push(message); }, false);
     const queue = new MessageQueue(processFn, {
-      debounceMs: 60_000,
+      debounceMs: 10,
       queueCap: 1,
     });
 
     queue.enqueue("chat1", "main", "accepted", platform);
-    for (let i = 0; i < 20; i++) queue.enqueue("chat1", "main", `rejected-${i}`, platform);
+    queue.enqueue("chat1", "main", "rejected", platform);
     await flushMicrotasks();
     assert.strictEqual(notices.length, 1);
 
-    t.mock.timers.setTime(31_001);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.strictEqual(calls.length, 1, "the first accepted burst becomes idle");
+
+    queue.enqueue("chat1", "main", "accepted-inside-cooldown", platform);
+    queue.enqueue("chat1", "main", "rejected-inside-cooldown", platform);
+    await flushMicrotasks();
+    assert.strictEqual(notices.length, 1, "idle eviction must not reset the cooldown");
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+
+    t.mock.timers.tick(DEFAULT_REJECTION_NOTICE_COOLDOWN_MS - 20);
+    queue.enqueue("chat1", "main", "accepted-after-cooldown", platform);
     queue.enqueue("chat1", "main", "rejected-after-cooldown", platform);
     await flushMicrotasks();
     assert.strictEqual(notices.length, 2, "one later rejection is visible after the cooldown");

@@ -14,8 +14,6 @@ import {
   mediaPipelineFailureMessage,
   mediaPipelineStage,
   requireTranscript,
-  toMediaPipelineError,
-  type MediaPipelineStage,
 } from "./voice.js";
 import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath } from "./media-store.js";
 import { log } from "./logger.js";
@@ -41,11 +39,6 @@ function ensureAttachmentWithinLimit(attachment: { size?: number | null; name?: 
   if (typeof attachment.size === "number" && Number.isFinite(attachment.size) && attachment.size > maxBytes) {
     throw new MediaPipelineError("size-limit");
   }
-}
-
-/** Stage-aware user message used by Discord audio and image handlers. */
-export function discordMediaFailureMessage(error: unknown, fallback: MediaPipelineStage): string {
-  return mediaPipelineFailureMessage(error, fallback);
 }
 
 /**
@@ -352,11 +345,7 @@ export async function createDiscordBot(
             const ext = attachment.name?.match(/\.(\w+)$/)?.[0] ?? ".jpg";
             tempPath = allocateMediaPath(key, "discord-img", ext);
             await downloadFile(attachment.url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
-            try {
-              enforceMediaCap(config.sessionDefaults.maxMediaBytes);
-            } catch (error) {
-              throw toMediaPipelineError(error, "size-limit");
-            }
+            enforceMediaCap(config.sessionDefaults.maxMediaBytes);
 
             // Only include caption text with the first image to avoid duplication
             const caption = i === 0 ? (message.content ?? "").replace(botMentionRe, "").trim() : "";
@@ -377,7 +366,7 @@ export async function createDiscordBot(
           } catch (err) {
             const stage = mediaPipelineStage(err, "download");
             log.error("discord-bot", `Image media pipeline failed stage=${stage}`);
-            await message.reply(discordMediaFailureMessage(err, "download")).catch(() => {});
+            await message.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
             if (tempPath) discardMediaPath(tempPath);
           }
         }
@@ -403,7 +392,7 @@ export async function createDiscordBot(
           } catch (err) {
             const stage = mediaPipelineStage(err, "transcription");
             log.error("discord-bot", `Voice media pipeline failed stage=${stage}`);
-            await message.reply(discordMediaFailureMessage(err, "transcription")).catch(() => {});
+            await message.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
           } finally {
             if (tempPath) await cleanupTempFile(tempPath);
           }

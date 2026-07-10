@@ -2,19 +2,19 @@ process.env.TZ = "UTC";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { Client, Events, REST } from "discord.js";
 import {
+  createDiscordBot,
   discordSessionKey,
   resolveDiscordBinding,
   shouldRespondInDiscord,
   buildDiscordSourcePrefix,
   handleDiscordChatInputCommand,
   installDiscordErrorHandlers,
-  discordMediaFailureMessage,
 } from "../discord-bot.js";
 import { validateDiscordBinding } from "../config.js";
 import type { BotConfig, DiscordBinding, DiscordConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
-import { MediaPipelineError } from "../voice.js";
 
 // --- discordSessionKey ---
 
@@ -46,13 +46,67 @@ describe("discordSessionKey", () => {
   });
 });
 
-describe("Discord media failure mapping", () => {
-  it("makes image download failures visible and distinguishes audio stages", () => {
-    assert.match(discordMediaFailureMessage(new MediaPipelineError("download"), "download"), /download/);
-    assert.match(discordMediaFailureMessage(new MediaPipelineError("size-limit"), "download"), /too large/);
-    assert.match(discordMediaFailureMessage(new MediaPipelineError("conversion"), "transcription"), /convert/);
-    assert.match(discordMediaFailureMessage(new MediaPipelineError("transcription"), "transcription"), /transcribe/);
-    assert.match(discordMediaFailureMessage(new MediaPipelineError("empty-transcript"), "transcription"), /empty result/);
+describe("Discord media failure handling", () => {
+  it("makes image and audio size failures visible from the actual message handler", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalPut = REST.prototype.put;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    REST.prototype.put = async () => ({}) as never;
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+
+    try {
+      const { client } = await createDiscordBot(config, discordConfig, sessionManager);
+      for (const [contentType, name] of [["image/png", "large.png"], ["audio/ogg", "large.ogg"]] as const) {
+        const replies: string[] = [];
+        const channel = {
+          send: async () => ({}),
+          isThread: () => false,
+        };
+        client.emit(Events.MessageCreate, {
+          author: { bot: false, username: "tester", globalName: "Tester" },
+          channel,
+          channelId: "channel-1",
+          guildId: "guild-1",
+          createdTimestamp: Date.now(),
+          mentions: { has: () => false },
+          attachments: new Map([["attachment-1", {
+            contentType,
+            name,
+            size: 11,
+            url: "https://example.invalid/media",
+          }]]),
+          content: "",
+          reply: async (text: string) => { replies.push(text); },
+        } as never);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepStrictEqual(replies, ["Media is too large to process."]);
+      }
+    } finally {
+      Client.prototype.login = originalLogin;
+      REST.prototype.put = originalPut;
+    }
   });
 });
 

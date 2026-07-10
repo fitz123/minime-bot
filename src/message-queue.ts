@@ -66,6 +66,8 @@ interface ChatQueueState {
   nextRejectionNoticeAt: number;
   /** A microtask notice waiting to be dispatched; clear() can cancel it. */
   rejectionNoticeScheduled: boolean;
+  /** Releases idle cooldown-only state without retaining it indefinitely. */
+  rejectionCooldownTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /**
@@ -121,8 +123,13 @@ export class MessageQueue {
         agentId,
         nextRejectionNoticeAt: 0,
         rejectionNoticeScheduled: false,
+        rejectionCooldownTimer: null,
       };
       this.queues.set(chatId, state);
+    }
+    if (state.rejectionCooldownTimer) {
+      clearTimeout(state.rejectionCooldownTimer);
+      state.rejectionCooldownTimer = null;
     }
     state.agentId = agentId;
     return state;
@@ -339,6 +346,9 @@ export class MessageQueue {
       if (state.debounceTimer) {
         clearTimeout(state.debounceTimer);
       }
+      if (state.rejectionCooldownTimer) {
+        clearTimeout(state.rejectionCooldownTimer);
+      }
       state.rejectionNoticeScheduled = false;
       this.runCleanups(state.pendingCleanups);
       this.runCleanups(state.pendingDropCleanups);
@@ -367,6 +377,9 @@ export class MessageQueue {
     for (const [chatId, state] of this.queues) {
       if (state.debounceTimer) {
         clearTimeout(state.debounceTimer);
+      }
+      if (state.rejectionCooldownTimer) {
+        clearTimeout(state.rejectionCooldownTimer);
       }
       state.rejectionNoticeScheduled = false;
       this.runCleanups(state.pendingCleanups);
@@ -444,7 +457,7 @@ export class MessageQueue {
     }
   }
 
-  /** Remove idle queue state to free memory (Context refs, etc). */
+  /** Remove idle queue state, retaining only a bounded saturation cooldown. */
   private evictIfIdle(chatId: string): void {
     const state = this.queues.get(chatId);
     if (
@@ -454,7 +467,20 @@ export class MessageQueue {
       state.collectBuffer.length === 0 &&
       !state.debounceTimer
     ) {
-      this.queues.delete(chatId);
+      const cooldownRemaining = state.nextRejectionNoticeAt - Date.now();
+      if (cooldownRemaining <= 0) {
+        this.queues.delete(chatId);
+        return;
+      }
+
+      // Do not retain the latest platform/context solely for rate limiting.
+      state.latestPlatform = null;
+      if (state.rejectionCooldownTimer === null) {
+        state.rejectionCooldownTimer = setTimeout(() => {
+          state.rejectionCooldownTimer = null;
+          this.evictIfIdle(chatId);
+        }, cooldownRemaining);
+      }
     }
   }
 }

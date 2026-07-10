@@ -74,14 +74,14 @@ export function createTelegramAdapter(
       }
     },
 
-    async sendDraft(draftId: number, text: string): Promise<DraftSendResult> {
+    async sendDraft(draftId: number, text: string, signal?: AbortSignal): Promise<DraftSendResult> {
       if (!chatId || !isDm) return { status: "unsupported" };
       const html = markdownToHtml(text);
       try {
         await ctx.api.sendMessageDraft(chatId, draftId, html, {
           parse_mode: "HTML",
           ...threadOpts,
-        });
+        }, signal as Parameters<typeof ctx.api.sendMessageDraft>[4]);
         return { status: "sent" };
       } catch (err) {
         return draftFailureResult(err);

@@ -165,6 +165,7 @@ class DraftScheduler {
   private pauseUntil = 0;
   private cancelled = false;
   private unsupported = false;
+  private inFlightController: AbortController | null = null;
 
   constructor(
     private readonly platform: PlatformContext,
@@ -190,6 +191,7 @@ class DraftScheduler {
   cancel(): void {
     this.cancelled = true;
     this.clearPending();
+    this.inFlightController?.abort();
   }
 
   async closeAndWait(): Promise<void> {
@@ -231,11 +233,14 @@ class DraftScheduler {
     const text = this.pendingText;
     this.pendingText = null;
     this.lastStartedAt = now;
+    const controller = new AbortController();
+    this.inFlightController = controller;
     this.inFlight = Promise.resolve()
-      .then(() => this.platform.sendDraft(this.draftId, text))
+      .then(() => this.platform.sendDraft(this.draftId, text, controller.signal))
       .then((result) => this.handleResult(result))
       .catch(() => this.handleResult({ status: "failed" }))
       .finally(() => {
+        if (this.inFlightController === controller) this.inFlightController = null;
         this.inFlight = null;
         if (!this.cancelled) this.startOrSchedule();
       });

@@ -229,6 +229,20 @@ graceful stale-resume recoveries increment
 `bot_pi_session_resume_discarded_total`; recovered stale resumes and
 `/clean`-superseded startups do not increment `bot_session_crashes_total`.
 
+Message buffers remain capped at 20 inputs. Over-cap input is not processed and
+receives a coalesced resend-later notice, at most once per chat every 30 seconds.
+`bot_message_queue_saturation_total` counts rejected inputs with a bounded
+`buffer` label (`debounce` or `collect`), while
+`bot_message_queue_rejection_notices_total` records `sent`, `failed`, and
+`rate_limited` notice outcomes without identifying the chat.
+
+Media downloads retry transient network or stream failures and HTTP 408, 429,
+and 5xx responses up to three attempts, honoring a bounded `Retry-After` value.
+`bot_media_download_retries_total` records bounded `recovered` and `exhausted`
+outcomes. Permanent HTTP, size-limit, conversion, transcription, and empty
+transcript failures are not retried; user replies identify the failed stage
+without exposing transport details.
+
 Streaming draft backpressure is reported by
 `bot_draft_scheduler_events_total`; its bounded `event` label is one of
 `throttled`, `coalesced`, `rate_limited`, or `failed`. These cosmetic outcomes
