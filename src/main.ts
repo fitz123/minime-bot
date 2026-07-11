@@ -4,7 +4,7 @@ import { createTelegramBot, BOT_COMMANDS, type TelegramBotResult } from "./teleg
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
 import { startMetricsServer, stopMetricsServer } from "./metrics.js";
-import { startBotWithRetry } from "./bot-startup.js";
+import { runTelegramSetupInBackground, startBotWithRetry } from "./bot-startup.js";
 import { createWatchdog, type Watchdog } from "./polling-watchdog.js";
 import { restoreThreadCache, saveThreadCache } from "./message-thread-cache.js";
 import { restoreMessageIndex, saveMessageIndex } from "./message-content-index.js";
@@ -13,6 +13,7 @@ import { getVersion } from "./version.js";
 import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
+import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -102,7 +103,7 @@ async function main(): Promise<void> {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
     });
     telegramBot = bot;
@@ -113,12 +114,15 @@ async function main(): Promise<void> {
     echoWatcher.drain();
     echoWatcher.start();
 
-    // Polling liveness watchdog: exits the process if no updates arrive
-    // within the threshold AND the Telegram API heartbeat also fails.
+    // Polling liveness watchdog: successful getUpdates completions, including
+    // empty responses during silence, are the health signal. Incoming updates
+    // remain an activity signal only.
     watchdog = createWatchdog({
-      heartbeat: async () => {
+      pollProgress: () => pollProgress.snapshot(),
+      updateProcessing: () => updateProcessing.snapshot(),
+      heartbeat: async (signal) => {
         try {
-          await bot.api.getMe();
+          await bot.api.getMe(signal as Parameters<typeof bot.api.getMe>[0]);
           return true;
         } catch {
           return false;
@@ -144,8 +148,9 @@ async function main(): Promise<void> {
     startBotWithRetry(
       () =>
         bot.start({
+          timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
           allowed_updates: ["message", "message_reaction"],
-          onStart: async (botInfo) => {
+          onStart: (botInfo) => {
             startedSuccessfully = true;
             clearTimeout(startupTimeout);
             setBotUsername(botInfo.username);
@@ -156,12 +161,14 @@ async function main(): Promise<void> {
             // still serving. Orphans from prior runs are reclaimed via per-session
             // cleanupSessionMediaDir on close and enforceMediaCap eviction.
             if (watchdog) watchdog.start();
-            try {
-              await bot.api.setMyCommands(BOT_COMMANDS);
-              log.info("main", "Bot commands registered with Telegram");
-            } catch (err) {
-              log.error("main", "Failed to register bot commands:", err);
-            }
+            // grammY does not begin getUpdates until onStart returns. Command
+            // registration is non-critical and autoRetry may wait indefinitely,
+            // so keep it off the polling startup path.
+            runTelegramSetupInBackground(
+              () => bot.api.setMyCommands(BOT_COMMANDS),
+              () => log.info("main", "Bot commands registered with Telegram"),
+              (err) => log.error("main", "Failed to register bot commands:", err),
+            );
           },
         }),
     ).catch((err) => {

@@ -1417,6 +1417,45 @@ describe("command handler wiring", () => {
     return bot;
   }
 
+  it("installs and exposes polling and update-processing probes", async () => {
+    const mockSM = createMockSessionManager();
+    const { bot, pollProgress, updateProcessing } = createTelegramBot(handlerConfig, mockSM);
+
+    assert.ok(bot.api.config.installedTransformers().includes(pollProgress.transformer));
+    assert.equal(pollProgress.snapshot().successfulPollCount, 0);
+    assert.deepEqual(updateProcessing.snapshot(), { inFlight: false, startedAtMs: null });
+
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "TestBot",
+      username: "test_bot",
+      can_join_groups: false,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+      has_topics_enabled: false,
+      allows_users_to_create_topics: false,
+    };
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    bot.use(async () => pending);
+    const handling = bot.handleUpdate({
+      update_id: 99,
+      message: {
+        message_id: 99,
+        from: { id: testChatId, is_bot: false, first_name: "Test" },
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        date: Math.floor(Date.now() / 1000),
+      },
+    });
+    assert.equal(updateProcessing.snapshot().inFlight, true);
+    release();
+    await handling;
+    assert.deepEqual(updateProcessing.snapshot(), { inFlight: false, startedAtMs: null });
+  });
+
   it("/reconnect calls closeSession (not destroySession)", async () => {
     const mockSM = createMockSessionManager();
     const bot = initBot(mockSM);

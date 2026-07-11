@@ -22,6 +22,13 @@ import {
   piSessionResumeDiscarded,
   telegramApiErrors,
   telegramApiCalls,
+  telegramPollProgressAge,
+  telegramPollInFlight,
+  pollWatchdogChecks,
+  pollWatchdogRestarts,
+  recordPollProgress,
+  recordPollWatchdogCheck,
+  recordPollWatchdogRestart,
   sessionsActive,
   sessionCrashes,
   messagesReceived,
@@ -211,6 +218,31 @@ describe("recordTelegramApiCall", () => {
     const val = await telegramApiCalls.get();
     assert.strictEqual(val.values[0].labels.binding, "unbound");
     assert.strictEqual(val.values[0].value, 1);
+  });
+});
+
+describe("polling watchdog metrics", () => {
+  it("records progress gauges without labels", async () => {
+    recordPollProgress(12_500, true);
+    assert.equal((await telegramPollProgressAge.get()).values[0].value, 12.5);
+    assert.equal((await telegramPollInFlight.get()).values[0].value, 1);
+
+    recordPollProgress(-1, false);
+    assert.equal((await telegramPollProgressAge.get()).values[0].value, 0);
+    assert.equal((await telegramPollInFlight.get()).values[0].value, 0);
+  });
+
+  it("uses only bounded check outcomes and restart reasons", async () => {
+    recordPollWatchdogCheck("healthy_quiet");
+    recordPollWatchdogCheck("poll_stalled");
+    recordPollWatchdogRestart("poll_stalled");
+
+    const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "healthy_quiet")?.value, 1);
+    assert.equal(checks.values.find((v) => v.labels.outcome === "poll_stalled")?.value, 1);
+    const restarts = await pollWatchdogRestarts.get();
+    assert.equal(restarts.values[0].labels.reason, "poll_stalled");
+    assert.equal(restarts.values[0].value, 1);
   });
 });
 

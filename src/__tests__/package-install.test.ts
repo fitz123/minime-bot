@@ -205,10 +205,19 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
     "scripts/deliver.sh",
+    "scripts/monitoring_native.py",
+    "scripts/alertmanager_webhook.py",
+    "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
+    "docs/monitoring.md",
+    "examples/monitoring/ai.minime.alertmanager-webhook.plist",
+    "examples/monitoring/ai.minime.runtime-doctor.plist",
+    "examples/monitoring/alertmanager.yml",
+    "examples/monitoring/minime.rules.yml",
+    "examples/monitoring/prometheus.yml",
     ...EXPECTED_BUNDLED_AGENT_FILES.map((file) => `dist/extensions/pi/subagent/agents/${file}`),
     ...EXPECTED_BUNDLED_PROMPT_FILES.map((file) => `dist/extensions/pi/subagent/prompts/${file}`),
   ]) {
@@ -277,6 +286,27 @@ describe("package artifact install", () => {
         env: commandEnv(),
       });
       assert.equal(install.status, 0, install.stderr || install.stdout);
+
+      const installedPackage = join(projectDir, "node_modules", "minime-bot");
+      for (const helper of ["monitoring_native.py", "alertmanager_webhook.py", "runtime_doctor.py"]) {
+        const helperPath = join(installedPackage, "scripts", helper);
+        assert.ok(existsSync(helperPath), `expected installed native helper ${helper}`);
+        const helperResult = spawnSync("python3", [helperPath, "--help"], {
+          cwd: projectDir,
+          encoding: "utf8",
+          env: commandEnv(),
+        });
+        assert.equal(helperResult.status, 0, helperResult.stderr || helperResult.stdout || String(helperResult.error));
+      }
+      for (const plist of ["ai.minime.alertmanager-webhook.plist", "ai.minime.runtime-doctor.plist"]) {
+        const plistPath = join(installedPackage, "examples", "monitoring", plist);
+        const plistResult = spawnSync(
+          "python3",
+          ["-c", "import plistlib,sys; plistlib.load(open(sys.argv[1], 'rb'))", plistPath],
+          { cwd: projectDir, encoding: "utf8", env: commandEnv() },
+        );
+        assert.equal(plistResult.status, 0, plistResult.stderr || String(plistResult.error));
+      }
 
       const help = runInstalledBin(projectDir, ["--help"], workspace);
       assert.equal(help.status, 0, help.stderr);

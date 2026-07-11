@@ -259,6 +259,18 @@ If recovery fails, the delivered error includes the original 1009/message-too-bi
 cause. `PI_EXTENSIONS_DISABLED=1` disables this normalizer with the other
 first-party wrappers.
 
+Telegram polling liveness is based on successful `getUpdates` completions,
+including empty responses during quiet chats. The runtime uses a 30-second
+long-poll timeout and treats 90 seconds without successful poll progress as
+stale. A bounded API check then classifies a deliberate restart as
+`poll_stalled` or `api_unreachable`; ordinary Telegram silence never causes a
+restart. The low-cardinality metrics are
+`bot_telegram_poll_progress_age_seconds`, `bot_telegram_poll_in_flight`,
+`bot_poll_watchdog_checks_total`, and `bot_poll_watchdog_restarts_total`.
+Because grammY pauses simple polling while middleware runs, bounded media
+preprocessing is tracked separately and allowed up to ten minutes before it is
+treated as a stalled handler.
+
 ## Launchd Operations
 
 The packaged restart script is self-safe by default when the bot runs under
@@ -322,6 +334,15 @@ the local `FAIL diagnostics: ...` cron log, and admin delivery-failure fallback
 uses the same concise failure context.
 
 More detail is in `docs/launchd-operations.md`.
+
+### Host-native monitoring
+
+The package also ships a Python-standard-library Telegram sender, loopback
+Alertmanager webhook, and one-shot runtime doctor. They do not load Node or
+package JavaScript, and the doctor can report failures of the container
+monitoring stack itself. See [Host-native monitoring and Telegram alerts](docs/monitoring.md)
+for prerequisites, configuration, installation, validation, diagnostics, and
+rollback.
 
 ## Repository Boundaries
 

@@ -29,6 +29,12 @@ import { logReaction } from "./reaction-log.js";
 import { EchoWatcher, ECHO_PREFIX } from "./echo-watcher.js";
 import { readQuotaStatus } from "./quota-status.js";
 import { buildStatusReport } from "./status-report.js";
+import {
+  createPollProgressProbe,
+  createUpdateProcessingProbe,
+  type PollProgressProbe,
+  type UpdateProcessingProbe,
+} from "./poll-progress.js";
 
 
 // Re-export for backward compatibility (tests import from here)
@@ -689,6 +695,8 @@ export interface TelegramBotResult {
   bot: Bot;
   messageQueue: MessageQueue;
   echoWatcher: EchoWatcher;
+  pollProgress: PollProgressProbe;
+  updateProcessing: UpdateProcessingProbe;
 }
 
 /** autoRetry options — exported so tests can assert the rethrowHttpErrors value. */
@@ -767,6 +775,17 @@ export function createTelegramBot(
   // errors). `sendMessageDraft` is excluded: drafts are cosmetic fire-and-
   // forget calls; retries amplify 429 log noise without user-visible benefit.
   bot.api.config.use(createDraftSkipAutoRetryTransformer());
+
+  // Outermost transformer: observe completion of each logical getUpdates call,
+  // including grammY polling calls, without retaining request/response data.
+  const pollProgress = createPollProgressProbe();
+  bot.api.config.use(pollProgress.transformer);
+
+  // Simple long polling waits for update middleware before the next poll.
+  // Expose that bounded state so the watchdog does not misclassify legitimate
+  // media preprocessing as a stuck getUpdates loop.
+  const updateProcessing = createUpdateProcessingProbe();
+  bot.use(updateProcessing.middleware);
 
   const maxMessageAgeMs = config.sessionDefaults.maxMessageAgeMs;
 
@@ -1296,5 +1315,5 @@ export function createTelegramBot(
     },
   });
 
-  return { bot, messageQueue, echoWatcher };
+  return { bot, messageQueue, echoWatcher, pollProgress, updateProcessing };
 }

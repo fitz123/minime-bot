@@ -33,6 +33,25 @@ export interface RetryOptions {
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
+ * Start non-critical Telegram setup without delaying grammY's first getUpdates.
+ * Synchronous throws and rejected promises are routed to the same error callback.
+ */
+export function runTelegramSetupInBackground(
+  task: () => Promise<unknown>,
+  onSuccess: () => void,
+  onError: (error: unknown) => void,
+): void {
+  let pending: Promise<unknown>;
+  try {
+    pending = task();
+  } catch (error) {
+    onError(error);
+    return;
+  }
+  void pending.then(onSuccess, onError);
+}
+
+/**
  * Start a grammY bot with retry-on-409 logic.
  *
  * When a new bot instance starts before Telegram releases the old long-poll

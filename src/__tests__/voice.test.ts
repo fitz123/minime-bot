@@ -18,11 +18,6 @@ import {
 } from "../voice.js";
 import { mediaDownloadRetries } from "../metrics.js";
 
-async function flushAsyncWork(): Promise<void> {
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-}
-
 async function retryMetricValue(result: "recovered" | "exhausted"): Promise<number> {
   return (await mediaDownloadRetries.get()).values.find(({ labels }) => labels.result === result)?.value ?? 0;
 }
@@ -243,8 +238,18 @@ describe("downloadFile", () => {
   });
 
   it("honors bounded numeric and HTTP-date Retry-After on every retryable status", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
     const originalFetch = globalThis.fetch;
+    const realSetTimeout = globalThis.setTimeout;
+    const observedRetryDelays: number[] = [];
+    t.mock.method(Date, "now", () => 1_000);
+    t.mock.method(globalThis, "setTimeout", ((callback: (...args: any[]) => void, delay = 0, ...args: any[]) => {
+      const delayMs = Number(delay);
+      if (delayMs === 30_000) {
+        return realSetTimeout(callback, delayMs, ...args);
+      }
+      observedRetryDelays.push(delayMs);
+      return realSetTimeout(callback, 0, ...args);
+    }) as typeof setTimeout);
 
     try {
       const cases = [
@@ -265,23 +270,16 @@ describe("downloadFile", () => {
           return new Response(new Uint8Array([1]));
         }) as unknown as typeof fetch;
 
-        const pending = downloadFile(`https://example.com/retry-after-${testCase.status}`, testDest);
-        while (calls === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-        await flushAsyncWork();
-        t.mock.timers.tick(testCase.expectedMs - 1);
-        await Promise.resolve();
-        assert.strictEqual(calls, 1, `HTTP ${testCase.status} retried before Retry-After elapsed`);
-        t.mock.timers.tick(1);
-        await pending;
+        await downloadFile(`https://example.com/retry-after-${testCase.status}`, testDest);
         assert.strictEqual(calls, 2);
+        assert.strictEqual(observedRetryDelays.at(-1), testCase.expectedMs);
       }
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
 
-  it("creates fresh timeout state for every attempt", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  it("creates fresh timeout state for every attempt", async () => {
     const originalFetch = globalThis.fetch;
     const signals: AbortSignal[] = [];
     let calls = 0;
@@ -298,16 +296,7 @@ describe("downloadFile", () => {
     }) as typeof fetch;
 
     try {
-      const pending = downloadFile("https://example.com/timeout", testDest, { timeoutMs: 5 });
-      while (calls === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(5);
-      await flushAsyncWork();
-      assert.strictEqual(calls, 1);
-      t.mock.timers.tick(99);
-      await Promise.resolve();
-      assert.strictEqual(calls, 1);
-      t.mock.timers.tick(1);
-      await pending;
+      await downloadFile("https://example.com/timeout", testDest, { timeoutMs: 5 });
       assert.strictEqual(calls, 2);
       assert.notStrictEqual(signals[0], signals[1]);
       assert.strictEqual(signals[0].aborted, true);

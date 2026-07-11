@@ -1,0 +1,10 @@
+groups:
+  - name: minime-runtime
+    rules:
+      - alert: MinimeBotMetricsDown
+        expr: up{job="minime-bot"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Minime bot metrics target is unavailable
