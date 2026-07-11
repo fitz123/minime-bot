@@ -13,6 +13,7 @@ import { getVersion } from "./version.js";
 import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
+import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -102,7 +103,7 @@ async function main(): Promise<void> {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
     });
     telegramBot = bot;
@@ -113,12 +114,14 @@ async function main(): Promise<void> {
     echoWatcher.drain();
     echoWatcher.start();
 
-    // Polling liveness watchdog: exits the process if no updates arrive
-    // within the threshold AND the Telegram API heartbeat also fails.
+    // Polling liveness watchdog: successful getUpdates completions, including
+    // empty responses during silence, are the health signal. Incoming updates
+    // remain an activity signal only.
     watchdog = createWatchdog({
-      heartbeat: async () => {
+      pollProgress: () => pollProgress.snapshot(),
+      heartbeat: async (signal) => {
         try {
-          await bot.api.getMe();
+          await bot.api.getMe(signal as Parameters<typeof bot.api.getMe>[0]);
           return true;
         } catch {
           return false;
@@ -144,6 +147,7 @@ async function main(): Promise<void> {
     startBotWithRetry(
       () =>
         bot.start({
+          timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
           allowed_updates: ["message", "message_reaction"],
           onStart: async (botInfo) => {
             startedSuccessfully = true;

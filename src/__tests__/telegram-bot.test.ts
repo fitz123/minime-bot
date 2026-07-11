@@ -1417,6 +1417,14 @@ describe("command handler wiring", () => {
     return bot;
   }
 
+  it("installs and exposes the getUpdates progress transformer", () => {
+    const mockSM = createMockSessionManager();
+    const { bot, pollProgress } = createTelegramBot(handlerConfig, mockSM);
+
+    assert.ok(bot.api.config.installedTransformers().includes(pollProgress.transformer));
+    assert.equal(pollProgress.snapshot().successfulPollCount, 0);
+  });
+
   it("/reconnect calls closeSession (not destroySession)", async () => {
     const mockSM = createMockSessionManager();
     const bot = initBot(mockSM);

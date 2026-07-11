@@ -29,10 +29,10 @@ npm pack --dry-run
 
 ### Task 1: #47 polling progress watchdog
 
-- [ ] Implement and wire the real `getUpdates` progress probe and bounded watchdog state machine.
-- [ ] Add stable low-cardinality logs/metrics for healthy quiet polling and restart reasons.
-- [ ] Add deterministic fake-clock/probe coverage for every #47 acceptance path.
-- [ ] Run focused and full validation, then commit this task independently with `#47` in the commit message.
+- [x] Implement and wire the real `getUpdates` progress probe and bounded watchdog state machine.
+- [x] Add stable low-cardinality logs/metrics for healthy quiet polling and restart reasons.
+- [x] Add deterministic fake-clock/probe coverage for every #47 acceptance path.
+- [x] Run focused and full validation, then commit this task independently with `#47` in the commit message.
 
 ### Runtime design
 

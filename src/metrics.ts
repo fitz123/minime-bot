@@ -110,6 +110,39 @@ export const telegramApiCalls = new client.Counter({
   labelNames: ["method", "binding"] as const,
 });
 
+// --- Telegram polling watchdog ---
+
+export type PollWatchdogCheckOutcome =
+  | "healthy_active"
+  | "healthy_quiet"
+  | "poll_resumed"
+  | "poll_stalled"
+  | "api_unreachable"
+  | "overlap_suppressed";
+export type PollWatchdogRestartReason = "poll_stalled" | "api_unreachable";
+
+export const telegramPollProgressAge = new client.Gauge({
+  name: "bot_telegram_poll_progress_age_seconds",
+  help: "Seconds since the last successful Telegram getUpdates completion or watchdog monitoring start",
+});
+
+export const telegramPollInFlight = new client.Gauge({
+  name: "bot_telegram_poll_in_flight",
+  help: "Whether a Telegram getUpdates request is currently in flight",
+});
+
+export const pollWatchdogChecks = new client.Counter({
+  name: "bot_poll_watchdog_checks_total",
+  help: "Total polling watchdog checks by bounded outcome",
+  labelNames: ["outcome"] as const,
+});
+
+export const pollWatchdogRestarts = new client.Counter({
+  name: "bot_poll_watchdog_restarts_total",
+  help: "Total polling watchdog restart decisions by bounded reason",
+  labelNames: ["reason"] as const,
+});
+
 // --- Session lifecycle ---
 
 export const sessionsActive = new client.Gauge({
@@ -299,6 +332,19 @@ export function recordTelegramApiError(method: string, errorCode: number | strin
  */
 export function recordTelegramApiCall(method: string, binding: string): void {
   telegramApiCalls.inc({ method, binding });
+}
+
+export function recordPollProgress(ageMs: number, inFlight: boolean): void {
+  telegramPollProgressAge.set(Math.max(0, ageMs) / 1000);
+  telegramPollInFlight.set(inFlight ? 1 : 0);
+}
+
+export function recordPollWatchdogCheck(outcome: PollWatchdogCheckOutcome): void {
+  pollWatchdogChecks.inc({ outcome });
+}
+
+export function recordPollWatchdogRestart(reason: PollWatchdogRestartReason): void {
+  pollWatchdogRestarts.inc({ reason });
 }
 
 /** Record a rejected input without adding a chat identifier label. */
