@@ -68,7 +68,9 @@ The webhook flags are `--host` (default `127.0.0.1`), `--port` (default 9876),
 `--body-timeout` (default 5 seconds, capped at 30). `GET /healthz` is its local
 readiness endpoint. Only IPv4 loopback or `localhost` bind hosts are accepted.
 `MINIME_WEBHOOK_HOST`, `MINIME_WEBHOOK_PORT`, and `MINIME_WEBHOOK_PATH` provide
-the corresponding launchd environment settings.
+the corresponding launchd environment settings. The body timeout is an
+absolute input deadline, and the receiver caps concurrent requests so slow
+local clients cannot create unbounded request threads.
 
 Merge the example Alertmanager receiver into the active configuration rather
 than replacing operator configuration. Validate the active configuration,
@@ -108,8 +110,9 @@ that exist in the installation:
   `MINIME_DOCTOR_NODE_BASELINE_VERSION` detect missing or drifted Node;
 - `MINIME_DOCTOR_RUNTIME_STATE_PATH` and `MINIME_DOCTOR_RUNTIME_MAX_AGE`
   check deployment freshness;
-- optional `MINIME_DOCTOR_TCC_STATUS_PATH` consumes a non-prompting external
-  signal containing `granted` or `denied`; absence is reported as unknown.
+- optional `MINIME_DOCTOR_TCC_STATUS_PATH` consumes a small regular-file,
+  non-prompting external signal containing `granted` or `denied`; absent,
+  oversized, or non-regular inputs are reported as unknown.
 
 `MINIME_DOCTOR_TIMEOUT` bounds subprocess and HTTP checks (default 5 seconds,
 maximum 30), and `MINIME_DOCTOR_LAUNCHCTL` may select the launchctl executable

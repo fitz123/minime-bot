@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import http.client
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -12,6 +13,7 @@ import os
 import math
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ from typing import Callable
 from monitoring_native import DeliveryConfig, MonitoringError, send_telegram
 
 STATE_VERSION = 1
+TCC_STATUS_MAX_BYTES = 1024
 ENV_PREFIX = "MINIME_DOCTOR_"
 INCIDENT_ACTIONS = {
     "alertmanager_unhealthy": "check Alertmanager health and recreate its current service",
@@ -128,8 +131,32 @@ def _http_healthy(url: str, timeout: float) -> bool:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response.read(4096)
             return 200 <= response.getcode() < 300
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        OSError,
+        ValueError,
+    ):
         return False
+
+
+def _read_tcc_status(path: Path) -> str:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > TCC_STATUS_MAX_BYTES:
+            return "unknown"
+        value = os.read(descriptor, TCC_STATUS_MAX_BYTES + 1)
+        if len(value) > TCC_STATUS_MAX_BYTES:
+            return "unknown"
+        return value.decode("utf-8").strip().lower()
+    except (OSError, UnicodeError):
+        return "unknown"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def collect_incidents(config: DoctorConfig, *, now: float | None = None) -> set[str]:
@@ -193,10 +220,7 @@ def collect_incidents(config: DoctorConfig, *, now: float | None = None) -> set[
             incidents.add("runtime_state_missing")
 
     if config.tcc_status_path:
-        try:
-            status = config.tcc_status_path.read_text(encoding="utf-8").strip().lower()
-        except (OSError, UnicodeError):
-            status = "unknown"
+        status = _read_tcc_status(config.tcc_status_path)
         if status == "denied":
             incidents.add("tcc_denied")
         elif status != "granted":

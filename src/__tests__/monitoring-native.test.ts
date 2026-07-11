@@ -1,7 +1,13 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createServer, type RequestListener, type Server } from "node:http";
+import { createServer, type RequestListener, type Server as HttpServer } from "node:http";
+import {
+  createConnection,
+  createServer as createNetServer,
+  type Server as NetServer,
+  type Socket,
+} from "node:net";
 import {
   chmodSync,
   existsSync,
@@ -64,7 +70,7 @@ function runPython(
 
 async function startServer(
   handler: RequestListener,
-): Promise<{ server: Server; base: string; port: number }> {
+): Promise<{ server: HttpServer; base: string; port: number }> {
   const server = createServer(handler);
   await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
   const address = server.address();
@@ -72,7 +78,17 @@ async function startServer(
   return { server, base: `http://127.0.0.1:${address.port}`, port: address.port };
 }
 
-async function closeServer(server: Server): Promise<void> {
+async function startRawServer(
+  handler: (socket: Socket) => void,
+): Promise<{ server: NetServer; base: string; port: number }> {
+  const server = createNetServer(handler);
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return { server, base: `http://127.0.0.1:${address.port}`, port: address.port };
+}
+
+async function closeServer(server: HttpServer | NetServer): Promise<void> {
   await new Promise<void>((resolvePromise, reject) =>
     server.close((error) => (error ? reject(error) : resolvePromise())),
   );
@@ -290,6 +306,28 @@ describe("host-native secret and Telegram delivery", () => {
     assert.equal(networkRetry.status, 0, networkRetry.stderr);
     assert.match(networkRetry.stdout, /network retries bounded/);
 
+    let protocolAttempts = 0;
+    const malformedProtocol = await startRawServer((socket) => {
+      protocolAttempts += 1;
+      socket.once("data", () => socket.end("not-an-http-response\r\n\r\n"));
+    });
+    try {
+      const protocolRetry = await runPython(
+        [
+          "-c",
+          "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m;\ntry: m.send_telegram('protocol failure', m.DeliveryConfig('10001', attempts=2, max_retry_after=0), sleep=lambda _value: None)\nexcept m.DeliveryError: print('protocol retries bounded')",
+        ],
+        telegramEnv(malformedProtocol.base),
+      );
+      assert.equal(protocolRetry.status, 0, protocolRetry.stderr);
+      assert.equal(protocolAttempts, 2);
+      assert.match(protocolRetry.stdout, /protocol retries bounded/);
+      assert.ok(!protocolRetry.stderr.includes("Traceback"));
+      assertSecretAbsent(protocolRetry);
+    } finally {
+      await closeServer(malformedProtocol.server);
+    }
+
     for (const timeout of ["-1", "31", "nan"]) {
       const invalid = await runPython(
         [nativeScript, "--message", "synthetic", "--chat-id", "10001", "--timeout", timeout],
@@ -355,7 +393,7 @@ describe("Alertmanager webhook", () => {
       assert.equal(messages.length, 2);
       assert.match(messages[1], /RESOLVED/);
       const largeBatch = {
-        alerts: Array.from({ length: 100 }, (_, index) => ({
+        alerts: Array.from({ length: 101 }, (_, index) => ({
           status: "firing",
           fingerprint: `large-${index}`,
           labels: { alertname: `Alert${index}${"A".repeat(110)}`, severity: "critical", instance: "I".repeat(120) },
@@ -419,9 +457,87 @@ describe("Alertmanager webhook", () => {
     assert.match(result.stderr, /host must be loopback/);
     assert.ok(!result.stderr.includes("Traceback"));
   });
+
+  it("enforces an absolute input deadline for slow request bodies", async () => {
+    const reservation = await startServer((_request, response) => response.end());
+    const port = reservation.port;
+    await closeServer(reservation.server);
+    const child = spawnWebhook(port, {}, ["--body-timeout", "0.2"]);
+    try {
+      await waitUntilReady(child);
+      const startedAt = Date.now();
+      const response = await new Promise<string>((resolvePromise, reject) => {
+        const socket = createConnection({ host: "127.0.0.1", port });
+        let output = "";
+        let finished = false;
+        let drip: NodeJS.Timeout | undefined;
+        const timeout = setTimeout(() => {
+          socket.destroy();
+          reject(new Error("slow request was not bounded"));
+        }, 1_500);
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timeout);
+          if (drip) clearInterval(drip);
+          resolvePromise(output);
+        };
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => (output += chunk));
+        socket.on("end", finish);
+        socket.on("close", finish);
+        socket.on("error", (error) => {
+          if (output) finish();
+          else reject(error);
+        });
+        socket.on("connect", () => {
+          socket.write("POST /alertmanager HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{");
+          drip = setInterval(() => socket.write(" "), 50);
+        });
+      });
+      assert.match(response, /408 Request Timeout/);
+      assert.ok(Date.now() - startedAt < 1_000);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+    }
+  });
 });
 
 describe("runtime doctor", () => {
+  it("reports malformed HTTP health responses as incidents", async () => {
+    let healthRequests = 0;
+    const malformedHealth = await startRawServer((socket) => {
+      healthRequests += 1;
+      socket.once("data", () => socket.end("not-an-http-response\r\n\r\n"));
+    });
+    const messages: string[] = [];
+    const telegram = await startServer((request, response) => {
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        messages.push(new URLSearchParams(body).get("text") ?? "");
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    try {
+      const result = await runPython([doctorScript], {
+        ...telegramEnv(telegram.base),
+        MINIME_DOCTOR_STATE_PATH: join(tempDir(), "state.json"),
+        MINIME_DOCTOR_PROMETHEUS_URL: `${malformedHealth.base}/health`,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(healthRequests, 1);
+      assert.equal(messages.length, 1);
+      assert.match(messages[0], /prometheus_unhealthy/);
+      assert.ok(!result.stderr.includes("doctor_runtime_failed"));
+    } finally {
+      await closeServer(malformedHealth.server);
+      await closeServer(telegram.server);
+    }
+  });
+
   it("detects monitoring failure, deduplicates it, and emits exactly one recovery with Node unavailable", async () => {
     const dir = tempDir();
     const state = join(dir, "doctor-state.json");
@@ -669,10 +785,15 @@ describe("runtime doctor", () => {
     assert.ok(!runtimeFailure.stderr.includes("Traceback"));
   });
 
-  it("maps a malformed UTF-8 TCC signal to the stable unknown incident", async () => {
+  it("maps malformed, non-regular, and oversized TCC signals to the stable unknown incident", async () => {
     const dir = tempDir();
-    const tcc = join(dir, "tcc-status");
-    writeFileSync(tcc, Buffer.from([0xff, 0xfe]));
+    const malformed = join(dir, "tcc-malformed");
+    const fifo = join(dir, "tcc-fifo");
+    const oversized = join(dir, "tcc-oversized");
+    writeFileSync(malformed, Buffer.from([0xff, 0xfe]));
+    writeFileSync(oversized, "x".repeat(1025));
+    const fifoResult = await runPython(["-c", "import os,sys; os.mkfifo(sys.argv[1])", fifo], {});
+    assert.equal(fifoResult.status, 0, fifoResult.stderr);
     const messages: string[] = [];
     const telegram = await startServer((request, response) => {
       let body = "";
@@ -683,14 +804,16 @@ describe("runtime doctor", () => {
       });
     });
     try {
-      const result = await runPython([doctorScript], {
-        ...telegramEnv(telegram.base),
-        MINIME_DOCTOR_STATE_PATH: join(dir, "state.json"),
-        MINIME_DOCTOR_TCC_STATUS_PATH: tcc,
-      });
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(messages.length, 1);
-      assert.match(messages[0], /tcc_unknown/);
+      for (const [index, tccPath] of [malformed, fifo, oversized].entries()) {
+        const result = await runPython([doctorScript], {
+          ...telegramEnv(telegram.base),
+          MINIME_DOCTOR_STATE_PATH: join(dir, `state-${index}.json`),
+          MINIME_DOCTOR_TCC_STATUS_PATH: tccPath,
+        }, 2_000);
+        assert.equal(result.status, 0, result.stderr);
+      }
+      assert.equal(messages.length, 3);
+      for (const message of messages) assert.match(message, /tcc_unknown/);
     } finally {
       await closeServer(telegram.server);
     }

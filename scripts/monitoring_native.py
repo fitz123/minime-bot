@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -185,7 +186,13 @@ def send_telegram(
                         retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
                 except (DeliveryError, AttributeError):
                     pass
-        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+        ):
             retryable = True
 
         if attempt + 1 >= config.attempts:

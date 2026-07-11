@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from monitoring_native import (
 )
 
 MAX_BODY_DEFAULT = 256 * 1024
+MAX_CONCURRENT_REQUESTS = 32
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
 
 
@@ -61,7 +63,7 @@ def parse_alertmanager_payload(body: bytes) -> tuple[str, str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("alerts"), list):
         raise ValueError("malformed Alertmanager payload")
     alerts = payload["alerts"]
-    if not alerts or len(alerts) > 100:
+    if not alerts:
         raise ValueError("invalid alert batch")
 
     lines: list[str] = []
@@ -149,6 +151,36 @@ class WebhookApplication:
         self.deduplicator = deduplicator or BatchDeduplicator()
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler: type[BaseHTTPRequestHandler],
+        *,
+        max_concurrent_requests: int = MAX_CONCURRENT_REQUESTS,
+    ):
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        super().__init__(server_address, request_handler)
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "MinimeNativeWebhook/1"
@@ -157,6 +189,41 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
         def setup(self) -> None:
             super().setup()
             self.connection.settimeout(app.body_timeout)
+            self._input_deadline = threading.Timer(app.body_timeout, self._expire_input)
+            self._input_deadline.daemon = True
+            self._input_deadline.start()
+
+        def finish(self) -> None:
+            self._cancel_input_deadline()
+            super().finish()
+
+        def _expire_input(self) -> None:
+            try:
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+        def _cancel_input_deadline(self) -> None:
+            deadline = getattr(self, "_input_deadline", None)
+            if deadline is not None:
+                deadline.cancel()
+                self._input_deadline = None
+
+        def _read_body(self, length: int) -> bytes:
+            chunks: list[bytes] = []
+            remaining = length
+            deadline = time.monotonic() + app.body_timeout
+            while remaining:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(timeout)
+                chunk = self.rfile.read1(min(remaining, 64 * 1024))
+                if not chunk:
+                    raise TimeoutError
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
 
         def log_message(self, _format: str, *_args: object) -> None:
             return
@@ -170,6 +237,7 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
+            self._cancel_input_deadline()
             if self.path == "/healthz":
                 self._reply(200, "ok")
             else:
@@ -177,6 +245,7 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path != app.path:
+                self._cancel_input_deadline()
                 self._reply(404, "not found")
                 return
             raw_length = self.headers.get("Content-Length")
@@ -185,16 +254,20 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 length = -1
             if length < 0:
+                self._cancel_input_deadline()
                 self._reply(411, "length required")
                 return
             if length > app.max_body:
+                self._cancel_input_deadline()
                 self._reply(413, "payload too large")
                 return
             try:
-                body = self.rfile.read(length)
+                body = self._read_body(length)
             except (TimeoutError, OSError):
+                self._cancel_input_deadline()
                 self._reply(408, "request timed out")
                 return
+            self._cancel_input_deadline()
             try:
                 key, message = parse_alertmanager_payload(body)
             except ValueError:
@@ -255,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         deliver=lambda message: send_telegram(message, config),
     )
     try:
-        server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
+        server = BoundedThreadingHTTPServer((args.host, args.port), handler_for(app))
     except OSError:
         print("webhook failed to bind", file=sys.stderr)
         return 1
