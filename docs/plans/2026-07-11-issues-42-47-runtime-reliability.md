@@ -29,6 +29,11 @@ npm pack --dry-run
 
 ### Task 1: #47 polling progress watchdog
 
+- [ ] Implement and wire the real `getUpdates` progress probe and bounded watchdog state machine.
+- [ ] Add stable low-cardinality logs/metrics for healthy quiet polling and restart reasons.
+- [ ] Add deterministic fake-clock/probe coverage for every #47 acceptance path.
+- [ ] Run focused and full validation, then commit this task independently with `#47` in the commit message.
+
 ### Runtime design
 
 - Add a small poll-progress probe (prefer `src/poll-progress.ts`) with a grammY `Transformer` and an immutable snapshot interface. Track `getUpdates` start time, successful completion time/count, in-flight state, and failed completion count. Only a successful `getUpdates` response advances healthy poll progress; an empty successful response is healthy silence.
@@ -65,6 +70,11 @@ Commit this task independently with `#47` in the commit message. The task is com
 Reverting the #47 commit removes the probe and restores the previous watchdog behavior without touching #42 files.
 
 ### Task 2: #42 Node-independent host monitoring and alert delivery
+
+- [ ] Implement the portable Python-standard-library secret, Telegram delivery, webhook, and runtime-doctor contracts.
+- [ ] Add generic launchd/config examples, package-file coverage, and public install/recovery documentation.
+- [ ] Add deterministic synthetic, Node-unavailable, secret-redaction, dedup/recovery, and self-monitoring tests.
+- [ ] Run full test/build/pack validation, then commit this task independently with `#42` in the commit message.
 
 ### Portable public contracts
 
