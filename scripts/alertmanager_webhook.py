@@ -82,7 +82,11 @@ def parse_alertmanager_payload(body: bytes) -> tuple[str, str]:
             identity = json.dumps([status, name, severity, instance], separators=(",", ":"))
         identities.append(f"{status}:{identity}")
 
-    digest = hashlib.sha256("\n".join(sorted(identities)).encode("utf-8")).hexdigest()
+    try:
+        identity_bytes = "\n".join(sorted(identities)).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid alert fingerprint") from None
+    digest = hashlib.sha256(identity_bytes).hexdigest()
     message = _bounded_alert_message(lines)
     return digest, message
 
@@ -95,14 +99,16 @@ class BatchDeduplicator:
         self._in_flight: set[str] = set()
         self._lock = threading.Lock()
 
-    def claim(self, key: str, now: float | None = None) -> bool:
+    def claim(self, key: str, now: float | None = None) -> str:
         current = time.monotonic() if now is None else now
         with self._lock:
             self._prune(current)
-            if key in self._seen or key in self._in_flight:
-                return False
+            if key in self._seen:
+                return "committed"
+            if key in self._in_flight:
+                return "in_flight"
             self._in_flight.add(key)
-            return True
+            return "claimed"
 
     def commit(self, key: str, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
@@ -194,8 +200,12 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 self._reply(400, "invalid payload")
                 return
-            if not app.deduplicator.claim(key):
+            claim = app.deduplicator.claim(key)
+            if claim == "committed":
                 self._reply(200, "duplicate suppressed")
+                return
+            if claim == "in_flight":
+                self._reply(503, "delivery in progress")
                 return
             try:
                 app.deliver(message)

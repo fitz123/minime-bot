@@ -39,9 +39,11 @@ identifier such as `telegram.bot_token`.
 The SOPS path executes only `sops -d --extract <expression> <file>`, captures
 the result in memory, and rejects malformed keys. It never performs a whole
 file decrypt. Do not put the token in command arguments, plist files, logs, or
-test fixtures. The default Telegram API is HTTPS. Plain HTTP is available only
-for isolated tests when `MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API=1` is set.
-`MINIME_TELEGRAM_API_BASE` is test-only and must not be set in production.
+test fixtures. The default Telegram API is the official HTTPS origin. Every
+`MINIME_TELEGRAM_API_BASE` override is test-only and requires
+`MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API=1`; overrides with credentials,
+paths, queries, or fragments are rejected. Neither variable may be set in
+production.
 The delivery CLI accepts `--timeout` (default 8 seconds, maximum 30) and
 `--attempts` (default 3, maximum 10). Messages are limited to Telegram's 4,096
 UTF-16-unit text boundary.

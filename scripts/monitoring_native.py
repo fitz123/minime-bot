@@ -24,6 +24,7 @@ SOPS_KEY_ENV = "MINIME_TELEGRAM_SOPS_KEY"
 SOPS_EXECUTABLE_ENV = "MINIME_SOPS_EXECUTABLE"
 API_BASE_ENV = "MINIME_TELEGRAM_API_BASE"
 INSECURE_TEST_ENV = "MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API"
+DEFAULT_API_BASE = "https://api.telegram.org"
 TELEGRAM_TEXT_MAX_UTF16_UNITS = 4096
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 
@@ -87,13 +88,23 @@ def resolve_token(
 
 
 def _api_base(environ: dict[str, str] | os._Environ[str]) -> str:
-    base = environ.get(API_BASE_ENV, "https://api.telegram.org").rstrip("/")
+    base = environ.get(API_BASE_ENV, DEFAULT_API_BASE).rstrip("/")
     parsed = urllib.parse.urlsplit(base)
-    if parsed.scheme == "https" and parsed.netloc:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise DeliveryError("Telegram API base is invalid")
+    if base == DEFAULT_API_BASE:
         return base
-    if parsed.scheme == "http" and parsed.netloc and environ.get(INSECURE_TEST_ENV) == "1":
+    if environ.get(INSECURE_TEST_ENV) == "1":
         return base
-    raise DeliveryError("Telegram API base must use HTTPS")
+    raise DeliveryError("custom Telegram API base requires test mode")
 
 
 def _response_json(body: bytes) -> dict[str, Any]:

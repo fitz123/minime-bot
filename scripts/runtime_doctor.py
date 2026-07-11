@@ -222,7 +222,9 @@ def read_state(path: Path) -> tuple[set[str], bool]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return set(), True
     incidents = value.get("incidents") if isinstance(value, dict) and value.get("version") == STATE_VERSION else None
-    if not isinstance(incidents, list) or not all(item in INCIDENT_ACTIONS for item in incidents):
+    if not isinstance(incidents, list) or not all(
+        isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents
+    ):
         return set(), True
     return set(incidents), False
 

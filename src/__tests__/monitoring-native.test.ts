@@ -176,6 +176,33 @@ describe("host-native secret and Telegram delivery", () => {
     assertSecretAbsent(timed);
   });
 
+  it("requires explicit test mode for every custom Telegram API origin", async () => {
+    const check = await runPython(
+      [
+        "-c",
+        [
+          "import sys",
+          "sys.path.insert(0, 'scripts')",
+          "import monitoring_native as m",
+          "assert m._api_base({}) == m.DEFAULT_API_BASE",
+          "for value in ['https://example.invalid', 'http://127.0.0.1']:",
+          " try: m._api_base({m.API_BASE_ENV: value})",
+          " except m.DeliveryError: pass",
+          " else: raise AssertionError('custom origin accepted without test mode')",
+          "test_env = {m.INSECURE_TEST_ENV: '1'}",
+          "for value in ['https://user@example.invalid', 'https://example.invalid/path', 'https://example.invalid?query=1', 'https://example.invalid#fragment']:",
+          " try: m._api_base({**test_env, m.API_BASE_ENV: value})",
+          " except m.DeliveryError: pass",
+          " else: raise AssertionError('unsafe custom origin accepted')",
+          "assert m._api_base({**test_env, m.API_BASE_ENV: 'https://example.invalid/'}) == 'https://example.invalid'",
+          "assert m._api_base({**test_env, m.API_BASE_ENV: 'http://127.0.0.1:9876'}) == 'http://127.0.0.1:9876'",
+        ].join("\n"),
+      ],
+      {},
+    );
+    assert.equal(check.status, 0, check.stderr);
+  });
+
   it("sends POST data, retries transient responses, bounds retry_after, and fails safely", async () => {
     const requests: Array<{ url: string; body: string }> = [];
     let attempts = 0;
@@ -319,7 +346,7 @@ describe("Alertmanager webhook", () => {
           body: JSON.stringify(payload),
         });
       const concurrent = await Promise.all([post(firing), post(firing)]);
-      assert.deepEqual(concurrent.map((response) => response.status), [200, 200]);
+      assert.deepEqual(concurrent.map((response) => response.status).sort(), [200, 503]);
       assert.equal((await post(firing)).status, 200);
       assert.equal(messages.length, 1);
       assert.match(messages[0], /FIRING alert=BotDown severity=critical instance=test/);
@@ -351,8 +378,10 @@ describe("Alertmanager webhook", () => {
     const telegram = await startServer((_request, response) => {
       deliveryAttempts += 1;
       if (deliveryAttempts === 1) {
-        response.statusCode = 400;
-        response.end(JSON.stringify({ ok: false, error_code: 400 }));
+        setTimeout(() => {
+          response.statusCode = 400;
+          response.end(JSON.stringify({ ok: false, error_code: 400 }));
+        }, 100);
       } else {
         response.end(JSON.stringify({ ok: true }));
       }
@@ -366,8 +395,15 @@ describe("Alertmanager webhook", () => {
       const endpoint = `http://127.0.0.1:${port}/alertmanager`;
       assert.equal((await fetch(endpoint, { method: "POST", body: "{" })).status, 400);
       assert.equal((await fetch(endpoint, { method: "POST", body: "x".repeat(257) })).status, 413);
+      const invalidUnicode = { alerts: [{ status: "firing", fingerprint: "\ud800" }] };
+      assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(invalidUnicode) })).status, 400);
       const valid = { alerts: [{ status: "firing", fingerprint: "retryable", labels: { alertname: "Synthetic" } }] };
-      assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(valid) })).status, 503);
+      const concurrent = await Promise.all([
+        fetch(endpoint, { method: "POST", body: JSON.stringify(valid) }),
+        fetch(endpoint, { method: "POST", body: JSON.stringify(valid) }),
+      ]);
+      assert.deepEqual(concurrent.map((response) => response.status), [503, 503]);
+      assert.equal(deliveryAttempts, 1, "an in-flight duplicate must not start or acknowledge another delivery");
       assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(valid) })).status, 200);
       assert.equal(deliveryAttempts, 2, "a failed delivery must release its deduplication claim");
     } finally {
@@ -520,11 +556,16 @@ describe("runtime doctor", () => {
       MINIME_DOCTOR_RUNTIME_STATE_PATH: join(dir, "missing-state"),
     };
     try {
-      writeFileSync(state, "not-json\n");
-      const corrupt = await runPython([doctorScript], env);
-      assert.equal(corrupt.status, 0);
-      assert.equal(deliveries, 0, "corrupt state must be reset without a notification storm");
-      assert.deepEqual((JSON.parse(readFileSync(state, "utf8")) as { incidents: string[] }).incidents, []);
+      for (const corruptState of [
+        "not-json\n",
+        JSON.stringify({ version: 1, incidents: [{}] }),
+      ]) {
+        writeFileSync(state, corruptState);
+        const corrupt = await runPython([doctorScript], env);
+        assert.equal(corrupt.status, 0);
+        assert.equal(deliveries, 0, "corrupt state must be reset without a notification storm");
+        assert.deepEqual((JSON.parse(readFileSync(state, "utf8")) as { incidents: string[] }).incidents, []);
+      }
 
       const repaired = await runPython([doctorScript], env);
       assert.equal(repaired.status, 0);
