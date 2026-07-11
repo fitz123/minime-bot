@@ -46,7 +46,8 @@ paths, queries, or fragments are rejected. Neither variable may be set in
 production.
 The delivery CLI accepts `--timeout` (default 8 seconds, maximum 30) and
 `--attempts` (default 3, maximum 10). Messages are limited to Telegram's 4,096
-UTF-16-unit text boundary.
+UTF-16-unit text boundary. The per-attempt timeout is an absolute deadline for
+DNS resolution, connection establishment, headers, and the response body.
 
 Validate delivery before installing services:
 
@@ -109,7 +110,7 @@ that exist in the installation:
 - `MINIME_DOCTOR_NODE_EXECUTABLE`, `MINIME_DOCTOR_NODE_BASELINE_PATH`, and
   `MINIME_DOCTOR_NODE_BASELINE_VERSION` detect missing or drifted Node;
 - `MINIME_DOCTOR_RUNTIME_STATE_PATH` and `MINIME_DOCTOR_RUNTIME_MAX_AGE`
-  check deployment freshness;
+  check deployment freshness from a regular file;
 - optional `MINIME_DOCTOR_TCC_STATUS_PATH` consumes a small regular-file,
   non-prompting external signal containing `granted` or `denied`; absent,
   oversized, or non-regular inputs are reported as unknown.

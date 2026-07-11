@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   createPollProgressProbe,
+  createUpdateProcessingProbe,
   DEFAULT_POLL_STALL_THRESHOLD_MS,
   TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -100,5 +101,24 @@ describe("poll-progress probe", () => {
     assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
     assert.equal("payload" in result, false);
     assert.equal("response" in result, false);
+  });
+
+  it("tracks middleware processing and clears state after success or failure", async () => {
+    let clock = 10;
+    const probe = createUpdateProcessingProbe(() => clock);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const running = probe.middleware({} as never, async () => pending);
+
+    assert.deepEqual(probe.snapshot(), { inFlight: true, startedAtMs: 10 });
+    clock = 20;
+    release();
+    await running;
+    assert.deepEqual(probe.snapshot(), { inFlight: false, startedAtMs: null });
+
+    await assert.rejects(
+      probe.middleware({} as never, async () => { throw new Error("synthetic"); }) as Promise<unknown>,
+    );
+    assert.deepEqual(probe.snapshot(), { inFlight: false, startedAtMs: null });
   });
 });

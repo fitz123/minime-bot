@@ -272,6 +272,7 @@ describe("downloadFile", () => {
         await Promise.resolve();
         assert.strictEqual(calls, 1, `HTTP ${testCase.status} retried before Retry-After elapsed`);
         t.mock.timers.tick(1);
+        await flushAsyncWork();
         await pending;
         assert.strictEqual(calls, 2);
       }
@@ -307,6 +308,7 @@ describe("downloadFile", () => {
       await Promise.resolve();
       assert.strictEqual(calls, 1);
       t.mock.timers.tick(1);
+      await flushAsyncWork();
       await pending;
       assert.strictEqual(calls, 2);
       assert.notStrictEqual(signals[0], signals[1]);

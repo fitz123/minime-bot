@@ -10,16 +10,20 @@ import {
 import {
   DEFAULT_POLL_STALL_THRESHOLD_MS,
   type PollProgressSnapshot,
+  type UpdateProcessingSnapshot,
 } from "./poll-progress.js";
 
 const DEFAULT_INTERVAL_MS = 30 * 1000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15 * 1000;
+export const DEFAULT_UPDATE_HANDLER_TIMEOUT_MS = 10 * 60 * 1000;
 
 type TimeoutHandle = unknown;
 
 export interface WatchdogDeps {
   /** Immutable progress snapshot from the getUpdates transformer. */
   pollProgress: () => Readonly<PollProgressSnapshot>;
+  /** Current grammY middleware execution, which pauses simple long polling. */
+  updateProcessing?: () => Readonly<UpdateProcessingSnapshot>;
   /** Bounded API reachability probe. The signal is aborted on timeout/stop. */
   heartbeat: (signal: AbortSignal) => Promise<boolean>;
   /** Called to terminate the process. Default: process.exit. */
@@ -32,6 +36,8 @@ export interface WatchdogDeps {
   intervalMs?: number;
   /** Maximum API heartbeat duration. Default: 15 seconds. */
   heartbeatTimeoutMs?: number;
+  /** Maximum time to allow one update handler to pause polling. Default: 10 minutes. */
+  updateHandlerTimeoutMs?: number;
   setTimeoutFn?: (callback: () => void, ms: number) => TimeoutHandle;
   clearTimeoutFn?: (handle: TimeoutHandle) => void;
 }
@@ -59,6 +65,7 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
   const thresholdMs = deps.thresholdMs ?? DEFAULT_POLL_STALL_THRESHOLD_MS;
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
   const heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+  const updateHandlerTimeoutMs = deps.updateHandlerTimeoutMs ?? DEFAULT_UPDATE_HANDLER_TIMEOUT_MS;
   const exitFn = deps.exit ?? ((code: number) => process.exit(code));
   const now = deps.now ?? Date.now;
   const setTimeoutFn = deps.setTimeoutFn ?? ((callback, ms) => setTimeout(callback, ms));
@@ -138,6 +145,20 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
         return;
       }
 
+      const updateProcessing = deps.updateProcessing?.();
+      if (
+        updateProcessing?.inFlight
+        && updateProcessing.startedAtMs !== null
+        && checkedAt - updateProcessing.startedAtMs < updateHandlerTimeoutMs
+      ) {
+        recordPollWatchdogCheck("update_processing");
+        log.debug(
+          "watchdog",
+          `Polling paused for update processing: handler_age_seconds=${Math.round((checkedAt - updateProcessing.startedAtMs) / 1000)}`,
+        );
+        return;
+      }
+
       log.warn(
         "watchdog",
         `Poll progress stale: age_seconds=${Math.round(ageMs / 1000)} in_flight=${snapshot.inFlight ? 1 : 0}; checking API reachability`,
@@ -182,7 +203,7 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
     (timer as NodeJS.Timeout).unref();
     log.info(
       "watchdog",
-      `Started: poll_stall_threshold_seconds=${Math.round(thresholdMs / 1000)} interval_seconds=${Math.round(intervalMs / 1000)} heartbeat_timeout_seconds=${Math.round(heartbeatTimeoutMs / 1000)}`,
+      `Started: poll_stall_threshold_seconds=${Math.round(thresholdMs / 1000)} interval_seconds=${Math.round(intervalMs / 1000)} heartbeat_timeout_seconds=${Math.round(heartbeatTimeoutMs / 1000)} update_handler_timeout_seconds=${Math.round(updateHandlerTimeoutMs / 1000)}`,
     );
   }
 

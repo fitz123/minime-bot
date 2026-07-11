@@ -267,6 +267,9 @@ stale. A bounded API check then classifies a deliberate restart as
 restart. The low-cardinality metrics are
 `bot_telegram_poll_progress_age_seconds`, `bot_telegram_poll_in_flight`,
 `bot_poll_watchdog_checks_total`, and `bot_poll_watchdog_restarts_total`.
+Because grammY pauses simple polling while middleware runs, bounded media
+preprocessing is tracked separately and allowed up to ten minutes before it is
+treated as a stalled handler.
 
 ## Launchd Operations
 

@@ -7,12 +7,12 @@ import argparse
 import http.client
 import json
 import math
+import multiprocessing
 import os
 import re
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -135,15 +135,65 @@ class HttpResponse:
     body: bytes
 
 
-def _abort_connection(connection: http.client.HTTPConnection) -> None:
-    """Interrupt an in-progress header/body read from the deadline timer."""
-    sock = connection.sock
-    if sock is not None:
+def _perform_http_request(
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+    max_body: int,
+) -> HttpResponse:
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port
+    connection_type = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(parsed.hostname, port=port, timeout=timeout)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    try:
+        connection.request(method, target, body=data, headers=headers)
+        response = connection.getresponse()
+        body = response.read(max_body + 1) if max_body > 0 else b""
+        return HttpResponse(response.status, body)
+    finally:
+        connection.close()
+
+
+def _http_request_worker(
+    sender: Any,
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+    max_body: int,
+) -> None:
+    try:
+        response = _perform_http_request(url, method, data, headers, timeout, max_body)
+        sender.send(("ok", response.status, response.body))
+    except BaseException:
+        # Endpoint, resolver, and protocol details must not cross the boundary.
         try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
+            sender.send(("error",))
+        except (BrokenPipeError, EOFError, OSError):
             pass
-    connection.close()
+    finally:
+        sender.close()
+
+
+def _stop_worker(process: multiprocessing.Process) -> None:
+    if process.pid is None:
+        return
+    if not process.is_alive():
+        process.join(timeout=0)
+        return
+    process.terminate()
+    process.join(timeout=0.1)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=0.1)
 
 
 def request_with_deadline(
@@ -155,37 +205,40 @@ def request_with_deadline(
     headers: dict[str, str] | None = None,
     max_body: int = 0,
 ) -> HttpResponse:
-    """Perform one HTTP request with an absolute header/body deadline."""
+    """Perform one HTTP request with a process-enforced absolute deadline."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("HTTP URL is invalid")
-    port = parsed.port
-    connection_type = (
-        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    # Force port validation in the parent so malformed configuration fails
+    # synchronously rather than being collapsed into a network failure.
+    parsed.port
+    if not math.isfinite(timeout) or timeout <= 0 or max_body < 0:
+        raise ValueError("HTTP request options are invalid")
+
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_http_request_worker,
+        args=(sender, url, method, data, headers or {}, timeout, max_body),
+        daemon=True,
     )
-    connection = connection_type(parsed.hostname, port=port, timeout=timeout)
-    target = parsed.path or "/"
-    if parsed.query:
-        target = f"{target}?{parsed.query}"
-    expired = threading.Event()
-
-    def expire() -> None:
-        expired.set()
-        _abort_connection(connection)
-
-    timer = threading.Timer(timeout, expire)
-    timer.daemon = True
-    timer.start()
+    deadline = time.monotonic() + timeout
     try:
-        connection.request(method, target, body=data, headers=headers or {})
-        response = connection.getresponse()
-        body = response.read(max_body + 1) if max_body > 0 else b""
-        if expired.is_set():
+        process.start()
+        sender.close()
+        remaining = max(0.0, deadline - time.monotonic())
+        if not receiver.poll(remaining):
             raise TimeoutError("HTTP request timed out")
-        return HttpResponse(response.status, body)
+        result = receiver.recv()
+        if len(result) != 3 or result[0] != "ok":
+            raise OSError("HTTP request failed")
+        return HttpResponse(result[1], result[2])
+    except EOFError:
+        raise OSError("HTTP request failed") from None
     finally:
-        timer.cancel()
-        _abort_connection(connection)
+        sender.close()
+        receiver.close()
+        _stop_worker(process)
 
 
 def send_telegram(

@@ -115,6 +115,7 @@ export const telegramApiCalls = new client.Counter({
 export type PollWatchdogCheckOutcome =
   | "healthy_active"
   | "healthy_quiet"
+  | "update_processing"
   | "poll_resumed"
   | "poll_stalled"
   | "api_unreachable"

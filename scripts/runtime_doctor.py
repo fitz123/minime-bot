@@ -213,12 +213,23 @@ def collect_incidents(config: DoctorConfig, *, now: float | None = None) -> set[
                 incidents.add("node_unavailable")
 
     if config.runtime_state_path:
+        descriptor: int | None = None
         try:
-            age = current_time - config.runtime_state_path.stat().st_mtime
+            descriptor = os.open(
+                config.runtime_state_path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC,
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("runtime state is not a regular file")
+            age = current_time - metadata.st_mtime
             if age < -300 or age > config.runtime_max_age:
                 incidents.add("runtime_state_stale")
         except OSError:
             incidents.add("runtime_state_missing")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     if config.tcc_status_path:
         status = _read_tcc_status(config.tcc_status_path)

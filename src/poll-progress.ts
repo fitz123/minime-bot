@@ -1,4 +1,4 @@
-import type { Transformer } from "grammy";
+import type { Context, MiddlewareFn, Transformer } from "grammy";
 
 /** Explicit cadence used by grammY long polling in main.ts. */
 export const TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 30;
@@ -23,6 +23,16 @@ export interface PollProgressSnapshot {
 export interface PollProgressProbe {
   readonly transformer: Transformer;
   snapshot(): Readonly<PollProgressSnapshot>;
+}
+
+export interface UpdateProcessingSnapshot {
+  readonly inFlight: boolean;
+  readonly startedAtMs: number | null;
+}
+
+export interface UpdateProcessingProbe {
+  readonly middleware: MiddlewareFn<Context>;
+  snapshot(): Readonly<UpdateProcessingSnapshot>;
 }
 
 /**
@@ -71,6 +81,37 @@ export function createPollProgressProbe(now: () => number = Date.now): PollProgr
         successfulPollCount,
         inFlight: inFlightCount > 0,
         failedPollCount,
+      });
+    },
+  };
+}
+
+/**
+ * Track time spent inside grammY middleware. Simple long polling waits for the
+ * current update handler before issuing the next getUpdates call, so this is
+ * distinct from a stalled request and must be bounded separately.
+ */
+export function createUpdateProcessingProbe(now: () => number = Date.now): UpdateProcessingProbe {
+  let inFlightCount = 0;
+  let startedAtMs: number | null = null;
+
+  const middleware: MiddlewareFn<Context> = async (_ctx, next) => {
+    if (inFlightCount === 0) startedAtMs = now();
+    inFlightCount++;
+    try {
+      await next();
+    } finally {
+      inFlightCount--;
+      if (inFlightCount === 0) startedAtMs = null;
+    }
+  };
+
+  return {
+    middleware,
+    snapshot(): Readonly<UpdateProcessingSnapshot> {
+      return Object.freeze({
+        inFlight: inFlightCount > 0,
+        startedAtMs,
       });
     },
   };

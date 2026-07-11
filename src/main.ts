@@ -103,7 +103,7 @@ async function main(): Promise<void> {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew, pollProgress } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
     });
     telegramBot = bot;
@@ -119,6 +119,7 @@ async function main(): Promise<void> {
     // remain an activity signal only.
     watchdog = createWatchdog({
       pollProgress: () => pollProgress.snapshot(),
+      updateProcessing: () => updateProcessing.snapshot(),
       heartbeat: async (signal) => {
         try {
           await bot.api.getMe(signal as Parameters<typeof bot.api.getMe>[0]);

@@ -387,6 +387,26 @@ describe("host-native secret and Telegram delivery", () => {
       }
     }
   });
+
+  it("enforces the absolute deadline while DNS resolution is blocked", async () => {
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, "sitecustomize.py"),
+      "import socket,time\n_original=socket.getaddrinfo\ndef _slow(*args, **kwargs):\n time.sleep(5)\n return _original(*args, **kwargs)\nsocket.getaddrinfo=_slow\n",
+    );
+    const started = Date.now();
+    const result = await runPython(
+      [
+        "-c",
+        "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m;\ntry: m.request_with_deadline('http://example.invalid', method='GET', timeout=.2)\nexcept TimeoutError: print('dns deadline enforced')",
+      ],
+      { PYTHONPATH: dir },
+      2_000,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /dns deadline enforced/);
+    assert.ok(Date.now() - started < 1_500, "DNS resolution exceeded absolute deadline");
+  });
 });
 
 describe("Alertmanager webhook", () => {
@@ -732,6 +752,12 @@ describe("runtime doctor", () => {
       assert.equal(deliveries, 1, "the next run must notify an active incident after repair");
       assert.match(readFileSync(state, "utf8"), /runtime_state_missing/);
 
+      rmSync(join(dir, "missing-state"), { force: true });
+      mkdirSync(join(dir, "missing-state"));
+      const nonFile = await runPython([doctorScript], { ...env, MINIME_DOCTOR_PROMETHEUS_URL: "http://127.0.0.1:1/down" });
+      assert.equal(nonFile.status, 0);
+      assert.match(readFileSync(state, "utf8"), /runtime_state_missing/);
+
       // A stale lock inode is harmless because ownership is process-bound.
       writeFileSync(lock, "active\n");
       const staleLock = await runPython([doctorScript], env);
@@ -764,6 +790,7 @@ describe("runtime doctor", () => {
       assert.equal(deliveries, 1);
 
       await closeServer(hanging.server);
+      rmSync(join(dir, "missing-state"), { recursive: true, force: true });
       writeFileSync(join(dir, "missing-state"), "fresh\n");
       const changed = await runPython([doctorScript], { ...env, MINIME_DOCTOR_PROMETHEUS_URL: "http://127.0.0.1:1/down" });
       assert.equal(changed.status, 0);

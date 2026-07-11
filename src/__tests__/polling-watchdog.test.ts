@@ -244,6 +244,33 @@ describe("polling-watchdog", () => {
     assert.equal(exits, 0);
   });
 
+  it("allows bounded update processing to pause polling, then detects a stuck handler", async () => {
+    let clock = 0;
+    let exits = 0;
+    let heartbeats = 0;
+    const wd = createWatchdog({
+      pollProgress: () => snapshot({ lastPollSucceededAtMs: 1 }),
+      updateProcessing: () => ({ inFlight: true, startedAtMs: 1 }),
+      heartbeat: async () => { heartbeats++; return true; },
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 90_000,
+      updateHandlerTimeoutMs: 600_000,
+    });
+
+    clock = 240_000;
+    await wd.check();
+    assert.equal(exits, 0, "legitimate media preprocessing must not look like a poll stall");
+    assert.equal(heartbeats, 0);
+
+    clock = 600_001;
+    await wd.check();
+    assert.equal(exits, 1, "a stuck update handler must remain bounded");
+    assert.equal(heartbeats, 1);
+    const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "update_processing")?.value, 1);
+  });
+
   it("suppresses overlapping and post-decision checks", async () => {
     let clock = 0;
     let resolveHeartbeat!: (value: boolean) => void;
