@@ -1,5 +1,8 @@
 # Plan: Issues #42 and #47 runtime reliability
 
+Status: public package implementation complete and validated on 2026-07-11;
+private control-workspace wiring remains a post-merge external follow-up.
+
 ## Goal
 
 Ship two independently testable fixes in one sequential Ralphex run:

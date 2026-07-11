@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
@@ -41,7 +44,6 @@ INCIDENT_ACTIONS = {
 @dataclass(frozen=True)
 class DoctorConfig:
     state_path: Path
-    lock_path: Path
     chat_id: str
     thread_id: str | None
     timeout: float
@@ -64,25 +66,42 @@ class DoctorConfig:
         if not state:
             raise ValueError("state path is required")
         timeout = float(env.get(f"{ENV_PREFIX}TIMEOUT", "5"))
+        runtime_max_age = float(env.get(f"{ENV_PREFIX}RUNTIME_MAX_AGE", "3600"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout is invalid")
+        if not math.isfinite(runtime_max_age) or runtime_max_age <= 0:
+            raise ValueError("runtime age is invalid")
         runtime = env.get(f"{ENV_PREFIX}RUNTIME_STATE_PATH")
         tcc = env.get(f"{ENV_PREFIX}TCC_STATUS_PATH")
         log = env.get(f"{ENV_PREFIX}LOG_PATH")
+        urls = {
+            name: env.get(f"{ENV_PREFIX}{name}") or None
+            for name in ("BOT_METRICS_URL", "PROMETHEUS_URL", "ALERTMANAGER_URL")
+        }
+        for url in urls.values():
+            if url:
+                parsed = urllib.parse.urlsplit(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    raise ValueError("health URL is invalid")
+                try:
+                    parsed.port
+                except ValueError:
+                    raise ValueError("health URL is invalid") from None
         return cls(
             state_path=Path(state),
-            lock_path=Path(env.get(f"{ENV_PREFIX}LOCK_PATH", f"{state}.lock")),
             chat_id=env.get("MINIME_TELEGRAM_CHAT_ID", ""),
             thread_id=env.get("MINIME_TELEGRAM_THREAD_ID"),
             timeout=max(0.1, min(timeout, 30.0)),
             launchd_label=env.get(f"{ENV_PREFIX}LAUNCHD_LABEL") or None,
             launchctl=env.get(f"{ENV_PREFIX}LAUNCHCTL", "/bin/launchctl"),
-            bot_metrics_url=env.get(f"{ENV_PREFIX}BOT_METRICS_URL") or None,
-            prometheus_url=env.get(f"{ENV_PREFIX}PROMETHEUS_URL") or None,
-            alertmanager_url=env.get(f"{ENV_PREFIX}ALERTMANAGER_URL") or None,
+            bot_metrics_url=urls["BOT_METRICS_URL"],
+            prometheus_url=urls["PROMETHEUS_URL"],
+            alertmanager_url=urls["ALERTMANAGER_URL"],
             node_executable=env.get(f"{ENV_PREFIX}NODE_EXECUTABLE") or None,
             node_baseline_path=env.get(f"{ENV_PREFIX}NODE_BASELINE_PATH") or None,
             node_baseline_version=env.get(f"{ENV_PREFIX}NODE_BASELINE_VERSION") or None,
             runtime_state_path=Path(runtime) if runtime else None,
-            runtime_max_age=max(1.0, float(env.get(f"{ENV_PREFIX}RUNTIME_MAX_AGE", "3600"))),
+            runtime_max_age=runtime_max_age,
             tcc_status_path=Path(tcc) if tcc else None,
             log_path=Path(log) if log else None,
         )
@@ -104,12 +123,12 @@ def make_logger(path: Path | None) -> logging.Logger:
 
 
 def _http_healthy(url: str, timeout: float) -> bool:
-    request = urllib.request.Request(url, method="GET")
     try:
+        request = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response.read(4096)
-            return 200 <= response.status < 300
-    except (urllib.error.URLError, TimeoutError, OSError):
+            return 200 <= response.getcode() < 300
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return False
 
 
@@ -176,7 +195,7 @@ def collect_incidents(config: DoctorConfig, *, now: float | None = None) -> set[
     if config.tcc_status_path:
         try:
             status = config.tcc_status_path.read_text(encoding="utf-8").strip().lower()
-        except OSError:
+        except (OSError, UnicodeError):
             status = "unknown"
         if status == "denied":
             incidents.add("tcc_denied")
@@ -231,10 +250,17 @@ def write_state(path: Path, incidents: set[str]) -> None:
 
 def acquire_lock(path: Path) -> int | None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
         return None
+    except OSError:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def run_doctor(
@@ -244,7 +270,8 @@ def run_doctor(
     logger: logging.Logger | None = None,
 ) -> int:
     active_logger = logger or make_logger(config.log_path)
-    lock_fd = acquire_lock(config.lock_path)
+    lock_path = config.state_path.with_name(f"{config.state_path.name}.lock")
+    lock_fd = acquire_lock(lock_path)
     if lock_fd is None:
         active_logger.warning("doctor_overlap_suppressed")
         return 0
@@ -253,7 +280,7 @@ def run_doctor(
         previous, corrupt = read_state(config.state_path)
         if corrupt:
             active_logger.error("doctor_state_corrupt_reset")
-            write_state(config.state_path, incidents)
+            write_state(config.state_path, set())
             return 0
         if incidents == previous:
             if not config.state_path.exists():
@@ -270,11 +297,8 @@ def run_doctor(
         active_logger.info("doctor_transition_notified codes=%s", ",".join(sorted(incidents)) or "recovered")
         return 0
     finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
-        try:
-            config.lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def main() -> int:
@@ -286,7 +310,11 @@ def main() -> int:
     except (ValueError, OSError):
         print("doctor configuration invalid", file=sys.stderr)
         return 2
-    return run_doctor(config, logger=logger)
+    try:
+        return run_doctor(config, logger=logger)
+    except Exception:
+        logger.error("doctor_runtime_failed")
+        return 1
 
 
 if __name__ == "__main__":

@@ -14,6 +14,20 @@ Copy them outside the package and replace every placeholder. Keep the package
 checkout, installed package, control workspace, and runtime state in distinct
 locations.
 
+## Prerequisites
+
+The native helpers require Python 3.9 or newer. The encrypted-secret path also
+requires SOPS. Resolve SOPS to an absolute executable path and set
+`MINIME_SOPS_EXECUTABLE`; the launchd examples intentionally keep
+`PATH=/usr/bin:/bin` so Node is not reachable. Before bootstrap, validate the
+same executables the plist will use:
+
+```sh
+/usr/bin/python3 --version
+test -x /PATH/TO/sops
+env -i PATH=/usr/bin:/bin /PATH/TO/sops --version
+```
+
 ## Secret and destination contract
 
 Set `MINIME_TELEGRAM_CHAT_ID` and optionally
@@ -27,6 +41,10 @@ the result in memory, and rejects malformed keys. It never performs a whole
 file decrypt. Do not put the token in command arguments, plist files, logs, or
 test fixtures. The default Telegram API is HTTPS. Plain HTTP is available only
 for isolated tests when `MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API=1` is set.
+`MINIME_TELEGRAM_API_BASE` is test-only and must not be set in production.
+The delivery CLI accepts `--timeout` (default 8 seconds, maximum 30) and
+`--attempts` (default 3, maximum 10). Messages are limited to Telegram's 4,096
+UTF-16-unit text boundary.
 
 Validate delivery before installing services:
 
@@ -42,6 +60,13 @@ placeholders, lint it with `plutil -lint`, copy it to
 `~/Library/LaunchAgents`, then use `launchctl bootstrap gui/$(id -u) <plist>`.
 Keep the listener on loopback. Configure the container-to-host route separately
 and restrict it with the host firewall where appropriate.
+
+The webhook flags are `--host` (default `127.0.0.1`), `--port` (default 9876),
+`--path` (default `/alertmanager`), `--max-body` (default 256 KiB), and
+`--body-timeout` (default 5 seconds, capped at 30). `GET /healthz` is its local
+readiness endpoint. Only IPv4 loopback or `localhost` bind hosts are accepted.
+`MINIME_WEBHOOK_HOST`, `MINIME_WEBHOOK_PORT`, and `MINIME_WEBHOOK_PATH` provide
+the corresponding launchd environment settings.
 
 Merge the example Alertmanager receiver into the active configuration rather
 than replacing operator configuration. Validate the active configuration,
@@ -62,6 +87,10 @@ Post controlled synthetic firing and resolved Alertmanager payloads using
 placeholder labels and confirm one Telegram message for each transition.
 Repost the same payload to confirm batch deduplication. A delivery failure
 returns a non-2xx response so Alertmanager can retry.
+Deduplication is process-local, retains at most 1,024 successful batch digests
+for one hour, and resets when the webhook restarts. It suppresses immediate
+retries; it is not durable exactly-once delivery. Large batches are summarized
+within Telegram's message limit.
 
 ## Runtime doctor installation
 
@@ -80,16 +109,24 @@ that exist in the installation:
 - optional `MINIME_DOCTOR_TCC_STATUS_PATH` consumes a non-prompting external
   signal containing `granted` or `denied`; absence is reported as unknown.
 
+`MINIME_DOCTOR_TIMEOUT` bounds subprocess and HTTP checks (default 5 seconds,
+maximum 30), and `MINIME_DOCTOR_LAUNCHCTL` may select the launchctl executable
+(default `/bin/launchctl`). `MINIME_DOCTOR_LOG_PATH` enables a 256 KB rotating
+log with three backups. `MINIME_DOCTOR_RUNTIME_MAX_AGE` defaults to 3,600
+seconds. All health URLs must be HTTP(S) URLs with a host.
+
 `MINIME_DOCTOR_STATE_PATH` is required. Incident state is versioned JSON,
 written atomically with mode 0600. Identical failures are suppressed, a changed
 failure set is notified once, and a return to health sends one recovery.
 Corrupt state is replaced without notifying on that run to prevent a storm.
-An adjacent exclusive lock suppresses overlapping invocations. Configure
+The next run can notify an active incident from the repaired baseline. An
+adjacent process-owned advisory lock suppresses overlapping invocations and is
+automatically released after abnormal process exit. Configure
 `MINIME_DOCTOR_LOG_PATH` for a bounded rotating log; logs contain stable codes,
 not configured paths, endpoints, destinations, payloads, or secrets.
 
-The example plists use `/usr/bin/python3` and a Node-free
-`PATH=/usr/bin:/bin`. To prove independence, temporarily point the bot's Node
+The example plists use `/usr/bin/python3`, an absolute SOPS executable, and a
+Node-free `PATH=/usr/bin:/bin`. To prove independence, temporarily point the bot's Node
 check at an unavailable synthetic path, stop the monitoring containers, and
 run the doctor. Telegram delivery must still work. Restore health and run it
 again to confirm exactly one recovery. The doctor never reads or edits TCC

@@ -136,7 +136,8 @@ describe("host-native secret and Telegram delivery", () => {
     );
     chmodSync(sops, 0o755);
     const commonEnv = {
-      PATH: `${bin}:/usr/bin:/bin`,
+      PATH: "/usr/bin:/bin",
+      MINIME_SOPS_EXECUTABLE: sops,
       MINIME_TELEGRAM_SOPS_FILE: join(dir, "synthetic.sops.yaml"),
       MINIME_TELEGRAM_SOPS_KEY: "telegram.bot_token",
       EXPECTED_TOKEN: syntheticSecret,
@@ -187,7 +188,7 @@ describe("host-native secret and Telegram delivery", () => {
         response.setHeader("Content-Type", "application/json");
         if (attempts === 1) {
           response.statusCode = 429;
-          response.end(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 0 } }));
+          response.end(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 999 } }));
         } else {
           response.end(JSON.stringify({ ok: true, result: {} }));
         }
@@ -195,12 +196,16 @@ describe("host-native secret and Telegram delivery", () => {
     });
     try {
       const result = await runPython(
-        [nativeScript, "--message", "synthetic firing", "--chat-id", "10001", "--thread-id", "9"],
+        [
+          "-c",
+          "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; m.send_telegram('synthetic firing', m.DeliveryConfig('10001', '9', attempts=3, max_retry_after=.01), sleep=lambda value: print(f'sleep={value}'))",
+        ],
         telegramEnv(base),
       );
       assert.equal(result.status, 0, result.stderr);
       assertSecretAbsent(result);
       assert.equal(requests.length, 2);
+      assert.match(result.stdout, /sleep=0\.01/);
       assert.match(requests[1].url, /^\/bot.+\/sendMessage$/);
       const form = new URLSearchParams(requests[1].body);
       assert.equal(form.get("chat_id"), "10001");
@@ -226,6 +231,53 @@ describe("host-native secret and Telegram delivery", () => {
     } finally {
       await closeServer(failedServer.server);
     }
+
+    let exhaustedAttempts = 0;
+    const exhaustedServer = await startServer((_request, response) => {
+      exhaustedAttempts += 1;
+      response.statusCode = 503;
+      response.end(JSON.stringify({ ok: false, error_code: 503 }));
+    });
+    try {
+      const exhausted = await runPython(
+        [
+          "-c",
+          "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; m.send_telegram('synthetic exhaustion', m.DeliveryConfig('10001', attempts=2, max_retry_after=0), sleep=lambda _value: None)",
+        ],
+        telegramEnv(exhaustedServer.base),
+      );
+      assert.notEqual(exhausted.status, 0);
+      assert.equal(exhaustedAttempts, 2);
+      assertSecretAbsent(exhausted);
+    } finally {
+      await closeServer(exhaustedServer.server);
+    }
+
+    const networkRetry = await runPython(
+      [
+        "-c",
+        "import sys,urllib.error; sys.path.insert(0, 'scripts'); import monitoring_native as m; calls=[]; m.urllib.request.urlopen=lambda *_a, **_k: (calls.append(1), (_ for _ in ()).throw(urllib.error.URLError('private endpoint')))[1];\ntry: m.send_telegram('network failure', m.DeliveryConfig('10001', attempts=2, max_retry_after=0), environ={'MINIME_TELEGRAM_BOT_TOKEN':'synthetic', 'MINIME_TELEGRAM_API_BASE':'http://127.0.0.1', 'MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API':'1'}, sleep=lambda _value: None)\nexcept m.DeliveryError: assert len(calls) == 2; print('network retries bounded')",
+      ],
+      {},
+    );
+    assert.equal(networkRetry.status, 0, networkRetry.stderr);
+    assert.match(networkRetry.stdout, /network retries bounded/);
+
+    for (const timeout of ["-1", "31", "nan"]) {
+      const invalid = await runPython(
+        [nativeScript, "--message", "synthetic", "--chat-id", "10001", "--timeout", timeout],
+        telegramEnv("http://127.0.0.1:1"),
+      );
+      assert.equal(invalid.status, 1);
+      assert.ok(!invalid.stderr.includes("Traceback"));
+      assertSecretAbsent(invalid);
+    }
+    const excessiveAttempts = await runPython(
+      [nativeScript, "--message", "synthetic", "--chat-id", "10001", "--attempts", "11"],
+      telegramEnv("http://127.0.0.1:1"),
+    );
+    assert.equal(excessiveAttempts.status, 1);
+    assert.ok(!excessiveAttempts.stderr.includes("Traceback"));
   });
 });
 
@@ -243,7 +295,7 @@ describe("Alertmanager webhook", () => {
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
         messages.push(new URLSearchParams(body).get("text") ?? "");
-        response.end(JSON.stringify({ ok: true }));
+        setTimeout(() => response.end(JSON.stringify({ ok: true })), 100);
       });
     });
     const reservation = await startServer((_request, response) => response.end());
@@ -266,7 +318,8 @@ describe("Alertmanager webhook", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
         });
-      assert.equal((await post(firing)).status, 200);
+      const concurrent = await Promise.all([post(firing), post(firing)]);
+      assert.deepEqual(concurrent.map((response) => response.status), [200, 200]);
       assert.equal((await post(firing)).status, 200);
       assert.equal(messages.length, 1);
       assert.match(messages[0], /FIRING alert=BotDown severity=critical instance=test/);
@@ -274,6 +327,16 @@ describe("Alertmanager webhook", () => {
       assert.equal((await post(resolved)).status, 200);
       assert.equal(messages.length, 2);
       assert.match(messages[1], /RESOLVED/);
+      const largeBatch = {
+        alerts: Array.from({ length: 100 }, (_, index) => ({
+          status: "firing",
+          fingerprint: `large-${index}`,
+          labels: { alertname: `Alert${index}${"A".repeat(110)}`, severity: "critical", instance: "I".repeat(120) },
+        })),
+      };
+      assert.equal((await post(largeBatch)).status, 200);
+      assert.ok(Buffer.from(messages[2], "utf16le").byteLength / 2 <= 4096);
+      assert.match(messages[2], /alerts omitted/);
       assert.equal(existsSync(marker), false);
       assert.ok(!stderr.includes(syntheticSecret));
     } finally {
@@ -284,9 +347,15 @@ describe("Alertmanager webhook", () => {
   });
 
   it("rejects malformed and oversized bodies and returns non-2xx when delivery fails", async () => {
+    let deliveryAttempts = 0;
     const telegram = await startServer((_request, response) => {
-      response.statusCode = 500;
-      response.end(JSON.stringify({ ok: false, error_code: 500 }));
+      deliveryAttempts += 1;
+      if (deliveryAttempts === 1) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ ok: false, error_code: 400 }));
+      } else {
+        response.end(JSON.stringify({ ok: true }));
+      }
     });
     const reservation = await startServer((_request, response) => response.end());
     const port = reservation.port;
@@ -299,11 +368,20 @@ describe("Alertmanager webhook", () => {
       assert.equal((await fetch(endpoint, { method: "POST", body: "x".repeat(257) })).status, 413);
       const valid = { alerts: [{ status: "firing", fingerprint: "retryable", labels: { alertname: "Synthetic" } }] };
       assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(valid) })).status, 503);
+      assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(valid) })).status, 200);
+      assert.equal(deliveryAttempts, 2, "a failed delivery must release its deduplication claim");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
       await closeServer(telegram.server);
     }
+  });
+
+  it("rejects unsupported IPv6 binding without a traceback", async () => {
+    const result = await runPython([webhookScript, "--host", "::1", "--port", "0"], {});
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /host must be loopback/);
+    assert.ok(!result.stderr.includes("Traceback"));
   });
 });
 
@@ -446,21 +524,133 @@ describe("runtime doctor", () => {
       const corrupt = await runPython([doctorScript], env);
       assert.equal(corrupt.status, 0);
       assert.equal(deliveries, 0, "corrupt state must be reset without a notification storm");
+      assert.deepEqual((JSON.parse(readFileSync(state, "utf8")) as { incidents: string[] }).incidents, []);
+
+      const repaired = await runPython([doctorScript], env);
+      assert.equal(repaired.status, 0);
+      assert.equal(deliveries, 1, "the next run must notify an active incident after repair");
       assert.match(readFileSync(state, "utf8"), /runtime_state_missing/);
 
+      // A stale lock inode is harmless because ownership is process-bound.
       writeFileSync(lock, "active\n");
+      const staleLock = await runPython([doctorScript], env);
+      assert.equal(staleLock.status, 0);
+      assert.equal(deliveries, 1);
+
+      const holder = spawn(
+        python,
+        [
+          "-c",
+          "import fcntl,sys,time; handle=open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)",
+          lock,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      await new Promise<void>((resolvePromise, reject) => {
+        const timer = setTimeout(() => reject(new Error("lock holder timed out")), 2_000);
+        holder.stdout.setEncoding("utf8").on("data", (chunk) => {
+          if (chunk.includes("locked")) {
+            clearTimeout(timer);
+            resolvePromise();
+          }
+        });
+      });
       const overlap = await runPython([doctorScript], env);
+      holder.kill("SIGTERM");
+      await new Promise((resolvePromise) => holder.once("close", resolvePromise));
       assert.equal(overlap.status, 0);
-      assert.equal(deliveries, 0);
-      rmSync(lock);
+      assert.match(overlap.stderr, /doctor_overlap_suppressed/);
+      assert.equal(deliveries, 1);
 
       await closeServer(hanging.server);
       writeFileSync(join(dir, "missing-state"), "fresh\n");
       const changed = await runPython([doctorScript], { ...env, MINIME_DOCTOR_PROMETHEUS_URL: "http://127.0.0.1:1/down" });
       assert.equal(changed.status, 0);
-      assert.equal(deliveries, 1);
+      assert.equal(deliveries, 2);
     } finally {
       if (hanging.server.listening) await closeServer(hanging.server);
+      await closeServer(telegram.server);
+    }
+  });
+
+  it("retries an unchanged incident after notification delivery fails", async () => {
+    const dir = tempDir();
+    const state = join(dir, "state.json");
+    let requests = 0;
+    const telegram = await startServer((_request, response) => {
+      requests += 1;
+      if (requests === 1) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ ok: false, error_code: 400 }));
+      } else {
+        response.end(JSON.stringify({ ok: true }));
+      }
+    });
+    const env = {
+      ...telegramEnv(telegram.base),
+      MINIME_DOCTOR_STATE_PATH: state,
+      MINIME_DOCTOR_NODE_EXECUTABLE: join(dir, "missing-node"),
+    };
+    try {
+      const failed = await runPython([doctorScript], env);
+      assert.equal(failed.status, 1);
+      assert.equal(existsSync(state), false, "failed delivery must not advance incident state");
+      const retried = await runPython([doctorScript], env);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.match(readFileSync(state, "utf8"), /node_unavailable/);
+      const unchanged = await runPython([doctorScript], env);
+      assert.equal(unchanged.status, 0);
+      assert.equal(requests, 2);
+    } finally {
+      await closeServer(telegram.server);
+    }
+  });
+
+  it("sanitizes malformed configuration and runtime filesystem failures", async () => {
+    const dir = tempDir();
+    const privateUrl = "file:///private/configured/health";
+    const invalidUrl = await runPython([doctorScript], {
+      MINIME_DOCTOR_STATE_PATH: join(dir, "state.json"),
+      MINIME_DOCTOR_PROMETHEUS_URL: privateUrl,
+    });
+    assert.equal(invalidUrl.status, 2);
+    assert.ok(!invalidUrl.stderr.includes(privateUrl));
+    assert.ok(!invalidUrl.stderr.includes("Traceback"));
+
+    const blockedParent = join(dir, "private-parent");
+    writeFileSync(blockedParent, "not a directory");
+    const runtimeFailure = await runPython([doctorScript], {
+      MINIME_DOCTOR_STATE_PATH: join(blockedParent, "state.json"),
+    });
+    assert.equal(runtimeFailure.status, 1);
+    assert.match(runtimeFailure.stderr, /doctor_runtime_failed/);
+    assert.ok(!runtimeFailure.stderr.includes(blockedParent));
+    assert.ok(!runtimeFailure.stderr.includes("Traceback"));
+  });
+
+  it("maps a malformed UTF-8 TCC signal to the stable unknown incident", async () => {
+    const dir = tempDir();
+    const tcc = join(dir, "tcc-status");
+    writeFileSync(tcc, Buffer.from([0xff, 0xfe]));
+    const messages: string[] = [];
+    const telegram = await startServer((request, response) => {
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        messages.push(new URLSearchParams(body).get("text") ?? "");
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    try {
+      const result = await runPython([doctorScript], {
+        ...telegramEnv(telegram.base),
+        MINIME_DOCTOR_STATE_PATH: join(dir, "state.json"),
+        MINIME_DOCTOR_TCC_STATUS_PATH: tcc,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(messages.length, 1);
+      assert.match(messages[0], /tcc_unknown/);
+    } finally {
       await closeServer(telegram.server);
     }
   });
@@ -504,6 +694,7 @@ describe("monitoring package examples", () => {
       const plist = readFileSync(path, "utf8");
       assert.match(plist, /<string>\/usr\/bin\/python3<\/string>/);
       assert.match(plist, /<string>\/usr\/bin:\/bin<\/string>/);
+      assert.match(plist, /<key>MINIME_SOPS_EXECUTABLE<\/key>/);
       assert.ok(!plist.includes("users/"));
       assert.ok(!plist.includes("node_modules"));
     }

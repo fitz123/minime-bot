@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import socket
@@ -20,8 +21,10 @@ from typing import Any, Callable
 TOKEN_ENV = "MINIME_TELEGRAM_BOT_TOKEN"
 SOPS_FILE_ENV = "MINIME_TELEGRAM_SOPS_FILE"
 SOPS_KEY_ENV = "MINIME_TELEGRAM_SOPS_KEY"
+SOPS_EXECUTABLE_ENV = "MINIME_SOPS_EXECUTABLE"
 API_BASE_ENV = "MINIME_TELEGRAM_API_BASE"
 INSECURE_TEST_ENV = "MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API"
+TELEGRAM_TEXT_MAX_UTF16_UNITS = 4096
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 
 
@@ -59,10 +62,13 @@ def resolve_token(
     sops_key = environ.get(SOPS_KEY_ENV, "")
     if not sops_file or not sops_key:
         raise SecretError("secret source is not configured")
+    sops_executable = environ.get(SOPS_EXECUTABLE_ENV, "sops")
+    if sops_executable != "sops" and not os.path.isabs(sops_executable):
+        raise SecretError("secret executable is invalid")
     expression = sops_expression(sops_key)
     try:
         result = run(
-            ["sops", "-d", "--extract", expression, sops_file],
+            [sops_executable, "-d", "--extract", expression, sops_file],
             capture_output=True,
             text=True,
             timeout=sops_timeout,
@@ -118,9 +124,17 @@ def send_telegram(
     environ: dict[str, str] | os._Environ[str] = os.environ,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    if not message or len(message.encode("utf-8")) > 16_000:
+    message_units = len(message.encode("utf-16-le")) // 2
+    if not message or message_units > TELEGRAM_TEXT_MAX_UTF16_UNITS:
         raise DeliveryError("notification message is invalid")
-    if not config.chat_id or config.attempts < 1:
+    if (
+        not config.chat_id
+        or not 1 <= config.attempts <= 10
+        or not math.isfinite(config.timeout)
+        or not 0 < config.timeout <= 30
+        or not math.isfinite(config.max_retry_after)
+        or not 0 <= config.max_retry_after <= 60
+    ):
         raise DeliveryError("Telegram destination is invalid")
     token = resolve_token(environ=environ)
     base = _api_base(environ)
@@ -143,7 +157,7 @@ def send_telegram(
             parameters = payload.get("parameters")
             if error_code == 429 and isinstance(parameters, dict):
                 raw_delay = parameters.get("retry_after")
-                if isinstance(raw_delay, (int, float)):
+                if isinstance(raw_delay, (int, float)) and math.isfinite(raw_delay):
                     retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
             retryable = error_code == 429 or (isinstance(error_code, int) and 500 <= error_code <= 599)
             if not retryable:
@@ -156,7 +170,7 @@ def send_telegram(
                 try:
                     payload = _response_json(exc.read(1_000_001))
                     raw_delay = payload.get("parameters", {}).get("retry_after")
-                    if isinstance(raw_delay, (int, float)):
+                    if isinstance(raw_delay, (int, float)) and math.isfinite(raw_delay):
                         retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
                 except (DeliveryError, AttributeError):
                     pass

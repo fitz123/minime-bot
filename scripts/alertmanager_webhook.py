@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -15,7 +16,12 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from monitoring_native import DeliveryConfig, MonitoringError, send_telegram
+from monitoring_native import (
+    TELEGRAM_TEXT_MAX_UTF16_UNITS,
+    DeliveryConfig,
+    MonitoringError,
+    send_telegram,
+)
 
 MAX_BODY_DEFAULT = 256 * 1024
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
@@ -26,6 +32,25 @@ def safe_field(value: Any, limit: int = 120) -> str:
         return "unknown"
     cleaned = _SAFE_TEXT.sub("?", str(value).replace("\n", " ").replace("\r", " "))
     return cleaned[:limit] or "unknown"
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _bounded_alert_message(lines: list[str]) -> str:
+    prefix = "minime monitoring"
+    selected: list[str] = []
+    for index, line in enumerate(lines):
+        omitted = len(lines) - index - 1
+        trailer = f"\n... {omitted} alerts omitted" if omitted else ""
+        candidate = prefix + "\n" + "\n".join([*selected, line]) + trailer
+        if _utf16_units(candidate) > TELEGRAM_TEXT_MAX_UTF16_UNITS:
+            break
+        selected.append(line)
+    omitted = len(lines) - len(selected)
+    trailer = f"\n... {omitted} alerts omitted" if omitted else ""
+    return prefix + "\n" + "\n".join(selected) + trailer
 
 
 def parse_alertmanager_payload(body: bytes) -> tuple[str, str]:
@@ -58,7 +83,7 @@ def parse_alertmanager_payload(body: bytes) -> tuple[str, str]:
         identities.append(f"{status}:{identity}")
 
     digest = hashlib.sha256("\n".join(sorted(identities)).encode("utf-8")).hexdigest()
-    message = "minime monitoring\n" + "\n".join(lines)
+    message = _bounded_alert_message(lines)
     return digest, message
 
 
@@ -67,22 +92,31 @@ class BatchDeduplicator:
         self.ttl_seconds = ttl_seconds
         self.limit = limit
         self._seen: OrderedDict[str, float] = OrderedDict()
+        self._in_flight: set[str] = set()
         self._lock = threading.Lock()
 
-    def contains(self, key: str, now: float | None = None) -> bool:
+    def claim(self, key: str, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
         with self._lock:
             self._prune(current)
-            return key in self._seen
+            if key in self._seen or key in self._in_flight:
+                return False
+            self._in_flight.add(key)
+            return True
 
-    def remember(self, key: str, now: float | None = None) -> None:
+    def commit(self, key: str, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
         with self._lock:
             self._prune(current)
+            self._in_flight.discard(key)
             self._seen[key] = current
             self._seen.move_to_end(key)
             while len(self._seen) > self.limit:
                 self._seen.popitem(last=False)
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._in_flight.discard(key)
 
     def _prune(self, now: float) -> None:
         while self._seen:
@@ -160,15 +194,16 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 self._reply(400, "invalid payload")
                 return
-            if app.deduplicator.contains(key):
+            if not app.deduplicator.claim(key):
                 self._reply(200, "duplicate suppressed")
                 return
             try:
                 app.deliver(message)
             except (MonitoringError, OSError):
+                app.deduplicator.release(key)
                 self._reply(503, "delivery failed")
                 return
-            app.deduplicator.remember(key)
+            app.deduplicator.commit(key)
             self._reply(200, "delivered")
 
     return Handler
@@ -177,7 +212,7 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Receive Alertmanager webhooks without Node")
     parser.add_argument("--host", default=os.environ.get("MINIME_WEBHOOK_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("MINIME_WEBHOOK_PORT", "9876")))
+    parser.add_argument("--port", type=int, default=os.environ.get("MINIME_WEBHOOK_PORT", "9876"))
     parser.add_argument("--path", default=os.environ.get("MINIME_WEBHOOK_PATH", "/alertmanager"))
     parser.add_argument("--max-body", type=int, default=MAX_BODY_DEFAULT)
     parser.add_argument("--body-timeout", type=float, default=5.0)
@@ -188,10 +223,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.host not in {"127.0.0.1", "::1", "localhost"}:
+    if args.host not in {"127.0.0.1", "localhost"}:
         print("webhook configuration rejected: host must be loopback", file=sys.stderr)
         return 2
-    if not args.path.startswith("/") or "?" in args.path or args.max_body < 1 or args.body_timeout <= 0:
+    if (
+        not args.path.startswith("/")
+        or "?" in args.path
+        or args.max_body < 1
+        or not math.isfinite(args.body_timeout)
+        or args.body_timeout <= 0
+        or not 0 <= args.port <= 65535
+    ):
         print("webhook configuration rejected", file=sys.stderr)
         return 2
 

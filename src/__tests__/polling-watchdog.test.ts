@@ -165,6 +165,31 @@ describe("polling-watchdog", () => {
     assert.equal(checks.values.find((v) => v.labels.outcome === "poll_resumed")?.value, 1);
   });
 
+  it("does not treat rejected getUpdates completions as healthy progress", async () => {
+    let clock = 0;
+    let exits = 0;
+    const progress = snapshot({
+      lastPollStartedAtMs: 5_500,
+      lastPollSucceededAtMs: null,
+      failedPollCount: 3,
+      inFlight: false,
+    });
+    const wd = createWatchdog({
+      pollProgress: () => progress,
+      heartbeat: async () => true,
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 5_000,
+    });
+
+    clock = 6_000;
+    await wd.check();
+    await wd.check();
+    assert.equal(exits, 1);
+    const restarts = await pollWatchdogRestarts.get();
+    assert.equal(restarts.values.find((value) => value.labels.reason === "poll_stalled")?.value, 1);
+  });
+
   it("does not treat a real incoming update as poll progress", async () => {
     let clock = 0;
     let exits = 0;
