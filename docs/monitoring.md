@@ -120,9 +120,10 @@ maximum 30), and `MINIME_DOCTOR_LAUNCHCTL` may select the launchctl executable
 log with three backups. `MINIME_DOCTOR_RUNTIME_MAX_AGE` defaults to 3,600
 seconds. All health URLs must be HTTP(S) URLs with a host.
 
-`MINIME_DOCTOR_STATE_PATH` is required. Incident state is versioned JSON,
-written atomically with mode 0600. Identical failures are suppressed, a changed
-failure set is notified once, and a return to health sends one recovery.
+`MINIME_DOCTOR_STATE_PATH` is required. Incident state is bounded,
+regular-file versioned JSON written atomically with mode 0600. Identical
+failures are suppressed, a changed failure set is notified once, and a return
+to health sends one recovery.
 Corrupt state is replaced without notifying on that run to prevent a storm.
 The next run can notify an active incident from the repaired baseline. An
 adjacent process-owned advisory lock suppresses overlapping invocations and is

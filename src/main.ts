@@ -4,7 +4,7 @@ import { createTelegramBot, BOT_COMMANDS, type TelegramBotResult } from "./teleg
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
 import { startMetricsServer, stopMetricsServer } from "./metrics.js";
-import { startBotWithRetry } from "./bot-startup.js";
+import { runTelegramSetupInBackground, startBotWithRetry } from "./bot-startup.js";
 import { createWatchdog, type Watchdog } from "./polling-watchdog.js";
 import { restoreThreadCache, saveThreadCache } from "./message-thread-cache.js";
 import { restoreMessageIndex, saveMessageIndex } from "./message-content-index.js";
@@ -149,7 +149,7 @@ async function main(): Promise<void> {
         bot.start({
           timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
           allowed_updates: ["message", "message_reaction"],
-          onStart: async (botInfo) => {
+          onStart: (botInfo) => {
             startedSuccessfully = true;
             clearTimeout(startupTimeout);
             setBotUsername(botInfo.username);
@@ -160,12 +160,14 @@ async function main(): Promise<void> {
             // still serving. Orphans from prior runs are reclaimed via per-session
             // cleanupSessionMediaDir on close and enforceMediaCap eviction.
             if (watchdog) watchdog.start();
-            try {
-              await bot.api.setMyCommands(BOT_COMMANDS);
-              log.info("main", "Bot commands registered with Telegram");
-            } catch (err) {
-              log.error("main", "Failed to register bot commands:", err);
-            }
+            // grammY does not begin getUpdates until onStart returns. Command
+            // registration is non-critical and autoRetry may wait indefinitely,
+            // so keep it off the polling startup path.
+            runTelegramSetupInBackground(
+              () => bot.api.setMyCommands(BOT_COMMANDS),
+              () => log.info("main", "Bot commands registered with Telegram"),
+              (err) => log.error("main", "Failed to register bot commands:", err),
+            );
           },
         }),
     ).catch((err) => {

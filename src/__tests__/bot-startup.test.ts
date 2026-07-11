@@ -1,7 +1,46 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { GrammyError } from "grammy";
-import { is409ConflictError, startBotWithRetry } from "../bot-startup.js";
+import {
+  is409ConflictError,
+  runTelegramSetupInBackground,
+  startBotWithRetry,
+} from "../bot-startup.js";
+
+describe("runTelegramSetupInBackground", () => {
+  it("returns before a pending setup task completes", async () => {
+    let finishSetup!: () => void;
+    const pending = new Promise<void>((resolve) => { finishSetup = resolve; });
+    let succeeded = false;
+
+    runTelegramSetupInBackground(
+      () => pending,
+      () => { succeeded = true; },
+      () => assert.fail("setup unexpectedly failed"),
+    );
+
+    assert.equal(succeeded, false);
+    finishSetup();
+    await pending;
+    await Promise.resolve();
+    assert.equal(succeeded, true);
+  });
+
+  it("reports synchronous setup failures without an unhandled rejection", async () => {
+    const expected = new Error("synthetic setup failure");
+    let reported: unknown;
+
+    runTelegramSetupInBackground(
+      () => { throw expected; },
+      () => assert.fail("setup unexpectedly succeeded"),
+      (error) => { reported = error; },
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(reported, expected);
+  });
+});
 
 describe("is409ConflictError", () => {
   it("returns true for GrammyError with error_code 409", () => {

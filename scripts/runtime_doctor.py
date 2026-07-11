@@ -18,16 +18,20 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from monitoring_native import DeliveryConfig, MonitoringError, send_telegram
+from monitoring_native import (
+    DeliveryConfig,
+    MonitoringError,
+    request_with_deadline,
+    send_telegram,
+)
 
 STATE_VERSION = 1
 TCC_STATUS_MAX_BYTES = 1024
+STATE_MAX_BYTES = 64 * 1024
 ENV_PREFIX = "MINIME_DOCTOR_"
 INCIDENT_ACTIONS = {
     "alertmanager_unhealthy": "check Alertmanager health and recreate its current service",
@@ -127,12 +131,9 @@ def make_logger(path: Path | None) -> logging.Logger:
 
 def _http_healthy(url: str, timeout: float) -> bool:
     try:
-        request = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read(4096)
-            return 200 <= response.getcode() < 300
+        response = request_with_deadline(url, method="GET", timeout=timeout)
+        return 200 <= response.status < 300
     except (
-        urllib.error.URLError,
         http.client.HTTPException,
         TimeoutError,
         OSError,
@@ -239,12 +240,23 @@ def incident_message(incidents: set[str]) -> str:
 
 
 def read_state(path: Path) -> tuple[set[str], bool]:
+    descriptor: int | None = None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > STATE_MAX_BYTES:
+            return set(), True
+        raw = os.read(descriptor, STATE_MAX_BYTES + 1)
+        if len(raw) > STATE_MAX_BYTES:
+            return set(), True
+        value = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         return set(), False
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError):
         return set(), True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     incidents = value.get("incidents") if isinstance(value, dict) and value.get("version") == STATE_VERSION else None
     if not isinstance(incidents, list) or not all(
         isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents

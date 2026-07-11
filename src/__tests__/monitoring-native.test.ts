@@ -299,7 +299,7 @@ describe("host-native secret and Telegram delivery", () => {
     const networkRetry = await runPython(
       [
         "-c",
-        "import sys,urllib.error; sys.path.insert(0, 'scripts'); import monitoring_native as m; calls=[]; m.urllib.request.urlopen=lambda *_a, **_k: (calls.append(1), (_ for _ in ()).throw(urllib.error.URLError('private endpoint')))[1];\ntry: m.send_telegram('network failure', m.DeliveryConfig('10001', attempts=2, max_retry_after=0), environ={'MINIME_TELEGRAM_BOT_TOKEN':'synthetic', 'MINIME_TELEGRAM_API_BASE':'http://127.0.0.1', 'MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API':'1'}, sleep=lambda _value: None)\nexcept m.DeliveryError: assert len(calls) == 2; print('network retries bounded')",
+        "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; calls=[]; m.request_with_deadline=lambda *_a, **_k: (calls.append(1), (_ for _ in ()).throw(OSError('private endpoint')))[1];\ntry: m.send_telegram('network failure', m.DeliveryConfig('10001', attempts=2, max_retry_after=0), environ={'MINIME_TELEGRAM_BOT_TOKEN':'synthetic', 'MINIME_TELEGRAM_API_BASE':'http://127.0.0.1', 'MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API':'1'}, sleep=lambda _value: None)\nexcept m.DeliveryError: assert len(calls) == 2; print('network retries bounded')",
       ],
       {},
     );
@@ -343,6 +343,49 @@ describe("host-native secret and Telegram delivery", () => {
     );
     assert.equal(excessiveAttempts.status, 1);
     assert.ok(!excessiveAttempts.stderr.includes("Traceback"));
+  });
+
+  it("enforces absolute deadlines for slow Telegram headers and bodies", async () => {
+    for (const phase of ["headers", "body"] as const) {
+      const slow = await startRawServer((socket) => {
+        socket.on("error", () => {});
+        socket.once("data", () => {
+          const chunks = phase === "headers"
+            ? [..."HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"]
+            : [
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+                ...Array.from({ length: 100 }, () => " "),
+              ];
+          let index = 0;
+          const drip = setInterval(() => {
+            if (index >= chunks.length || socket.destroyed) {
+              clearInterval(drip);
+              if (!socket.destroyed) socket.end();
+              return;
+            }
+            socket.write(chunks[index++]);
+          }, 30);
+          socket.once("close", () => clearInterval(drip));
+        });
+      });
+      const started = Date.now();
+      try {
+        const result = await runPython(
+          [
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); import monitoring_native as m;\ntry: m.send_telegram('deadline test', m.DeliveryConfig('10001', timeout=.15, attempts=1), sleep=lambda _value: None)\nexcept m.DeliveryError: print('deadline enforced')",
+          ],
+          telegramEnv(slow.base),
+          2_000,
+        );
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /deadline enforced/);
+        assert.ok(Date.now() - started < 1_500, `${phase} response exceeded absolute deadline`);
+        assertSecretAbsent(result);
+      } finally {
+        await closeServer(slow.server);
+      }
+    }
   });
 });
 
@@ -675,6 +718,7 @@ describe("runtime doctor", () => {
       for (const corruptState of [
         "not-json\n",
         JSON.stringify({ version: 1, incidents: [{}] }),
+        JSON.stringify({ version: 1, incidents: [], padding: "x".repeat(70_000) }),
       ]) {
         writeFileSync(state, corruptState);
         const corrupt = await runPython([doctorScript], env);
@@ -726,6 +770,70 @@ describe("runtime doctor", () => {
       assert.equal(deliveries, 2);
     } finally {
       if (hanging.server.listening) await closeServer(hanging.server);
+      await closeServer(telegram.server);
+    }
+  });
+
+  it("classifies every JSON ValueError as corrupt state", async () => {
+    const dir = tempDir();
+    const state = join(dir, "state.json");
+    writeFileSync(state, JSON.stringify({ version: 1, incidents: [] }));
+    const result = await runPython(
+      [
+        "-c",
+        "import pathlib,sys; sys.path.insert(0, 'scripts'); import runtime_doctor as d; d.json.loads=lambda _value: (_ for _ in ()).throw(ValueError('synthetic integer limit')); incidents,corrupt=d.read_state(pathlib.Path(sys.argv[1])); assert incidents == set() and corrupt; print('corrupt')",
+        state,
+      ],
+      {},
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /corrupt/);
+    assert.ok(!result.stderr.includes(state));
+  });
+
+  it("bounds slow doctor health-response headers by the configured timeout", async () => {
+    const dir = tempDir();
+    const state = join(dir, "state.json");
+    const messages: string[] = [];
+    const telegram = await startServer((request, response) => {
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        messages.push(new URLSearchParams(body).get("text") ?? "");
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const slow = await startRawServer((socket) => {
+      socket.on("error", () => {});
+      socket.once("data", () => {
+        const chunks = [..."HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"];
+        let index = 0;
+        const drip = setInterval(() => {
+          if (index >= chunks.length || socket.destroyed) {
+            clearInterval(drip);
+            if (!socket.destroyed) socket.end();
+            return;
+          }
+          socket.write(chunks[index++]);
+        }, 30);
+        socket.once("close", () => clearInterval(drip));
+      });
+    });
+    const started = Date.now();
+    try {
+      const result = await runPython([doctorScript], {
+        ...telegramEnv(telegram.base),
+        MINIME_DOCTOR_STATE_PATH: state,
+        MINIME_DOCTOR_TIMEOUT: "0.15",
+        MINIME_DOCTOR_PROMETHEUS_URL: `${slow.base}/-/healthy`,
+      }, 2_000);
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(Date.now() - started < 1_500, "doctor health check exceeded absolute deadline");
+      assert.equal(messages.length, 1);
+      assert.match(messages[0], /prometheus_unhealthy/);
+      assertSecretAbsent(result);
+    } finally {
+      await closeServer(slow.server);
       await closeServer(telegram.server);
     }
   });

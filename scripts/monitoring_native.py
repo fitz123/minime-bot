@@ -12,10 +12,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -27,6 +26,7 @@ API_BASE_ENV = "MINIME_TELEGRAM_API_BASE"
 INSECURE_TEST_ENV = "MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API"
 DEFAULT_API_BASE = "https://api.telegram.org"
 TELEGRAM_TEXT_MAX_UTF16_UNITS = 4096
+HTTP_RESPONSE_MAX_BYTES = 1_000_000
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 
 
@@ -109,7 +109,7 @@ def _api_base(environ: dict[str, str] | os._Environ[str]) -> str:
 
 
 def _response_json(body: bytes) -> dict[str, Any]:
-    if len(body) > 1_000_000:
+    if len(body) > HTTP_RESPONSE_MAX_BYTES:
         raise DeliveryError("Telegram response is too large")
     try:
         value = json.loads(body.decode("utf-8"))
@@ -127,6 +127,65 @@ class DeliveryConfig:
     timeout: float = 8.0
     attempts: int = 3
     max_retry_after: float = 10.0
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    body: bytes
+
+
+def _abort_connection(connection: http.client.HTTPConnection) -> None:
+    """Interrupt an in-progress header/body read from the deadline timer."""
+    sock = connection.sock
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    connection.close()
+
+
+def request_with_deadline(
+    url: str,
+    *,
+    method: str,
+    timeout: float,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    max_body: int = 0,
+) -> HttpResponse:
+    """Perform one HTTP request with an absolute header/body deadline."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("HTTP URL is invalid")
+    port = parsed.port
+    connection_type = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(parsed.hostname, port=port, timeout=timeout)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    expired = threading.Event()
+
+    def expire() -> None:
+        expired.set()
+        _abort_connection(connection)
+
+    timer = threading.Timer(timeout, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        connection.request(method, target, body=data, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read(max_body + 1) if max_body > 0 else b""
+        if expired.is_set():
+            raise TimeoutError("HTTP request timed out")
+        return HttpResponse(response.status, body)
+    finally:
+        timer.cancel()
+        _abort_connection(connection)
 
 
 def send_telegram(
@@ -159,39 +218,46 @@ def send_telegram(
     for attempt in range(config.attempts):
         retry_delay = min(2**attempt, config.max_retry_after)
         try:
-            request = urllib.request.Request(url, data=data, method="POST")
-            request.add_header("Content-Type", "application/x-www-form-urlencoded")
-            with urllib.request.urlopen(request, timeout=config.timeout) as response:
-                payload = _response_json(response.read(1_000_001))
-            if payload.get("ok") is True:
-                return
-            error_code = payload.get("error_code")
-            parameters = payload.get("parameters")
-            if error_code == 429 and isinstance(parameters, dict):
-                raw_delay = parameters.get("retry_after")
-                if isinstance(raw_delay, (int, float)) and math.isfinite(raw_delay):
-                    retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
-            retryable = error_code == 429 or (isinstance(error_code, int) and 500 <= error_code <= 599)
-            if not retryable:
-                raise DeliveryError("Telegram rejected the notification")
-        except urllib.error.HTTPError as exc:
-            retryable = exc.code == 429 or 500 <= exc.code <= 599
-            if not retryable:
-                raise DeliveryError("Telegram rejected the notification") from None
-            if exc.code == 429:
+            response = request_with_deadline(
+                url,
+                method="POST",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=config.timeout,
+                max_body=HTTP_RESPONSE_MAX_BYTES,
+            )
+            if response.status == 429:
+                retryable = True
                 try:
-                    payload = _response_json(exc.read(1_000_001))
+                    payload = _response_json(response.body)
                     raw_delay = payload.get("parameters", {}).get("retry_after")
                     if isinstance(raw_delay, (int, float)) and math.isfinite(raw_delay):
                         retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
                 except (DeliveryError, AttributeError):
                     pass
+            elif 500 <= response.status <= 599:
+                retryable = True
+            elif not 200 <= response.status <= 299:
+                raise DeliveryError("Telegram rejected the notification")
+            else:
+                payload = _response_json(response.body)
+                if payload.get("ok") is True:
+                    return
+                error_code = payload.get("error_code")
+                parameters = payload.get("parameters")
+                if error_code == 429 and isinstance(parameters, dict):
+                    raw_delay = parameters.get("retry_after")
+                    if isinstance(raw_delay, (int, float)) and math.isfinite(raw_delay):
+                        retry_delay = min(max(float(raw_delay), 0.0), config.max_retry_after)
+                retryable = error_code == 429 or (isinstance(error_code, int) and 500 <= error_code <= 599)
+                if not retryable:
+                    raise DeliveryError("Telegram rejected the notification")
         except (
-            urllib.error.URLError,
             http.client.HTTPException,
             TimeoutError,
             socket.timeout,
             OSError,
+            ValueError,
         ):
             retryable = True
 
