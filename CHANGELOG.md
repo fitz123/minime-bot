@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.5
+
+- Track real Telegram `getUpdates` progress so healthy quiet polling remains stable while stalled polling or API failure still triggers one bounded launchd recovery.
+- Add Node-independent host-native Telegram alert delivery, Alertmanager webhook handling, runtime health checks, launchd/config examples, and a monitoring recovery runbook.
+- Harden monitoring secret isolation, request deadlines, deduplication, corrupt-state recovery, bounded concurrency, and cross-version media retry tests.
+
 ## 2026.7.4
 
 - Reject saturated debounce/collect queue input with bounded user-visible notices and queue-rejection metrics instead of silently dropping messages.
