@@ -27,7 +27,7 @@ npm run build
 npm pack --dry-run
 ```
 
-## Task 1 — #47: polling progress watchdog
+### Task 1: #47 polling progress watchdog
 
 ### Runtime design
 
@@ -64,7 +64,7 @@ Commit this task independently with `#47` in the commit message. The task is com
 
 Reverting the #47 commit removes the probe and restores the previous watchdog behavior without touching #42 files.
 
-## Task 2 — #42: Node-independent host monitoring and alert delivery
+### Task 2: #42 Node-independent host monitoring and alert delivery
 
 ### Portable public contracts
 
