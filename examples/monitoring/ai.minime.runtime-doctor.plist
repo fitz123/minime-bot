@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.minime.runtime-doctor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/PATH/TO/minime-bot/scripts/runtime_doctor.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin</string>
+    <key>MINIME_DOCTOR_STATE_PATH</key>
+    <string>/PATH/TO/state/runtime-doctor.json</string>
+    <key>MINIME_DOCTOR_LAUNCHD_LABEL</key>
+    <string>BOT_LABEL_PLACEHOLDER</string>
+    <key>MINIME_DOCTOR_BOT_METRICS_URL</key>
+    <string>http://127.0.0.1:BOT_METRICS_PORT/metrics</string>
+    <key>MINIME_DOCTOR_PROMETHEUS_URL</key>
+    <string>http://127.0.0.1:PROMETHEUS_PORT/-/healthy</string>
+    <key>MINIME_DOCTOR_ALERTMANAGER_URL</key>
+    <string>http://127.0.0.1:ALERTMANAGER_PORT/-/healthy</string>
+    <key>MINIME_DOCTOR_NODE_EXECUTABLE</key>
+    <string>/PATH/TO/node</string>
+    <key>MINIME_DOCTOR_NODE_BASELINE_PATH</key>
+    <string>/PATH/TO/node</string>
+    <key>MINIME_DOCTOR_NODE_BASELINE_VERSION</key>
+    <string>NODE_VERSION_PLACEHOLDER</string>
+    <key>MINIME_DOCTOR_RUNTIME_STATE_PATH</key>
+    <string>/PATH/TO/deploy/runtime-state.json</string>
+    <key>MINIME_TELEGRAM_CHAT_ID</key>
+    <string>DESTINATION_PLACEHOLDER</string>
+    <key>MINIME_TELEGRAM_SOPS_FILE</key>
+    <string>/PATH/TO/secrets.sops.yaml</string>
+    <key>MINIME_TELEGRAM_SOPS_KEY</key>
+    <string>telegram.bot_token</string>
+  </dict>
+</dict>
+</plist>

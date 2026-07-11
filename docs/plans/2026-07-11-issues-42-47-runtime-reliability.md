@@ -71,10 +71,10 @@ Reverting the #47 commit removes the probe and restores the previous watchdog be
 
 ### Task 2: #42 Node-independent host monitoring and alert delivery
 
-- [ ] Implement the portable Python-standard-library secret, Telegram delivery, webhook, and runtime-doctor contracts.
-- [ ] Add generic launchd/config examples, package-file coverage, and public install/recovery documentation.
-- [ ] Add deterministic synthetic, Node-unavailable, secret-redaction, dedup/recovery, and self-monitoring tests.
-- [ ] Run full test/build/pack validation, then commit this task independently with `#42` in the commit message.
+- [x] Implement the portable Python-standard-library secret, Telegram delivery, webhook, and runtime-doctor contracts.
+- [x] Add generic launchd/config examples, package-file coverage, and public install/recovery documentation.
+- [x] Add deterministic synthetic, Node-unavailable, secret-redaction, dedup/recovery, and self-monitoring tests.
+- [x] Run full test/build/pack validation, then commit this task independently with `#42` in the commit message.
 
 ### Portable public contracts
 

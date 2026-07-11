@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.minime.alertmanager-webhook</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/PATH/TO/minime-bot/scripts/alertmanager_webhook.py</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin</string>
+    <key>MINIME_WEBHOOK_HOST</key>
+    <string>127.0.0.1</string>
+    <key>MINIME_WEBHOOK_PORT</key>
+    <string>PORT_PLACEHOLDER</string>
+    <key>MINIME_WEBHOOK_PATH</key>
+    <string>/WEBHOOK_PATH_PLACEHOLDER</string>
+    <key>MINIME_TELEGRAM_CHAT_ID</key>
+    <string>DESTINATION_PLACEHOLDER</string>
+    <key>MINIME_TELEGRAM_SOPS_FILE</key>
+    <string>/PATH/TO/secrets.sops.yaml</string>
+    <key>MINIME_TELEGRAM_SOPS_KEY</key>
+    <string>telegram.bot_token</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/PATH/TO/logs/alertmanager-webhook.log</string>
+  <key>StandardErrorPath</key>
+  <string>/PATH/TO/logs/alertmanager-webhook.log</string>
+</dict>
+</plist>

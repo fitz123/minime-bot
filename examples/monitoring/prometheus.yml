@@ -1,0 +1,7 @@
+scrape_configs:
+  - job_name: minime-bot
+    static_configs:
+      - targets: ["host.docker.internal:METRICS_PORT"]
+
+rule_files:
+  - /etc/prometheus/minime.rules.yml

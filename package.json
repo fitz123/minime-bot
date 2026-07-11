@@ -35,10 +35,15 @@
     "dist/extensions/pi/**/*.js",
     "dist/extensions/pi/**/*.md",
     "scripts/deliver.sh",
+    "scripts/monitoring_native.py",
+    "scripts/alertmanager_webhook.py",
+    "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
-    "telegram-bot.plist.example"
+    "telegram-bot.plist.example",
+    "docs/monitoring.md",
+    "examples/monitoring/*"
   ],
   "keywords": [
     "telegram",
