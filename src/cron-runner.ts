@@ -30,6 +30,11 @@ import {
   shouldIncludePiChildEnvKey,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
+import {
+  formatPiRuntimeDiagnostic,
+  resolvePackageOwnedPiInvocation,
+  type PiInvocation,
+} from "./pi-runtime.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
@@ -42,7 +47,6 @@ const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
 const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
 const PI_CRON_MODEL = "openai-codex/gpt-5.5";
-const PI_BIN = "pi";
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
@@ -661,6 +665,7 @@ export interface PiRunDeps {
   buildEnv: (agentWorkspaceRoot?: string) => Record<string, string>;
   assembleContext: typeof assemblePiContext;
   resolveExtensionArgs?: () => string[];
+  resolveInvocation?: (args: string[]) => PiInvocation;
 }
 
 function buildPiCronAgentConfigForRun(cron: CronJob, workspaceCwd: string, agentData?: CronAgentData): AgentConfig {
@@ -735,7 +740,15 @@ function runPi(
 
   args.push("--append-system-prompt", systemInstruction);
   args.push(...(deps.resolveExtensionArgs?.() ?? resolvePiExtensionArgs({ relpaths: PI_CRON_WRAPPER_RELPATHS })));
-  const result = deps.spawnSync(PI_BIN, args, {
+  let invocation: PiInvocation;
+  if (deps.resolveInvocation) {
+    invocation = deps.resolveInvocation(args);
+  } else {
+    const packageInvocation = resolvePackageOwnedPiInvocation("cli", args);
+    log(cron.name, `package-owned Pi runtime ${formatPiRuntimeDiagnostic(packageInvocation.diagnostic)}`);
+    invocation = packageInvocation;
+  }
+  const result = deps.spawnSync(invocation.command, invocation.args, {
     cwd: validatedWorkspaceCwd,
     timeout: cron.timeout ?? DEFAULT_TIMEOUT_MS,
     encoding: "utf8",

@@ -61,10 +61,10 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.79.0",
-    "@earendil-works/pi-ai": "^0.79.0",
-    "@earendil-works/pi-coding-agent": "0.79.0",
-    "@earendil-works/pi-tui": "^0.79.0",
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
     "@grammyjs/auto-retry": "^2.0.2",
     "discord.js": "^14.25.1",
     "grammy": "^1.41.1",

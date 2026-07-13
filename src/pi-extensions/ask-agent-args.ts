@@ -6,7 +6,7 @@ import {
 } from "../pi-rpc-protocol.js";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import type { AgentConfig, BotConfig } from "../types.js";
-import type { PiInvocation } from "./pi-invocation.js";
+import { resolvePiInvocation, type PiInvocation } from "./pi-invocation.js";
 import {
   getFinalOutput,
   isFailedResult,
@@ -397,9 +397,9 @@ export async function runAskAgentTargetChild(
     context: request.context,
     extensionArgs: deps.extensionArgs,
   });
-  const invocation = deps.command === undefined && deps.resolveInvocation
-    ? deps.resolveInvocation(args)
-    : { command: deps.command ?? "pi", args };
+  const invocation = deps.command !== undefined
+    ? { command: deps.command, args }
+    : (deps.resolveInvocation ?? resolvePiInvocation)(args);
 
   try {
     const result = await runSubagentChild({

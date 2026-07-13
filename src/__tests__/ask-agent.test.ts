@@ -721,7 +721,10 @@ describe("ask-agent helper", () => {
     };
     const promise = runAskAgentTargetChild(request, {
       spawn,
-      command: "pi",
+      resolveInvocation: (args) => ({
+        command: "/runtime/node",
+        args: ["/package/pi-coding-agent/dist/cli.js", ...args],
+      }),
       extensionArgs: ["--extension", "/abs/web-tools.ts"],
       env: { PATH: "/usr/bin" },
     });
@@ -737,7 +740,8 @@ describe("ask-agent helper", () => {
       needsClarification: false,
     });
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].command, "pi");
+    assert.equal(calls[0].command, "/runtime/node");
+    assert.equal(calls[0].args[0], "/package/pi-coding-agent/dist/cli.js");
     assert.equal(calls[0].options.cwd, "/tmp/target-workspace");
     assert.deepEqual(calls[0].options.env, { PATH: "/usr/bin" });
     assert.equal(calls[0].args[calls[0].args.indexOf("--model") + 1], "openai-codex/gpt-5.5");

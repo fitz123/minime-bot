@@ -15,6 +15,11 @@ import type {
 import { log } from "./logger.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
 import {
+  formatPiRuntimeDiagnostic,
+  resolvePackageOwnedPiInvocation,
+  type PiRuntimeDiagnostic,
+} from "./pi-runtime.js";
+import {
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -24,7 +29,6 @@ import {
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
 
-const PI_BIN = "pi";
 export const PI_PROVIDER = "openai-codex";
 export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
@@ -641,6 +645,7 @@ function copyExplicitControlPathEnv(
  */
 export interface PiStartupDiagnostics {
   piStartupStderr?: () => string;
+  piRuntimeDiagnostic?: PiRuntimeDiagnostic;
 }
 
 /** Cap on buffered startup stderr (the classifier only needs the startup tail). */
@@ -655,11 +660,17 @@ export function spawnPiRpcSession(
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
-  const child = spawn(PI_BIN, buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions), {
+  const invocation = resolvePackageOwnedPiInvocation(
+    "rpc",
+    buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions),
+  );
+  log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
+  const child = spawn(invocation.command, invocation.args, {
     env,
     cwd: workspaceCwd,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  (child as unknown as PiStartupDiagnostics).piRuntimeDiagnostic = invocation.diagnostic;
 
   // Buffer startup stderr so the spawn caller can classify a resume failure
   // (Pi prints `No session found matching <id>` and exits 1 when handed a stale

@@ -139,8 +139,12 @@ describe("cron-runner runPi", () => {
     assert.strictEqual(output, "pi output");
     assert.strictEqual(captures.length, 1);
     const capture = captures[0];
-    assert.strictEqual(capture.command, "pi");
-    assert.deepStrictEqual(capture.args.slice(0, 8), [
+    assert.strictEqual(capture.command, process.execPath);
+    assert.match(
+      capture.args[0],
+      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+    );
+    assert.deepStrictEqual(capture.args.slice(1, 9), [
       "-p",
       "Summarize the workspace",
       "--no-session",
@@ -214,9 +218,9 @@ describe("cron-runner runPi", () => {
       runPi(makeCron({ prompt }), ws, deps);
 
       assert.strictEqual(captures[0].options.input, undefined);
-      assert.strictEqual(captures[0].args[0], "-p");
-      assert.strictEqual(captures[0].args[1], ` ${prompt}`);
-      assert.strictEqual(captures[0].args[2], "--no-session");
+      assert.strictEqual(captures[0].args[1], "-p");
+      assert.strictEqual(captures[0].args[2], ` ${prompt}`);
+      assert.strictEqual(captures[0].args[3], "--no-session");
     }
   });
 

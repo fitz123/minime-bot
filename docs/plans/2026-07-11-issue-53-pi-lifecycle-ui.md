@@ -33,13 +33,13 @@ npm ls --depth=0 @earendil-works/pi-agent-core @earendil-works/pi-ai @earendil-w
 
 ### Task 1: Pin and resolve the package-owned Pi 0.80.6 runtime
 
-- [ ] Exact-pin `@earendil-works/pi-agent-core`, `pi-ai`, `pi-coding-agent`, and `pi-tui` to 0.80.6 in `package.json`; refresh `package-lock.json` and assert one aligned direct version set.
-- [ ] Add one shared ESM-safe resolver module for package-owned Pi invocation. Resolve the exported `@earendil-works/pi-coding-agent/rpc-entry` for RPC mode and the sibling package CLI/bin for print mode; execute JS entrypoints with `process.execPath`. Fail loudly if the locked entrypoint is absent—never fall back to bare `pi`.
-- [ ] Use the resolver in `spawnPiRpcSession`, `runPi`, `resolvePiInvocation` fallback, and the quota sampler. Preserve self-reuse when a child already runs from the package-owned Pi entrypoint; cover subagent and ask-agent children through their existing shared invocation helper.
-- [ ] Add a non-sensitive startup/version diagnostic containing expected package version, selected entrypoint kind, and detected mismatch state, but not an absolute host path. Do not add `thinking:max`.
-- [ ] Update spawn/invocation/cron/quota/package-install tests to prove a missing or deliberately different global `pi` cannot affect package-owned RPC, cron, subagent, ask-agent, or sampler execution.
-- [ ] Run focused tests for Pi invocation, RPC spawn workspaces, cron runner, subagent, ask-agent, quota sampler, and package installation.
-- [ ] Commit this slice as `Pin package-owned Pi runtime to 0.80.6 (#53)`.
+- [x] Exact-pin `@earendil-works/pi-agent-core`, `pi-ai`, `pi-coding-agent`, and `pi-tui` to 0.80.6 in `package.json`; refresh `package-lock.json` and assert one aligned direct version set.
+- [x] Add one shared ESM-safe resolver module for package-owned Pi invocation. Resolve the exported `@earendil-works/pi-coding-agent/rpc-entry` for RPC mode and the sibling package CLI/bin for print mode; execute JS entrypoints with `process.execPath`. Fail loudly if the locked entrypoint is absent—never fall back to bare `pi`.
+- [x] Use the resolver in `spawnPiRpcSession`, `runPi`, `resolvePiInvocation` fallback, and the quota sampler. Preserve self-reuse when a child already runs from the package-owned Pi entrypoint; cover subagent and ask-agent children through their existing shared invocation helper.
+- [x] Add a non-sensitive startup/version diagnostic containing expected package version, selected entrypoint kind, and detected mismatch state, but not an absolute host path. Do not add `thinking:max`.
+- [x] Update spawn/invocation/cron/quota/package-install tests to prove a missing or deliberately different global `pi` cannot affect package-owned RPC, cron, subagent, ask-agent, or sampler execution.
+- [x] Run focused tests for Pi invocation, RPC spawn workspaces, cron runner, subagent, ask-agent, quota sampler, and package installation.
+- [x] Commit this slice as `Pin package-owned Pi runtime to 0.80.6 (#53)`.
 
 ### Task 2: Finalize Pi turns on agent_settled
 

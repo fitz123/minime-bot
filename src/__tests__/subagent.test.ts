@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { buildPiSubagentChildSpawnEnv } from "../pi-rpc-protocol.js";
+import { resolvePiInvocation } from "../pi-extensions/pi-invocation.js";
 import {
   accumulateAssistantUsage,
   buildSubagentSpawnArgs,
@@ -146,10 +147,32 @@ describe("subagent: bundled agent tool allowlists", () => {
 });
 
 describe("subagent: wrapper spawn environment", () => {
+  it("uses the package-owned Pi CLI even when PATH advertises a different global Pi", () => {
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = "/deliberately-different-global-pi";
+      const invocation = resolvePiInvocation(["--mode", "json", "-p"]);
+
+      assert.equal(invocation.command, process.execPath);
+      assert.match(
+        invocation.args[0],
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+      );
+      assert.deepEqual(invocation.args.slice(1), ["--mode", "json", "-p"]);
+    } finally {
+      if (oldPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = oldPath;
+      }
+    }
+  });
+
   it("uses the scrubbed subagent-child env helper instead of copying process.env", () => {
     const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
 
     assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(defaultCwd\)/);
+    assert.match(wrapper, /resolvePiInvocation\(args\)/);
     assert.doesNotMatch(wrapper, /env:\s*\{\s*\.{3}process\.env/);
   });
 

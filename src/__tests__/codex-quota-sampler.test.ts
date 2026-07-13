@@ -182,11 +182,13 @@ describe("codex quota sampler command setup", () => {
       forbiddenSamplerCwds: [],
     });
 
-    assert.notEqual(config.piBin, "pi");
+    assert.equal(config.piBin, process.execPath);
+    assert.equal(config.piArgsPrefix?.length, 1);
     assert.match(
-      config.piBin,
-      /(node_modules[\/\\]\.bin[\/\\]pi(?:\.cmd)?|node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js)$/,
+      config.piArgsPrefix?.[0] ?? "",
+      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
     );
+    assert.equal(config.piRuntimeDiagnostic?.versionMismatch, false);
 
     const envOverride = resolveCodexQuotaSamplerConfig({
       cwd,
@@ -198,6 +200,7 @@ describe("codex quota sampler command setup", () => {
       forbiddenSamplerCwds: [],
     });
     assert.equal(envOverride.piBin, "/env/pi");
+    assert.deepEqual(envOverride.piArgsPrefix, undefined);
 
     const cliOverride = resolveCodexQuotaSamplerConfig({
       cwd,
@@ -210,6 +213,7 @@ describe("codex quota sampler command setup", () => {
       forbiddenSamplerCwds: [],
     });
     assert.equal(cliOverride.piBin, "/cli/pi");
+    assert.deepEqual(cliOverride.piArgsPrefix, undefined);
   });
 
   it("defaults quota state to the selected workspace runtime dir", () => {

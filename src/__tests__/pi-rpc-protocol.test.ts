@@ -1307,11 +1307,11 @@ describe("spawnPiRpcSession workspace validation", () => {
     }
   });
 
-  it("passes trusted ask-agent caller env to the spawned Pi process", async () => {
+  it("ignores a deliberately different global Pi binary", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-caller-env-root-"));
     const agentWorkspace = join(workspaceRoot, "agent-workspace");
     const fakeBin = join(workspaceRoot, "fake-bin");
-    const capturePath = join(workspaceRoot, "caller-env.txt");
+    const capturePath = join(workspaceRoot, "global-pi-ran.txt");
     const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const oldPath = process.env.PATH;
 
@@ -1321,7 +1321,7 @@ describe("spawnPiRpcSession workspace validation", () => {
       join(fakeBin, "pi"),
       [
         "#!/bin/sh",
-        `printf '%s\\n' "\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
+        `printf '%s\\n' "global pi ran" > ${JSON.stringify(capturePath)}`,
         "",
       ].join("\n"),
       "utf8",
@@ -1338,10 +1338,17 @@ describe("spawnPiRpcSession workspace validation", () => {
         NO_EXTENSIONS,
         { askCallerAgentId: "main" },
       );
-      const [code] = await once(child, "close");
+      const close = once(child, "close");
+      await once(child, "spawn");
+      assert.strictEqual(child.spawnfile, process.execPath);
+      assert.match(
+        child.spawnargs[1],
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]rpc-entry\.js$/,
+      );
+      child.kill();
+      await close;
 
-      assert.strictEqual(code, 0);
-      assert.strictEqual(readFileSync(capturePath, "utf8").trim(), "main");
+      assert.strictEqual(existsSync(capturePath), false);
     } finally {
       if (oldWorkspace === undefined) {
         delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
