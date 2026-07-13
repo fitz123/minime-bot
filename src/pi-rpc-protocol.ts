@@ -408,7 +408,17 @@ export interface PiGetStateCommand {
   type: "get_state";
 }
 
-export type PiRpcCommand = PiPromptCommand | PiSteerCommand | PiGetStateCommand;
+export interface PiExtensionUiResponseCommand {
+  type: "extension_ui_response";
+  id: string;
+  cancelled: true;
+}
+
+export type PiRpcCommand =
+  | PiPromptCommand
+  | PiSteerCommand
+  | PiGetStateCommand
+  | PiExtensionUiResponseCommand;
 
 /**
  * Pi RPC uses strict JSONL framing: LF is the only record delimiter.
@@ -716,6 +726,38 @@ export function buildGetStateCommand(): PiGetStateCommand {
   return { type: "get_state" };
 }
 
+const PI_BLOCKING_EXTENSION_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+const PI_FIRE_AND_FORGET_EXTENSION_UI_METHODS = new Set([
+  "notify",
+  "setStatus",
+  "setWidget",
+  "setTitle",
+  "set_editor_text",
+]);
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Convert a blocking extension UI request into Pi's correlated cancellation
+ * command. Unsupported UI is deliberately failed closed: minime-bot has no UI
+ * bridge for extension dialogs, so leaving one pending would stall the turn.
+ */
+export function buildPiExtensionUiCancellationCommand(
+  event: PiRpcEvent,
+): PiExtensionUiResponseCommand | null {
+  if (
+    event.type !== "extension_ui_request" ||
+    !isNonEmptyString(event.id) ||
+    !isNonEmptyString(event.method) ||
+    !PI_BLOCKING_EXTENSION_UI_METHODS.has(event.method)
+  ) {
+    return null;
+  }
+  return { type: "extension_ui_response", id: event.id, cancelled: true };
+}
+
 /**
  * Send a `prompt` command. Pass `streamingBehavior: "followUp"` for the
  * queue-driven send path: it is a no-op when the Pi agent is idle (the prompt
@@ -760,6 +802,10 @@ function writePiCommand(child: ChildProcess, command: PiRpcCommand): void {
  */
 export interface PiRpcEvent {
   type?: string;
+  /** Correlation id for command responses and extension UI requests. */
+  id?: string;
+  /** Extension UI method (`select`, `confirm`, `input`, `editor`, etc.). */
+  method?: string;
   sessionId?: string;
   errorMessage?: string;
   /**
@@ -1315,12 +1361,66 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   });
 }
 
+function handlePiExtensionUiRequest(child: ChildProcess, event: PiRpcEvent): boolean {
+  if (event.type !== "extension_ui_request") {
+    return false;
+  }
+
+  const cancellation = buildPiExtensionUiCancellationCommand(event);
+  if (cancellation) {
+    try {
+      writePiCommand(child, cancellation);
+    } catch {
+      // The prompt lifecycle remains authoritative even when stdin has already
+      // closed. A failed side-channel cancellation must not truncate the turn.
+      log.warn("pi-rpc", "Unable to cancel unsupported Pi extension UI request: child stdin unavailable");
+    }
+    return true;
+  }
+
+  if (!isNonEmptyString(event.id) || !isNonEmptyString(event.method)) {
+    log.warn("pi-rpc", "Ignored malformed Pi extension UI request: missing non-empty id or method");
+    return true;
+  }
+  if (!PI_FIRE_AND_FORGET_EXTENSION_UI_METHODS.has(event.method)) {
+    log.warn("pi-rpc", "Ignored unknown Pi extension UI request method");
+  }
+  return true;
+}
+
+function parsePiJsonlRecord(record: string): PiRpcEvent | null {
+  const trimmed = record.trim();
+  if (!trimmed || !trimmed.startsWith("{")) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(trimmed) as PiRpcEvent;
+  } catch {
+    return null;
+  }
+}
+
+function handlePiStreamRecord(
+  child: ChildProcess,
+  record: string,
+  state: PiRpcParseState,
+): StreamLine | null {
+  const event = parsePiJsonlRecord(record);
+  if (!event || handlePiExtensionUiRequest(child, event)) {
+    return null;
+  }
+  return parsePiEvent(event, state);
+}
+
 /**
  * Async generator yielding translated `StreamLine`s from a Pi RPC child's
  * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. The reader
  * remains active through low-level run boundaries and ends only on the settled
- * result, prompt preflight rejection, or an EOF/close fallback. Malformed JSON
- * records and untranslatable events are skipped (never throw mid-stream).
+ * result, prompt preflight rejection, or an EOF/close fallback. Blocking
+ * extension UI requests are cancelled through the child's shared JSONL stdin
+ * writer before stream delivery. Malformed JSON records and untranslatable
+ * events are skipped (never throw mid-stream).
  */
 export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
@@ -1335,7 +1435,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
     let chunk: Buffer | string | null;
     while ((chunk = stdout.read()) !== null) {
       for (const record of splitter.push(chunk)) {
-        const line = parsePiRecord(record, parseState);
+        const line = handlePiStreamRecord(child, record, parseState);
         if (line) {
           yield line;
           if (line.type === "result") {
@@ -1352,7 +1452,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
   }
 
   for (const record of splitter.end()) {
-    const line = parsePiRecord(record, parseState);
+    const line = handlePiStreamRecord(child, record, parseState);
     if (line) {
       yield line;
       if (line.type === "result") {
@@ -1368,19 +1468,8 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
 }
 
 export function parsePiRecord(record: string, state?: PiRpcParseState): StreamLine | null {
-  const trimmed = record.trim();
-  if (!trimmed || !trimmed.startsWith("{")) {
-    return null;
-  }
-
-  let parsed: PiRpcEvent;
-  try {
-    parsed = JSON.parse(trimmed) as PiRpcEvent;
-  } catch {
-    return null;
-  }
-
-  return parsePiEvent(parsed, state);
+  const parsed = parsePiJsonlRecord(record);
+  return parsed ? parsePiEvent(parsed, state) : null;
 }
 
 /**

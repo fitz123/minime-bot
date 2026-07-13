@@ -29,6 +29,7 @@ import {
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
+  buildPiExtensionUiCancellationCommand,
   buildPiAskAgentChildSpawnEnv,
   buildPiPromptCommand,
   buildPiSpawnArgs,
@@ -1578,6 +1579,38 @@ describe("Pi RPC prompt and steer commands", () => {
     assert.deepStrictEqual(buildGetStateCommand(), { type: "get_state" });
   });
 
+  it("builds exact correlated cancellations for every blocking extension UI method", () => {
+    for (const method of ["select", "confirm", "input", "editor"]) {
+      assert.deepStrictEqual(
+        buildPiExtensionUiCancellationCommand({
+          type: "extension_ui_request",
+          id: `request-${method}`,
+          method,
+        }),
+        {
+          type: "extension_ui_response",
+          id: `request-${method}`,
+          cancelled: true,
+        },
+      );
+    }
+  });
+
+  it("does not build extension UI cancellations for malformed, unknown, or fire-and-forget requests", () => {
+    const ignored = [
+      { type: "extension_ui_request", method: "confirm" },
+      { type: "extension_ui_request", id: "", method: "editor" },
+      { type: "extension_ui_request", id: "request-1", method: "" },
+      { type: "extension_ui_request", id: "request-2", method: "notify" },
+      { type: "extension_ui_request", id: "request-3", method: "futureDialog" },
+      { type: "agent_end", id: "request-4", method: "confirm" },
+    ];
+    for (const event of ignored) {
+      assert.strictEqual(buildPiExtensionUiCancellationCommand(event), null);
+      assert.strictEqual(parsePiEvent(event), null);
+    }
+  });
+
   it("writes get_state commands to stdin", () => {
     const chunks: Buffer[] = [];
     const stdin = new Writable({
@@ -2149,6 +2182,149 @@ describe("readPiStream", () => {
     );
     assert.strictEqual(extractPiTextDelta(lines[1]), "hi");
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
+  });
+
+  it("cancels all blocking extension UI methods through captured child stdin and still settles once", async () => {
+    const stdout = new Readable({ read() {} });
+    const requests = [
+      { type: "extension_ui_request", id: "select-id", method: "select", title: "Select", options: ["A"] },
+      { type: "extension_ui_request", id: "confirm-id", method: "confirm", title: "Confirm", message: "Proceed?" },
+      { type: "extension_ui_request", id: "input-id", method: "input", title: "Input" },
+      { type: "extension_ui_request", id: "editor-id", method: "editor", title: "Editor", prefill: "draft" },
+    ];
+    const writes: Array<Record<string, unknown>> = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+        writes.push(command);
+        callback();
+
+        const requestIndex = writes.length;
+        queueMicrotask(() => {
+          stdout.push(
+            `${JSON.stringify({
+              type: "response",
+              command: "extension_ui_response",
+              success: true,
+              id: command.id,
+            })}\n`,
+          );
+          if (requestIndex < requests.length) {
+            stdout.push(`${JSON.stringify(requests[requestIndex])}\n`);
+            return;
+          }
+          stdout.push(
+            `${JSON.stringify({
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "dialogues cancelled" }] }],
+            })}\n`,
+          );
+          stdout.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+          stdout.push(null);
+        });
+      },
+    });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+
+    const collect = (async () => {
+      const lines: StreamLine[] = [];
+      for await (const line of readPiStream(child)) lines.push(line);
+      return lines;
+    })();
+    stdout.push(`${JSON.stringify(requests[0])}\n`);
+
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      const lines = await Promise.race([
+        collect,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("timed out waiting for extension UI cancellation")), 2_500);
+        }),
+      ]);
+
+      assert.deepStrictEqual(writes, requests.map((request) => ({
+        type: "extension_ui_response",
+        id: request.id,
+        cancelled: true,
+      })));
+      assert.deepStrictEqual(lines.map((line) => line.type), ["result"]);
+      assert.strictEqual((lines[0] as { result: string }).result, "dialogues cancelled");
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      stdout.destroy();
+      stdin.destroy();
+    }
+  });
+
+  it("ignores malformed and fire-and-forget UI requests and survives destroyed stdin", async () => {
+    const secretPresentation = "do not echo this title, message, or option";
+    const writes: string[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        writes.push(chunk.toString());
+        callback();
+      },
+    });
+    stdin.destroy();
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "extension_ui_request",
+        method: "confirm",
+        title: secretPresentation,
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "unknown-id",
+        method: "futureDialog",
+        title: secretPresentation,
+        options: [secretPresentation],
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notify-id",
+        method: "notify",
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "confirm-id",
+        method: "confirm",
+        title: secretPresentation,
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "extension_ui_response",
+        success: false,
+        error: "side-channel response failed",
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "normal result" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    Object.assign(child, { stdin, exitCode: null, killed: false });
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    try {
+      const lines: StreamLine[] = [];
+      for await (const line of readPiStream(child)) lines.push(line);
+
+      assert.deepStrictEqual(writes, []);
+      assert.strictEqual(lines.filter((line) => line.type === "result").length, 1);
+      assert.strictEqual((lines[0] as { result: string }).result, "normal result");
+      assert.ok(warnings.some((warning) => warning.includes("malformed Pi extension UI request")));
+      assert.ok(warnings.some((warning) => warning.includes("unknown Pi extension UI request method")));
+      assert.ok(warnings.some((warning) => warning.includes("child stdin unavailable")));
+      assert.ok(warnings.every((warning) => !warning.includes(secretPresentation)));
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   it("uses the final low-level run after retry and emits no stale terminal text", async () => {

@@ -54,13 +54,13 @@ npm ls --depth=0 @earendil-works/pi-agent-core @earendil-works/pi-ai @earendil-w
 
 ### Task 3: Fail closed for blocking extension UI requests
 
-- [ ] Extend RPC record types with the request ID and method needed for `extension_ui_request`; validate both are non-empty strings before acting.
-- [ ] Extend the command union and centralized JSONL stdin writer with `extension_ui_response`. For `select`, `confirm`, `input`, and `editor`, construct `{type:"extension_ui_response", id, cancelled:true}` using the exact request ID.
-- [ ] Route cancellation controls inside `readPiStream`/the shared child-stdin path before user-facing stream delivery. Do not yield them as assistant text, do not classify their command responses as prompt results, and do not truncate an active turn.
-- [ ] Ignore fire-and-forget UI methods as today. Unknown/malformed requests remain ignored and logged without echoing titles/messages/options.
-- [ ] Add pure parser/command tests plus capturing-child integration fixtures for all four blocking methods. Include no-timeout `confirm` and `editor`, interleaved command responses, a normal `agent_end` + `agent_settled`, destroyed stdin, and malformed/missing IDs; assert no hang and exactly one final result.
-- [ ] Run focused Pi protocol, SessionManager, subagent, ask-agent, and package-install extension tests.
-- [ ] Commit this slice as `Cancel unsupported Pi RPC dialogs safely (#53)`.
+- [x] Extend RPC record types with the request ID and method needed for `extension_ui_request`; validate both are non-empty strings before acting.
+- [x] Extend the command union and centralized JSONL stdin writer with `extension_ui_response`. For `select`, `confirm`, `input`, and `editor`, construct `{type:"extension_ui_response", id, cancelled:true}` using the exact request ID.
+- [x] Route cancellation controls inside `readPiStream`/the shared child-stdin path before user-facing stream delivery. Do not yield them as assistant text, do not classify their command responses as prompt results, and do not truncate an active turn.
+- [x] Ignore fire-and-forget UI methods as today. Unknown/malformed requests remain ignored and logged without echoing titles/messages/options.
+- [x] Add pure parser/command tests plus capturing-child integration fixtures for all four blocking methods. Include no-timeout `confirm` and `editor`, interleaved command responses, a normal `agent_end` + `agent_settled`, destroyed stdin, and malformed/missing IDs; assert no hang and exactly one final result.
+- [x] Run focused Pi protocol, SessionManager, subagent, ask-agent, and package-install extension tests.
+- [x] Commit this slice as `Cancel unsupported Pi RPC dialogs safely (#53)`.
 
 ### Task 4: Exact-pin grammY 1.44.0 and run compatibility gates
 
