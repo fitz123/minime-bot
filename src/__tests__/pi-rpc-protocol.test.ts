@@ -29,6 +29,7 @@ import {
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
+  buildPiExtensionUiCancellationCommand,
   buildPiAskAgentChildSpawnEnv,
   buildPiPromptCommand,
   buildPiSpawnArgs,
@@ -36,8 +37,10 @@ import {
   buildPiSubagentChildSpawnEnv,
   buildPiSteerCommand,
   extractPiTextDelta,
+  handlePiExtensionUiRecord,
   isPiAlreadyProcessingRejection,
   parsePiEvent,
+  parsePiStartupRecord,
   piExtensionRelpathForDir,
   readPiStream,
   resolvePiAskAgentChildExtensionArgs,
@@ -1307,11 +1310,11 @@ describe("spawnPiRpcSession workspace validation", () => {
     }
   });
 
-  it("passes trusted ask-agent caller env to the spawned Pi process", async () => {
+  it("ignores a deliberately different global Pi binary", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-spawn-caller-env-root-"));
     const agentWorkspace = join(workspaceRoot, "agent-workspace");
     const fakeBin = join(workspaceRoot, "fake-bin");
-    const capturePath = join(workspaceRoot, "caller-env.txt");
+    const capturePath = join(workspaceRoot, "global-pi-ran.txt");
     const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const oldPath = process.env.PATH;
 
@@ -1321,7 +1324,7 @@ describe("spawnPiRpcSession workspace validation", () => {
       join(fakeBin, "pi"),
       [
         "#!/bin/sh",
-        `printf '%s\\n' "\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}" > ${JSON.stringify(capturePath)}`,
+        `printf '%s\\n' "global pi ran" > ${JSON.stringify(capturePath)}`,
         "",
       ].join("\n"),
       "utf8",
@@ -1338,10 +1341,17 @@ describe("spawnPiRpcSession workspace validation", () => {
         NO_EXTENSIONS,
         { askCallerAgentId: "main" },
       );
-      const [code] = await once(child, "close");
+      const close = once(child, "close");
+      await once(child, "spawn");
+      assert.strictEqual(child.spawnfile, process.execPath);
+      assert.match(
+        child.spawnargs[1],
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]rpc-entry\.js$/,
+      );
+      child.kill();
+      await close;
 
-      assert.strictEqual(code, 0);
-      assert.strictEqual(readFileSync(capturePath, "utf8").trim(), "main");
+      assert.strictEqual(existsSync(capturePath), false);
     } finally {
       if (oldWorkspace === undefined) {
         delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
@@ -1352,6 +1362,96 @@ describe("spawnPiRpcSession workspace validation", () => {
         delete process.env.PATH;
       } else {
         process.env.PATH = oldPath;
+      }
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on a real Pi session_start handler awaiting a no-timeout confirmation", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-startup-ui-real-"));
+    const agentWorkspace = join(workspaceRoot, "agent-workspace");
+    const agentDir = join(workspaceRoot, "pi-agent");
+    const sessionDir = join(workspaceRoot, "pi-sessions");
+    const extensionPath = join(workspaceRoot, "startup-confirm.js");
+    const oldEnv = new Map<string, string | undefined>();
+    for (const key of [
+      MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+      "PI_CODING_AGENT_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+    ]) {
+      oldEnv.set(key, process.env[key]);
+    }
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      extensionPath,
+      [
+        "export default function (pi) {",
+        "  pi.on('session_start', async (_event, ctx) => {",
+        "    await ctx.ui.confirm('Startup confirmation', 'Continue?');",
+        "  });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    let child: ChildProcess | undefined;
+    let close: Promise<unknown[]> | undefined;
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+      process.env.PI_OFFLINE = "1";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+
+      child = spawnPiRpcSession(
+        { ...testAgent, id: "startup-ui", workspaceCwd: agentWorkspace },
+        undefined,
+        { relpaths: [], extraExtensions: [extensionPath] },
+      );
+      close = once(child, "close");
+      await once(child, "spawn");
+      sendPiGetState(child);
+
+      const startupFailure = new Promise<Error>((resolveFailure, rejectFailure) => {
+        const splitter = new NewlineOnlyJsonlSplitter();
+        child!.stdout!.on("data", (chunk: Buffer | string) => {
+          for (const record of splitter.push(chunk)) {
+            try {
+              parsePiStartupRecord(child!, record);
+            } catch (err) {
+              resolveFailure(err as Error);
+            }
+          }
+        });
+        child!.once("exit", (code, signal) => {
+          rejectFailure(new Error(`Pi exited before startup UI was observed: code=${code} signal=${signal}`));
+        });
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Timed out waiting for Pi startup UI request")), 10_000);
+      });
+      const error = await Promise.race([startupFailure, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+
+      assert.match(error.message, /unsupported blocking extension UI before RPC startup completed/);
+      assert.strictEqual(child.exitCode, null, "the blocked Pi child should still be alive when detected");
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (close) {
+        await close;
+      }
+      for (const [key, value] of oldEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
       }
       rmSync(workspaceRoot, { recursive: true, force: true });
     }
@@ -1569,6 +1669,66 @@ describe("Pi RPC prompt and steer commands", () => {
 
   it("builds a no-argument get_state command object", () => {
     assert.deepStrictEqual(buildGetStateCommand(), { type: "get_state" });
+    assert.deepStrictEqual(buildGetStateCommand("probe-1"), { type: "get_state", id: "probe-1" });
+  });
+
+  it("builds exact correlated cancellations for every blocking extension UI method", () => {
+    for (const method of ["select", "confirm", "input", "editor"]) {
+      assert.deepStrictEqual(
+        buildPiExtensionUiCancellationCommand({
+          type: "extension_ui_request",
+          id: `request-${method}`,
+          method,
+        }),
+        {
+          type: "extension_ui_response",
+          id: `request-${method}`,
+          cancelled: true,
+        },
+      );
+    }
+  });
+
+  it("does not build extension UI cancellations for malformed, unknown, or fire-and-forget requests", () => {
+    const ignored = [
+      { type: "extension_ui_request", method: "confirm" },
+      { type: "extension_ui_request", id: "", method: "editor" },
+      { type: "extension_ui_request", id: "request-1", method: "" },
+      { type: "extension_ui_request", id: "request-2", method: "notify" },
+      { type: "extension_ui_request", id: "request-3", method: "futureDialog" },
+      { type: "agent_end", id: "request-4", method: "confirm" },
+    ];
+    for (const event of ignored) {
+      assert.strictEqual(buildPiExtensionUiCancellationCommand(event), null);
+      assert.strictEqual(parsePiEvent(event), null);
+    }
+  });
+
+  it("classifies and cancels a blocking extension UI JSONL record", () => {
+    const chunks: Buffer[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    const child = createMockChild({ stdin });
+
+    assert.strictEqual(
+      handlePiExtensionUiRecord(child, JSON.stringify({
+        type: "extension_ui_request",
+        id: "startup-editor",
+        method: "editor",
+        title: "private title",
+      })),
+      "blocking",
+    );
+    assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
+      type: "extension_ui_response",
+      id: "startup-editor",
+      cancelled: true,
+    });
+    assert.strictEqual(handlePiExtensionUiRecord(child, "not json"), "not_ui");
   });
 
   it("writes get_state commands to stdin", () => {
@@ -1598,11 +1758,12 @@ describe("Pi RPC prompt and steer commands", () => {
     });
     const child = createMockChild({ stdin });
 
-    sendPiPrompt(child, "hello");
+    const promptId = sendPiPrompt(child, "hello");
 
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "prompt",
       message: "hello",
+      id: promptId,
     });
   });
 
@@ -1616,11 +1777,12 @@ describe("Pi RPC prompt and steer commands", () => {
     });
     const child = createMockChild({ stdin });
 
-    sendPiPrompt(child, "hello", "followUp");
+    const promptId = sendPiPrompt(child, "hello", "followUp");
 
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "prompt",
       message: "hello",
+      id: promptId,
       streamingBehavior: "followUp",
     });
   });
@@ -1725,221 +1887,155 @@ describe("parsePiEvent", () => {
     assert.strictEqual(flipsSawNonTextBlock(line), true);
   });
 
-  it("treats turn_end as a non-terminal per-turn boundary (returns null)", () => {
-    // turn_end fires once per turn; only agent_end is terminal. Mapping turn_end
-    // to a ResultMessage would truncate a multi-turn (tool-using) response at its
-    // first turn, so turn_end must translate to null regardless of its content.
+  it("keeps turn_end and agent_end nonterminal, then emits one result at agent_settled", () => {
+    const state: PiRpcParseState = {};
     assert.strictEqual(
-      parsePiEvent({
-        type: "turn_end",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "hmm" },
-            { type: "text", text: "partial turn text" },
-          ],
-        },
-      }),
+      parsePiEvent({ type: "turn_end", message: { role: "assistant" } }, state),
       null,
     );
-  });
-
-  it("translates agent_end into a ResultMessage with the last assistant message text", () => {
-    const line = parsePiEvent({
-      type: "agent_end",
-      messages: [
-        { role: "user", content: "hi" },
-        { role: "assistant", content: [{ type: "text", text: "first" }] },
-        { role: "toolResult", content: [{ type: "text", text: "tool output" }] },
-        { role: "assistant", content: [{ type: "text", text: "final answer" }] },
-      ],
-    });
-
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    assert.strictEqual((line as { result: string }).result, "final answer");
-  });
-
-  it("yields empty result text (not a crash) for an agent_end with no assistant text", () => {
-    const line = parsePiEvent({
-      type: "agent_end",
-      messages: [{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" }] }],
-    });
-
-    assert.ok(line);
-    assert.strictEqual((line as { result: string }).result, "");
-    // agent_end here carries no top-level sessionId — that comes from get_state.
-    assert.strictEqual((line as { session_id: string }).session_id, "");
-  });
-
-  it("surfaces a terminal error-only agent_end as a non-empty error result", () => {
-    const line = parsePiEvent({
-      type: "agent_end",
-      messages: [
-        { role: "user", content: "summarize the workspace" },
-        {
-          role: "assistant",
-          stopReason: "error",
-          errorMessage: "Model returned an error before producing final text",
-          content: [],
-        },
-      ],
-    });
-
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
-    assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(result.result, "Model returned an error before producing final text");
-    assert.strictEqual(result.is_error, true);
-  });
-
-  it("uses a non-empty fallback for terminal error-only agent_end without a useful error message", () => {
-    for (const errorMessage of [undefined, "   "]) {
-      const line = parsePiEvent({
+    assert.strictEqual(
+      parsePiEvent({
         type: "agent_end",
+        sessionId: "run-session",
         messages: [
-          {
-            role: "assistant",
-            stopReason: "error",
-            ...(errorMessage === undefined ? {} : { errorMessage }),
-            content: [],
-          },
+          { role: "assistant", content: [{ type: "text", text: "first" }] },
+          { role: "toolResult", content: [{ type: "text", text: "tool output" }] },
+          { role: "assistant", content: [{ type: "text", text: "final answer" }] },
         ],
-      });
+      }, state),
+      null,
+    );
 
-      assert.ok(line);
-      assert.strictEqual(line.type, "result");
-      const result = line as unknown as Record<string, unknown>;
-      assert.strictEqual(result.subtype, "error_during_execution");
-      assert.strictEqual(result.result, "Pi RPC agent failed");
-      assert.strictEqual(result.is_error, true);
-    }
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual(settled.type, "result");
+    assert.strictEqual((settled as { result: string }).result, "final answer");
+    assert.strictEqual((settled as { session_id: string }).session_id, "run-session");
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
-  it("ignores a retryable context-overflow agent_end so compaction can continue", () => {
-    const line = parsePiEvent({
+  it("replaces retained outcomes across retries and queued continuations", () => {
+    const state: PiRpcParseState = {};
+    const retryReset = parsePiEvent({
       type: "agent_end",
       willRetry: true,
-      messages: [
-        { role: "user", content: "summarize the workspace" },
-        {
-          role: "assistant",
-          stopReason: "error",
-          errorMessage:
-            "context_length_exceeded: input exceeds the context window",
-          content: [],
-        },
-      ],
-    });
+      messages: [{
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "provider unavailable",
+        content: [{ type: "text", text: "stale partial" }],
+      }],
+    }, state);
+    assert.ok(retryReset);
+    assert.strictEqual((retryReset as { action?: unknown }).action, "reset_response_text");
+    assert.strictEqual((retryReset as { reason?: unknown }).reason, "pi_agent_retry");
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "retry answer" }] }],
+      }, state),
+      null,
+    );
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "follow-up answer" }] }],
+      }, state),
+      null,
+    );
 
-    assert.strictEqual(line, null);
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual((settled as { result: string }).result, "follow-up answer");
+    assert.notStrictEqual((settled as { is_error?: boolean }).is_error, true);
   });
 
-  it("surfaces a standalone context-overflow agent_end as an error without stream recovery state", () => {
-    const line = parsePiEvent({
-      type: "agent_end",
-      willRetry: false,
-      messages: [
-        { role: "user", content: "summarize the workspace" },
-        {
+  it("retains overflow recovery, reset signalling, and the final retry outcome until settlement", () => {
+    const state: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
           role: "assistant",
           stopReason: "error",
-          errorMessage:
-            "context_length_exceeded: input exceeds the context window",
-          content: [],
-        },
-      ],
-    });
+          errorMessage: "context_length_exceeded: input exceeds the context window",
+          content: [{ type: "text", text: "stale partial" }],
+        }],
+      }, state),
+      null,
+    );
+    const reset = parsePiEvent({ type: "compaction_start", reason: "overflow" }, state);
+    assert.ok(reset);
+    assert.strictEqual((reset as { action?: unknown }).action, "reset_response_text");
+    assert.strictEqual(
+      parsePiEvent({ type: "compaction_end", reason: "overflow", willRetry: true }, state),
+      null,
+    );
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "recovered" }] }],
+      }, state),
+      null,
+    );
 
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual((settled as { result: string }).result, "recovered");
+  });
+
+  it("defers final errors until settlement and preserves the original overflow cause", () => {
+    const state: PiRpcParseState = {};
+    const overflowMessage = "context_length_exceeded: original request too large";
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        sessionId: "test-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: overflowMessage,
+          content: [],
+        }],
+      }, state),
+      null,
+    );
+    assert.strictEqual(
+      parsePiEvent({ type: "error", errorMessage: "Unable to compact the conversation" }, state),
+      null,
+    );
+
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    const result = settled as unknown as Record<string, unknown>;
     assert.strictEqual(result.subtype, "error_during_execution");
     assert.strictEqual(
       result.result,
-      "context_length_exceeded: input exceeds the context window",
+      `Unable to compact the conversation; original overflow: ${overflowMessage}`,
     );
+    assert.strictEqual(result.session_id, "test-session");
     assert.strictEqual(result.is_error, true);
   });
 
-  it("does not treat unknown agent_end willRetry fields as recoverable without an overflow", () => {
-    const line = parsePiEvent({
-      type: "agent_end",
-      willRetry: true,
-      messages: [
-        { role: "user", content: "summarize the workspace" },
-        {
-          role: "assistant",
-          stopReason: "error",
-          errorMessage: "provider unavailable",
-          content: [],
-        },
-      ],
-    });
+  it("uses a non-empty error for final agent failure and settlement without an outcome", () => {
+    for (const messages of [
+      [{ role: "assistant", stopReason: "error", errorMessage: "   ", content: [] }],
+      [{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" }] }],
+    ]) {
+      const state: PiRpcParseState = {};
+      assert.strictEqual(parsePiEvent({ type: "agent_end", messages }, state), null);
+      const settled = parsePiEvent({ type: "agent_settled" }, state);
+      assert.ok(settled);
+      assert.strictEqual(settled.type, "result");
+      assert.ok((settled as { result: string }).result.trim().length > 0);
+      assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    }
 
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
-    assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(result.result, "provider unavailable");
-    assert.strictEqual(result.is_error, true);
-  });
-
-  it("multi-turn sequence (2x turn_end + 1x agent_end) terminates exactly once with the FINAL text", () => {
-    // Verified live sequence: a tool-using response fires turn_end per turn, then
-    // a single agent_end. Only agent_end is terminal, and it carries the final answer.
-    const sequence = [
-      {
-        type: "turn_end",
-        message: { role: "assistant", content: [{ type: "text", text: "let me check" }] },
-      },
-      {
-        type: "turn_end",
-        message: { role: "assistant", content: [{ type: "text", text: "still working" }] },
-      },
-      {
-        type: "agent_end",
-        messages: [
-          { role: "user", content: "do the thing" },
-          { role: "assistant", content: [{ type: "text", text: "let me check" }] },
-          { role: "toolResult", content: [{ type: "text", text: "tool output" }] },
-          { role: "assistant", content: [{ type: "text", text: "the final answer" }] },
-        ],
-      },
-    ];
-
-    const lines = sequence.map((e) => parsePiEvent(e));
-    const terminals = lines.filter((l) => l?.type === "result");
-
-    assert.strictEqual(terminals.length, 1);
-    assert.strictEqual((terminals[0] as { result: string }).result, "the final answer");
-    // The two turn_end boundaries do not terminate.
-    assert.strictEqual(lines[0], null);
-    assert.strictEqual(lines[1], null);
-  });
-
-  it("single-turn sequence (1x turn_end + 1x agent_end) terminates exactly once", () => {
-    const sequence = [
-      {
-        type: "turn_end",
-        message: { role: "assistant", content: [{ type: "text", text: "quick answer" }] },
-      },
-      {
-        type: "agent_end",
-        messages: [
-          { role: "user", content: "hi" },
-          { role: "assistant", content: [{ type: "text", text: "quick answer" }] },
-        ],
-      },
-    ];
-
-    const lines = sequence.map((e) => parsePiEvent(e));
-    const terminals = lines.filter((l) => l?.type === "result");
-
-    assert.strictEqual(terminals.length, 1);
-    assert.strictEqual((terminals[0] as { result: string }).result, "quick answer");
-    assert.strictEqual(lines[0], null);
+    const noRunState: PiRpcParseState = {};
+    const noRun = parsePiEvent({ type: "agent_settled" }, noRunState);
+    assert.ok(noRun);
+    assert.match((noRun as { result: string }).result, /without a usable agent_end outcome/);
+    assert.strictEqual((noRun as { is_error?: boolean }).is_error, true);
   });
 
   it("captures the Pi session id from a successful get_state response", () => {
@@ -1965,80 +2061,17 @@ describe("parsePiEvent", () => {
     );
   });
 
-  it("defers a context-overflow failed prompt response when stream recovery state exists", () => {
+  it("keeps a real prompt preflight rejection terminal and exactly once", () => {
     const state: PiRpcParseState = {};
     const line = parsePiEvent(
       {
         type: "response",
         command: "prompt",
         success: false,
-        error: "context_length_exceeded: input exceeds the context window",
+        error: "prompt rejected",
       },
       state,
     );
-
-    assert.strictEqual(line, null);
-
-    const reset = parsePiEvent({ type: "compaction_start", reason: "overflow" }, state);
-    assert.ok(reset);
-    assert.strictEqual(reset.type, "assistant");
-    assert.strictEqual(reset.subtype, "control_request");
-    assert.strictEqual((reset as { action?: unknown }).action, "reset_response_text");
-  });
-
-  it("surfaces a context-overflow failed prompt response without stream recovery state", () => {
-    const line = parsePiEvent({
-      type: "response",
-      command: "prompt",
-      success: false,
-      error: "context_length_exceeded: input exceeds the context window",
-    });
-
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
-    assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(
-      result.result,
-      "context_length_exceeded: input exceeds the context window",
-    );
-    assert.strictEqual(result.is_error, true);
-  });
-
-  it("surfaces an explicit non-retryable prompt-response overflow without stale pending state", () => {
-    const state: PiRpcParseState = {};
-    const line = parsePiEvent(
-      {
-        type: "response",
-        command: "prompt",
-        success: false,
-        willRetry: false,
-        sessionId: "test-session",
-        error: "context_length_exceeded: input exceeds the context window",
-      },
-      state,
-    );
-
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
-    assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(
-      result.result,
-      "context_length_exceeded: input exceeds the context window",
-    );
-    assert.strictEqual(result.session_id, "test-session");
-    assert.strictEqual(result.is_error, true);
-    assert.strictEqual(parsePiEvent({ type: "compaction_start", reason: "overflow" }, state), null);
-  });
-
-  it("surfaces a failed prompt response (a REAL rejection) as a terminal error ResultMessage", () => {
-    const line = parsePiEvent({
-      type: "response",
-      command: "prompt",
-      success: false,
-      error: "prompt rejected",
-    });
 
     assert.ok(line);
     assert.strictEqual(line.type, "result");
@@ -2046,6 +2079,7 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.subtype, "error_during_execution");
     assert.strictEqual(result.result, "prompt rejected");
     assert.strictEqual(result.is_error, true);
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
   it("does NOT terminate the turn on Pi's 'already processing' prompt rejection (Defect A)", () => {
@@ -2200,7 +2234,7 @@ describe("parsePiEvent", () => {
     assert.strictEqual(rateLimit.error_message, "");
   });
 
-  it("translates an error event into an error ResultMessage", () => {
+  it("keeps stateless error translation for isolated parser callers", () => {
     const line = parsePiEvent({ type: "error", errorMessage: "boom" });
 
     assert.ok(line);
@@ -2208,49 +2242,6 @@ describe("parsePiEvent", () => {
     const result = line as unknown as Record<string, unknown>;
     assert.strictEqual(result.subtype, "error_during_execution");
     assert.strictEqual(result.result, "boom");
-    assert.strictEqual(result.is_error, true);
-  });
-
-  it("preserves the original overflow cause when a pending recovery emits a top-level error", () => {
-    const state: PiRpcParseState = {};
-    const overflowMessage =
-      "context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)";
-    assert.strictEqual(
-      parsePiEvent(
-        {
-          type: "agent_end",
-          sessionId: "test-session",
-          messages: [
-            {
-              role: "assistant",
-              stopReason: "error",
-              errorMessage: overflowMessage,
-              content: [],
-            },
-          ],
-        },
-        state,
-      ),
-      null,
-    );
-
-    const line = parsePiEvent(
-      {
-        type: "error",
-        errorMessage: "Unable to compact the conversation",
-      },
-      state,
-    );
-
-    assert.ok(line);
-    assert.strictEqual(line.type, "result");
-    const result = line as unknown as Record<string, unknown>;
-    assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(
-      result.result,
-      "Unable to compact the conversation; original overflow: context_length_exceeded: Codex request too large (WebSocket 1009 message too big; requestBytes=24800000)",
-    );
-    assert.strictEqual(result.session_id, "test-session");
     assert.strictEqual(result.is_error, true);
   });
 
@@ -2299,6 +2290,7 @@ describe("readPiStream", () => {
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
       }),
+      JSON.stringify({ type: "agent_settled" }),
     ]);
 
     const lines: StreamLine[] = [];
@@ -2314,7 +2306,398 @@ describe("readPiStream", () => {
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
   });
 
-  it("keeps reading after a prompt-response overflow until the final answer", async () => {
+  for (const handledBy of ["extension command", "input handler"]) {
+    it(`completes a prompt handled immediately by an ${handledBy} without waiting for agent_settled`, async () => {
+      const stdout = new Readable({ read() {} });
+      const writes: Array<Record<string, unknown>> = [];
+      const stdin = new Writable({
+        write(chunk, _enc, callback) {
+          const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+          writes.push(command);
+          callback();
+          queueMicrotask(() => {
+            stdout.push(`${JSON.stringify({
+              type: "response",
+              command: "get_state",
+              success: true,
+              id: command.id,
+              data: { sessionId: "handled-session", isStreaming: false },
+            })}\n`);
+          });
+        },
+      });
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+      const promptId = `prompt-handled-by-${handledBy.replaceAll(" ", "-")}`;
+
+      try {
+        const collect = (async () => {
+          const lines: StreamLine[] = [];
+          for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
+          return lines;
+        })();
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "prompt",
+          success: true,
+          id: promptId,
+        })}\n`);
+
+        const lines = await Promise.race([
+          collect,
+          new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
+          }),
+        ]);
+
+        assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
+        assert.strictEqual(lines.length, 1);
+        assert.strictEqual(lines[0].type, "result");
+        assert.strictEqual((lines[0] as { result: string }).result, "");
+        assert.strictEqual((lines[0] as { session_id: string }).session_id, "handled-session");
+        assert.notStrictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+      } finally {
+        stdout.destroy();
+        stdin.destroy();
+      }
+    });
+  }
+
+  it("keeps a real agent run open when the correlated prompt state probe reports streaming", async () => {
+    const stdout = new Readable({ read() {} });
+    const writes: Array<Record<string, unknown>> = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+        writes.push(command);
+        callback();
+        queueMicrotask(() => {
+          stdout.push(`${JSON.stringify({
+            type: "response",
+            command: "get_state",
+            success: true,
+            id: command.id,
+            data: { sessionId: "running-session", isStreaming: true },
+          })}\n`);
+          stdout.push(`${JSON.stringify({ type: "agent_start" })}\n`);
+          stdout.push(`${JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "model answer" }] }],
+          })}\n`);
+          stdout.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+        });
+      },
+    });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+    const promptId = "prompt-with-agent-run";
+
+    try {
+      const collect = (async () => {
+        const lines: StreamLine[] = [];
+        for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
+        return lines;
+      })();
+      stdout.push(`${JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: true,
+        id: promptId,
+      })}\n`);
+      const lines = await collect;
+
+      assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
+      assert.strictEqual(lines.length, 1, "the internal state probe is not user-facing");
+      assert.strictEqual(lines[0].type, "result");
+      assert.strictEqual((lines[0] as { result: string }).result, "model answer");
+    } finally {
+      stdout.destroy();
+      stdin.destroy();
+    }
+  });
+
+  it("ignores a stale successful prompt response from an earlier stream reader", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: true,
+        id: "previous-prompt",
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "current answer" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child, undefined, "current-prompt")) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.strictEqual((lines[0] as { result: string }).result, "current answer");
+  });
+
+  it("cancels all blocking extension UI methods through captured child stdin and still settles once", async () => {
+    const stdout = new Readable({ read() {} });
+    const requests = [
+      { type: "extension_ui_request", id: "select-id", method: "select", title: "Select", options: ["A"] },
+      { type: "extension_ui_request", id: "confirm-id", method: "confirm", title: "Confirm", message: "Proceed?" },
+      { type: "extension_ui_request", id: "input-id", method: "input", title: "Input" },
+      { type: "extension_ui_request", id: "editor-id", method: "editor", title: "Editor", prefill: "draft" },
+    ];
+    const writes: Array<Record<string, unknown>> = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+        writes.push(command);
+        callback();
+
+        const requestIndex = writes.length;
+        queueMicrotask(() => {
+          stdout.push(
+            `${JSON.stringify({
+              type: "response",
+              command: "extension_ui_response",
+              success: true,
+              id: command.id,
+            })}\n`,
+          );
+          if (requestIndex < requests.length) {
+            stdout.push(`${JSON.stringify(requests[requestIndex])}\n`);
+            return;
+          }
+          stdout.push(
+            `${JSON.stringify({
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "dialogues cancelled" }] }],
+            })}\n`,
+          );
+          stdout.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+          stdout.push(null);
+        });
+      },
+    });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+
+    const collect = (async () => {
+      const lines: StreamLine[] = [];
+      for await (const line of readPiStream(child)) lines.push(line);
+      return lines;
+    })();
+    stdout.push(`${JSON.stringify(requests[0])}\n`);
+
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      const lines = await Promise.race([
+        collect,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("timed out waiting for extension UI cancellation")), 2_500);
+        }),
+      ]);
+
+      assert.deepStrictEqual(writes, requests.map((request) => ({
+        type: "extension_ui_response",
+        id: request.id,
+        cancelled: true,
+      })));
+      assert.deepStrictEqual(lines.map((line) => line.type), ["result"]);
+      assert.strictEqual((lines[0] as { result: string }).result, "dialogues cancelled");
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      stdout.destroy();
+      stdin.destroy();
+    }
+  });
+
+  it("ignores malformed and fire-and-forget UI requests and survives destroyed stdin", async () => {
+    const secretPresentation = "do not echo this title, message, or option";
+    const writes: string[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        writes.push(chunk.toString());
+        callback();
+      },
+    });
+    stdin.destroy();
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "extension_ui_request",
+        method: "confirm",
+        title: secretPresentation,
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "unknown-id",
+        method: "futureDialog",
+        title: secretPresentation,
+        options: [secretPresentation],
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notify-id",
+        method: "notify",
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "confirm-id",
+        method: "confirm",
+        title: secretPresentation,
+        message: secretPresentation,
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "extension_ui_response",
+        success: false,
+        error: "side-channel response failed",
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "normal result" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    Object.assign(child, { stdin, exitCode: null, killed: false });
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    try {
+      const lines: StreamLine[] = [];
+      for await (const line of readPiStream(child)) lines.push(line);
+
+      assert.deepStrictEqual(writes, []);
+      assert.strictEqual(lines.filter((line) => line.type === "result").length, 1);
+      assert.strictEqual((lines[0] as { result: string }).result, "normal result");
+      assert.ok(warnings.some((warning) => warning.includes("malformed Pi extension UI request")));
+      assert.ok(warnings.some((warning) => warning.includes("unknown Pi extension UI request method")));
+      assert.ok(warnings.some((warning) => warning.includes("child stdin unavailable")));
+      assert.ok(warnings.every((warning) => !warning.includes(secretPresentation)));
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("uses the final low-level run after retry and emits no stale terminal text", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "stale partial" },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        willRetry: true,
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "temporary provider failure",
+          content: [{ type: "text", text: "stale partial" }],
+        }],
+      }),
+      JSON.stringify({ type: "auto_retry_start", errorMessage: "429 rate limit" }),
+      JSON.stringify({ type: "auto_retry_end", success: true }),
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "final retry answer" },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "final retry answer" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "final retry answer");
+    assert.ok(!results.some((line) => (line as { result?: string }).result?.includes("stale")));
+    assert.strictEqual(
+      lines.filter(
+        (line) => line.type === "assistant" && (line as { action?: unknown }).action === "reset_response_text",
+      ).length,
+      1,
+    );
+  });
+
+  it("waits through queued continuations and settles on the last run once", async () => {
+    const child = childWithStdout([
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "first run" },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "first run" }] }],
+      }),
+      JSON.stringify({ type: "queue_update", followUp: ["continue"] }),
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "continued final" },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "continued final" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "continued final");
+    assert.deepStrictEqual(
+      lines.map(extractPiTextDelta).filter((text): text is string => text !== null),
+      ["first run", "continued final"],
+    );
+    const resets = lines.filter(
+      (line) => line.type === "assistant" && (line as { action?: unknown }).action === "reset_response_text",
+    );
+    assert.strictEqual(resets.length, 1);
+    assert.strictEqual((resets[0] as { reason?: unknown }).reason, "pi_queued_continuation");
+    assert.ok(lines.indexOf(resets[0]) > 0);
+    assert.ok(lines.indexOf(resets[0]) < lines.findIndex((line) => extractPiTextDelta(line) === "continued final"));
+  });
+
+  it("emits a protocol error when settlement has no usable agent_end outcome", async () => {
+    const child = childWithStdout([JSON.stringify({ type: "agent_settled" })]);
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.match((lines[0] as { result: string }).result, /without a usable agent_end outcome/);
+    assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+  });
+
+  it("reports an explicit error when stdout ends after agent_end but before settlement", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "completed before exit" }] }],
+      }),
+    ]);
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.strictEqual(
+      (lines[0] as { result: string }).result,
+      "Pi subprocess exited before agent_settled",
+    );
+    assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+  });
+
+  it("treats a failed prompt response as a preflight rejection before acceptance", async () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "response",
@@ -2331,6 +2714,7 @@ describe("readPiStream", () => {
           { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
         ],
       }),
+      JSON.stringify({ type: "agent_settled" }),
     ]);
 
     const lines: StreamLine[] = [];
@@ -2338,21 +2722,16 @@ describe("readPiStream", () => {
       lines.push(line);
     }
 
-    assert.ok(
-      lines.some(
-        (line) =>
-          line.type === "assistant" &&
-          line.subtype === "control_request" &&
-          (line as { action?: unknown }).action === "reset_response_text",
-      ),
-    );
     const results = lines.filter((line) => line.type === "result");
     assert.strictEqual(results.length, 1);
-    assert.strictEqual((results[0] as { result: string }).result, "post-compaction answer");
-    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "context_length_exceeded: input exceeds the context window",
+    );
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
   });
 
-  it("surfaces compaction failure after a deferred prompt-response overflow", async () => {
+  it("does not let later recovery-looking records replace a prompt preflight rejection", async () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "response",
@@ -2378,10 +2757,7 @@ describe("readPiStream", () => {
     const result = results[0] as unknown as Record<string, unknown>;
     assert.strictEqual(result.type, "result");
     assert.strictEqual(result.subtype, "error_during_execution");
-    assert.strictEqual(
-      result.result,
-      "Unable to compact the conversation; original overflow: context_length_exceeded: input exceeds the context window",
-    );
+    assert.strictEqual(result.result, "context_length_exceeded: input exceeds the context window");
     assert.strictEqual(result.is_error, true);
   });
 
@@ -2466,6 +2842,7 @@ describe("readPiStream", () => {
           { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
         ],
       }),
+      JSON.stringify({ type: "agent_settled" }),
     ]);
 
     const lines: StreamLine[] = [];
@@ -2513,6 +2890,7 @@ describe("readPiStream", () => {
           { role: "assistant", content: [{ type: "text", text: "post-compaction answer" }] },
         ],
       }),
+      JSON.stringify({ type: "agent_settled" }),
     ]);
 
     const lines: StreamLine[] = [];
@@ -2554,6 +2932,7 @@ describe("readPiStream", () => {
         willRetry: false,
         errorMessage: "Unable to compact the conversation",
       }),
+      JSON.stringify({ type: "agent_settled" }),
     ]);
 
     const lines: StreamLine[] = [];
@@ -2768,7 +3147,7 @@ describe("readPiStream", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("terminates a willRetry-false context-overflow agent_end after a bounded grace", async () => {
+  it("does not terminate an accepted overflow run before agent_settled", async () => {
     const stdout = new Readable({ read() {} });
     const child = new EventEmitter() as unknown as ChildProcess;
     const killSignals: Array<NodeJS.Signals | number | undefined> = [];
@@ -2811,10 +3190,11 @@ describe("readPiStream", () => {
       ]);
       assert.strictEqual(early, "pending");
 
+      stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
       const result = await Promise.race([
         next,
         new Promise<never>((_resolve, reject) => {
-          setTimeout(() => reject(new Error("timed out waiting for overflow grace fallback")), 2_500);
+          setTimeout(() => reject(new Error("timed out waiting for agent_settled")), 2_500);
         }),
       ]);
       assert.strictEqual(result.done, false);
@@ -2827,13 +3207,9 @@ describe("readPiStream", () => {
       );
       assert.strictEqual(line.session_id, "test-session");
       assert.strictEqual(line.is_error, true);
-      assert.strictEqual((child as unknown as { killed: boolean }).killed, true);
-      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-      assert.strictEqual(stdout.destroyed, true, "late overflow records must not remain readable");
-
-      const second = readPiStream(child);
-      const stale = await second.next();
-      assert.strictEqual(stale.done, true, "a fresh stream must not read records from the timed-out turn");
+      assert.strictEqual((child as unknown as { killed: boolean }).killed, false);
+      assert.deepStrictEqual(killSignals, []);
+      assert.strictEqual(stdout.destroyed, false, "settlement must leave the reusable child alive");
     } finally {
       await stream.return(undefined);
       stdout.destroy();
@@ -2862,7 +3238,6 @@ describe("readPiStream", () => {
           ],
         }) + "\n",
       );
-
       const early = await Promise.race([
         next.then(() => "resolved" as const),
         new Promise<"pending">((resolve) => {
@@ -2908,6 +3283,7 @@ describe("readPiStream", () => {
           ],
         }) + "\n",
       );
+      stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
 
       const final = await Promise.race([
         finalNext,
@@ -2929,7 +3305,7 @@ describe("readPiStream", () => {
     }
   });
 
-  it("handles records split across stdout chunks", async () => {
+  it("handles records split across stdout chunks and reports pre-settlement EOF", async () => {
     const child = new EventEmitter() as unknown as ChildProcess;
     const record = JSON.stringify({
       type: "message_update",
@@ -2946,8 +3322,11 @@ describe("readPiStream", () => {
       lines.push(line);
     }
 
-    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines.length, 2);
     assert.strictEqual(extractPiTextDelta(lines[0]), "split");
+    assert.strictEqual(lines[1].type, "result");
+    assert.strictEqual((lines[1] as { result: string }).result, "Pi subprocess exited before agent_settled");
+    assert.strictEqual((lines[1] as { is_error?: boolean }).is_error, true);
   });
 
   it("throws when stdout is unavailable", async () => {

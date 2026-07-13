@@ -1409,6 +1409,8 @@ describe("command handler wiring", () => {
       can_join_groups: false,
       can_read_all_group_messages: false,
       supports_inline_queries: false,
+      can_manage_bots: false,
+      supports_join_request_queries: false,
       can_connect_to_business: false,
       has_main_web_app: false,
       has_topics_enabled: false,
@@ -1433,6 +1435,8 @@ describe("command handler wiring", () => {
       can_join_groups: false,
       can_read_all_group_messages: false,
       supports_inline_queries: false,
+      can_manage_bots: false,
+      supports_join_request_queries: false,
       can_connect_to_business: false,
       has_main_web_app: false,
       has_topics_enabled: false,
@@ -2155,9 +2159,9 @@ describe("makeSteerFn", () => {
     assert.strictEqual(child.stdin.writes.length, 0);
   });
 
-  it("returns false in the idle window after agent_end", () => {
+  it("returns false in the idle window after agent_settled", () => {
     // processingStartedAt === null: session-manager has cleared it after
-    // agent_end but MessageQueue.busy may still be true. Steering here would
+    // agent_settled but MessageQueue.busy may still be true. Steering here would
     // hand the message to an idle Pi child and lose it; buffer instead.
     const child = makeLiveChild();
     const steerFn = makeSteerFn(fakeManager(true, child, null));

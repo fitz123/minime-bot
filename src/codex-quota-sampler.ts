@@ -11,11 +11,15 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
+import {
+  formatPiRuntimeDiagnostic,
+  resolvePackageOwnedPiInvocation,
+  type PiRuntimeDiagnostic,
+} from "./pi-runtime.js";
 import { resolveAgentWorkspaceCwd, resolveWorkspaceContract, type ResolvedWorkspaceContract } from "./workspace-contract.js";
 import {
   CODEX_QUOTA_ATTEMPT_FILE_ENV,
@@ -35,8 +39,6 @@ export const CODEX_QUOTA_PI_BIN_ENV = "CODEX_QUOTA_PI_BIN";
 export const CODEX_QUOTA_PROBE_TEXTFILE_NAME = "codex_usage_probe.prom";
 
 const PI_PROVIDER = "openai-codex";
-const DEFAULT_PI_BIN = "pi";
-const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
 const DEFAULT_CODEX_QUOTA_MODEL = "openai-codex/gpt-5.5";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -46,7 +48,6 @@ const OUTPUT_BUFFER_LIMIT = 64 * 1024;
 const SAMPLER_PROJECT_SETTINGS = { transport: "sse" };
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const requireFromSampler = createRequire(import.meta.url);
 const DEFAULT_BOT_DIR = resolve(__dirname, "..");
 
 export function defaultCodexQuotaExtensionPath(botDir: string, moduleDir = __dirname): string {
@@ -81,6 +82,8 @@ export interface ResolveCodexQuotaSamplerConfigOptions {
 
 export interface CodexQuotaSamplerConfig {
   piBin: string;
+  piArgsPrefix?: string[];
+  piRuntimeDiagnostic?: PiRuntimeDiagnostic;
   model: string;
   prompt: string;
   stateFile: string;
@@ -241,8 +244,13 @@ export function resolveCodexQuotaSamplerConfig(
     options.forbiddenSamplerCwds ?? readConfiguredAgentWorkspaceCwds(workspaceContract),
   );
 
+  const explicitPiBin = nonEmpty(cli.piBin) ?? nonEmpty(env[CODEX_QUOTA_PI_BIN_ENV]);
+  const packageInvocation = explicitPiBin ? undefined : resolvePackageOwnedPiInvocation("cli", []);
+
   return {
-    piBin: nonEmpty(cli.piBin) ?? nonEmpty(env[CODEX_QUOTA_PI_BIN_ENV]) ?? defaultPiBin(),
+    piBin: explicitPiBin ?? packageInvocation!.command,
+    piArgsPrefix: packageInvocation?.args,
+    piRuntimeDiagnostic: packageInvocation?.diagnostic,
     model: normalizeCodexModel(nonEmpty(cli.model) ?? nonEmpty(env[CODEX_QUOTA_MODEL_ENV])),
     prompt: nonEmpty(cli.prompt) ?? DEFAULT_PROMPT,
     stateFile,
@@ -426,7 +434,7 @@ export async function runCodexQuotaSampler(
       extensionPath: options.extensionPath,
     });
   const settingsFile = samplerProjectSettingsFile(config.samplerCwd);
-  const args = buildCodexQuotaSamplerArgs(config);
+  const args = [...(config.piArgsPrefix ?? []), ...buildCodexQuotaSamplerArgs(config)];
 
   if (config.dryRun) {
     return {
@@ -438,6 +446,12 @@ export async function runCodexQuotaSampler(
   }
 
   ensureSamplerProjectSettings(config.samplerCwd);
+
+  if (config.piRuntimeDiagnostic) {
+    console.error(
+      `[codex-quota-sampler] package-owned Pi runtime ${formatPiRuntimeDiagnostic(config.piRuntimeDiagnostic)}`,
+    );
+  }
 
   const attemptedAt = options.now ?? new Date();
   const attemptFile = buildAttemptFilePath(config.samplerCwd);
@@ -626,26 +640,6 @@ function prependHomebrewPath(path: string | undefined): string {
     return homebrewPath;
   }
   return path.split(":").includes(homebrewPath) ? path : `${homebrewPath}:${path}`;
-}
-
-function defaultPiBin(): string {
-  return resolveBundledPiBin() ?? DEFAULT_PI_BIN;
-}
-
-function resolveBundledPiBin(): string | undefined {
-  const searchPaths = requireFromSampler.resolve.paths(PI_CODING_AGENT_PACKAGE) ?? [];
-  for (const nodeModulesDir of searchPaths) {
-    const binPath = join(nodeModulesDir, ".bin", process.platform === "win32" ? "pi.cmd" : "pi");
-    if (existsSync(binPath)) {
-      return binPath;
-    }
-
-    const cliPath = join(nodeModulesDir, "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-    if (existsSync(cliPath)) {
-      return cliPath;
-    }
-  }
-  return undefined;
 }
 
 function defaultSamplerCwd(): string {

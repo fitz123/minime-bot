@@ -30,6 +30,10 @@ import {
   shouldIncludePiChildEnvKey,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
+import {
+  formatPiRuntimeDiagnostic,
+  resolvePackageOwnedPiInvocation,
+} from "./pi-runtime.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
@@ -42,7 +46,6 @@ const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
 const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
 const PI_CRON_MODEL = "openai-codex/gpt-5.5";
-const PI_BIN = "pi";
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
@@ -735,7 +738,9 @@ function runPi(
 
   args.push("--append-system-prompt", systemInstruction);
   args.push(...(deps.resolveExtensionArgs?.() ?? resolvePiExtensionArgs({ relpaths: PI_CRON_WRAPPER_RELPATHS })));
-  const result = deps.spawnSync(PI_BIN, args, {
+  const invocation = resolvePackageOwnedPiInvocation("cli", args);
+  log(cron.name, `package-owned Pi runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
+  const result = deps.spawnSync(invocation.command, invocation.args, {
     cwd: validatedWorkspaceCwd,
     timeout: cron.timeout ?? DEFAULT_TIMEOUT_MS,
     encoding: "utf8",

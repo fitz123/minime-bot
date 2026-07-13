@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable, PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
-import type { BotConfig } from "../types.js";
+import type { BotConfig, StreamLine } from "../types.js";
 import { waitForSpawn, outboxDir, type ActiveSession } from "../session-manager.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
@@ -88,13 +88,16 @@ function piTextDelta(text: string): string {
 }
 
 function piAgentEnd(result: string, sessionId = "pi-session"): string {
-  return JSON.stringify({
-    type: "agent_end",
-    sessionId,
-    messages: [
-      { role: "assistant", content: [{ type: "text", text: result }] },
-    ],
-  }) + "\n";
+  return [
+    JSON.stringify({
+      type: "agent_end",
+      sessionId,
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: result }] },
+      ],
+    }),
+    JSON.stringify({ type: "agent_settled" }),
+  ].join("\n") + "\n";
 }
 
 let mockChildFactory: () => ChildProcess;
@@ -784,7 +787,7 @@ describe("SessionManager sendSessionMessage streaming", () => {
     await manager.closeAll();
   });
 
-  it("throws when subprocess dies before sending result", async () => {
+  it("surfaces one error result when the subprocess exits before agent_settled", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const PQueue = (await import("p-queue")).default;
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
@@ -826,6 +829,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       outboxPath: "/tmp/bot-outbox/test",
     };
     (manager as unknown as Record<string, unknown>).active = new Map([["dead-chat", session]]);
+    const restartCounts = (manager as unknown as { restartCounts: Map<string, number> }).restartCounts;
+    restartCounts.set("dead-chat", 2);
 
     const gen = manager.sendSessionMessage("dead-chat", "main", "hello");
 
@@ -836,12 +841,17 @@ describe("SessionManager sendSessionMessage streaming", () => {
       stdout.push(null);
     }, 30);
 
-    // Consuming the generator should yield the partial line then throw
-    await assert.rejects(async () => {
-      for await (const _line of gen) {
-        // consume
-      }
-    }, /Pi subprocess exited before sending a result/);
+    const lines: StreamLine[] = [];
+    for await (const line of gen) lines.push(line);
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "Pi subprocess exited before agent_settled",
+    );
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
+    assert.strictEqual(session.lastSuccessAt, null, "an EOF error must not be recorded as success");
+    assert.strictEqual(restartCounts.get("dead-chat"), 2, "an EOF error must not reset crash backoff");
 
     await manager.closeAll();
   });
@@ -905,12 +915,16 @@ describe("SessionManager sendSessionMessage streaming", () => {
     // Close stdout shortly after — subprocess died, no result
     setTimeout(() => { stdout.push(null); }, 30);
 
-    // The EPIPE write error is caught, and stream ends without result
-    await assert.rejects(async () => {
-      for await (const _line of gen) {
-        // consume
-      }
-    }, /Pi subprocess exited before sending a result/);
+    // The EPIPE write error is caught, and stream EOF becomes one terminal error.
+    const lines: StreamLine[] = [];
+    for await (const line of gen) lines.push(line);
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "Pi subprocess exited before agent_settled",
+    );
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
 
     await manager.closeAll();
   });
@@ -2026,9 +2040,8 @@ describe("SessionManager Pi dispatch", () => {
 
     const gen = manager.sendSessionMessage("pi-chat", "pi", "hello pi");
 
-    // Drive a multi-turn-shaped Pi run: per-turn boundary then the terminal
-    // agent_end. readPiStream/parsePiEvent translates agent_end into a terminal
-    // result while turn_end is ignored.
+    // Drive a multi-turn-shaped Pi run: per-turn and low-level run boundaries,
+    // followed by the session-level settlement emitted by the helper.
     setTimeout(() => {
       stdout.push(JSON.stringify({ type: "turn_end", sessionId: "pi-real" }) + "\n");
       stdout.push(piAgentEnd("final pi answer", "pi-real"));
@@ -2043,6 +2056,7 @@ describe("SessionManager Pi dispatch", () => {
     assert.ok(stdinWrites.length >= 1, "should have written to stdin");
     const sent = JSON.parse(stdinWrites[0]);
     assert.strictEqual(sent.type, "prompt", "pi path must write a Pi prompt command");
+    assert.match(sent.id, /^minime-prompt-\d+$/, "pi prompt must carry a correlation id");
     assert.ok(sent.message.startsWith("hello pi\n\n"), "user prompt should be preserved at the start");
     assert.ok(
       sent.message.includes("To share a file with the user, write or copy it to this outbox directory:"),
@@ -2062,13 +2076,168 @@ describe("SessionManager Pi dispatch", () => {
       "pi prompt must carry streamingBehavior:followUp (never a bare prompt)",
     );
 
-    // Read routed to readPiStream: agent_end became the single terminal result
-    // carrying the FINAL assistant text; turn_end produced no line.
+    // Read routed to readPiStream: agent_end retained the final assistant text,
+    // and agent_settled emitted the single terminal result.
     const results = lines.filter((l) => l.type === "result");
-    assert.strictEqual(results.length, 1, "exactly one terminal result from agent_end");
+    assert.strictEqual(results.length, 1, "exactly one terminal result from agent_settled");
     assert.strictEqual(results[0].result, "final pi answer");
 
     await manager.closeAll();
+  });
+
+  for (const handledBy of ["extension command", "input handler"]) {
+    it(`finishes a prompt handled by an ${handledBy} without an agent lifecycle`, async () => {
+      const { SessionManager } = await import("../session-manager.js");
+      const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+      const chatId = `pi-handled-${handledBy.replaceAll(" ", "-")}`;
+      const { child, stdout, stdinWrites } = makeCapturingChild();
+      injectSession(manager, chatId, "pi", child);
+
+      const collect = (async () => {
+        const lines: StreamLine[] = [];
+        for await (const line of manager.sendSessionMessage(chatId, "pi", "handled request")) {
+          lines.push(line);
+        }
+        return lines;
+      })();
+
+      try {
+        while (stdinWrites.length < 1) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        const prompt = JSON.parse(stdinWrites[0]) as { id: string; type: string };
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "prompt",
+          success: true,
+          id: prompt.id,
+        })}\n`);
+
+        while (stdinWrites.length < 2) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        const stateProbe = JSON.parse(stdinWrites[1]) as { id: string; type: string };
+        assert.deepStrictEqual(stateProbe, { type: "get_state", id: `${prompt.id}-state` });
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "get_state",
+          success: true,
+          id: stateProbe.id,
+          data: { sessionId: "handled-session", isStreaming: false },
+        })}\n`);
+
+        const lines = await Promise.race([
+          collect,
+          new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
+          }),
+        ]);
+        assert.strictEqual(lines.length, 1);
+        assert.strictEqual(lines[0].type, "result");
+        assert.strictEqual((lines[0] as { result: string }).result, "");
+        assert.notStrictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+        assert.strictEqual(manager.getSessionHealth(chatId)?.processingMs, null);
+      } finally {
+        await manager.closeAll();
+      }
+    });
+  }
+
+  it("keeps busy state, metrics, and the per-session queue active until agent_settled", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const durationCount = async (): Promise<number> =>
+      (await piTurnDuration.get()).values.find(
+        (v) => v.metricName === "bot_pi_turn_duration_seconds_count" && v.labels.agent_id === "pi",
+      )?.value ?? 0;
+    const durationBefore = await durationCount();
+
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-settlement", "pi", child);
+
+    const first = manager.sendSessionMessage("pi-settlement", "pi", "first");
+    const firstNext = first.next();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    stdout.push(JSON.stringify({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "first answer" }] }],
+    }) + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const beforeSettlement = await Promise.race([
+      firstNext.then(() => "resolved" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 50)),
+    ]);
+    assert.strictEqual(beforeSettlement, "pending", "agent_end must not finish the response");
+    assert.ok(manager.getSessionHealth("pi-settlement")?.processingMs !== null);
+    assert.strictEqual(await durationCount(), durationBefore, "duration is not recorded at agent_end");
+
+    const second = manager.sendSessionMessage("pi-settlement", "pi", "second");
+    const secondNext = second.next();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.strictEqual(stdinWrites.length, 1, "the next queued prompt waits for settlement");
+
+    stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
+    const firstResult = await firstNext;
+    assert.strictEqual(firstResult.done, false);
+    assert.strictEqual(firstResult.value.type, "result");
+    assert.strictEqual((firstResult.value as { result: string }).result, "first answer");
+    assert.strictEqual((await first.next()).done, true);
+
+    for (let i = 0; i < 20 && stdinWrites.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.strictEqual(stdinWrites.length, 2, "the queued prompt starts after settlement");
+    stdout.push(piAgentEnd("second answer", "pi-real"));
+    const secondResult = await secondNext;
+    assert.strictEqual(secondResult.done, false);
+    assert.strictEqual(secondResult.value.type, "result");
+    assert.strictEqual((secondResult.value as { result: string }).result, "second answer");
+    assert.strictEqual((await second.next()).done, true);
+    assert.strictEqual((await durationCount()) - durationBefore, 2);
+
+    await manager.closeAll();
+  });
+
+  it("refreshes the activity watchdog for filtered lifecycle records before settlement", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-activity", "pi", child);
+    manager.getActive("pi-activity")!.idleTimeoutMs = 10_000_000;
+
+    const response = manager.sendSessionMessage("pi-activity", "pi", "keep working");
+    const resultPromise = response.next();
+    while (stdinWrites.length === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    try {
+      t.mock.timers.tick(1_799_999);
+      stdout.push(JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(2);
+      assert.strictEqual(child.killed, false, "filtered agent_end refreshes the watchdog");
+
+      t.mock.timers.tick(1_799_997);
+      stdout.push(JSON.stringify({ type: "compaction_start", reason: "threshold" }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(2);
+      assert.strictEqual(child.killed, false, "filtered compaction activity refreshes the watchdog");
+
+      stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
+      const result = await resultPromise;
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      assert.strictEqual((result.value as { result: string }).result, "done");
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("does not truncate the in-flight Pi turn when an 'already processing' rejection arrives mid-stream (Defects A+B wedge)", async () => {
@@ -2105,7 +2274,7 @@ describe("SessionManager Pi dispatch", () => {
       lines.push(line as { type: string; result?: string; is_error?: boolean });
     }
 
-    // Exactly one terminal result — from the real agent_end, NOT the rejection.
+    // Exactly one terminal result — from settlement of the real run, NOT the rejection.
     const results = lines.filter((l) => l.type === "result");
     assert.strictEqual(results.length, 1, "the rejection must not produce a terminal result");
     assert.strictEqual(results[0].result, "final pi answer", "must relay the real answer, not Pi's error");
@@ -2131,7 +2300,7 @@ describe("SessionManager Pi dispatch", () => {
     const { child, stdout } = makeCapturingChild();
     injectSession(manager, "pi-telemetry", "pi", child);
 
-    // A retry pair (start → end) followed by the terminal agent_end. The read
+    // A retry pair (start → end) followed by agent_end + agent_settled. The read
     // loop must count the retry exactly once (on auto_retry_start; auto_retry_end
     // signals recovery and would double-count) and record one turn duration.
     setTimeout(() => {
@@ -2186,7 +2355,7 @@ describe("SessionManager Pi dispatch", () => {
     assert.strictEqual(sent.type, "prompt", "same runtime signature reuses the existing Pi child");
 
     const results = lines.filter((l) => l.type === "result");
-    assert.strictEqual(results.length, 1, "Pi agent_end terminated the turn");
+    assert.strictEqual(results.length, 1, "Pi agent_settled terminated the turn");
     assert.strictEqual(results[0].result, "pi answer");
 
     await manager.closeAll();

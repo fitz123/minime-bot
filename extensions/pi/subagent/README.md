@@ -6,7 +6,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 
 This is the upstream Pi `subagent` example, ADOPTED as a bot Pi extension and
 loaded into every `pi --mode rpc` spawn via `--extension` (see
-`resolvePiExtensionArgs` in `bot/src/pi-rpc-protocol.ts`). Three behavioral changes
+`resolvePiExtensionArgs` in `bot/src/pi-rpc-protocol.ts`). Four behavioral changes
 from upstream:
 
 1. **Provider wiring**: each spawned child runs on the bot's `openai-codex`
@@ -34,6 +34,11 @@ from upstream:
    do not load `subagent/index.ts`, so recursive subagent spawning stays
    disabled. Missing wrappers fail during spawn arg resolution; a missing Tavily
    key leaves web tools registered but returning graceful unavailable results.
+4. **Noninteractive project-agent guard**: project agents can be discovered with
+   `agentScope: "project"` or `"both"`, but running one requires an interactive
+   confirmation. Bot-created RPC sessions cancel that unsupported dialog, so the
+   invocation is denied. This restriction does not affect bundled agents or user
+   agents that are included by the selected scope.
 
 **Tool/param contract:** the registered tool is named `subagent`; modes are
 `single` (`{ agent, task }`), `parallel` (`{ tasks: [...] }`), and `chain`
@@ -108,9 +113,11 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 **Default behavior:** Loads the **bundled agents** (shipped with this extension, lowest precedence) plus **user-level agents** from `~/.pi/agent/agents` (which override bundled by name). Project-local agents are NOT loaded by default.
 
-To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
+To discover project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
-When running interactively, the tool prompts for confirmation before running project-local agents.
+When running interactively, the tool prompts for confirmation before running
+project-local agents. Bot-created RPC sessions cancel that confirmation and do
+not run the requested project agent.
 
 ## Usage
 
@@ -191,6 +198,8 @@ System prompt for the agent goes here.
 - `.pi/agents/*.md` - Project-level (only with `agentScope: "project"` or `"both"`)
 
 Later sources override earlier ones with the same name: user overrides bundled; project overrides both (when `agentScope` includes project). The bundled agents always load regardless of `agentScope`, so the extension is self-contained.
+In bot-created RPC sessions, discovered project agents still cannot run because
+their required confirmation is cancelled.
 
 ## Sample Agents
 

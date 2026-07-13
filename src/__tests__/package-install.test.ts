@@ -188,6 +188,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/config.js",
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
+    "dist/pi-runtime.js",
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
@@ -324,11 +325,12 @@ describe("package artifact install", () => {
       );
       assert.equal(samplerDryRun.status, 0, samplerDryRun.stderr || samplerDryRun.stdout || String(samplerDryRun.error));
       const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { command: string; args: string[] };
+      assert.equal(samplerDryRunJson.command, process.execPath);
       assert.match(
-        samplerDryRunJson.command,
-        /(node_modules[\/\\]\.bin[\/\\]pi(?:\.cmd)?|node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js)$/,
+        samplerDryRunJson.args[0],
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
       );
-      assert.equal(samplerDryRunJson.args[0], "--approve");
+      assert.equal(samplerDryRunJson.args[1], "--approve");
 
       const configValidate = runInstalledBin(projectDir, ["config", "validate", "--workspace", workspace], workspace);
       assert.equal(configValidate.status, 0, configValidate.stderr);
@@ -725,6 +727,16 @@ assert.deepEqual(
 );
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
+const piInvocation = await importPackageFile("dist/pi-extensions/pi-invocation.js");
+const installedChildInvocation = piInvocation.resolvePiInvocation(["--mode", "json"]);
+assert.equal(installedChildInvocation.command, process.execPath);
+assert.match(
+  installedChildInvocation.args[0],
+  /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+);
+assert.deepEqual(installedChildInvocation.args.slice(1), ["--mode", "json"]);
+assert.match(readFileSync(join(artifactDir, "subagent", "index.js"), "utf8"), /resolvePiInvocation\(args\)/);
+assert.match(readFileSync(join(artifactDir, "ask-agent", "index.js"), "utf8"), /resolveInvocation:\s*resolvePiInvocation/);
 const askAgentSmokeRoot = join(projectDir, "ask-agent-smoke");
 const askAgentCallerWorkspace = join(askAgentSmokeRoot, "agent-b-workspace");
 const askAgentTargetWorkspace = join(askAgentSmokeRoot, "agent-c-workspace");
@@ -775,6 +787,7 @@ const askAgentSmoke = askAgentArgs.executeAskAgent(
           askAgentSpawnCalls.push({ command, args, options });
           return askAgentSmokeChild;
         },
+        command: "pi",
         extensionArgs: askAgentChildExtensionArgs,
         env: askAgentChildEnv,
         timeoutMs: 1000,
@@ -854,6 +867,7 @@ writeFileSync(
 const askAgentWrapperArgvPath = join(askAgentSmokeRoot, "wrapper-argv.bin");
 const askAgentWrapperCwdPath = join(askAgentSmokeRoot, "wrapper-cwd.txt");
 const askAgentWrapperCallerEnvPath = join(askAgentSmokeRoot, "wrapper-caller-env.txt");
+const globalPiMarkerPath = join(askAgentSmokeRoot, "global-pi-ran.txt");
 const askAgentWrapperJsonl = JSON.stringify({
   type: "message_end",
   message: {
@@ -869,15 +883,26 @@ writeFileSync(
   join(fakeBinDir, "pi"),
   [
     "#!/bin/sh",
-    "pwd > " + JSON.stringify(askAgentWrapperCwdPath),
-    "printf '%s\\0' \"$@\" > " + JSON.stringify(askAgentWrapperArgvPath),
-    "printf '%s\\n' \"\${MINIME_BOT_PI_SESSION_AGENT_ID-__unset__}\" > " + JSON.stringify(askAgentWrapperCallerEnvPath),
-    "printf '%s\\n' " + JSON.stringify(askAgentWrapperJsonl),
+    "printf '%s\\n' 'global pi ran' > " + JSON.stringify(globalPiMarkerPath),
+    "exit 97",
     "",
   ].join("\n"),
   "utf8",
 );
 chmodSync(join(fakeBinDir, "pi"), 0o755);
+const installedPiCliPath = installedChildInvocation.args[0];
+writeFileSync(
+  installedPiCliPath,
+  [
+    'import { writeFileSync } from "node:fs";',
+    "writeFileSync(" + JSON.stringify(askAgentWrapperCwdPath) + ", process.cwd() + '\\n');",
+    "writeFileSync(" + JSON.stringify(askAgentWrapperArgvPath) + ", process.argv.slice(2).join('\\0') + '\\0');",
+    "writeFileSync(" + JSON.stringify(askAgentWrapperCallerEnvPath) + ", (process.env.MINIME_BOT_PI_SESSION_AGENT_ID ?? '__unset__') + '\\n');",
+    "console.log(" + JSON.stringify(askAgentWrapperJsonl) + ");",
+    "",
+  ].join("\n"),
+  "utf8",
+);
 
 const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
 const oldAskAgentCaller = process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
@@ -902,6 +927,7 @@ try {
     truncated: false,
     needsClarification: false,
   });
+  assert.equal(existsSync(globalPiMarkerPath), false);
   assert.equal(readFileSync(askAgentWrapperCwdPath, "utf8").trim(), askAgentTargetWorkspace);
   assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
   const askAgentWrapperArgv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);

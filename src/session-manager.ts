@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiRecord, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -122,20 +122,6 @@ export function hasExited(child: ChildProcess): boolean {
 function piStartupStderr(child: ChildProcess): string {
   const reader = (child as unknown as PiStartupDiagnostics).piStartupStderr;
   return typeof reader === "function" ? reader() : "";
-}
-
-/**
- * Parse one raw JSONL record from a Pi child's stdout via the protocol module's
- * shared `parsePiRecord` (single source of truth for the JSONL framing/guard
- * rules) and, if it is a SystemInit (get_state) record, return its non-empty
- * session_id; otherwise null.
- */
-function parsePiSystemInitId(record: string): string | null {
-  const line = parsePiRecord(record);
-  if (line && line.type === "system" && typeof line.session_id === "string" && line.session_id.length > 0) {
-    return line.session_id;
-  }
-  return null;
 }
 
 export interface ActiveSession {
@@ -342,12 +328,18 @@ export class SessionManager {
       sendPiGetState(child);
       for await (const [chunk] of on(stdout, "data", { signal: controller.signal, close: ["close"] })) {
         for (const record of splitter.push(chunk as Buffer)) {
-          const id = parsePiSystemInitId(record);
+          // This routes extension UI records before parsing get_state. A
+          // blocking startup request throws because Pi 0.80.6 cannot consume
+          // its correlated cancellation until session_start has completed.
+          const id = parsePiStartupRecord(child, record);
           if (id) return id;
         }
       }
       return null;
     } catch (err) {
+      if (err instanceof PiStartupBlockingUiError) {
+        throw err;
+      }
       // Aborted (timeout or child exit) is an expected best-effort end: the
       // session stays usable on its local id. Otherwise sendPiGetState may have
       // thrown on a closed stdin (a spawn-then-exit race) — swallow it too, but
@@ -882,7 +874,11 @@ export class SessionManager {
         // from the child's real lifecycle, and a bare prompt sent into that
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
-        sendPiPrompt(session.child, appendOutboxInstruction(text, session.outboxPath), "followUp");
+        const promptId = sendPiPrompt(
+          session.child,
+          appendOutboxInstruction(text, session.outboxPath),
+          "followUp",
+        );
         session.lastActivity = Date.now();
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);
@@ -890,7 +886,8 @@ export class SessionManager {
         // Update store with new activity time
         this.store.setSession(chatId, this.toSessionState(chatId, session));
 
-        // Read response lines until we get a result.
+        // Read response lines through agent_settled, when readPiStream emits the
+        // accepted prompt's single terminal result.
         // Activity timeout: if no events arrive for RESPONSE_ACTIVITY_TIMEOUT_MS,
         // kill the subprocess to unstick the queue (handles hung processes).
         let gotResult = false;
@@ -922,9 +919,8 @@ export class SessionManager {
         // histogram. processingStartedAt is reset to null after the loop, so
         // capture it now while it is still set.
         const turnStartedAt = session.processingStartedAt ?? Date.now();
-        const stream = readPiStream(session.child);
+        const stream = readPiStream(session.child, resetActivityTimer, promptId);
         for await (const line of stream) {
-          resetActivityTimer();
           push(line);
           // Pi auto-retry telemetry: increment once per retry on auto_retry_start
           // (auto_retry_end signals recovery — counting it too would double-count).
@@ -938,10 +934,12 @@ export class SessionManager {
           }
           if (line.type === "result") {
             gotResult = true;
-            session.lastSuccessAt = Date.now();
             session.lastActivity = Date.now();
-            // Reset crash backoff on successful response
-            this.restartCounts.set(chatId, 0);
+            if (line.is_error !== true) {
+              session.lastSuccessAt = Date.now();
+              // Reset crash backoff only after a successful response.
+              this.restartCounts.set(chatId, 0);
+            }
             recordResultMetrics(session.agentId, line);
             recordPiTurnDuration(session.agentId, (Date.now() - turnStartedAt) / 1000);
             break;
@@ -950,7 +948,7 @@ export class SessionManager {
         clearActivityTimers();
         session.processingStartedAt = null;
         if (!gotResult) {
-          finish(new Error("Pi subprocess exited before sending a result"));
+          finish(new Error("Pi stream ended without an agent_settled result"));
           return;
         }
         finish();

@@ -161,12 +161,17 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(config.agents.reviewer.workspaceCwd, reviewerWorkspace);
       assert.deepEqual(secretReads, [controlSecretsFile]);
 
-      spawnPiRpcSession(config.agents.main);
+      spawnPiRpcSession(config.agents.main, undefined, undefined, { askCallerAgentId: "main" });
       spawnPiRpcSession(config.agents.reviewer);
 
       assert.equal(spawnCaptures.length, 2);
-      assert.equal(spawnCaptures[0].command, "pi");
+      assert.equal(spawnCaptures[0].command, process.execPath);
+      assert.match(
+        spawnCaptures[0].args[0],
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]rpc-entry\.js$/,
+      );
       assert.equal(spawnCaptures[0].options.cwd, mainWorkspace);
+      assert.equal(spawnCaptures[1].command, process.execPath);
       assert.equal(spawnCaptures[1].options.cwd, reviewerWorkspace);
       for (const capture of spawnCaptures) {
         const env = capture.options.env as NodeJS.ProcessEnv;
@@ -181,6 +186,10 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(
         (spawnCaptures[0].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_ROOT_ENV],
         mainWorkspace,
+      );
+      assert.equal(
+        (spawnCaptures[0].options.env as NodeJS.ProcessEnv).MINIME_BOT_PI_SESSION_AGENT_ID,
+        "main",
       );
       assert.equal(
         (spawnCaptures[1].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_ROOT_ENV],
