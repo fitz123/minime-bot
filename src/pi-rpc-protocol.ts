@@ -375,6 +375,8 @@ export function piExtensionRelpathForDir(baseDir: string, relpath: string): stri
 export interface PiPromptCommand {
   type: "prompt";
   message: string;
+  /** Correlates prompt acceptance/rejection with the active bot request. */
+  id?: string;
   /**
    * Pi's mid-turn concurrency control. When the agent is STREAMING (a turn is
    * live), a `prompt` with no `streamingBehavior` is REJECTED with the "already
@@ -405,6 +407,8 @@ export interface PiSteerCommand {
  */
 export interface PiGetStateCommand {
   type: "get_state";
+  /** Optional correlation id for in-turn state probes. */
+  id?: string;
 }
 
 export interface PiExtensionUiResponseCommand {
@@ -704,8 +708,12 @@ export function spawnPiRpcSession(
 export function buildPiPromptCommand(
   text: string,
   streamingBehavior?: "steer" | "followUp",
+  id?: string,
 ): PiPromptCommand {
   const command: PiPromptCommand = { type: "prompt", message: text };
+  if (id) {
+    command.id = id;
+  }
   // Only attach the field when requested so a bare prompt (no behavior) stays
   // byte-identical to its historical shape — callers that pass nothing get the
   // exact `{ type, message }` object Pi accepted before Defect B's fix.
@@ -719,8 +727,8 @@ export function buildPiSteerCommand(text: string): PiSteerCommand {
   return { type: "steer", message: text };
 }
 
-export function buildGetStateCommand(): PiGetStateCommand {
-  return { type: "get_state" };
+export function buildGetStateCommand(id?: string): PiGetStateCommand {
+  return id ? { type: "get_state", id } : { type: "get_state" };
 }
 
 const PI_BLOCKING_EXTENSION_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
@@ -766,8 +774,10 @@ export function sendPiPrompt(
   child: ChildProcess,
   text: string,
   streamingBehavior?: "steer" | "followUp",
-): void {
-  writePiCommand(child, buildPiPromptCommand(text, streamingBehavior));
+): string {
+  const id = `minime-prompt-${++piPromptCommandSequence}`;
+  writePiCommand(child, buildPiPromptCommand(text, streamingBehavior, id));
+  return id;
 }
 
 export function sendPiSteer(child: ChildProcess, text: string): void {
@@ -779,9 +789,11 @@ export function sendPiSteer(child: ChildProcess, text: string): void {
  * session id, which `parsePiEvent` surfaces as a `SystemInit` — the bot's only
  * hook for capturing + persisting that id for resume.
  */
-export function sendPiGetState(child: ChildProcess): void {
-  writePiCommand(child, buildGetStateCommand());
+export function sendPiGetState(child: ChildProcess, id?: string): void {
+  writePiCommand(child, buildGetStateCommand(id));
 }
+
+let piPromptCommandSequence = 0;
 
 function writePiCommand(child: ChildProcess, command: PiRpcCommand): void {
   if (!child.stdin || child.stdin.destroyed || child.exitCode !== null || child.killed) {
@@ -877,6 +889,12 @@ export interface PiRpcParseState {
   completedRunResetEmitted?: boolean;
   pendingOverflowErrorMessage?: string;
   pendingOverflowSessionId?: string;
+  /** Prompt response id owned by this stream reader. */
+  expectedPromptId?: string;
+  /** Correlated get_state request used to detect a prompt handled without a run. */
+  promptStateProbeId?: string;
+  /** Guards an idle state probe from racing a real agent lifecycle. */
+  agentLifecycleObserved?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
@@ -1162,6 +1180,9 @@ export function parsePiEvent(
       return null;
 
     case "agent_start":
+      if (state) {
+        state.agentLifecycleObserved = true;
+      }
       if (state?.completedRunHasStreamOutput) {
         return markCompletedRunReset(state, "pi_queued_continuation");
       }
@@ -1175,6 +1196,7 @@ export function parsePiEvent(
         // can be consumed by a later agent_settled record.
         return null;
       }
+      state.agentLifecycleObserved = true;
       const sessionId = rawEvent.sessionId ?? state.observedSessionId;
       if (isFinalAssistantError && isContextOverflowError(finalAssistant.errorMessage)) {
         const overflowMessage =
@@ -1221,6 +1243,9 @@ export function parsePiEvent(
     }
 
     case "agent_settled":
+      if (state) {
+        state.agentLifecycleObserved = true;
+      }
       return consumeSettledOutcome(state);
 
     case "compaction_start":
@@ -1273,6 +1298,13 @@ export function parsePiEvent(
       //    the failure is visible without ending the turn.
       // A successful `get_state`/`get_session_stats` reply carries the Pi-minted
       // session id (no event exposes it) and is captured below.
+      if (
+        rawEvent.command === "prompt" &&
+        state?.expectedPromptId &&
+        rawEvent.id !== state.expectedPromptId
+      ) {
+        return null;
+      }
       if (rawEvent.success === false) {
         if (rawEvent.command === "prompt") {
           if (isPiAlreadyProcessingRejection(rawEvent.error)) {
@@ -1435,7 +1467,71 @@ function handlePiStreamRecord(
   if (handlePiExtensionUiRequest(child, event)) {
     return null;
   }
+  const promptCompletionProbe = handlePiPromptCompletionProbe(child, event, state);
+  if (promptCompletionProbe.handled) {
+    return promptCompletionProbe.line;
+  }
   return parsePiEvent(event, state);
+}
+
+interface PiPromptCompletionProbeResult {
+  handled: boolean;
+  line: StreamLine | null;
+}
+
+/**
+ * Pi 0.80.6 accepts extension commands and `input` handlers that finish without
+ * starting an agent run. Those paths emit a successful prompt response but no
+ * agent lifecycle events. Probe the correlated session state after acceptance:
+ * an active/queued model turn remains authoritative through agent_settled,
+ * while an idle prompt completes successfully with no fabricated reply text.
+ */
+function handlePiPromptCompletionProbe(
+  child: ChildProcess,
+  event: PiRpcEvent,
+  state: PiRpcParseState,
+): PiPromptCompletionProbeResult {
+  if (
+    event.type === "response" &&
+    event.command === "prompt" &&
+    event.success === true &&
+    state.expectedPromptId &&
+    event.id === state.expectedPromptId
+  ) {
+    if (!state.promptStateProbeId) {
+      state.promptStateProbeId = `${state.expectedPromptId}-state`;
+      sendPiGetState(child, state.promptStateProbeId);
+    }
+    return { handled: true, line: null };
+  }
+
+  if (
+    event.type !== "response" ||
+    event.command !== "get_state" ||
+    !state.promptStateProbeId ||
+    event.id !== state.promptStateProbeId
+  ) {
+    return { handled: false, line: null };
+  }
+
+  const sessionId = nonEmptyText(event.data?.sessionId);
+  if (sessionId) {
+    state.observedSessionId = sessionId;
+  }
+  if (
+    event.success === true &&
+    event.data?.isStreaming === false &&
+    !state.agentLifecycleObserved
+  ) {
+    return {
+      handled: true,
+      line: emitPiRpcResult(
+        { type: "result", result: "", session_id: sessionId ?? state.observedSessionId ?? "" },
+        state,
+      ),
+    };
+  }
+  return { handled: true, line: null };
 }
 
 /**
@@ -1452,6 +1548,7 @@ function handlePiStreamRecord(
 export async function* readPiStream(
   child: ChildProcess,
   onActivity?: () => void,
+  expectedPromptId?: string,
 ): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
   if (!stdout) {
@@ -1459,7 +1556,7 @@ export async function* readPiStream(
   }
 
   const splitter = new NewlineOnlyJsonlSplitter();
-  const parseState: PiRpcParseState = {};
+  const parseState: PiRpcParseState = { expectedPromptId };
 
   for (;;) {
     let chunk: Buffer | string | null;

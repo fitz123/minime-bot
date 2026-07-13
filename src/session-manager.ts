@@ -882,7 +882,11 @@ export class SessionManager {
         // from the child's real lifecycle, and a bare prompt sent into that
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
-        sendPiPrompt(session.child, appendOutboxInstruction(text, session.outboxPath), "followUp");
+        const promptId = sendPiPrompt(
+          session.child,
+          appendOutboxInstruction(text, session.outboxPath),
+          "followUp",
+        );
         session.lastActivity = Date.now();
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);
@@ -923,7 +927,7 @@ export class SessionManager {
         // histogram. processingStartedAt is reset to null after the loop, so
         // capture it now while it is still set.
         const turnStartedAt = session.processingStartedAt ?? Date.now();
-        const stream = readPiStream(session.child, resetActivityTimer);
+        const stream = readPiStream(session.child, resetActivityTimer, promptId);
         for await (const line of stream) {
           push(line);
           // Pi auto-retry telemetry: increment once per retry on auto_retry_start

@@ -2056,6 +2056,7 @@ describe("SessionManager Pi dispatch", () => {
     assert.ok(stdinWrites.length >= 1, "should have written to stdin");
     const sent = JSON.parse(stdinWrites[0]);
     assert.strictEqual(sent.type, "prompt", "pi path must write a Pi prompt command");
+    assert.match(sent.id, /^minime-prompt-\d+$/, "pi prompt must carry a correlation id");
     assert.ok(sent.message.startsWith("hello pi\n\n"), "user prompt should be preserved at the start");
     assert.ok(
       sent.message.includes("To share a file with the user, write or copy it to this outbox directory:"),
@@ -2083,6 +2084,64 @@ describe("SessionManager Pi dispatch", () => {
 
     await manager.closeAll();
   });
+
+  for (const handledBy of ["extension command", "input handler"]) {
+    it(`finishes a prompt handled by an ${handledBy} without an agent lifecycle`, async () => {
+      const { SessionManager } = await import("../session-manager.js");
+      const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+      const chatId = `pi-handled-${handledBy.replaceAll(" ", "-")}`;
+      const { child, stdout, stdinWrites } = makeCapturingChild();
+      injectSession(manager, chatId, "pi", child);
+
+      const collect = (async () => {
+        const lines: StreamLine[] = [];
+        for await (const line of manager.sendSessionMessage(chatId, "pi", "handled request")) {
+          lines.push(line);
+        }
+        return lines;
+      })();
+
+      try {
+        while (stdinWrites.length < 1) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        const prompt = JSON.parse(stdinWrites[0]) as { id: string; type: string };
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "prompt",
+          success: true,
+          id: prompt.id,
+        })}\n`);
+
+        while (stdinWrites.length < 2) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        const stateProbe = JSON.parse(stdinWrites[1]) as { id: string; type: string };
+        assert.deepStrictEqual(stateProbe, { type: "get_state", id: `${prompt.id}-state` });
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "get_state",
+          success: true,
+          id: stateProbe.id,
+          data: { sessionId: "handled-session", isStreaming: false },
+        })}\n`);
+
+        const lines = await Promise.race([
+          collect,
+          new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
+          }),
+        ]);
+        assert.strictEqual(lines.length, 1);
+        assert.strictEqual(lines[0].type, "result");
+        assert.strictEqual((lines[0] as { result: string }).result, "");
+        assert.notStrictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+        assert.strictEqual(manager.getSessionHealth(chatId)?.processingMs, null);
+      } finally {
+        await manager.closeAll();
+      }
+    });
+  }
 
   it("keeps busy state, metrics, and the per-session queue active until agent_settled", async () => {
     const { SessionManager } = await import("../session-manager.js");

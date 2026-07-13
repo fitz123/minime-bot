@@ -1577,6 +1577,7 @@ describe("Pi RPC prompt and steer commands", () => {
 
   it("builds a no-argument get_state command object", () => {
     assert.deepStrictEqual(buildGetStateCommand(), { type: "get_state" });
+    assert.deepStrictEqual(buildGetStateCommand("probe-1"), { type: "get_state", id: "probe-1" });
   });
 
   it("builds exact correlated cancellations for every blocking extension UI method", () => {
@@ -1638,11 +1639,12 @@ describe("Pi RPC prompt and steer commands", () => {
     });
     const child = createMockChild({ stdin });
 
-    sendPiPrompt(child, "hello");
+    const promptId = sendPiPrompt(child, "hello");
 
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "prompt",
       message: "hello",
+      id: promptId,
     });
   });
 
@@ -1656,11 +1658,12 @@ describe("Pi RPC prompt and steer commands", () => {
     });
     const child = createMockChild({ stdin });
 
-    sendPiPrompt(child, "hello", "followUp");
+    const promptId = sendPiPrompt(child, "hello", "followUp");
 
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "prompt",
       message: "hello",
+      id: promptId,
       streamingBehavior: "followUp",
     });
   });
@@ -2182,6 +2185,138 @@ describe("readPiStream", () => {
     );
     assert.strictEqual(extractPiTextDelta(lines[1]), "hi");
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
+  });
+
+  for (const handledBy of ["extension command", "input handler"]) {
+    it(`completes a prompt handled immediately by an ${handledBy} without waiting for agent_settled`, async () => {
+      const stdout = new Readable({ read() {} });
+      const writes: Array<Record<string, unknown>> = [];
+      const stdin = new Writable({
+        write(chunk, _enc, callback) {
+          const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+          writes.push(command);
+          callback();
+          queueMicrotask(() => {
+            stdout.push(`${JSON.stringify({
+              type: "response",
+              command: "get_state",
+              success: true,
+              id: command.id,
+              data: { sessionId: "handled-session", isStreaming: false },
+            })}\n`);
+          });
+        },
+      });
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+      const promptId = `prompt-handled-by-${handledBy.replaceAll(" ", "-")}`;
+
+      try {
+        const collect = (async () => {
+          const lines: StreamLine[] = [];
+          for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
+          return lines;
+        })();
+        stdout.push(`${JSON.stringify({
+          type: "response",
+          command: "prompt",
+          success: true,
+          id: promptId,
+        })}\n`);
+
+        const lines = await Promise.race([
+          collect,
+          new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
+          }),
+        ]);
+
+        assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
+        assert.strictEqual(lines.length, 1);
+        assert.strictEqual(lines[0].type, "result");
+        assert.strictEqual((lines[0] as { result: string }).result, "");
+        assert.strictEqual((lines[0] as { session_id: string }).session_id, "handled-session");
+        assert.notStrictEqual((lines[0] as { is_error?: boolean }).is_error, true);
+      } finally {
+        stdout.destroy();
+        stdin.destroy();
+      }
+    });
+  }
+
+  it("keeps a real agent run open when the correlated prompt state probe reports streaming", async () => {
+    const stdout = new Readable({ read() {} });
+    const writes: Array<Record<string, unknown>> = [];
+    const stdin = new Writable({
+      write(chunk, _enc, callback) {
+        const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+        writes.push(command);
+        callback();
+        queueMicrotask(() => {
+          stdout.push(`${JSON.stringify({
+            type: "response",
+            command: "get_state",
+            success: true,
+            id: command.id,
+            data: { sessionId: "running-session", isStreaming: true },
+          })}\n`);
+          stdout.push(`${JSON.stringify({ type: "agent_start" })}\n`);
+          stdout.push(`${JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "model answer" }] }],
+          })}\n`);
+          stdout.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+        });
+      },
+    });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
+    const promptId = "prompt-with-agent-run";
+
+    try {
+      const collect = (async () => {
+        const lines: StreamLine[] = [];
+        for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
+        return lines;
+      })();
+      stdout.push(`${JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: true,
+        id: promptId,
+      })}\n`);
+      const lines = await collect;
+
+      assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
+      assert.strictEqual(lines.length, 1, "the internal state probe is not user-facing");
+      assert.strictEqual(lines[0].type, "result");
+      assert.strictEqual((lines[0] as { result: string }).result, "model answer");
+    } finally {
+      stdout.destroy();
+      stdin.destroy();
+    }
+  });
+
+  it("ignores a stale successful prompt response from an earlier stream reader", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "prompt",
+        success: true,
+        id: "previous-prompt",
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "current answer" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child, undefined, "current-prompt")) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.strictEqual((lines[0] as { result: string }).result, "current answer");
   });
 
   it("cancels all blocking extension UI methods through captured child stdin and still settles once", async () => {
