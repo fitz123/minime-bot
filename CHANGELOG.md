@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.7.6
+
+- Resolve every package-owned Pi process through the shipped 0.80.6 CLI and exact-pin all Pi runtime packages, removing dependence on a global `pi` executable.
+- Finalize accepted Pi RPC turns on `agent_settled` so retry, compaction, and continuation remain inside one terminal lifecycle while preserving errors, metrics, steering, and delivery authority.
+- Fail closed with correlated cancellation for unsupported blocking extension UI dialogs, including startup-time requests, so sessions cannot wedge before registration.
+- Exact-pin grammY 1.44.0 without enabling Rich Messages or changing the existing draft scheduler.
+
 ## 2026.7.5
 
 - Track real Telegram `getUpdates` progress so healthy quiet polling remains stable while stalled polling or API failure still triggers one bounded launchd recovery.
