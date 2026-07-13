@@ -64,13 +64,13 @@ npm ls --depth=0 @earendil-works/pi-agent-core @earendil-works/pi-ai @earendil-w
 
 ### Task 4: Exact-pin grammY 1.44.0 and run compatibility gates
 
-- [ ] Change only the grammY dependency contract to exact `1.44.0`; refresh the lockfile and verify clean install/runtime resolution. Keep `@grammyjs/auto-retry` unchanged unless npm lock resolution requires metadata-only movement.
-- [ ] Compile against Bot API 10.1 types without adding Rich Message calls, `@grammyjs/stream`, new commands, or Telegram interaction features.
-- [ ] Preserve `sendMessageDraft` outside autoRetry, the bounded/coalescing DraftScheduler, HTML-to-plain fallback, authoritative final delivery, topics, polling, media, and retry behavior. Add/adjust regression assertions only where 1.44.0 types require it.
-- [ ] Run Telegram adapter/bot, stream relay, polling, media, package-import, package-install, and full test suites.
-- [ ] Run `npm test`, `npm run build`, `npm pack --dry-run`, `git diff --check`, and verify `git diff --stat main...HEAD` contains only issue #53 implementation/tests/plan/dependency lock changes.
-- [ ] Confirm no `/cancel`, Telegram dialog buttons, input/editor bridge, Rich Messages, stream plugin, thinking:max, session-tree UI, watchdog, SDK embedding, or unrelated refactor entered the diff.
-- [ ] Commit this slice as `Pin grammY 1.44.0 compatibility contract (#53)`.
+- [x] Change only the grammY dependency contract to exact `1.44.0`; refresh the lockfile and verify clean install/runtime resolution. Keep `@grammyjs/auto-retry` unchanged unless npm lock resolution requires metadata-only movement.
+- [x] Compile against Bot API 10.1 types without adding Rich Message calls, `@grammyjs/stream`, new commands, or Telegram interaction features.
+- [x] Preserve `sendMessageDraft` outside autoRetry, the bounded/coalescing DraftScheduler, HTML-to-plain fallback, authoritative final delivery, topics, polling, media, and retry behavior. Add/adjust regression assertions only where 1.44.0 types require it.
+- [x] Run Telegram adapter/bot, stream relay, polling, media, package-import, package-install, and full test suites.
+- [x] Run `npm test`, `npm run build`, `npm pack --dry-run`, `git diff --check`, and verify `git diff --stat main...HEAD` contains only issue #53 implementation/tests/plan/dependency lock changes.
+- [x] Confirm no `/cancel`, Telegram dialog buttons, input/editor bridge, Rich Messages, stream plugin, thinking:max, session-tree UI, watchdog, SDK embedding, or unrelated refactor entered the diff.
+- [x] Commit this slice as `Pin grammY 1.44.0 compatibility contract (#53)`.
 
 ## Final acceptance
 
