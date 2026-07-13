@@ -6,14 +6,15 @@ import {
 
 export type { PiInvocation } from "../pi-runtime.js";
 
-export interface PiInvocationOptions extends PiRuntimeResolveOptions {
+export interface PiInvocationOptions extends Omit<PiRuntimeResolveOptions, "currentEntrypoint"> {
   entrypoint?: string;
 }
 
 export function resolvePiInvocation(args: string[], options: PiInvocationOptions = {}): PiInvocation {
+  const { entrypoint, ...resolveOptions } = options;
   const { command, args: invocationArgs } = resolvePackageOwnedPiInvocation("cli", args, {
-    ...options,
-    currentEntrypoint: options.entrypoint ?? options.currentEntrypoint,
+    ...resolveOptions,
+    currentEntrypoint: entrypoint,
   });
   return { command, args: invocationArgs };
 }

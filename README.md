@@ -84,9 +84,16 @@ The package also exposes a quota sampler for Prometheus textfile collectors:
 minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/to/textfiles
 ```
 
-The sampler uses the packaged Pi CLI by default; override it with `--pi-bin` or
-`CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for Pi 0.79 project trust,
-and `--dry-run` prints the resolved command without executing it.
+Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
+the package-owned Pi 0.80.6 entrypoints and execute them with Node. They never
+fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
+explicitly. Startup logs report only the expected version, entrypoint kind, and
+mismatch state, without exposing the resolved host path.
+
+The sampler uses the same packaged Pi CLI by default; override it explicitly
+with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
+isolated sampler project settings, and `--dry-run` prints the resolved command
+without executing it.
 
 ## Control Workspace
 
@@ -141,6 +148,11 @@ scope. Subagent and ask-agent child spawns load the non-recursive first-party
 wrappers, including the Codex transport overflow normalizer; ask-agent target
 children also load approved `piExtraExtensions`, but reject configured extras
 that point back at the first-party `subagent` or `ask-agent` wrappers.
+
+Bot-created RPC sessions do not provide an interactive extension UI bridge.
+Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
+cancelled; fire-and-forget UI updates are ignored. External extensions must
+handle cancellation or provide a noninteractive path.
 
 Agents opt into first-party `ask_agent` handoffs with an `askAgent` block. Both
 the caller and target must have `enabled: true`; an omitted `canAsk` on an

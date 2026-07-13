@@ -923,9 +923,8 @@ export class SessionManager {
         // histogram. processingStartedAt is reset to null after the loop, so
         // capture it now while it is still set.
         const turnStartedAt = session.processingStartedAt ?? Date.now();
-        const stream = readPiStream(session.child);
+        const stream = readPiStream(session.child, resetActivityTimer);
         for await (const line of stream) {
-          resetActivityTimer();
           push(line);
           // Pi auto-retry telemetry: increment once per retry on auto_retry_start
           // (auto_retry_end signals recovery — counting it too would double-count).
@@ -939,10 +938,12 @@ export class SessionManager {
           }
           if (line.type === "result") {
             gotResult = true;
-            session.lastSuccessAt = Date.now();
             session.lastActivity = Date.now();
-            // Reset crash backoff on successful response
-            this.restartCounts.set(chatId, 0);
+            if (line.is_error !== true) {
+              session.lastSuccessAt = Date.now();
+              // Reset crash backoff only after a successful response.
+              this.restartCounts.set(chatId, 0);
+            }
             recordResultMetrics(session.agentId, line);
             recordPiTurnDuration(session.agentId, (Date.now() - turnStartedAt) / 1000);
             break;

@@ -113,4 +113,23 @@ describe("package-owned Pi invocation", () => {
       assert.equal(packageLock.packages[`node_modules/${name}`].version, EXPECTED_PI_PACKAGE_VERSION);
     }
   });
+
+  it("keeps grammY exact at 1.44.0 without changing the auto-retry contract", () => {
+    const packageJson = JSON.parse(readFileSync(resolve(TEST_ROOT, "package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    const packageLock = JSON.parse(readFileSync(resolve(TEST_ROOT, "package-lock.json"), "utf8")) as {
+      packages: Record<string, { version?: string; dependencies?: Record<string, string> }>;
+    };
+    const installedGrammy = JSON.parse(
+      readFileSync(resolve(TEST_ROOT, "node_modules", "grammy", "package.json"), "utf8"),
+    ) as { version?: string };
+
+    assert.equal(packageJson.dependencies.grammy, "1.44.0");
+    assert.equal(packageLock.packages[""].dependencies?.grammy, "1.44.0");
+    assert.equal(packageLock.packages["node_modules/grammy"].version, "1.44.0");
+    assert.equal(installedGrammy.version, "1.44.0");
+    assert.equal(packageJson.dependencies["@grammyjs/auto-retry"], "^2.0.2");
+    assert.equal(packageLock.packages[""].dependencies?.["@grammyjs/auto-retry"], "^2.0.2");
+  });
 });

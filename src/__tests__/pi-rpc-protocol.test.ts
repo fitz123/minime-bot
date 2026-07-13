@@ -2345,6 +2345,7 @@ describe("readPiStream", () => {
       }),
       JSON.stringify({ type: "auto_retry_start", errorMessage: "429 rate limit" }),
       JSON.stringify({ type: "auto_retry_end", success: true }),
+      JSON.stringify({ type: "agent_start" }),
       JSON.stringify({
         type: "message_update",
         assistantMessageEvent: { type: "text_delta", delta: "final retry answer" },
@@ -2372,11 +2373,21 @@ describe("readPiStream", () => {
 
   it("waits through queued continuations and settles on the last run once", async () => {
     const child = childWithStdout([
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "first run" },
+      }),
       JSON.stringify({
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "first run" }] }],
       }),
       JSON.stringify({ type: "queue_update", followUp: ["continue"] }),
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "continued final" },
+      }),
       JSON.stringify({
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "continued final" }] }],
@@ -2389,6 +2400,17 @@ describe("readPiStream", () => {
     const results = lines.filter((line) => line.type === "result");
     assert.strictEqual(results.length, 1);
     assert.strictEqual((results[0] as { result: string }).result, "continued final");
+    assert.deepStrictEqual(
+      lines.map(extractPiTextDelta).filter((text): text is string => text !== null),
+      ["first run", "continued final"],
+    );
+    const resets = lines.filter(
+      (line) => line.type === "assistant" && (line as { action?: unknown }).action === "reset_response_text",
+    );
+    assert.strictEqual(resets.length, 1);
+    assert.strictEqual((resets[0] as { reason?: unknown }).reason, "pi_queued_continuation");
+    assert.ok(lines.indexOf(resets[0]) > 0);
+    assert.ok(lines.indexOf(resets[0]) < lines.findIndex((line) => extractPiTextDelta(line) === "continued final"));
   });
 
   it("emits a protocol error when settlement has no usable agent_end outcome", async () => {
@@ -2402,7 +2424,7 @@ describe("readPiStream", () => {
     assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
   });
 
-  it("surfaces the retained outcome once when stdout ends before settlement", async () => {
+  it("reports an explicit error when stdout ends after agent_end but before settlement", async () => {
     const child = childWithStdout([
       JSON.stringify({
         type: "agent_end",
@@ -2414,7 +2436,11 @@ describe("readPiStream", () => {
 
     assert.strictEqual(lines.length, 1);
     assert.strictEqual(lines[0].type, "result");
-    assert.strictEqual((lines[0] as { result: string }).result, "completed before exit");
+    assert.strictEqual(
+      (lines[0] as { result: string }).result,
+      "Pi subprocess exited before agent_settled",
+    );
+    assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
   });
 
   it("treats a failed prompt response as a preflight rejection before acceptance", async () => {

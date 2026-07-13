@@ -829,6 +829,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       outboxPath: "/tmp/bot-outbox/test",
     };
     (manager as unknown as Record<string, unknown>).active = new Map([["dead-chat", session]]);
+    const restartCounts = (manager as unknown as { restartCounts: Map<string, number> }).restartCounts;
+    restartCounts.set("dead-chat", 2);
 
     const gen = manager.sendSessionMessage("dead-chat", "main", "hello");
 
@@ -848,6 +850,8 @@ describe("SessionManager sendSessionMessage streaming", () => {
       "Pi subprocess exited before agent_settled",
     );
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
+    assert.strictEqual(session.lastSuccessAt, null, "an EOF error must not be recorded as success");
+    assert.strictEqual(restartCounts.get("dead-chat"), 2, "an EOF error must not reset crash backoff");
 
     await manager.closeAll();
   });
@@ -2134,6 +2138,47 @@ describe("SessionManager Pi dispatch", () => {
     assert.strictEqual((await durationCount()) - durationBefore, 2);
 
     await manager.closeAll();
+  });
+
+  it("refreshes the activity watchdog for filtered lifecycle records before settlement", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-activity", "pi", child);
+    manager.getActive("pi-activity")!.idleTimeoutMs = 10_000_000;
+
+    const response = manager.sendSessionMessage("pi-activity", "pi", "keep working");
+    const resultPromise = response.next();
+    while (stdinWrites.length === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    try {
+      t.mock.timers.tick(1_799_999);
+      stdout.push(JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(2);
+      assert.strictEqual(child.killed, false, "filtered agent_end refreshes the watchdog");
+
+      t.mock.timers.tick(1_799_997);
+      stdout.push(JSON.stringify({ type: "compaction_start", reason: "threshold" }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(2);
+      assert.strictEqual(child.killed, false, "filtered compaction activity refreshes the watchdog");
+
+      stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
+      const result = await resultPromise;
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      assert.strictEqual((result.value as { result: string }).result, "done");
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("does not truncate the in-flight Pi turn when an 'already processing' rejection arrives mid-stream (Defects A+B wedge)", async () => {

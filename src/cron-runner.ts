@@ -33,7 +33,6 @@ import { assemblePiContext } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
-  type PiInvocation,
 } from "./pi-runtime.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
@@ -665,7 +664,6 @@ export interface PiRunDeps {
   buildEnv: (agentWorkspaceRoot?: string) => Record<string, string>;
   assembleContext: typeof assemblePiContext;
   resolveExtensionArgs?: () => string[];
-  resolveInvocation?: (args: string[]) => PiInvocation;
 }
 
 function buildPiCronAgentConfigForRun(cron: CronJob, workspaceCwd: string, agentData?: CronAgentData): AgentConfig {
@@ -740,14 +738,8 @@ function runPi(
 
   args.push("--append-system-prompt", systemInstruction);
   args.push(...(deps.resolveExtensionArgs?.() ?? resolvePiExtensionArgs({ relpaths: PI_CRON_WRAPPER_RELPATHS })));
-  let invocation: PiInvocation;
-  if (deps.resolveInvocation) {
-    invocation = deps.resolveInvocation(args);
-  } else {
-    const packageInvocation = resolvePackageOwnedPiInvocation("cli", args);
-    log(cron.name, `package-owned Pi runtime ${formatPiRuntimeDiagnostic(packageInvocation.diagnostic)}`);
-    invocation = packageInvocation;
-  }
+  const invocation = resolvePackageOwnedPiInvocation("cli", args);
+  log(cron.name, `package-owned Pi runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const result = deps.spawnSync(invocation.command, invocation.args, {
     cwd: validatedWorkspaceCwd,
     timeout: cron.timeout ?? DEFAULT_TIMEOUT_MS,

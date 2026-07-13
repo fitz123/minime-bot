@@ -17,7 +17,6 @@ import { assemblePiContext } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
-  type PiRuntimeDiagnostic,
 } from "./pi-runtime.js";
 import {
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
@@ -655,7 +654,6 @@ function copyExplicitControlPathEnv(
  */
 export interface PiStartupDiagnostics {
   piStartupStderr?: () => string;
-  piRuntimeDiagnostic?: PiRuntimeDiagnostic;
 }
 
 /** Cap on buffered startup stderr (the classifier only needs the startup tail). */
@@ -680,7 +678,6 @@ export function spawnPiRpcSession(
     cwd: workspaceCwd,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  (child as unknown as PiStartupDiagnostics).piRuntimeDiagnostic = invocation.diagnostic;
 
   // Buffer startup stderr so the spawn caller can classify a resume failure
   // (Pi prints `No session found matching <id>` and exits 1 when handed a stale
@@ -866,17 +863,20 @@ interface FinalAssistantInfo {
 }
 
 export interface PiRpcParseState {
-  /** Latest usable outcome from a low-level `agent_end`; replaced on every run. */
-  latestAgentEndOutcome?: ResultMessage;
-  /** Terminal execution/recovery failure waiting for `agent_settled`. */
-  pendingTerminalOutcome?: ResultMessage;
+  /** Latest usable run or terminal failure outcome waiting for `agent_settled`. */
+  pendingOutcome?: ResultMessage;
   /** Session metadata observed on this stream, used when events omit it. */
   observedSessionId?: string;
   /** Guards prompt rejection, settlement, and EOF fallbacks from duplicating results. */
   terminalResultEmitted?: boolean;
+  /** Whether the current low-level run emitted user-facing stream content. */
+  currentRunHasStreamOutput?: boolean;
+  /** Whether the completed run left stream content that a continuation must replace. */
+  completedRunHasStreamOutput?: boolean;
+  /** Prevents duplicate resets across retry, compaction, and continuation signals. */
+  completedRunResetEmitted?: boolean;
   pendingOverflowErrorMessage?: string;
   pendingOverflowSessionId?: string;
-  pendingOverflowResetEmitted?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
@@ -961,19 +961,18 @@ function buildPiRpcErrorResult(message: string, sessionId: string | undefined): 
   };
 }
 
-function buildPiRpcRetryResetEvent(): ControlRequest {
+function buildPiRpcRetryResetEvent(reason = "pi_context_overflow_retry"): ControlRequest {
   return {
     type: "assistant",
     subtype: "control_request",
     action: "reset_response_text",
-    reason: "pi_context_overflow_retry",
+    reason,
   };
 }
 
 function clearPendingOverflow(state: PiRpcParseState): void {
   state.pendingOverflowErrorMessage = undefined;
   state.pendingOverflowSessionId = undefined;
-  state.pendingOverflowResetEmitted = undefined;
 }
 
 function emitPiRpcResult(
@@ -987,8 +986,10 @@ function emitPiRpcResult(
     return null;
   }
   state.terminalResultEmitted = true;
-  state.latestAgentEndOutcome = undefined;
-  state.pendingTerminalOutcome = undefined;
+  state.pendingOutcome = undefined;
+  state.currentRunHasStreamOutput = undefined;
+  state.completedRunHasStreamOutput = undefined;
+  state.completedRunResetEmitted = undefined;
   clearPendingOverflow(state);
   return result;
 }
@@ -1020,15 +1021,17 @@ function retainAgentEndOutcome(
   state: PiRpcParseState,
   outcome: ResultMessage | undefined,
 ): void {
-  state.latestAgentEndOutcome = outcome;
-  state.pendingTerminalOutcome = undefined;
+  state.pendingOutcome = outcome;
+  state.completedRunHasStreamOutput = state.currentRunHasStreamOutput;
+  state.currentRunHasStreamOutput = undefined;
+  state.completedRunResetEmitted = undefined;
 }
 
 function consumeSettledOutcome(state?: PiRpcParseState): ResultMessage | null {
   if (!state) {
     return buildPiRpcErrorResult(PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE, undefined);
   }
-  const outcome = state.pendingTerminalOutcome ?? state.latestAgentEndOutcome;
+  const outcome = state.pendingOutcome;
   if (outcome && nonEmptyText(outcome.result)) {
     return emitPiRpcResult(outcome, state);
   }
@@ -1039,22 +1042,28 @@ function consumeSettledOutcome(state?: PiRpcParseState): ResultMessage | null {
 }
 
 function consumeEofOutcome(state: PiRpcParseState): ResultMessage | null {
-  const outcome = state.pendingTerminalOutcome ?? state.latestAgentEndOutcome;
-  if (outcome && nonEmptyText(outcome.result)) {
+  const outcome = state.pendingOutcome;
+  if (outcome?.is_error === true && nonEmptyText(outcome.result)) {
     return emitPiRpcResult(outcome, state);
   }
   return emitPiRpcResult(
-    buildPiRpcErrorResult(PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE, state.observedSessionId),
+    buildPiRpcErrorResult(
+      PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE,
+      nonEmptyText(outcome?.session_id) ?? state.observedSessionId,
+    ),
     state,
   );
 }
 
-function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
-  if (state.pendingOverflowResetEmitted) {
+function markCompletedRunReset(
+  state: PiRpcParseState,
+  reason = "pi_context_overflow_retry",
+): ControlRequest | null {
+  if (state.completedRunResetEmitted) {
     return null;
   }
-  state.pendingOverflowResetEmitted = true;
-  return buildPiRpcRetryResetEvent();
+  state.completedRunResetEmitted = true;
+  return buildPiRpcRetryResetEvent(reason);
 }
 
 /**
@@ -1069,6 +1078,8 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
  * - `agent_end` → retains the latest low-level run outcome without yielding a
  *   terminal result. Pi may still retry, compact, or drain queued continuations.
+ * - a later `agent_start` → resets response text left by the completed run before
+ *   a queued continuation begins, unless retry/compaction already reset it.
  * - `agent_settled` → consumes the latest retained outcome and yields the one
  *   terminal `ResultMessage` for the accepted prompt.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
@@ -1115,6 +1126,9 @@ export function parsePiEvent(
     case "message_update": {
       const inner = rawEvent.assistantMessageEvent;
       if (inner?.type === "text_delta" && typeof inner.delta === "string" && inner.delta.length > 0) {
+        if (state) {
+          state.currentRunHasStreamOutput = true;
+        }
         const event: StreamEvent = {
           type: "stream_event",
           event: {
@@ -1128,6 +1142,9 @@ export function parsePiEvent(
     }
 
     case "tool_execution_start": {
+      if (state) {
+        state.currentRunHasStreamOutput = true;
+      }
       const toolName = rawEvent.toolName ?? rawEvent.tool?.name ?? "tool";
       const event: StreamEvent = {
         type: "stream_event",
@@ -1142,6 +1159,12 @@ export function parsePiEvent(
     case "turn_end":
       // Per-turn boundary, NOT terminal. A multi-turn response fires turn_end
       // once per turn, and the accepted prompt remains active through settlement.
+      return null;
+
+    case "agent_start":
+      if (state?.completedRunHasStreamOutput) {
+        return markCompletedRunReset(state, "pi_queued_continuation");
+      }
       return null;
 
     case "agent_end": {
@@ -1162,7 +1185,7 @@ export function parsePiEvent(
           buildOverflowAwareErrorResult(state, { ...rawEvent, errorMessage: overflowMessage }),
         );
         if (rawEvent.willRetry === true) {
-          return markPendingOverflowRetry(state);
+          return markCompletedRunReset(state);
         }
         return null;
       }
@@ -1179,10 +1202,7 @@ export function parsePiEvent(
         clearPendingOverflow(state);
         retainAgentEndOutcome(state, outcome);
         if (rawEvent.willRetry === true) {
-          return {
-            ...buildPiRpcRetryResetEvent(),
-            reason: "pi_agent_retry",
-          };
+          return markCompletedRunReset(state, "pi_agent_retry");
         }
         return null;
       }
@@ -1205,7 +1225,7 @@ export function parsePiEvent(
 
     case "compaction_start":
       if (state?.pendingOverflowErrorMessage) {
-        return markPendingOverflowRetry(state);
+        return markCompletedRunReset(state);
       }
       return null;
 
@@ -1214,7 +1234,7 @@ export function parsePiEvent(
         return null;
       }
       if (rawEvent.willRetry === true) {
-        return markPendingOverflowRetry(state);
+        return markCompletedRunReset(state);
       }
       if (
         rawEvent.willRetry === false ||
@@ -1224,7 +1244,7 @@ export function parsePiEvent(
         nonEmptyText(rawEvent.error) ||
         nonEmptyText(rawEvent.message)
       ) {
-        state.pendingTerminalOutcome = buildOverflowAwareErrorResult(state, rawEvent);
+        state.pendingOutcome = buildOverflowAwareErrorResult(state, rawEvent);
         clearPendingOverflow(state);
       }
       return null;
@@ -1306,7 +1326,7 @@ export function parsePiEvent(
       const fallbackMessage =
         typeof rawEvent.message === "string" ? rawEvent.message : undefined;
       if (state) {
-        state.pendingTerminalOutcome = state.pendingOverflowErrorMessage
+        state.pendingOutcome = state.pendingOverflowErrorMessage
           ? buildOverflowAwareErrorResult(state, rawEvent)
           : buildPiRpcErrorResult(
               rawEvent.errorMessage ?? fallbackMessage ?? "Pi RPC error",
@@ -1405,9 +1425,14 @@ function handlePiStreamRecord(
   child: ChildProcess,
   record: string,
   state: PiRpcParseState,
+  onActivity?: () => void,
 ): StreamLine | null {
   const event = parsePiJsonlRecord(record);
-  if (!event || handlePiExtensionUiRequest(child, event)) {
+  if (!event) {
+    return null;
+  }
+  onActivity?.();
+  if (handlePiExtensionUiRequest(child, event)) {
     return null;
   }
   return parsePiEvent(event, state);
@@ -1419,10 +1444,15 @@ function handlePiStreamRecord(
  * remains active through low-level run boundaries and ends only on the settled
  * result, prompt preflight rejection, or an EOF/close fallback. Blocking
  * extension UI requests are cancelled through the child's shared JSONL stdin
- * writer before stream delivery. Malformed JSON records and untranslatable
- * events are skipped (never throw mid-stream).
+ * writer before stream delivery. `onActivity` runs for every valid JSON record,
+ * including lifecycle and UI records that do not become user-facing lines, so
+ * callers can maintain an accurate inactivity watchdog. Malformed JSON records
+ * and untranslatable events are skipped (never throw mid-stream).
  */
-export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamLine> {
+export async function* readPiStream(
+  child: ChildProcess,
+  onActivity?: () => void,
+): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
   if (!stdout) {
     throw new Error("Pi RPC child process stdout is not available");
@@ -1435,7 +1465,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
     let chunk: Buffer | string | null;
     while ((chunk = stdout.read()) !== null) {
       for (const record of splitter.push(chunk)) {
-        const line = handlePiStreamRecord(child, record, parseState);
+        const line = handlePiStreamRecord(child, record, parseState, onActivity);
         if (line) {
           yield line;
           if (line.type === "result") {
@@ -1452,7 +1482,7 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
   }
 
   for (const record of splitter.end()) {
-    const line = handlePiStreamRecord(child, record, parseState);
+    const line = handlePiStreamRecord(child, record, parseState, onActivity);
     if (line) {
       yield line;
       if (line.type === "result") {
