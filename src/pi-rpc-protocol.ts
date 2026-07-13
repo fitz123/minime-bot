@@ -1413,9 +1413,21 @@ function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   });
 }
 
-function handlePiExtensionUiRequest(child: ChildProcess, event: PiRpcEvent): boolean {
+export type PiExtensionUiRequestHandling = "not_ui" | "nonblocking" | "blocking";
+
+export class PiStartupBlockingUiError extends Error {
+  constructor() {
+    super("Pi requested unsupported blocking extension UI before RPC startup completed");
+    this.name = "PiStartupBlockingUiError";
+  }
+}
+
+function handlePiExtensionUiRequest(
+  child: ChildProcess,
+  event: PiRpcEvent,
+): PiExtensionUiRequestHandling {
   if (event.type !== "extension_ui_request") {
-    return false;
+    return "not_ui";
   }
 
   const cancellation = buildPiExtensionUiCancellationCommand(event);
@@ -1427,17 +1439,17 @@ function handlePiExtensionUiRequest(child: ChildProcess, event: PiRpcEvent): boo
       // closed. A failed side-channel cancellation must not truncate the turn.
       log.warn("pi-rpc", "Unable to cancel unsupported Pi extension UI request: child stdin unavailable");
     }
-    return true;
+    return "blocking";
   }
 
   if (!isNonEmptyString(event.id) || !isNonEmptyString(event.method)) {
     log.warn("pi-rpc", "Ignored malformed Pi extension UI request: missing non-empty id or method");
-    return true;
+    return "nonblocking";
   }
   if (!PI_FIRE_AND_FORGET_EXTENSION_UI_METHODS.has(event.method)) {
     log.warn("pi-rpc", "Ignored unknown Pi extension UI request method");
   }
-  return true;
+  return "nonblocking";
 }
 
 function parsePiJsonlRecord(record: string): PiRpcEvent | null {
@@ -1453,6 +1465,36 @@ function parsePiJsonlRecord(record: string): PiRpcEvent | null {
   }
 }
 
+/**
+ * Route an extension UI JSONL record through the shared cancellation writer.
+ * Startup capture uses the result to fail promptly on blocking dialogs: Pi
+ * 0.80.6 does not attach its RPC stdin reader until session_start handlers have
+ * completed, so a handler awaiting a dialog cannot consume its cancellation.
+ */
+export function handlePiExtensionUiRecord(
+  child: ChildProcess,
+  record: string,
+): PiExtensionUiRequestHandling {
+  const event = parsePiJsonlRecord(record);
+  return event ? handlePiExtensionUiRequest(child, event) : "not_ui";
+}
+
+/** Route startup side channels and extract a Pi-minted session id when present. */
+export function parsePiStartupRecord(child: ChildProcess, record: string): string | null {
+  if (handlePiExtensionUiRecord(child, record) === "blocking") {
+    throw new PiStartupBlockingUiError();
+  }
+  const line = parsePiRecord(record);
+  if (
+    line?.type === "system" &&
+    typeof line.session_id === "string" &&
+    line.session_id.length > 0
+  ) {
+    return line.session_id;
+  }
+  return null;
+}
+
 function handlePiStreamRecord(
   child: ChildProcess,
   record: string,
@@ -1464,7 +1506,7 @@ function handlePiStreamRecord(
     return null;
   }
   onActivity?.();
-  if (handlePiExtensionUiRequest(child, event)) {
+  if (handlePiExtensionUiRequest(child, event) !== "not_ui") {
     return null;
   }
   const promptCompletionProbe = handlePiPromptCompletionProbe(child, event, state);

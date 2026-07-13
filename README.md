@@ -152,7 +152,9 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path.
+handle cancellation or provide a noninteractive path. Pi 0.80.6 does not bind
+its RPC input reader until startup handlers complete, so a blocking dialog from
+`session_start` instead fails session creation promptly and the child is reaped.
 
 Agents opt into first-party `ask_agent` handoffs with an `askAgent` block. Both
 the caller and target must have `enabled: true`; an omitted `canAsk` on an

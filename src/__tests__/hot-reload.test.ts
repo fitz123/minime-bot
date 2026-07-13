@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import type { BotConfig } from "../types.js";
-import { NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord } from "../pi-rpc-protocol.js";
+import { NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, normalizePiModel, parsePiStartupRecord } from "../pi-rpc-protocol.js";
 
 const TEST_DIR = "/tmp/minime-test-hot-reload";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -84,7 +84,8 @@ mock.module("../pi-rpc-protocol.js", {
     async *readPiStream() {},
     normalizePiModel,
     NewlineOnlyJsonlSplitter,
-    parsePiRecord,
+    PiStartupBlockingUiError,
+    parsePiStartupRecord,
   },
 });
 

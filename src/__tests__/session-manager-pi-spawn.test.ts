@@ -15,7 +15,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, normalizePiModel, parsePiRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, normalizePiModel, parsePiStartupRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
@@ -48,6 +48,8 @@ const piSpawnCaptures: PiSpawnCapture[] = [];
  */
 let nextPiSessionId: string | null = "pi-generated-id";
 let suppressGetStateResponse = false;
+let startupRecords: Array<Record<string, unknown>> = [];
+const piStdinWrites: Array<Record<string, unknown>> = [];
 
 /**
  * When set, the mocked sendPiGetState throws this error — models the
@@ -71,7 +73,12 @@ function createAutoSpawnChild(): ChildProcess {
   const child = new EventEmitter() as unknown as ChildProcess;
   const stdout = new Readable({ read() {} });
   const stderr = new Readable({ read() {} });
-  const stdin = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+  const stdin = new Writable({
+    write(chunk, _enc, cb) {
+      piStdinWrites.push(JSON.parse(chunk.toString().trim()) as Record<string, unknown>);
+      cb();
+    },
+  });
 
   Object.assign(child, {
     stdout,
@@ -358,6 +365,9 @@ mock.module("../pi-rpc-protocol.js", {
         stdout.push(null);
         return;
       }
+      for (const record of startupRecords) {
+        stdout.push(`${JSON.stringify(record)}\n`);
+      }
       if (nextPiSessionId !== null) {
         stdout.push(
           JSON.stringify({ type: "response", success: true, data: { sessionId: nextPiSessionId } }) + "\n",
@@ -375,7 +385,8 @@ mock.module("../pi-rpc-protocol.js", {
     },
     // Re-export the genuine parse helpers the capture uses.
     NewlineOnlyJsonlSplitter,
-    parsePiRecord,
+    PiStartupBlockingUiError,
+    parsePiStartupRecord,
   },
 });
 
@@ -442,6 +453,8 @@ describe("SessionManager Pi session-id capture + resume", () => {
     piSpawnOutcomes = [];
     nextPiSessionId = "pi-generated-id";
     suppressGetStateResponse = false;
+    startupRecords = [];
+    piStdinWrites.length = 0;
     getStateError = null;
     onGetState = null;
   });
@@ -486,6 +499,41 @@ describe("SessionManager Pi session-id capture + resume", () => {
     );
 
     await manager.closeAll();
+  });
+
+  it("fails promptly and reaps a child blocked on extension UI during startup", async () => {
+    startupRecords = [{
+      type: "extension_ui_request",
+      id: "startup-confirm",
+      method: "confirm",
+      title: "sensitive title",
+      message: "sensitive message",
+    }];
+    let child: ChildProcess | undefined;
+    onGetState = (spawnedChild) => {
+      child = spawnedChild;
+    };
+    const manager = new SessionManager(
+      () => makeConfig(),
+      TEST_STORE_PATH,
+      undefined,
+      { startupTimeoutMs: 5_000 },
+    );
+    const startedAt = Date.now();
+
+    await assert.rejects(
+      manager.getOrCreateSession("pi-startup-ui", "pi"),
+      /unsupported blocking extension UI before RPC startup completed/,
+    );
+
+    assert.ok(Date.now() - startedAt < 1_000, "startup dialog must not wait for the timeout");
+    assert.deepStrictEqual(piStdinWrites, [{
+      type: "extension_ui_response",
+      id: "startup-confirm",
+      cancelled: true,
+    }]);
+    assert.strictEqual(child?.killed, true, "failed startup child must be reaped");
+    assert.strictEqual(manager.getActive("pi-startup-ui"), undefined);
   });
 
   it("does not reuse an active Pi session whose stdout was destroyed", async () => {

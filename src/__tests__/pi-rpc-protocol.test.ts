@@ -37,8 +37,10 @@ import {
   buildPiSubagentChildSpawnEnv,
   buildPiSteerCommand,
   extractPiTextDelta,
+  handlePiExtensionUiRecord,
   isPiAlreadyProcessingRejection,
   parsePiEvent,
+  parsePiStartupRecord,
   piExtensionRelpathForDir,
   readPiStream,
   resolvePiAskAgentChildExtensionArgs,
@@ -1364,6 +1366,96 @@ describe("spawnPiRpcSession workspace validation", () => {
       rmSync(workspaceRoot, { recursive: true, force: true });
     }
   });
+
+  it("fails closed on a real Pi session_start handler awaiting a no-timeout confirmation", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-startup-ui-real-"));
+    const agentWorkspace = join(workspaceRoot, "agent-workspace");
+    const agentDir = join(workspaceRoot, "pi-agent");
+    const sessionDir = join(workspaceRoot, "pi-sessions");
+    const extensionPath = join(workspaceRoot, "startup-confirm.js");
+    const oldEnv = new Map<string, string | undefined>();
+    for (const key of [
+      MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+      "PI_CODING_AGENT_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+    ]) {
+      oldEnv.set(key, process.env[key]);
+    }
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      extensionPath,
+      [
+        "export default function (pi) {",
+        "  pi.on('session_start', async (_event, ctx) => {",
+        "    await ctx.ui.confirm('Startup confirmation', 'Continue?');",
+        "  });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    let child: ChildProcess | undefined;
+    let close: Promise<unknown[]> | undefined;
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+      process.env.PI_OFFLINE = "1";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+
+      child = spawnPiRpcSession(
+        { ...testAgent, id: "startup-ui", workspaceCwd: agentWorkspace },
+        undefined,
+        { relpaths: [], extraExtensions: [extensionPath] },
+      );
+      close = once(child, "close");
+      await once(child, "spawn");
+      sendPiGetState(child);
+
+      const startupFailure = new Promise<Error>((resolveFailure, rejectFailure) => {
+        const splitter = new NewlineOnlyJsonlSplitter();
+        child!.stdout!.on("data", (chunk: Buffer | string) => {
+          for (const record of splitter.push(chunk)) {
+            try {
+              parsePiStartupRecord(child!, record);
+            } catch (err) {
+              resolveFailure(err as Error);
+            }
+          }
+        });
+        child!.once("exit", (code, signal) => {
+          rejectFailure(new Error(`Pi exited before startup UI was observed: code=${code} signal=${signal}`));
+        });
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Timed out waiting for Pi startup UI request")), 10_000);
+      });
+      const error = await Promise.race([startupFailure, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+
+      assert.match(error.message, /unsupported blocking extension UI before RPC startup completed/);
+      assert.strictEqual(child.exitCode, null, "the blocked Pi child should still be alive when detected");
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (close) {
+        await close;
+      }
+      for (const [key, value] of oldEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildPiSubagentChildSpawnEnv", () => {
@@ -1610,6 +1702,33 @@ describe("Pi RPC prompt and steer commands", () => {
       assert.strictEqual(buildPiExtensionUiCancellationCommand(event), null);
       assert.strictEqual(parsePiEvent(event), null);
     }
+  });
+
+  it("classifies and cancels a blocking extension UI JSONL record", () => {
+    const chunks: Buffer[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    const child = createMockChild({ stdin });
+
+    assert.strictEqual(
+      handlePiExtensionUiRecord(child, JSON.stringify({
+        type: "extension_ui_request",
+        id: "startup-editor",
+        method: "editor",
+        title: "private title",
+      })),
+      "blocking",
+    );
+    assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
+      type: "extension_ui_response",
+      id: "startup-editor",
+      cancelled: true,
+    });
+    assert.strictEqual(handlePiExtensionUiRecord(child, "not json"), "not_ui");
   });
 
   it("writes get_state commands to stdin", () => {

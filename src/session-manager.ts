@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiRecord, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -122,20 +122,6 @@ export function hasExited(child: ChildProcess): boolean {
 function piStartupStderr(child: ChildProcess): string {
   const reader = (child as unknown as PiStartupDiagnostics).piStartupStderr;
   return typeof reader === "function" ? reader() : "";
-}
-
-/**
- * Parse one raw JSONL record from a Pi child's stdout via the protocol module's
- * shared `parsePiRecord` (single source of truth for the JSONL framing/guard
- * rules) and, if it is a SystemInit (get_state) record, return its non-empty
- * session_id; otherwise null.
- */
-function parsePiSystemInitId(record: string): string | null {
-  const line = parsePiRecord(record);
-  if (line && line.type === "system" && typeof line.session_id === "string" && line.session_id.length > 0) {
-    return line.session_id;
-  }
-  return null;
 }
 
 export interface ActiveSession {
@@ -342,12 +328,18 @@ export class SessionManager {
       sendPiGetState(child);
       for await (const [chunk] of on(stdout, "data", { signal: controller.signal, close: ["close"] })) {
         for (const record of splitter.push(chunk as Buffer)) {
-          const id = parsePiSystemInitId(record);
+          // This routes extension UI records before parsing get_state. A
+          // blocking startup request throws because Pi 0.80.6 cannot consume
+          // its correlated cancellation until session_start has completed.
+          const id = parsePiStartupRecord(child, record);
           if (id) return id;
         }
       }
       return null;
     } catch (err) {
+      if (err instanceof PiStartupBlockingUiError) {
+        throw err;
+      }
       // Aborted (timeout or child exit) is an expected best-effort end: the
       // session stays usable on its local id. Otherwise sendPiGetState may have
       // thrown on a closed stdin (a spawn-then-exit race) — swallow it too, but
