@@ -2155,9 +2155,9 @@ describe("makeSteerFn", () => {
     assert.strictEqual(child.stdin.writes.length, 0);
   });
 
-  it("returns false in the idle window after agent_end", () => {
+  it("returns false in the idle window after agent_settled", () => {
     // processingStartedAt === null: session-manager has cleared it after
-    // agent_end but MessageQueue.busy may still be true. Steering here would
+    // agent_settled but MessageQueue.busy may still be true. Steering here would
     // hand the message to an idle Pi child and lose it; buffer instead.
     const child = makeLiveChild();
     const steerFn = makeSteerFn(fakeManager(true, child, null));

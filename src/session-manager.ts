@@ -890,7 +890,8 @@ export class SessionManager {
         // Update store with new activity time
         this.store.setSession(chatId, this.toSessionState(chatId, session));
 
-        // Read response lines until we get a result.
+        // Read response lines through agent_settled, when readPiStream emits the
+        // accepted prompt's single terminal result.
         // Activity timeout: if no events arrive for RESPONSE_ACTIVITY_TIMEOUT_MS,
         // kill the subprocess to unstick the queue (handles hung processes).
         let gotResult = false;
@@ -950,7 +951,7 @@ export class SessionManager {
         clearActivityTimers();
         session.processingStartedAt = null;
         if (!gotResult) {
-          finish(new Error("Pi subprocess exited before sending a result"));
+          finish(new Error("Pi stream ended without an agent_settled result"));
           return;
         }
         finish();

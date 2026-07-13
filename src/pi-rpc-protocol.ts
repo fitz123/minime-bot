@@ -820,15 +820,24 @@ interface FinalAssistantInfo {
 }
 
 export interface PiRpcParseState {
+  /** Latest usable outcome from a low-level `agent_end`; replaced on every run. */
+  latestAgentEndOutcome?: ResultMessage;
+  /** Terminal execution/recovery failure waiting for `agent_settled`. */
+  pendingTerminalOutcome?: ResultMessage;
+  /** Session metadata observed on this stream, used when events omit it. */
+  observedSessionId?: string;
+  /** Guards prompt rejection, settlement, and EOF fallbacks from duplicating results. */
+  terminalResultEmitted?: boolean;
   pendingOverflowErrorMessage?: string;
   pendingOverflowSessionId?: string;
-  pendingOverflowRecoveryStarted?: boolean;
   pendingOverflowResetEmitted?: boolean;
 }
 
 const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
-const PI_RPC_PENDING_OVERFLOW_GRACE_MS = 1_000;
+const PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE =
+  "Pi agent_settled arrived without a usable agent_end outcome";
+const PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE = "Pi subprocess exited before agent_settled";
 
 /**
  * True when a failed `prompt` response is Pi's "already processing" CONCURRENCY
@@ -915,17 +924,30 @@ function buildPiRpcRetryResetEvent(): ControlRequest {
   };
 }
 
-function finishPiRpcResult(result: ResultMessage, state?: PiRpcParseState): ResultMessage {
-  if (state) {
-    state.pendingOverflowErrorMessage = undefined;
-    state.pendingOverflowSessionId = undefined;
-    state.pendingOverflowRecoveryStarted = undefined;
-    state.pendingOverflowResetEmitted = undefined;
+function clearPendingOverflow(state: PiRpcParseState): void {
+  state.pendingOverflowErrorMessage = undefined;
+  state.pendingOverflowSessionId = undefined;
+  state.pendingOverflowResetEmitted = undefined;
+}
+
+function emitPiRpcResult(
+  result: ResultMessage,
+  state?: PiRpcParseState,
+): ResultMessage | null {
+  if (!state) {
+    return result;
   }
+  if (state.terminalResultEmitted) {
+    return null;
+  }
+  state.terminalResultEmitted = true;
+  state.latestAgentEndOutcome = undefined;
+  state.pendingTerminalOutcome = undefined;
+  clearPendingOverflow(state);
   return result;
 }
 
-function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRpcEvent): ResultMessage {
+function buildOverflowAwareErrorResult(state: PiRpcParseState, rawEvent?: PiRpcEvent): ResultMessage {
   const recoveryFailureMessage =
     nonEmptyText(rawEvent?.errorMessage) ??
     nonEmptyText(rawEvent?.error) ??
@@ -935,12 +957,50 @@ function buildPendingOverflowErrorResult(state: PiRpcParseState, rawEvent?: PiRp
     recoveryFailureMessage && overflowMessage && !recoveryFailureMessage.includes(overflowMessage)
       ? `${recoveryFailureMessage}; original overflow: ${overflowMessage}`
       : recoveryFailureMessage ?? overflowMessage ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
-  const sessionId = rawEvent?.sessionId ?? state.pendingOverflowSessionId;
-  state.pendingOverflowErrorMessage = undefined;
-  state.pendingOverflowSessionId = undefined;
-  state.pendingOverflowRecoveryStarted = undefined;
-  state.pendingOverflowResetEmitted = undefined;
+  const sessionId = rawEvent?.sessionId ?? state.pendingOverflowSessionId ?? state.observedSessionId;
   return buildPiRpcErrorResult(message, sessionId);
+}
+
+function rememberPendingOverflow(
+  state: PiRpcParseState,
+  message: string,
+  sessionId: string | undefined,
+): void {
+  state.pendingOverflowErrorMessage ??= message;
+  state.pendingOverflowSessionId ??= sessionId ?? state.observedSessionId;
+}
+
+function retainAgentEndOutcome(
+  state: PiRpcParseState,
+  outcome: ResultMessage | undefined,
+): void {
+  state.latestAgentEndOutcome = outcome;
+  state.pendingTerminalOutcome = undefined;
+}
+
+function consumeSettledOutcome(state?: PiRpcParseState): ResultMessage | null {
+  if (!state) {
+    return buildPiRpcErrorResult(PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE, undefined);
+  }
+  const outcome = state.pendingTerminalOutcome ?? state.latestAgentEndOutcome;
+  if (outcome && nonEmptyText(outcome.result)) {
+    return emitPiRpcResult(outcome, state);
+  }
+  return emitPiRpcResult(
+    buildPiRpcErrorResult(PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE, state.observedSessionId),
+    state,
+  );
+}
+
+function consumeEofOutcome(state: PiRpcParseState): ResultMessage | null {
+  const outcome = state.pendingTerminalOutcome ?? state.latestAgentEndOutcome;
+  if (outcome && nonEmptyText(outcome.result)) {
+    return emitPiRpcResult(outcome, state);
+  }
+  return emitPiRpcResult(
+    buildPiRpcErrorResult(PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE, state.observedSessionId),
+    state,
+  );
 }
 
 function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null {
@@ -961,33 +1021,28 @@ function markPendingOverflowRetry(state: PiRpcParseState): ControlRequest | null
  *   `assistantMessageEvent.delta` chunk (drives live streaming).
  * - `tool_execution_start` → synthetic `StreamEvent` shaped as a
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
- * - `agent_end` → terminal `ResultMessage`; the result text is the FINAL assistant
- *   message text reconstructed from `agent_end.messages`. A context overflow
- *   `agent_end` can be followed by compaction/retry records even though
- *   `agent_end` itself carries no retry field in Pi's RPC contract, so the
- *   stateful stream reader defers that overflow error record until recovery
- *   succeeds, fails, or stdout ends.
+ * - `agent_end` → retains the latest low-level run outcome without yielding a
+ *   terminal result. Pi may still retry, compact, or drain queued continuations.
+ * - `agent_settled` → consumes the latest retained outcome and yields the one
+ *   terminal `ResultMessage` for the accepted prompt.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
- *   `agent_end` is pending; a failed compaction end becomes the visible terminal
- *   error for that deferred overflow.
+ *   `agent_end` is pending; a failed compaction end is retained until settlement.
  * - `turn_end` → `null`. It is a per-turn boundary that fires once PER turn, so a
- *   multi-turn (tool-using) response emits several `turn_end`s before its single
- *   `agent_end`. Treating `turn_end` as terminal truncates such responses at their
- *   first turn — only `agent_end` is terminal.
+ *   multi-turn (tool-using) response emits several `turn_end`s before `agent_end`.
+ *   Neither boundary settles the accepted prompt.
  * - `response` → a successful `get_state`/`get_session_stats` reply yields a
  *   `SystemInit` capturing `data.sessionId` (the ONLY place Pi exposes the
  *   session id — no event carries it). A failed reply (`success: false`) is
- *   correlated by `command`: a failed `prompt` with a context-overflow error
- *   follows the same deferred recovery path as an overflow `agent_end`; a
- *   failed `prompt` with another REAL rejection yields an error `ResultMessage`
- *   (the turn cannot proceed), while Pi's "already processing" concurrency
+ *   correlated by `command`: a failed `prompt` is a preflight rejection and
+ *   yields an error `ResultMessage` (the turn was never accepted), while Pi's
+ *   "already processing" concurrency
  *   rejection returns null + logs (the in-flight turn is still alive and will
  *   emit its own `agent_end`). A failed side-command (`steer`, `get_state`,
  *   `set_model`, …) likewise returns null + logs — mapping it to a terminal
  *   result would truncate the in-flight prompt turn whose stdout it shares.
  * - `auto_retry_start` / `auto_retry_end` → `RateLimitEvent` (raw error message
  *   preserved for the Task 4 retry classifier).
- * - `error` → error `ResultMessage` (`subtype: "error_during_execution"`).
+ * - `error` → retains an error outcome until settlement when state is present.
  *
  * Returns null for unknown/ignored records (e.g. `tool_execution_update/end`,
  * non-text `message_update` deltas, responses with no session id) so the caller
@@ -998,6 +1053,15 @@ export function parsePiEvent(
   state?: PiRpcParseState,
 ): StreamLine | null {
   if (!rawEvent || typeof rawEvent !== "object") {
+    return null;
+  }
+
+  if (
+    state?.terminalResultEmitted &&
+    ["agent_end", "agent_settled", "compaction_start", "compaction_end", "error"].includes(
+      rawEvent.type ?? "",
+    )
+  ) {
     return null;
   }
 
@@ -1030,59 +1094,71 @@ export function parsePiEvent(
     }
 
     case "turn_end":
-      // Per-turn boundary, NOT terminal. A multi-turn (tool-using) response fires
-      // turn_end once per turn; the run only truly ends at agent_end (fires once).
-      // Mapping turn_end to a ResultMessage truncates such responses at turn 1.
+      // Per-turn boundary, NOT terminal. A multi-turn response fires turn_end
+      // once per turn, and the accepted prompt remains active through settlement.
       return null;
 
     case "agent_end": {
       const finalAssistant = extractFinalAssistantInfo(rawEvent.messages);
       const isFinalAssistantError = isErrorStopReason(finalAssistant.stopReason);
+      if (!state) {
+        // Correct lifecycle translation requires state so the low-level outcome
+        // can be consumed by a later agent_settled record.
+        return null;
+      }
+      const sessionId = rawEvent.sessionId ?? state.observedSessionId;
       if (isFinalAssistantError && isContextOverflowError(finalAssistant.errorMessage)) {
         const overflowMessage =
           nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_OVERFLOW_FAILURE_MESSAGE;
-        if (state) {
-          state.pendingOverflowErrorMessage = overflowMessage;
-          state.pendingOverflowSessionId = rawEvent.sessionId;
-          if (rawEvent.willRetry === true) {
-            return markPendingOverflowRetry(state);
-          }
-          return null;
-        }
-        if (rawEvent.willRetry === true) {
-          return null;
-        }
-        return finishPiRpcResult(
-          buildPiRpcErrorResult(overflowMessage, rawEvent.sessionId),
+        rememberPendingOverflow(state, overflowMessage, sessionId);
+        retainAgentEndOutcome(
           state,
+          buildOverflowAwareErrorResult(state, { ...rawEvent, errorMessage: overflowMessage }),
         );
+        if (rawEvent.willRetry === true) {
+          return markPendingOverflowRetry(state);
+        }
+        return null;
       }
-      if (isFinalAssistantError && finalAssistant.text.length === 0) {
-        if (state?.pendingOverflowErrorMessage) {
-          return buildPendingOverflowErrorResult(state, {
+      if (isFinalAssistantError) {
+        const outcome = state.pendingOverflowErrorMessage
+          ? buildOverflowAwareErrorResult(state, {
             ...rawEvent,
             errorMessage: nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
-          });
+          })
+          : buildPiRpcErrorResult(
+              nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
+              sessionId,
+            );
+        clearPendingOverflow(state);
+        retainAgentEndOutcome(state, outcome);
+        if (rawEvent.willRetry === true) {
+          return {
+            ...buildPiRpcRetryResetEvent(),
+            reason: "pi_agent_retry",
+          };
         }
-        return finishPiRpcResult(
-          buildPiRpcErrorResult(
-            nonEmptyText(finalAssistant.errorMessage) ?? PI_RPC_AGENT_FAILURE_MESSAGE,
-            rawEvent.sessionId,
-          ),
-          state,
-        );
+        return null;
       }
-      const result: ResultMessage = {
-        type: "result",
-        result: finalAssistant.text,
-        session_id: rawEvent.sessionId ?? "",
-      };
-      return finishPiRpcResult(result, state);
+      clearPendingOverflow(state);
+      retainAgentEndOutcome(
+        state,
+        finalAssistant.text.trim().length > 0
+          ? {
+              type: "result",
+              result: finalAssistant.text,
+              session_id: sessionId ?? "",
+            }
+          : undefined,
+      );
+      return null;
     }
+
+    case "agent_settled":
+      return consumeSettledOutcome(state);
 
     case "compaction_start":
       if (state?.pendingOverflowErrorMessage) {
-        state.pendingOverflowRecoveryStarted = true;
         return markPendingOverflowRetry(state);
       }
       return null;
@@ -1091,7 +1167,6 @@ export function parsePiEvent(
       if (!state?.pendingOverflowErrorMessage) {
         return null;
       }
-      state.pendingOverflowRecoveryStarted = true;
       if (rawEvent.willRetry === true) {
         return markPendingOverflowRetry(state);
       }
@@ -1103,23 +1178,20 @@ export function parsePiEvent(
         nonEmptyText(rawEvent.error) ||
         nonEmptyText(rawEvent.message)
       ) {
-        return buildPendingOverflowErrorResult(state, rawEvent);
+        state.pendingTerminalOutcome = buildOverflowAwareErrorResult(state, rawEvent);
+        clearPendingOverflow(state);
       }
       return null;
 
     case "response": {
       // Command responses are side-channel replies, NOT prompt-turn stream
-      // content. The terminal event of a prompt turn is `agent_end` (or a
-      // top-level `error`). A `response` shares the same stdout the active turn
+      // content. The terminal event of an accepted prompt is `agent_settled`.
+      // A `response` shares the same stdout the active turn
       // is reading, so it must be correlated by `command` before being treated
       // as terminal:
-      //  - a failed `prompt` response with a context-overflow error can be
-      //    followed by Pi compaction/continuation, so the stateful reader defers
-      //    it just like the overflow-only `agent_end` path above.
-      //  - a failed `prompt` response with another REAL rejection IS terminal —
-      //    the prompt was rejected with no live turn behind it, so no `agent_end`
-      //    will ever arrive; surface it as an error result so the turn ends now
-      //    instead of hanging until the activity timeout.
+      //  - a failed `prompt` response is terminal because Pi 0.80.6 emits it
+      //    only when preflight rejects before acceptance; no agent lifecycle
+      //    records will follow for that prompt.
       //  - EXCEPT Pi's "already processing" concurrency rejection (a second,
       //    concurrent prompt colliding with a turn that is STILL ALIVE). That
       //    turn will still emit its own `agent_end`, so terminating here would
@@ -1145,18 +1217,9 @@ export function parsePiEvent(
             return null;
           }
           const promptErrorMessage = nonEmptyText(rawEvent.error) ?? "Pi RPC command failed";
-          if (isContextOverflowError(rawEvent.error) && state) {
-            if (rawEvent.willRetry === false) {
-              return finishPiRpcResult(
-                buildPiRpcErrorResult(promptErrorMessage, rawEvent.sessionId),
-                state,
-              );
-            }
-            state.pendingOverflowErrorMessage = promptErrorMessage;
-            state.pendingOverflowSessionId = rawEvent.sessionId;
-            return null;
-          }
-          return finishPiRpcResult(
+          // In Pi 0.80.6 a failed prompt response is emitted only when preflight
+          // rejected before acceptance, so it is terminal without agent_settled.
+          return emitPiRpcResult(
             buildPiRpcErrorResult(promptErrorMessage, rawEvent.sessionId),
             state,
           );
@@ -1169,6 +1232,9 @@ export function parsePiEvent(
       }
       const sessionId = rawEvent.data?.sessionId;
       if (typeof sessionId === "string" && sessionId.length > 0) {
+        if (state) {
+          state.observedSessionId = sessionId;
+        }
         const init: SystemInit = {
           type: "system",
           subtype: "init",
@@ -1191,19 +1257,22 @@ export function parsePiEvent(
     }
 
     case "error": {
-      if (state?.pendingOverflowErrorMessage) {
-        return buildPendingOverflowErrorResult(state, rawEvent);
-      }
       const fallbackMessage =
         typeof rawEvent.message === "string" ? rawEvent.message : undefined;
-      const result: ResultMessage = {
-        type: "result",
-        subtype: "error_during_execution",
-        result: rawEvent.errorMessage ?? fallbackMessage ?? "Pi RPC error",
-        session_id: rawEvent.sessionId ?? "",
-        is_error: true,
-      };
-      return finishPiRpcResult(result, state);
+      if (state) {
+        state.pendingTerminalOutcome = state.pendingOverflowErrorMessage
+          ? buildOverflowAwareErrorResult(state, rawEvent)
+          : buildPiRpcErrorResult(
+              rawEvent.errorMessage ?? fallbackMessage ?? "Pi RPC error",
+              rawEvent.sessionId ?? state.observedSessionId,
+            );
+        clearPendingOverflow(state);
+        return null;
+      }
+      return buildPiRpcErrorResult(
+        rawEvent.errorMessage ?? fallbackMessage ?? "Pi RPC error",
+        rawEvent.sessionId,
+      );
     }
 
     default:
@@ -1211,9 +1280,9 @@ export function parsePiEvent(
   }
 }
 
-type PiStdoutWaitResult = "readable" | "end" | "close" | "timeout";
+type PiStdoutWaitResult = "readable" | "end" | "close";
 
-function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdoutWaitResult> {
+function waitForPiStdout(stdout: Readable): Promise<PiStdoutWaitResult> {
   if (stdout.readableEnded) {
     return Promise.resolve("end");
   }
@@ -1222,12 +1291,7 @@ function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdout
   }
 
   return new Promise((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
       stdout.off("readable", onReadable);
       stdout.off("end", onEnd);
       stdout.off("close", onClose);
@@ -1244,56 +1308,19 @@ function waitForPiStdout(stdout: Readable, timeoutMs?: number): Promise<PiStdout
       cleanup();
       reject(err);
     };
-    const onTimeout = () => finish("timeout");
-
     stdout.once("readable", onReadable);
     stdout.once("end", onEnd);
     stdout.once("close", onClose);
     stdout.once("error", onError);
-    if (timeoutMs !== undefined) {
-      timer = setTimeout(onTimeout, timeoutMs);
-      (timer as { unref?: () => void }).unref?.();
-    }
   });
-}
-
-function markPiChildUnusable(child: ChildProcess): void {
-  try {
-    (child as { killed: boolean }).killed = true;
-  } catch {
-    // Best effort: the caller also destroys stdout so stale records cannot be reused.
-  }
-}
-
-function terminatePiChildAfterOverflowGrace(child: ChildProcess, stdout: Readable): void {
-  if (!child.killed) {
-    const kill = (child as { kill?: (signal?: NodeJS.Signals | number) => boolean }).kill;
-    if (typeof kill === "function") {
-      try {
-        if (!kill.call(child, "SIGTERM")) {
-          markPiChildUnusable(child);
-        }
-      } catch (err) {
-        markPiChildUnusable(child);
-        log.warn(
-          "pi-rpc",
-          `Failed to terminate Pi child after pending overflow timeout: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    } else {
-      markPiChildUnusable(child);
-    }
-  }
-
-  if (!stdout.destroyed) {
-    stdout.destroy();
-  }
 }
 
 /**
  * Async generator yielding translated `StreamLine`s from a Pi RPC child's
- * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. Malformed
- * JSON records and untranslatable events are skipped (never throw mid-stream).
+ * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. The reader
+ * remains active through low-level run boundaries and ends only on the settled
+ * result, prompt preflight rejection, or an EOF/close fallback. Malformed JSON
+ * records and untranslatable events are skipped (never throw mid-stream).
  */
 export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
@@ -1311,23 +1338,16 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
         const line = parsePiRecord(record, parseState);
         if (line) {
           yield line;
+          if (line.type === "result") {
+            return;
+          }
         }
       }
     }
 
-    const waitResult = await waitForPiStdout(
-      stdout,
-      parseState.pendingOverflowErrorMessage && !parseState.pendingOverflowRecoveryStarted
-        ? PI_RPC_PENDING_OVERFLOW_GRACE_MS
-        : undefined,
-    );
+    const waitResult = await waitForPiStdout(stdout);
     if (waitResult === "end" || waitResult === "close") {
       break;
-    }
-    if (waitResult === "timeout" && parseState.pendingOverflowErrorMessage) {
-      terminatePiChildAfterOverflowGrace(child, stdout);
-      yield buildPendingOverflowErrorResult(parseState);
-      return;
     }
   }
 
@@ -1335,11 +1355,15 @@ export async function* readPiStream(child: ChildProcess): AsyncGenerator<StreamL
     const line = parsePiRecord(record, parseState);
     if (line) {
       yield line;
+      if (line.type === "result") {
+        return;
+      }
     }
   }
 
-  if (parseState.pendingOverflowErrorMessage) {
-    yield buildPendingOverflowErrorResult(parseState);
+  const eofResult = consumeEofOutcome(parseState);
+  if (eofResult) {
+    yield eofResult;
   }
 }
 

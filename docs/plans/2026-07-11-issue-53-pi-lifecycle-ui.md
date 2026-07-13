@@ -43,14 +43,14 @@ npm ls --depth=0 @earendil-works/pi-agent-core @earendil-works/pi-ai @earendil-w
 
 ### Task 2: Finalize Pi turns on agent_settled
 
-- [ ] Extend `PiRpcParseState` to retain the latest low-level `agent_end` outcome (success text or terminal error plus session metadata) without yielding a `ResultMessage` at `agent_end`.
-- [ ] On each later `agent_end`, replace the retained outcome so retries/continuations settle on the final run. Keep overflow reset signalling and original-cause preservation, but do not surface a terminal recovery failure before Pi settles unless the prompt was rejected before acceptance or the process/stream ends.
-- [ ] Add `agent_settled` handling that consumes the retained outcome and emits exactly one terminal result. If settlement arrives without a usable outcome, emit one explicit non-empty protocol error instead of an empty success.
-- [ ] On EOF/close before settlement, surface the retained failure/outcome or a clear `Pi subprocess exited before agent_settled` error exactly once. Keep real prompt preflight rejection terminal; keep failed side-command responses nonterminal.
-- [ ] Update `readPiStream`, comments, and SessionManager integration so metrics, busy state, duration, retry telemetry, stream text reset, session persistence/resume, steering, and follow-up queues remain active until the settled result.
-- [ ] Replace old `agent_end is terminal` fixtures with sequences for: one run then settled; multiple retry runs; overflow compaction retry; queued continuation; final error; settlement without outcome; prompt rejection; and EOF before settlement. Assert one result and no duplicate/stale text.
-- [ ] Run focused Pi protocol, SessionManager, stream relay, queue, metrics, and resume tests.
-- [ ] Commit this slice as `Finalize Pi RPC turns on agent_settled (#53)`.
+- [x] Extend `PiRpcParseState` to retain the latest low-level `agent_end` outcome (success text or terminal error plus session metadata) without yielding a `ResultMessage` at `agent_end`.
+- [x] On each later `agent_end`, replace the retained outcome so retries/continuations settle on the final run. Keep overflow reset signalling and original-cause preservation, but do not surface a terminal recovery failure before Pi settles unless the prompt was rejected before acceptance or the process/stream ends.
+- [x] Add `agent_settled` handling that consumes the retained outcome and emits exactly one terminal result. If settlement arrives without a usable outcome, emit one explicit non-empty protocol error instead of an empty success.
+- [x] On EOF/close before settlement, surface the retained failure/outcome or a clear `Pi subprocess exited before agent_settled` error exactly once. Keep real prompt preflight rejection terminal; keep failed side-command responses nonterminal.
+- [x] Update `readPiStream`, comments, and SessionManager integration so metrics, busy state, duration, retry telemetry, stream text reset, session persistence/resume, steering, and follow-up queues remain active until the settled result.
+- [x] Replace old `agent_end is terminal` fixtures with sequences for: one run then settled; multiple retry runs; overflow compaction retry; queued continuation; final error; settlement without outcome; prompt rejection; and EOF before settlement. Assert one result and no duplicate/stale text.
+- [x] Run focused Pi protocol, SessionManager, stream relay, queue, metrics, and resume tests.
+- [x] Commit this slice as `Finalize Pi RPC turns on agent_settled (#53)`.
 
 ### Task 3: Fail closed for blocking extension UI requests
 

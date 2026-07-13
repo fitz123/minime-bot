@@ -717,7 +717,7 @@ export function makeSteerFn(
   return (chatId: string, _agentId: string, text: string): boolean => {
     const session = sessionManager.getActive(chatId);
     if (!session || hasExited(session.child)) return false;
-    // Only steer when a Pi turn is actively processing. After `agent_end`,
+    // Only steer when a Pi turn is actively processing. After `agent_settled`,
     // session-manager clears `processingStartedAt` while MessageQueue.busy can
     // still be true (relay/cleanup of the final response is finishing). A
     // echo arriving in that window must NOT be steered: the Pi child has no
