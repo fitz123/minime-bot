@@ -31,7 +31,7 @@ npm run workspace:validate
 npm run validate-config
 ```
 
-## Task 1: Preserve Telegram work during temporary outages
+### Task 1: Preserve Telegram work during temporary outages
 
 - [ ] In `src/polling-watchdog.ts`, keep the existing reachable-API `poll_stalled` restart path exactly once, but make `api_unreachable` a recorded/logged degraded state that does not call the exit path. Preserve bounded heartbeat timeout/abort, overlap suppression, and later recovery observation.
 - [ ] Narrow restart-reason typing/metrics if `api_unreachable` can no longer be a restart reason, while retaining it as a watchdog check outcome.
