@@ -356,6 +356,7 @@ def _write_state_document(
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         try:
             os.unlink(temporary)
@@ -365,6 +366,14 @@ def _write_state_document(
 
 def write_state(path: Path, incidents: set[str]) -> None:
     _write_state_document(path, incidents)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def doctor_transition_id(code: str, status: str, transition: str) -> str:
@@ -389,6 +398,24 @@ def _transition_events(previous: set[str], current: set[str]) -> list[dict[str, 
                     "transition_id": doctor_transition_id(code, status, transition),
                 }
             )
+    return events
+
+
+def _source_snapshot_events(current: set[str]) -> list[dict[str, str]]:
+    """Reconcile every known doctor code after local delivery state is lost."""
+
+    events: list[dict[str, str]] = []
+    for code in sorted(INCIDENT_ACTIONS):
+        status = "firing" if code in current else "resolved"
+        transition = uuid.uuid4().hex
+        events.append(
+            {
+                "code": code,
+                "status": status,
+                "transition": transition,
+                "transition_id": doctor_transition_id(code, status, transition),
+            }
+        )
     return events
 
 
@@ -533,6 +560,7 @@ def _write_recovery_fallback_timestamp(path: Path, timestamp: float) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         try:
             os.unlink(temporary)
@@ -622,11 +650,10 @@ def run_doctor(
             active_logger.info("doctor_transition_notified codes=%s", ",".join(sorted(incidents)) or "recovered")
             return 0
 
+        state_missing = not config.state_path.exists()
         previous, pending, corrupt = read_delivery_state(config.state_path)
         if corrupt:
-            active_logger.error("doctor_state_corrupt_reset")
-            write_delivery_state(config.state_path, set(), None)
-            return 0
+            active_logger.error("doctor_state_corrupt_reconcile")
         source_heartbeats = {"runtime_doctor": True}
         if config.alertmanager_url is not None:
             source_heartbeats["alertmanager"] = "alertmanager_unhealthy" not in incidents
@@ -666,6 +693,19 @@ def run_doctor(
                 ",".join(sorted(target)) or "recovered",
             )
             return True, target
+
+        if corrupt or state_missing:
+            pending = {
+                "events": _source_snapshot_events(incidents),
+                # A healthy first observation is source reconciliation, not a
+                # native recovery transition. Active incidents still preserve
+                # tee's direct native notification behavior.
+                "native_delivered": not incidents,
+                "target_incidents": sorted(incidents),
+            }
+            write_delivery_state(config.state_path, set(), pending)
+            completed, _target = finish_pending(pending)
+            return 0 if completed else 1
 
         if pending is not None:
             completed, previous = finish_pending(pending)

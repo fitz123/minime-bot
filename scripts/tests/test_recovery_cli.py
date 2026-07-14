@@ -147,6 +147,34 @@ class RecoveryConfigTests(unittest.TestCase):
 
 
 class RecoveryCliTests(unittest.TestCase):
+    def test_read_only_commands_do_not_publish_changed_static_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_config(root, "enabled")
+            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                original_revision = controls.ensure_static_policy(
+                    recovery_config.recovery_static_policy(loaded)
+                )
+
+            write_config(root, "observe")
+            code, _output, error = call_cli(root, "status")
+            self.assertEqual((code, error), (0, ""))
+            code, _output, error = call_cli(root, "incidents")
+            self.assertEqual((code, error), (0, ""))
+
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                self.assertEqual(controls.current().revision, original_revision)
+                policy = json.loads(
+                    ledger.connection.execute(
+                        "SELECT policy_json FROM policy_revisions WHERE revision = ?",
+                        (original_revision,),
+                    ).fetchone()[0]
+                )
+                self.assertEqual(policy["recovery_static"]["mode"], "enabled")
+
     def test_status_controls_history_digest_and_process_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

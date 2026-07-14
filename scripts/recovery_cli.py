@@ -318,13 +318,19 @@ def run(args: argparse.Namespace) -> int:
 
     with RecoveryLedger(config.database) as ledger:
         controls = RecoveryControls(ledger)
-        revision = controls.ensure_static_policy(recovery_static_policy(config))
+        static_policy = recovery_static_policy(config)
+        revision = (
+            controls.ensure_static_policy(static_policy)
+            if args.command == "process"
+            else controls.current().revision
+        )
         coordinator = IncidentCoordinator(
             ledger,
             _policy(config, revision),
             owner="recovery-cli",
             controls=controls,
             mode=config.mode,
+            static_policy=static_policy if args.command == "process" else None,
         )
         if args.command == "status":
             _json(_status(ledger, controls, config))
