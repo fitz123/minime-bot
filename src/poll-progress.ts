@@ -15,6 +15,8 @@ export interface PollProgressSnapshot {
   readonly initializedAtMs: number;
   readonly lastPollStartedAtMs: number | null;
   readonly lastPollSucceededAtMs: number | null;
+  /** Most recent failed poll that has not yet been followed by a success. */
+  readonly lastPollFailedAtMs: number | null;
   readonly successfulPollCount: number;
   readonly inFlight: boolean;
   readonly failedPollCount: number;
@@ -43,6 +45,7 @@ export function createPollProgressProbe(now: () => number = Date.now): PollProgr
   const initializedAtMs = now();
   let lastPollStartedAtMs: number | null = null;
   let lastPollSucceededAtMs: number | null = null;
+  let lastPollFailedAtMs: number | null = null;
   let successfulPollCount = 0;
   let inFlightCount = 0;
   let failedPollCount = 0;
@@ -58,12 +61,15 @@ export function createPollProgressProbe(now: () => number = Date.now): PollProgr
       const response = await prev(method, payload, signal);
       if (response.ok) {
         lastPollSucceededAtMs = now();
+        lastPollFailedAtMs = null;
         successfulPollCount++;
       } else {
+        lastPollFailedAtMs = now();
         failedPollCount++;
       }
       return response;
     } catch (error) {
+      lastPollFailedAtMs = now();
       failedPollCount++;
       throw error;
     } finally {
@@ -78,6 +84,7 @@ export function createPollProgressProbe(now: () => number = Date.now): PollProgr
         initializedAtMs,
         lastPollStartedAtMs,
         lastPollSucceededAtMs,
+        lastPollFailedAtMs,
         successfulPollCount,
         inFlight: inFlightCount > 0,
         failedPollCount,

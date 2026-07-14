@@ -1,7 +1,7 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
@@ -610,50 +610,6 @@ describe("voiceTranscriptEcho config", () => {
   });
 });
 
-describe("isStaleMessage", () => {
-  it("returns true for messages older than threshold", () => {
-    const sixMinAgoMs = Date.now() - 6 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(sixMinAgoMs, 300000), true);
-  });
-
-  it("returns false for recent messages", () => {
-    const tenSecAgoMs = Date.now() - 10000;
-    assert.strictEqual(isStaleMessage(tenSecAgoMs, 300000), false);
-  });
-
-  it("returns true for messages just past threshold", () => {
-    const justPastMs = Date.now() - 300001;
-    assert.strictEqual(isStaleMessage(justPastMs, 300000), true);
-  });
-
-  it("returns false for messages at exact threshold boundary", () => {
-    // At exactly maxAge, not stale (> not >=). Use small buffer to avoid
-    // flakiness from wall-clock drift between the two Date.now() calls.
-    const nearExactMs = Date.now() - 299990;
-    assert.strictEqual(isStaleMessage(nearExactMs, 300000), false);
-  });
-
-  it("returns true for very old messages (hours)", () => {
-    const threeHoursAgoMs = Date.now() - 3 * 60 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(threeHoursAgoMs, 300000), true);
-  });
-
-  it("returns false for messages in the future (clock skew)", () => {
-    const futureMs = Date.now() + 10000;
-    assert.strictEqual(isStaleMessage(futureMs, 300000), false);
-  });
-
-  it("works with Telegram-style timestamps (seconds converted to ms)", () => {
-    const fiveMinAgoSec = Math.floor(Date.now() / 1000) - 301;
-    assert.strictEqual(isStaleMessage(fiveMinAgoSec * 1000, 300000), true);
-  });
-
-  it("works with Discord-style timestamps (already ms)", () => {
-    const fourMinAgoMs = Date.now() - 4 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(fourMinAgoMs, 300000), false);
-  });
-});
-
 describe("buildReplyContext", () => {
   it("returns empty string when replyTo is undefined", () => {
     assert.strictEqual(buildReplyContext(undefined), "");
@@ -1103,9 +1059,9 @@ describe("AUTO_RETRY_OPTIONS", () => {
   });
 });
 
-describe("createDraftSkipAutoRetryTransformer", () => {
+describe("createTelegramAutoRetryTransformer", () => {
   it("bypasses autoRetry for sendMessageDraft — calls prev exactly once on 429", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;
@@ -1116,8 +1072,20 @@ describe("createDraftSkipAutoRetryTransformer", () => {
     assert.strictEqual((result as { ok: boolean }).ok, false);
   });
 
+  it("bypasses autoRetry for getUpdates so grammY controls polling retries", async () => {
+    const transformer = createTelegramAutoRetryTransformer();
+    let callCount = 0;
+    const prev = async () => {
+      callCount++;
+      return { ok: false, error_code: 429, parameters: { retry_after: 0 } } as const;
+    };
+    const result = await transformer(prev as never, "getUpdates", { timeout: 30 } as never);
+    assert.strictEqual(callCount, 1, "getUpdates must be returned to grammY without autoRetry");
+    assert.strictEqual((result as { ok: boolean }).ok, false);
+  });
+
   it("retries sendMessage on 429 via autoRetry", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;
@@ -1132,7 +1100,7 @@ describe("createDraftSkipAutoRetryTransformer", () => {
   });
 
   it("retries sendChatAction on 429 via autoRetry", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;
@@ -1378,7 +1346,11 @@ describe("command handler wiring", () => {
     } as unknown as SessionManager & { calls: string[] };
   }
 
-  function makeCommandUpdate(command: string, updateId: number) {
+  function makeCommandUpdate(
+    command: string,
+    updateId: number,
+    date = Math.floor(Date.now() / 1000),
+  ) {
     const text = `/${command}`;
     return {
       update_id: updateId,
@@ -1386,7 +1358,7 @@ describe("command handler wiring", () => {
         message_id: updateId,
         from: { id: testChatId, is_bot: false, first_name: "Test" },
         chat: { id: testChatId, type: "private" as const, first_name: "Test" },
-        date: Math.floor(Date.now() / 1000),
+        date,
         text,
         entities: [{ offset: 0, length: text.length, type: "bot_command" as const }],
       },
@@ -1394,7 +1366,8 @@ describe("command handler wiring", () => {
   }
 
   function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
-    const { bot } = createTelegramBot(handlerConfig, mockSM);
+    const result = createTelegramBot(handlerConfig, mockSM);
+    const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
       apiCalls.push({ method, payload });
@@ -1416,7 +1389,7 @@ describe("command handler wiring", () => {
       has_topics_enabled: false,
       allows_users_to_create_topics: false,
     };
-    return bot;
+    return result;
   }
 
   it("installs and exposes polling and update-processing probes", async () => {
@@ -1462,18 +1435,18 @@ describe("command handler wiring", () => {
 
   it("/reconnect calls closeSession (not destroySession)", async () => {
     const mockSM = createMockSessionManager();
-    const bot = initBot(mockSM);
+    const { bot } = initBot(mockSM);
 
-    await bot.handleUpdate(makeCommandUpdate("reconnect", 1));
+    await bot.handleUpdate(makeCommandUpdate("reconnect", 1, Math.floor(Date.now() / 1000) - 60 * 60));
     assert.ok(mockSM.calls.includes("closeSession"), "/reconnect should call closeSession");
     assert.ok(!mockSM.calls.includes("destroySession"), "/reconnect should NOT call destroySession");
   });
 
   it("/clean calls destroySession (not closeSession directly)", async () => {
     const mockSM = createMockSessionManager();
-    const bot = initBot(mockSM);
+    const { bot } = initBot(mockSM);
 
-    await bot.handleUpdate(makeCommandUpdate("clean", 2));
+    await bot.handleUpdate(makeCommandUpdate("clean", 2, Math.floor(Date.now() / 1000) - 60 * 60));
     assert.ok(mockSM.calls.includes("destroySession"), "/clean should call destroySession");
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
   });
@@ -1481,9 +1454,9 @@ describe("command handler wiring", () => {
   it("/status replies from local health/cache without opening a session", async () => {
     const mockSM = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const bot = initBot(mockSM, apiCalls);
+    const { bot } = initBot(mockSM, apiCalls);
 
-    await bot.handleUpdate(makeCommandUpdate("status", 3));
+    await bot.handleUpdate(makeCommandUpdate("status", 3, Math.floor(Date.now() / 1000) - 60 * 60));
 
     const reply = apiCalls.find((call) => call.method === "sendMessage");
     assert.ok(reply);
@@ -1492,6 +1465,31 @@ describe("command handler wiring", () => {
     assert.ok(mockSM.calls.includes("getSessionHealth:111111111"));
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+
+  it("handles delayed command and text updates through their normal paths", async () => {
+    const delayedDate = Math.floor(Date.now() / 1000) - 60 * 60;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(createMockSessionManager(), apiCalls);
+
+    await bot.handleUpdate(makeCommandUpdate("start", 4, delayedDate));
+    assert.match(
+      String(apiCalls.find((call) => call.method === "sendMessage")?.payload.text),
+      /Connected to agent/,
+    );
+
+    await bot.handleUpdate({
+      update_id: 5,
+      message: {
+        message_id: 5,
+        from: { id: testChatId, is_bot: false, first_name: "Test" },
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        date: delayedDate,
+        text: "delayed text",
+      },
+    });
+    assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 1);
+    messageQueue.clear(String(testChatId));
   });
 
   it("drops idle echo context without enqueueing or opening a session", () => {
@@ -1506,7 +1504,7 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
   });
 
-  it("makes metadata failures visible from every Telegram media handler", async () => {
+  it("handles delayed non-text updates through every Telegram media handler", async () => {
     const mediaMessages = [
       { voice: { file_id: "voice-1", duration: 1 } },
       { photo: [{ file_id: "photo-1", file_unique_id: "photo-u1", width: 1, height: 1 }] },
@@ -1516,14 +1514,14 @@ describe("command handler wiring", () => {
 
     for (const [index, media] of mediaMessages.entries()) {
       const apiCalls: Array<{ method: string; payload: any }> = [];
-      const bot = initBot(createMockSessionManager(), apiCalls);
+      const { bot } = initBot(createMockSessionManager(), apiCalls);
       await bot.handleUpdate({
         update_id: 100 + index,
         message: {
           message_id: 100 + index,
           from: { id: testChatId, is_bot: false, first_name: "Test" },
           chat: { id: testChatId, type: "private", first_name: "Test" },
-          date: Math.floor(Date.now() / 1000),
+          date: Math.floor(Date.now() / 1000) - 60 * 60,
           ...media,
         },
       } as never);

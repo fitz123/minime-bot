@@ -610,16 +610,6 @@ export function formatMediaMeta(
 }
 
 /**
- * Check if a message is too old to process.
- * Used to discard stale messages that accumulated during bot downtime.
- * @param messageTimestampMs Message timestamp in milliseconds
- * @param maxAgeMs Maximum allowed age in milliseconds
- */
-export function isStaleMessage(messageTimestampMs: number, maxAgeMs: number): boolean {
-  return Date.now() - messageTimestampMs > maxAgeMs;
-}
-
-/**
  * Check whether the bot should respond to a message in a group chat.
  * Returns true if the binding is a DM, requireMention is false,
  * or the message is a reply to the bot / @mentions the bot.
@@ -734,23 +724,28 @@ export function makeSteerFn(
 }
 
 /**
- * Build a transformer that runs autoRetry for every Telegram API method EXCEPT
- * `sendMessageDraft`. Drafts are cosmetic fire-and-forget calls (see
+ * Build a transformer that runs autoRetry for ordinary Telegram API methods.
+ * `getUpdates` uses grammY's dedicated polling retry loop so a recovered poll
+ * cannot remain parked in autoRetry's long network-error backoff. Drafts are
+ * cosmetic fire-and-forget calls (see
  * stream-relay.ts) — a retry that fires after Telegram's 3-10s retry_after is
  * stale by the time it lands (the stream has produced newer text), and 5x
  * amplification turns one rate-limited draft into five log/metric increments.
  * Every other method retains the full AUTO_RETRY_OPTIONS retry behavior.
  * See issue #117.
  */
-export function createDraftSkipAutoRetryTransformer(): Transformer {
+export function createTelegramAutoRetryTransformer(): Transformer {
   const retry = autoRetry(AUTO_RETRY_OPTIONS);
   return async (prev, method, payload, signal) => {
-    if (method === "sendMessageDraft") {
+    if (method === "sendMessageDraft" || method === "getUpdates") {
       return prev(method, payload, signal);
     }
     return retry(prev, method, payload, signal);
   };
 }
+
+/** Backward-compatible name retained for existing deep imports. */
+export const createDraftSkipAutoRetryTransformer = createTelegramAutoRetryTransformer;
 
 /**
  * Create and configure the Telegram bot.
@@ -771,10 +766,10 @@ export function createTelegramBot(
   // before autoRetry decides whether to retry)
   bot.api.config.use(createApiErrorLoggingTransformer({ bindings: config.bindings }));
 
-  // Auto-retry on rate limits (outermost transformer — retries after inner
-  // errors). `sendMessageDraft` is excluded: drafts are cosmetic fire-and-
-  // forget calls; retries amplify 429 log noise without user-visible benefit.
-  bot.api.config.use(createDraftSkipAutoRetryTransformer());
+  // Auto-retry on rate limits and network errors (outermost transformer —
+  // retries after inner errors). Polling uses grammY's own retry loop, while
+  // cosmetic sendMessageDraft calls remain excluded from retries.
+  bot.api.config.use(createTelegramAutoRetryTransformer());
 
   // Outermost transformer: observe completion of each logical getUpdates call,
   // including grammY polling calls, without retaining request/response data.
@@ -786,8 +781,6 @@ export function createTelegramBot(
   // media preprocessing as a stuck getUpdates loop.
   const updateProcessing = createUpdateProcessingProbe();
   bot.use(updateProcessing.middleware);
-
-  const maxMessageAgeMs = config.sessionDefaults.maxMessageAgeMs;
 
   // Best-effort Pi steer for deliver.sh echo context only.
   const steerFn = makeSteerFn(sessionManager);
@@ -829,10 +822,6 @@ export function createTelegramBot(
     if (ctx.message) setThread(chatId, ctx.message.message_id, topicId);
     const binding = resolveBinding(chatId, config.bindings, topicId);
     if (!binding) return;
-    if (ctx.message && isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale /start for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
     const agent = config.agents[binding.agentId];
     await ctx.reply(
       `Connected to agent "${binding.agentId}" (${agent?.model ?? "unknown"}). Send a message to start.`,
@@ -850,10 +839,6 @@ export function createTelegramBot(
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
-    if (ctx.message && isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale /reconnect for chat ${ctx.chat.id} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
     const key = sessionKey(ctx.chat.id, topicId);
     messageQueue.clear(key);
     await sessionManager.closeSession(key);
@@ -868,10 +853,6 @@ export function createTelegramBot(
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
-    if (ctx.message && isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale /clean for chat ${ctx.chat.id} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
     const key = sessionKey(ctx.chat.id, topicId);
     messageQueue.clear(key);
     await sessionManager.destroySession(key);
@@ -884,10 +865,6 @@ export function createTelegramBot(
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
-    if (ctx.message && isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale /status for chat ${ctx.chat.id} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
     const key = sessionKey(ctx.chat.id, topicId);
     await ctx.reply(buildStatusReport({
       activeCount: sessionManager.getActiveCount(),
@@ -908,12 +885,6 @@ export function createTelegramBot(
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    // Discard stale messages accumulated during bot downtime
-    if (isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale message for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
 
     messagesReceived.inc({ type: "text" });
 
@@ -938,11 +909,6 @@ export function createTelegramBot(
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    if (isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale voice message for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
 
     messagesReceived.inc({ type: "voice" });
 
@@ -999,11 +965,6 @@ export function createTelegramBot(
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    if (isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale photo message for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
 
     messagesReceived.inc({ type: "photo" });
 
@@ -1078,11 +1039,6 @@ export function createTelegramBot(
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    if (isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale ${anim ? "animation" : "document"} message for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
 
     // Telegram Bot API limits file downloads to 20 MB
     const docSize = anim?.file_size ?? doc.file_size;
@@ -1178,11 +1134,6 @@ export function createTelegramBot(
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
-    if (isStaleMessage(ctx.message.date * 1000, maxMessageAgeMs)) {
-      log.debug("telegram-bot", `Discarding stale ${mediaType} message for chat ${chatId} (age: ${Math.round((Date.now() - ctx.message.date * 1000) / 1000)}s)`);
-      return;
-    }
-
     if (media.file_size !== undefined && media.file_size > TELEGRAM_FILE_SIZE_LIMIT) {
       await ctx.reply("File is too large (max 20 MB for bot downloads).").catch(() => {});
       return;
@@ -1255,11 +1206,6 @@ export function createTelegramBot(
     if (!shouldRespondToReaction(binding, config.sessionDefaults)) return;
 
     try {
-      if (isStaleMessage(ctx.messageReaction.date * 1000, maxMessageAgeMs)) {
-        log.debug("telegram-bot", `Discarding stale reaction for chat ${chatId} (age: ${Math.round((Date.now() - ctx.messageReaction.date * 1000) / 1000)}s)`);
-        return;
-      }
-
       const { emojiAdded, emojiRemoved } = ctx.reactions();
       if (emojiAdded.length === 0 && emojiRemoved.length === 0) return;
 

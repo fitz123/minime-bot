@@ -117,10 +117,11 @@ export type PollWatchdogCheckOutcome =
   | "healthy_quiet"
   | "update_processing"
   | "poll_resumed"
+  | "poll_recovery_pending"
   | "poll_stalled"
   | "api_unreachable"
   | "overlap_suppressed";
-export type PollWatchdogRestartReason = "poll_stalled" | "api_unreachable";
+export type PollWatchdogRestartReason = "poll_stalled";
 
 export const telegramPollProgressAge = new client.Gauge({
   name: "bot_telegram_poll_progress_age_seconds",

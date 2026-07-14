@@ -276,9 +276,16 @@ first-party wrappers.
 Telegram polling liveness is based on successful `getUpdates` completions,
 including empty responses during quiet chats. The runtime uses a 30-second
 long-poll timeout and treats 90 seconds without successful poll progress as
-stale. A bounded API check then classifies a deliberate restart as
-`poll_stalled` or `api_unreachable`; ordinary Telegram silence never causes a
-restart. The low-cardinality metrics are
+stale. A bounded API check then distinguishes a reachable stalled poller from
+degraded connectivity. A reachable API with no poll progress triggers one
+deliberate `poll_stalled` restart. After degraded connectivity, polling uses
+grammY's short retry cadence and gets one stale-threshold recovery window before
+that restart can be selected. A failed or timed-out reachability check records
+`api_unreachable` while keeping the process, queued messages, and active turns
+alive; ordinary Telegram silence never causes a restart. Delayed Telegram
+commands, messages, media, and reactions continue through normal handling
+regardless of `sessionDefaults.maxMessageAgeMs`; that setting remains the
+Discord stale-message cutoff. The low-cardinality metrics are
 `bot_telegram_poll_progress_age_seconds`, `bot_telegram_poll_in_flight`,
 `bot_poll_watchdog_checks_total`, and `bot_poll_watchdog_restarts_total`.
 Because grammY pauses simple polling while middleware runs, bounded media

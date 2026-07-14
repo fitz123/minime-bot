@@ -52,6 +52,22 @@ export function runTelegramSetupInBackground(
 }
 
 /**
+ * Stop grammY polling immediately without making graceful shutdown wait for
+ * its final update-offset confirmation. That confirmation is best-effort and
+ * can reject while Telegram is unreachable, so always observe its promise.
+ */
+export function stopTelegramBotInBackground(
+  bot: { stop: () => Promise<void> },
+  onError: (error: unknown) => void,
+): void {
+  try {
+    void bot.stop().catch(onError);
+  } catch (error) {
+    onError(error);
+  }
+}
+
+/**
  * Start a grammY bot with retry-on-409 logic.
  *
  * When a new bot instance starts before Telegram releases the old long-poll
