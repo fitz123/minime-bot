@@ -19,6 +19,16 @@
     <string>__CONTROL_WORKSPACE_ROOT__</string>
     <key>MINIME_AGENT_WORKSPACE_ROOT</key>
     <string>__AGENT_WORKSPACE_ROOT__</string>
+    <key>MINIME_RECOVERY_NODE_EXECUTABLE</key>
+    <string>__NODE_EXECUTABLE__</string>
+    <key>MINIME_TELEGRAM_CHAT_ID</key>
+    <string>__TELEGRAM_CHAT_ID__</string>
+    <key>MINIME_TELEGRAM_SOPS_FILE</key>
+    <string>__CONTROL_WORKSPACE_ROOT__/config/secrets.sops.yaml</string>
+    <key>MINIME_TELEGRAM_SOPS_KEY</key>
+    <string>__TELEGRAM_SOPS_KEY__</string>
+    <key>MINIME_SOPS_EXECUTABLE</key>
+    <string>__SOPS_EXECUTABLE__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

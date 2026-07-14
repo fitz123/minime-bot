@@ -365,6 +365,14 @@ monitoring stack itself. See [Host-native monitoring and Telegram alerts](docs/m
 for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
 
+An opt-in same-host recovery supervisor can durably correlate those native
+signals and, after explicit observe and plan shadow gates, invoke a tightly
+bounded fixer planner and static runbooks. Direct Telegram remains the default.
+Start with `minime-bot recovery config validate --workspace /path/to/control-workspace`
+and `minime-bot recovery status --workspace /path/to/control-workspace`; see
+[Same-host recovery supervisor](docs/recovery.md) for configuration, safety
+boundaries, drills, and rollback.
+
 ## Repository Boundaries
 
 Do not add private workspace files to the package root. In particular, this

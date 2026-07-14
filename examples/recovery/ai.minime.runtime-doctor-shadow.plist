@@ -23,6 +23,8 @@
     <string>http://127.0.0.1:9877/v1/runtime-doctor</string>
     <key>MINIME_DOCTOR_RECOVERY_TOKEN_FILE</key>
     <string>__CONTROL_WORKSPACE_ROOT__/config/recovery-auth-token</string>
+    <key>MINIME_DOCTOR_ALERTMANAGER_URL</key>
+    <string>http://127.0.0.1:9093/-/healthy</string>
   </dict>
   <key>StartInterval</key>
   <integer>60</integer>

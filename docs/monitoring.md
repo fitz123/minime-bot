@@ -139,6 +139,24 @@ run the doctor. Telegram delivery must still work. Restore health and run it
 again to confirm exactly one recovery. The doctor never reads or edits TCC
 databases and must not be used to trigger permission prompts.
 
+The runtime doctor defaults to `MINIME_DOCTOR_SINK=telegram`, preserving the
+direct native behavior above. Recovery shadowing adds these settings:
+
+- `MINIME_DOCTOR_SINK=tee` sends the native notification once, then retries the
+  same durable recovery transition without duplicating Telegram delivery.
+- `MINIME_DOCTOR_SINK=recovery` transfers routine transition delivery to the
+  recovery supervisor; use it only after the shadow gates pass.
+- `MINIME_DOCTOR_RECOVERY_URL` must be the loopback
+  `http://.../v1/runtime-doctor` endpoint.
+- `MINIME_DOCTOR_RECOVERY_TOKEN_FILE` must be an owner-only, non-symlink token
+  file; `MINIME_DOCTOR_RECOVERY_ATTEMPTS` is bounded to 1-10.
+
+Tee and recovery modes also send an authenticated heartbeat on every doctor
+run, including unchanged healthy runs. Configure `MINIME_DOCTOR_ALERTMANAGER_URL`
+so the same post carries a deterministic Alertmanager-health observation; this
+prevents quiet sources from being mistaken for stale sources during recovery
+verification.
+
 ## Diagnostics and recovery
 
 If notifications stop, test the native delivery CLI first, then inspect the

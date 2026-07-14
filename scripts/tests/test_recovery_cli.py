@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
@@ -70,6 +71,41 @@ class RecoveryConfigTests(unittest.TestCase):
             with self.assertRaises(recovery_config.RecoveryConfigError):
                 recovery_config.load_recovery_config(root / "recovery.json", root)
 
+            unsafe_commands = [
+                {
+                    "id": "bad+id",
+                    "actionClass": "diagnostic",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "sensitive-argv",
+                    "actionClass": "diagnostic",
+                    "executable": "/usr/bin/true",
+                    "argv": ["--token=literal-value"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "sudo-executable",
+                    "actionClass": "diagnostic",
+                    "executable": "/usr/bin/sudo",
+                    "argv": ["/usr/bin/true"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+            ]
+            for command in unsafe_commands:
+                unsafe = config_document()
+                unsafe["runbooks"] = [command]
+                (root / "recovery.json").write_text(json.dumps(unsafe), encoding="utf-8")
+                with self.subTest(command=command["id"]), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(root / "recovery.json", root)
+
             sensitive = config_document()
             sensitive["runbooks"] = [
                 {
@@ -132,6 +168,48 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("must be between 1 and 100", error)
 
+    def test_process_once_uses_the_concrete_recovery_processor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_config(root, "plan")
+            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        json.dumps(
+                            {
+                                "alerts": [
+                                    {
+                                        "status": "firing",
+                                        "fingerprint": "process-once",
+                                        "startsAt": "2026-07-14T00:00:00Z",
+                                        "labels": {
+                                            "alertname": "BotUnavailable",
+                                            "component": "bot",
+                                            "failure_class": "unavailable",
+                                            "instance": "local",
+                                        },
+                                    }
+                                ]
+                            }
+                        ).encode()
+                    )
+                )
+            processor = mock.Mock()
+            processor.process_once.return_value = {
+                "plannerLaunched": True,
+                "executorLaunched": False,
+                "outcome": "observe",
+            }
+            with mock.patch.object(
+                recovery_cli, "RecoveryProcessor", return_value=processor
+            ) as constructor:
+                code, output, error = call_cli(root, "process", "--once")
+            self.assertEqual((code, error), (0, ""))
+            self.assertTrue(json.loads(output)["plannerLaunched"])
+            constructor.assert_called_once()
+            processor.process_once.assert_called_once_with()
+
     def test_observe_mode_never_claims_and_approval_decisions_are_audited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -175,6 +253,33 @@ class RecoveryCliTests(unittest.TestCase):
                 self.assertIsNotNone(fence)
                 assert fence is not None
                 self.assertTrue(enabled.finish(fence, "pending_approval"))
+                frozen_plan = {
+                    "invocationId": fence.invocation_id,
+                    "incidentId": fence.incident_id,
+                    "generation": fence.generation,
+                    "evidenceHash": fence.evidence_hash,
+                    "policyRevision": fence.policy_revision,
+                    "verdict": "approval_required",
+                    "diagnosisCode": "operator_handoff",
+                    "summary": "A reviewed external handoff is required.",
+                    "evidenceRefs": ["event:1"],
+                    "runbookIds": ["external-handoff"],
+                    "probeIds": [],
+                    "nextEvaluationDelaySeconds": 60,
+                }
+                ledger.connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    (
+                        f"invocation:{fence.invocation_id}:plan",
+                        json.dumps(frozen_plan, separators=(",", ":"), sort_keys=True),
+                    ),
+                )
+
+            code, inspected, error = call_cli(
+                root, "invocations", "--id", str(fence.invocation_id)
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn("lease_token", json.loads(inspected)[0])
 
             code, output, error = call_cli(
                 root,
@@ -192,6 +297,21 @@ class RecoveryCliTests(unittest.TestCase):
                     "SELECT operation FROM audit ORDER BY id DESC LIMIT 1"
                 ).fetchone()[0]
                 self.assertEqual(audit, "approval_decision")
+                incident = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents WHERE id = ?", (fence.incident_id,)
+                ).fetchone()
+                self.assertEqual(incident["state"], "handoff_approved")
+                self.assertEqual(incident["generation"], fence.generation)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    recovery_cli._policy(
+                        loaded,
+                        recovery_supervisor.RecoveryControls(ledger).current().revision,
+                    ),
+                    owner="post-approval",
+                    mode="enabled",
+                )
+                self.assertIsNone(coordinator.claim_next())
 
 
 if __name__ == "__main__":

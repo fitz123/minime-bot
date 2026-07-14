@@ -36,6 +36,7 @@ import {
   type RecoveryCommandSpawnOptions,
   type RunbookDefinition,
 } from "../recovery/runbook-executor.js";
+import { runRecoveryWorkerRequest } from "../recovery/worker.js";
 
 const HASH = "a".repeat(64);
 const TRANSITION = "b".repeat(64);
@@ -250,6 +251,17 @@ describe("package-owned recovery fixer runner", () => {
     const result = await resultPromise;
     assert.equal(Object.isFrozen(result), true);
     assert.equal(result.diagnosisCode, "service_unhealthy");
+  });
+
+  it("rejects a signal-terminated planner even after valid-looking output", async () => {
+    const child = new FakePlannerChild();
+    const promise = runRecoveryPlanner(plannerRequest(), plannerDeps(child, []));
+    child.stdout.emitData(toolResultEvent(plan()));
+    child.emit("close", null, "SIGTERM");
+    await assert.rejects(
+      promise,
+      (error: unknown) => error instanceof RecoveryPlannerError && error.code === "child_failed",
+    );
   });
 
   it("keeps prompt-like evidence inside one untrusted positional argument", () => {
@@ -555,11 +567,135 @@ describe("deterministic recovery runbook executor", () => {
     assert.equal(spawnCount, 1);
   });
 
+  it("stops between runbooks and before probes when the durable fence changes", async () => {
+    const registry = commandRegistry();
+    registry.runbooks.push({
+      ...registry.runbooks[0],
+      id: "repair-second",
+      executable: "/opt/minime/runbook-second",
+    });
+    const children: FakeCommandChild[] = [];
+    let fenceChecks = 0;
+    const firstPromise = executeRecoveryPlan(
+      {
+        plan: plan({ runbookIds: ["repair-local", "repair-second"] }),
+        fence,
+        ...registry,
+      },
+      {
+        spawn: () => {
+          const child = new FakeCommandChild();
+          children.push(child);
+          return child;
+        },
+        checkFence: () => ++fenceChecks < 3,
+      },
+    );
+    await tick();
+    children[0].emitClose(0);
+    const first = await firstPromise;
+    assert.equal(first.status, "stale");
+    assert.equal(children.length, 1);
+
+    children.length = 0;
+    fenceChecks = 0;
+    const probePromise = executeRecoveryPlan(
+      { plan: plan(), fence, ...commandRegistry() },
+      {
+        spawn: () => {
+          const child = new FakeCommandChild();
+          children.push(child);
+          return child;
+        },
+        checkFence: () => ++fenceChecks < 4,
+      },
+    );
+    await tick();
+    children[0].emitClose(0);
+    const beforeProbe = await probePromise;
+    assert.equal(beforeProbe.status, "stale");
+    assert.equal(children.length, 1);
+  });
+
+  it("terminates an in-flight command when the owning worker is aborted", async () => {
+    const controller = new AbortController();
+    const child = new FakeCommandChild();
+    const signals: NodeJS.Signals[] = [];
+    const promise = executeRecoveryPlan(
+      { plan: plan(), fence, ...commandRegistry() },
+      {
+        spawn: () => child,
+        checkFence: () => !controller.signal.aborted,
+        signal: controller.signal,
+        abortGraceMs: 5,
+        killProcessGroup: (_child, signal) => signals.push(signal),
+      },
+    );
+    await tick();
+    controller.abort();
+    assert.deepEqual(signals, ["SIGTERM"]);
+    child.emitClose(1);
+    const result = await promise;
+    assert.equal(result.status, "failed");
+  });
+
   it("redacts bounded command output patterns", () => {
     const output = redactRecoveryOutput(
       "Authorization: Bearer abc token=def password: ghi https://user:pass@example.invalid/path",
     );
     assert.doesNotMatch(output, /\babc\b|\bdef\b|\bghi\b|user:pass/);
     assert.match(output, /\[REDACTED\]/);
+  });
+});
+
+describe("package-owned recovery worker bridge", () => {
+  it("connects a claimed request to the planner and mode-gated executor", async () => {
+    const requests: RecoveryPlannerRequest[] = [];
+    const result = await runRecoveryWorkerRequest(
+      {
+        version: 1,
+        mode: "plan",
+        fence,
+        evidence,
+        ...commandRegistry(),
+      },
+      {
+        env: { MINIME_AGENT_WORKSPACE_ROOT: "/agent/fixer" },
+        planner: async (request) => {
+          requests.push(request);
+          return plan();
+        },
+        executor: async () => ({
+          status: "planned",
+          runbookIds: ["repair-local"],
+          probeIds: ["probe-local"],
+          actions: [],
+          probes: [],
+        }),
+      },
+    );
+    assert.equal(result.status, "planned");
+    assert.equal(result.plannerLaunched, true);
+    assert.equal(result.executorLaunched, false);
+    assert.equal(result.plan?.invocationId, fence.invocationId);
+    assert.equal(requests[0].agent.workspaceCwd, "/agent/fixer");
+    assert.deepEqual(requests[0].knownRunbookIds, ["repair-local"]);
+  });
+
+  it("fails closed before planning when the dedicated agent workspace is absent", async () => {
+    let plannerCalls = 0;
+    const result = await runRecoveryWorkerRequest(
+      { version: 1, mode: "plan", fence, evidence, ...commandRegistry() },
+      {
+        env: {},
+        planner: async () => {
+          plannerCalls++;
+          return plan();
+        },
+      },
+    );
+    assert.equal(result.status, "planner_error");
+    assert.equal(result.code, "context_unavailable");
+    assert.equal(plannerCalls, 0);
   });
 });

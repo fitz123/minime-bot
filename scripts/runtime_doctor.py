@@ -27,6 +27,7 @@ from typing import Any, Callable
 from monitoring_native import (
     DeliveryConfig,
     MonitoringError,
+    read_private_ascii_token,
     request_with_deadline,
     send_telegram,
 )
@@ -287,42 +288,62 @@ def incident_message(incidents: set[str]) -> str:
     return "\n".join(lines)
 
 
-def read_state(path: Path) -> tuple[set[str], bool]:
+def _read_state_document(path: Path) -> tuple[dict[str, Any] | None, bool]:
     descriptor: int | None = None
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > STATE_MAX_BYTES:
-            return set(), True
+            return None, True
         raw = os.read(descriptor, STATE_MAX_BYTES + 1)
         if len(raw) > STATE_MAX_BYTES:
-            return set(), True
+            return None, True
         value = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
-        return set(), False
+        return None, False
     except (OSError, UnicodeError, ValueError):
-        return set(), True
+        return None, True
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    incidents = value.get("incidents") if isinstance(value, dict) and value.get("version") == STATE_VERSION else None
+    incidents = (
+        value.get("incidents")
+        if isinstance(value, dict) and value.get("version") == STATE_VERSION
+        else None
+    )
     if not isinstance(incidents, list) or not all(
         isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents
     ):
-        return set(), True
+        return None, True
     pending = value.get("pending")
-    if pending is not None:
-        if not _valid_pending(pending):
-            return set(), True
-        if pending["native_delivered"]:
-            return set(pending["target_incidents"]), False
-    return set(incidents), False
+    if pending is not None and not _valid_pending(pending):
+        return None, True
+    return value, False
 
 
-def write_state(path: Path, incidents: set[str]) -> None:
+def read_state(path: Path) -> tuple[set[str], bool]:
+    value, corrupt = _read_state_document(path)
+    if corrupt or value is None:
+        return set(), corrupt
+    pending = value.get("pending")
+    if isinstance(pending, dict) and pending["native_delivered"]:
+        return set(pending["target_incidents"]), False
+    return set(value["incidents"]), False
+
+
+def _write_state_document(
+    path: Path, incidents: set[str], pending: dict[str, Any] | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    document: dict[str, Any] = {
+        "version": STATE_VERSION,
+        "incidents": sorted(incidents),
+        "updated_at": int(time.time()),
+    }
+    if pending is not None:
+        document["pending"] = pending
     payload = json.dumps(
-        {"version": STATE_VERSION, "incidents": sorted(incidents), "updated_at": int(time.time())},
+        document,
         separators=(",", ":"),
     ) + "\n"
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
@@ -338,6 +359,10 @@ def write_state(path: Path, incidents: set[str]) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def write_state(path: Path, incidents: set[str]) -> None:
+    _write_state_document(path, incidents)
 
 
 def doctor_transition_id(code: str, status: str, transition: str) -> str:
@@ -408,32 +433,13 @@ def _valid_pending(value: Any) -> bool:
 
 
 def read_delivery_state(path: Path) -> tuple[set[str], dict[str, Any] | None, bool]:
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > STATE_MAX_BYTES:
-            return set(), None, True
-        raw = os.read(descriptor, STATE_MAX_BYTES + 1)
-        if len(raw) > STATE_MAX_BYTES:
-            return set(), None, True
-        value = json.loads(raw.decode("utf-8"))
-    except FileNotFoundError:
-        return set(), None, False
-    except (OSError, UnicodeError, ValueError):
-        return set(), None, True
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    incidents = value.get("incidents") if isinstance(value, dict) and value.get("version") == STATE_VERSION else None
-    if not isinstance(incidents, list) or not all(
-        isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents
-    ):
-        return set(), None, True
+    value, corrupt = _read_state_document(path)
+    if corrupt or value is None:
+        return set(), None, corrupt
     pending = value.get("pending")
-    if pending is not None and not _valid_pending(pending):
+    if pending is not None and not isinstance(pending, dict):
         return set(), None, True
-    return set(incidents), pending, False
+    return set(value["incidents"]), pending, False
 
 
 def write_delivery_state(
@@ -441,62 +447,32 @@ def write_delivery_state(
     incidents: set[str],
     pending: dict[str, Any] | None,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        {
-            "version": STATE_VERSION,
-            "incidents": sorted(incidents),
-            "pending": pending,
-            "updated_at": int(time.time()),
-        },
-        separators=(",", ":"),
-    ) + "\n"
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    _write_state_document(path, incidents, pending)
 
 
 def _read_recovery_token(path: Path) -> str:
-    descriptor: int | None = None
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or not 16 <= metadata.st_size <= RECOVERY_TOKEN_MAX_BYTES:
-            raise MonitoringError("recovery authentication is invalid")
-        raw = os.read(descriptor, RECOVERY_TOKEN_MAX_BYTES + 1)
-        token = raw.decode("utf-8").strip()
-        if len(raw) > RECOVERY_TOKEN_MAX_BYTES or not 16 <= len(token) or "\n" in token or "\r" in token:
-            raise MonitoringError("recovery authentication is invalid")
-        token.encode("ascii")
-        return token
-    except (OSError, UnicodeError) as exc:
+        return read_private_ascii_token(path, max_bytes=RECOVERY_TOKEN_MAX_BYTES)
+    except MonitoringError as exc:
         raise MonitoringError("recovery authentication is unavailable") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def send_recovery_events(
     events: list[dict[str, str]],
     config: DoctorConfig,
     *,
+    heartbeats: dict[str, bool] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     if config.recovery_url is None or config.recovery_token_file is None:
         raise MonitoringError("recovery sink is not configured")
     token = _read_recovery_token(config.recovery_token_file)
     body = json.dumps(
-        {"version": 1, "events": events},
+        {
+            "version": 1,
+            "events": events,
+            "heartbeats": heartbeats or {"runtime_doctor": True},
+        },
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
@@ -581,9 +557,18 @@ def run_doctor(
             active_logger.error("doctor_state_corrupt_reset")
             write_delivery_state(config.state_path, set(), None)
             return 0
-        recovery_notify = deliver_recovery or (lambda events: send_recovery_events(events, config))
+        source_heartbeats = {"runtime_doctor": True}
+        if config.alertmanager_url is not None:
+            source_heartbeats["alertmanager"] = "alertmanager_unhealthy" not in incidents
+        recovery_notify = deliver_recovery or (
+            lambda events: send_recovery_events(
+                events, config, heartbeats=source_heartbeats
+            )
+        )
+        recovery_delivered = False
 
         def finish_pending(active: dict[str, Any]) -> tuple[bool, set[str]]:
+            nonlocal recovery_delivered
             target = set(active["target_incidents"])
             if config.sink_mode == "tee" and not active["native_delivered"]:
                 try:
@@ -598,6 +583,7 @@ def run_doctor(
             except (MonitoringError, OSError):
                 active_logger.error("doctor_recovery_sink_failed")
                 return False, previous
+            recovery_delivered = True
             write_delivery_state(config.state_path, target, None)
             active_logger.info(
                 "doctor_transition_notified codes=%s",
@@ -612,6 +598,12 @@ def run_doctor(
         if incidents == previous:
             if not config.state_path.exists():
                 write_delivery_state(config.state_path, incidents, None)
+            if not recovery_delivered:
+                try:
+                    recovery_notify([])
+                except (MonitoringError, OSError):
+                    active_logger.error("doctor_recovery_sink_failed")
+                    return 1
             active_logger.info("doctor_state_unchanged codes=%s", ",".join(sorted(incidents)) or "healthy")
             return 0
         pending = {

@@ -33,7 +33,7 @@ export const MAX_RECOVERY_PLANNER_OUTPUT_BYTES = 256 * 1024;
 export const RECOVERY_PLANNER_TIMEOUT_MS = 120_000;
 export const RECOVERY_PLANNER_ABORT_GRACE_MS = 5_000;
 
-const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_EVIDENCE_VALUE = /^[A-Za-z0-9][A-Za-z0-9 ._:/@+?-]{0,159}$/;
 const HASH = /^[a-f0-9]{64}$/;
 
@@ -86,7 +86,10 @@ export class RecoveryPlannerError extends Error {
 export interface RecoveryPlannerChildLike {
   stdout: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
   stderr: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
-  on(event: "close", listener: (code: number | null) => void): unknown;
+  on(
+    event: "close",
+    listener: (code: number | null, signal?: NodeJS.Signals | null) => void,
+  ): unknown;
   on(event: "error", listener: (error: Error) => void): unknown;
   kill(signal?: NodeJS.Signals | number): boolean;
 }
@@ -486,7 +489,7 @@ function runPlannerChild(
         aborted,
       });
     };
-    child.on("close", (code) => finish(code ?? 0));
+    child.on("close", (code, signal) => finish(code === null || signal ? 1 : code));
     child.on("error", () => {
       spawnFailed = true;
       finish(1);

@@ -132,6 +132,7 @@ export interface RecoveryExecutorDependencies {
   ) => void;
   abortGraceMs?: number;
   maxOutputBytes?: number;
+  signal?: AbortSignal;
 }
 
 class ExecutorConfigError extends Error {}
@@ -257,6 +258,9 @@ function runStaticCommand(
   command: StaticRecoveryCommand,
   deps: RecoveryExecutorDependencies,
 ): Promise<RecoveryCommandResult> {
+  if (deps.signal?.aborted) {
+    return Promise.resolve({ id, exitCode: 1, timedOut: false, output: "", truncated: false });
+  }
   const commandSpawn: RecoveryCommandSpawn = deps.spawn ?? ((executable, argv, options) => (
     spawn(executable, argv, options) as unknown as RecoveryCommandChildLike
   ));
@@ -300,15 +304,18 @@ function runStaticCommand(
     const kill = (signal: NodeJS.Signals) => {
       (deps.killProcessGroup ?? defaultKillProcessGroup)(child, signal, detached);
     };
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    const stop = (timeoutStop: boolean) => {
+      timedOut = timedOut || timeoutStop;
       kill("SIGTERM");
-      killTimer = setTimeout(() => {
+      killTimer ??= setTimeout(() => {
         if (!settled) {
           kill("SIGKILL");
         }
       }, abortGraceMs);
-    }, command.timeoutMs);
+    };
+    const timeout = setTimeout(() => stop(true), command.timeoutMs);
+    const onAbort = () => stop(false);
+    deps.signal?.addEventListener("abort", onAbort, { once: true });
 
     const finish = (exitCode: number) => {
       if (settled) {
@@ -319,6 +326,7 @@ function runStaticCommand(
       if (killTimer) {
         clearTimeout(killTimer);
       }
+      deps.signal?.removeEventListener("abort", onAbort);
       const raw = Buffer.concat(chunks).toString("utf8");
       resolve({
         id,
@@ -330,6 +338,9 @@ function runStaticCommand(
     };
     child.on("close", (code) => finish(code ?? (timedOut ? 124 : 1)));
     child.on("error", () => finish(1));
+    if (deps.signal?.aborted) {
+      onAbort();
+    }
   });
 }
 

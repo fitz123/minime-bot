@@ -201,6 +201,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/tavily-secret.js",
     "dist/recovery/fixer-runner.js",
     "dist/recovery/runbook-executor.js",
+    "dist/recovery/worker.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -580,6 +581,7 @@ describe("package artifact install", () => {
 });
 
 const INSTALLED_RECOVERY_E2E = String.raw`
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -702,6 +704,83 @@ with tempfile.TemporaryDirectory() as directory:
     assert len(list((root / "events").glob("*.json"))) == 1
     assert len(delivered) == 1
 
+worker_config = replace(
+    config,
+    mode="enabled",
+    database=workspace / "var/recovery/worker-ledger.sqlite3",
+    source_ids=("alertmanager",),
+    runbooks=({
+        "id": "installed-repair",
+        "actionClass": "local_repair",
+        "executable": "/usr/bin/true",
+        "argv": [],
+        "env": {},
+        "timeoutMs": 1000,
+    },),
+    probes=({
+        "id": "installed-probe",
+        "executable": "/usr/bin/true",
+        "argv": [],
+        "env": {},
+        "timeoutMs": 1000,
+    },),
+)
+worker_ledger = recovery_ledger.RecoveryLedger(worker_config.database)
+worker_ledger.record_events(events)
+worker_controls = recovery_supervisor.RecoveryControls(worker_ledger)
+worker_coordinator = recovery_supervisor.IncidentCoordinator(
+    worker_ledger, policy, owner="installed-worker", controls=worker_controls, mode="enabled"
+)
+worker_verifier = recovery_supervisor.RecoveryVerifier(
+    worker_ledger,
+    worker_coordinator,
+    probe_ids=("installed-probe",),
+    source_ids=("alertmanager",),
+)
+worker_adapter = recovery_supervisor.BoundedPolicyAdapter(worker_ledger, worker_controls)
+
+def installed_worker(request, _fence):
+    fence = request["fence"]
+    return {
+        "version": 1,
+        "status": "completed",
+        "plannerLaunched": True,
+        "executorLaunched": True,
+        "plan": {
+            "invocationId": fence["invocationId"],
+            "incidentId": fence["incidentId"],
+            "generation": fence["generation"],
+            "evidenceHash": fence["evidenceHash"],
+            "policyRevision": fence["policyRevision"],
+            "verdict": "execute",
+            "diagnosisCode": "installed_repair",
+            "summary": "Installed worker orchestration check.",
+            "evidenceRefs": [request["evidence"][0]["ref"]],
+            "runbookIds": ["installed-repair"],
+            "probeIds": ["installed-probe"],
+            "nextEvaluationDelaySeconds": 60,
+        },
+        "actions": [{
+            "id": "installed-repair", "exitCode": 0, "timedOut": False,
+            "output": "", "truncated": False,
+        }],
+        "probes": [{
+            "id": "installed-probe", "exitCode": 0, "timedOut": False,
+            "output": "", "truncated": False,
+        }],
+    }
+
+worker_result = recovery_supervisor.RecoveryProcessor(
+    worker_config,
+    worker_coordinator,
+    worker_verifier,
+    worker_adapter,
+    runner=installed_worker,
+).process_once()
+assert worker_result["outcome"] == "completed"
+assert worker_ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 2
+worker_ledger.close()
+
 second_ledger.close()
 ledger.close()
 `;
@@ -787,6 +866,7 @@ class FakeChild extends EventEmitter {
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-runner.js");
 const recoveryExecutor = await importPackageFile("dist/recovery/runbook-executor.js");
+const recoveryWorker = await importPackageFile("dist/recovery/worker.js");
 let recoverySpawnCount = 0;
 const installedFence = {
   invocationId: 1,
@@ -840,6 +920,62 @@ for (const mode of ["observe", "plan"]) {
   assert.equal(modeResult.status, mode === "observe" ? "observe" : "planned");
 }
 assert.equal(recoverySpawnCount, 0, "installed observe/plan modes must have zero executor side effects");
+const enabledChildren = [];
+const enabledPromise = recoveryExecutor.executeRecoveryPlan(
+  {
+    mode: "enabled",
+    plan: installedPlan,
+    fence: installedFence,
+    runbooks: [installedRunbook],
+    probes: [installedProbe],
+  },
+  {
+    checkFence: () => true,
+    spawn: () => {
+      const child = new FakeChild();
+      enabledChildren.push(child);
+      return child;
+    },
+  },
+);
+await new Promise((resolve) => setImmediate(resolve));
+enabledChildren[0].emitClose(0);
+await new Promise((resolve) => setImmediate(resolve));
+enabledChildren[1].emitClose(0);
+assert.equal((await enabledPromise).status, "completed");
+
+const workerResult = await recoveryWorker.runRecoveryWorkerRequest(
+  {
+    version: 1,
+    mode: "plan",
+    fence: installedFence,
+    evidence: [{
+      ref: "event:one",
+      source: "alertmanager",
+      fingerprint: "installed-episode",
+      code: "service_unhealthy",
+      component: "bot",
+      failureClass: "availability",
+      status: "firing",
+      transitionId: "c".repeat(64),
+    }],
+    runbooks: [installedRunbook],
+    probes: [installedProbe],
+  },
+  {
+    env: { MINIME_AGENT_WORKSPACE_ROOT: agentWorkspace },
+    planner: async () => installedPlan,
+    executor: async () => ({
+      status: "planned",
+      runbookIds: ["installed-check"],
+      probeIds: ["installed-probe"],
+      actions: [],
+      probes: [],
+    }),
+  },
+);
+assert.equal(workerResult.status, "planned");
+assert.equal(workerResult.plan.invocationId, installedFence.invocationId);
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(

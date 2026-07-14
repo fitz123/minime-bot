@@ -3,10 +3,12 @@ from __future__ import annotations
 import http.client
 import json
 from pathlib import Path
+import socket
 import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -14,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import monitoring_native
+import recovery_config
 import recovery_ledger
 import recovery_supervisor
 import runtime_doctor
@@ -529,6 +532,42 @@ class IncidentCoordinatorTests(unittest.TestCase):
                     self.assertTrue(coordinator.finish(fence, outcome))
                     self.assertEqual(escalations, [escalation])
 
+    def test_lease_renewal_keeps_one_owner_and_rejects_changed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert("one")))
+                )
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=2),
+                    owner="supervisor-one",
+                    clock=lambda: clock[0],
+                )
+                fence = coordinator.claim_next()
+                self.assertIsNotNone(fence)
+                assert fence is not None
+                clock[0] = 101.5
+                self.assertTrue(coordinator.renew_lease(fence))
+                lease_expiry = ledger.connection.execute(
+                    "SELECT expires_at FROM fixer_lease WHERE singleton = 1"
+                ).fetchone()[0]
+                self.assertEqual(lease_expiry, 103.5)
+                contender = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=2),
+                    owner="supervisor-two",
+                    clock=lambda: clock[0],
+                )
+                self.assertIsNone(contender.claim_next())
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("two", starts_at="2026-07-14T00:01:00Z"))
+                    )
+                )
+                self.assertFalse(coordinator.renew_lease(fence))
+
 
 class RecoveryControlTests(unittest.TestCase):
     def test_controls_expire_and_rollback_with_complete_revision_audits(self) -> None:
@@ -610,6 +649,59 @@ class RecoveryControlTests(unittest.TestCase):
                     )
                     self.assertIsInstance(details["revision"], int)
                     self.assertTrue(details["reason"])
+
+    def test_replacing_expired_temporary_control_reverts_to_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                controls = recovery_supervisor.RecoveryControls(
+                    ledger, clock=lambda: clock[0]
+                )
+                controls.set_dispatch(
+                    False,
+                    actor="operator",
+                    reason="first window",
+                    expires_at=110.0,
+                )
+                clock[0] = 111.0
+                controls.set_dispatch(
+                    False,
+                    actor="operator",
+                    reason="second window",
+                    expires_at=120.0,
+                )
+                clock[0] = 121.0
+                self.assertTrue(controls.current().dispatch_enabled)
+                controls.expire()
+                self.assertTrue(controls.current().dispatch_enabled)
+
+    def test_static_configuration_is_revision_fenced_and_rollback_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                first = controls.ensure_static_policy(
+                    {"version": 1, "mode": "plan", "runbooks": [{"id": "one"}]}
+                )
+                same = controls.ensure_static_policy(
+                    {"version": 1, "mode": "plan", "runbooks": [{"id": "one"}]}
+                )
+                self.assertEqual(same, first)
+                control_revision = controls.set_cooldown(
+                    60, actor="operator", reason="reviewed cooldown"
+                )
+                changed = controls.ensure_static_policy(
+                    {"version": 1, "mode": "plan", "runbooks": [{"id": "two"}]}
+                )
+                self.assertGreater(changed, control_revision)
+                rollback = controls.rollback(
+                    control_revision, actor="operator", reason="restore controls only"
+                )
+                document = json.loads(
+                    ledger.connection.execute(
+                        "SELECT policy_json FROM policy_revisions WHERE revision = ?", (rollback,)
+                    ).fetchone()[0]
+                )
+                self.assertEqual(document["recovery_static"]["runbooks"], [{"id": "two"}])
 
     def test_dispatch_confirmation_cooldown_silence_and_retry_budget_gate_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -949,16 +1041,175 @@ class RecoveryDigestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     outbox.immediate_escalation("routine_digest")
 
+    def test_immediate_escalation_reports_missing_delivery_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                emergency = recovery_supervisor.EmergencyNotifier(
+                    root / "notifications", delivery=None
+                )
+                outbox = recovery_supervisor.RecoveryNotificationOutbox(
+                    ledger, emergency=emergency
+                )
+                self.assertFalse(outbox.immediate_escalation("pi_unavailable"))
+
+
+class RecoveryProcessorTests(unittest.TestCase):
+    def test_claim_plan_execute_persist_probe_and_finish_are_wired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = recovery_config.RecoveryConfig(
+                path=root / "recovery.json",
+                workspace=root,
+                mode="enabled",
+                database=root / "ledger.sqlite3",
+                spool_directory=root / "spool",
+                auth_token_file=root / "auth-token",
+                host="127.0.0.1",
+                port=9877,
+                correlation_rules=(),
+                source_ids=("alertmanager",),
+                runbooks=(
+                    {
+                        "id": "repair-local",
+                        "actionClass": "local_repair",
+                        "executable": "/usr/bin/true",
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                ),
+                probes=(
+                    {
+                        "id": "probe-local",
+                        "executable": "/usr/bin/true",
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                ),
+            )
+            with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                )
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="processor-owner", controls=controls
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("probe-local",),
+                    source_ids=("alertmanager",),
+                )
+                adapter = recovery_supervisor.BoundedPolicyAdapter(ledger, controls)
+                requests: list[dict[str, object]] = []
+
+                def runner(
+                    request: dict[str, object], _fence: recovery_supervisor.InvocationFence
+                ) -> dict[str, object]:
+                    requests.append(request)
+                    public_fence = {
+                        key: request["fence"][key]  # type: ignore[index]
+                        for key in (
+                            "invocationId",
+                            "incidentId",
+                            "generation",
+                            "evidenceHash",
+                            "policyRevision",
+                        )
+                    }
+                    return {
+                        "version": 1,
+                        "status": "completed",
+                        "plannerLaunched": True,
+                        "executorLaunched": True,
+                        "plan": {
+                            **public_fence,
+                            "verdict": "execute",
+                            "diagnosisCode": "local_repair",
+                            "summary": "A configured local repair is applicable.",
+                            "evidenceRefs": [request["evidence"][0]["ref"]],  # type: ignore[index]
+                            "runbookIds": ["repair-local"],
+                            "probeIds": ["probe-local"],
+                            "nextEvaluationDelaySeconds": 60,
+                        },
+                        "actions": [
+                            {
+                                "id": "repair-local",
+                                "exitCode": 0,
+                                "timedOut": False,
+                                "output": "",
+                                "truncated": False,
+                            }
+                        ],
+                        "probes": [
+                            {
+                                "id": "probe-local",
+                                "exitCode": 0,
+                                "timedOut": False,
+                                "output": "",
+                                "truncated": False,
+                            }
+                        ],
+                    }
+
+                processor = recovery_supervisor.RecoveryProcessor(
+                    config, coordinator, verifier, adapter, runner=runner
+                )
+                result = processor.process_once()
+                self.assertEqual(result["outcome"], "completed")
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(requests[0]["evidence"]), 1)  # type: ignore[arg-type]
+                invocation = ledger.connection.execute(
+                    "SELECT id, state FROM invocations"
+                ).fetchone()
+                self.assertEqual(invocation["state"], "completed")
+                self.assertIsNotNone(
+                    ledger.connection.execute(
+                        "SELECT value FROM metadata WHERE key = ?",
+                        (f"invocation:{invocation['id']}:plan",),
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0], 2
+                )
+                probe = json.loads(
+                    ledger.connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'verification:probe:probe-local'"
+                    ).fetchone()[0]
+                )
+                self.assertTrue(probe["healthy"])
+                self.assertIsNotNone(
+                    ledger.connection.execute(
+                        "SELECT 1 FROM audit WHERE operation = 'mechanical_outcome'"
+                    ).fetchone()
+                )
+
 
 class RecoveryHttpTests(unittest.TestCase):
     def test_authenticated_health_and_input_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                recovery_supervisor.RecoveryPolicy(revision=1, rules=()),
+                owner="http-test",
+                mode="observe",
+            )
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                source_ids=("alertmanager", "runtime_doctor"),
+            )
             service = recovery_supervisor.RecoveryService(
                 ledger,
                 recovery_supervisor.AtomicJsonSpool(root / "events"),
                 recovery_supervisor.EmergencyNotifier(root / "notifications", delivery=None),
+                coordinator,
+                verifier,
             )
             token = "synthetic-auth-token-value"
             app = recovery_supervisor.RecoveryApplication(
@@ -1006,7 +1257,91 @@ class RecoveryHttpTests(unittest.TestCase):
                 self.assertEqual(request("POST", "/v1/alertmanager", valid)[0], 200)
                 self.assertEqual(request("POST", "/v1/alertmanager", valid)[0], 200)
                 self.assertEqual(ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0], 1)
+                heartbeat = json.dumps(
+                    {
+                        "version": 1,
+                        "events": [],
+                        "heartbeats": {"runtime_doctor": True, "alertmanager": True},
+                    }
+                ).encode()
+                self.assertEqual(request("POST", "/v1/runtime-doctor", heartbeat)[0], 200)
+                self.assertIsNotNone(
+                    ledger.connection.execute(
+                        "SELECT value FROM metadata "
+                        "WHERE key = 'verification:heartbeat:runtime_doctor'"
+                    ).fetchone()
+                )
             finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                ledger.close()
+
+    def test_partial_body_timeout_releases_bounded_request_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            service = recovery_supervisor.RecoveryService(
+                ledger,
+                recovery_supervisor.AtomicJsonSpool(root / "events"),
+                recovery_supervisor.EmergencyNotifier(root / "notifications", delivery=None),
+            )
+            token = "synthetic-auth-token-value"
+            app = recovery_supervisor.RecoveryApplication(
+                auth_token=token,
+                max_body=1_024,
+                body_timeout=1.0,
+                service=service,
+            )
+            server = recovery_supervisor.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                recovery_supervisor.handler_for(app),
+                max_concurrent_requests=2,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            partials: list[socket.socket] = []
+            try:
+                request = (
+                    "POST /v1/runtime-doctor HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer {token}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 128\r\n\r\n{"
+                ).encode("ascii")
+                for _ in range(2):
+                    connection = socket.create_connection(("127.0.0.1", port), timeout=1)
+                    connection.sendall(request)
+                    partials.append(connection)
+                deadline = time.monotonic() + 1
+                while getattr(server._request_slots, "_value", 1) != 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(getattr(server._request_slots, "_value", 1), 0)
+                excess = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                with self.assertRaises((ConnectionError, http.client.HTTPException, OSError)):
+                    excess.request(
+                        "GET",
+                        "/healthz",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    excess.getresponse()
+                excess.close()
+                for connection in partials:
+                    connection.settimeout(2)
+                    response = connection.recv(1024)
+                    self.assertIn(b"408", response)
+                    connection.close()
+                partials.clear()
+                healthy = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                healthy.request(
+                    "GET", "/healthz", headers={"Authorization": f"Bearer {token}"}
+                )
+                self.assertEqual(healthy.getresponse().status, 200)
+                healthy.close()
+            finally:
+                for connection in partials:
+                    connection.close()
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
@@ -1034,6 +1369,7 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
     def config(self, root: Path, mode: str) -> runtime_doctor.DoctorConfig:
         token = root / "auth-token"
         token.write_text("synthetic-auth-token-value", encoding="utf-8")
+        token.chmod(0o600)
         return runtime_doctor.DoctorConfig.from_environ(
             {
                 "MINIME_DOCTOR_STATE_PATH": str(root / "doctor.json"),
@@ -1131,8 +1467,189 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual([event["status"] for event in events], ["firing"])
 
+    def test_real_recovery_http_retries_and_sends_authenticated_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            received: list[tuple[str, dict[str, object]]] = []
+            statuses = [503, 200]
+
+            class Handler(recovery_supervisor.BaseHTTPRequestHandler):
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+                def do_POST(self) -> None:  # noqa: N802
+                    length = int(self.headers["Content-Length"])
+                    received.append(
+                        (
+                            self.headers.get("Authorization", ""),
+                            json.loads(self.rfile.read(length).decode("ascii")),
+                        )
+                    )
+                    self.send_response(statuses.pop(0))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            server = recovery_supervisor.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
+            config = runtime_doctor.DoctorConfig.from_environ(
+                {
+                    "MINIME_DOCTOR_STATE_PATH": str(root / "doctor.json"),
+                    "MINIME_DOCTOR_SINK": "recovery",
+                    "MINIME_DOCTOR_RECOVERY_URL": (
+                        f"http://127.0.0.1:{server.server_address[1]}/v1/runtime-doctor"
+                    ),
+                    "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": str(token),
+                    "MINIME_DOCTOR_RECOVERY_ATTEMPTS": "2",
+                    "MINIME_DOCTOR_TIMEOUT": "1",
+                }
+            )
+            try:
+                runtime_doctor.send_recovery_events(
+                    [],
+                    config,
+                    heartbeats={"runtime_doctor": True, "alertmanager": True},
+                    sleep=lambda _delay: None,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertEqual(len(received), 2)
+            self.assertEqual(received[0], received[1])
+            self.assertEqual(received[0][0], "Bearer synthetic-auth-token-value")
+            self.assertEqual(
+                received[0][1]["heartbeats"],
+                {"runtime_doctor": True, "alertmanager": True},
+            )
+
+    def test_real_recovery_http_does_not_retry_terminal_4xx_or_network_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
+            calls = [0]
+
+            class RejectingHandler(recovery_supervisor.BaseHTTPRequestHandler):
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+                def do_POST(self) -> None:  # noqa: N802
+                    calls[0] += 1
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                    self.send_response(400)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            server = recovery_supervisor.ThreadingHTTPServer(
+                ("127.0.0.1", 0), RejectingHandler
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            def config_for(target_port: int) -> runtime_doctor.DoctorConfig:
+                return runtime_doctor.DoctorConfig.from_environ(
+                    {
+                        "MINIME_DOCTOR_STATE_PATH": str(root / "doctor.json"),
+                        "MINIME_DOCTOR_SINK": "recovery",
+                        "MINIME_DOCTOR_RECOVERY_URL": (
+                            f"http://127.0.0.1:{target_port}/v1/runtime-doctor"
+                        ),
+                        "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": str(token),
+                        "MINIME_DOCTOR_RECOVERY_ATTEMPTS": "2",
+                        "MINIME_DOCTOR_TIMEOUT": "0.2",
+                    }
+                )
+
+            try:
+                with self.assertRaises(monitoring_native.MonitoringError):
+                    runtime_doctor.send_recovery_events([], config_for(port), sleep=lambda _delay: None)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertEqual(calls[0], 1)
+
+            unused = socket.socket()
+            unused.bind(("127.0.0.1", 0))
+            unused_port = unused.getsockname()[1]
+            unused.close()
+            with self.assertRaises(monitoring_native.MonitoringError):
+                runtime_doctor.send_recovery_events(
+                    [], config_for(unused_port), sleep=lambda _delay: None
+                )
+
+    def test_authentication_token_files_must_be_owner_only_and_not_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o644)
+            with self.assertRaises(ValueError):
+                recovery_supervisor.read_auth_token(token)
+            with self.assertRaises(monitoring_native.MonitoringError):
+                runtime_doctor._read_recovery_token(token)
+            token.chmod(0o600)
+            self.assertEqual(
+                recovery_supervisor.read_auth_token(token), "synthetic-auth-token-value"
+            )
+            link = root / "auth-token-link"
+            link.symlink_to(token)
+            with self.assertRaises(ValueError):
+                recovery_supervisor.read_auth_token(link)
+
 
 class SupervisorStartupTests(unittest.TestCase):
+    def test_temporary_startup_ledger_failure_keeps_spool_only_intake_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
+            captured: list[recovery_supervisor.RecoveryApplication] = []
+            server = mock.Mock()
+            server.handle_request.side_effect = KeyboardInterrupt
+
+            def capture(app: recovery_supervisor.RecoveryApplication) -> object:
+                captured.append(app)
+                return object
+
+            with (
+                mock.patch.object(
+                    recovery_supervisor,
+                    "RecoveryLedger",
+                    side_effect=recovery_ledger.LedgerUnavailable("synthetic startup lock"),
+                ),
+                mock.patch.object(recovery_supervisor, "handler_for", side_effect=capture),
+                mock.patch.object(
+                    recovery_supervisor, "BoundedThreadingHTTPServer", return_value=server
+                ),
+            ):
+                result = recovery_supervisor.main(
+                    [
+                        "--mode",
+                        "observe",
+                        "--db",
+                        str(root / "ledger.sqlite3"),
+                        "--spool-dir",
+                        str(root / "spool"),
+                        "--auth-token-file",
+                        str(token),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(len(captured), 1)
+            intake = captured[0].service.accept(
+                recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+            )
+            self.assertEqual(intake.status, 202)
+            self.assertEqual(len(list((root / "spool" / "events").glob("*.json"))), 1)
+
     def test_corruption_triggers_only_compact_native_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1140,10 +1657,13 @@ class SupervisorStartupTests(unittest.TestCase):
             database.write_bytes(b"corrupt database with private-looking material")
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
             messages: list[str] = []
             with mock.patch.object(recovery_supervisor, "send_telegram", side_effect=lambda message, _config: messages.append(message)):
                 result = recovery_supervisor.main(
                     [
+                        "--mode",
+                        "observe",
                         "--db",
                         str(database),
                         "--spool-dir",

@@ -9,8 +9,10 @@ import json
 import math
 import multiprocessing
 import os
+from pathlib import Path
 import re
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -40,6 +42,34 @@ class SecretError(MonitoringError):
 
 class DeliveryError(MonitoringError):
     pass
+
+
+def read_private_ascii_token(path: Path, *, max_bytes: int) -> str:
+    """Read an owner-only regular token file without following symlinks."""
+
+    descriptor: int | None = None
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or not 16 <= metadata.st_size <= max_bytes
+        ):
+            raise MonitoringError("authentication token file is invalid")
+        raw = os.read(descriptor, max_bytes + 1)
+        token = raw.decode("utf-8").strip()
+        if len(raw) > max_bytes or not 16 <= len(token) or "\n" in token or "\r" in token:
+            raise MonitoringError("authentication token file is invalid")
+        token.encode("ascii")
+        return token
+    except (OSError, UnicodeError) as exc:
+        raise MonitoringError("authentication token file is invalid") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def sops_expression(dotted_key: str) -> str:

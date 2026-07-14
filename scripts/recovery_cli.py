@@ -6,12 +6,18 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import sys
 import time
 from typing import Any
 
-from recovery_config import RecoveryConfig, RecoveryConfigError, load_recovery_config
+from recovery_config import (
+    RecoveryConfig,
+    RecoveryConfigError,
+    load_recovery_config,
+    recovery_static_policy,
+)
 from recovery_ledger import LedgerError, RecoveryLedger
 from recovery_supervisor import (
     CorrelationRule,
@@ -19,6 +25,9 @@ from recovery_supervisor import (
     RecoveryControls,
     RecoveryNotificationOutbox,
     RecoveryPolicy,
+    RecoveryProcessor,
+    RecoveryVerifier,
+    BoundedPolicyAdapter,
     safe_field,
 )
 
@@ -127,9 +136,9 @@ def _config(args: argparse.Namespace) -> RecoveryConfig:
     return load_recovery_config(path, workspace)
 
 
-def _policy(config: RecoveryConfig) -> RecoveryPolicy:
+def _policy(config: RecoveryConfig, revision: int = 1) -> RecoveryPolicy:
     return RecoveryPolicy(
-        revision=1,
+        revision=revision,
         rules=tuple(
             CorrelationRule(
                 component=str(rule["component"]),
@@ -152,6 +161,11 @@ def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: Recovery
     return {
         "mode": config.mode,
         "database": str(config.database),
+        "emergencyDeliveryConfigured": bool(
+            os.environ.get("MINIME_TELEGRAM_CHAT_ID", "").strip()
+            and os.environ.get("MINIME_TELEGRAM_SOPS_FILE", "").strip()
+            and os.environ.get("MINIME_TELEGRAM_SOPS_KEY", "").strip()
+        ),
         "controls": asdict(snapshot),
         "counts": {
             "events": connection.execute("SELECT count(*) FROM events").fetchone()[0],
@@ -169,13 +183,18 @@ def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: Recovery
 def _inspect(ledger: RecoveryLedger, table: str, identifier: int | None, limit: int) -> list[dict[str, Any]]:
     if table not in {"incidents", "invocations"}:
         raise ValueError("recovery inspection target is invalid")
+    columns = (
+        "id, correlation_key, state, generation, evidence_hash, policy_revision, opened_at, updated_at"
+        if table == "incidents"
+        else "id, incident_id, generation, evidence_hash, policy_revision, state, created_at, updated_at"
+    )
     if identifier is None:
         rows = ledger.connection.execute(
-            f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)
+            f"SELECT {columns} FROM {table} ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     else:
         rows = ledger.connection.execute(
-            f"SELECT * FROM {table} WHERE id = ?", (identifier,)
+            f"SELECT {columns} FROM {table} WHERE id = ?", (identifier,)
         ).fetchall()
     return _rows(rows)
 
@@ -207,9 +226,21 @@ def _approval(
         ).fetchone()
         if incident is None or incident["state"] != "pending_approval":
             raise ValueError("recovery incident is not pending approval")
+        frozen = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (f"invocation:{invocation_id}:plan",),
+        ).fetchone()
+        if frozen is None:
+            raise ValueError("recovery invocation has no frozen plan")
+        try:
+            frozen_plan = json.loads(str(frozen["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("recovery invocation frozen plan is invalid") from exc
+        if not isinstance(frozen_plan, dict) or frozen_plan.get("invocationId") != invocation_id:
+            raise ValueError("recovery invocation frozen plan is invalid")
         row = controls._current_row(connection)
         document = controls._document(row)
-        after_state = "eligible" if approved else "not_actionable"
+        after_state = "handoff_approved" if approved else "handoff_rejected"
         revision = controls.append_revision(
             connection,
             document,
@@ -223,8 +254,7 @@ def _approval(
             now=now,
         )
         connection.execute(
-            "UPDATE incidents SET state = ?, generation = generation + 1, "
-            "policy_revision = ?, updated_at = ? WHERE id = ?",
+            "UPDATE incidents SET state = ?, policy_revision = ?, updated_at = ? WHERE id = ?",
             (after_state, revision, now, incident["id"]),
         )
         connection.execute(
@@ -279,9 +309,10 @@ def run(args: argparse.Namespace) -> int:
 
     with RecoveryLedger(config.database) as ledger:
         controls = RecoveryControls(ledger)
+        revision = controls.ensure_static_policy(recovery_static_policy(config))
         coordinator = IncidentCoordinator(
             ledger,
-            _policy(config),
+            _policy(config, revision),
             owner="recovery-cli",
             controls=controls,
             mode=config.mode,
@@ -352,7 +383,15 @@ def run(args: argparse.Namespace) -> int:
             active = coordinator.reconcile()
             controls.expire()
             RecoveryNotificationOutbox(ledger).queue_periodic()
-            _json({"ok": True, "mode": config.mode, "activeIncidents": active, "plannerLaunched": False, "executorLaunched": False})
+            verifier = RecoveryVerifier(
+                ledger,
+                coordinator,
+                probe_ids=tuple(str(probe["id"]) for probe in config.probes),
+                source_ids=config.source_ids,
+            )
+            adapter = BoundedPolicyAdapter(ledger, controls)
+            processing = RecoveryProcessor(config, coordinator, verifier, adapter).process_once()
+            _json({"ok": True, "mode": config.mode, "activeIncidents": active, **processing})
         else:
             raise ValueError("unknown recovery command")
     return 0

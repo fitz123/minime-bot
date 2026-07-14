@@ -11,9 +11,13 @@ from typing import Any
 
 
 RECOVERY_MODES = frozenset({"observe", "plan", "enabled"})
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _SENSITIVE = re.compile(r"AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
+_SENSITIVE_ARG = re.compile(
+    r"^--?(?:api[-_]?key|authorization|credential|password|secret|token)(?:=|$)",
+    re.IGNORECASE,
+)
 _ROOT_KEYS = {
     "version",
     "mode",
@@ -82,13 +86,24 @@ def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
     item = _object(value, keys, "runbook" if runbook else "probe")
     _safe_id(item["id"], "command id")
     executable = item["executable"]
-    if not isinstance(executable, str) or not Path(executable).is_absolute() or "\0" in executable:
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or "\0" in executable
+        or Path(executable).name.lower() == "sudo"
+    ):
         raise RecoveryConfigError("recovery command executable is invalid")
     argv = item["argv"]
     if (
         not isinstance(argv, list)
         or len(argv) > 64
-        or not all(isinstance(arg, str) and "\0" not in arg and len(arg.encode()) <= 4096 for arg in argv)
+        or not all(
+            isinstance(arg, str)
+            and "\0" not in arg
+            and len(arg.encode()) <= 4096
+            and _SENSITIVE_ARG.search(arg) is None
+            for arg in argv
+        )
         or sum(len(arg.encode()) for arg in argv) > 16 * 1024
     ):
         raise RecoveryConfigError("recovery command argv is invalid")
@@ -121,6 +136,19 @@ def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
     }:
         raise RecoveryConfigError("recovery runbook action class is invalid")
     return dict(item)
+
+
+def recovery_static_policy(config: RecoveryConfig) -> dict[str, Any]:
+    """Return the canonical dispatch-relevant configuration for durable fencing."""
+
+    return {
+        "version": 1,
+        "mode": config.mode,
+        "correlationRules": [dict(rule) for rule in config.correlation_rules],
+        "sourceIds": list(config.source_ids),
+        "runbooks": [dict(runbook) for runbook in config.runbooks],
+        "probes": [dict(probe) for probe in config.probes],
+    }
 
 
 def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:

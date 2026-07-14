@@ -42,6 +42,42 @@ paths in it are control-workspace-relative and cannot contain `..`. Validate it:
 minime-bot recovery config validate --workspace /path/to/control-workspace
 ```
 
+The JSON object is closed and requires every field shown in the example:
+`version` is `1`; `mode` is `observe`, `plan`, or `enabled`; `database`,
+`spoolDirectory`, and `authTokenFile` are control-workspace-relative; `host` is
+loopback; and `port` is 0-65535. `sourceIds` contains unique values from
+`alertmanager` and `runtime_doctor`. Each correlation rule has unique
+`component`/`failureClass` identity, an `incidentKey`, and impact 0-3. Each
+registry is limited to 128 unique IDs:
+
+```json
+{
+  "id": "local-health",
+  "actionClass": "diagnostic",
+  "executable": "/usr/bin/true",
+  "argv": [],
+  "env": {"LANG": "C"},
+  "timeoutMs": 1000
+}
+```
+
+Probe entries omit `actionClass`. IDs use letters, digits, `.`, `_`, `:`, and
+`-`; executables are absolute and cannot be `sudo`; argv has at most 64 static
+items and cannot contain credential-bearing flags; env has at most 32 uppercase
+keys and rejects authentication, credential, key, password, secret, and token
+names. Command timeouts are 100-300000 ms. Allowed runbook classes are
+`diagnostic`, `local_repair`, `cache_cleanup`, and the restricted handoff
+classes listed below. The public example intentionally configures no commands.
+
+The supervisor starts the package-owned Node worker with
+`MINIME_RECOVERY_NODE_EXECUTABLE` when set, otherwise an absolute `node` found
+on its bounded `PATH`. The dedicated fixer context comes only from
+`MINIME_AGENT_WORKSPACE_ROOT`; the control workspace comes only from
+`MINIME_CONTROL_WORKSPACE_ROOT`. Plan/enabled startup also requires the native
+Telegram destination and secret-reference environment used by
+`monitoring_native`; the status command reports only whether that delivery is
+configured, never its destination.
+
 The modes are intentionally one-way safety gates:
 
 - `observe`: intake, correlation, audit, health, digest, fallback, and
@@ -84,7 +120,10 @@ the hold-down elapses. Missing or stale monitoring never means recovered.
 The following action classes always require a handoff, regardless of planner
 output: restart, deploy, sudo, package upgrade, secret migration, and public
 write. Approval/rejection is tied to one pending invocation and recorded in the
-audit ledger. Confirmed impact, approval requirements, unsafe/failed recovery,
+audit ledger. It terminates that frozen handoff; it never executes a restricted
+class or silently asks the planner for a different plan. Material evidence or
+an explicit bounded retry is required for another invocation. Confirmed impact,
+approval requirements, unsafe/failed recovery,
 exhausted retries, planner/supervisor unavailability, and spool failure use the
 immediate native escalation path.
 
@@ -99,8 +138,9 @@ alerts, escalation classes, allowlists, fallback, or runbooks.
 1. Install the package, create the auth-token file with restrictive permissions,
    validate config, and start the supervisor in `observe`.
 2. Configure Alertmanager's shadow receiver with `continue: true` and run the
-   runtime doctor with `--sink tee`. Direct Telegram remains the owner of user
-   notifications.
+   runtime doctor with `MINIME_DOCTOR_SINK=tee`, as shown in
+   `examples/recovery/ai.minime.runtime-doctor-shadow.plist`. Direct Telegram
+   remains the owner of user notifications.
 3. Send duplicate and out-of-order firing/resolved transitions. Verify one
    durable event per transition ID, correct correlation, no planner invocation,
    and no executor process.
