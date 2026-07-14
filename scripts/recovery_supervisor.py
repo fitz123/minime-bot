@@ -91,6 +91,7 @@ _INVOCATION_OUTCOMES = {
 _REEVALUATABLE_OUTCOMES = {"malformed_output", "not_actionable", "observe"}
 _CONTROL_POLICY_KEY = "recovery_controls"
 _STATIC_POLICY_KEY = "recovery_static"
+_EFFECTIVE_POLICY_REVISION_KEY = "effective_policy_revision"
 _CONTROL_POLICY_VERSION = 1
 _CONFIRMATION_BOUNDS = (1, 5)
 _COOLDOWN_BOUNDS = (0.0, 86_400.0)
@@ -514,13 +515,40 @@ class RecoveryControls:
         return state
 
     def _current_row(self, connection: Any) -> Any:
-        row = connection.execute(
-            "SELECT revision, policy_json FROM policy_revisions "
-            "WHERE revision >= ? ORDER BY revision DESC LIMIT 1",
-            (self.base_revision,),
+        pointer = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (_EFFECTIVE_POLICY_REVISION_KEY,),
         ).fetchone()
+        revision: int | None = None
+        if pointer is not None:
+            try:
+                revision = int(str(pointer["value"]))
+            except (TypeError, ValueError) as exc:
+                raise LedgerCorrupt("effective recovery policy revision is invalid") from exc
+            if revision < 1:
+                raise LedgerCorrupt("effective recovery policy revision is invalid")
+        row = None
+        if revision is not None and revision >= self.base_revision:
+            row = connection.execute(
+                "SELECT revision, policy_json FROM policy_revisions WHERE revision = ?",
+                (revision,),
+            ).fetchone()
+            if row is None:
+                raise LedgerCorrupt("effective recovery policy revision is missing")
+        if row is None:
+            row = connection.execute(
+                "SELECT revision, policy_json FROM policy_revisions "
+                "WHERE revision >= ? ORDER BY revision DESC LIMIT 1",
+                (self.base_revision,),
+            ).fetchone()
         if row is None:
             raise LedgerCorrupt("configured recovery policy revision is missing")
+        if revision != int(row["revision"]):
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_EFFECTIVE_POLICY_REVISION_KEY, str(int(row["revision"]))),
+            )
         return row
 
     def current(self, connection: Any | None = None, *, now: float | None = None) -> ControlSnapshot:
@@ -566,6 +594,7 @@ class RecoveryControls:
         before: Any,
         after: Any,
         now: float,
+        effective: bool = True,
     ) -> int:
         self._operator(actor, reason)
         revision = self._next_revision(connection)
@@ -574,6 +603,12 @@ class RecoveryControls:
             "VALUES (?, ?, ?, ?, ?)",
             (revision, now, actor, reason, _canonical_json(document)),
         )
+        if effective:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_EFFECTIVE_POLICY_REVISION_KEY, str(revision)),
+            )
         details = {
             "after": after,
             "before": before,
@@ -1155,7 +1190,18 @@ class IncidentCoordinator:
                     incident["state"] in {"verifying", "recovered"}
                     and incident["evidence_hash"] == _EMPTY_EVIDENCE_HASH
                 )
-                if correlation_key in evidence or already_resolved:
+                if correlation_key in evidence:
+                    continue
+                if already_resolved:
+                    if (
+                        incident["state"] == "verifying"
+                        and incident["policy_revision"] != control.revision
+                    ):
+                        connection.execute(
+                            "UPDATE incidents SET generation = generation + 1, "
+                            "policy_revision = ?, updated_at = ? WHERE id = ?",
+                            (control.revision, now, incident["id"]),
+                        )
                     continue
                 self._invalidate_invocation(connection, int(incident["id"]), now)
                 connection.execute(
@@ -1545,7 +1591,7 @@ class IncidentCoordinator:
                 "state": str(incident["state"]),
             }
             after = {"generation": int(incident["generation"]) + 1, "state": "eligible"}
-            revision = self.controls.append_revision(
+            self.controls.append_revision(
                 connection,
                 document,
                 operation="explicit_retry",
@@ -1556,11 +1602,12 @@ class IncidentCoordinator:
                 before=before,
                 after=after,
                 now=now,
+                effective=False,
             )
             connection.execute(
                 "UPDATE incidents SET state = 'eligible', generation = generation + 1, "
                 "policy_revision = ?, updated_at = ? WHERE id = ?",
-                (revision, now, incident_id),
+                (control.revision, now, incident_id),
             )
             return True
 
@@ -1923,17 +1970,18 @@ class RecoveryVerifier:
             raise LedgerCorrupt("recovery probe observation is invalid")
         return bool(value["healthy"]), float(value["observed_at"])
 
-    @staticmethod
-    def _fence_valid(connection: Any, fence: VerificationFence) -> bool:
+    def _fence_valid(self, connection: Any, fence: VerificationFence) -> bool:
         incident = connection.execute(
             "SELECT state, generation, policy_revision FROM incidents WHERE id = ?",
             (fence.incident_id,),
         ).fetchone()
+        control = self.coordinator.controls.current(connection, now=self.clock())
         return bool(
             incident is not None
             and incident["state"] == "verifying"
             and incident["generation"] == fence.generation
             and incident["policy_revision"] == fence.policy_revision
+            and control.revision == fence.policy_revision
         )
 
     def fence_valid(self, fence: VerificationFence) -> bool:
@@ -2043,6 +2091,9 @@ class RecoveryVerifier:
                 int(incident["policy_revision"]),
             )
             reasons: list[str] = []
+            control = self.coordinator.controls.current(connection, now=now)
+            if control.revision != fence.policy_revision:
+                reasons.append("policy_stale")
             active = self.coordinator._active_evidence(connection)
             if str(incident["correlation_key"]) in active:
                 reasons.append("episodes_firing")
@@ -2805,6 +2856,8 @@ class RecoveryProcessor:
         return self._run_worker_process(request, lambda: self.verifier.fence_valid(fence))
 
     def _refresh_verification_once(self) -> dict[str, Any] | None:
+        if self.config.mode != "enabled":
+            return None
         fence = self.verifier.next_probe_refresh()
         if fence is None:
             return None

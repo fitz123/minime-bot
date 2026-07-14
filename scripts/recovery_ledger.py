@@ -232,6 +232,9 @@ class RecoveryLedger:
                 (str(SCHEMA_VERSION),),
             )
             connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('effective_policy_revision', '1')"
+            )
+            connection.execute(
                 "INSERT INTO policy_revisions(revision, created_at, actor, reason, policy_json) "
                 "VALUES (1, ?, 'system', 'fixed schema initialization', '{}')",
                 (now,),
@@ -341,6 +344,13 @@ class RecoveryLedger:
             raise ValueError("policy revision is invalid")
         document = _canonical_event(policy)
         with self.transaction() as connection:
+            pointer = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'effective_policy_revision'"
+            ).fetchone()
+            try:
+                effective_revision = int(pointer[0]) if pointer is not None else 0
+            except (TypeError, ValueError) as exc:
+                raise LedgerCorrupt("effective recovery policy revision is invalid") from exc
             existing = connection.execute(
                 "SELECT policy_json FROM policy_revisions WHERE revision = ?",
                 (revision,),
@@ -348,12 +358,26 @@ class RecoveryLedger:
             if existing is not None:
                 if existing[0] != document:
                     raise LedgerCorrupt("policy revision is immutable")
+                if revision > effective_revision:
+                    connection.execute(
+                        "INSERT INTO metadata(key, value) VALUES "
+                        "('effective_policy_revision', ?) ON CONFLICT(key) DO UPDATE "
+                        "SET value = excluded.value",
+                        (str(revision),),
+                    )
                 return
             connection.execute(
                 "INSERT INTO policy_revisions(revision, created_at, actor, reason, policy_json) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (revision, time.time() if now is None else now, actor, reason, document),
             )
+            if revision > effective_revision:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES "
+                    "('effective_policy_revision', ?) ON CONFLICT(key) DO UPDATE "
+                    "SET value = excluded.value",
+                    (str(revision),),
+                )
 
     def ping(self) -> None:
         with self._lock:

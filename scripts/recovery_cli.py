@@ -238,6 +238,14 @@ def _approval(
             raise ValueError("recovery invocation frozen plan is invalid") from exc
         if not isinstance(frozen_plan, dict) or frozen_plan.get("invocationId") != invocation_id:
             raise ValueError("recovery invocation frozen plan is invalid")
+        control = controls.current(connection, now=now)
+        if (
+            incident["policy_revision"] != control.revision
+            or invocation["policy_revision"] != control.revision
+            or incident["generation"] != invocation["generation"]
+            or incident["evidence_hash"] != invocation["evidence_hash"]
+        ):
+            raise ValueError("recovery approval fence is stale")
         row = controls._current_row(connection)
         document = controls._document(row)
         after_state = "handoff_approved" if approved else "handoff_rejected"
@@ -252,10 +260,11 @@ def _approval(
             before={"decision": "pending", "state": "pending_approval"},
             after={"decision": "approved" if approved else "rejected", "state": after_state},
             now=now,
+            effective=False,
         )
         connection.execute(
-            "UPDATE incidents SET state = ?, policy_revision = ?, updated_at = ? WHERE id = ?",
-            (after_state, revision, now, incident["id"]),
+            "UPDATE incidents SET state = ?, updated_at = ? WHERE id = ?",
+            (after_state, now, incident["id"]),
         )
         connection.execute(
             "UPDATE invocations SET state = ?, updated_at = ? WHERE id = ?",

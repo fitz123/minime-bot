@@ -237,7 +237,16 @@ class RecoveryCliTests(unittest.TestCase):
     def test_observe_mode_never_claims_and_approval_decisions_are_audited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_config(root, "observe")
+            document = config_document("observe")
+            document["correlationRules"].append(  # type: ignore[union-attr]
+                {
+                    "component": "worker",
+                    "failureClass": "unavailable",
+                    "incidentKey": "worker-unavailable",
+                    "impact": 2,
+                }
+            )
+            (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
             loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
             event = recovery_supervisor.normalize_alertmanager(
                 json.dumps(
@@ -253,16 +262,35 @@ class RecoveryCliTests(unittest.TestCase):
                                     "failure_class": "unavailable",
                                     "instance": "local",
                                 },
-                            }
+                            },
+                            {
+                                "status": "firing",
+                                "fingerprint": "episode-two",
+                                "startsAt": "2026-07-14T00:01:00Z",
+                                "labels": {
+                                    "alertname": "WorkerUnavailable",
+                                    "component": "worker",
+                                    "failure_class": "unavailable",
+                                    "instance": "local",
+                                },
+                            },
                         ]
                     }
                 ).encode()
             )
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
                 ledger.record_events(event)
-                policy = recovery_cli._policy(loaded)
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                policy_revision = controls.ensure_static_policy(
+                    recovery_config.recovery_static_policy(loaded)
+                )
+                policy = recovery_cli._policy(loaded, policy_revision)
                 observer = recovery_supervisor.IncidentCoordinator(
-                    ledger, policy, owner="observer", mode="observe"
+                    ledger,
+                    policy,
+                    owner="observer",
+                    controls=controls,
+                    mode="observe",
                 )
                 self.assertIsNone(observer.claim_next())
                 self.assertEqual(
@@ -271,12 +299,20 @@ class RecoveryCliTests(unittest.TestCase):
                 )
 
                 enabled = recovery_supervisor.IncidentCoordinator(
-                    ledger, policy, owner="enabled", mode="enabled"
+                    ledger,
+                    policy,
+                    owner="enabled",
+                    controls=controls,
+                    mode="enabled",
                 )
                 fence = enabled.claim_next()
                 self.assertIsNotNone(fence)
                 assert fence is not None
                 self.assertTrue(enabled.finish(fence, "pending_approval"))
+                unrelated = enabled.claim_next()
+                self.assertIsNotNone(unrelated)
+                assert unrelated is not None
+                self.assertTrue(enabled.finish(unrelated, "not_actionable"))
                 frozen_plan = {
                     "invocationId": fence.invocation_id,
                     "incidentId": fence.incident_id,
@@ -326,6 +362,14 @@ class RecoveryCliTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(incident["state"], "handoff_approved")
                 self.assertEqual(incident["generation"], fence.generation)
+                unrelated_incident = ledger.connection.execute(
+                    "SELECT state, generation, policy_revision FROM incidents WHERE id = ?",
+                    (unrelated.incident_id,),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(unrelated_incident),
+                    ("not_actionable", unrelated.generation, unrelated.policy_revision),
+                )
                 coordinator = recovery_supervisor.IncidentCoordinator(
                     ledger,
                     recovery_cli._policy(

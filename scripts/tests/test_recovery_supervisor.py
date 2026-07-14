@@ -382,6 +382,70 @@ class IncidentCoordinatorTests(unittest.TestCase):
                     "explicit_retry",
                 )
 
+    def test_explicit_retry_does_not_redispatch_unrelated_incidents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                policy = recovery_supervisor.RecoveryPolicy(
+                    revision=1,
+                    rules=(
+                        recovery_supervisor.CorrelationRule(
+                            "synthetic", "unavailable", "incident-one", impact=2
+                        ),
+                        recovery_supervisor.CorrelationRule(
+                            "synthetic", "degraded", "incident-two", impact=2
+                        ),
+                    ),
+                )
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, policy, owner="supervisor-one", controls=controls
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(
+                            firing_alert("one"),
+                            firing_alert("two", failure_class="degraded"),
+                        )
+                    )
+                )
+                first = coordinator.claim_next()
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertTrue(coordinator.finish(first, "not_actionable"))
+                second = coordinator.claim_next()
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertTrue(coordinator.finish(second, "not_actionable"))
+                effective_revision = controls.current().revision
+
+                self.assertTrue(
+                    coordinator.explicit_retry(
+                        first.incident_id, reason="retry only the reviewed incident"
+                    )
+                )
+                coordinator.reconcile()
+                unrelated = ledger.connection.execute(
+                    "SELECT state, generation, policy_revision FROM incidents WHERE id = ?",
+                    (second.incident_id,),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(unrelated),
+                    ("not_actionable", second.generation, effective_revision),
+                )
+                self.assertEqual(controls.current().revision, effective_revision)
+                self.assertGreater(
+                    ledger.connection.execute(
+                        "SELECT max(revision) FROM policy_revisions"
+                    ).fetchone()[0],
+                    effective_revision,
+                )
+                retried = coordinator.claim_next()
+                self.assertIsNotNone(retried)
+                assert retried is not None
+                self.assertEqual(retried.incident_id, first.incident_id)
+                self.assertTrue(coordinator.finish(retried, "not_actionable"))
+                self.assertIsNone(coordinator.claim_next())
+
     def test_resolved_first_and_out_of_order_events_do_not_false_fire(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
@@ -1066,6 +1130,39 @@ class RecoveryVerificationTests(unittest.TestCase):
                 self.assertIn("probe_missing:bot-health", result.reasons)
                 self.assertEqual(verifier.next_probe_refresh(), current_fence)
 
+    def test_verification_is_refenced_when_static_probe_policy_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [400.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                controls = coordinator.controls
+                controls.ensure_static_policy({"version": 1, "probes": ["old-probe"]})
+                coordinator.reconcile()
+                old_fence = self._fence(ledger, incident_id)
+
+                current_revision = controls.ensure_static_policy(
+                    {"version": 1, "probes": ["new-probe"]}
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("new-probe",),
+                    source_ids=(),
+                    freshness_seconds=60,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                self.assertFalse(verifier.fence_valid(old_fence))
+                stale = verifier.evaluate(incident_id)
+                self.assertFalse(stale.recovered)
+                self.assertIn("policy_stale", stale.reasons)
+
+                coordinator.reconcile()
+                current_fence = self._fence(ledger, incident_id)
+                self.assertEqual(current_fence.policy_revision, current_revision)
+                self.assertEqual(current_fence.generation, old_fence.generation + 1)
+                self.assertEqual(verifier.next_probe_refresh(), current_fence)
+
     def test_completed_commands_are_classified_only_after_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             clock = [1_000.0]
@@ -1210,6 +1307,80 @@ class RecoveryDigestTests(unittest.TestCase):
 
 
 class RecoveryProcessorTests(unittest.TestCase):
+    def test_shadow_modes_do_not_launch_verification_probes(self) -> None:
+        for mode in ("observe", "plan"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = recovery_config.RecoveryConfig(
+                    path=root / "recovery.json",
+                    workspace=root,
+                    mode=mode,
+                    database=root / "ledger.sqlite3",
+                    spool_directory=root / "spool",
+                    auth_token_file=root / "auth-token",
+                    host="127.0.0.1",
+                    port=9877,
+                    correlation_rules=(),
+                    source_ids=("alertmanager",),
+                    runbooks=(),
+                    probes=(
+                        {
+                            "id": "side-effecting-probe",
+                            "executable": "/usr/bin/touch",
+                            "argv": [str(root / "must-not-exist")],
+                            "env": {},
+                            "timeoutMs": 1000,
+                        },
+                    ),
+                )
+                with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                    initial = recovery_supervisor.IncidentCoordinator(
+                        ledger, correlation_policy(), owner="initial-owner"
+                    )
+                    ledger.record_events(
+                        recovery_supervisor.normalize_alertmanager(
+                            alert_body(firing_alert())
+                        )
+                    )
+                    initial.reconcile()
+                    ledger.record_events(
+                        recovery_supervisor.normalize_alertmanager(
+                            alert_body(resolved_alert())
+                        )
+                    )
+                    initial.reconcile()
+                    controls = initial.controls
+                    controls.ensure_static_policy(
+                        recovery_config.recovery_static_policy(config)
+                    )
+                    coordinator = recovery_supervisor.IncidentCoordinator(
+                        ledger,
+                        correlation_policy(),
+                        owner=f"{mode}-owner",
+                        controls=controls,
+                        mode=mode,
+                    )
+                    verifier = recovery_supervisor.RecoveryVerifier(
+                        ledger,
+                        coordinator,
+                        probe_ids=("side-effecting-probe",),
+                        source_ids=("alertmanager",),
+                    )
+                    verification_runner = mock.Mock()
+                    processor = recovery_supervisor.RecoveryProcessor(
+                        config,
+                        coordinator,
+                        verifier,
+                        recovery_supervisor.BoundedPolicyAdapter(ledger, controls),
+                        verification_runner=verification_runner,
+                    )
+
+                    result = processor.process_once()
+                    self.assertFalse(result["plannerLaunched"])
+                    self.assertFalse(result["executorLaunched"])
+                    verification_runner.assert_not_called()
+                    self.assertFalse((root / "must-not-exist").exists())
+
     def test_worker_executor_boundaries_use_synchronous_coordinator_fence_channel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
