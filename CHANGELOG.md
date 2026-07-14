@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.7
+
+- Preserve active Telegram work during connectivity loss by treating an unreachable API as degraded state instead of restarting the process.
+- Consume delayed Telegram updates retained by Telegram while keeping Discord's existing stale-message policy unchanged.
+- Let grammY own short polling retries and add a bounded recovery window before a reachable stalled poller can restart.
+
 ## 2026.7.6
 
 - Resolve every package-owned Pi process through the shipped 0.80.6 CLI and exact-pin all Pi runtime packages, removing dependence on a global `pi` executable.
