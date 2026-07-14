@@ -183,7 +183,12 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
       }
 
       if (apiReachable) {
-        if (awaitingPollRecovery) {
+        // A failed getUpdates followed by a successful heartbeat is also
+        // degraded-connectivity recovery, even if the watchdog did not observe
+        // an earlier failed heartbeat. Give grammY's next poll retry time to
+        // complete before classifying the poller itself as stalled.
+        if (awaitingPollRecovery || latest.lastPollFailedAtMs !== null) {
+          awaitingPollRecovery = true;
           const recoveredAtMs = now();
           pollRecoveryStartedAtMs ??= recoveredAtMs;
           if (recoveredAtMs - pollRecoveryStartedAtMs < thresholdMs) {

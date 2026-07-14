@@ -27,6 +27,7 @@ describe("poll-progress probe", () => {
       initializedAtMs: 10,
       lastPollStartedAtMs: null,
       lastPollSucceededAtMs: null,
+      lastPollFailedAtMs: null,
       successfulPollCount: 0,
       inFlight: false,
       failedPollCount: 0,
@@ -44,6 +45,7 @@ describe("poll-progress probe", () => {
       initializedAtMs: 100,
       lastPollStartedAtMs: 100,
       lastPollSucceededAtMs: null,
+      lastPollFailedAtMs: null,
       successfulPollCount: 0,
       inFlight: true,
       failedPollCount: 0,
@@ -55,6 +57,7 @@ describe("poll-progress probe", () => {
       initializedAtMs: 100,
       lastPollStartedAtMs: 100,
       lastPollSucceededAtMs: 130,
+      lastPollFailedAtMs: null,
       successfulPollCount: 1,
       inFlight: false,
       failedPollCount: 0,
@@ -81,10 +84,32 @@ describe("poll-progress probe", () => {
       initializedAtMs: 0,
       lastPollStartedAtMs: 1,
       lastPollSucceededAtMs: null,
+      lastPollFailedAtMs: 1,
       successfulPollCount: 0,
       inFlight: false,
       failedPollCount: 2,
     });
+  });
+
+  it("clears failed-poll recovery evidence after a successful completion", async () => {
+    let clock = 1;
+    const probe = createPollProgressProbe(() => clock);
+    await assert.rejects(
+      probe.transformer(
+        (async () => { throw new Error("synthetic rejection"); }) as never,
+        "getUpdates",
+        {},
+      ),
+    );
+    assert.equal(probe.snapshot().lastPollFailedAtMs, 1);
+
+    clock = 2;
+    await probe.transformer(
+      (async () => ({ ok: true, result: [] })) as never,
+      "getUpdates",
+      {},
+    );
+    assert.equal(probe.snapshot().lastPollFailedAtMs, null);
   });
 
   it("returns immutable snapshots containing no token, payload, or response", async () => {

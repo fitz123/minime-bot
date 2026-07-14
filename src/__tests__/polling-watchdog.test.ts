@@ -10,6 +10,7 @@ function snapshot(overrides: Partial<PollProgressSnapshot> = {}): PollProgressSn
     initializedAtMs: 0,
     lastPollStartedAtMs: null,
     lastPollSucceededAtMs: null,
+    lastPollFailedAtMs: null,
     successfulPollCount: 0,
     inFlight: false,
     failedPollCount: 0,
@@ -212,6 +213,45 @@ describe("polling-watchdog", () => {
     assert.equal(checks.values.find((v) => v.labels.outcome === "poll_recovery_pending")?.value, 1);
   });
 
+  it("gives polling a recovery window when the first stale heartbeat is already reachable", async () => {
+    let clock = 0;
+    let progress = snapshot({
+      lastPollStartedAtMs: 5_500,
+      lastPollFailedAtMs: 5_500,
+      failedPollCount: 1,
+    });
+    let exits = 0;
+    let heartbeatCalls = 0;
+    const wd = createWatchdog({
+      pollProgress: () => progress,
+      heartbeat: async () => {
+        heartbeatCalls++;
+        if (heartbeatCalls === 2) {
+          progress = snapshot({
+            lastPollStartedAtMs: clock,
+            lastPollSucceededAtMs: clock,
+            successfulPollCount: 1,
+          });
+        }
+        return true;
+      },
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 5_000,
+    });
+
+    clock = 6_000;
+    await wd.check();
+    assert.equal(exits, 0, "failed polling must provide recovery grace even when getMe succeeds first");
+
+    clock = 7_000;
+    await wd.check();
+    assert.equal(exits, 0);
+    const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "poll_recovery_pending")?.value, 1);
+    assert.equal(checks.values.find((v) => v.labels.outcome === "poll_resumed")?.value, 1);
+  });
+
   it("restarts once if polling does not recover within the post-outage window", async () => {
     let clock = 0;
     let exits = 0;
@@ -239,12 +279,13 @@ describe("polling-watchdog", () => {
     assert.equal(restarts.values.find((v) => v.labels.reason === "poll_stalled")?.value, 1);
   });
 
-  it("does not treat rejected getUpdates completions as healthy progress", async () => {
+  it("bounds recovery grace after rejected getUpdates completions", async () => {
     let clock = 0;
     let exits = 0;
     const progress = snapshot({
       lastPollStartedAtMs: 5_500,
       lastPollSucceededAtMs: null,
+      lastPollFailedAtMs: 5_500,
       failedPollCount: 3,
       inFlight: false,
     });
@@ -258,6 +299,11 @@ describe("polling-watchdog", () => {
 
     clock = 6_000;
     await wd.check();
+    assert.equal(exits, 0);
+    clock = 10_999;
+    await wd.check();
+    assert.equal(exits, 0);
+    clock = 11_000;
     await wd.check();
     assert.equal(exits, 1);
     const restarts = await pollWatchdogRestarts.get();
