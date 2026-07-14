@@ -195,12 +195,17 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
+    "dist/pi-extensions/recovery-plan.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
+    "dist/recovery/fixer-runner.js",
+    "dist/recovery/runbook-executor.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
+    "dist/extensions/pi/recovery-knowledge-tools.js",
+    "dist/extensions/pi/recovery-plan.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
@@ -574,6 +579,7 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
+const recoveryFixer = await importPackageFile("dist/recovery/fixer-runner.js");
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
@@ -601,6 +607,13 @@ assert.deepEqual(
   ["knowledge-tools.js"],
 );
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
+
+const recoveryExtensionArgs = recoveryFixer.resolveRecoveryPlannerExtensionArgs();
+assert.deepEqual(
+  extensionPathsFromArgs(recoveryExtensionArgs).map((path) => relative(artifactDir, path)),
+  ["recovery-knowledge-tools.js", "recovery-plan.js"],
+);
+assertNoGuardContract("recovery planner extension args must not load the retired guard", recoveryExtensionArgs);
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);

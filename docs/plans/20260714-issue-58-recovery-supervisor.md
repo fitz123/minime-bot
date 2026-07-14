@@ -57,12 +57,12 @@ python3 -m py_compile scripts/recovery_supervisor.py scripts/runtime_doctor.py
 - [x] Run focused tests before Task 3.
 
 ### Task 3: Dedicated Pi fixer planner and deterministic runbook executor
-- [ ] Add a first-party Pi extension exposing one terminating, strictly validated `recovery_plan` result: verdict, diagnosis code, bounded summary/evidence references, known runbook IDs, known probe IDs, and next-evaluation delay.
-- [ ] Add a package-owned fixer runner that loads the configured agent workspace via package context assembly, uses a sanitized environment, allowlists only `knowledge_search`/`knowledge_get`/`recovery_plan` (no bash, file, web, subagents, or Knowledge writes), supplies bounded evidence as untrusted data, enforces timeout/output bounds, parses one result, and rejects stale/multiple/text-only/oversized output.
-- [ ] Add a deterministic executor for configured runbook IDs using absolute executable plus static argv/env, no shell, bounded process-group timeout, redacted output, fencing checks, and post-action probes; ship no mutating runbooks by default.
-- [ ] Hard-code restart/deploy/sudo/package-upgrade/secret/public-write classes as non-executable approval handoffs regardless of planner output.
-- [ ] Add focused tests: exact spawn arguments/tools, one valid result and frozen-plan acceptance, prompt/argument injection rejection, unknown fields/runbooks/stale IDs, allowlisted execution with timeout cleanup, and zero side effects for restricted classes.
-- [ ] Run focused tests before Task 4.
+- [x] Add a first-party Pi extension exposing one terminating, strictly validated `recovery_plan` result: verdict, diagnosis code, bounded summary/evidence references, known runbook IDs, known probe IDs, and next-evaluation delay.
+- [x] Add a package-owned fixer runner that loads the configured agent workspace via package context assembly, uses a sanitized environment, allowlists only `knowledge_search`/`knowledge_get`/`recovery_plan` (no bash, file, web, subagents, or Knowledge writes), supplies bounded evidence as untrusted data, enforces timeout/output bounds, parses one result, and rejects stale/multiple/text-only/oversized output.
+- [x] Add a deterministic executor for configured runbook IDs using absolute executable plus static argv/env, no shell, bounded process-group timeout, redacted output, fencing checks, and post-action probes; ship no mutating runbooks by default.
+- [x] Hard-code restart/deploy/sudo/package-upgrade/secret/public-write classes as non-executable approval handoffs regardless of planner output.
+- [x] Add focused tests: exact spawn arguments/tools, one valid result and frozen-plan acceptance, prompt/argument injection rejection, unknown fields/runbooks/stale IDs, allowlisted execution with timeout cleanup, and zero side effects for restricted classes.
+- [x] Run focused tests before Task 4.
 
 ### Task 4: Audited controls, bounded adaptation, verification, and digest
 - [ ] Implement audited dispatch enable/disable, confirmation count, cooldown, retry budget, expiring silence, explicit retry, and rollback — each recording actor, reason, expiry, before/after, and a new revision — while intake, source checks, audit, digest, and fallback stay active.
