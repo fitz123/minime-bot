@@ -45,7 +45,7 @@ from recovery_ledger import LedgerCorrupt, LedgerError, LedgerUnavailable, Recov
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 16
 MAX_WORKER_OUTPUT_BYTES = 512 * 1024
-RECOVERY_WORKER_MAX_SECONDS = 3_600.0
+RECOVERY_WORKER_MAX_SECONDS = 3 * 60 * 60.0
 MAX_ALERTS_PER_REQUEST = 512
 SPOOL_ITEM_MAX_BYTES = 16 * 1024
 AUTH_TOKEN_MAX_BYTES = 4 * 1024
@@ -911,6 +911,7 @@ class IncidentCoordinator:
         clock: Callable[[], float] = time.time,
         controls: RecoveryControls | None = None,
         immediate_escalation: Callable[[str], Any] | None = None,
+        mechanical_outcome: Callable[..., Any] | None = None,
         mode: str = "enabled",
     ):
         if not isinstance(owner, str) or safe_field(owner, default="") != owner:
@@ -925,6 +926,7 @@ class IncidentCoordinator:
             ledger, base_revision=policy.revision, clock=clock
         )
         self.immediate_escalation = immediate_escalation
+        self.mechanical_outcome = mechanical_outcome
         self.mode = mode
         self._rules = {
             (rule.component, rule.failure_class): rule for rule in self.policy.rules
@@ -1099,6 +1101,7 @@ class IncidentCoordinator:
         now = self.clock()
         self.controls.expire(now=now)
         critical_impact = False
+        critical_incidents: list[tuple[int, int]] = []
         retries_exhausted = False
         with self.ledger.transaction() as connection:
             control = self.controls.current(connection, now=now)
@@ -1118,16 +1121,17 @@ class IncidentCoordinator:
             for correlation_key, evidence_hash in sorted(evidence.items()):
                 incident = incidents.get(correlation_key)
                 if incident is None:
-                    connection.execute(
+                    cursor = connection.execute(
                         "INSERT INTO incidents(correlation_key, state, generation, evidence_hash, "
                         "policy_revision, opened_at, updated_at) VALUES (?, 'eligible', 1, ?, ?, ?, ?)",
                         (correlation_key, evidence_hash, control.revision, now, now),
                     )
+                    if evidence_details[correlation_key].max_impact >= 3:
+                        critical_incidents.append((int(cursor.lastrowid), 1))
                     continue
                 changed = (
                     incident["evidence_hash"] != evidence_hash
                     or incident["policy_revision"] != control.revision
-                    or incident["state"] in {"verifying", "recovered"}
                 )
                 if changed:
                     self._invalidate_invocation(connection, int(incident["id"]), now)
@@ -1142,9 +1146,16 @@ class IncidentCoordinator:
                         "updated_at = ? WHERE id = ?",
                         (now, incident["id"]),
                     )
+                if evidence_details[correlation_key].max_impact >= 3:
+                    generation = int(incident["generation"]) + (1 if changed else 0)
+                    critical_incidents.append((int(incident["id"]), generation))
 
             for correlation_key, incident in incidents.items():
-                if correlation_key in evidence or incident["state"] in {"verifying", "recovered"}:
+                already_resolved = (
+                    incident["state"] in {"verifying", "recovered"}
+                    and incident["evidence_hash"] == _EMPTY_EVIDENCE_HASH
+                )
+                if correlation_key in evidence or already_resolved:
                     continue
                 self._invalidate_invocation(connection, int(incident["id"]), now)
                 connection.execute(
@@ -1155,6 +1166,14 @@ class IncidentCoordinator:
             active_count = len(evidence)
         if critical_impact and self.immediate_escalation is not None:
             self.immediate_escalation("confirmed_impact")
+        if self.mechanical_outcome is not None:
+            for incident_id, generation in critical_incidents:
+                self.mechanical_outcome(
+                    incident_id,
+                    "impact",
+                    critical=True,
+                    dedupe_key=f"impact:{generation}",
+                )
         if retries_exhausted and self.immediate_escalation is not None:
             self.immediate_escalation("retries_exhausted")
         return active_count
@@ -1468,9 +1487,10 @@ class IncidentCoordinator:
                 "UPDATE invocations SET state = ?, updated_at = ? WHERE id = ?",
                 (outcome, now, fence.invocation_id),
             )
+            incident_state = "verifying" if outcome == "completed" else outcome
             connection.execute(
                 "UPDATE incidents SET state = ?, updated_at = ? WHERE id = ?",
-                (outcome, now, fence.incident_id),
+                (incident_state, now, fence.incident_id),
             )
             connection.execute(
                 "UPDATE fixer_lease SET owner = NULL, token = NULL, acquired_at = NULL, "
@@ -1565,24 +1585,41 @@ class BoundedPolicyAdapter:
         classification: str,
         *,
         critical: bool = False,
+        dedupe_key: str | None = None,
         now: float | None = None,
     ) -> int:
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery outcome incident is invalid")
         if classification not in _MECHANICAL_OUTCOMES or not isinstance(critical, bool):
             raise ValueError("recovery outcome classification is invalid")
+        if dedupe_key is not None and (
+            not isinstance(dedupe_key, str)
+            or safe_field(dedupe_key, limit=160, default="") != dedupe_key
+        ):
+            raise ValueError("recovery outcome dedupe key is invalid")
         timestamp = self.clock() if now is None else now
+        target = f"incident:{incident_id}"
+        if dedupe_key is not None:
+            target = f"{target}:{dedupe_key}"
         with self.ledger.transaction() as connection:
             if connection.execute(
                 "SELECT 1 FROM incidents WHERE id = ?", (incident_id,)
             ).fetchone() is None:
                 raise ValueError("recovery outcome incident is invalid")
+            if dedupe_key is not None:
+                existing = connection.execute(
+                    "SELECT id FROM audit WHERE operation = 'mechanical_outcome' "
+                    "AND target = ? ORDER BY id LIMIT 1",
+                    (target,),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
             cursor = connection.execute(
                 "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
                 "VALUES (?, 'system', 'mechanical_outcome', ?, ?)",
                 (
                     timestamp,
-                    f"incident:{incident_id}",
+                    target,
                     _canonical_json({"classification": classification, "critical": critical}),
                 ),
             )
@@ -1745,6 +1782,13 @@ class VerificationResult:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class VerificationFence:
+    incident_id: int
+    generation: int
+    policy_revision: int
+
+
 class RecoveryVerifier:
     """Fail-closed deterministic verification backed by durable observations."""
 
@@ -1783,14 +1827,14 @@ class RecoveryVerifier:
         self.hold_down_seconds = float(hold_down_seconds)
         self.clock = clock
 
-    def _record(self, category: str, identifier: str, healthy: bool, observed_at: float) -> None:
+    def _record_heartbeat(self, identifier: str, healthy: bool, observed_at: float) -> None:
         if not isinstance(healthy, bool) or (
             isinstance(observed_at, bool)
             or not isinstance(observed_at, (int, float))
             or not math.isfinite(observed_at)
         ):
             raise ValueError("recovery verification observation is invalid")
-        key = f"verification:{category}:{identifier}"
+        key = f"verification:heartbeat:{identifier}"
         value = _canonical_json({"healthy": healthy, "observed_at": float(observed_at)})
         with self.ledger.transaction() as connection:
             connection.execute(
@@ -1804,17 +1848,23 @@ class RecoveryVerifier:
     ) -> None:
         if source not in {"supervisor", *self.source_ids}:
             raise ValueError("recovery heartbeat source is invalid")
-        self._record(
-            "heartbeat", source, healthy, self.clock() if observed_at is None else observed_at
-        )
+        self._record_heartbeat(source, healthy, self.clock() if observed_at is None else observed_at)
 
     def record_probe(
-        self, probe_id: str, healthy: bool, *, observed_at: float | None = None
-    ) -> None:
+        self,
+        fence: VerificationFence,
+        probe_id: str,
+        healthy: bool,
+        *,
+        observed_at: float | None = None,
+    ) -> bool:
         if probe_id not in self.probe_ids:
             raise ValueError("recovery probe id is invalid")
-        self._record(
-            "probe", probe_id, healthy, self.clock() if observed_at is None else observed_at
+        return self.record_probe_results(
+            fence,
+            [{"id": probe_id, "exitCode": 0 if healthy else 1, "timedOut": False}],
+            require_all=False,
+            observed_at=observed_at,
         )
 
     @staticmethod
@@ -1837,6 +1887,144 @@ class RecoveryVerifier:
             raise LedgerCorrupt("recovery verification observation is invalid")
         return bool(value["healthy"]), float(value["observed_at"])
 
+    @staticmethod
+    def _probe_key(fence: VerificationFence, probe_id: str) -> str:
+        return (
+            f"verification:probe:{fence.incident_id}:{fence.generation}:"
+            f"{fence.policy_revision}:{probe_id}"
+        )
+
+    @staticmethod
+    def _probe_observation(
+        connection: Any, fence: VerificationFence, probe_id: str
+    ) -> tuple[bool, float] | None:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (RecoveryVerifier._probe_key(fence, probe_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(str(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LedgerCorrupt("recovery probe observation is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {"generation", "healthy", "incident_id", "observed_at", "policy_revision"}
+            or value["incident_id"] != fence.incident_id
+            or value["generation"] != fence.generation
+            or value["policy_revision"] != fence.policy_revision
+            or not isinstance(value["healthy"], bool)
+            or isinstance(value["observed_at"], bool)
+            or not isinstance(value["observed_at"], (int, float))
+            or not math.isfinite(value["observed_at"])
+        ):
+            raise LedgerCorrupt("recovery probe observation is invalid")
+        return bool(value["healthy"]), float(value["observed_at"])
+
+    @staticmethod
+    def _fence_valid(connection: Any, fence: VerificationFence) -> bool:
+        incident = connection.execute(
+            "SELECT state, generation, policy_revision FROM incidents WHERE id = ?",
+            (fence.incident_id,),
+        ).fetchone()
+        return bool(
+            incident is not None
+            and incident["state"] == "verifying"
+            and incident["generation"] == fence.generation
+            and incident["policy_revision"] == fence.policy_revision
+        )
+
+    def fence_valid(self, fence: VerificationFence) -> bool:
+        with self.ledger.transaction() as connection:
+            return self._fence_valid(connection, fence)
+
+    def next_probe_refresh(self) -> VerificationFence | None:
+        if not self.probe_ids:
+            return None
+        now = self.clock()
+        refresh_after = min(30.0, max(1.0, self.freshness_seconds / 2.0))
+        with self.ledger.transaction() as connection:
+            incidents = connection.execute(
+                "SELECT id, generation, policy_revision FROM incidents "
+                "WHERE state = 'verifying' ORDER BY updated_at, id"
+            ).fetchall()
+            for incident in incidents:
+                fence = VerificationFence(
+                    int(incident["id"]),
+                    int(incident["generation"]),
+                    int(incident["policy_revision"]),
+                )
+                observations = [
+                    self._probe_observation(connection, fence, probe_id)
+                    for probe_id in self.probe_ids
+                ]
+                if any(
+                    observation is None
+                    or observation[1] > now + 1.0
+                    or now - observation[1] >= refresh_after
+                    for observation in observations
+                ):
+                    return fence
+        return None
+
+    def record_probe_results(
+        self,
+        fence: VerificationFence,
+        results: list[dict[str, Any]],
+        *,
+        require_all: bool = True,
+        observed_at: float | None = None,
+    ) -> bool:
+        if not isinstance(fence, VerificationFence) or not isinstance(results, list):
+            raise ValueError("recovery probe results are invalid")
+        normalized: dict[str, bool] = {}
+        for result in results:
+            if not isinstance(result, dict):
+                raise ValueError("recovery probe result is invalid")
+            probe_id = result.get("id")
+            exit_code = result.get("exitCode")
+            timed_out = result.get("timedOut")
+            if (
+                not isinstance(probe_id, str)
+                or probe_id not in self.probe_ids
+                or probe_id in normalized
+                or isinstance(exit_code, bool)
+                or not isinstance(exit_code, int)
+                or not isinstance(timed_out, bool)
+            ):
+                raise ValueError("recovery probe result is invalid")
+            normalized[probe_id] = exit_code == 0 and not timed_out
+        if require_all and set(normalized) != set(self.probe_ids):
+            raise ValueError("recovery probe results are incomplete")
+        timestamp = self.clock() if observed_at is None else observed_at
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+        ):
+            raise ValueError("recovery probe observation is invalid")
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence):
+                return False
+            for probe_id, healthy in normalized.items():
+                value = _canonical_json(
+                    {
+                        "generation": fence.generation,
+                        "healthy": healthy,
+                        "incident_id": fence.incident_id,
+                        "observed_at": float(timestamp),
+                        "policy_revision": fence.policy_revision,
+                    }
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (self._probe_key(fence, probe_id), value),
+                )
+        return True
+
     def evaluate(self, incident_id: int) -> VerificationResult:
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery verification incident is invalid")
@@ -1849,6 +2037,11 @@ class RecoveryVerifier:
                 raise ValueError("recovery verification incident is invalid")
             if incident["state"] == "recovered":
                 return VerificationResult(True, ())
+            fence = VerificationFence(
+                incident_id,
+                int(incident["generation"]),
+                int(incident["policy_revision"]),
+            )
             reasons: list[str] = []
             active = self.coordinator._active_evidence(connection)
             if str(incident["correlation_key"]) in active:
@@ -1868,7 +2061,7 @@ class RecoveryVerifier:
                 ):
                     reasons.append(f"heartbeat_unhealthy:{source}")
             for probe_id in self.probe_ids:
-                observation = self._observation(connection, f"verification:probe:{probe_id}")
+                observation = self._probe_observation(connection, fence, probe_id)
                 if observation is None:
                     reasons.append(f"probe_missing:{probe_id}")
                 elif (
@@ -1911,6 +2104,55 @@ class RecoveryVerifier:
                 ).fetchall()
             ]
         return [(incident_id, self.evaluate(incident_id)) for incident_id in ids]
+
+    def mechanical_classification(
+        self, incident_id: int, result: VerificationResult
+    ) -> tuple[str, str] | None:
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            incident = connection.execute(
+                "SELECT generation, policy_revision, state, updated_at FROM incidents WHERE id = ?",
+                (incident_id,),
+            ).fetchone()
+            if incident is None:
+                raise ValueError("recovery verification incident is invalid")
+            generation = int(incident["generation"])
+            invocation = connection.execute(
+                "SELECT id, generation FROM invocations WHERE incident_id = ? "
+                "AND state = 'completed' AND policy_revision = ? AND generation >= ? "
+                "AND generation <= ? ORDER BY generation DESC, id DESC LIMIT 1",
+                (incident_id, incident["policy_revision"], max(1, generation - 1), generation),
+            ).fetchone()
+            if result.recovered:
+                if invocation is None:
+                    return "false_positive", f"verification:{generation}"
+                return "stable_recovery", f"invocation:{int(invocation['id'])}"
+            if invocation is None or "hold_down" in result.reasons:
+                return None
+            delay = max(self.hold_down_seconds, self.freshness_seconds)
+            plan_row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (f"invocation:{int(invocation['id'])}:plan",),
+            ).fetchone()
+            if plan_row is not None:
+                try:
+                    plan = json.loads(str(plan_row["value"]))
+                    requested_delay = plan["nextEvaluationDelaySeconds"]
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise LedgerCorrupt("recovery frozen plan is invalid") from exc
+                if (
+                    isinstance(requested_delay, bool)
+                    or not isinstance(requested_delay, int)
+                    or not 30 <= requested_delay <= 86_400
+                ):
+                    raise LedgerCorrupt("recovery frozen plan is invalid")
+                delay = max(delay, float(requested_delay))
+            if now - float(incident["updated_at"]) < delay:
+                return None
+            return (
+                "missed_recovery",
+                f"invocation:{int(invocation['id'])}:verification:{generation}",
+            )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -2285,6 +2527,9 @@ class RecoveryProcessor:
         *,
         environment: dict[str, str] | os._Environ[str] = os.environ,
         runner: Callable[[dict[str, Any], InvocationFence], dict[str, Any]] | None = None,
+        verification_runner: (
+            Callable[[dict[str, Any], VerificationFence], dict[str, Any]] | None
+        ) = None,
         clock: Callable[[], float] = time.time,
     ):
         self.config = config
@@ -2293,6 +2538,7 @@ class RecoveryProcessor:
         self.adapter = adapter
         self.environment = environment
         self.runner = runner or self._run_node_worker
+        self.verification_runner = verification_runner or self._run_verification_worker
         self.clock = clock
         self._state_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -2318,6 +2564,18 @@ class RecoveryProcessor:
             "fence": self._fence_document(fence),
             "evidence": self.coordinator.planner_evidence(fence),
             "runbooks": [dict(item) for item in self.config.runbooks],
+            "probes": [dict(item) for item in self.config.probes],
+        }
+
+    def _verification_request(self, fence: VerificationFence) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "operation": "verify",
+            "fence": {
+                "incidentId": fence.incident_id,
+                "generation": fence.generation,
+                "policyRevision": fence.policy_revision,
+            },
             "probes": [dict(item) for item in self.config.probes],
         }
 
@@ -2367,7 +2625,7 @@ class RecoveryProcessor:
             and set(probe_ids).issubset(known_probes)
         )
 
-    def _worker_environment(self) -> dict[str, str]:
+    def _worker_environment(self, fence_descriptor: int | None = None) -> dict[str, str]:
         allowed = {
             "CI",
             "COLORTERM",
@@ -2399,6 +2657,8 @@ class RecoveryProcessor:
         agent_root = self.environment.get("MINIME_AGENT_WORKSPACE_ROOT", "").strip()
         if agent_root:
             result["MINIME_AGENT_WORKSPACE_ROOT"] = agent_root
+        if fence_descriptor is not None:
+            result["MINIME_RECOVERY_FENCE_FD"] = str(fence_descriptor)
         return result
 
     def _terminate_worker(self, process: subprocess.Popen[bytes]) -> None:
@@ -2426,8 +2686,8 @@ class RecoveryProcessor:
             except OSError:
                 pass
 
-    def _run_node_worker(
-        self, request: dict[str, Any], fence: InvocationFence
+    def _run_worker_process(
+        self, request: dict[str, Any], fence_check: Callable[[], bool]
     ) -> dict[str, Any]:
         configured_node = self.environment.get("MINIME_RECOVERY_NODE_EXECUTABLE", "").strip()
         node = configured_node or shutil.which("node", path=self.environment.get("PATH")) or ""
@@ -2437,6 +2697,7 @@ class RecoveryProcessor:
         payload = _canonical_json(request).encode("ascii")
         if len(payload) > MAX_WORKER_OUTPUT_BYTES:
             raise RecoveryWorkerUnavailable("recovery worker request is oversized")
+        parent_fence, child_fence = socket.socketpair()
         try:
             process = subprocess.Popen(
                 [node, str(worker)],
@@ -2444,18 +2705,55 @@ class RecoveryProcessor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=self.config.workspace,
-                env=self._worker_environment(),
+                env=self._worker_environment(child_fence.fileno()),
                 start_new_session=True,
+                pass_fds=(child_fence.fileno(),),
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            parent_fence.close()
+            child_fence.close()
             raise RecoveryWorkerUnavailable("recovery worker failed to start") from exc
+        child_fence.close()
         with self._state_lock:
             if self._closing:
                 self._terminate_worker(process)
+                parent_fence.close()
                 raise RecoveryWorkerStale("recovery worker is stopping")
             self._process = process
         deadline = time.monotonic() + RECOVERY_WORKER_MAX_SECONDS
         input_value: bytes | None = payload
+        stop_fence_checks = threading.Event()
+        fence_lost = threading.Event()
+
+        def durable_fence_valid() -> bool:
+            try:
+                return fence_check()
+            except (LedgerError, OSError, ValueError):
+                return False
+
+        def serve_fence_checks() -> None:
+            parent_fence.settimeout(0.25)
+            while not stop_fence_checks.is_set():
+                try:
+                    request_byte = parent_fence.recv(1)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not request_byte:
+                    return
+                valid = request_byte == b"?"
+                if valid:
+                    valid = durable_fence_valid()
+                if not valid:
+                    fence_lost.set()
+                try:
+                    parent_fence.sendall(b"1" if valid else b"0")
+                except OSError:
+                    return
+
+        fence_thread = threading.Thread(target=serve_fence_checks, daemon=True)
+        fence_thread.start()
         try:
             while True:
                 try:
@@ -2466,7 +2764,7 @@ class RecoveryProcessor:
                     if self._closing or time.monotonic() >= deadline:
                         self._terminate_worker(process)
                         raise RecoveryWorkerUnavailable("recovery worker timed out")
-                    if not self.coordinator.renew_lease(fence):
+                    if fence_lost.is_set() or not durable_fence_valid():
                         self._terminate_worker(process)
                         raise RecoveryWorkerStale("recovery worker lost its fence")
             if process.returncode != 0:
@@ -2481,14 +2779,78 @@ class RecoveryProcessor:
                 raise RecoveryWorkerUnavailable("recovery worker output is invalid")
             return result
         finally:
+            if process.poll() is None:
+                self._terminate_worker(process)
+            stop_fence_checks.set()
+            try:
+                parent_fence.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            parent_fence.close()
+            fence_thread.join(timeout=1)
             with self._state_lock:
                 if self._process is process:
                     self._process = None
 
+    def _run_node_worker(
+        self, request: dict[str, Any], fence: InvocationFence
+    ) -> dict[str, Any]:
+        return self._run_worker_process(
+            request, lambda: self.coordinator.renew_lease(fence)
+        )
+
+    def _run_verification_worker(
+        self, request: dict[str, Any], fence: VerificationFence
+    ) -> dict[str, Any]:
+        return self._run_worker_process(request, lambda: self.verifier.fence_valid(fence))
+
+    def _refresh_verification_once(self) -> dict[str, Any] | None:
+        fence = self.verifier.next_probe_refresh()
+        if fence is None:
+            return None
+        try:
+            result = self.verification_runner(self._verification_request(fence), fence)
+        except RecoveryWorkerStale:
+            return {"plannerLaunched": False, "executorLaunched": False, "outcome": "stale"}
+        except (RecoveryWorkerUnavailable, LedgerError, OSError, ValueError):
+            if self.coordinator.immediate_escalation is not None:
+                self.coordinator.immediate_escalation("recovery_failed")
+            return {
+                "plannerLaunched": False,
+                "executorLaunched": False,
+                "outcome": "verification_failed",
+            }
+        status = result.get("status")
+        probes = result.get("probes")
+        if status == "stale":
+            return {"plannerLaunched": False, "executorLaunched": False, "outcome": "stale"}
+        if status not in {"completed", "failed"} or not isinstance(probes, list):
+            if self.coordinator.immediate_escalation is not None:
+                self.coordinator.immediate_escalation("recovery_failed")
+            return {
+                "plannerLaunched": False,
+                "executorLaunched": False,
+                "outcome": "verification_failed",
+            }
+        try:
+            stored = self.verifier.record_probe_results(fence, probes)
+        except (LedgerError, ValueError):
+            stored = False
+        return {
+            "plannerLaunched": False,
+            "executorLaunched": bool(probes),
+            "outcome": ("verification_refreshed" if stored else "stale"),
+        }
+
     def process_once(self) -> dict[str, Any]:
         fence = self.coordinator.claim_next()
         if fence is None:
-            return {"plannerLaunched": False, "executorLaunched": False, "outcome": None}
+            refreshed = self._refresh_verification_once()
+            return refreshed or {
+                "plannerLaunched": False,
+                "executorLaunched": False,
+                "outcome": None,
+            }
         try:
             result = self.runner(self._request(fence), fence)
         except RecoveryWorkerStale:
@@ -2562,21 +2924,12 @@ class RecoveryProcessor:
             "completed": "completed",
         }.get(status, "malformed_output")
         accepted = self.coordinator.finish(fence, outcome)
-        if accepted:
-            for probe in probes:
-                probe_id = probe.get("id") if isinstance(probe, dict) else None
-                if isinstance(probe_id, str) and probe_id in self.verifier.probe_ids:
-                    self.verifier.record_probe(
-                        probe_id,
-                        healthy=(
-                            probe.get("exitCode") == 0
-                            and probe.get("timedOut") is False
-                        ),
-                    )
-        if accepted and outcome == "completed":
-            self.adapter.record_outcome(fence.incident_id, "stable_recovery")
-        elif accepted and outcome == "recovery_failed":
-            self.adapter.record_outcome(fence.incident_id, "failed_recovery")
+        if accepted and outcome == "recovery_failed":
+            self.adapter.record_outcome(
+                fence.incident_id,
+                "failed_recovery",
+                dedupe_key=f"invocation:{fence.invocation_id}",
+            )
         return {
             "plannerLaunched": True,
             "executorLaunched": executor_launched,
@@ -2697,14 +3050,26 @@ class RecoveryService:
             self._drain_events()
             if self.coordinator is not None:
                 self.coordinator.reconcile()
-        except (LedgerError, SpoolError):
+        except LedgerError:
             self.emergency.emit("ledger_unavailable")
+        except SpoolError:
+            self.emergency.emit("spool_corrupt")
         if self.processor is not None:
             self.processor.start_background()
         if self.verifier is not None:
             try:
                 self.verifier.record_heartbeat("supervisor")
-                self.verifier.evaluate_all()
+                verification_results = self.verifier.evaluate_all()
+                if self.adapter is not None:
+                    for incident_id, result in verification_results:
+                        classification = self.verifier.mechanical_classification(
+                            incident_id, result
+                        )
+                        if classification is not None:
+                            name, dedupe_key = classification
+                            self.adapter.record_outcome(
+                                incident_id, name, dedupe_key=dedupe_key
+                            )
             except LedgerError:
                 self.emergency.emit("ledger_unavailable")
         if self.adapter is not None:
@@ -2719,7 +3084,10 @@ class RecoveryService:
                     self.notifications.deliver_due(self.notification_delivery)
             except LedgerError:
                 self.emergency.emit("ledger_unavailable")
-        self.emergency.drain()
+        try:
+            self.emergency.drain()
+        except SpoolError:
+            self.emergency.emit("spool_corrupt")
 
 
 def _valid_spooled_event(event: dict[str, Any]) -> bool:
@@ -2960,6 +3328,7 @@ def _build_recovery_service(
         source_ids=source_ids,
     )
     adapter = BoundedPolicyAdapter(ledger, controls)
+    coordinator.mechanical_outcome = adapter.record_outcome
     processor = (
         RecoveryProcessor(configured, coordinator, verifier, adapter)
         if configured is not None

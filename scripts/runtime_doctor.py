@@ -36,6 +36,8 @@ STATE_VERSION = 1
 TCC_STATUS_MAX_BYTES = 1024
 STATE_MAX_BYTES = 64 * 1024
 RECOVERY_TOKEN_MAX_BYTES = 4 * 1024
+RECOVERY_FALLBACK_COOLDOWN_SECONDS = 300.0
+SUPERVISOR_UNAVAILABLE_MESSAGE = "MINIME RECOVERY SUPERVISOR\nsupervisor unavailable"
 ENV_PREFIX = "MINIME_DOCTOR_"
 INCIDENT_ACTIONS = {
     "alertmanager_unhealthy": "check Alertmanager health and recreate its current service",
@@ -501,6 +503,74 @@ def send_recovery_events(
     raise MonitoringError("recovery delivery failed")
 
 
+def _recovery_fallback_state_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.recovery-fallback")
+
+
+def _read_recovery_fallback_timestamp(path: Path) -> float:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 128:
+            return 0.0
+        value = float(os.read(descriptor, 129).decode("ascii").strip())
+        return value if math.isfinite(value) and value >= 0 else 0.0
+    except (OSError, UnicodeError, ValueError):
+        return 0.0
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_recovery_fallback_timestamp(path: Path, timestamp: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(f"{timestamp:.6f}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _notify_supervisor_unavailable(
+    config: DoctorConfig,
+    notify: Callable[[str], None],
+    logger: logging.Logger,
+    *,
+    now: float | None = None,
+) -> None:
+    timestamp = time.time() if now is None else now
+    state_path = _recovery_fallback_state_path(config.state_path)
+    last_notification = _read_recovery_fallback_timestamp(state_path)
+    if (
+        last_notification > 0
+        and timestamp - last_notification < RECOVERY_FALLBACK_COOLDOWN_SECONDS
+    ):
+        return
+    try:
+        notify(SUPERVISOR_UNAVAILABLE_MESSAGE)
+        _write_recovery_fallback_timestamp(state_path, timestamp)
+    except (MonitoringError, OSError):
+        logger.error("doctor_recovery_fallback_failed")
+
+
+def _clear_recovery_fallback(config: DoctorConfig) -> None:
+    try:
+        _recovery_fallback_state_path(config.state_path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def acquire_lock(path: Path) -> int | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -567,6 +637,11 @@ def run_doctor(
         )
         recovery_delivered = False
 
+        def recovery_sink_failed() -> None:
+            active_logger.error("doctor_recovery_sink_failed")
+            if config.sink_mode == "recovery":
+                _notify_supervisor_unavailable(config, notify, active_logger)
+
         def finish_pending(active: dict[str, Any]) -> tuple[bool, set[str]]:
             nonlocal recovery_delivered
             target = set(active["target_incidents"])
@@ -581,9 +656,10 @@ def run_doctor(
             try:
                 recovery_notify(active["events"])
             except (MonitoringError, OSError):
-                active_logger.error("doctor_recovery_sink_failed")
+                recovery_sink_failed()
                 return False, previous
             recovery_delivered = True
+            _clear_recovery_fallback(config)
             write_delivery_state(config.state_path, target, None)
             active_logger.info(
                 "doctor_transition_notified codes=%s",
@@ -602,8 +678,9 @@ def run_doctor(
                 try:
                     recovery_notify([])
                 except (MonitoringError, OSError):
-                    active_logger.error("doctor_recovery_sink_failed")
+                    recovery_sink_failed()
                     return 1
+                _clear_recovery_fallback(config)
             active_logger.info("doctor_state_unchanged codes=%s", ",".join(sorted(incidents)) or "healthy")
             return 0
         pending = {

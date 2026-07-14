@@ -610,7 +610,6 @@ function runRecoveryCommand(
       cwd: runOptions.cwd,
       env: runOptions.env,
       encoding: "utf8",
-      timeout: 30_000,
       shell: false,
     });
     return {

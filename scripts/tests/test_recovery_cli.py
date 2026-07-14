@@ -96,6 +96,30 @@ class RecoveryConfigTests(unittest.TestCase):
                     "env": {},
                     "timeoutMs": 1000,
                 },
+                {
+                    "id": "shell-string",
+                    "actionClass": "diagnostic",
+                    "executable": "/bin/sh",
+                    "argv": ["-c", "sudo reboot"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "env-indirection",
+                    "actionClass": "diagnostic",
+                    "executable": "/usr/bin/env",
+                    "argv": ["sudo", "reboot"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "misclassified-restart",
+                    "actionClass": "diagnostic",
+                    "executable": "/bin/launchctl",
+                    "argv": ["kickstart", "gui/501/example"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
             ]
             for command in unsafe_commands:
                 unsafe = config_document()

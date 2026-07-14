@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.minime.runtime-doctor-shadow</string>
+  <string>ai.minime.runtime-doctor</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
@@ -11,22 +11,44 @@
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin</string>
     <key>MINIME_CONTROL_WORKSPACE_ROOT</key>
     <string>__CONTROL_WORKSPACE_ROOT__</string>
-    <key>MINIME_AGENT_WORKSPACE_ROOT</key>
-    <string>__AGENT_WORKSPACE_ROOT__</string>
     <key>MINIME_DOCTOR_STATE_PATH</key>
-    <string>__CONTROL_WORKSPACE_ROOT__/var/recovery/runtime-doctor-state.json</string>
+    <string>__EXISTING_RUNTIME_DOCTOR_STATE_PATH__</string>
+    <key>MINIME_DOCTOR_LAUNCHD_LABEL</key>
+    <string>__BOT_LAUNCHD_LABEL__</string>
+    <key>MINIME_DOCTOR_BOT_METRICS_URL</key>
+    <string>http://127.0.0.1:__BOT_METRICS_PORT__/metrics</string>
+    <key>MINIME_DOCTOR_PROMETHEUS_URL</key>
+    <string>http://127.0.0.1:__PROMETHEUS_PORT__/-/healthy</string>
+    <key>MINIME_DOCTOR_ALERTMANAGER_URL</key>
+    <string>http://127.0.0.1:__ALERTMANAGER_PORT__/-/healthy</string>
+    <key>MINIME_DOCTOR_NODE_EXECUTABLE</key>
+    <string>__NODE_EXECUTABLE__</string>
+    <key>MINIME_DOCTOR_NODE_BASELINE_PATH</key>
+    <string>__NODE_EXECUTABLE__</string>
+    <key>MINIME_DOCTOR_NODE_BASELINE_VERSION</key>
+    <string>__NODE_VERSION__</string>
+    <key>MINIME_DOCTOR_RUNTIME_STATE_PATH</key>
+    <string>__EXISTING_RUNTIME_STATE_PATH__</string>
     <key>MINIME_DOCTOR_SINK</key>
     <string>tee</string>
     <key>MINIME_DOCTOR_RECOVERY_URL</key>
     <string>http://127.0.0.1:9877/v1/runtime-doctor</string>
     <key>MINIME_DOCTOR_RECOVERY_TOKEN_FILE</key>
     <string>__CONTROL_WORKSPACE_ROOT__/config/recovery-auth-token</string>
-    <key>MINIME_DOCTOR_ALERTMANAGER_URL</key>
-    <string>http://127.0.0.1:9093/-/healthy</string>
+    <key>MINIME_TELEGRAM_CHAT_ID</key>
+    <string>__TELEGRAM_DESTINATION__</string>
+    <key>MINIME_TELEGRAM_SOPS_FILE</key>
+    <string>__SOPS_FILE__</string>
+    <key>MINIME_TELEGRAM_SOPS_KEY</key>
+    <string>telegram.bot_token</string>
+    <key>MINIME_SOPS_EXECUTABLE</key>
+    <string>__SOPS_EXECUTABLE__</string>
   </dict>
   <key>StartInterval</key>
-  <integer>60</integer>
+  <integer>300</integer>
 </dict>
 </plist>

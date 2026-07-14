@@ -34,6 +34,51 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SENSITIVE_ENV_KEY = /(AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)/i;
 const SENSITIVE_ARG = /^--?(?:api[-_]?key|authorization|credential|password|secret|token)(?:=|$)/i;
+const INDIRECTION_EXECUTABLES = new Set([
+  "bash",
+  "dash",
+  "env",
+  "expect",
+  "find",
+  "fish",
+  "ksh",
+  "node",
+  "osascript",
+  "parallel",
+  "perl",
+  "php",
+  "python",
+  "python3",
+  "ruby",
+  "script",
+  "sh",
+  "sudo",
+  "xargs",
+  "zsh",
+]);
+const RESTRICTED_EXECUTABLE_CLASSES = new Map<string, RecoveryActionClass>([
+  ["apt", "package_upgrade"],
+  ["apt-get", "package_upgrade"],
+  ["brew", "package_upgrade"],
+  ["dnf", "package_upgrade"],
+  ["doas", "sudo"],
+  ["halt", "restart"],
+  ["launchctl", "restart"],
+  ["npm", "package_upgrade"],
+  ["pip", "package_upgrade"],
+  ["pip3", "package_upgrade"],
+  ["pnpm", "package_upgrade"],
+  ["poweroff", "restart"],
+  ["reboot", "restart"],
+  ["rpm", "package_upgrade"],
+  ["service", "restart"],
+  ["shutdown", "restart"],
+  ["sops", "secret_migration"],
+  ["su", "sudo"],
+  ["systemctl", "restart"],
+  ["yum", "package_upgrade"],
+  ["yarn", "package_upgrade"],
+]);
 const ACTION_CLASSES = new Set<RecoveryActionClass>([
   "diagnostic",
   "local_repair",
@@ -147,11 +192,12 @@ function exactKeys(value: object, required: readonly string[]): boolean {
 }
 
 function validateStaticCommand(command: StaticRecoveryCommand): void {
+  const executableName = basename(command.executable).toLowerCase();
   if (
     !isRecord(command.env)
     || !isAbsolute(command.executable)
     || command.executable.includes("\0")
-    || basename(command.executable).toLowerCase() === "sudo"
+    || INDIRECTION_EXECUTABLES.has(executableName)
     || !Array.isArray(command.argv)
     || command.argv.length > 64
     || !Number.isSafeInteger(command.timeoutMs)
@@ -219,11 +265,67 @@ function registry<T extends RunbookDefinition | ProbeDefinition>(
       if (!ACTION_CLASSES.has(runbook.actionClass)) {
         throw new ExecutorConfigError("runbook action class is invalid");
       }
+      const requiredClass = RESTRICTED_EXECUTABLE_CLASSES.get(basename(runbook.executable).toLowerCase());
+      if (requiredClass && runbook.actionClass !== requiredClass) {
+        throw new ExecutorConfigError("runbook action class is invalid");
+      }
+    } else if (RESTRICTED_EXECUTABLE_CLASSES.has(basename(definition.executable).toLowerCase())) {
+      throw new ExecutorConfigError("probe executable is restricted");
     }
     validateStaticCommand(definition);
     result.set(definition.id, definition);
   }
   return result;
+}
+
+export interface RecoveryProbeExecutionDependencies {
+  spawn?: RecoveryCommandSpawn;
+  checkFence: () => boolean | Promise<boolean>;
+  killProcessGroup?: RecoveryExecutorDependencies["killProcessGroup"];
+  abortGraceMs?: number;
+  maxOutputBytes?: number;
+  signal?: AbortSignal;
+}
+
+export interface RecoveryProbeExecutionResult {
+  status: "completed" | "failed" | "rejected" | "stale";
+  probes: readonly RecoveryCommandResult[];
+}
+
+/** Run every configured verification probe under a caller-owned durable fence. */
+export async function executeRecoveryProbes(
+  definitions: readonly ProbeDefinition[],
+  deps: RecoveryProbeExecutionDependencies,
+): Promise<RecoveryProbeExecutionResult> {
+  let probes: Map<string, ProbeDefinition>;
+  try {
+    probes = registry(definitions, "probe");
+  } catch {
+    return { status: "rejected", probes: Object.freeze([]) };
+  }
+  if (!(await deps.checkFence())) {
+    return { status: "stale", probes: Object.freeze([]) };
+  }
+  const results: RecoveryCommandResult[] = [];
+  let failed = false;
+  for (const probe of probes.values()) {
+    if (!(await deps.checkFence())) {
+      return { status: "stale", probes: Object.freeze(results) };
+    }
+    const result = await runStaticCommand(probe.id, probe, {
+      ...deps,
+      checkFence: () => true,
+    });
+    results.push(result);
+    failed = failed || result.timedOut || result.exitCode !== 0;
+    if (!(await deps.checkFence())) {
+      return { status: "stale", probes: Object.freeze(results) };
+    }
+  }
+  return {
+    status: failed ? "failed" : "completed",
+    probes: Object.freeze(results),
+  };
 }
 
 export function redactRecoveryOutput(value: string): string {

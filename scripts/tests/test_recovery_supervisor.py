@@ -256,6 +256,29 @@ class RecoveryServiceTests(unittest.TestCase):
             notifier.emit("ledger_corrupt")
             self.assertEqual(len(delivered), 1)
 
+    def test_corrupt_emergency_spool_does_not_terminate_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            delivered: list[str] = []
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                notifier = recovery_supervisor.EmergencyNotifier(
+                    root / "notifications", delivery=delivered.append, cooldown=0
+                )
+                notifier.spool.path.mkdir(parents=True)
+                (notifier.spool.path / "000-corrupt.json").write_text(
+                    "not-json", encoding="ascii"
+                )
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    notifier,
+                )
+                service.maintenance()
+                service.maintenance()
+            self.assertTrue(
+                any("spool validation failed" in message for message in delivered)
+            )
+
 
 class IncidentCoordinatorTests(unittest.TestCase):
     def test_cross_source_correlation_groups_one_incident_and_one_launch(self) -> None:
@@ -494,6 +517,8 @@ class IncidentCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             escalations: list[str] = []
             with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                adapter = recovery_supervisor.BoundedPolicyAdapter(ledger, controls)
                 ledger.record_events(
                     doctor_events(("node_unavailable", "firing", "doctor-critical"))
                 )
@@ -501,10 +526,18 @@ class IncidentCoordinatorTests(unittest.TestCase):
                     ledger,
                     correlation_policy(),
                     owner="supervisor-one",
+                    controls=controls,
                     immediate_escalation=escalations.append,
+                    mechanical_outcome=adapter.record_outcome,
                 )
                 coordinator.reconcile()
+                coordinator.reconcile()
                 self.assertIn("confirmed_impact", escalations)
+                impact_rows = ledger.connection.execute(
+                    "SELECT count(*) FROM audit WHERE operation = 'mechanical_outcome' "
+                    "AND details_json LIKE '%\"classification\":\"impact\"%'"
+                ).fetchone()[0]
+                self.assertEqual(impact_rows, 1)
 
         expected = {
             "pending_approval": "approval_required",
@@ -910,6 +943,18 @@ class BoundedAdaptationTests(unittest.TestCase):
 
 
 class RecoveryVerificationTests(unittest.TestCase):
+    @staticmethod
+    def _fence(
+        ledger: recovery_ledger.RecoveryLedger, incident_id: int
+    ) -> recovery_supervisor.VerificationFence:
+        row = ledger.connection.execute(
+            "SELECT generation, policy_revision FROM incidents WHERE id = ?",
+            (incident_id,),
+        ).fetchone()
+        return recovery_supervisor.VerificationFence(
+            incident_id, int(row["generation"]), int(row["policy_revision"])
+        )
+
     def _verifying_incident(
         self,
         ledger: recovery_ledger.RecoveryLedger,
@@ -950,7 +995,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                 )
                 verifier.record_heartbeat("supervisor")
                 verifier.record_heartbeat("alertmanager")
-                verifier.record_probe("bot-health", True)
+                verifier.record_probe(self._fence(ledger, incident_id), "bot-health", True)
                 holding = verifier.evaluate(incident_id)
                 self.assertFalse(holding.recovered)
                 self.assertIn("hold_down", holding.reasons)
@@ -983,10 +1028,120 @@ class RecoveryVerificationTests(unittest.TestCase):
                 self.assertTrue(any("missing" in reason for reason in missing.reasons))
                 verifier.record_heartbeat("supervisor", observed_at=100)
                 verifier.record_heartbeat("alertmanager", observed_at=100)
-                verifier.record_probe("bot-health", True, observed_at=100)
+                verifier.record_probe(
+                    self._fence(ledger, incident_id),
+                    "bot-health",
+                    True,
+                    observed_at=100,
+                )
                 stale = verifier.evaluate(incident_id)
                 self.assertFalse(stale.recovered)
                 self.assertTrue(any("unhealthy" in reason for reason in stale.reasons))
+
+    def test_probe_evidence_is_fenced_to_the_exact_verification_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [300.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("bot-health",),
+                    source_ids=(),
+                    freshness_seconds=60,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                verifier.record_heartbeat("supervisor")
+                old_fence = self._fence(ledger, incident_id)
+                self.assertTrue(verifier.record_probe(old_fence, "bot-health", True))
+                ledger.connection.execute(
+                    "UPDATE incidents SET generation = generation + 1 WHERE id = ?",
+                    (incident_id,),
+                )
+                current_fence = self._fence(ledger, incident_id)
+                self.assertFalse(verifier.fence_valid(old_fence))
+                result = verifier.evaluate(incident_id)
+                self.assertFalse(result.recovered)
+                self.assertIn("probe_missing:bot-health", result.reasons)
+                self.assertEqual(verifier.next_probe_refresh(), current_fence)
+
+    def test_completed_commands_are_classified_only_after_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [1_000.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                )
+                controls = recovery_supervisor.RecoveryControls(
+                    ledger, clock=lambda: clock[0]
+                )
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(),
+                    owner="verification-owner",
+                    controls=controls,
+                    clock=lambda: clock[0],
+                )
+                fence = coordinator.claim_next()
+                self.assertIsNotNone(fence)
+                assert fence is not None
+                self.assertTrue(coordinator.finish(fence, "completed"))
+                ledger.connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    (
+                        f"invocation:{fence.invocation_id}:plan",
+                        json.dumps(
+                            {"nextEvaluationDelaySeconds": 60},
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("bot-health",),
+                    source_ids=("alertmanager",),
+                    freshness_seconds=30,
+                    hold_down_seconds=10,
+                    clock=lambda: clock[0],
+                )
+                adapter = recovery_supervisor.BoundedPolicyAdapter(
+                    ledger, controls, clock=lambda: clock[0]
+                )
+
+                initial = verifier.evaluate(fence.incident_id)
+                self.assertFalse(initial.recovered)
+                self.assertIsNone(
+                    verifier.mechanical_classification(fence.incident_id, initial)
+                )
+                clock[0] += 61
+                missed = verifier.evaluate(fence.incident_id)
+                classification = verifier.mechanical_classification(
+                    fence.incident_id, missed
+                )
+                self.assertEqual(classification[0] if classification else None, "missed_recovery")
+                assert classification is not None
+                adapter.record_outcome(
+                    fence.incident_id,
+                    classification[0],
+                    dedupe_key=classification[1],
+                )
+
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(resolved_alert()))
+                )
+                coordinator.reconcile()
+                verifier.record_heartbeat("supervisor")
+                verifier.record_heartbeat("alertmanager")
+                verifier.record_probe(
+                    self._fence(ledger, fence.incident_id), "bot-health", True
+                )
+                clock[0] += 11
+                recovered = verifier.evaluate(fence.incident_id)
+                self.assertTrue(recovered.recovered)
+                stable = verifier.mechanical_classification(fence.incident_id, recovered)
+                self.assertEqual(stable[0] if stable else None, "stable_recovery")
 
 
 class RecoveryDigestTests(unittest.TestCase):
@@ -1055,6 +1210,63 @@ class RecoveryDigestTests(unittest.TestCase):
 
 
 class RecoveryProcessorTests(unittest.TestCase):
+    def test_worker_executor_boundaries_use_synchronous_coordinator_fence_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_node = root / "fake-node"
+            fake_node.write_text(
+                """#!/usr/bin/python3
+import json
+import os
+import sys
+json.load(sys.stdin)
+descriptor = int(os.environ[\"MINIME_RECOVERY_FENCE_FD\"])
+responses = []
+for _ in range(2):
+    os.write(descriptor, b\"?\")
+    responses.append(os.read(descriptor, 1) == b\"1\")
+sys.stdout.write(json.dumps({\"version\": 1, \"responses\": responses}))
+""",
+                encoding="utf-8",
+            )
+            fake_node.chmod(0o700)
+            config = recovery_config.RecoveryConfig(
+                path=root / "recovery.json",
+                workspace=root,
+                mode="enabled",
+                database=root / "ledger.sqlite3",
+                spool_directory=root / "spool",
+                auth_token_file=root / "auth-token",
+                host="127.0.0.1",
+                port=9877,
+                correlation_rules=(),
+                source_ids=("alertmanager",),
+                runbooks=(),
+                probes=(),
+            )
+            with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="fence-owner", controls=controls
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger, coordinator, source_ids=("alertmanager",)
+                )
+                processor = recovery_supervisor.RecoveryProcessor(
+                    config,
+                    coordinator,
+                    verifier,
+                    recovery_supervisor.BoundedPolicyAdapter(ledger, controls),
+                    environment={"MINIME_RECOVERY_NODE_EXECUTABLE": str(fake_node)},
+                )
+                checks = [True, False]
+                with mock.patch.object(recovery_supervisor.Path, "is_file", return_value=True):
+                    result = processor._run_worker_process(
+                        {"version": 1}, lambda: checks.pop(0)
+                    )
+                self.assertEqual(result["responses"], [True, False])
+                self.assertEqual(checks, [])
+
     def test_claim_plan_execute_persist_probe_and_finish_are_wired(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1105,6 +1317,7 @@ class RecoveryProcessorTests(unittest.TestCase):
                 )
                 adapter = recovery_supervisor.BoundedPolicyAdapter(ledger, controls)
                 requests: list[dict[str, object]] = []
+                verification_requests: list[dict[str, object]] = []
 
                 def runner(
                     request: dict[str, object], _fence: recovery_supervisor.InvocationFence
@@ -1155,8 +1368,32 @@ class RecoveryProcessorTests(unittest.TestCase):
                         ],
                     }
 
+                def verification_runner(
+                    request: dict[str, object],
+                    _fence: recovery_supervisor.VerificationFence,
+                ) -> dict[str, object]:
+                    verification_requests.append(request)
+                    return {
+                        "version": 1,
+                        "status": "completed",
+                        "probes": [
+                            {
+                                "id": "probe-local",
+                                "exitCode": 0,
+                                "timedOut": False,
+                                "output": "",
+                                "truncated": False,
+                            }
+                        ],
+                    }
+
                 processor = recovery_supervisor.RecoveryProcessor(
-                    config, coordinator, verifier, adapter, runner=runner
+                    config,
+                    coordinator,
+                    verifier,
+                    adapter,
+                    runner=runner,
+                    verification_runner=verification_runner,
                 )
                 result = processor.process_once()
                 self.assertEqual(result["outcome"], "completed")
@@ -1175,13 +1412,26 @@ class RecoveryProcessorTests(unittest.TestCase):
                 self.assertEqual(
                     ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0], 2
                 )
+                refresh = processor.process_once()
+                self.assertEqual(refresh["outcome"], "verification_refreshed")
+                self.assertEqual(len(verification_requests), 1)
+                verification_fence = verifier.next_probe_refresh()
+                self.assertIsNone(verification_fence)
+                incident = ledger.connection.execute(
+                    "SELECT id, generation, policy_revision FROM incidents"
+                ).fetchone()
                 probe = json.loads(
                     ledger.connection.execute(
-                        "SELECT value FROM metadata WHERE key = 'verification:probe:probe-local'"
+                        "SELECT value FROM metadata WHERE key = ?",
+                        (
+                            "verification:probe:"
+                            f"{incident['id']}:{incident['generation']}:"
+                            f"{incident['policy_revision']}:probe-local",
+                        ),
                     ).fetchone()[0]
                 )
                 self.assertTrue(probe["healthy"])
-                self.assertIsNotNone(
+                self.assertIsNone(
                     ledger.connection.execute(
                         "SELECT 1 FROM audit WHERE operation = 'mechanical_outcome'"
                     ).fetchone()
@@ -1466,6 +1716,54 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             self.assertEqual([event["status"] for event in events], ["firing"])
+
+    def test_recovery_mode_uses_throttled_native_fallback_when_supervisor_is_down(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "recovery")
+            messages: list[str] = []
+
+            def unavailable(_events: list[dict[str, str]]) -> None:
+                raise monitoring_native.DeliveryError("synthetic supervisor outage")
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value={"node_unavailable"}
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config, deliver=messages.append, deliver_recovery=unavailable
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config, deliver=messages.append, deliver_recovery=unavailable
+                    ),
+                    1,
+                )
+                self.assertEqual(messages, [runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE])
+
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=messages.append,
+                        deliver_recovery=lambda _events: None,
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config, deliver=messages.append, deliver_recovery=unavailable
+                    ),
+                    1,
+                )
+            self.assertEqual(
+                messages,
+                [
+                    runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
+                    runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
+                ],
+            )
 
     def test_real_recovery_http_retries_and_sends_authenticated_heartbeats(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

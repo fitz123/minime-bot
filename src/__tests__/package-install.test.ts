@@ -351,6 +351,21 @@ describe("package artifact install", () => {
         );
         assert.equal(plistResult.status, 0, plistResult.stderr || String(plistResult.error));
       }
+      const doctorShadow = readFileSync(
+        join(installedPackage, "examples", "recovery", "ai.minime.runtime-doctor-shadow.plist"),
+        "utf8",
+      );
+      assert.match(doctorShadow, /<string>ai\.minime\.runtime-doctor<\/string>/);
+      for (const requiredSetting of [
+        "MINIME_DOCTOR_LAUNCHD_LABEL",
+        "MINIME_DOCTOR_BOT_METRICS_URL",
+        "MINIME_DOCTOR_PROMETHEUS_URL",
+        "MINIME_TELEGRAM_CHAT_ID",
+        "MINIME_TELEGRAM_SOPS_FILE",
+        "MINIME_TELEGRAM_SOPS_KEY",
+      ]) {
+        assert.match(doctorShadow, new RegExp(`<key>${requiredSetting}</key>`));
+      }
       for (const plist of ["ai.minime.alertmanager-webhook.plist", "ai.minime.runtime-doctor.plist"]) {
         const plistPath = join(installedPackage, "examples", "monitoring", plist);
         const plistResult = spawnSync(

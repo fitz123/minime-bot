@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readSync, writeSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,6 +10,7 @@ import {
 } from "./fixer-runner.js";
 import {
   executeRecoveryPlan,
+  executeRecoveryProbes,
   type ProbeDefinition,
   type RecoveryExecutionResult,
   type RecoveryMode,
@@ -18,6 +19,7 @@ import {
 import type { RecoveryPlan } from "../pi-extensions/recovery-plan.js";
 
 const MAX_WORKER_INPUT_BYTES = 512 * 1024;
+const MAX_WORKER_COMMAND_OUTPUT_BYTES = 8 * 1024;
 
 export interface RecoveryWorkerRequest {
   version: 1;
@@ -33,6 +35,24 @@ export interface RecoveryWorkerDependencies {
   executor?: typeof executeRecoveryPlan;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  checkFence?: () => boolean | Promise<boolean>;
+}
+
+export interface RecoveryVerificationWorkerRequest {
+  version: 1;
+  operation: "verify";
+  fence: {
+    incidentId: number;
+    generation: number;
+    policyRevision: number;
+  };
+  probes: readonly ProbeDefinition[];
+}
+
+export interface RecoveryVerificationWorkerResult {
+  version: 1;
+  status: "completed" | "failed" | "rejected" | "stale";
+  probes: readonly import("./runbook-executor.js").RecoveryCommandResult[];
 }
 
 export interface RecoveryWorkerResult {
@@ -69,6 +89,27 @@ function validateRequest(value: unknown): RecoveryWorkerRequest {
     throw new RecoveryPlannerError("invalid_request", "recovery worker request is invalid");
   }
   return value as unknown as RecoveryWorkerRequest;
+}
+
+function validateVerificationRequest(value: unknown): RecoveryVerificationWorkerRequest {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ["version", "operation", "fence", "probes"])
+    || value.version !== 1
+    || value.operation !== "verify"
+    || !isRecord(value.fence)
+    || !exactKeys(value.fence, ["incidentId", "generation", "policyRevision"])
+    || !Number.isSafeInteger(value.fence.incidentId)
+    || (value.fence.incidentId as number) < 1
+    || !Number.isSafeInteger(value.fence.generation)
+    || (value.fence.generation as number) < 1
+    || !Number.isSafeInteger(value.fence.policyRevision)
+    || (value.fence.policyRevision as number) < 1
+    || !Array.isArray(value.probes)
+  ) {
+    throw new RecoveryPlannerError("invalid_request", "recovery verification request is invalid");
+  }
+  return value as unknown as RecoveryVerificationWorkerRequest;
 }
 
 function emptyPlannerError(code: string): RecoveryWorkerResult {
@@ -129,7 +170,8 @@ export async function runRecoveryWorkerRequest(
         probes: request.probes,
       },
       {
-        checkFence: () => deps.signal?.aborted !== true,
+        checkFence: deps.checkFence ?? (() => deps.signal?.aborted !== true),
+        maxOutputBytes: MAX_WORKER_COMMAND_OUTPUT_BYTES,
         signal: deps.signal,
       },
     );
@@ -155,6 +197,53 @@ export async function runRecoveryWorkerRequest(
   };
 }
 
+export async function runRecoveryVerificationWorkerRequest(
+  value: unknown,
+  deps: Pick<RecoveryWorkerDependencies, "signal" | "checkFence"> = {},
+): Promise<RecoveryVerificationWorkerResult> {
+  let request: RecoveryVerificationWorkerRequest;
+  try {
+    request = validateVerificationRequest(value);
+  } catch {
+    return { version: 1, status: "rejected", probes: Object.freeze([]) };
+  }
+  const result = await executeRecoveryProbes(request.probes, {
+    checkFence: deps.checkFence ?? (() => deps.signal?.aborted !== true),
+    maxOutputBytes: MAX_WORKER_COMMAND_OUTPUT_BYTES,
+    signal: deps.signal,
+  });
+  return {
+    version: 1,
+    status: result.status,
+    probes: Object.freeze(result.probes.map((probe) => Object.freeze({
+      ...probe,
+      output: "",
+    }))),
+  };
+}
+
+function fenceCheckFromEnvironment(env: NodeJS.ProcessEnv): (() => boolean) | undefined {
+  const raw = env.MINIME_RECOVERY_FENCE_FD?.trim();
+  if (!raw || !/^[0-9]{1,6}$/.test(raw)) {
+    return undefined;
+  }
+  const descriptor = Number(raw);
+  if (!Number.isSafeInteger(descriptor) || descriptor < 3) {
+    return undefined;
+  }
+  return () => {
+    const response = Buffer.alloc(1);
+    try {
+      if (writeSync(descriptor, Buffer.from("?", "ascii")) !== 1) {
+        return false;
+      }
+      return readSync(descriptor, response, 0, 1, null) === 1 && response[0] === 0x31;
+    } catch {
+      return false;
+    }
+  };
+}
+
 async function main(): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -171,7 +260,10 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify(emptyPlannerError("invalid_request")));
     return;
   }
-  const result = await runRecoveryWorkerRequest(value, { signal: controller.signal });
+  const checkFence = fenceCheckFromEnvironment(process.env);
+  const result = isRecord(value) && value.operation === "verify"
+    ? await runRecoveryVerificationWorkerRequest(value, { signal: controller.signal, checkFence })
+    : await runRecoveryWorkerRequest(value, { signal: controller.signal, checkFence });
   process.stdout.write(JSON.stringify(result));
 }
 

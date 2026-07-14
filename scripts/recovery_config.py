@@ -18,6 +18,53 @@ _SENSITIVE_ARG = re.compile(
     r"^--?(?:api[-_]?key|authorization|credential|password|secret|token)(?:=|$)",
     re.IGNORECASE,
 )
+_INDIRECTION_EXECUTABLES = frozenset(
+    {
+        "bash",
+        "dash",
+        "env",
+        "expect",
+        "find",
+        "fish",
+        "ksh",
+        "node",
+        "osascript",
+        "parallel",
+        "perl",
+        "php",
+        "python",
+        "python3",
+        "ruby",
+        "script",
+        "sh",
+        "sudo",
+        "xargs",
+        "zsh",
+    }
+)
+_RESTRICTED_EXECUTABLE_CLASSES = {
+    "apt": "package_upgrade",
+    "apt-get": "package_upgrade",
+    "brew": "package_upgrade",
+    "dnf": "package_upgrade",
+    "doas": "sudo",
+    "halt": "restart",
+    "launchctl": "restart",
+    "npm": "package_upgrade",
+    "pip": "package_upgrade",
+    "pip3": "package_upgrade",
+    "pnpm": "package_upgrade",
+    "poweroff": "restart",
+    "reboot": "restart",
+    "rpm": "package_upgrade",
+    "service": "restart",
+    "shutdown": "restart",
+    "sops": "secret_migration",
+    "su": "sudo",
+    "systemctl": "restart",
+    "yum": "package_upgrade",
+    "yarn": "package_upgrade",
+}
 _ROOT_KEYS = {
     "version",
     "mode",
@@ -86,11 +133,12 @@ def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
     item = _object(value, keys, "runbook" if runbook else "probe")
     _safe_id(item["id"], "command id")
     executable = item["executable"]
+    executable_name = Path(executable).name.lower() if isinstance(executable, str) else ""
     if (
         not isinstance(executable, str)
         or not Path(executable).is_absolute()
         or "\0" in executable
-        or Path(executable).name.lower() == "sudo"
+        or executable_name in _INDIRECTION_EXECUTABLES
     ):
         raise RecoveryConfigError("recovery command executable is invalid")
     argv = item["argv"]
@@ -135,6 +183,11 @@ def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
         "public_write",
     }:
         raise RecoveryConfigError("recovery runbook action class is invalid")
+    required_class = _RESTRICTED_EXECUTABLE_CLASSES.get(executable_name)
+    if required_class is not None and (
+        not runbook or item.get("actionClass") != required_class
+    ):
+        raise RecoveryConfigError("recovery command action class is invalid")
     return dict(item)
 
 

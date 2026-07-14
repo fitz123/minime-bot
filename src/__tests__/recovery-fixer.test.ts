@@ -36,7 +36,10 @@ import {
   type RecoveryCommandSpawnOptions,
   type RunbookDefinition,
 } from "../recovery/runbook-executor.js";
-import { runRecoveryWorkerRequest } from "../recovery/worker.js";
+import {
+  runRecoveryVerificationWorkerRequest,
+  runRecoveryWorkerRequest,
+} from "../recovery/worker.js";
 
 const HASH = "a".repeat(64);
 const TRANSITION = "b".repeat(64);
@@ -540,6 +543,46 @@ describe("deterministic recovery runbook executor", () => {
     assert.equal(spawnCount, 0);
   });
 
+  it("rejects shell and executable indirection plus misclassified restricted commands", async () => {
+    let spawnCount = 0;
+    const spawn = () => {
+      spawnCount++;
+      return new FakeCommandChild();
+    };
+    for (const executable of ["/bin/sh", "/usr/bin/env", "/usr/bin/python3"]) {
+      const registry = commandRegistry();
+      registry.runbooks[0] = { ...registry.runbooks[0], executable, argv: ["-c", "sudo reboot"] };
+      const result = await executeRecoveryPlan(
+        { plan: plan(), fence, ...registry },
+        { spawn, checkFence: () => true },
+      );
+      assert.equal(result.status, "rejected");
+    }
+    const misclassified = commandRegistry();
+    misclassified.runbooks[0] = {
+      ...misclassified.runbooks[0],
+      executable: "/bin/systemctl",
+      argv: ["restart", "example"],
+    };
+    assert.equal((await executeRecoveryPlan(
+      { plan: plan(), fence, ...misclassified },
+      { spawn, checkFence: () => true },
+    )).status, "rejected");
+
+    const classified = commandRegistry();
+    classified.runbooks[0] = {
+      ...classified.runbooks[0],
+      actionClass: "restart",
+      executable: "/bin/systemctl",
+      argv: ["restart", "example"],
+    };
+    assert.equal((await executeRecoveryPlan(
+      { plan: plan(), fence, ...classified },
+      { spawn, checkFence: () => true },
+    )).status, "approval_required");
+    assert.equal(spawnCount, 0);
+  });
+
   it("kills a timed-out process group and does not run post-action probes", async () => {
     const child = new FakeCommandChild();
     const signals: NodeJS.Signals[] = [];
@@ -697,5 +740,53 @@ describe("package-owned recovery worker bridge", () => {
     assert.equal(result.status, "planner_error");
     assert.equal(result.code, "context_unavailable");
     assert.equal(plannerCalls, 0);
+  });
+
+  it("passes the coordinator-owned durable fence check into the executor", async () => {
+    let fenceChecks = 0;
+    const result = await runRecoveryWorkerRequest(
+      { version: 1, mode: "enabled", fence, evidence, ...commandRegistry() },
+      {
+        env: { MINIME_AGENT_WORKSPACE_ROOT: "/agent/fixer" },
+        planner: async () => plan(),
+        checkFence: () => {
+          fenceChecks++;
+          return false;
+        },
+      },
+    );
+    assert.equal(result.status, "stale");
+    assert.equal(fenceChecks, 1);
+    assert.equal(result.executorLaunched, false);
+  });
+
+  it("runs every configured verification probe under its verification fence", async () => {
+    const children: FakeCommandChild[] = [];
+    const probes = [
+      commandRegistry().probes[0],
+      { ...commandRegistry().probes[0], id: "probe-second", executable: "/opt/minime/probe-second" },
+    ];
+    let fenceChecks = 0;
+    const promise = runRecoveryVerificationWorkerRequest(
+      {
+        version: 1,
+        operation: "verify",
+        fence: { incidentId: 5, generation: 4, policyRevision: 2 },
+        probes,
+      },
+      {
+        checkFence: () => {
+          fenceChecks++;
+          return true;
+        },
+      },
+    );
+    // The production helper uses real spawn; validate the closed request without
+    // allowing an unconfigured executable to be treated as success.
+    const result = await promise;
+    assert.equal(result.status, "failed");
+    assert.deepEqual(result.probes.map((probe) => probe.id), ["probe-local", "probe-second"]);
+    assert.ok(fenceChecks >= 5);
+    assert.deepEqual(children, []);
   });
 });

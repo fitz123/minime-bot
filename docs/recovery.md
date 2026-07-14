@@ -62,10 +62,13 @@ registry is limited to 128 unique IDs:
 ```
 
 Probe entries omit `actionClass`. IDs use letters, digits, `.`, `_`, `:`, and
-`-`; executables are absolute and cannot be `sudo`; argv has at most 64 static
-items and cannot contain credential-bearing flags; env has at most 32 uppercase
-keys and rejects authentication, credential, key, password, secret, and token
-names. Command timeouts are 100-300000 ms. Allowed runbook classes are
+`-`; executables are absolute and cannot be `sudo`, a shell/interpreter, or a
+process-indirection utility. Well-known service, package, and secret-management
+executables are accepted only under their matching approval-required class.
+Argv has at most 64 static items and cannot contain credential-bearing flags;
+env has at most 32 uppercase keys and rejects authentication, credential, key,
+password, secret, and token names. Command timeouts are 100-300000 ms. Allowed
+runbook classes are
 `diagnostic`, `local_repair`, `cache_cleanup`, and the restricted handoff
 classes listed below. The public example intentionally configures no commands.
 
@@ -139,8 +142,11 @@ alerts, escalation classes, allowlists, fallback, or runbooks.
    validate config, and start the supervisor in `observe`.
 2. Configure Alertmanager's shadow receiver with `continue: true` and run the
    runtime doctor with `MINIME_DOCTOR_SINK=tee`, as shown in
-   `examples/recovery/ai.minime.runtime-doctor-shadow.plist`. Direct Telegram
-   remains the owner of user notifications.
+   `examples/recovery/ai.minime.runtime-doctor-shadow.plist`. Treat that plist
+   as a replacement for the existing doctor job: preserve its state path,
+   checks, Telegram destination, and SOPS references, then add the recovery
+   sink settings and reload the same launchd label. Do not load it alongside
+   the original job. Direct Telegram remains the owner of user notifications.
 3. Send duplicate and out-of-order firing/resolved transitions. Verify one
    durable event per transition ID, correct correlation, no planner invocation,
    and no executor process.
