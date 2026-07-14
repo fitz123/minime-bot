@@ -365,9 +365,10 @@ monitoring stack itself. See [Host-native monitoring and Telegram alerts](docs/m
 for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
 
-An opt-in same-host recovery supervisor can durably correlate those native
-signals and, after explicit observe and plan shadow gates, invoke a tightly
-bounded fixer planner and static runbooks. Direct Telegram remains the default.
+An opt-in same-host recovery supervisor can durably correlate and verify those
+native signals while exposing bounded controls and native fallback. The shipped
+foundation is observe-only: it starts no Pi/Node remediation and performs no
+mutating action. Direct Telegram remains the default.
 Start with `minime-bot recovery config validate --workspace /path/to/control-workspace`
 and `minime-bot recovery status --workspace /path/to/control-workspace`; see
 [Same-host recovery supervisor](docs/recovery.md) for configuration, safety

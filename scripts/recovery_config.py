@@ -10,7 +10,7 @@ import re
 from typing import Any
 
 
-RECOVERY_MODES = frozenset({"observe", "plan", "enabled"})
+RECOVERY_MODES = frozenset({"observe"})
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _SENSITIVE = re.compile(r"AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
@@ -42,29 +42,31 @@ _INDIRECTION_EXECUTABLES = frozenset(
         "zsh",
     }
 )
-_RESTRICTED_EXECUTABLE_CLASSES = {
-    "apt": "package_upgrade",
-    "apt-get": "package_upgrade",
-    "brew": "package_upgrade",
-    "dnf": "package_upgrade",
-    "doas": "sudo",
-    "halt": "restart",
-    "launchctl": "restart",
-    "npm": "package_upgrade",
-    "pip": "package_upgrade",
-    "pip3": "package_upgrade",
-    "pnpm": "package_upgrade",
-    "poweroff": "restart",
-    "reboot": "restart",
-    "rpm": "package_upgrade",
-    "service": "restart",
-    "shutdown": "restart",
-    "sops": "secret_migration",
-    "su": "sudo",
-    "systemctl": "restart",
-    "yum": "package_upgrade",
-    "yarn": "package_upgrade",
-}
+_MUTATING_EXECUTABLES = frozenset(
+    {
+        "apt",
+        "apt-get",
+        "brew",
+        "dnf",
+        "doas",
+        "halt",
+        "launchctl",
+        "npm",
+        "pip",
+        "pip3",
+        "pnpm",
+        "poweroff",
+        "reboot",
+        "rpm",
+        "service",
+        "shutdown",
+        "sops",
+        "su",
+        "systemctl",
+        "yum",
+        "yarn",
+    }
+)
 _ROOT_KEYS = {
     "version",
     "mode",
@@ -75,7 +77,6 @@ _ROOT_KEYS = {
     "port",
     "correlationRules",
     "sourceIds",
-    "runbooks",
     "probes",
 }
 
@@ -96,7 +97,6 @@ class RecoveryConfig:
     port: int
     correlation_rules: tuple[dict[str, Any], ...]
     source_ids: tuple[str, ...]
-    runbooks: tuple[dict[str, Any], ...]
     probes: tuple[dict[str, Any], ...]
 
 
@@ -126,11 +126,9 @@ def _workspace_path(workspace: Path, value: Any, name: str) -> Path:
     return resolved
 
 
-def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
+def _command(value: Any) -> dict[str, Any]:
     keys = {"id", "executable", "argv", "env", "timeoutMs"}
-    if runbook:
-        keys.add("actionClass")
-    item = _object(value, keys, "runbook" if runbook else "probe")
+    item = _object(value, keys, "probe")
     _safe_id(item["id"], "command id")
     executable = item["executable"]
     executable_name = Path(executable).name.lower() if isinstance(executable, str) else ""
@@ -171,23 +169,8 @@ def _command(value: Any, *, runbook: bool) -> dict[str, Any]:
     timeout = item["timeoutMs"]
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 100 <= timeout <= 300_000:
         raise RecoveryConfigError("recovery command timeout is invalid")
-    if runbook and item["actionClass"] not in {
-        "diagnostic",
-        "local_repair",
-        "cache_cleanup",
-        "restart",
-        "deploy",
-        "sudo",
-        "package_upgrade",
-        "secret_migration",
-        "public_write",
-    }:
-        raise RecoveryConfigError("recovery runbook action class is invalid")
-    required_class = _RESTRICTED_EXECUTABLE_CLASSES.get(executable_name)
-    if required_class is not None and (
-        not runbook or item.get("actionClass") != required_class
-    ):
-        raise RecoveryConfigError("recovery command action class is invalid")
+    if executable_name in _MUTATING_EXECUTABLES:
+        raise RecoveryConfigError("recovery probe executable is invalid")
     return dict(item)
 
 
@@ -199,7 +182,6 @@ def recovery_static_policy(config: RecoveryConfig) -> dict[str, Any]:
         "mode": config.mode,
         "correlationRules": [dict(rule) for rule in config.correlation_rules],
         "sourceIds": list(config.source_ids),
-        "runbooks": [dict(runbook) for runbook in config.runbooks],
         "probes": [dict(probe) for probe in config.probes],
     }
 
@@ -256,18 +238,13 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     if not set(sources).issubset({"alertmanager", "runtime_doctor"}):
         raise RecoveryConfigError("recovery source IDs are invalid")
 
-    raw_runbooks = document["runbooks"]
     raw_probes = document["probes"]
-    if not isinstance(raw_runbooks, list) or len(raw_runbooks) > 128:
-        raise RecoveryConfigError("recovery runbooks are invalid")
     if not isinstance(raw_probes, list) or len(raw_probes) > 128:
         raise RecoveryConfigError("recovery probes are invalid")
-    runbooks = tuple(_command(item, runbook=True) for item in raw_runbooks)
-    probes = tuple(_command(item, runbook=False) for item in raw_probes)
-    for registry, name in ((runbooks, "runbooks"), (probes, "probes")):
-        ids = [str(item["id"]) for item in registry]
-        if len(ids) != len(set(ids)):
-            raise RecoveryConfigError(f"recovery {name} contain duplicate IDs")
+    probes = tuple(_command(item) for item in raw_probes)
+    ids = [str(item["id"]) for item in probes]
+    if len(ids) != len(set(ids)):
+        raise RecoveryConfigError("recovery probes contain duplicate IDs")
 
     return RecoveryConfig(
         path=path.resolve(),
@@ -280,6 +257,5 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
         port=int(port),
         correlation_rules=tuple(rules),
         source_ids=sources,
-        runbooks=runbooks,
         probes=probes,
     )

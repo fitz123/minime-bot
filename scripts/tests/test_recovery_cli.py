@@ -36,14 +36,13 @@ def config_document(mode: str = "observe") -> dict[str, object]:
             }
         ],
         "sourceIds": ["alertmanager", "runtime_doctor"],
-        "runbooks": [],
         "probes": [],
     }
 
 
-def write_config(root: Path, mode: str = "observe") -> None:
+def write_config(root: Path) -> None:
     (root / "recovery.json").write_text(
-        json.dumps(config_document(mode)), encoding="utf-8"
+        json.dumps(config_document()), encoding="utf-8"
     )
 
 
@@ -56,25 +55,63 @@ def call_cli(root: Path, *args: str) -> tuple[int, str, str]:
 
 
 class RecoveryConfigTests(unittest.TestCase):
-    def test_fixed_config_accepts_public_defaults_and_rejects_escape_and_sensitive_env(self) -> None:
+    def test_foundation_config_accepts_only_observe_and_validated_probes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_config(root)
-            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            document = config_document()
+            document["probes"] = [
+                {
+                    "id": "local-health",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {"LANG": "C"},
+                    "timeoutMs": 1000,
+                }
+            ]
+            (root / "recovery.json").write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+            loaded = recovery_config.load_recovery_config(
+                root / "recovery.json", root
+            )
             self.assertEqual(loaded.mode, "observe")
-            self.assertEqual(loaded.runbooks, ())
-            self.assertEqual(loaded.database, root.resolve() / "var/recovery/ledger.sqlite3")
+            self.assertEqual(len(loaded.probes), 1)
+            self.assertEqual(
+                loaded.database, root.resolve() / "var/recovery/ledger.sqlite3"
+            )
+            self.assertEqual(
+                set(recovery_config.recovery_static_policy(loaded)),
+                {"version", "mode", "correlationRules", "sourceIds", "probes"},
+            )
 
-            escaped = config_document()
-            escaped["database"] = "../outside.sqlite3"
-            (root / "recovery.json").write_text(json.dumps(escaped), encoding="utf-8")
+            for legacy_mode in ("plan", "enabled"):
+                invalid = config_document(legacy_mode)
+                (root / "recovery.json").write_text(
+                    json.dumps(invalid), encoding="utf-8"
+                )
+                with self.subTest(mode=legacy_mode), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    )
+
+    def test_closed_config_rejects_actuator_fields_and_unsafe_probe_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extra_registry = config_document()
+            extra_registry["runbooks"] = []
+            (root / "recovery.json").write_text(
+                json.dumps(extra_registry), encoding="utf-8"
+            )
             with self.assertRaises(recovery_config.RecoveryConfigError):
-                recovery_config.load_recovery_config(root / "recovery.json", root)
+                recovery_config.load_recovery_config(
+                    root / "recovery.json", root
+                )
 
-            unsafe_commands = [
+            unsafe_shapes = [
                 {
                     "id": "bad+id",
-                    "actionClass": "diagnostic",
                     "executable": "/usr/bin/true",
                     "argv": [],
                     "env": {},
@@ -82,111 +119,68 @@ class RecoveryConfigTests(unittest.TestCase):
                 },
                 {
                     "id": "sensitive-argv",
-                    "actionClass": "diagnostic",
                     "executable": "/usr/bin/true",
                     "argv": ["--token=literal-value"],
                     "env": {},
                     "timeoutMs": 1000,
                 },
                 {
-                    "id": "sudo-executable",
-                    "actionClass": "diagnostic",
-                    "executable": "/usr/bin/sudo",
-                    "argv": ["/usr/bin/true"],
-                    "env": {},
-                    "timeoutMs": 1000,
-                },
-                {
-                    "id": "shell-string",
-                    "actionClass": "diagnostic",
+                    "id": "shell",
                     "executable": "/bin/sh",
-                    "argv": ["-c", "sudo reboot"],
+                    "argv": ["-c", "true"],
                     "env": {},
                     "timeoutMs": 1000,
                 },
                 {
-                    "id": "env-indirection",
-                    "actionClass": "diagnostic",
-                    "executable": "/usr/bin/env",
-                    "argv": ["sudo", "reboot"],
-                    "env": {},
-                    "timeoutMs": 1000,
-                },
-                {
-                    "id": "misclassified-restart",
-                    "actionClass": "diagnostic",
+                    "id": "service-control",
                     "executable": "/bin/launchctl",
                     "argv": ["kickstart", "gui/501/example"],
                     "env": {},
                     "timeoutMs": 1000,
                 },
-            ]
-            for command in unsafe_commands:
-                unsafe = config_document()
-                unsafe["runbooks"] = [command]
-                (root / "recovery.json").write_text(json.dumps(unsafe), encoding="utf-8")
-                with self.subTest(command=command["id"]), self.assertRaises(
-                    recovery_config.RecoveryConfigError
-                ):
-                    recovery_config.load_recovery_config(root / "recovery.json", root)
-
-            sensitive = config_document()
-            sensitive["runbooks"] = [
                 {
-                    "id": "unsafe",
-                    "actionClass": "diagnostic",
+                    "id": "sensitive-env",
                     "executable": "/usr/bin/true",
                     "argv": [],
                     "env": {"API_TOKEN": "not-allowed"},
                     "timeoutMs": 1000,
-                }
+                },
             ]
-            (root / "recovery.json").write_text(json.dumps(sensitive), encoding="utf-8")
-            with self.assertRaises(recovery_config.RecoveryConfigError):
-                recovery_config.load_recovery_config(root / "recovery.json", root)
+            for probe in unsafe_shapes:
+                invalid = config_document()
+                invalid["probes"] = [probe]
+                (root / "recovery.json").write_text(
+                    json.dumps(invalid), encoding="utf-8"
+                )
+                with self.subTest(probe=probe["id"]), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    )
 
 
 class RecoveryCliTests(unittest.TestCase):
-    def test_read_only_commands_do_not_publish_changed_static_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_config(root, "enabled")
-            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
-            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
-                controls = recovery_supervisor.RecoveryControls(ledger)
-                original_revision = controls.ensure_static_policy(
-                    recovery_config.recovery_static_policy(loaded)
-                )
-
-            write_config(root, "observe")
-            code, _output, error = call_cli(root, "status")
-            self.assertEqual((code, error), (0, ""))
-            code, _output, error = call_cli(root, "incidents")
-            self.assertEqual((code, error), (0, ""))
-
-            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
-                controls = recovery_supervisor.RecoveryControls(ledger)
-                self.assertEqual(controls.current().revision, original_revision)
-                policy = json.loads(
-                    ledger.connection.execute(
-                        "SELECT policy_json FROM policy_revisions WHERE revision = ?",
-                        (original_revision,),
-                    ).fetchone()[0]
-                )
-                self.assertEqual(policy["recovery_static"]["mode"], "enabled")
-
-    def test_status_controls_history_digest_and_process_are_bounded(self) -> None:
+    def test_retained_commands_are_bounded_and_removed_commands_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_config(root)
 
             code, output, error = call_cli(root, "config", "validate")
             self.assertEqual((code, error), (0, ""))
-            self.assertTrue(json.loads(output)["ok"])
+            self.assertEqual(
+                json.loads(output),
+                {
+                    "config": str((root / "recovery.json").resolve()),
+                    "mode": "observe",
+                    "ok": True,
+                    "probes": 0,
+                },
+            )
 
-            code, output, error = call_cli(root, "status")
+            code, status, error = call_cli(root, "status")
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(output)["mode"], "observe")
+            self.assertEqual(json.loads(status)["mode"], "observe")
 
             code, output, error = call_cli(
                 root,
@@ -202,29 +196,28 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             self.assertGreater(json.loads(output)["revision"], 1)
 
-            code, history, error = call_cli(root, "policy", "history", "--limit", "2")
+            code, history, error = call_cli(
+                root, "policy", "history", "--limit", "2"
+            )
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(len(json.loads(history)), 2)
 
-            code, digest, error = call_cli(root, "digest", "preview", "--window", "3600")
-            self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(digest)["kind"], "digest")
-
-            code, processed, error = call_cli(root, "process", "--once")
-            self.assertEqual((code, error), (0, ""))
-            result = json.loads(processed)
-            self.assertFalse(result["plannerLaunched"])
-            self.assertFalse(result["executorLaunched"])
+            for removed in (("approve", "1"), ("reject", "1"), ("digest", "preview")):
+                code, _output, error = call_cli(root, *removed)
+                self.assertEqual(code, 2)
+                self.assertIn("invalid choice", error)
 
             code, _output, error = call_cli(root, "incidents", "--limit", "101")
             self.assertEqual(code, 2)
             self.assertIn("must be between 1 and 100", error)
 
-    def test_process_once_uses_the_concrete_recovery_processor(self) -> None:
+    def test_process_once_reports_foundation_state_without_launch_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_config(root, "plan")
-            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            write_config(root)
+            loaded = recovery_config.load_recovery_config(
+                root / "recovery.json", root
+            )
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
                 ledger.record_events(
                     recovery_supervisor.normalize_alertmanager(
@@ -247,167 +240,32 @@ class RecoveryCliTests(unittest.TestCase):
                         ).encode()
                     )
                 )
-            processor = mock.Mock()
-            processor.process_once.return_value = {
-                "plannerLaunched": True,
-                "executorLaunched": False,
-                "outcome": "observe",
-            }
-            with mock.patch.object(
-                recovery_cli, "RecoveryProcessor", return_value=processor
-            ) as constructor:
+
+            with mock.patch("subprocess.Popen") as popen:
                 code, output, error = call_cli(root, "process", "--once")
             self.assertEqual((code, error), (0, ""))
-            self.assertTrue(json.loads(output)["plannerLaunched"])
-            constructor.assert_called_once()
-            processor.process_once.assert_called_once_with()
-
-    def test_observe_mode_never_claims_and_approval_decisions_are_audited(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            document = config_document("observe")
-            document["correlationRules"].append(  # type: ignore[union-attr]
-                {
-                    "component": "worker",
-                    "failureClass": "unavailable",
-                    "incidentKey": "worker-unavailable",
-                    "impact": 2,
-                }
+            popen.assert_not_called()
+            result = json.loads(output)
+            self.assertEqual(
+                set(result),
+                {"ok", "mode", "activeIncidents", "verification"},
             )
-            (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
-            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
-            event = recovery_supervisor.normalize_alertmanager(
-                json.dumps(
-                    {
-                        "alerts": [
-                            {
-                                "status": "firing",
-                                "fingerprint": "episode-one",
-                                "startsAt": "2026-07-14T00:00:00Z",
-                                "labels": {
-                                    "alertname": "BotUnavailable",
-                                    "component": "bot",
-                                    "failure_class": "unavailable",
-                                    "instance": "local",
-                                },
-                            },
-                            {
-                                "status": "firing",
-                                "fingerprint": "episode-two",
-                                "startsAt": "2026-07-14T00:01:00Z",
-                                "labels": {
-                                    "alertname": "WorkerUnavailable",
-                                    "component": "worker",
-                                    "failure_class": "unavailable",
-                                    "instance": "local",
-                                },
-                            },
-                        ]
-                    }
-                ).encode()
-            )
+            self.assertEqual(result["mode"], "observe")
+            self.assertEqual(result["activeIncidents"], 1)
+            self.assertEqual(result["verification"], [])
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
-                ledger.record_events(event)
-                controls = recovery_supervisor.RecoveryControls(ledger)
-                policy_revision = controls.ensure_static_policy(
-                    recovery_config.recovery_static_policy(loaded)
-                )
-                policy = recovery_cli._policy(loaded, policy_revision)
-                observer = recovery_supervisor.IncidentCoordinator(
-                    ledger,
-                    policy,
-                    owner="observer",
-                    controls=controls,
-                    mode="observe",
-                )
-                self.assertIsNone(observer.claim_next())
                 self.assertEqual(
-                    ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0],
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM invocations"
+                    ).fetchone()[0],
                     0,
                 )
-
-                enabled = recovery_supervisor.IncidentCoordinator(
-                    ledger,
-                    policy,
-                    owner="enabled",
-                    controls=controls,
-                    mode="enabled",
-                )
-                fence = enabled.claim_next()
-                self.assertIsNotNone(fence)
-                assert fence is not None
-                self.assertTrue(enabled.finish(fence, "pending_approval"))
-                unrelated = enabled.claim_next()
-                self.assertIsNotNone(unrelated)
-                assert unrelated is not None
-                self.assertTrue(enabled.finish(unrelated, "not_actionable"))
-                frozen_plan = {
-                    "invocationId": fence.invocation_id,
-                    "incidentId": fence.incident_id,
-                    "generation": fence.generation,
-                    "evidenceHash": fence.evidence_hash,
-                    "policyRevision": fence.policy_revision,
-                    "verdict": "approval_required",
-                    "diagnosisCode": "operator_handoff",
-                    "summary": "A reviewed external handoff is required.",
-                    "evidenceRefs": ["event:1"],
-                    "runbookIds": ["external-handoff"],
-                    "probeIds": [],
-                    "nextEvaluationDelaySeconds": 60,
-                }
-                ledger.connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                    (
-                        f"invocation:{fence.invocation_id}:plan",
-                        json.dumps(frozen_plan, separators=(",", ":"), sort_keys=True),
-                    ),
-                )
-
-            code, inspected, error = call_cli(
-                root, "invocations", "--id", str(fence.invocation_id)
-            )
-            self.assertEqual((code, error), (0, ""))
-            self.assertNotIn("lease_token", json.loads(inspected)[0])
-
-            code, output, error = call_cli(
-                root,
-                "approve",
-                str(fence.invocation_id),
-                "--actor",
-                "operator",
-                "--reason",
-                "reviewed static plan",
-            )
-            self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(output)["decision"], "approve")
-            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
-                audit = ledger.connection.execute(
-                    "SELECT operation FROM audit ORDER BY id DESC LIMIT 1"
-                ).fetchone()[0]
-                self.assertEqual(audit, "approval_decision")
-                incident = ledger.connection.execute(
-                    "SELECT state, generation FROM incidents WHERE id = ?", (fence.incident_id,)
-                ).fetchone()
-                self.assertEqual(incident["state"], "handoff_approved")
-                self.assertEqual(incident["generation"], fence.generation)
-                unrelated_incident = ledger.connection.execute(
-                    "SELECT state, generation, policy_revision FROM incidents WHERE id = ?",
-                    (unrelated.incident_id,),
-                ).fetchone()
                 self.assertEqual(
-                    tuple(unrelated_incident),
-                    ("not_actionable", unrelated.generation, unrelated.policy_revision),
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM actions"
+                    ).fetchone()[0],
+                    0,
                 )
-                coordinator = recovery_supervisor.IncidentCoordinator(
-                    ledger,
-                    recovery_cli._policy(
-                        loaded,
-                        recovery_supervisor.RecoveryControls(ledger).current().revision,
-                    ),
-                    owner="post-approval",
-                    mode="enabled",
-                )
-                self.assertIsNone(coordinator.claim_next())
 
 
 if __name__ == "__main__":

@@ -16,11 +16,9 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import signal
 import socket
 import stat
-import subprocess
 import sys
 import tempfile
 import threading
@@ -44,8 +42,6 @@ from recovery_ledger import LedgerCorrupt, LedgerError, LedgerUnavailable, Recov
 
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 16
-MAX_WORKER_OUTPUT_BYTES = 512 * 1024
-RECOVERY_WORKER_MAX_SECONDS = 3 * 60 * 60.0
 MAX_ALERTS_PER_REQUEST = 512
 SPOOL_ITEM_MAX_BYTES = 1024 * 1024
 AUTH_TOKEN_MAX_BYTES = 4 * 1024
@@ -57,38 +53,28 @@ _EMERGENCY_MESSAGES = {
     "persistence_failed": "MINIME RECOVERY SUPERVISOR\nledger and emergency spool persistence failed",
     "spool_corrupt": "MINIME RECOVERY SUPERVISOR\nemergency spool validation failed",
     "confirmed_impact": "MINIME RECOVERY SUPERVISOR\ncritical impact confirmed",
-    "approval_required": "MINIME RECOVERY SUPERVISOR\nrecovery requires operator approval",
     "recovery_unsafe": "MINIME RECOVERY SUPERVISOR\nrecovery was refused as unsafe",
     "recovery_failed": "MINIME RECOVERY SUPERVISOR\nrecovery action or verification failed",
     "retries_exhausted": "MINIME RECOVERY SUPERVISOR\nrecovery retry budget exhausted",
     "supervisor_unavailable": "MINIME RECOVERY SUPERVISOR\nsupervisor unavailable",
-    "pi_unavailable": "MINIME RECOVERY SUPERVISOR\nfixer planner unavailable",
 }
 _IMMEDIATE_ESCALATION_REASONS = frozenset(
     {
         "confirmed_impact",
-        "approval_required",
         "recovery_unsafe",
         "recovery_failed",
         "retries_exhausted",
         "supervisor_unavailable",
-        "pi_unavailable",
         "persistence_failed",
     }
 )
 _EMPTY_EVIDENCE_HASH = hashlib.sha256(b"[]").hexdigest()
 _INVOCATION_OUTCOMES = {
     "completed",
-    "malformed_output",
-    "not_actionable",
-    "observe",
-    "pending_approval",
-    "pi_unavailable",
     "recovery_failed",
     "recovery_unsafe",
     "retries_exhausted",
 }
-_REEVALUATABLE_OUTCOMES = {"malformed_output", "not_actionable", "observe"}
 _CONTROL_POLICY_KEY = "recovery_controls"
 _STATIC_POLICY_KEY = "recovery_static"
 _EFFECTIVE_POLICY_REVISION_KEY = "effective_policy_revision"
@@ -97,10 +83,6 @@ _CONFIRMATION_BOUNDS = (1, 5)
 _COOLDOWN_BOUNDS = (0.0, 86_400.0)
 _RETRY_BUDGET_BOUNDS = (0, 10)
 _MAX_CONTROL_TTL = 31 * 86_400.0
-_ADAPTATION_COOLDOWN_STEP = 60.0
-_MECHANICAL_OUTCOMES = frozenset(
-    {"false_positive", "stable_recovery", "failed_recovery", "missed_recovery", "impact"}
-)
 
 
 class IntakeError(ValueError):
@@ -291,12 +273,6 @@ class RecoveryPolicy:
 
     revision: int
     rules: tuple[CorrelationRule, ...]
-    reevaluation_delays: tuple[tuple[str, float], ...] = (
-        ("malformed_output", 900.0),
-        ("not_actionable", 900.0),
-        ("observe", 900.0),
-    )
-    max_reevaluations: int = 1
     max_crash_retries: int = 1
     lease_seconds: float = 120.0
 
@@ -310,18 +286,6 @@ class RecoveryPolicy:
         rule_keys = [(rule.component, rule.failure_class) for rule in self.rules]
         if len(rule_keys) != len(set(rule_keys)):
             raise ValueError("recovery correlation rules overlap")
-        delays = dict(self.reevaluation_delays)
-        if len(delays) != len(self.reevaluation_delays) or any(
-            outcome not in _REEVALUATABLE_OUTCOMES
-            or isinstance(delay, bool)
-            or not isinstance(delay, (int, float))
-            or not math.isfinite(delay)
-            or not 1 <= delay <= 86_400
-            for outcome, delay in self.reevaluation_delays
-        ):
-            raise ValueError("recovery reevaluation bounds are invalid")
-        if not isinstance(self.max_reevaluations, int) or not 0 <= self.max_reevaluations <= 10:
-            raise ValueError("recovery reevaluation count is invalid")
         if not isinstance(self.max_crash_retries, int) or not 0 <= self.max_crash_retries <= 10:
             raise ValueError("recovery crash retry count is invalid")
         if (
@@ -354,8 +318,6 @@ class ControlSnapshot:
     cooldown_seconds: float
     retry_budget: int
     silences: tuple[tuple[str, float], ...]
-    baseline_confirmation_count: int
-    baseline_cooldown_seconds: float
 
     def silence_expiry(self, correlation_key: str, now: float) -> float | None:
         for target, expires_at in self.silences:
@@ -376,8 +338,6 @@ def _default_control_state() -> dict[str, Any]:
         "cooldown_seconds": {"value": 0.0, "expires_at": None, "revert": 0.0},
         "retry_budget": {"value": 1, "expires_at": None, "revert": 1},
         "silences": {},
-        "baseline": {"confirmation_count": 1, "cooldown_seconds": 0.0},
-        "adaptation": {"last_day": None, "last_outcome_id": 0},
     }
 
 
@@ -440,8 +400,6 @@ class RecoveryControls:
             "cooldown_seconds",
             "retry_budget",
             "silences",
-            "baseline",
-            "adaptation",
         }:
             raise LedgerCorrupt("recovery control policy is invalid")
         state = copy.deepcopy(raw)
@@ -484,34 +442,6 @@ class RecoveryControls:
                 or not math.isfinite(expiry)
             ):
                 raise LedgerCorrupt("recovery control policy is invalid")
-        baseline = state.get("baseline")
-        if not isinstance(baseline, dict) or set(baseline) != {
-            "confirmation_count",
-            "cooldown_seconds",
-        }:
-            raise LedgerCorrupt("recovery control policy is invalid")
-        baseline_count = baseline.get("confirmation_count")
-        baseline_cooldown = baseline.get("cooldown_seconds")
-        if (
-            isinstance(baseline_count, bool)
-            or not isinstance(baseline_count, int)
-            or not _CONFIRMATION_BOUNDS[0] <= baseline_count <= _CONFIRMATION_BOUNDS[1]
-            or isinstance(baseline_cooldown, bool)
-            or not isinstance(baseline_cooldown, (int, float))
-            or not _COOLDOWN_BOUNDS[0] <= baseline_cooldown <= _COOLDOWN_BOUNDS[1]
-        ):
-            raise LedgerCorrupt("recovery control policy is invalid")
-        adaptation = state.get("adaptation")
-        if not isinstance(adaptation, dict) or set(adaptation) != {"last_day", "last_outcome_id"}:
-            raise LedgerCorrupt("recovery control policy is invalid")
-        if adaptation["last_day"] is not None and not isinstance(adaptation["last_day"], int):
-            raise LedgerCorrupt("recovery control policy is invalid")
-        if (
-            isinstance(adaptation["last_outcome_id"], bool)
-            or not isinstance(adaptation["last_outcome_id"], int)
-            or adaptation["last_outcome_id"] < 0
-        ):
-            raise LedgerCorrupt("recovery control policy is invalid")
         return state
 
     def _current_row(self, connection: Any) -> Any:
@@ -573,8 +503,6 @@ class RecoveryControls:
             silences=tuple(
                 sorted((str(target), float(expiry)) for target, expiry in state["silences"].items())
             ),
-            baseline_confirmation_count=int(state["baseline"]["confirmation_count"]),
-            baseline_cooldown_seconds=float(state["baseline"]["cooldown_seconds"]),
         )
 
     @staticmethod
@@ -745,12 +673,9 @@ class RecoveryControls:
             raise ValueError("recovery confirmation count is invalid")
 
         def mutate(state: dict[str, Any]) -> tuple[Any, Any]:
-            result = self._replace_entry(
+            return self._replace_entry(
                 state, "confirmation_count", value, expires_at, self.clock()
             )
-            if expires_at is None:
-                state["baseline"]["confirmation_count"] = value
-            return result
 
         return self._change(
             operation="confirmation_control",
@@ -778,12 +703,9 @@ class RecoveryControls:
             raise ValueError("recovery cooldown is invalid")
 
         def mutate(state: dict[str, Any]) -> tuple[Any, Any]:
-            result = self._replace_entry(
+            return self._replace_entry(
                 state, "cooldown_seconds", float(seconds), expires_at, self.clock()
             )
-            if expires_at is None:
-                state["baseline"]["cooldown_seconds"] = float(seconds)
-            return result
 
         return self._change(
             operation="cooldown_control",
@@ -946,8 +868,7 @@ class IncidentCoordinator:
         clock: Callable[[], float] = time.time,
         controls: RecoveryControls | None = None,
         immediate_escalation: Callable[[str], Any] | None = None,
-        mechanical_outcome: Callable[..., Any] | None = None,
-        mode: str = "enabled",
+        mode: str = "observe",
         static_policy: dict[str, Any] | None = None,
     ):
         if not isinstance(owner, str) or safe_field(owner, default="") != owner:
@@ -962,7 +883,6 @@ class IncidentCoordinator:
             ledger, base_revision=policy.revision, clock=clock
         )
         self.immediate_escalation = immediate_escalation
-        self.mechanical_outcome = mechanical_outcome
         self.mode = mode
         self._static_policy = (
             _canonical_json(static_policy) if static_policy is not None else None
@@ -1133,27 +1053,12 @@ class IncidentCoordinator:
             )
         return exhausted
 
-    def _reevaluation_due(
-        self, connection: Any, incident: Any, now: float, retry_budget: int
-    ) -> bool:
-        state = str(incident["state"])
-        delay = dict(self.policy.reevaluation_delays).get(state)
-        if delay is None or now - float(incident["updated_at"]) < delay:
-            return False
-        attempts = connection.execute(
-            "SELECT count(*) FROM invocations WHERE incident_id = ? AND evidence_hash = ? "
-            "AND policy_revision = ? AND state IN ('malformed_output', 'not_actionable', 'observe')",
-            (incident["id"], incident["evidence_hash"], incident["policy_revision"]),
-        ).fetchone()[0]
-        return attempts <= min(self.policy.max_reevaluations, retry_budget)
-
     def reconcile(self) -> int:
         """Rebuild active incidents from the durable event stream."""
 
         now = self.clock()
         self.controls.expire(now=now)
         critical_impact = False
-        critical_incidents: list[tuple[int, int]] = []
         retries_exhausted = False
         with self.ledger.transaction() as connection:
             control = self.controls.current(connection, now=now)
@@ -1175,13 +1080,11 @@ class IncidentCoordinator:
             for correlation_key, evidence_hash in sorted(evidence.items()):
                 incident = incidents.get(correlation_key)
                 if incident is None:
-                    cursor = connection.execute(
+                    connection.execute(
                         "INSERT INTO incidents(correlation_key, state, generation, evidence_hash, "
                         "policy_revision, opened_at, updated_at) VALUES (?, 'eligible', 1, ?, ?, ?, ?)",
                         (correlation_key, evidence_hash, control.revision, now, now),
                     )
-                    if evidence_details[correlation_key].max_impact >= 3:
-                        critical_incidents.append((int(cursor.lastrowid), 1))
                     continue
                 changed = (
                     incident["evidence_hash"] != evidence_hash
@@ -1194,15 +1097,6 @@ class IncidentCoordinator:
                         "evidence_hash = ?, policy_revision = ?, updated_at = ? WHERE id = ?",
                         (evidence_hash, control.revision, now, incident["id"]),
                     )
-                elif self._reevaluation_due(connection, incident, now, control.retry_budget):
-                    connection.execute(
-                        "UPDATE incidents SET state = 'eligible', generation = generation + 1, "
-                        "updated_at = ? WHERE id = ?",
-                        (now, incident["id"]),
-                    )
-                if evidence_details[correlation_key].max_impact >= 3:
-                    generation = int(incident["generation"]) + (1 if changed else 0)
-                    critical_incidents.append((int(incident["id"]), generation))
 
             for correlation_key, incident in incidents.items():
                 already_resolved = (
@@ -1231,14 +1125,6 @@ class IncidentCoordinator:
             active_count = len(evidence)
         if critical_impact and self.immediate_escalation is not None:
             self.immediate_escalation("confirmed_impact")
-        if self.mechanical_outcome is not None:
-            for incident_id, generation in critical_incidents:
-                self.mechanical_outcome(
-                    incident_id,
-                    "impact",
-                    critical=True,
-                    dedupe_key=f"impact:{generation}",
-                )
         if retries_exhausted and self.immediate_escalation is not None:
             self.immediate_escalation("retries_exhausted")
         return active_count
@@ -1382,7 +1268,7 @@ class IncidentCoordinator:
             )
             return True
 
-    def planner_evidence(self, fence: InvocationFence) -> list[dict[str, Any]]:
+    def invocation_evidence(self, fence: InvocationFence) -> list[dict[str, Any]]:
         """Return at most 32 normalized firing observations for the claimed incident."""
 
         now = self.clock()
@@ -1433,75 +1319,8 @@ class IncidentCoordinator:
                 raise ValueError("recovery invocation evidence is unavailable")
             return evidence[:32]
 
-    def record_worker_result(
-        self,
-        fence: InvocationFence,
-        plan: dict[str, Any],
-        actions: list[dict[str, Any]],
-        probes: list[dict[str, Any]],
-    ) -> bool:
-        """Persist the frozen plan and bounded action/probe result codes under its fence."""
-
-        if not isinstance(plan, dict) or len(_canonical_json(plan).encode("utf-8")) > 16 * 1024:
-            raise ValueError("recovery frozen plan is invalid")
-        if not isinstance(actions, list) or len(actions) > 8:
-            raise ValueError("recovery action results are invalid")
-        if not isinstance(probes, list) or len(probes) > 16:
-            raise ValueError("recovery probe results are invalid")
-
-        def normalized_result(value: Any, kind: str) -> tuple[str, str, str]:
-            if not isinstance(value, dict):
-                raise ValueError(f"recovery {kind} result is invalid")
-            identifier = value.get("id")
-            exit_code = value.get("exitCode")
-            timed_out = value.get("timedOut")
-            if (
-                not isinstance(identifier, str)
-                or safe_field(identifier, limit=128, default="") != identifier
-                or isinstance(exit_code, bool)
-                or not isinstance(exit_code, int)
-                or not isinstance(timed_out, bool)
-            ):
-                raise ValueError(f"recovery {kind} result is invalid")
-            state = "failed" if timed_out or exit_code != 0 else "completed"
-            code = "timeout" if timed_out else f"exit:{exit_code}"
-            return identifier, state, code
-
-        normalized = [
-            ("runbook", *normalized_result(value, "action")) for value in actions
-        ] + [("probe", *normalized_result(value, "probe")) for value in probes]
-        now = self.clock()
-        with self.ledger.transaction() as connection:
-            if not self._fence_valid(connection, fence, now):
-                return False
-            key = f"invocation:{fence.invocation_id}:plan"
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, _canonical_json(plan)),
-            )
-            if connection.execute(
-                "SELECT 1 FROM actions WHERE invocation_id = ? LIMIT 1",
-                (fence.invocation_id,),
-            ).fetchone() is not None:
-                raise LedgerCorrupt("recovery invocation results are duplicated")
-            for kind, identifier, state, code in normalized:
-                connection.execute(
-                    "INSERT INTO actions(invocation_id, runbook_id, state, started_at, "
-                    "finished_at, result_code) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        fence.invocation_id,
-                        identifier if kind == "runbook" else f"probe:{identifier}",
-                        state,
-                        now,
-                        now,
-                        code,
-                    ),
-                )
-            return True
-
     def finish(self, fence: InvocationFence, outcome: str) -> bool:
-        """Accept a planner result only while every durable fence still matches."""
+        """Accept a future fixer result only while every durable fence still matches."""
 
         if outcome not in _INVOCATION_OUTCOMES:
             raise ValueError("recovery invocation outcome is invalid")
@@ -1571,8 +1390,6 @@ class IncidentCoordinator:
                 (fence.lease_token,),
             )
         escalation = {
-            "pending_approval": "approval_required",
-            "pi_unavailable": "pi_unavailable",
             "recovery_failed": "recovery_failed",
             "recovery_unsafe": "recovery_unsafe",
             "retries_exhausted": "retries_exhausted",
@@ -1681,217 +1498,6 @@ class IncidentCoordinator:
         if self.immediate_escalation is not None:
             self.immediate_escalation("recovery_failed")
         return True
-
-
-class BoundedPolicyAdapter:
-    """Replay mechanical outcomes into two tightly bounded policy knobs."""
-
-    def __init__(
-        self,
-        ledger: RecoveryLedger,
-        controls: RecoveryControls,
-        *,
-        clock: Callable[[], float] = time.time,
-    ):
-        self.ledger = ledger
-        self.controls = controls
-        self.clock = clock
-
-    def record_outcome(
-        self,
-        incident_id: int,
-        classification: str,
-        *,
-        critical: bool = False,
-        dedupe_key: str | None = None,
-        now: float | None = None,
-    ) -> int:
-        if not isinstance(incident_id, int) or incident_id < 1:
-            raise ValueError("recovery outcome incident is invalid")
-        if classification not in _MECHANICAL_OUTCOMES or not isinstance(critical, bool):
-            raise ValueError("recovery outcome classification is invalid")
-        if dedupe_key is not None and (
-            not isinstance(dedupe_key, str)
-            or safe_field(dedupe_key, limit=160, default="") != dedupe_key
-        ):
-            raise ValueError("recovery outcome dedupe key is invalid")
-        timestamp = self.clock() if now is None else now
-        target = f"incident:{incident_id}"
-        if dedupe_key is not None:
-            target = f"{target}:{dedupe_key}"
-        with self.ledger.transaction() as connection:
-            if connection.execute(
-                "SELECT 1 FROM incidents WHERE id = ?", (incident_id,)
-            ).fetchone() is None:
-                raise ValueError("recovery outcome incident is invalid")
-            if dedupe_key is not None:
-                existing = connection.execute(
-                    "SELECT id FROM audit WHERE operation = 'mechanical_outcome' "
-                    "AND target = ? ORDER BY id LIMIT 1",
-                    (target,),
-                ).fetchone()
-                if existing is not None:
-                    return int(existing["id"])
-            cursor = connection.execute(
-                "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
-                "VALUES (?, 'system', 'mechanical_outcome', ?, ?)",
-                (
-                    timestamp,
-                    target,
-                    _canonical_json({"classification": classification, "critical": critical}),
-                ),
-            )
-            return int(cursor.lastrowid)
-
-    @staticmethod
-    def _toward(current: float, baseline: float, step: float) -> float:
-        if current < baseline:
-            return min(baseline, current + step)
-        if current > baseline:
-            return max(baseline, current - step)
-        return current
-
-    @classmethod
-    def replay(
-        cls,
-        *,
-        confirmation_count: int,
-        cooldown_seconds: float,
-        baseline_confirmation_count: int,
-        baseline_cooldown_seconds: float,
-        outcomes: tuple[tuple[str, bool], ...],
-    ) -> tuple[int, float]:
-        if len(outcomes) < 3 or any(name not in _MECHANICAL_OUTCOMES for name, _ in outcomes):
-            raise ValueError("recovery adaptation replay is invalid")
-        classifications = [name for name, _critical in outcomes]
-        critical = any(is_critical for _name, is_critical in outcomes)
-        must_revert = critical or any(
-            name in {"impact", "missed_recovery"} for name in classifications
-        )
-        if must_revert:
-            next_confirmation = int(
-                cls._toward(confirmation_count, baseline_confirmation_count, 1)
-            )
-            next_cooldown = cls._toward(
-                cooldown_seconds, baseline_cooldown_seconds, _ADAPTATION_COOLDOWN_STEP
-            )
-        elif all(name == "false_positive" for name in classifications):
-            next_confirmation = confirmation_count + 1
-            next_cooldown = cooldown_seconds + _ADAPTATION_COOLDOWN_STEP
-        elif all(name == "stable_recovery" for name in classifications):
-            next_confirmation = confirmation_count - 1
-            next_cooldown = cooldown_seconds - _ADAPTATION_COOLDOWN_STEP
-        elif any(name == "failed_recovery" for name in classifications):
-            next_confirmation = confirmation_count - 1
-            next_cooldown = cooldown_seconds - _ADAPTATION_COOLDOWN_STEP
-        else:
-            next_confirmation = confirmation_count
-            next_cooldown = cooldown_seconds
-        return (
-            min(_CONFIRMATION_BOUNDS[1], max(_CONFIRMATION_BOUNDS[0], next_confirmation)),
-            min(_COOLDOWN_BOUNDS[1], max(_COOLDOWN_BOUNDS[0], float(next_cooldown))),
-        )
-
-    def adapt(self, *, now: float | None = None) -> int | None:
-        timestamp = self.clock() if now is None else now
-        day = int(timestamp // 86_400)
-        with self.ledger.transaction() as connection:
-            row = self.controls._current_row(connection)
-            document = self.controls._document(row)
-            state = self.controls._state(document)
-            if state["adaptation"]["last_day"] == day:
-                return None
-            prior_adaptations = connection.execute(
-                "SELECT occurred_at, details_json FROM audit "
-                "WHERE operation = 'policy_adaptation' ORDER BY id"
-            ).fetchall()
-            last_outcome_id = int(state["adaptation"]["last_outcome_id"])
-            for prior in prior_adaptations:
-                if day * 86_400 <= float(prior["occurred_at"]) < (day + 1) * 86_400:
-                    return None
-                try:
-                    prior_details = json.loads(str(prior["details_json"]))
-                    consumed = prior_details["after"]["last_outcome_id"]
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise LedgerCorrupt("recovery adaptation audit is invalid") from exc
-                if isinstance(consumed, bool) or not isinstance(consumed, int) or consumed < 0:
-                    raise LedgerCorrupt("recovery adaptation audit is invalid")
-                last_outcome_id = max(last_outcome_id, consumed)
-            if any(
-                state[name]["expires_at"] is not None
-                and state[name]["expires_at"] > timestamp
-                for name in ("confirmation_count", "cooldown_seconds")
-            ):
-                return None
-            rows = connection.execute(
-                "SELECT id, details_json FROM audit WHERE operation = 'mechanical_outcome' "
-                "AND id > ? ORDER BY id",
-                (last_outcome_id,),
-            ).fetchall()
-            outcomes: list[tuple[str, bool]] = []
-            for outcome_row in rows:
-                try:
-                    details = json.loads(str(outcome_row["details_json"]))
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise LedgerCorrupt("mechanical recovery outcome is invalid") from exc
-                if (
-                    not isinstance(details, dict)
-                    or set(details) != {"classification", "critical"}
-                    or details["classification"] not in _MECHANICAL_OUTCOMES
-                    or not isinstance(details["critical"], bool)
-                ):
-                    raise LedgerCorrupt("mechanical recovery outcome is invalid")
-                outcomes.append((str(details["classification"]), bool(details["critical"])))
-            if len(outcomes) < 3:
-                return None
-            arguments = {
-                "confirmation_count": int(state["confirmation_count"]["value"]),
-                "cooldown_seconds": float(state["cooldown_seconds"]["value"]),
-                "baseline_confirmation_count": int(state["baseline"]["confirmation_count"]),
-                "baseline_cooldown_seconds": float(state["baseline"]["cooldown_seconds"]),
-                "outcomes": tuple(outcomes),
-            }
-            target = self.replay(**arguments)
-            if target != self.replay(**arguments):
-                raise LedgerCorrupt("recovery adaptation replay is nondeterministic")
-            before = {
-                "confirmation_count": state["confirmation_count"]["value"],
-                "cooldown_seconds": state["cooldown_seconds"]["value"],
-                "last_outcome_id": last_outcome_id,
-            }
-            state["confirmation_count"] = {
-                "value": target[0],
-                "expires_at": None,
-                "revert": target[0],
-            }
-            state["cooldown_seconds"] = {
-                "value": target[1],
-                "expires_at": None,
-                "revert": target[1],
-            }
-            state["adaptation"] = {
-                "last_day": day,
-                "last_outcome_id": int(rows[-1]["id"]),
-            }
-            after = {
-                "confirmation_count": target[0],
-                "cooldown_seconds": target[1],
-                "last_outcome_id": int(rows[-1]["id"]),
-            }
-            updated = copy.deepcopy(document)
-            updated[_CONTROL_POLICY_KEY] = state
-            return self.controls.append_revision(
-                connection,
-                updated,
-                operation="policy_adaptation",
-                target="dispatch_policy",
-                actor="system",
-                reason="deterministic mechanical outcome replay",
-                expires_at=None,
-                before=before,
-                after=after,
-                now=timestamp,
-            )
 
 
 @dataclass(frozen=True)
@@ -2253,23 +1859,6 @@ class RecoveryVerifier:
             if invocation is None or "hold_down" in result.reasons:
                 return None
             delay = max(self.hold_down_seconds, self.freshness_seconds)
-            plan_row = connection.execute(
-                "SELECT value FROM metadata WHERE key = ?",
-                (f"invocation:{int(invocation['id'])}:plan",),
-            ).fetchone()
-            if plan_row is not None:
-                try:
-                    plan = json.loads(str(plan_row["value"]))
-                    requested_delay = plan["nextEvaluationDelaySeconds"]
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise LedgerCorrupt("recovery frozen plan is invalid") from exc
-                if (
-                    isinstance(requested_delay, bool)
-                    or not isinstance(requested_delay, int)
-                    or not 30 <= requested_delay <= 86_400
-                ):
-                    raise LedgerCorrupt("recovery frozen plan is invalid")
-                delay = max(delay, float(requested_delay))
             if now - float(incident["updated_at"]) < delay:
                 return None
             return (
@@ -2456,7 +2045,7 @@ class EmergencyNotifier:
 
 
 class RecoveryNotificationOutbox:
-    """Deterministic digest creation and durable bounded delivery retry."""
+    """Durable immediate escalation handoff to the native notifier."""
 
     def __init__(
         self,
@@ -2472,142 +2061,44 @@ class RecoveryNotificationOutbox:
     def immediate_escalation(self, reason: str) -> bool:
         if reason not in _IMMEDIATE_ESCALATION_REASONS:
             raise ValueError("immediate recovery escalation reason is invalid")
-        if self.emergency is None or not self.emergency.delivery_available:
-            return False
-        self.emergency.emit(reason)
-        return True
-
-    def queue_digest(self, window_start: float, window_end: float) -> dict[str, Any]:
-        if (
-            isinstance(window_start, bool)
-            or isinstance(window_end, bool)
-            or not isinstance(window_start, (int, float))
-            or not isinstance(window_end, (int, float))
-            or not math.isfinite(window_start)
-            or not math.isfinite(window_end)
-            or window_start < 0
-            or window_end <= window_start
-            or int(window_start) != window_start
-            or int(window_end) != window_end
-        ):
-            raise ValueError("recovery digest window is invalid")
-        start = int(window_start)
-        end = int(window_end)
-        key = f"digest:{start}:{end}"
+        now = self.clock()
+        cooldown = 300.0 if self.emergency is None else max(1.0, self.emergency.cooldown)
+        key = f"immediate:{reason}:{int(now // cooldown)}"
+        body = _canonical_json({"kind": "immediate", "reason": reason, "version": 1})
         with self.ledger.transaction() as connection:
-            existing = connection.execute(
-                "SELECT body_json FROM notification_outbox WHERE notification_key = ?", (key,)
-            ).fetchone()
-            if existing is not None:
-                try:
-                    body = json.loads(str(existing["body_json"]))
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise LedgerCorrupt("recovery notification body is invalid") from exc
-                if not isinstance(body, dict):
-                    raise LedgerCorrupt("recovery notification body is invalid")
-                return body
-            counts = {
-                "actions": int(
-                    connection.execute(
-                        "SELECT count(*) FROM actions WHERE started_at >= ? AND started_at < ?",
-                        (start, end),
-                    ).fetchone()[0]
-                ),
-                "audit_entries": int(
-                    connection.execute(
-                        "SELECT count(*) FROM audit WHERE occurred_at >= ? AND occurred_at < ?",
-                        (start, end),
-                    ).fetchone()[0]
-                ),
-                "events": int(
-                    connection.execute(
-                        "SELECT count(*) FROM events WHERE received_at >= ? AND received_at < ?",
-                        (start, end),
-                    ).fetchone()[0]
-                ),
-                "invocations": int(
-                    connection.execute(
-                        "SELECT count(*) FROM invocations WHERE created_at >= ? AND created_at < ?",
-                        (start, end),
-                    ).fetchone()[0]
-                ),
-                "recoveries": int(
-                    connection.execute(
-                        "SELECT count(*) FROM audit WHERE operation = 'verification_recovered' "
-                        "AND occurred_at >= ? AND occurred_at < ?",
-                        (start, end),
-                    ).fetchone()[0]
-                ),
-            }
-            states = {
-                str(row["state"]): int(row["count"])
-                for row in connection.execute(
-                    "SELECT state, count(*) AS count FROM incidents GROUP BY state ORDER BY state"
-                ).fetchall()
-            }
-            body = {
-                "counts": counts,
-                "incident_states": states,
-                "kind": "digest",
-                "version": 1,
-                "window_end": end,
-                "window_start": start,
-            }
             connection.execute(
-                "INSERT INTO notification_outbox(notification_key, kind, body_json, created_at, "
-                "available_at) VALUES (?, 'digest', ?, ?, ?)",
-                (key, _canonical_json(body), self.clock(), self.clock()),
+                "INSERT OR IGNORE INTO notification_outbox(notification_key, kind, body_json, "
+                "created_at, available_at) VALUES (?, 'immediate', ?, ?, ?)",
+                (key, body, now, now),
             )
-            return body
+        return self.deliver_due() > 0
 
-    def queue_periodic(self, interval_seconds: int = 86_400) -> dict[str, Any] | None:
-        if (
-            isinstance(interval_seconds, bool)
-            or not isinstance(interval_seconds, int)
-            or not 60 <= interval_seconds <= 86_400
-        ):
-            raise ValueError("recovery digest interval is invalid")
-        now = self.clock()
-        end = int(now // interval_seconds) * interval_seconds
-        if end <= 0:
-            return None
-        return self.queue_digest(end - interval_seconds, end)
-
-    def deliver_due(
-        self,
-        delivery: Callable[[dict[str, Any]], None],
-        *,
-        limit: int = 32,
-    ) -> int:
-        if not callable(delivery) or not isinstance(limit, int) or not 1 <= limit <= 128:
+    def deliver_due(self, *, limit: int = 32) -> int:
+        if not isinstance(limit, int) or not 1 <= limit <= 128:
             raise ValueError("recovery notification delivery is invalid")
-        delivered = 0
-        now = self.clock()
+        if self.emergency is None or not self.emergency.delivery_available:
+            return 0
         with self.ledger.transaction() as connection:
             rows = connection.execute(
-                "SELECT * FROM notification_outbox WHERE delivered_at IS NULL "
-                "AND available_at <= ? ORDER BY available_at, id LIMIT ?",
-                (now, limit),
+                "SELECT id, body_json FROM notification_outbox WHERE kind = 'immediate' "
+                "AND delivered_at IS NULL AND available_at <= ? ORDER BY available_at, id LIMIT ?",
+                (self.clock(), limit),
             ).fetchall()
+        delivered = 0
         for row in rows:
             try:
                 body = json.loads(str(row["body_json"]))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise LedgerCorrupt("recovery notification body is invalid") from exc
-            if not isinstance(body, dict) or body.get("kind") != row["kind"]:
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"kind", "reason", "version"}
+                or body["kind"] != "immediate"
+                or body["reason"] not in _IMMEDIATE_ESCALATION_REASONS
+                or body["version"] != 1
+            ):
                 raise LedgerCorrupt("recovery notification body is invalid")
-            try:
-                delivery(body)
-            except Exception:
-                attempts = int(row["attempts"]) + 1
-                delay = min(3_600.0, 5.0 * (2 ** min(attempts - 1, 10)))
-                with self.ledger.transaction() as connection:
-                    connection.execute(
-                        "UPDATE notification_outbox SET attempts = ?, available_at = ? "
-                        "WHERE id = ? AND delivered_at IS NULL",
-                        (attempts, now + delay, row["id"]),
-                    )
-                continue
+            self.emergency.emit(str(body["reason"]))
             with self.ledger.transaction() as connection:
                 cursor = connection.execute(
                     "UPDATE notification_outbox SET delivered_at = ? "
@@ -2618,477 +2109,10 @@ class RecoveryNotificationOutbox:
         return delivered
 
 
-def format_recovery_notification(body: dict[str, Any]) -> str:
-    if body.get("kind") != "digest" or not isinstance(body.get("counts"), dict):
-        raise ValueError("recovery notification body is invalid")
-    counts = body["counts"]
-    return (
-        "MINIME RECOVERY DIGEST\n"
-        f"window={body.get('window_start')}-{body.get('window_end')} "
-        f"events={counts.get('events', 0)} invocations={counts.get('invocations', 0)} "
-        f"recoveries={counts.get('recoveries', 0)}"
-    )
-
-
 @dataclass(frozen=True)
 class IntakeResult:
     status: int
     text: str
-
-
-class RecoveryWorkerUnavailable(RuntimeError):
-    pass
-
-
-class RecoveryWorkerStale(RuntimeError):
-    pass
-
-
-class RecoveryProcessor:
-    """Own one durable claim -> bounded Node worker -> persisted finish cycle."""
-
-    def __init__(
-        self,
-        config: RecoveryConfig,
-        coordinator: IncidentCoordinator,
-        verifier: RecoveryVerifier,
-        adapter: BoundedPolicyAdapter,
-        *,
-        environment: dict[str, str] | os._Environ[str] = os.environ,
-        runner: Callable[[dict[str, Any], InvocationFence], dict[str, Any]] | None = None,
-        verification_runner: (
-            Callable[[dict[str, Any], VerificationFence], dict[str, Any]] | None
-        ) = None,
-        clock: Callable[[], float] = time.time,
-    ):
-        self.config = config
-        self.coordinator = coordinator
-        self.verifier = verifier
-        self.adapter = adapter
-        self.environment = environment
-        self.runner = runner or self._run_node_worker
-        self.verification_runner = verification_runner or self._run_verification_worker
-        self.clock = clock
-        self._state_lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._process: subprocess.Popen[bytes] | None = None
-        self._closing = False
-
-    @staticmethod
-    def _fence_document(fence: InvocationFence) -> dict[str, Any]:
-        return {
-            "invocationId": fence.invocation_id,
-            "incidentId": fence.incident_id,
-            "generation": fence.generation,
-            "evidenceHash": fence.evidence_hash,
-            "policyRevision": fence.policy_revision,
-            "leaseToken": fence.lease_token,
-            "owner": fence.owner,
-        }
-
-    def _request(self, fence: InvocationFence) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "mode": self.config.mode,
-            "fence": self._fence_document(fence),
-            "evidence": self.coordinator.planner_evidence(fence),
-            "runbooks": [dict(item) for item in self.config.runbooks],
-            "probes": [dict(item) for item in self.config.probes],
-        }
-
-    def _verification_request(self, fence: VerificationFence) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "operation": "verify",
-            "fence": {
-                "incidentId": fence.incident_id,
-                "generation": fence.generation,
-                "policyRevision": fence.policy_revision,
-            },
-            "probes": [dict(item) for item in self.config.probes],
-        }
-
-    def _valid_plan(self, plan: Any, fence: InvocationFence) -> bool:
-        if not isinstance(plan, dict) or set(plan) != {
-            "invocationId",
-            "incidentId",
-            "generation",
-            "evidenceHash",
-            "policyRevision",
-            "verdict",
-            "diagnosisCode",
-            "summary",
-            "evidenceRefs",
-            "runbookIds",
-            "probeIds",
-            "nextEvaluationDelaySeconds",
-        }:
-            return False
-        expected = self._fence_document(fence)
-        if any(plan.get(key) != expected[key] for key in (
-            "invocationId",
-            "incidentId",
-            "generation",
-            "evidenceHash",
-            "policyRevision",
-        )):
-            return False
-        runbook_ids = plan.get("runbookIds")
-        probe_ids = plan.get("probeIds")
-        evidence_refs = plan.get("evidenceRefs")
-        known_runbooks = {str(item["id"]) for item in self.config.runbooks}
-        known_probes = {str(item["id"]) for item in self.config.probes}
-        return bool(
-            isinstance(runbook_ids, list)
-            and isinstance(probe_ids, list)
-            and isinstance(evidence_refs, list)
-            and all(isinstance(value, str) for value in runbook_ids)
-            and all(isinstance(value, str) for value in probe_ids)
-            and all(isinstance(value, str) for value in evidence_refs)
-            and len(runbook_ids) <= 8
-            and len(probe_ids) <= 16
-            and len(evidence_refs) <= 16
-            and len(set(runbook_ids)) == len(runbook_ids)
-            and len(set(probe_ids)) == len(probe_ids)
-            and set(runbook_ids).issubset(known_runbooks)
-            and set(probe_ids).issubset(known_probes)
-        )
-
-    def _worker_environment(self, fence_descriptor: int | None = None) -> dict[str, str]:
-        allowed = {
-            "CI",
-            "COLORTERM",
-            "FORCE_COLOR",
-            "HOME",
-            "LANG",
-            "LOGNAME",
-            "NO_COLOR",
-            "PATH",
-            "SHELL",
-            "SSL_CERT_DIR",
-            "SSL_CERT_FILE",
-            "TEMP",
-            "TERM",
-            "TMP",
-            "TMPDIR",
-            "USER",
-            "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_RUNTIME_DIR",
-        }
-        result = {
-            key: value
-            for key, value in self.environment.items()
-            if key in allowed or key.startswith("LC_")
-        }
-        result["MINIME_CONTROL_WORKSPACE_ROOT"] = str(self.config.workspace)
-        agent_root = self.environment.get("MINIME_AGENT_WORKSPACE_ROOT", "").strip()
-        if agent_root:
-            result["MINIME_AGENT_WORKSPACE_ROOT"] = agent_root
-        if fence_descriptor is not None:
-            result["MINIME_RECOVERY_FENCE_FD"] = str(fence_descriptor)
-        return result
-
-    def _terminate_worker(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            try:
-                process.terminate()
-            except OSError:
-                return
-        try:
-            # The Node executor uses a two-second abort grace before killing a
-            # detached runbook process group. Let that cleanup complete first.
-            process.wait(timeout=3)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            try:
-                process.kill()
-            except OSError:
-                pass
-
-    def _run_worker_process(
-        self, request: dict[str, Any], fence_check: Callable[[], bool]
-    ) -> dict[str, Any]:
-        configured_node = self.environment.get("MINIME_RECOVERY_NODE_EXECUTABLE", "").strip()
-        node = configured_node or shutil.which("node", path=self.environment.get("PATH")) or ""
-        worker = Path(__file__).resolve().parent.parent / "dist" / "recovery" / "worker.js"
-        if not node or not Path(node).is_absolute() or not os.access(node, os.X_OK) or not worker.is_file():
-            raise RecoveryWorkerUnavailable("recovery worker runtime is unavailable")
-        payload = _canonical_json(request).encode("ascii")
-        if len(payload) > MAX_WORKER_OUTPUT_BYTES:
-            raise RecoveryWorkerUnavailable("recovery worker request is oversized")
-        parent_fence, child_fence = socket.socketpair()
-        try:
-            process = subprocess.Popen(
-                [node, str(worker)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=self.config.workspace,
-                env=self._worker_environment(child_fence.fileno()),
-                start_new_session=True,
-                pass_fds=(child_fence.fileno(),),
-            )
-        except (OSError, ValueError) as exc:
-            parent_fence.close()
-            child_fence.close()
-            raise RecoveryWorkerUnavailable("recovery worker failed to start") from exc
-        child_fence.close()
-        with self._state_lock:
-            if self._closing:
-                self._terminate_worker(process)
-                parent_fence.close()
-                raise RecoveryWorkerStale("recovery worker is stopping")
-            self._process = process
-        deadline = time.monotonic() + RECOVERY_WORKER_MAX_SECONDS
-        input_value: bytes | None = payload
-        stop_fence_checks = threading.Event()
-        fence_lost = threading.Event()
-
-        def durable_fence_valid() -> bool:
-            try:
-                return fence_check()
-            except (LedgerError, OSError, ValueError):
-                return False
-
-        def serve_fence_checks() -> None:
-            parent_fence.settimeout(0.25)
-            while not stop_fence_checks.is_set():
-                try:
-                    request_byte = parent_fence.recv(1)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    return
-                if not request_byte:
-                    return
-                valid = request_byte == b"?"
-                if valid:
-                    valid = durable_fence_valid()
-                if not valid:
-                    fence_lost.set()
-                try:
-                    parent_fence.sendall(b"1" if valid else b"0")
-                except OSError:
-                    return
-
-        fence_thread = threading.Thread(target=serve_fence_checks, daemon=True)
-        fence_thread.start()
-        try:
-            while True:
-                try:
-                    stdout, _stderr = process.communicate(input=input_value, timeout=1.0)
-                    break
-                except subprocess.TimeoutExpired:
-                    input_value = None
-                    if self._closing or time.monotonic() >= deadline:
-                        self._terminate_worker(process)
-                        raise RecoveryWorkerUnavailable("recovery worker timed out")
-                    if fence_lost.is_set() or not durable_fence_valid():
-                        self._terminate_worker(process)
-                        raise RecoveryWorkerStale("recovery worker lost its fence")
-            if process.returncode != 0:
-                raise RecoveryWorkerUnavailable("recovery worker failed")
-            if len(stdout) > MAX_WORKER_OUTPUT_BYTES:
-                raise RecoveryWorkerUnavailable("recovery worker output is oversized")
-            try:
-                result = json.loads(stdout.decode("ascii"))
-            except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
-                raise RecoveryWorkerUnavailable("recovery worker output is invalid") from exc
-            if not isinstance(result, dict) or result.get("version") != 1:
-                raise RecoveryWorkerUnavailable("recovery worker output is invalid")
-            return result
-        finally:
-            if process.poll() is None:
-                self._terminate_worker(process)
-            stop_fence_checks.set()
-            try:
-                parent_fence.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            parent_fence.close()
-            fence_thread.join(timeout=1)
-            with self._state_lock:
-                if self._process is process:
-                    self._process = None
-
-    def _run_node_worker(
-        self, request: dict[str, Any], fence: InvocationFence
-    ) -> dict[str, Any]:
-        return self._run_worker_process(
-            request, lambda: self.coordinator.renew_lease(fence)
-        )
-
-    def _run_verification_worker(
-        self, request: dict[str, Any], fence: VerificationFence
-    ) -> dict[str, Any]:
-        return self._run_worker_process(request, lambda: self.verifier.fence_valid(fence))
-
-    def _refresh_verification_once(self) -> dict[str, Any] | None:
-        if self.config.mode != "enabled":
-            return None
-        fence = self.verifier.next_probe_refresh()
-        if fence is None:
-            return None
-        try:
-            result = self.verification_runner(self._verification_request(fence), fence)
-        except RecoveryWorkerStale:
-            return {"plannerLaunched": False, "executorLaunched": False, "outcome": "stale"}
-        except (RecoveryWorkerUnavailable, LedgerError, OSError, ValueError):
-            if self.coordinator.immediate_escalation is not None:
-                self.coordinator.immediate_escalation("recovery_failed")
-            return {
-                "plannerLaunched": False,
-                "executorLaunched": False,
-                "outcome": "verification_failed",
-            }
-        status = result.get("status")
-        probes = result.get("probes")
-        if status == "stale":
-            return {"plannerLaunched": False, "executorLaunched": False, "outcome": "stale"}
-        if status not in {"completed", "failed"} or not isinstance(probes, list):
-            if self.coordinator.immediate_escalation is not None:
-                self.coordinator.immediate_escalation("recovery_failed")
-            return {
-                "plannerLaunched": False,
-                "executorLaunched": False,
-                "outcome": "verification_failed",
-            }
-        try:
-            stored = self.verifier.record_probe_results(fence, probes)
-        except (LedgerError, ValueError):
-            stored = False
-        return {
-            "plannerLaunched": False,
-            "executorLaunched": bool(probes),
-            "outcome": ("verification_refreshed" if stored else "stale"),
-        }
-
-    def process_once(self) -> dict[str, Any]:
-        fence = self.coordinator.claim_next()
-        if fence is None:
-            refreshed = self._refresh_verification_once()
-            return refreshed or {
-                "plannerLaunched": False,
-                "executorLaunched": False,
-                "outcome": None,
-            }
-        try:
-            result = self.runner(self._request(fence), fence)
-        except RecoveryWorkerStale:
-            return {"plannerLaunched": True, "executorLaunched": False, "outcome": "stale"}
-        except (RecoveryWorkerUnavailable, LedgerError, OSError, ValueError):
-            accepted = self.coordinator.finish(fence, "pi_unavailable")
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": False,
-                "outcome": "pi_unavailable" if accepted else "stale",
-            }
-
-        planner_launched = result.get("plannerLaunched") is True
-        executor_launched = result.get("executorLaunched") is True
-        status = result.get("status")
-        if not planner_launched or not isinstance(status, str):
-            accepted = self.coordinator.finish(fence, "malformed_output")
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": executor_launched,
-                "outcome": "malformed_output" if accepted else "stale",
-            }
-        if status == "planner_error":
-            code = result.get("code")
-            malformed = code in {
-                "malformed_result",
-                "missing_result",
-                "multiple_results",
-                "output_oversized",
-            }
-            outcome = "malformed_output" if malformed else "pi_unavailable"
-            accepted = self.coordinator.finish(fence, outcome)
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": False,
-                "outcome": outcome if accepted else "stale",
-            }
-        if status == "stale":
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": executor_launched,
-                "outcome": "stale",
-            }
-        plan = result.get("plan")
-        actions = result.get("actions", [])
-        probes = result.get("probes", [])
-        if not self._valid_plan(plan, fence) or not isinstance(actions, list) or not isinstance(probes, list):
-            accepted = self.coordinator.finish(fence, "malformed_output")
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": executor_launched,
-                "outcome": "malformed_output" if accepted else "stale",
-            }
-        try:
-            stored = self.coordinator.record_worker_result(fence, plan, actions, probes)
-        except (LedgerError, ValueError):
-            stored = False
-        if not stored:
-            return {
-                "plannerLaunched": True,
-                "executorLaunched": executor_launched,
-                "outcome": "stale",
-            }
-        outcome = {
-            "observe": "observe",
-            "not_actionable": "not_actionable",
-            "planned": "observe",
-            "approval_required": "pending_approval",
-            "rejected": "recovery_unsafe",
-            "failed": "recovery_failed",
-            "completed": "completed",
-        }.get(status, "malformed_output")
-        accepted = self.coordinator.finish(fence, outcome)
-        if accepted and outcome == "recovery_failed":
-            self.adapter.record_outcome(
-                fence.incident_id,
-                "failed_recovery",
-                dedupe_key=f"invocation:{fence.invocation_id}",
-            )
-        return {
-            "plannerLaunched": True,
-            "executorLaunched": executor_launched,
-            "outcome": outcome if accepted else "stale",
-        }
-
-    def start_background(self) -> None:
-        def run() -> None:
-            try:
-                self.process_once()
-            except (LedgerError, OSError, ValueError):
-                return
-
-        with self._state_lock:
-            if self._closing or (self._thread is not None and self._thread.is_alive()):
-                return
-            self._thread = threading.Thread(target=run, daemon=True)
-            self._thread.start()
-
-    def close(self) -> None:
-        with self._state_lock:
-            self._closing = True
-            process = self._process
-            thread = self._thread
-        if process is not None:
-            self._terminate_worker(process)
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5)
 
 
 class RecoveryService:
@@ -3099,22 +2123,14 @@ class RecoveryService:
         emergency: EmergencyNotifier,
         coordinator: IncidentCoordinator | None = None,
         verifier: RecoveryVerifier | None = None,
-        adapter: BoundedPolicyAdapter | None = None,
         notifications: RecoveryNotificationOutbox | None = None,
-        processor: RecoveryProcessor | None = None,
-        notification_delivery: Callable[[dict[str, Any]], None] | None = None,
-        digest_interval_seconds: int = 86_400,
     ):
         self.ledger = ledger
         self.event_spool = event_spool
         self.emergency = emergency
         self.coordinator = coordinator
         self.verifier = verifier
-        self.adapter = adapter
         self.notifications = notifications
-        self.processor = processor
-        self.notification_delivery = notification_delivery
-        self.digest_interval_seconds = digest_interval_seconds
 
     @staticmethod
     def _intake_envelope(
@@ -3219,38 +2235,23 @@ class RecoveryService:
             self.emergency.emit("ledger_unavailable")
         except SpoolError:
             self.emergency.emit("spool_corrupt")
-        if self.processor is not None:
-            self.processor.start_background()
         if self.verifier is not None:
             try:
                 self.verifier.record_heartbeat("supervisor")
                 verification_results = self.verifier.evaluate_all()
                 for incident_id, result in verification_results:
-                    classification = self.verifier.mechanical_classification(
-                        incident_id, result
-                    )
+                    classification = self.verifier.mechanical_classification(incident_id, result)
                     if classification is not None:
                         name, dedupe_key = classification
                         if name == "missed_recovery":
                             self.verifier.coordinator.mark_missed_recovery(
                                 incident_id, dedupe_key=dedupe_key
                             )
-                        if self.adapter is not None:
-                            self.adapter.record_outcome(
-                                incident_id, name, dedupe_key=dedupe_key
-                            )
-            except LedgerError:
-                self.emergency.emit("ledger_unavailable")
-        if self.adapter is not None:
-            try:
-                self.adapter.adapt()
             except LedgerError:
                 self.emergency.emit("ledger_unavailable")
         if self.notifications is not None:
             try:
-                self.notifications.queue_periodic(self.digest_interval_seconds)
-                if self.notification_delivery is not None:
-                    self.notifications.deliver_due(self.notification_delivery)
+                self.notifications.deliver_due()
             except LedgerError:
                 self.emergency.emit("ledger_unavailable")
         try:
@@ -3462,7 +2463,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace", default=os.environ.get("MINIME_CONTROL_WORKSPACE_ROOT", "")
     )
-    parser.add_argument("--mode", choices=sorted(RECOVERY_MODES), default="enabled")
+    parser.add_argument("--mode", choices=sorted(RECOVERY_MODES), default="observe")
     parser.add_argument("--host", default=os.environ.get("MINIME_RECOVERY_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=os.environ.get("MINIME_RECOVERY_PORT", "9877"))
     parser.add_argument("--db", default=os.environ.get("MINIME_RECOVERY_DB_PATH", ""))
@@ -3497,8 +2498,7 @@ def _build_recovery_service(
     configured_rules: tuple[CorrelationRule, ...],
     source_ids: tuple[str, ...],
     mode: str,
-    delivery: Callable[[str], None] | None,
-) -> tuple[RecoveryService, RecoveryProcessor | None]:
+) -> RecoveryService:
     controls = RecoveryControls(ledger)
     static_policy = None
     if configured is not None:
@@ -3525,28 +2525,15 @@ def _build_recovery_service(
         ),
         source_ids=source_ids,
     )
-    adapter = BoundedPolicyAdapter(ledger, controls)
-    coordinator.mechanical_outcome = adapter.record_outcome
-    processor = (
-        RecoveryProcessor(configured, coordinator, verifier, adapter)
-        if configured is not None
-        else None
-    )
-    notification_delivery = None
-    if delivery is not None:
-        notification_delivery = lambda body: delivery(format_recovery_notification(body))
     service = RecoveryService(
         ledger,
         event_spool,
         emergency,
         coordinator=coordinator,
         verifier=verifier,
-        adapter=adapter,
         notifications=notifications,
-        processor=processor,
-        notification_delivery=notification_delivery,
     )
-    return service, processor
+    return service
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3580,11 +2567,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             for rule in configured.correlation_rules
         )
-    emergency_configured = bool(
-        args.chat_id
-        and os.environ.get("MINIME_TELEGRAM_SOPS_FILE", "").strip()
-        and os.environ.get("MINIME_TELEGRAM_SOPS_KEY", "").strip()
-    )
     if (
         args.host not in {"127.0.0.1", "localhost"}
         or not 0 <= args.port <= 65535
@@ -3598,7 +2580,6 @@ def main(argv: list[str] | None = None) -> int:
         or not 0 < args.body_timeout <= 30
         or not math.isfinite(args.emergency_cooldown)
         or not 0 <= args.emergency_cooldown <= 86_400
-        or (args.mode in {"plan", "enabled"} and not emergency_configured)
     ):
         print("recovery supervisor configuration rejected", file=sys.stderr)
         return 2
@@ -3620,7 +2601,6 @@ def main(argv: list[str] | None = None) -> int:
         cooldown=args.emergency_cooldown,
     )
     ledger: RecoveryLedger | None
-    processor: RecoveryProcessor | None = None
     try:
         ledger = RecoveryLedger(Path(args.db), busy_timeout_ms=args.busy_timeout_ms)
     except LedgerCorrupt:
@@ -3661,8 +2641,6 @@ def main(argv: list[str] | None = None) -> int:
             max_concurrent_requests=args.max_concurrent,
         )
     except OSError:
-        if processor is not None:
-            processor.close()
         if ledger is not None:
             ledger.close()
         restore_signal_handlers()
@@ -3670,7 +2648,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if ledger is not None:
         try:
-            service, processor = _build_recovery_service(
+            service = _build_recovery_service(
                 ledger,
                 event_spool,
                 emergency,
@@ -3678,7 +2656,6 @@ def main(argv: list[str] | None = None) -> int:
                 configured_rules=configured_rules,
                 source_ids=source_ids,
                 mode=args.mode,
-                delivery=delivery,
             )
             app.service = service
         except LedgerUnavailable:
@@ -3707,7 +2684,7 @@ def main(argv: list[str] | None = None) -> int:
                     recovered_ledger = RecoveryLedger(
                         Path(args.db), busy_timeout_ms=args.busy_timeout_ms
                     )
-                    recovered_service, recovered_processor = _build_recovery_service(
+                    recovered_service = _build_recovery_service(
                         recovered_ledger,
                         event_spool,
                         emergency,
@@ -3715,7 +2692,6 @@ def main(argv: list[str] | None = None) -> int:
                         configured_rules=configured_rules,
                         source_ids=source_ids,
                         mode=args.mode,
-                        delivery=delivery,
                     )
                 except LedgerUnavailable:
                     if recovered_ledger is not None:
@@ -3728,15 +2704,12 @@ def main(argv: list[str] | None = None) -> int:
                     next_ledger_retry = float("inf")
                 else:
                     ledger = recovered_ledger
-                    processor = recovered_processor
                     app.service = recovered_service
             app.service.maintenance()
     except KeyboardInterrupt:
         stop_requested.set()
     finally:
         server.server_close()
-        if processor is not None:
-            processor.close()
         if ledger is not None:
             ledger.close()
         restore_signal_handlers()

@@ -36,13 +36,13 @@ npm pack --json --dry-run
 ## Tasks
 
 ### Task 1: Remove the obsolete planner, actuator, worker, and adaptive policy
-- [ ] Delete both planner output-extension copies, the planner-only Knowledge wrapper, static runbook actuator, Node worker, planner-only package build entries, and their dedicated tests without removing the generic supervisor ledger/fencing substrate.
-- [ ] Remove the actuator-only `runbooks` config field and `actionClass` handoff enum from the closed schema, examples, docs, and tests while retaining only validated deterministic `probes`.
-- [ ] Remove plan-mode/model-result/runbook execution paths and reduce `RECOVERY_MODES` plus config/CLI/example defaults to startup-enforced `observe` only, so the foundation cannot spawn Pi or Node remediation and cannot claim aggregate planner output as final recovery success.
-- [ ] Remove adaptive threshold/replay implementation and aggregate digest queue/format/CLI/docs/tests while retaining reviewed static controls, dispatch kill switch, expiring silences, retry controls, audit, status, the durable immediate-escalation outbox, and native fallback.
-- [ ] Pin the post-retarget CLI: retain `status`, `incidents`, `invocations`, `dispatch`, `controls`, `silence`, `retry`, `policy history`, `policy rollback`, and `process --once`; remove `approve`, `reject`, and `digest`, `_approval`, approval/handoff states and outcomes, and drop `plannerLaunched`/`executorLaunched` from the `process --once` JSON contract and installed-package assertions.
-- [ ] Keep crash reconciliation, one-owner lease/fencing, generations, deterministic incident state, and explicit injectable seams needed by the subsequent full-fixer PR.
-- [ ] Add regression assertions that observe/foundation operation launches no Pi/Node fixer, creates no completion claim, and performs no mutating action, then run focused tests.
+- [x] Delete both planner output-extension copies, the planner-only Knowledge wrapper, static runbook actuator, Node worker, planner-only package build entries, and their dedicated tests without removing the generic supervisor ledger/fencing substrate.
+- [x] Remove the actuator-only `runbooks` config field and `actionClass` handoff enum from the closed schema, examples, docs, and tests while retaining only validated deterministic `probes`.
+- [x] Remove plan-mode/model-result/runbook execution paths and reduce `RECOVERY_MODES` plus config/CLI/example defaults to startup-enforced `observe` only, so the foundation cannot spawn Pi or Node remediation and cannot claim aggregate planner output as final recovery success.
+- [x] Remove adaptive threshold/replay implementation and aggregate digest queue/format/CLI/docs/tests while retaining reviewed static controls, dispatch kill switch, expiring silences, retry controls, audit, status, the durable immediate-escalation outbox, and native fallback.
+- [x] Pin the post-retarget CLI: retain `status`, `incidents`, `invocations`, `dispatch`, `controls`, `silence`, `retry`, `policy history`, `policy rollback`, and `process --once`; remove `approve`, `reject`, and `digest`, `_approval`, approval/handoff states and outcomes, and drop `plannerLaunched`/`executorLaunched` from the `process --once` JSON contract and installed-package assertions.
+- [x] Keep crash reconciliation, one-owner lease/fencing, generations, deterministic incident state, and explicit injectable seams needed by the subsequent full-fixer PR.
+- [x] Add regression assertions that observe/foundation operation launches no Pi/Node fixer, creates no completion claim, and performs no mutating action, then run focused tests.
 
 ### Task 2: Make tee delivery lossless across recovery-sink outages
 - [ ] Refactor `scripts/runtime_doctor.py` so a stuck recovery pending batch does not return before comparing the current incident set with the pending target in tee mode.

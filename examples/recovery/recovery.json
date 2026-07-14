@@ -11,6 +11,5 @@
     "alertmanager",
     "runtime_doctor"
   ],
-  "runbooks": [],
   "probes": []
 }

@@ -102,8 +102,6 @@ const HELP_TEXT = `Usage:
   minime-bot recovery silence <incident-key> --ttl <seconds> --actor <actor> --reason <reason>
   minime-bot recovery retry <incident-id> --actor <actor> --reason <reason>
   minime-bot recovery policy history|rollback [revision] [--limit N] [--actor <actor> --reason <reason>]
-  minime-bot recovery approve|reject <invocation-id> --actor <actor> --reason <reason>
-  minime-bot recovery digest preview [--window <seconds>]
   minime-bot recovery process --once
 
 Options:

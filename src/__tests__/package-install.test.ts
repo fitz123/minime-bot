@@ -195,18 +195,12 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
-    "dist/pi-extensions/recovery-plan.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
-    "dist/recovery/fixer-runner.js",
-    "dist/recovery/runbook-executor.js",
-    "dist/recovery/worker.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
-    "dist/extensions/pi/recovery-knowledge-tools.js",
-    "dist/extensions/pi/recovery-plan.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
@@ -241,6 +235,11 @@ function assertPackFiles(files: readonly string[]): void {
   }
 
   assert.ok(!files.some((file) => file.includes(RETIRED_GUARD_WRAPPER)), "guard extension should not be packed");
+  assert.ok(!files.some((file) => file.startsWith("dist/recovery/")), "recovery worker artifacts should not be packed");
+  const retiredOutputExtension = ["recovery", "plan"].join("-");
+  const retiredKnowledgeWrapper = ["recovery", "knowledge", "tools"].join("-");
+  assert.ok(!files.some((file) => file.includes(retiredOutputExtension)), "recovery output extension should not be packed");
+  assert.ok(!files.some((file) => file.includes(retiredKnowledgeWrapper)), "recovery-only knowledge wrapper should not be packed");
   assert.ok(!files.some((file) => file.startsWith("src/")), "source TS should not be packed");
   assert.ok(!files.some((file) => file.startsWith(".claude/")), "source extension wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");
@@ -304,7 +303,6 @@ describe("package artifact install", () => {
           impact: 2,
         }],
         sourceIds: ["alertmanager", "runtime_doctor"],
-        runbooks: [],
         probes: [],
       }),
     );
@@ -396,12 +394,11 @@ describe("package artifact install", () => {
         workspace,
       );
       assert.equal(recoveryProcess.status, 0, recoveryProcess.stderr || recoveryProcess.stdout);
-      const recoveryProcessJson = JSON.parse(recoveryProcess.stdout) as {
-        plannerLaunched: boolean;
-        executorLaunched: boolean;
-      };
-      assert.equal(recoveryProcessJson.plannerLaunched, false);
-      assert.equal(recoveryProcessJson.executorLaunched, false);
+      const recoveryProcessJson = JSON.parse(recoveryProcess.stdout) as Record<string, unknown>;
+      assert.deepEqual(
+        Object.keys(recoveryProcessJson).sort(),
+        ["activeIncidents", "mode", "ok", "verification"],
+      );
 
       const recoveryE2e = spawnSync(
         "python3",
@@ -596,7 +593,6 @@ describe("package artifact install", () => {
 });
 
 const INSTALLED_RECOVERY_E2E = String.raw`
-from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -608,6 +604,10 @@ import recovery_supervisor
 
 workspace = Path(sys.argv[1])
 config = recovery_config.load_recovery_config(workspace / "recovery.json", workspace)
+assert config.mode == "observe"
+assert set(recovery_config.recovery_static_policy(config)) == {
+    "version", "mode", "correlationRules", "sourceIds", "probes"
+}
 ledger = recovery_ledger.RecoveryLedger(config.database)
 policy = recovery_supervisor.RecoveryPolicy(
     revision=1,
@@ -615,7 +615,7 @@ policy = recovery_supervisor.RecoveryPolicy(
     lease_seconds=10,
 )
 
-payload = json.dumps({"alerts": [{
+firing = json.dumps({"alerts": [{
     "status": "firing",
     "fingerprint": "installed-episode",
     "startsAt": "2026-07-14T00:00:00Z",
@@ -626,65 +626,25 @@ payload = json.dumps({"alerts": [{
         "instance": "local",
     },
 }]}).encode()
-events = recovery_supervisor.normalize_alertmanager(payload)
+events = recovery_supervisor.normalize_alertmanager(firing)
 assert ledger.record_events(events) == 1
 assert ledger.record_events(events) == 0
 
-observer = recovery_supervisor.IncidentCoordinator(ledger, policy, owner="installed-observer", mode="observe")
+observer = recovery_supervisor.IncidentCoordinator(
+    ledger, policy, owner="installed-observer", mode="observe"
+)
+assert observer.reconcile() == 1
 assert observer.claim_next() is None
 assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
-
-clock = [100.0]
-first = recovery_supervisor.IncidentCoordinator(
-    ledger, policy, owner="installed-owner-one", mode="enabled", clock=lambda: clock[0]
-)
-fence = first.claim_next()
-assert fence is not None
-assert first.finish(fence, "not_actionable")
-assert first.claim_next() is None
-assert first.explicit_retry(fence.incident_id, actor="operator", reason="installed retry")
-orphan = first.claim_next()
-assert orphan is not None
-
-second_ledger = recovery_ledger.RecoveryLedger(config.database)
-clock[0] = 111.0
-second = recovery_supervisor.IncidentCoordinator(
-    second_ledger, policy, owner="installed-owner-two", mode="enabled", clock=lambda: clock[0]
-)
-replacement = second.claim_next()
-assert replacement is not None
-assert replacement.generation > orphan.generation
-assert second.finish(replacement, "pending_approval")
-assert not first.finish(orphan, "completed")
+assert ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 0
 
 controls_clock = [200.0]
-controls = recovery_supervisor.RecoveryControls(second_ledger, clock=lambda: controls_clock[0])
+controls = recovery_supervisor.RecoveryControls(ledger, clock=lambda: controls_clock[0])
 controls.set_dispatch(False, actor="operator", reason="installed bounded control", expires_at=210.0)
 assert controls.current().dispatch_enabled is False
 controls_clock[0] = 211.0
 assert controls.expire() is not None
 assert controls.current().dispatch_enabled is True
-
-adapt_clock = [300000.0]
-adapt_controls = recovery_supervisor.RecoveryControls(
-    second_ledger, clock=lambda: adapt_clock[0]
-)
-adapter = recovery_supervisor.BoundedPolicyAdapter(
-    second_ledger, adapt_controls, clock=lambda: adapt_clock[0]
-)
-for _ in range(3):
-    adapter.record_outcome(replacement.incident_id, "false_positive")
-assert adapter.adapt() is not None
-assert (adapt_controls.current().confirmation_count, adapt_controls.current().cooldown_seconds) == (2, 60.0)
-adapt_clock[0] += 86400.0
-for _ in range(3):
-    adapter.record_outcome(replacement.incident_id, "impact", critical=True)
-assert adapter.adapt() is not None
-assert (adapt_controls.current().confirmation_count, adapt_controls.current().cooldown_seconds) == (1, 0.0)
-
-outbox = recovery_supervisor.RecoveryNotificationOutbox(second_ledger, clock=lambda: 1000.0)
-digest = outbox.queue_digest(0.0, 1000.0)
-assert digest["kind"] == "digest"
 
 resolved = json.dumps({"alerts": [{
     "status": "resolved",
@@ -698,8 +658,23 @@ resolved = json.dumps({"alerts": [{
         "instance": "local",
     },
 }]}).encode()
-assert second_ledger.record_events(recovery_supervisor.normalize_alertmanager(resolved)) == 1
-second.reconcile()
+assert ledger.record_events(recovery_supervisor.normalize_alertmanager(resolved)) == 1
+observer.reconcile()
+incident = ledger.connection.execute("SELECT id, state FROM incidents").fetchone()
+assert incident["state"] == "verifying"
+verifier = recovery_supervisor.RecoveryVerifier(
+    ledger,
+    observer,
+    source_ids=("alertmanager",),
+    freshness_seconds=10,
+    hold_down_seconds=0,
+    clock=lambda: 300.0,
+)
+result = verifier.evaluate(int(incident["id"]))
+assert result.recovered is False
+assert "heartbeat_missing:alertmanager" in result.reasons
+assert verifier.mechanical_classification(int(incident["id"]), result) is None
+assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
 
 class FailingLedger:
     def record_events(self, _events):
@@ -714,89 +689,17 @@ with tempfile.TemporaryDirectory() as directory:
     service = recovery_supervisor.RecoveryService(
         FailingLedger(), recovery_supervisor.AtomicJsonSpool(root / "events"), emergency
     )
-    result = service.accept(events)
-    assert result.status == 202
+    accepted = service.accept(events)
+    assert accepted.status == 202
     assert len(list((root / "events").glob("*.json"))) == 1
     assert len(delivered) == 1
 
-worker_config = replace(
-    config,
-    mode="enabled",
-    database=workspace / "var/recovery/worker-ledger.sqlite3",
-    source_ids=("alertmanager",),
-    runbooks=({
-        "id": "installed-repair",
-        "actionClass": "local_repair",
-        "executable": "/usr/bin/true",
-        "argv": [],
-        "env": {},
-        "timeoutMs": 1000,
-    },),
-    probes=({
-        "id": "installed-probe",
-        "executable": "/usr/bin/true",
-        "argv": [],
-        "env": {},
-        "timeoutMs": 1000,
-    },),
+removed = (
+    "Recovery" + "Processor",
+    "Recovery" + "WorkerUnavailable",
+    "Bounded" + "PolicyAdapter",
 )
-worker_ledger = recovery_ledger.RecoveryLedger(worker_config.database)
-worker_ledger.record_events(events)
-worker_controls = recovery_supervisor.RecoveryControls(worker_ledger)
-worker_coordinator = recovery_supervisor.IncidentCoordinator(
-    worker_ledger, policy, owner="installed-worker", controls=worker_controls, mode="enabled"
-)
-worker_verifier = recovery_supervisor.RecoveryVerifier(
-    worker_ledger,
-    worker_coordinator,
-    probe_ids=("installed-probe",),
-    source_ids=("alertmanager",),
-)
-worker_adapter = recovery_supervisor.BoundedPolicyAdapter(worker_ledger, worker_controls)
-
-def installed_worker(request, _fence):
-    fence = request["fence"]
-    return {
-        "version": 1,
-        "status": "completed",
-        "plannerLaunched": True,
-        "executorLaunched": True,
-        "plan": {
-            "invocationId": fence["invocationId"],
-            "incidentId": fence["incidentId"],
-            "generation": fence["generation"],
-            "evidenceHash": fence["evidenceHash"],
-            "policyRevision": fence["policyRevision"],
-            "verdict": "execute",
-            "diagnosisCode": "installed_repair",
-            "summary": "Installed worker orchestration check.",
-            "evidenceRefs": [request["evidence"][0]["ref"]],
-            "runbookIds": ["installed-repair"],
-            "probeIds": ["installed-probe"],
-            "nextEvaluationDelaySeconds": 60,
-        },
-        "actions": [{
-            "id": "installed-repair", "exitCode": 0, "timedOut": False,
-            "output": "", "truncated": False,
-        }],
-        "probes": [{
-            "id": "installed-probe", "exitCode": 0, "timedOut": False,
-            "output": "", "truncated": False,
-        }],
-    }
-
-worker_result = recovery_supervisor.RecoveryProcessor(
-    worker_config,
-    worker_coordinator,
-    worker_verifier,
-    worker_adapter,
-    runner=installed_worker,
-).process_once()
-assert worker_result["outcome"] == "completed"
-assert worker_ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 2
-worker_ledger.close()
-
-second_ledger.close()
+assert all(not hasattr(recovery_supervisor, name) for name in removed)
 ledger.close()
 `;
 
@@ -879,118 +782,6 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
-const recoveryFixer = await importPackageFile("dist/recovery/fixer-runner.js");
-const recoveryExecutor = await importPackageFile("dist/recovery/runbook-executor.js");
-const recoveryWorker = await importPackageFile("dist/recovery/worker.js");
-let recoverySpawnCount = 0;
-const installedFence = {
-  invocationId: 1,
-  incidentId: 1,
-  generation: 1,
-  evidenceHash: "a".repeat(64),
-  policyRevision: 1,
-  leaseToken: "b".repeat(48),
-  owner: "installed-supervisor",
-};
-const installedPlan = {
-  invocationId: 1,
-  incidentId: 1,
-  generation: 1,
-  evidenceHash: "a".repeat(64),
-  policyRevision: 1,
-  verdict: "execute",
-  diagnosisCode: "installed_check",
-  summary: "Installed plan mode check.",
-  evidenceRefs: ["event:one"],
-  runbookIds: ["installed-check"],
-  probeIds: ["installed-probe"],
-  nextEvaluationDelaySeconds: 60,
-};
-const installedRunbook = {
-  id: "installed-check",
-  actionClass: "diagnostic",
-  executable: "/usr/bin/true",
-  argv: [],
-  env: {},
-  timeoutMs: 1000,
-};
-const installedProbe = {
-  id: "installed-probe",
-  executable: "/usr/bin/true",
-  argv: [],
-  env: {},
-  timeoutMs: 1000,
-};
-for (const mode of ["observe", "plan"]) {
-  const modeResult = await recoveryExecutor.executeRecoveryPlan(
-    { mode, plan: installedPlan, fence: installedFence, runbooks: [installedRunbook], probes: [installedProbe] },
-    {
-      checkFence: () => true,
-      spawn: () => {
-        recoverySpawnCount += 1;
-        return new FakeChild();
-      },
-    },
-  );
-  assert.equal(modeResult.status, mode === "observe" ? "observe" : "planned");
-}
-assert.equal(recoverySpawnCount, 0, "installed observe/plan modes must have zero executor side effects");
-const enabledChildren = [];
-const enabledPromise = recoveryExecutor.executeRecoveryPlan(
-  {
-    mode: "enabled",
-    plan: installedPlan,
-    fence: installedFence,
-    runbooks: [installedRunbook],
-    probes: [installedProbe],
-  },
-  {
-    checkFence: () => true,
-    spawn: () => {
-      const child = new FakeChild();
-      enabledChildren.push(child);
-      return child;
-    },
-  },
-);
-await new Promise((resolve) => setImmediate(resolve));
-enabledChildren[0].emitClose(0);
-await new Promise((resolve) => setImmediate(resolve));
-enabledChildren[1].emitClose(0);
-assert.equal((await enabledPromise).status, "completed");
-
-const workerResult = await recoveryWorker.runRecoveryWorkerRequest(
-  {
-    version: 1,
-    mode: "plan",
-    fence: installedFence,
-    evidence: [{
-      ref: "event:one",
-      source: "alertmanager",
-      fingerprint: "installed-episode",
-      code: "service_unhealthy",
-      component: "bot",
-      failureClass: "availability",
-      status: "firing",
-      transitionId: "c".repeat(64),
-    }],
-    runbooks: [installedRunbook],
-    probes: [installedProbe],
-  },
-  {
-    env: { MINIME_AGENT_WORKSPACE_ROOT: agentWorkspace },
-    planner: async () => installedPlan,
-    executor: async () => ({
-      status: "planned",
-      runbookIds: ["installed-check"],
-      probeIds: ["installed-probe"],
-      actions: [],
-      probes: [],
-    }),
-  },
-);
-assert.equal(workerResult.status, "planned");
-assert.equal(workerResult.plan.invocationId, installedFence.invocationId);
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
@@ -1018,13 +809,6 @@ assert.deepEqual(
   ["knowledge-tools.js"],
 );
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
-
-const recoveryExtensionArgs = recoveryFixer.resolveRecoveryPlannerExtensionArgs();
-assert.deepEqual(
-  extensionPathsFromArgs(recoveryExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["recovery-knowledge-tools.js", "recovery-plan.js"],
-);
-assertNoGuardContract("recovery planner extension args must not load the retired guard", recoveryExtensionArgs);
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);

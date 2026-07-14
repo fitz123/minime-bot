@@ -17,10 +17,6 @@
   <dict>
     <key>MINIME_CONTROL_WORKSPACE_ROOT</key>
     <string>__CONTROL_WORKSPACE_ROOT__</string>
-    <key>MINIME_AGENT_WORKSPACE_ROOT</key>
-    <string>__AGENT_WORKSPACE_ROOT__</string>
-    <key>MINIME_RECOVERY_NODE_EXECUTABLE</key>
-    <string>__NODE_EXECUTABLE__</string>
     <key>MINIME_TELEGRAM_CHAT_ID</key>
     <string>__TELEGRAM_CHAT_ID__</string>
     <key>MINIME_TELEGRAM_SOPS_FILE</key>

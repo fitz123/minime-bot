@@ -23,11 +23,8 @@ from recovery_supervisor import (
     CorrelationRule,
     IncidentCoordinator,
     RecoveryControls,
-    RecoveryNotificationOutbox,
     RecoveryPolicy,
-    RecoveryProcessor,
     RecoveryVerifier,
-    BoundedPolicyAdapter,
     safe_field,
 )
 
@@ -109,15 +106,6 @@ def _parser() -> argparse.ArgumentParser:
     rollback = policy_sub.add_parser("rollback")
     rollback.add_argument("revision", type=_positive_id)
     _operator_options(rollback)
-
-    for decision in ("approve", "reject"):
-        approval = sub.add_parser(decision)
-        approval.add_argument("invocation_id", type=_positive_id)
-        _operator_options(approval)
-
-    digest = sub.add_parser("digest")
-    digest.add_argument("action", choices=("preview",))
-    digest.add_argument("--window", type=_ttl, default=86_400)
 
     process = sub.add_parser("process")
     process.add_argument("--once", action="store_true", required=True)
@@ -206,104 +194,6 @@ def _operator(args: argparse.Namespace) -> tuple[str, str]:
     )
 
 
-def _approval(
-    ledger: RecoveryLedger,
-    controls: RecoveryControls,
-    invocation_id: int,
-    approved: bool,
-    actor: str,
-    reason: str,
-) -> int:
-    now = time.time()
-    with ledger.transaction() as connection:
-        invocation = connection.execute(
-            "SELECT * FROM invocations WHERE id = ?", (invocation_id,)
-        ).fetchone()
-        if invocation is None or invocation["state"] != "pending_approval":
-            raise ValueError("recovery invocation is not pending approval")
-        incident = connection.execute(
-            "SELECT * FROM incidents WHERE id = ?", (invocation["incident_id"],)
-        ).fetchone()
-        if incident is None or incident["state"] != "pending_approval":
-            raise ValueError("recovery incident is not pending approval")
-        frozen = connection.execute(
-            "SELECT value FROM metadata WHERE key = ?",
-            (f"invocation:{invocation_id}:plan",),
-        ).fetchone()
-        if frozen is None:
-            raise ValueError("recovery invocation has no frozen plan")
-        try:
-            frozen_plan = json.loads(str(frozen["value"]))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("recovery invocation frozen plan is invalid") from exc
-        if not isinstance(frozen_plan, dict) or frozen_plan.get("invocationId") != invocation_id:
-            raise ValueError("recovery invocation frozen plan is invalid")
-        control = controls.current(connection, now=now)
-        if (
-            incident["policy_revision"] != control.revision
-            or invocation["policy_revision"] != control.revision
-            or incident["generation"] != invocation["generation"]
-            or incident["evidence_hash"] != invocation["evidence_hash"]
-        ):
-            raise ValueError("recovery approval fence is stale")
-        row = controls._current_row(connection)
-        document = controls._document(row)
-        after_state = "handoff_approved" if approved else "handoff_rejected"
-        revision = controls.append_revision(
-            connection,
-            document,
-            operation="approval_decision",
-            target=f"invocation:{invocation_id}",
-            actor=actor,
-            reason=reason,
-            expires_at=None,
-            before={"decision": "pending", "state": "pending_approval"},
-            after={"decision": "approved" if approved else "rejected", "state": after_state},
-            now=now,
-            effective=False,
-        )
-        connection.execute(
-            "UPDATE incidents SET state = ?, updated_at = ? WHERE id = ?",
-            (after_state, now, incident["id"]),
-        )
-        connection.execute(
-            "UPDATE invocations SET state = ?, updated_at = ? WHERE id = ?",
-            ("approved" if approved else "rejected", now, invocation_id),
-        )
-        return revision
-
-
-def _digest_preview(ledger: RecoveryLedger, window: float) -> dict[str, Any]:
-    end = time.time()
-    start = end - window
-    connection = ledger.connection
-    states = {
-        str(row["state"]): int(row["count"])
-        for row in connection.execute(
-            "SELECT state, count(*) AS count FROM incidents GROUP BY state ORDER BY state"
-        ).fetchall()
-    }
-    return {
-        "kind": "digest",
-        "version": 1,
-        "windowStart": start,
-        "windowEnd": end,
-        "counts": {
-            "events": connection.execute(
-                "SELECT count(*) FROM events WHERE received_at >= ? AND received_at < ?", (start, end)
-            ).fetchone()[0],
-            "invocations": connection.execute(
-                "SELECT count(*) FROM invocations WHERE created_at >= ? AND created_at < ?", (start, end)
-            ).fetchone()[0],
-            "recoveries": connection.execute(
-                "SELECT count(*) FROM audit WHERE operation = 'verification_recovered' "
-                "AND occurred_at >= ? AND occurred_at < ?", (start, end)
-            ).fetchone()[0],
-        },
-        "incidentStates": states,
-    }
-
-
 def run(args: argparse.Namespace) -> int:
     config = _config(args)
     if args.command == "config":
@@ -311,7 +201,6 @@ def run(args: argparse.Namespace) -> int:
             "ok": True,
             "mode": config.mode,
             "config": str(config.path),
-            "runbooks": len(config.runbooks),
             "probes": len(config.probes),
         })
         return 0
@@ -386,27 +275,31 @@ def run(args: argparse.Namespace) -> int:
         elif args.command == "policy" and args.action == "rollback":
             actor, reason = _operator(args)
             _json({"ok": True, "revision": controls.rollback(args.revision, actor=actor, reason=reason)})
-        elif args.command in {"approve", "reject"}:
-            actor, reason = _operator(args)
-            revision = _approval(
-                ledger, controls, args.invocation_id, args.command == "approve", actor, reason
-            )
-            _json({"ok": True, "revision": revision, "decision": args.command})
-        elif args.command == "digest":
-            _json(_digest_preview(ledger, args.window))
         elif args.command == "process":
             active = coordinator.reconcile()
             controls.expire()
-            RecoveryNotificationOutbox(ledger).queue_periodic()
             verifier = RecoveryVerifier(
                 ledger,
                 coordinator,
                 probe_ids=tuple(str(probe["id"]) for probe in config.probes),
                 source_ids=config.source_ids,
             )
-            adapter = BoundedPolicyAdapter(ledger, controls)
-            processing = RecoveryProcessor(config, coordinator, verifier, adapter).process_once()
-            _json({"ok": True, "mode": config.mode, "activeIncidents": active, **processing})
+            verification = [
+                {
+                    "incidentId": incident_id,
+                    "recovered": result.recovered,
+                    "reasons": list(result.reasons),
+                }
+                for incident_id, result in verifier.evaluate_all()
+            ]
+            _json(
+                {
+                    "ok": True,
+                    "mode": config.mode,
+                    "activeIncidents": active,
+                    "verification": verification,
+                }
+            )
         else:
             raise ValueError("unknown recovery command")
     return 0
