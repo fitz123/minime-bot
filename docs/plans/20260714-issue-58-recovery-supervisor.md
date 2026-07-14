@@ -65,12 +65,12 @@ python3 -m py_compile scripts/recovery_supervisor.py scripts/runtime_doctor.py
 - [x] Run focused tests before Task 4.
 
 ### Task 4: Audited controls, bounded adaptation, verification, and digest
-- [ ] Implement audited dispatch enable/disable, confirmation count, cooldown, retry budget, expiring silence, explicit retry, and rollback — each recording actor, reason, expiry, before/after, and a new revision — while intake, source checks, audit, digest, and fallback stay active.
-- [ ] Implement bounded adaptation of only confirmation count and cooldown within hard bounds: requires ≥3 mechanically classified outcomes and deterministic replay, runs at most once per policy per day, cannot delay critical escalation, and auto-reverts toward baseline after impact or missed recovery; enable/disable, alert definitions, escalation classes, allowlists, and fallback are never auto-changed.
-- [ ] Implement deterministic verification (all firing episodes resolved, probes healthy, heartbeats fresh, hold-down elapsed) and deterministic periodic digests with a durable notification outbox/retry.
-- [ ] Reserve immediate native escalation for confirmed impact, required approval, unsafe/failed recovery, exhausted retries, supervisor/Pi unavailability, or emergency-spool failure.
-- [ ] Add focused tests: control expiry/rollback, bounded adaptation and reversion, verification hold-down, deterministic digest, no false recovery from missing data, and notification-outage retry.
-- [ ] Run focused tests before Task 5.
+- [x] Implement audited dispatch enable/disable, confirmation count, cooldown, retry budget, expiring silence, explicit retry, and rollback — each recording actor, reason, expiry, before/after, and a new revision — while intake, source checks, audit, digest, and fallback stay active.
+- [x] Implement bounded adaptation of only confirmation count and cooldown within hard bounds: requires ≥3 mechanically classified outcomes and deterministic replay, runs at most once per policy per day, cannot delay critical escalation, and auto-reverts toward baseline after impact or missed recovery; enable/disable, alert definitions, escalation classes, allowlists, and fallback are never auto-changed.
+- [x] Implement deterministic verification (all firing episodes resolved, probes healthy, heartbeats fresh, hold-down elapsed) and deterministic periodic digests with a durable notification outbox/retry.
+- [x] Reserve immediate native escalation for confirmed impact, required approval, unsafe/failed recovery, exhausted retries, supervisor/Pi unavailability, or emergency-spool failure.
+- [x] Add focused tests: control expiry/rollback, bounded adaptation and reversion, verification hold-down, deterministic digest, no false recovery from missing data, and notification-outage retry.
+- [x] Run focused tests before Task 5.
 
 ### Task 5: CLI modes, package artifacts, docs, and shadow gates
 - [ ] Add additive `minime-bot recovery` commands for config validation, status, incident/invocation inspection, dispatch controls, expiring silences, explicit retry, policy history/rollback, approve/reject, digest preview, and one-shot processing; reject arbitrary SQL/shell and unbounded controls.
