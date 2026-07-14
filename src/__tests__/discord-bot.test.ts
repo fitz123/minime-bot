@@ -110,6 +110,59 @@ describe("Discord media failure handling", () => {
   });
 });
 
+describe("Discord stale-message handling", () => {
+  it("continues dropping messages older than maxMessageAgeMs", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalPut = REST.prototype.put;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    REST.prototype.put = async () => ({}) as never;
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 209_715_200,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    let sessionCalls = 0;
+    const sessionManager = {
+      sendSessionMessage: () => { sessionCalls++; throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+
+    try {
+      const { client } = await createDiscordBot(config, discordConfig, sessionManager);
+      client.emit(Events.MessageCreate, {
+        author: { bot: false, username: "tester", globalName: "Tester" },
+        channel: { send: async () => ({}), isThread: () => false },
+        channelId: "channel-1",
+        guildId: "guild-1",
+        createdTimestamp: Date.now() - config.sessionDefaults.maxMessageAgeMs - 1,
+        mentions: { has: () => false },
+        attachments: new Map(),
+        content: "delayed Discord message",
+        reply: async () => ({}),
+      } as never);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.strictEqual(sessionCalls, 0);
+    } finally {
+      Client.prototype.login = originalLogin;
+      REST.prototype.put = originalPut;
+    }
+  });
+});
+
 // --- resolveDiscordBinding ---
 
 const testBindings: DiscordBinding[] = [

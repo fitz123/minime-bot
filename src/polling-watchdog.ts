@@ -182,8 +182,10 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
         decideRestart("poll_stalled");
       } else {
         recordPollWatchdogCheck("api_unreachable");
-        log.error("watchdog", "Telegram API reachability check failed or timed out: reason=api_unreachable");
-        decideRestart("api_unreachable");
+        log.warn(
+          "watchdog",
+          "Telegram API reachability check failed or timed out: state=api_unreachable; keeping polling and queued work alive",
+        );
       }
     } finally {
       checking = false;

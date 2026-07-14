@@ -83,7 +83,7 @@ describe("polling-watchdog", () => {
   });
 
   for (const failure of ["false", "throw"] as const) {
-    it(`restarts exactly once with api_unreachable when heartbeat returns ${failure}`, async () => {
+    it(`records degraded connectivity without exiting when heartbeat returns ${failure}`, async () => {
       let clock = 0;
       let exits = 0;
       let calls = 0;
@@ -102,20 +102,24 @@ describe("polling-watchdog", () => {
       clock = 6_000;
       await wd.check();
       await wd.check();
-      assert.equal(exits, 1);
-      assert.equal(calls, 1);
+      assert.equal(exits, 0);
+      assert.equal(calls, 2);
+      const checks = await pollWatchdogChecks.get();
+      assert.equal(checks.values.find((v) => v.labels.outcome === "api_unreachable")?.value, 2);
       const restarts = await pollWatchdogRestarts.get();
-      assert.equal(restarts.values.find((v) => v.labels.reason === "api_unreachable")?.value, 1);
+      assert.equal(restarts.values.length, 0);
     });
   }
 
-  it("bounds a hung heartbeat and emits one api_unreachable decision", async () => {
+  it("bounds every hung heartbeat without exiting", async () => {
     let clock = 0;
     let exits = 0;
     let aborted = false;
+    let calls = 0;
     const wd = createWatchdog({
       pollProgress: () => snapshot(),
       heartbeat: (signal) => {
+        calls++;
         aborted = signal.aborted;
         signal.addEventListener("abort", () => { aborted = true; });
         return new Promise<boolean>(() => {});
@@ -131,24 +135,31 @@ describe("polling-watchdog", () => {
     await wd.check();
     await wd.check();
     assert.equal(aborted, true);
-    assert.equal(exits, 1);
+    assert.equal(calls, 2);
+    assert.equal(exits, 0);
+    const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "api_unreachable")?.value, 2);
   });
 
-  it("detects hung and rejected polls, but accepts resumed polling", async () => {
+  it("keeps repeated unreachable checks bounded and observes resumed polling", async () => {
     let clock = 0;
     let progress = snapshot({ lastPollStartedAtMs: 1_000, inFlight: true });
     let exits = 0;
+    let heartbeatCalls = 0;
     const wd = createWatchdog({
       pollProgress: () => progress,
       heartbeat: async () => {
-        // Polling resumes while reachability is being checked.
-        progress = snapshot({
-          lastPollStartedAtMs: clock,
-          lastPollSucceededAtMs: clock,
-          successfulPollCount: 1,
-          failedPollCount: 1,
-        });
-        return true;
+        heartbeatCalls++;
+        if (heartbeatCalls === 3) {
+          // Polling resumes during a later degraded-connectivity check.
+          progress = snapshot({
+            lastPollStartedAtMs: clock,
+            lastPollSucceededAtMs: clock,
+            successfulPollCount: 1,
+            failedPollCount: 2,
+          });
+        }
+        return false;
       },
       exit: () => { exits++; },
       now: () => clock,
@@ -157,11 +168,14 @@ describe("polling-watchdog", () => {
 
     clock = 6_000;
     await wd.check();
-    assert.equal(exits, 0);
-    clock = 10_000;
+    clock = 7_000;
+    await wd.check();
+    clock = 8_000;
     await wd.check();
     assert.equal(exits, 0);
+    assert.equal(heartbeatCalls, 3);
     const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "api_unreachable")?.value, 2);
     assert.equal(checks.values.find((v) => v.labels.outcome === "poll_resumed")?.value, 1);
   });
 

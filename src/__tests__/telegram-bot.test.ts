@@ -1,7 +1,7 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, isStaleMessage, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
@@ -607,50 +607,6 @@ describe("voiceTranscriptEcho config", () => {
     assert.ok(binding);
     assert.strictEqual(binding.agentId, "finance");
     assert.strictEqual(binding.voiceTranscriptEcho, false);
-  });
-});
-
-describe("isStaleMessage", () => {
-  it("returns true for messages older than threshold", () => {
-    const sixMinAgoMs = Date.now() - 6 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(sixMinAgoMs, 300000), true);
-  });
-
-  it("returns false for recent messages", () => {
-    const tenSecAgoMs = Date.now() - 10000;
-    assert.strictEqual(isStaleMessage(tenSecAgoMs, 300000), false);
-  });
-
-  it("returns true for messages just past threshold", () => {
-    const justPastMs = Date.now() - 300001;
-    assert.strictEqual(isStaleMessage(justPastMs, 300000), true);
-  });
-
-  it("returns false for messages at exact threshold boundary", () => {
-    // At exactly maxAge, not stale (> not >=). Use small buffer to avoid
-    // flakiness from wall-clock drift between the two Date.now() calls.
-    const nearExactMs = Date.now() - 299990;
-    assert.strictEqual(isStaleMessage(nearExactMs, 300000), false);
-  });
-
-  it("returns true for very old messages (hours)", () => {
-    const threeHoursAgoMs = Date.now() - 3 * 60 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(threeHoursAgoMs, 300000), true);
-  });
-
-  it("returns false for messages in the future (clock skew)", () => {
-    const futureMs = Date.now() + 10000;
-    assert.strictEqual(isStaleMessage(futureMs, 300000), false);
-  });
-
-  it("works with Telegram-style timestamps (seconds converted to ms)", () => {
-    const fiveMinAgoSec = Math.floor(Date.now() / 1000) - 301;
-    assert.strictEqual(isStaleMessage(fiveMinAgoSec * 1000, 300000), true);
-  });
-
-  it("works with Discord-style timestamps (already ms)", () => {
-    const fourMinAgoMs = Date.now() - 4 * 60 * 1000;
-    assert.strictEqual(isStaleMessage(fourMinAgoMs, 300000), false);
   });
 });
 
@@ -1378,7 +1334,11 @@ describe("command handler wiring", () => {
     } as unknown as SessionManager & { calls: string[] };
   }
 
-  function makeCommandUpdate(command: string, updateId: number) {
+  function makeCommandUpdate(
+    command: string,
+    updateId: number,
+    date = Math.floor(Date.now() / 1000),
+  ) {
     const text = `/${command}`;
     return {
       update_id: updateId,
@@ -1386,15 +1346,16 @@ describe("command handler wiring", () => {
         message_id: updateId,
         from: { id: testChatId, is_bot: false, first_name: "Test" },
         chat: { id: testChatId, type: "private" as const, first_name: "Test" },
-        date: Math.floor(Date.now() / 1000),
+        date,
         text,
         entities: [{ offset: 0, length: text.length, type: "bot_command" as const }],
       },
     };
   }
 
-  function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
-    const { bot } = createTelegramBot(handlerConfig, mockSM);
+  function initBotResult(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
+    const result = createTelegramBot(handlerConfig, mockSM);
+    const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
       apiCalls.push({ method, payload });
@@ -1416,7 +1377,11 @@ describe("command handler wiring", () => {
       has_topics_enabled: false,
       allows_users_to_create_topics: false,
     };
-    return bot;
+    return result;
+  }
+
+  function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
+    return initBotResult(mockSM, apiCalls).bot;
   }
 
   it("installs and exposes polling and update-processing probes", async () => {
@@ -1494,6 +1459,31 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
   });
 
+  it("handles delayed command and text updates through their normal paths", async () => {
+    const delayedDate = Math.floor(Date.now() / 1000) - 60 * 60;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBotResult(createMockSessionManager(), apiCalls);
+
+    await bot.handleUpdate(makeCommandUpdate("start", 4, delayedDate));
+    assert.match(
+      String(apiCalls.find((call) => call.method === "sendMessage")?.payload.text),
+      /Connected to agent/,
+    );
+
+    await bot.handleUpdate({
+      update_id: 5,
+      message: {
+        message_id: 5,
+        from: { id: testChatId, is_bot: false, first_name: "Test" },
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        date: delayedDate,
+        text: "delayed text",
+      },
+    });
+    assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 1);
+    messageQueue.clear(String(testChatId));
+  });
+
   it("drops idle echo context without enqueueing or opening a session", () => {
     const mockSM = createMockSessionManager();
     const { messageQueue, echoWatcher } = createTelegramBot(handlerConfig, mockSM);
@@ -1506,7 +1496,7 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
   });
 
-  it("makes metadata failures visible from every Telegram media handler", async () => {
+  it("handles delayed non-text updates through every Telegram media handler", async () => {
     const mediaMessages = [
       { voice: { file_id: "voice-1", duration: 1 } },
       { photo: [{ file_id: "photo-1", file_unique_id: "photo-u1", width: 1, height: 1 }] },
@@ -1523,7 +1513,7 @@ describe("command handler wiring", () => {
           message_id: 100 + index,
           from: { id: testChatId, is_bot: false, first_name: "Test" },
           chat: { id: testChatId, type: "private", first_name: "Test" },
-          date: Math.floor(Date.now() / 1000),
+          date: Math.floor(Date.now() / 1000) - 60 * 60,
           ...media,
         },
       } as never);

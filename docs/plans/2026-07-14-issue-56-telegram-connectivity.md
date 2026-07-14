@@ -33,11 +33,11 @@ npm run validate-config
 
 ### Task 1: Preserve Telegram work during temporary outages
 
-- [ ] In `src/polling-watchdog.ts`, keep the existing reachable-API `poll_stalled` restart path exactly once, but make `api_unreachable` a recorded/logged degraded state that does not call the exit path. Preserve bounded heartbeat timeout/abort, overlap suppression, and later recovery observation.
-- [ ] Narrow restart-reason typing/metrics if `api_unreachable` can no longer be a restart reason, while retaining it as a watchdog check outcome.
-- [ ] In `src/telegram-bot.ts`, remove local message-age rejection from `/start`, `/reconnect`, `/clean`, `/status`, text, voice, photo, document/animation, other media, and reaction handling. Remove only helpers/local variables made unused by this deletion. Keep `sessionDefaults.maxMessageAgeMs` in the shared configuration contract because Discord still uses it.
-- [ ] Leave `src/discord-bot.ts`, queue capacity/rejection, media lifecycle/ownership, grammY polling retry, generic `autoRetry`, and final delivery behavior unchanged.
-- [ ] Update watchdog tests to prove failed/thrown/timed-out heartbeats never exit, repeated unreachable checks stay bounded and can observe resumed polling, and reachable poll stalls still restart once.
-- [ ] Add delayed Telegram update coverage through the existing bot harness, including text plus at least one non-text/command path, proving old timestamps reach normal handling.
-- [ ] Add or preserve an explicit Discord regression proving its stale-message behavior remains unchanged.
-- [ ] Run every validation command above, keep the branch diff limited to issue #56, and commit all intended changes with a clean worktree.
+- [x] In `src/polling-watchdog.ts`, keep the existing reachable-API `poll_stalled` restart path exactly once, but make `api_unreachable` a recorded/logged degraded state that does not call the exit path. Preserve bounded heartbeat timeout/abort, overlap suppression, and later recovery observation.
+- [x] Narrow restart-reason typing/metrics if `api_unreachable` can no longer be a restart reason, while retaining it as a watchdog check outcome.
+- [x] In `src/telegram-bot.ts`, remove local message-age rejection from `/start`, `/reconnect`, `/clean`, `/status`, text, voice, photo, document/animation, other media, and reaction handling. Remove only helpers/local variables made unused by this deletion. Keep `sessionDefaults.maxMessageAgeMs` in the shared configuration contract because Discord still uses it.
+- [x] Leave `src/discord-bot.ts`, queue capacity/rejection, media lifecycle/ownership, grammY polling retry, generic `autoRetry`, and final delivery behavior unchanged.
+- [x] Update watchdog tests to prove failed/thrown/timed-out heartbeats never exit, repeated unreachable checks stay bounded and can observe resumed polling, and reachable poll stalls still restart once.
+- [x] Add delayed Telegram update coverage through the existing bot harness, including text plus at least one non-text/command path, proving old timestamps reach normal handling.
+- [x] Add or preserve an explicit Discord regression proving its stale-message behavior remains unchanged.
+- [x] Run every validation command above, keep the branch diff limited to issue #56, and commit all intended changes with a clean worktree.
