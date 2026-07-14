@@ -724,23 +724,28 @@ export function makeSteerFn(
 }
 
 /**
- * Build a transformer that runs autoRetry for every Telegram API method EXCEPT
- * `sendMessageDraft`. Drafts are cosmetic fire-and-forget calls (see
+ * Build a transformer that runs autoRetry for ordinary Telegram API methods.
+ * `getUpdates` uses grammY's dedicated polling retry loop so a recovered poll
+ * cannot remain parked in autoRetry's long network-error backoff. Drafts are
+ * cosmetic fire-and-forget calls (see
  * stream-relay.ts) — a retry that fires after Telegram's 3-10s retry_after is
  * stale by the time it lands (the stream has produced newer text), and 5x
  * amplification turns one rate-limited draft into five log/metric increments.
  * Every other method retains the full AUTO_RETRY_OPTIONS retry behavior.
  * See issue #117.
  */
-export function createDraftSkipAutoRetryTransformer(): Transformer {
+export function createTelegramAutoRetryTransformer(): Transformer {
   const retry = autoRetry(AUTO_RETRY_OPTIONS);
   return async (prev, method, payload, signal) => {
-    if (method === "sendMessageDraft") {
+    if (method === "sendMessageDraft" || method === "getUpdates") {
       return prev(method, payload, signal);
     }
     return retry(prev, method, payload, signal);
   };
 }
+
+/** Backward-compatible name retained for existing deep imports. */
+export const createDraftSkipAutoRetryTransformer = createTelegramAutoRetryTransformer;
 
 /**
  * Create and configure the Telegram bot.
@@ -761,10 +766,10 @@ export function createTelegramBot(
   // before autoRetry decides whether to retry)
   bot.api.config.use(createApiErrorLoggingTransformer({ bindings: config.bindings }));
 
-  // Auto-retry on rate limits (outermost transformer — retries after inner
-  // errors). `sendMessageDraft` is excluded: drafts are cosmetic fire-and-
-  // forget calls; retries amplify 429 log noise without user-visible benefit.
-  bot.api.config.use(createDraftSkipAutoRetryTransformer());
+  // Auto-retry on rate limits and network errors (outermost transformer —
+  // retries after inner errors). Polling uses grammY's own retry loop, while
+  // cosmetic sendMessageDraft calls remain excluded from retries.
+  bot.api.config.use(createTelegramAutoRetryTransformer());
 
   // Outermost transformer: observe completion of each logical getUpdates call,
   // including grammY polling calls, without retaining request/response data.

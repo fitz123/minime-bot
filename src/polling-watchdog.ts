@@ -78,6 +78,8 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
   let stopped = false;
   let heartbeatController: AbortController | null = null;
   let monitoringStartedAtMs = now();
+  let awaitingPollRecovery = false;
+  let pollRecoveryStartedAtMs: number | null = null;
 
   function touch(): void {
     lastActivityAtMs = now();
@@ -134,6 +136,8 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
       recordPollProgress(ageMs, snapshot.inFlight);
 
       if (ageMs < thresholdMs) {
+        awaitingPollRecovery = false;
+        pollRecoveryStartedAtMs = null;
         const outcome = checkedAt - lastActivityAtMs >= thresholdMs
           ? "healthy_quiet"
           : "healthy_active";
@@ -171,16 +175,32 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
       const latestAgeMs = pollProgressAgeMs(latest, now(), monitoringStartedAtMs);
       recordPollProgress(latestAgeMs, latest.inFlight);
       if (latestAgeMs < thresholdMs) {
+        awaitingPollRecovery = false;
+        pollRecoveryStartedAtMs = null;
         recordPollWatchdogCheck("poll_resumed");
         log.info("watchdog", "Polling resumed during API reachability check; restart cancelled");
         return;
       }
 
       if (apiReachable) {
+        if (awaitingPollRecovery) {
+          const recoveredAtMs = now();
+          pollRecoveryStartedAtMs ??= recoveredAtMs;
+          if (recoveredAtMs - pollRecoveryStartedAtMs < thresholdMs) {
+            recordPollWatchdogCheck("poll_recovery_pending");
+            log.info(
+              "watchdog",
+              `Telegram API reachable after degraded connectivity; waiting for polling recovery: grace_remaining_seconds=${Math.ceil((thresholdMs - (recoveredAtMs - pollRecoveryStartedAtMs)) / 1000)}`,
+            );
+            return;
+          }
+        }
         recordPollWatchdogCheck("poll_stalled");
         log.error("watchdog", "Telegram API reachable but polling is stalled: reason=poll_stalled");
         decideRestart("poll_stalled");
       } else {
+        awaitingPollRecovery = true;
+        pollRecoveryStartedAtMs = null;
         recordPollWatchdogCheck("api_unreachable");
         log.warn(
           "watchdog",
@@ -197,6 +217,8 @@ export function createWatchdog(deps: WatchdogDeps): Watchdog {
     stopped = false;
     lastActivityAtMs = now();
     monitoringStartedAtMs = now();
+    awaitingPollRecovery = false;
+    pollRecoveryStartedAtMs = null;
     timer = setInterval(() => {
       check().catch((error) => {
         log.error("watchdog", "Unexpected watchdog check failure", error);

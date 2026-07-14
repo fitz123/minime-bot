@@ -179,6 +179,66 @@ describe("polling-watchdog", () => {
     assert.equal(checks.values.find((v) => v.labels.outcome === "poll_resumed")?.value, 1);
   });
 
+  it("gives polling a bounded recovery window when the API becomes reachable first", async () => {
+    let clock = 0;
+    let progress = snapshot({ lastPollStartedAtMs: 1_000, inFlight: true });
+    let exits = 0;
+    let heartbeatCalls = 0;
+    const wd = createWatchdog({
+      pollProgress: () => progress,
+      heartbeat: async () => ++heartbeatCalls > 1,
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 5_000,
+    });
+
+    clock = 6_000;
+    await wd.check();
+    clock = 7_000;
+    await wd.check();
+    assert.equal(exits, 0, "a recovered heartbeat must not race polling recovery");
+
+    clock = 8_000;
+    progress = snapshot({
+      lastPollStartedAtMs: clock,
+      lastPollSucceededAtMs: clock,
+      successfulPollCount: 1,
+    });
+    await wd.check();
+    assert.equal(exits, 0);
+    assert.equal(heartbeatCalls, 2);
+    const checks = await pollWatchdogChecks.get();
+    assert.equal(checks.values.find((v) => v.labels.outcome === "api_unreachable")?.value, 1);
+    assert.equal(checks.values.find((v) => v.labels.outcome === "poll_recovery_pending")?.value, 1);
+  });
+
+  it("restarts once if polling does not recover within the post-outage window", async () => {
+    let clock = 0;
+    let exits = 0;
+    let heartbeatCalls = 0;
+    const wd = createWatchdog({
+      pollProgress: () => snapshot({ lastPollStartedAtMs: 1_000, inFlight: true }),
+      heartbeat: async () => ++heartbeatCalls > 1,
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 5_000,
+    });
+
+    clock = 6_000;
+    await wd.check();
+    clock = 7_000;
+    await wd.check();
+    clock = 11_999;
+    await wd.check();
+    assert.equal(exits, 0);
+    clock = 12_000;
+    await wd.check();
+    await wd.check();
+    assert.equal(exits, 1);
+    const restarts = await pollWatchdogRestarts.get();
+    assert.equal(restarts.values.find((v) => v.labels.reason === "poll_stalled")?.value, 1);
+  });
+
   it("does not treat rejected getUpdates completions as healthy progress", async () => {
     let clock = 0;
     let exits = 0;

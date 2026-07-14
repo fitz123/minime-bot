@@ -1,7 +1,7 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createDraftSkipAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
@@ -1059,9 +1059,9 @@ describe("AUTO_RETRY_OPTIONS", () => {
   });
 });
 
-describe("createDraftSkipAutoRetryTransformer", () => {
+describe("createTelegramAutoRetryTransformer", () => {
   it("bypasses autoRetry for sendMessageDraft — calls prev exactly once on 429", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;
@@ -1072,8 +1072,20 @@ describe("createDraftSkipAutoRetryTransformer", () => {
     assert.strictEqual((result as { ok: boolean }).ok, false);
   });
 
+  it("bypasses autoRetry for getUpdates so grammY controls polling retries", async () => {
+    const transformer = createTelegramAutoRetryTransformer();
+    let callCount = 0;
+    const prev = async () => {
+      callCount++;
+      return { ok: false, error_code: 429, parameters: { retry_after: 0 } } as const;
+    };
+    const result = await transformer(prev as never, "getUpdates", { timeout: 30 } as never);
+    assert.strictEqual(callCount, 1, "getUpdates must be returned to grammY without autoRetry");
+    assert.strictEqual((result as { ok: boolean }).ok, false);
+  });
+
   it("retries sendMessage on 429 via autoRetry", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;
@@ -1088,7 +1100,7 @@ describe("createDraftSkipAutoRetryTransformer", () => {
   });
 
   it("retries sendChatAction on 429 via autoRetry", async () => {
-    const transformer = createDraftSkipAutoRetryTransformer();
+    const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
       callCount++;

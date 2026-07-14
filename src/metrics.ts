@@ -117,6 +117,7 @@ export type PollWatchdogCheckOutcome =
   | "healthy_quiet"
   | "update_processing"
   | "poll_resumed"
+  | "poll_recovery_pending"
   | "poll_stalled"
   | "api_unreachable"
   | "overlap_suppressed";
