@@ -408,6 +408,29 @@ async function tick(): Promise<void> {
 }
 
 describe("deterministic recovery runbook executor", () => {
+  it("keeps observe and plan modes free of executor side effects", async () => {
+    let spawnCount = 0;
+    const spawn = () => {
+      spawnCount += 1;
+      return new FakeCommandChild();
+    };
+    const observe = await executeRecoveryPlan(
+      { mode: "observe", plan: plan(), fence, ...commandRegistry() },
+      { spawn, checkFence: () => true },
+    );
+    const planned = await executeRecoveryPlan(
+      { mode: "plan", plan: plan(), fence, ...commandRegistry() },
+      { spawn, checkFence: () => true },
+    );
+    assert.equal(observe.status, "observe");
+    assert.equal(planned.status, "planned");
+    assert.equal(spawnCount, 0);
+    if (planned.status === "planned") {
+      assert.deepEqual(planned.runbookIds, ["repair-local"]);
+      assert.deepEqual(planned.probeIds, ["probe-local"]);
+    }
+  });
+
   it("ships no mutating runbooks and executes only configured static argv followed by probes", async () => {
     assert.deepEqual(DEFAULT_RECOVERY_RUNBOOKS, []);
     assert.deepEqual(DEFAULT_RECOVERY_PROBES, []);

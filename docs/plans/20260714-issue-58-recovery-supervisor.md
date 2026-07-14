@@ -73,12 +73,12 @@ python3 -m py_compile scripts/recovery_supervisor.py scripts/runtime_doctor.py
 - [x] Run focused tests before Task 5.
 
 ### Task 5: CLI modes, package artifacts, docs, and shadow gates
-- [ ] Add additive `minime-bot recovery` commands for config validation, status, incident/invocation inspection, dispatch controls, expiring silences, explicit retry, policy history/rollback, approve/reject, digest preview, and one-shot processing; reject arbitrary SQL/shell and unbounded controls.
-- [ ] Add explicit `observe`, `plan`, and `enabled` modes: observe cannot launch Pi, plan cannot execute runbooks, enabled executes only configured approved classes.
-- [ ] Package recovery runtime, the Pi extension, examples, and docs; add generic launchd/Alertmanager/runtime-doctor shadow examples using the `MINIME_CONTROL_WORKSPACE_ROOT`/`MINIME_AGENT_WORKSPACE_ROOT` contract with no private paths, destinations, runbooks, or secrets.
-- [ ] Document same-host limits, security model, incident lifecycle, control/adaptation bounds, approval matrix, shadow acceptance drills, self-monitoring, upgrade/rollback, and the return-to-direct-Telegram procedure.
-- [ ] Add installed-tarball end-to-end tests: duplicate/out-of-order events, supervisor/Node/Pi crash and restart recovery, one-owner fencing, non-actionable suppression, approval gates, spool/fallback, control expiry, adaptation rollback, digest, and zero executor side effects in observe/plan.
-- [ ] Run the full validation commands and verify the package contains no private paths, identifiers, destinations, secrets, or source-checkout assumptions.
+- [x] Add additive `minime-bot recovery` commands for config validation, status, incident/invocation inspection, dispatch controls, expiring silences, explicit retry, policy history/rollback, approve/reject, digest preview, and one-shot processing; reject arbitrary SQL/shell and unbounded controls.
+- [x] Add explicit `observe`, `plan`, and `enabled` modes: observe cannot launch Pi, plan cannot execute runbooks, enabled executes only configured approved classes.
+- [x] Package recovery runtime, the Pi extension, examples, and docs; add generic launchd/Alertmanager/runtime-doctor shadow examples using the `MINIME_CONTROL_WORKSPACE_ROOT`/`MINIME_AGENT_WORKSPACE_ROOT` contract with no private paths, destinations, runbooks, or secrets.
+- [x] Document same-host limits, security model, incident lifecycle, control/adaptation bounds, approval matrix, shadow acceptance drills, self-monitoring, upgrade/rollback, and the return-to-direct-Telegram procedure.
+- [x] Add installed-tarball end-to-end tests: duplicate/out-of-order events, supervisor/Node/Pi crash and restart recovery, one-owner fencing, non-actionable suppression, approval gates, spool/fallback, control expiry, adaptation rollback, digest, and zero executor side effects in observe/plan.
+- [x] Run the full validation commands and verify the package contains no private paths, identifiers, destinations, secrets, or source-checkout assumptions.
 
 ## Post-completion: private consumer phase (not part of this public plan)
 

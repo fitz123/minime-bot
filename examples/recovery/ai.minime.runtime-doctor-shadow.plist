@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.minime.runtime-doctor-shadow</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__PACKAGE_INSTALL_ROOT__/scripts/runtime_doctor.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MINIME_CONTROL_WORKSPACE_ROOT</key>
+    <string>__CONTROL_WORKSPACE_ROOT__</string>
+    <key>MINIME_AGENT_WORKSPACE_ROOT</key>
+    <string>__AGENT_WORKSPACE_ROOT__</string>
+    <key>MINIME_DOCTOR_STATE_PATH</key>
+    <string>__CONTROL_WORKSPACE_ROOT__/var/recovery/runtime-doctor-state.json</string>
+    <key>MINIME_DOCTOR_SINK</key>
+    <string>tee</string>
+    <key>MINIME_DOCTOR_RECOVERY_URL</key>
+    <string>http://127.0.0.1:9877/v1/runtime-doctor</string>
+    <key>MINIME_DOCTOR_RECOVERY_TOKEN_FILE</key>
+    <string>__CONTROL_WORKSPACE_ROOT__/config/recovery-auth-token</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+</dict>
+</plist>

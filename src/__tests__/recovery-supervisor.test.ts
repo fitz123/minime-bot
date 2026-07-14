@@ -11,7 +11,7 @@ describe("recovery supervisor", () => {
   it("passes the focused standard-library recovery suite", () => {
     const result = spawnSync(
       python,
-      ["-m", "unittest", "scripts.tests.test_recovery_supervisor"],
+      ["-m", "unittest", "scripts.tests.test_recovery_supervisor", "scripts.tests.test_recovery_cli"],
       { cwd: root, encoding: "utf8", timeout: 30_000 },
     );
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);

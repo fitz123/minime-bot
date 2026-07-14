@@ -22,6 +22,7 @@ export type RecoveryActionClass =
   | "local_repair"
   | "cache_cleanup"
   | RestrictedRecoveryActionClass;
+export type RecoveryMode = "observe" | "plan" | "enabled";
 
 export const DEFAULT_RECOVERY_RUNBOOKS: readonly RunbookDefinition[] = Object.freeze([]);
 export const DEFAULT_RECOVERY_PROBES: readonly ProbeDefinition[] = Object.freeze([]);
@@ -94,6 +95,13 @@ export type RecoveryExecutionResult =
       probes: readonly RecoveryCommandResult[];
     }
   | {
+      status: "planned";
+      runbookIds: readonly string[];
+      probeIds: readonly string[];
+      actions: readonly RecoveryCommandResult[];
+      probes: readonly RecoveryCommandResult[];
+    }
+  | {
       status: "approval_required";
       approvalClasses: readonly RestrictedRecoveryActionClass[];
       runbookIds: readonly string[];
@@ -107,6 +115,7 @@ export type RecoveryExecutionResult =
     };
 
 export interface RecoveryExecutorRequest {
+  mode?: RecoveryMode;
   plan: Readonly<RecoveryPlan>;
   fence: RecoveryInvocationFence;
   runbooks: readonly RunbookDefinition[];
@@ -368,6 +377,27 @@ export async function executeRecoveryPlan(
   if (plan.verdict === "observe" || plan.verdict === "not_actionable") {
     return {
       status: plan.verdict,
+      actions: Object.freeze([]),
+      probes: Object.freeze([]),
+    };
+  }
+
+  const mode = request.mode ?? "enabled";
+  if (mode !== "observe" && mode !== "plan" && mode !== "enabled") {
+    return emptyResult("rejected");
+  }
+  if (mode === "observe") {
+    return {
+      status: "observe",
+      actions: Object.freeze([]),
+      probes: Object.freeze([]),
+    };
+  }
+  if (mode === "plan") {
+    return {
+      status: "planned",
+      runbookIds: Object.freeze([...plan.runbookIds]),
+      probeIds: Object.freeze([...plan.probeIds]),
       actions: Object.freeze([]),
       probes: Object.freeze([]),
     };

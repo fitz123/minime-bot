@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable
 
 from monitoring_native import DeliveryConfig, MonitoringError, send_telegram
+from recovery_config import RECOVERY_MODES, RecoveryConfigError, load_recovery_config
 from recovery_ledger import LedgerCorrupt, LedgerError, LedgerUnavailable, RecoveryLedger
 
 MAX_BODY_DEFAULT = 256 * 1024
@@ -819,9 +820,12 @@ class IncidentCoordinator:
         clock: Callable[[], float] = time.time,
         controls: RecoveryControls | None = None,
         immediate_escalation: Callable[[str], Any] | None = None,
+        mode: str = "enabled",
     ):
         if not isinstance(owner, str) or safe_field(owner, default="") != owner:
             raise ValueError("recovery owner is invalid")
+        if mode not in RECOVERY_MODES:
+            raise ValueError("recovery mode is invalid")
         self.ledger = ledger
         self.policy = policy
         self.owner = owner
@@ -830,6 +834,7 @@ class IncidentCoordinator:
             ledger, base_revision=policy.revision, clock=clock
         )
         self.immediate_escalation = immediate_escalation
+        self.mode = mode
         self._rules = {
             (rule.component, rule.failure_class): rule for rule in self.policy.rules
         }
@@ -1067,6 +1072,8 @@ class IncidentCoordinator:
         """Acquire the one global lease and atomically create one invocation."""
 
         self.reconcile()
+        if self.mode == "observe":
+            return None
         now = self.clock()
         with self.ledger.transaction() as connection:
             control = self.controls.current(connection, now=now)
@@ -2275,6 +2282,11 @@ def read_auth_token(path: Path) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the same-host minime recovery supervisor")
+    parser.add_argument("--config", default="")
+    parser.add_argument(
+        "--workspace", default=os.environ.get("MINIME_CONTROL_WORKSPACE_ROOT", "")
+    )
+    parser.add_argument("--mode", choices=sorted(RECOVERY_MODES), default="enabled")
     parser.add_argument("--host", default=os.environ.get("MINIME_RECOVERY_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=os.environ.get("MINIME_RECOVERY_PORT", "9877"))
     parser.add_argument("--db", default=os.environ.get("MINIME_RECOVERY_DB_PATH", ""))
@@ -2294,6 +2306,34 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    configured_rules: tuple[CorrelationRule, ...] = ()
+    source_ids = ("alertmanager", "runtime_doctor")
+    if args.config:
+        workspace = Path(args.workspace).resolve() if args.workspace else Path.cwd().resolve()
+        config_path = Path(args.config)
+        if not config_path.is_absolute():
+            config_path = workspace / config_path
+        try:
+            configured = load_recovery_config(config_path, workspace)
+        except RecoveryConfigError:
+            print("recovery supervisor configuration rejected", file=sys.stderr)
+            return 2
+        args.host = configured.host
+        args.port = configured.port
+        args.db = str(configured.database)
+        args.spool_dir = str(configured.spool_directory)
+        args.auth_token_file = str(configured.auth_token_file)
+        args.mode = configured.mode
+        source_ids = configured.source_ids
+        configured_rules = tuple(
+            CorrelationRule(
+                component=str(rule["component"]),
+                failure_class=str(rule["failureClass"]),
+                incident_key=str(rule["incidentKey"]),
+                impact=int(rule["impact"]),
+            )
+            for rule in configured.correlation_rules
+        )
     if (
         args.host not in {"127.0.0.1", "localhost"}
         or not 0 <= args.port <= 65535
@@ -2340,15 +2380,16 @@ def main(argv: list[str] | None = None) -> int:
     notifications = RecoveryNotificationOutbox(ledger, emergency=emergency)
     coordinator = IncidentCoordinator(
         ledger,
-        RecoveryPolicy(revision=1, rules=()),
+        RecoveryPolicy(revision=1, rules=configured_rules),
         owner=f"supervisor-{os.getpid()}",
         controls=controls,
         immediate_escalation=notifications.immediate_escalation,
+        mode=args.mode,
     )
     verifier = RecoveryVerifier(
         ledger,
         coordinator,
-        source_ids=("alertmanager", "runtime_doctor"),
+        source_ids=source_ids,
     )
     adapter = BoundedPolicyAdapter(ledger, controls)
     notification_delivery = None

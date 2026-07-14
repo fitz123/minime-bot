@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.minime.recovery-supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__PACKAGE_INSTALL_ROOT__/scripts/recovery_supervisor.py</string>
+    <string>--workspace</string>
+    <string>__CONTROL_WORKSPACE_ROOT__</string>
+    <string>--config</string>
+    <string>recovery.json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MINIME_CONTROL_WORKSPACE_ROOT</key>
+    <string>__CONTROL_WORKSPACE_ROOT__</string>
+    <key>MINIME_AGENT_WORKSPACE_ROOT</key>
+    <string>__AGENT_WORKSPACE_ROOT__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__CONTROL_WORKSPACE_ROOT__/var/recovery/supervisor.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__CONTROL_WORKSPACE_ROOT__/var/recovery/supervisor.stderr.log</string>
+</dict>
+</plist>

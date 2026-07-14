@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "mode": "observe",
+  "database": "var/recovery/ledger.sqlite3",
+  "spoolDirectory": "var/recovery/spool",
+  "authTokenFile": "config/recovery-auth-token",
+  "host": "127.0.0.1",
+  "port": 9877,
+  "correlationRules": [],
+  "sourceIds": [
+    "alertmanager",
+    "runtime_doctor"
+  ],
+  "runbooks": [],
+  "probes": []
+}

@@ -214,11 +214,20 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/monitoring_native.py",
     "scripts/alertmanager_webhook.py",
     "scripts/runtime_doctor.py",
+    "scripts/recovery_config.py",
+    "scripts/recovery_ledger.py",
+    "scripts/recovery_supervisor.py",
+    "scripts/recovery_cli.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/monitoring.md",
+    "docs/recovery.md",
+    "examples/recovery/recovery.json",
+    "examples/recovery/ai.minime.recovery-supervisor.plist",
+    "examples/recovery/ai.minime.runtime-doctor-shadow.plist",
+    "examples/recovery/alertmanager-shadow.yml",
     "examples/monitoring/ai.minime.alertmanager-webhook.plist",
     "examples/monitoring/ai.minime.runtime-doctor.plist",
     "examples/monitoring/alertmanager.yml",
@@ -276,6 +285,28 @@ describe("package artifact install", () => {
     mkdirSync(projectDir, { recursive: true });
     const workspace = createWorkspace(temp);
     const agentWorkspace = join(workspace, "agent-workspace");
+    writeWorkspaceFile(
+      workspace,
+      "recovery.json",
+      JSON.stringify({
+        version: 1,
+        mode: "observe",
+        database: "var/recovery/ledger.sqlite3",
+        spoolDirectory: "var/recovery/spool",
+        authTokenFile: "config/recovery-auth-token",
+        host: "127.0.0.1",
+        port: 9877,
+        correlationRules: [{
+          component: "bot",
+          failureClass: "unavailable",
+          incidentKey: "bot-unavailable",
+          impact: 2,
+        }],
+        sourceIds: ["alertmanager", "runtime_doctor"],
+        runbooks: [],
+        probes: [],
+      }),
+    );
     assert.deepEqual(collectSchemaFiles(workspace), [], "installed workspace fixture must not contain schema.md");
     createKnowledgeFixture(agentWorkspace);
 
@@ -294,7 +325,13 @@ describe("package artifact install", () => {
       assert.equal(install.status, 0, install.stderr || install.stdout);
 
       const installedPackage = join(projectDir, "node_modules", "minime-bot");
-      for (const helper of ["monitoring_native.py", "alertmanager_webhook.py", "runtime_doctor.py"]) {
+      for (const helper of [
+        "monitoring_native.py",
+        "alertmanager_webhook.py",
+        "runtime_doctor.py",
+        "recovery_supervisor.py",
+        "recovery_cli.py",
+      ]) {
         const helperPath = join(installedPackage, "scripts", helper);
         assert.ok(existsSync(helperPath), `expected installed native helper ${helper}`);
         const helperResult = spawnSync("python3", [helperPath, "--help"], {
@@ -303,6 +340,15 @@ describe("package artifact install", () => {
           env: commandEnv(),
         });
         assert.equal(helperResult.status, 0, helperResult.stderr || helperResult.stdout || String(helperResult.error));
+      }
+      for (const plist of ["ai.minime.recovery-supervisor.plist", "ai.minime.runtime-doctor-shadow.plist"]) {
+        const plistPath = join(installedPackage, "examples", "recovery", plist);
+        const plistResult = spawnSync(
+          "python3",
+          ["-c", "import plistlib,sys; plistlib.load(open(sys.argv[1], 'rb'))", plistPath],
+          { cwd: projectDir, encoding: "utf8", env: commandEnv() },
+        );
+        assert.equal(plistResult.status, 0, plistResult.stderr || String(plistResult.error));
       }
       for (const plist of ["ai.minime.alertmanager-webhook.plist", "ai.minime.runtime-doctor.plist"]) {
         const plistPath = join(installedPackage, "examples", "monitoring", plist);
@@ -318,6 +364,39 @@ describe("package artifact install", () => {
       assert.equal(help.status, 0, help.stderr);
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+      assert.match(help.stdout, /minime-bot recovery config validate/);
+
+      const recoveryValidate = runInstalledBin(
+        projectDir,
+        ["recovery", "config", "validate", "--workspace", workspace],
+        workspace,
+      );
+      assert.equal(recoveryValidate.status, 0, recoveryValidate.stderr || recoveryValidate.stdout);
+      assert.equal(JSON.parse(recoveryValidate.stdout).mode, "observe");
+
+      const recoveryProcess = runInstalledBin(
+        projectDir,
+        ["recovery", "process", "--once", "--workspace", workspace],
+        workspace,
+      );
+      assert.equal(recoveryProcess.status, 0, recoveryProcess.stderr || recoveryProcess.stdout);
+      const recoveryProcessJson = JSON.parse(recoveryProcess.stdout) as {
+        plannerLaunched: boolean;
+        executorLaunched: boolean;
+      };
+      assert.equal(recoveryProcessJson.plannerLaunched, false);
+      assert.equal(recoveryProcessJson.executorLaunched, false);
+
+      const recoveryE2e = spawnSync(
+        "python3",
+        ["-c", INSTALLED_RECOVERY_E2E, workspace],
+        {
+          cwd: join(installedPackage, "scripts"),
+          encoding: "utf8",
+          env: commandEnv(),
+        },
+      );
+      assert.equal(recoveryE2e.status, 0, recoveryE2e.stderr || recoveryE2e.stdout || String(recoveryE2e.error));
 
       const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
@@ -500,6 +579,133 @@ describe("package artifact install", () => {
   });
 });
 
+const INSTALLED_RECOVERY_E2E = String.raw`
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+import recovery_config
+import recovery_ledger
+import recovery_supervisor
+
+workspace = Path(sys.argv[1])
+config = recovery_config.load_recovery_config(workspace / "recovery.json", workspace)
+ledger = recovery_ledger.RecoveryLedger(config.database)
+policy = recovery_supervisor.RecoveryPolicy(
+    revision=1,
+    rules=(recovery_supervisor.CorrelationRule("bot", "unavailable", "bot-unavailable", 2),),
+    lease_seconds=10,
+)
+
+payload = json.dumps({"alerts": [{
+    "status": "firing",
+    "fingerprint": "installed-episode",
+    "startsAt": "2026-07-14T00:00:00Z",
+    "labels": {
+        "alertname": "BotUnavailable",
+        "component": "bot",
+        "failure_class": "unavailable",
+        "instance": "local",
+    },
+}]}).encode()
+events = recovery_supervisor.normalize_alertmanager(payload)
+assert ledger.record_events(events) == 1
+assert ledger.record_events(events) == 0
+
+observer = recovery_supervisor.IncidentCoordinator(ledger, policy, owner="installed-observer", mode="observe")
+assert observer.claim_next() is None
+assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
+
+clock = [100.0]
+first = recovery_supervisor.IncidentCoordinator(
+    ledger, policy, owner="installed-owner-one", mode="enabled", clock=lambda: clock[0]
+)
+fence = first.claim_next()
+assert fence is not None
+assert first.finish(fence, "not_actionable")
+assert first.claim_next() is None
+assert first.explicit_retry(fence.incident_id, actor="operator", reason="installed retry")
+orphan = first.claim_next()
+assert orphan is not None
+
+second_ledger = recovery_ledger.RecoveryLedger(config.database)
+clock[0] = 111.0
+second = recovery_supervisor.IncidentCoordinator(
+    second_ledger, policy, owner="installed-owner-two", mode="enabled", clock=lambda: clock[0]
+)
+replacement = second.claim_next()
+assert replacement is not None
+assert replacement.generation > orphan.generation
+assert second.finish(replacement, "pending_approval")
+assert not first.finish(orphan, "completed")
+
+controls_clock = [200.0]
+controls = recovery_supervisor.RecoveryControls(second_ledger, clock=lambda: controls_clock[0])
+controls.set_dispatch(False, actor="operator", reason="installed bounded control", expires_at=210.0)
+assert controls.current().dispatch_enabled is False
+controls_clock[0] = 211.0
+assert controls.expire() is not None
+assert controls.current().dispatch_enabled is True
+
+adapt_clock = [300000.0]
+adapt_controls = recovery_supervisor.RecoveryControls(
+    second_ledger, clock=lambda: adapt_clock[0]
+)
+adapter = recovery_supervisor.BoundedPolicyAdapter(
+    second_ledger, adapt_controls, clock=lambda: adapt_clock[0]
+)
+for _ in range(3):
+    adapter.record_outcome(replacement.incident_id, "false_positive")
+assert adapter.adapt() is not None
+assert (adapt_controls.current().confirmation_count, adapt_controls.current().cooldown_seconds) == (2, 60.0)
+adapt_clock[0] += 86400.0
+for _ in range(3):
+    adapter.record_outcome(replacement.incident_id, "impact", critical=True)
+assert adapter.adapt() is not None
+assert (adapt_controls.current().confirmation_count, adapt_controls.current().cooldown_seconds) == (1, 0.0)
+
+outbox = recovery_supervisor.RecoveryNotificationOutbox(second_ledger, clock=lambda: 1000.0)
+digest = outbox.queue_digest(0.0, 1000.0)
+assert digest["kind"] == "digest"
+
+resolved = json.dumps({"alerts": [{
+    "status": "resolved",
+    "fingerprint": "installed-episode",
+    "startsAt": "2026-07-14T00:00:00Z",
+    "endsAt": "2026-07-14T00:10:00Z",
+    "labels": {
+        "alertname": "BotUnavailable",
+        "component": "bot",
+        "failure_class": "unavailable",
+        "instance": "local",
+    },
+}]}).encode()
+assert second_ledger.record_events(recovery_supervisor.normalize_alertmanager(resolved)) == 1
+second.reconcile()
+
+class FailingLedger:
+    def record_events(self, _events):
+        raise recovery_ledger.LedgerUnavailable("synthetic")
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    delivered = []
+    emergency = recovery_supervisor.EmergencyNotifier(
+        root / "notifications", delivery=delivered.append, cooldown=0
+    )
+    service = recovery_supervisor.RecoveryService(
+        FailingLedger(), recovery_supervisor.AtomicJsonSpool(root / "events"), emergency
+    )
+    result = service.accept(events)
+    assert result.status == 202
+    assert len(list((root / "events").glob("*.json"))) == 1
+    assert len(delivered) == 1
+
+second_ledger.close()
+ledger.close()
+`;
+
 const INSTALLED_ARTIFACT_CHECK = String.raw`
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
@@ -580,6 +786,60 @@ class FakeChild extends EventEmitter {
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-runner.js");
+const recoveryExecutor = await importPackageFile("dist/recovery/runbook-executor.js");
+let recoverySpawnCount = 0;
+const installedFence = {
+  invocationId: 1,
+  incidentId: 1,
+  generation: 1,
+  evidenceHash: "a".repeat(64),
+  policyRevision: 1,
+  leaseToken: "b".repeat(48),
+  owner: "installed-supervisor",
+};
+const installedPlan = {
+  invocationId: 1,
+  incidentId: 1,
+  generation: 1,
+  evidenceHash: "a".repeat(64),
+  policyRevision: 1,
+  verdict: "execute",
+  diagnosisCode: "installed_check",
+  summary: "Installed plan mode check.",
+  evidenceRefs: ["event:one"],
+  runbookIds: ["installed-check"],
+  probeIds: ["installed-probe"],
+  nextEvaluationDelaySeconds: 60,
+};
+const installedRunbook = {
+  id: "installed-check",
+  actionClass: "diagnostic",
+  executable: "/usr/bin/true",
+  argv: [],
+  env: {},
+  timeoutMs: 1000,
+};
+const installedProbe = {
+  id: "installed-probe",
+  executable: "/usr/bin/true",
+  argv: [],
+  env: {},
+  timeoutMs: 1000,
+};
+for (const mode of ["observe", "plan"]) {
+  const modeResult = await recoveryExecutor.executeRecoveryPlan(
+    { mode, plan: installedPlan, fence: installedFence, runbooks: [installedRunbook], probes: [installedProbe] },
+    {
+      checkFence: () => true,
+      spawn: () => {
+        recoverySpawnCount += 1;
+        return new FakeChild();
+      },
+    },
+  );
+  assert.equal(modeResult.status, mode === "observe" ? "observe" : "planned");
+}
+assert.equal(recoverySpawnCount, 0, "installed observe/plan modes must have zero executor side effects");
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
