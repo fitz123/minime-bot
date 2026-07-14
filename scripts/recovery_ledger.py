@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 SCHEMA_VERSION = 1
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
@@ -295,6 +296,64 @@ class RecoveryLedger:
                 except sqlite3.DatabaseError:
                     pass
                 raise LedgerUnavailable("ledger write failed") from exc
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Serialize a durable state transition and translate SQLite failures."""
+
+        with self._lock:
+            connection = self.connection
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.execute("COMMIT")
+            except LedgerError:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise
+            except sqlite3.DatabaseError as exc:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise LedgerUnavailable("ledger transaction failed") from exc
+            except Exception:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise
+
+    def add_policy_revision(
+        self,
+        revision: int,
+        policy: dict[str, Any],
+        *,
+        actor: str = "operator",
+        reason: str = "configured policy",
+        now: float | None = None,
+    ) -> None:
+        """Add an immutable policy revision for later invocation fencing."""
+
+        if not isinstance(revision, int) or revision < 1:
+            raise ValueError("policy revision is invalid")
+        document = _canonical_event(policy)
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT policy_json FROM policy_revisions WHERE revision = ?",
+                (revision,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != document:
+                    raise LedgerCorrupt("policy revision is immutable")
+                return
+            connection.execute(
+                "INSERT INTO policy_revisions(revision, created_at, actor, reason, policy_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (revision, time.time() if now is None else now, actor, reason, document),
+            )
 
     def ping(self) -> None:
         with self._lock:

@@ -50,11 +50,11 @@ python3 -m py_compile scripts/recovery_supervisor.py scripts/runtime_doctor.py
 - [x] Run Python and focused tests before Task 2.
 
 ### Task 2: Incident correlation, deduplication, and suppression
-- [ ] Implement deterministic cross-source correlation, incident lifecycle with generations, and material-evidence hashing in the supervisor.
-- [ ] Enforce one global fixer lease and one active invocation per incident generation, fenced by generation + evidence hash + policy revision + lease, with crash reconciliation on restart.
-- [ ] Suppress relaunch when evidence and policy are unchanged after `observe`, `not_actionable`, malformed output, pending approval, or exhausted retries; only material evidence, impact escalation, explicit retry, or bounded reevaluation creates a new eligible generation.
-- [ ] Add focused tests: correlation grouping, exact launch counts, non-actionable suppression, material-evidence redispatch, out-of-order/resolved-first events, concurrent lease contention, and stale-fence rejection.
-- [ ] Run focused tests before Task 3.
+- [x] Implement deterministic cross-source correlation, incident lifecycle with generations, and material-evidence hashing in the supervisor.
+- [x] Enforce one global fixer lease and one active invocation per incident generation, fenced by generation + evidence hash + policy revision + lease, with crash reconciliation on restart.
+- [x] Suppress relaunch when evidence and policy are unchanged after `observe`, `not_actionable`, malformed output, pending approval, or exhausted retries; only material evidence, impact escalation, explicit retry, or bounded reevaluation creates a new eligible generation.
+- [x] Add focused tests: correlation grouping, exact launch counts, non-actionable suppression, material-evidence redispatch, out-of-order/resolved-first events, concurrent lease contention, and stale-fence rejection.
+- [x] Run focused tests before Task 3.
 
 ### Task 3: Dedicated Pi fixer planner and deterministic runbook executor
 - [ ] Add a first-party Pi extension exposing one terminating, strictly validated `recovery_plan` result: verdict, diagnosis code, bounded summary/evidence references, known runbook IDs, known probe IDs, and next-evaluation delay.

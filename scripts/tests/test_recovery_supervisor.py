@@ -23,19 +23,82 @@ def alert_body(*alerts: dict[str, object]) -> bytes:
     return json.dumps({"alerts": list(alerts)}, separators=(",", ":")).encode("utf-8")
 
 
-def firing_alert(fingerprint: str = "synthetic-1") -> dict[str, object]:
+def firing_alert(
+    fingerprint: str = "synthetic-1",
+    *,
+    starts_at: str = "2026-07-14T00:00:00Z",
+    component: str = "synthetic",
+    failure_class: str = "unavailable",
+    alertname: str = "SyntheticDown",
+) -> dict[str, object]:
     return {
         "status": "firing",
         "fingerprint": fingerprint,
-        "startsAt": "2026-07-14T00:00:00Z",
+        "startsAt": starts_at,
         "labels": {
-            "alertname": "SyntheticDown",
-            "component": "synthetic",
-            "failure_class": "unavailable",
+            "alertname": alertname,
+            "component": component,
+            "failure_class": failure_class,
             "instance": "test",
         },
         "annotations": {"private_payload": "must not be persisted"},
     }
+
+
+def resolved_alert(
+    fingerprint: str = "synthetic-1",
+    *,
+    starts_at: str = "2026-07-14T00:00:00Z",
+    ends_at: str = "2026-07-14T00:10:00Z",
+) -> dict[str, object]:
+    alert = firing_alert(fingerprint, starts_at=starts_at)
+    alert["status"] = "resolved"
+    alert["endsAt"] = ends_at
+    return alert
+
+
+def doctor_events(*events: tuple[str, str, str]) -> list[dict[str, object]]:
+    payload: list[dict[str, str]] = []
+    for code, status, transition in events:
+        payload.append(
+            {
+                "code": code,
+                "status": status,
+                "transition": transition,
+                "transition_id": recovery_supervisor.transition_id(
+                    "runtime_doctor", code, status, transition
+                ),
+            }
+        )
+    return recovery_supervisor.normalize_runtime_doctor(
+        json.dumps({"version": 1, "events": payload}, separators=(",", ":")).encode()
+    )
+
+
+def correlation_policy(
+    *,
+    lease_seconds: float = 30,
+    reevaluation_delay: float = 60,
+    max_reevaluations: int = 1,
+) -> recovery_supervisor.RecoveryPolicy:
+    return recovery_supervisor.RecoveryPolicy(
+        revision=1,
+        rules=(
+            recovery_supervisor.CorrelationRule(
+                "synthetic", "unavailable", "bot-unavailable", impact=2
+            ),
+            recovery_supervisor.CorrelationRule(
+                "runtime", "node_unavailable", "bot-unavailable", impact=3
+            ),
+        ),
+        reevaluation_delays=(
+            ("malformed_output", reevaluation_delay),
+            ("not_actionable", reevaluation_delay),
+            ("observe", reevaluation_delay),
+        ),
+        max_reevaluations=max_reevaluations,
+        lease_seconds=lease_seconds,
+    )
 
 
 class FailingLedger:
@@ -189,6 +252,240 @@ class RecoveryServiceTests(unittest.TestCase):
             self.assertEqual(list((root / "notifications").glob("*.json")), [])
             notifier.emit("ledger_corrupt")
             self.assertEqual(len(delivered), 1)
+
+
+class IncidentCoordinatorTests(unittest.TestCase):
+    def test_cross_source_correlation_groups_one_incident_and_one_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                )
+                ledger.record_events(
+                    doctor_events(("node_unavailable", "firing", "doctor-firing-1"))
+                )
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="supervisor-one"
+                )
+                self.assertEqual(coordinator.reconcile(), 1)
+                incidents = ledger.connection.execute("SELECT * FROM incidents").fetchall()
+                self.assertEqual(len(incidents), 1)
+                self.assertEqual(incidents[0]["correlation_key"], "bot-unavailable")
+                fence = coordinator.claim_next()
+                self.assertIsNotNone(fence)
+                self.assertIsNone(coordinator.claim_next())
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0],
+                    1,
+                )
+
+    def test_unchanged_suppressing_outcomes_do_not_relaunch(self) -> None:
+        for outcome in (
+            "observe",
+            "not_actionable",
+            "malformed_output",
+            "pending_approval",
+            "retries_exhausted",
+        ):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                clock = [100.0]
+                with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                    ledger.record_events(
+                        recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                    )
+                    coordinator = recovery_supervisor.IncidentCoordinator(
+                        ledger,
+                        correlation_policy(),
+                        owner="supervisor-one",
+                        clock=lambda: clock[0],
+                    )
+                    fence = coordinator.claim_next()
+                    self.assertIsNotNone(fence)
+                    assert fence is not None
+                    self.assertTrue(coordinator.finish(fence, outcome))
+                    ledger.record_events(
+                        recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                    )
+                    self.assertIsNone(coordinator.claim_next())
+                    self.assertEqual(
+                        ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0],
+                        1,
+                    )
+
+    def test_material_evidence_and_explicit_retry_create_new_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="supervisor-one"
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert("one")))
+                )
+                first = coordinator.claim_next()
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertTrue(coordinator.finish(first, "not_actionable"))
+
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(
+                            firing_alert(
+                                "two", starts_at="2026-07-14T00:01:00Z"
+                            )
+                        )
+                    )
+                )
+                second = coordinator.claim_next()
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertEqual(second.generation, first.generation + 1)
+                self.assertNotEqual(second.evidence_hash, first.evidence_hash)
+                self.assertTrue(coordinator.finish(second, "pending_approval"))
+
+                self.assertTrue(
+                    coordinator.explicit_retry(second.incident_id, reason="operator requested retry")
+                )
+                third = coordinator.claim_next()
+                self.assertIsNotNone(third)
+                assert third is not None
+                self.assertEqual(third.generation, second.generation + 1)
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT operation FROM audit ORDER BY id DESC LIMIT 1"
+                    ).fetchone()[0],
+                    "explicit_retry",
+                )
+
+    def test_resolved_first_and_out_of_order_events_do_not_false_fire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="supervisor-one"
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(resolved_alert("episode-one"))
+                    )
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("episode-one"))
+                    )
+                )
+                self.assertEqual(coordinator.reconcile(), 0)
+                self.assertIsNone(coordinator.claim_next())
+
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(
+                            firing_alert(
+                                "episode-one", starts_at="2026-07-14T00:20:00Z"
+                            )
+                        )
+                    )
+                )
+                self.assertEqual(coordinator.reconcile(), 1)
+                self.assertIsNotNone(coordinator.claim_next())
+
+    def test_concurrent_global_lease_and_crash_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            clock = [100.0]
+            first_ledger = recovery_ledger.RecoveryLedger(path)
+            second_ledger = recovery_ledger.RecoveryLedger(path)
+            try:
+                first_ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                )
+                policy = correlation_policy(lease_seconds=10)
+                first = recovery_supervisor.IncidentCoordinator(
+                    first_ledger,
+                    policy,
+                    owner="supervisor-one",
+                    clock=lambda: clock[0],
+                )
+                second = recovery_supervisor.IncidentCoordinator(
+                    second_ledger,
+                    policy,
+                    owner="supervisor-two",
+                    clock=lambda: clock[0],
+                )
+                abandoned = first.claim_next()
+                self.assertIsNotNone(abandoned)
+                self.assertIsNone(second.claim_next())
+
+                clock[0] = 111.0
+                recovered = second.claim_next()
+                self.assertIsNotNone(recovered)
+                assert abandoned is not None and recovered is not None
+                self.assertEqual(recovered.generation, abandoned.generation + 1)
+                self.assertEqual(
+                    second_ledger.connection.execute(
+                        "SELECT state FROM invocations WHERE id = ?", (abandoned.invocation_id,)
+                    ).fetchone()[0],
+                    "interrupted",
+                )
+            finally:
+                second_ledger.close()
+                first_ledger.close()
+
+    def test_stale_fence_is_rejected_after_material_evidence_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="supervisor-one"
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert("one")))
+                )
+                stale = coordinator.claim_next()
+                self.assertIsNotNone(stale)
+                assert stale is not None
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(
+                            firing_alert(
+                                "two", starts_at="2026-07-14T00:01:00Z"
+                            )
+                        )
+                    )
+                )
+                self.assertFalse(coordinator.finish(stale, "completed"))
+                current = coordinator.claim_next()
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertGreater(current.generation, stale.generation)
+
+    def test_bounded_reevaluation_launches_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3") as ledger:
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                )
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(reevaluation_delay=10, max_reevaluations=1),
+                    owner="supervisor-one",
+                    clock=lambda: clock[0],
+                )
+                first = coordinator.claim_next()
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertTrue(coordinator.finish(first, "observe"))
+                clock[0] = 109.0
+                self.assertIsNone(coordinator.claim_next())
+                clock[0] = 110.0
+                second = coordinator.claim_next()
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertTrue(coordinator.finish(second, "observe"))
+                clock[0] = 120.0
+                self.assertIsNone(coordinator.claim_next())
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0],
+                    2,
+                )
 
 
 class RecoveryHttpTests(unittest.TestCase):
