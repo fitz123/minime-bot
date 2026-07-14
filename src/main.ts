@@ -4,7 +4,11 @@ import { createTelegramBot, BOT_COMMANDS, type TelegramBotResult } from "./teleg
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
 import { startMetricsServer, stopMetricsServer } from "./metrics.js";
-import { runTelegramSetupInBackground, startBotWithRetry } from "./bot-startup.js";
+import {
+  runTelegramSetupInBackground,
+  startBotWithRetry,
+  stopTelegramBotInBackground,
+} from "./bot-startup.js";
 import { createWatchdog, type Watchdog } from "./polling-watchdog.js";
 import { restoreThreadCache, saveThreadCache } from "./message-thread-cache.js";
 import { restoreMessageIndex, saveMessageIndex } from "./message-content-index.js";
@@ -56,7 +60,11 @@ async function main(): Promise<void> {
     log.info("main", `Received ${signal}, shutting down...`);
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
-    if (telegramBot) telegramBot.stop();
+    if (telegramBot) {
+      stopTelegramBotInBackground(telegramBot, () => {
+        log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
+      });
+    }
     if (discordClient) discordClient.destroy();
     // Cancel debounce timers BEFORE waiting — telegramBot.stop() prevents new
     // updates, but already-scheduled debounce timers could still fire and start

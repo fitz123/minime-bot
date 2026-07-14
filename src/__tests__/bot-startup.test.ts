@@ -5,6 +5,7 @@ import {
   is409ConflictError,
   runTelegramSetupInBackground,
   startBotWithRetry,
+  stopTelegramBotInBackground,
 } from "../bot-startup.js";
 
 describe("runTelegramSetupInBackground", () => {
@@ -36,6 +37,29 @@ describe("runTelegramSetupInBackground", () => {
       (error) => { reported = error; },
     );
 
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(reported, expected);
+  });
+});
+
+describe("stopTelegramBotInBackground", () => {
+  it("handles a rejected final getUpdates confirmation without an unhandled rejection", async () => {
+    const expected = new Error("synthetic Telegram outage");
+    let reported: unknown;
+    let stopCalls = 0;
+
+    stopTelegramBotInBackground(
+      {
+        stop: async () => {
+          stopCalls++;
+          throw expected;
+        },
+      },
+      (error) => { reported = error; },
+    );
+
+    assert.equal(stopCalls, 1);
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(reported, expected);
