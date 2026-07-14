@@ -141,21 +141,37 @@ describe("Discord stale-message handling", () => {
     } as unknown as SessionManager;
 
     try {
-      const { client } = await createDiscordBot(config, discordConfig, sessionManager);
-      client.emit(Events.MessageCreate, {
-        author: { bot: false, username: "tester", globalName: "Tester" },
-        channel: { send: async () => ({}), isThread: () => false },
-        channelId: "channel-1",
-        guildId: "guild-1",
-        createdTimestamp: Date.now() - config.sessionDefaults.maxMessageAgeMs - 1,
-        mentions: { has: () => false },
-        attachments: new Map(),
-        content: "delayed Discord message",
-        reply: async () => ({}),
-      } as never);
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      const { client, messageQueue } = await createDiscordBot(config, discordConfig, sessionManager);
+      const key = discordSessionKey("channel-1");
+      const emitMessage = (createdTimestamp: number, content: string) => {
+        client.emit(Events.MessageCreate, {
+          author: { bot: false, username: "tester", globalName: "Tester" },
+          channel: { send: async () => ({}), isThread: () => false },
+          channelId: "channel-1",
+          guildId: "guild-1",
+          createdTimestamp,
+          mentions: { has: () => false },
+          attachments: new Map(),
+          content,
+          reply: async () => ({}),
+        } as never);
+      };
 
-      assert.strictEqual(sessionCalls, 0);
+      try {
+        emitMessage(
+          Date.now() - config.sessionDefaults.maxMessageAgeMs - 1,
+          "delayed Discord message",
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.strictEqual(messageQueue.getPendingCount(key), 0);
+
+        emitMessage(Date.now(), "current Discord message");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.strictEqual(messageQueue.getPendingCount(key), 1);
+        assert.strictEqual(sessionCalls, 0);
+      } finally {
+        messageQueue.clear(key);
+      }
     } finally {
       Client.prototype.login = originalLogin;
       REST.prototype.put = originalPut;

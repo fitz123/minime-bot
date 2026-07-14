@@ -1353,7 +1353,7 @@ describe("command handler wiring", () => {
     };
   }
 
-  function initBotResult(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
+  function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
     const result = createTelegramBot(handlerConfig, mockSM);
     const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
@@ -1378,10 +1378,6 @@ describe("command handler wiring", () => {
       allows_users_to_create_topics: false,
     };
     return result;
-  }
-
-  function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
-    return initBotResult(mockSM, apiCalls).bot;
   }
 
   it("installs and exposes polling and update-processing probes", async () => {
@@ -1427,18 +1423,18 @@ describe("command handler wiring", () => {
 
   it("/reconnect calls closeSession (not destroySession)", async () => {
     const mockSM = createMockSessionManager();
-    const bot = initBot(mockSM);
+    const { bot } = initBot(mockSM);
 
-    await bot.handleUpdate(makeCommandUpdate("reconnect", 1));
+    await bot.handleUpdate(makeCommandUpdate("reconnect", 1, Math.floor(Date.now() / 1000) - 60 * 60));
     assert.ok(mockSM.calls.includes("closeSession"), "/reconnect should call closeSession");
     assert.ok(!mockSM.calls.includes("destroySession"), "/reconnect should NOT call destroySession");
   });
 
   it("/clean calls destroySession (not closeSession directly)", async () => {
     const mockSM = createMockSessionManager();
-    const bot = initBot(mockSM);
+    const { bot } = initBot(mockSM);
 
-    await bot.handleUpdate(makeCommandUpdate("clean", 2));
+    await bot.handleUpdate(makeCommandUpdate("clean", 2, Math.floor(Date.now() / 1000) - 60 * 60));
     assert.ok(mockSM.calls.includes("destroySession"), "/clean should call destroySession");
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
   });
@@ -1446,9 +1442,9 @@ describe("command handler wiring", () => {
   it("/status replies from local health/cache without opening a session", async () => {
     const mockSM = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const bot = initBot(mockSM, apiCalls);
+    const { bot } = initBot(mockSM, apiCalls);
 
-    await bot.handleUpdate(makeCommandUpdate("status", 3));
+    await bot.handleUpdate(makeCommandUpdate("status", 3, Math.floor(Date.now() / 1000) - 60 * 60));
 
     const reply = apiCalls.find((call) => call.method === "sendMessage");
     assert.ok(reply);
@@ -1462,7 +1458,7 @@ describe("command handler wiring", () => {
   it("handles delayed command and text updates through their normal paths", async () => {
     const delayedDate = Math.floor(Date.now() / 1000) - 60 * 60;
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot, messageQueue } = initBotResult(createMockSessionManager(), apiCalls);
+    const { bot, messageQueue } = initBot(createMockSessionManager(), apiCalls);
 
     await bot.handleUpdate(makeCommandUpdate("start", 4, delayedDate));
     assert.match(
@@ -1506,7 +1502,7 @@ describe("command handler wiring", () => {
 
     for (const [index, media] of mediaMessages.entries()) {
       const apiCalls: Array<{ method: string; payload: any }> = [];
-      const bot = initBot(createMockSessionManager(), apiCalls);
+      const { bot } = initBot(createMockSessionManager(), apiCalls);
       await bot.handleUpdate({
         update_id: 100 + index,
         message: {
