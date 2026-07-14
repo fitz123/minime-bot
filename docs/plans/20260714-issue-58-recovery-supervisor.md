@@ -42,12 +42,12 @@ python3 -m py_compile scripts/recovery_supervisor.py scripts/runtime_doctor.py
 ## Implementation steps
 
 ### Task 1: Durable ledger and Node-independent intake with fallback
-- [ ] Add a stdlib-only SQLite ledger module (events, incidents, invocations, actions, policy revisions, one lease, notification outbox, audit) with a single fixed schema version, WAL/`synchronous=FULL`/FK/busy-timeout, startup integrity check, and fail-closed corruption handling that triggers compact native escalation.
-- [ ] Add `scripts/recovery_supervisor.py`: loopback-only authenticated Alertmanager/runtime-doctor/health endpoints, body/concurrency limits, per-transition normalization, commit-before-ack, at-least-once idempotency keyed by transition id, and atomic emergency spool.
-- [ ] Extend `scripts/runtime_doctor.py` with backward-compatible `telegram|tee|recovery` sink modes, stable persisted transition IDs, partial firing/resolution events, and sink retry that never duplicates the native notification; `telegram` stays the default with unchanged behavior.
-- [ ] Reuse existing `monitoring_native` secret resolution and Telegram delivery for compact throttled emergency escalation; never replay routine raw alert bodies.
-- [ ] Add focused tests: unchanged default behavior, duplicate transitions across restart, overlapping batches, lost-ack retry, spool drain and fallback delivery, malformed/oversized/unauthenticated input, DB lock/full/corruption fail-closed, and retryable response on total persistence failure.
-- [ ] Run Python and focused tests before Task 2.
+- [x] Add a stdlib-only SQLite ledger module (events, incidents, invocations, actions, policy revisions, one lease, notification outbox, audit) with a single fixed schema version, WAL/`synchronous=FULL`/FK/busy-timeout, startup integrity check, and fail-closed corruption handling that triggers compact native escalation.
+- [x] Add `scripts/recovery_supervisor.py`: loopback-only authenticated Alertmanager/runtime-doctor/health endpoints, body/concurrency limits, per-transition normalization, commit-before-ack, at-least-once idempotency keyed by transition id, and atomic emergency spool.
+- [x] Extend `scripts/runtime_doctor.py` with backward-compatible `telegram|tee|recovery` sink modes, stable persisted transition IDs, partial firing/resolution events, and sink retry that never duplicates the native notification; `telegram` stays the default with unchanged behavior.
+- [x] Reuse existing `monitoring_native` secret resolution and Telegram delivery for compact throttled emergency escalation; never replay routine raw alert bodies.
+- [x] Add focused tests: unchanged default behavior, duplicate transitions across restart, overlapping batches, lost-ack retry, spool drain and fallback delivery, malformed/oversized/unauthenticated input, DB lock/full/corruption fail-closed, and retryable response on total persistence failure.
+- [x] Run Python and focused tests before Task 2.
 
 ### Task 2: Incident correlation, deduplication, and suppression
 - [ ] Implement deterministic cross-source correlation, incident lifecycle with generations, and material-evidence hashing in the supervisor.
