@@ -202,6 +202,9 @@ def run(args: argparse.Namespace) -> int:
             "mode": config.mode,
             "config": str(config.path),
             "probes": len(config.probes),
+            "runtimeDoctorCadenceSeconds": config.runtime_doctor_cadence_seconds,
+            "verificationFreshnessSeconds": config.verification_freshness_seconds,
+            "verificationHoldDownSeconds": config.verification_hold_down_seconds,
         })
         return 0
 
@@ -283,12 +286,23 @@ def run(args: argparse.Namespace) -> int:
                 coordinator,
                 probe_ids=tuple(str(probe["id"]) for probe in config.probes),
                 source_ids=config.source_ids,
+                cadence_seconds=config.runtime_doctor_cadence_seconds,
+                freshness_seconds=config.verification_freshness_seconds,
+                hold_down_seconds=config.verification_hold_down_seconds,
             )
             verification = [
                 {
                     "incidentId": incident_id,
                     "recovered": result.recovered,
                     "reasons": list(result.reasons),
+                    "evidence": [
+                        {
+                            "kind": item.kind,
+                            "id": item.identifier,
+                            "state": item.state,
+                        }
+                        for item in result.evidence
+                    ],
                 }
                 for incident_id, result in verifier.evaluate_all()
             ]

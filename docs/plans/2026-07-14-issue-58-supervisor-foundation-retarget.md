@@ -52,12 +52,12 @@ npm pack --json --dry-run
 - [x] Run the runtime-doctor and supervisor focused tests before continuing.
 
 ### Task 3: Configure 300-second cadence and 660-second freshness with stale-as-defer semantics
-- [ ] Add required closed-schema recovery config fields for runtime-doctor cadence and verification freshness, wire them into production construction, and ship/document defaults of 300 and 660 seconds respectively; retain a bounded configurable hold-down.
-- [ ] Keep the launchd shadow example at the configured 300-second cadence and validate field presence, ranges, and timing relationships without silently substituting hard-coded verifier defaults.
-- [ ] Distinguish missing, stale, fresh-unhealthy, and fresh-healthy heartbeat/probe evidence in verification results.
-- [ ] Retain `mechanical_classification`/`mark_missed_recovery` only as a guarded follow-up seam: no recorded completed invocation claim means defer, any missing/stale required evidence means defer regardless of elapsed time, and only a completed claim plus fresh contradictory evidence may classify/mark failed; observe-mode maintenance never creates such a claim.
-- [ ] Add boundary tests spanning successive 300-second doctor observations, 660-second freshness expiry, future timestamps, missing sources/probes, no-invocation observe mode, and fresh unhealthy evidence after an explicit test claim; prove stale data cannot emit `recovery_failed`.
-- [ ] Run focused config, CLI, and supervisor tests before continuing.
+- [x] Add required closed-schema recovery config fields for runtime-doctor cadence and verification freshness, wire them into production construction, and ship/document defaults of 300 and 660 seconds respectively; retain a bounded configurable hold-down.
+- [x] Keep the launchd shadow example at the configured 300-second cadence and validate field presence, ranges, and timing relationships without silently substituting hard-coded verifier defaults.
+- [x] Distinguish missing, stale, fresh-unhealthy, and fresh-healthy heartbeat/probe evidence in verification results.
+- [x] Retain `mechanical_classification`/`mark_missed_recovery` only as a guarded follow-up seam: no recorded completed invocation claim means defer, any missing/stale required evidence means defer regardless of elapsed time, and only a completed claim plus fresh contradictory evidence may classify/mark failed; observe-mode maintenance never creates such a claim.
+- [x] Add boundary tests spanning successive 300-second doctor observations, 660-second freshness expiry, future timestamps, missing sources/probes, no-invocation observe mode, and fresh unhealthy evidence after an explicit test claim; prove stale data cannot emit `recovery_failed`.
+- [x] Run focused config, CLI, and supervisor tests before continuing.
 
 ### Task 4: Execute deterministic verification entirely in the Python supervisor
 - [ ] Replace Node-worker verification with a stdlib Python probe runner that accepts only validated absolute executables plus static argv/env, uses no shell or interpreter indirection, and applies bounded output and process-group timeouts.

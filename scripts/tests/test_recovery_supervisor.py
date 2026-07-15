@@ -236,6 +236,9 @@ class RecoveryServiceTests(unittest.TestCase):
                     ledger,
                     coordinator,
                     source_ids=("runtime_doctor",),
+                    cadence_seconds=300,
+                    freshness_seconds=660,
+                    hold_down_seconds=60,
                 )
                 event_spool = recovery_supervisor.AtomicJsonSpool(root / "events")
                 emergency = recovery_supervisor.EmergencyNotifier(
@@ -542,11 +545,23 @@ class RecoveryControlTests(unittest.TestCase):
                         "timeoutMs": 1000,
                     },
                 ),
+                runtime_doctor_cadence_seconds=300,
+                verification_freshness_seconds=660,
+                verification_hold_down_seconds=60,
             )
             policy = recovery_config.recovery_static_policy(config)
             self.assertEqual(
                 set(policy),
-                {"version", "mode", "correlationRules", "sourceIds", "probes"},
+                {
+                    "version",
+                    "mode",
+                    "correlationRules",
+                    "sourceIds",
+                    "probes",
+                    "runtimeDoctorCadenceSeconds",
+                    "verificationFreshnessSeconds",
+                    "verificationHoldDownSeconds",
+                },
             )
             self.assertEqual(policy["mode"], "observe")
             with recovery_ledger.RecoveryLedger(config.database) as ledger:
@@ -593,6 +608,15 @@ class RecoveryVerificationTests(unittest.TestCase):
         self.assertEqual(row["state"], "verifying")
         return coordinator, int(row["id"])
 
+    @staticmethod
+    def _evidence_states(
+        result: recovery_supervisor.VerificationResult,
+    ) -> dict[tuple[str, str], str]:
+        return {
+            (item.kind, item.identifier): item.state
+            for item in result.evidence
+        }
+
     def test_verification_requires_fresh_health_probes_and_hold_down(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             clock = [100.0]
@@ -605,6 +629,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                     coordinator,
                     probe_ids=("bot-health",),
                     source_ids=("alertmanager",),
+                    cadence_seconds=10,
                     freshness_seconds=30,
                     hold_down_seconds=20,
                     clock=lambda: clock[0],
@@ -641,6 +666,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                     ledger,
                     coordinator,
                     source_ids=("alertmanager",),
+                    cadence_seconds=4,
                     freshness_seconds=10,
                     hold_down_seconds=0,
                     clock=lambda: clock[0],
@@ -650,7 +676,11 @@ class RecoveryVerificationTests(unittest.TestCase):
                 clock[0] += 11
                 result = verifier.evaluate(incident_id)
                 self.assertFalse(result.recovered)
-                self.assertIn("heartbeat_unhealthy:alertmanager", result.reasons)
+                self.assertIn("heartbeat_stale:alertmanager", result.reasons)
+                self.assertEqual(
+                    {item.state for item in result.evidence},
+                    {"stale"},
+                )
                 self.assertIsNone(
                     verifier.mechanical_classification(incident_id, result)
                 )
@@ -681,6 +711,200 @@ class RecoveryVerificationTests(unittest.TestCase):
                     0,
                 )
 
+    def test_evidence_states_follow_300_second_cadence_and_660_second_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("health",),
+                    source_ids=("runtime_doctor",),
+                    cadence_seconds=300,
+                    freshness_seconds=660,
+                    hold_down_seconds=86_400,
+                    clock=lambda: clock[0],
+                )
+                fence = self._fence(ledger, incident_id)
+
+                missing = verifier.evaluate(incident_id)
+                self.assertEqual(
+                    self._evidence_states(missing),
+                    {
+                        ("heartbeat", "supervisor"): "missing",
+                        ("heartbeat", "runtime_doctor"): "missing",
+                        ("probe", "health"): "missing",
+                    },
+                )
+
+                for observed_at in (110.0, 410.0, 710.0):
+                    clock[0] = observed_at
+                    verifier.record_heartbeat("supervisor", observed_at=observed_at)
+                    verifier.record_heartbeat("runtime_doctor", observed_at=observed_at)
+                    self.assertTrue(
+                        verifier.record_probe(
+                            fence,
+                            "health",
+                            True,
+                            observed_at=observed_at,
+                        )
+                    )
+                    self.assertEqual(
+                        set(self._evidence_states(verifier.evaluate(incident_id)).values()),
+                        {"fresh_healthy"},
+                    )
+
+                clock[0] = 1_369.0
+                self.assertEqual(
+                    set(self._evidence_states(verifier.evaluate(incident_id)).values()),
+                    {"fresh_healthy"},
+                )
+                clock[0] = 1_370.0
+                expired = verifier.evaluate(incident_id)
+                self.assertEqual(
+                    set(self._evidence_states(expired).values()),
+                    {"stale"},
+                )
+                self.assertIn("heartbeat_stale:runtime_doctor", expired.reasons)
+                self.assertIn("probe_stale:health", expired.reasons)
+
+                clock[0] = 1_371.0
+                verifier.record_heartbeat("supervisor", observed_at=1_372.0)
+                verifier.record_heartbeat("runtime_doctor", observed_at=1_372.0)
+                self.assertTrue(
+                    verifier.record_probe(fence, "health", True, observed_at=1_372.0)
+                )
+                future = verifier.evaluate(incident_id)
+                self.assertEqual(
+                    set(self._evidence_states(future).values()),
+                    {"stale"},
+                )
+
+                verifier.record_heartbeat("supervisor", healthy=False)
+                verifier.record_heartbeat("runtime_doctor", healthy=False)
+                self.assertTrue(verifier.record_probe(fence, "health", False))
+                unhealthy = verifier.evaluate(incident_id)
+                self.assertEqual(
+                    set(self._evidence_states(unhealthy).values()),
+                    {"fresh_unhealthy"},
+                )
+                self.assertIn("heartbeat_unhealthy:runtime_doctor", unhealthy.reasons)
+                self.assertIn("probe_unhealthy:health", unhealthy.reasons)
+
+    def test_missed_recovery_requires_a_completed_claim_and_fresh_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("health",),
+                    source_ids=("runtime_doctor",),
+                    cadence_seconds=300,
+                    freshness_seconds=660,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                fence = self._fence(ledger, incident_id)
+                clock[0] = 800.0
+                verifier.record_heartbeat("supervisor", observed_at=140.0)
+                verifier.record_heartbeat("runtime_doctor", observed_at=140.0)
+                self.assertTrue(
+                    verifier.record_probe(fence, "health", False, observed_at=140.0)
+                )
+                stale = verifier.evaluate(incident_id)
+                self.assertIsNone(verifier.mechanical_classification(incident_id, stale))
+                self.assertFalse(
+                    coordinator.mark_missed_recovery(
+                        incident_id,
+                        dedupe_key=f"invocation:1:verification:{fence.generation}",
+                        result=stale,
+                    )
+                )
+
+                incident = ledger.connection.execute(
+                    "SELECT evidence_hash, generation, policy_revision FROM incidents "
+                    "WHERE id = ?",
+                    (incident_id,),
+                ).fetchone()
+                with ledger.transaction() as connection:
+                    cursor = connection.execute(
+                        "INSERT INTO invocations(incident_id, generation, evidence_hash, "
+                        "policy_revision, lease_token, state, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'test-completed-claim', 'completed', ?, ?)",
+                        (
+                            incident_id,
+                            incident["generation"],
+                            incident["evidence_hash"],
+                            incident["policy_revision"],
+                            clock[0],
+                            clock[0],
+                        ),
+                    )
+                    invocation_id = int(cursor.lastrowid)
+
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                    coordinator=coordinator,
+                    verifier=verifier,
+                )
+                service.maintenance()
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                    ).fetchone()[0],
+                    "verifying",
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM audit WHERE operation = 'verification_failed'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+                verifier.record_heartbeat("runtime_doctor")
+                self.assertTrue(verifier.record_probe(fence, "health", False))
+                fresh_failure = verifier.evaluate(incident_id)
+                self.assertEqual(
+                    self._evidence_states(fresh_failure)[("probe", "health")],
+                    "fresh_unhealthy",
+                )
+                self.assertEqual(
+                    verifier.mechanical_classification(incident_id, fresh_failure),
+                    (
+                        "missed_recovery",
+                        f"invocation:{invocation_id}:verification:{fence.generation}",
+                    ),
+                )
+                clock[0] = 1_460.0
+                self.assertFalse(
+                    coordinator.mark_missed_recovery(
+                        incident_id,
+                        dedupe_key=(
+                            f"invocation:{invocation_id}:verification:{fence.generation}"
+                        ),
+                        result=fresh_failure,
+                    )
+                )
+                verifier.record_heartbeat("runtime_doctor")
+                self.assertTrue(verifier.record_probe(fence, "health", False))
+                service.maintenance()
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                    ).fetchone()[0],
+                    "recovery_failed",
+                )
+
     def test_probe_results_are_fenced_to_the_verification_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             clock = [100.0]
@@ -692,6 +916,9 @@ class RecoveryVerificationTests(unittest.TestCase):
                     ledger,
                     coordinator,
                     probe_ids=("health",),
+                    cadence_seconds=30,
+                    freshness_seconds=120,
+                    hold_down_seconds=60,
                     clock=lambda: clock[0],
                 )
                 stale = self._fence(ledger, incident_id)
@@ -807,6 +1034,9 @@ class RecoveryFoundationTests(unittest.TestCase):
                 ),
                 source_ids=("alertmanager", "runtime_doctor"),
                 probes=(),
+                runtime_doctor_cadence_seconds=300,
+                verification_freshness_seconds=660,
+                verification_hold_down_seconds=60,
             )
             with recovery_ledger.RecoveryLedger(config.database) as ledger:
                 service = recovery_supervisor._build_recovery_service(
@@ -820,6 +1050,11 @@ class RecoveryFoundationTests(unittest.TestCase):
                     source_ids=config.source_ids,
                     mode=config.mode,
                 )
+                self.assertIsNotNone(service.verifier)
+                assert service.verifier is not None
+                self.assertEqual(service.verifier.cadence_seconds, 300.0)
+                self.assertEqual(service.verifier.freshness_seconds, 660.0)
+                self.assertEqual(service.verifier.hold_down_seconds, 60.0)
                 service.accept(
                     recovery_supervisor.normalize_alertmanager(
                         alert_body(firing_alert())
@@ -859,6 +1094,9 @@ class RecoveryHttpTests(unittest.TestCase):
                 ledger,
                 coordinator,
                 source_ids=("alertmanager", "runtime_doctor"),
+                cadence_seconds=300,
+                freshness_seconds=660,
+                hold_down_seconds=60,
             )
             service = recovery_supervisor.RecoveryService(
                 ledger,
@@ -1596,6 +1834,9 @@ class SupervisorStartupTests(unittest.TestCase):
                         "correlationRules": [],
                         "sourceIds": ["alertmanager", "runtime_doctor"],
                         "probes": [],
+                        "runtimeDoctorCadenceSeconds": 300,
+                        "verificationFreshnessSeconds": 660,
+                        "verificationHoldDownSeconds": 60,
                     }
                 ),
                 encoding="utf-8",

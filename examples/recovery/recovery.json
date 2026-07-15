@@ -11,5 +11,8 @@
     "alertmanager",
     "runtime_doctor"
   ],
-  "probes": []
+  "probes": [],
+  "runtimeDoctorCadenceSeconds": 300,
+  "verificationFreshnessSeconds": 660,
+  "verificationHoldDownSeconds": 60
 }

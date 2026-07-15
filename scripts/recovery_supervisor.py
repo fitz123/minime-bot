@@ -32,6 +32,9 @@ from monitoring_native import (
     send_telegram,
 )
 from recovery_config import (
+    DEFAULT_RUNTIME_DOCTOR_CADENCE_SECONDS,
+    DEFAULT_VERIFICATION_FRESHNESS_SECONDS,
+    DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS,
     RECOVERY_MODES,
     RecoveryConfig,
     RecoveryConfigError,
@@ -1466,14 +1469,25 @@ class IncidentCoordinator:
             )
             return True
 
-    def mark_missed_recovery(self, incident_id: int, *, dedupe_key: str) -> bool:
+    def mark_missed_recovery(
+        self,
+        incident_id: int,
+        *,
+        dedupe_key: str,
+        result: VerificationResult,
+    ) -> bool:
         """Fail one overdue verification generation and escalate it exactly once."""
 
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery incident id is invalid")
         if safe_field(dedupe_key, limit=160, default="") != dedupe_key:
             raise ValueError("recovery verification dedupe key is invalid")
+        claim = re.fullmatch(r"invocation:([1-9][0-9]*):verification:([1-9][0-9]*)", dedupe_key)
         now = self.clock()
+        if claim is None or not _is_fresh_contradiction(result, now=now):
+            return False
+        invocation_id = int(claim.group(1))
+        verification_generation = int(claim.group(2))
         target = f"incident:{incident_id}:{dedupe_key}"
         with self.ledger.transaction() as connection:
             if connection.execute(
@@ -1482,9 +1496,42 @@ class IncidentCoordinator:
             ).fetchone() is not None:
                 return False
             incident = connection.execute(
-                "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                "SELECT state, generation, policy_revision, correlation_key "
+                "FROM incidents WHERE id = ?",
+                (incident_id,),
             ).fetchone()
-            if incident is None or incident["state"] != "verifying":
+            if (
+                incident is None
+                or incident["state"] != "verifying"
+                or int(incident["generation"]) != verification_generation
+            ):
+                return False
+            control = self.controls.current(connection, now=now)
+            if (
+                control.revision != int(incident["policy_revision"])
+                or not self._static_policy_matches(connection, control.revision)
+                or str(incident["correlation_key"]) in self._active_evidence(connection)
+                or not _current_evidence_matches(
+                    connection,
+                    incident_id=incident_id,
+                    generation=verification_generation,
+                    policy_revision=int(incident["policy_revision"]),
+                    result=result,
+                    now=now,
+                )
+            ):
+                return False
+            invocation = connection.execute(
+                "SELECT generation FROM invocations WHERE id = ? AND incident_id = ? "
+                "AND state = 'completed' AND policy_revision = ?",
+                (invocation_id, incident_id, incident["policy_revision"]),
+            ).fetchone()
+            if (
+                invocation is None
+                or not max(1, verification_generation - 1)
+                <= int(invocation["generation"])
+                <= verification_generation
+            ):
                 return False
             connection.execute(
                 "UPDATE incidents SET state = 'recovery_failed', updated_at = ? WHERE id = ?",
@@ -1501,9 +1548,42 @@ class IncidentCoordinator:
 
 
 @dataclass(frozen=True)
+class VerificationEvidence:
+    kind: str
+    identifier: str
+    state: str
+    observed_at: float | None = None
+    fresh_until: float | None = None
+
+
+@dataclass(frozen=True)
 class VerificationResult:
     recovered: bool
     reasons: tuple[str, ...]
+    evidence: tuple[VerificationEvidence, ...] = ()
+
+
+def _is_fresh_contradiction(
+    result: VerificationResult, *, now: float | None = None
+) -> bool:
+    if not isinstance(result, VerificationResult) or not result.evidence:
+        return False
+    if any(item.state not in {"fresh_healthy", "fresh_unhealthy"} for item in result.evidence):
+        return False
+    if now is not None and any(
+        item.observed_at is None
+        or item.fresh_until is None
+        or item.observed_at > now
+        or now >= item.fresh_until
+        for item in result.evidence
+    ):
+        return False
+    contradictions = {
+        f"{item.kind}_unhealthy:{item.identifier}"
+        for item in result.evidence
+        if item.state == "fresh_unhealthy"
+    }
+    return bool(contradictions) and set(result.reasons) == contradictions
 
 
 @dataclass(frozen=True)
@@ -1511,6 +1591,34 @@ class VerificationFence:
     incident_id: int
     generation: int
     policy_revision: int
+
+
+def _current_evidence_matches(
+    connection: Any,
+    *,
+    incident_id: int,
+    generation: int,
+    policy_revision: int,
+    result: VerificationResult,
+    now: float,
+) -> bool:
+    if not _is_fresh_contradiction(result, now=now):
+        return False
+    fence = VerificationFence(incident_id, generation, policy_revision)
+    for item in result.evidence:
+        if item.kind == "heartbeat":
+            observation = RecoveryVerifier._observation(
+                connection, f"verification:heartbeat:{item.identifier}"
+            )
+        elif item.kind == "probe":
+            observation = RecoveryVerifier._probe_observation(
+                connection, fence, item.identifier
+            )
+        else:
+            return False
+        if observation != (item.state == "fresh_healthy", item.observed_at):
+            return False
+    return True
 
 
 class RecoveryVerifier:
@@ -1523,8 +1631,9 @@ class RecoveryVerifier:
         *,
         probe_ids: tuple[str, ...] = (),
         source_ids: tuple[str, ...] = (),
-        freshness_seconds: float = 120.0,
-        hold_down_seconds: float = 60.0,
+        cadence_seconds: float,
+        freshness_seconds: float,
+        hold_down_seconds: float,
         clock: Callable[[], float] = time.time,
     ):
         identifiers = probe_ids + source_ids
@@ -1535,7 +1644,7 @@ class RecoveryVerifier:
             for identifier in identifiers
         ):
             raise ValueError("recovery verification identifier is invalid")
-        for value in (freshness_seconds, hold_down_seconds):
+        for value in (cadence_seconds, freshness_seconds, hold_down_seconds):
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
@@ -1543,10 +1652,13 @@ class RecoveryVerifier:
                 or not 0 <= value <= 86_400
             ):
                 raise ValueError("recovery verification timing is invalid")
+        if cadence_seconds <= 0 or freshness_seconds <= cadence_seconds * 2:
+            raise ValueError("recovery verification timing relationship is invalid")
         self.ledger = ledger
         self.coordinator = coordinator
         self.probe_ids = probe_ids
         self.source_ids = source_ids
+        self.cadence_seconds = float(cadence_seconds)
         self.freshness_seconds = float(freshness_seconds)
         self.hold_down_seconds = float(hold_down_seconds)
         self.clock = clock
@@ -1670,7 +1782,7 @@ class RecoveryVerifier:
         if not self.probe_ids:
             return None
         now = self.clock()
-        refresh_after = min(30.0, max(1.0, self.freshness_seconds / 2.0))
+        refresh_after = self.cadence_seconds
         with self.ledger.transaction() as connection:
             incidents = connection.execute(
                 "SELECT id, generation, policy_revision FROM incidents "
@@ -1769,6 +1881,7 @@ class RecoveryVerifier:
                 int(incident["policy_revision"]),
             )
             reasons: list[str] = []
+            evidence: list[VerificationEvidence] = []
             control = self.coordinator.controls.current(connection, now=now)
             if control.revision != fence.policy_revision:
                 reasons.append("policy_stale")
@@ -1782,27 +1895,57 @@ class RecoveryVerifier:
                     connection, f"verification:heartbeat:{source}"
                 )
                 if observation is None:
+                    state = "missing"
                     reasons.append(f"heartbeat_missing:{source}")
-                elif (
-                    not observation[0]
-                    or observation[1] > now + 1.0
-                    or now - observation[1] > self.freshness_seconds
-                ):
+                elif observation[1] > now or now - observation[1] >= self.freshness_seconds:
+                    state = "stale"
+                    reasons.append(f"heartbeat_stale:{source}")
+                elif not observation[0]:
+                    state = "fresh_unhealthy"
                     reasons.append(f"heartbeat_unhealthy:{source}")
+                else:
+                    state = "fresh_healthy"
+                observed_at = None if observation is None else observation[1]
+                evidence.append(
+                    VerificationEvidence(
+                        "heartbeat",
+                        source,
+                        state,
+                        observed_at,
+                        None if observed_at is None else observed_at + self.freshness_seconds,
+                    )
+                )
             for probe_id in self.probe_ids:
                 observation = self._probe_observation(connection, fence, probe_id)
                 if observation is None:
+                    state = "missing"
                     reasons.append(f"probe_missing:{probe_id}")
-                elif (
-                    not observation[0]
-                    or observation[1] > now + 1.0
-                    or now - observation[1] > self.freshness_seconds
-                ):
+                elif observation[1] > now or now - observation[1] >= self.freshness_seconds:
+                    state = "stale"
+                    reasons.append(f"probe_stale:{probe_id}")
+                elif not observation[0]:
+                    state = "fresh_unhealthy"
                     reasons.append(f"probe_unhealthy:{probe_id}")
+                else:
+                    state = "fresh_healthy"
+                observed_at = None if observation is None else observation[1]
+                evidence.append(
+                    VerificationEvidence(
+                        "probe",
+                        probe_id,
+                        state,
+                        observed_at,
+                        None if observed_at is None else observed_at + self.freshness_seconds,
+                    )
+                )
             if now - float(incident["updated_at"]) < self.hold_down_seconds:
                 reasons.append("hold_down")
             if reasons:
-                return VerificationResult(False, tuple(sorted(set(reasons))))
+                return VerificationResult(
+                    False,
+                    tuple(sorted(set(reasons))),
+                    tuple(evidence),
+                )
             connection.execute(
                 "UPDATE incidents SET state = 'recovered', updated_at = ? WHERE id = ?",
                 (now, incident_id),
@@ -1822,7 +1965,7 @@ class RecoveryVerifier:
                     ),
                 ),
             )
-            return VerificationResult(True, ())
+            return VerificationResult(True, (), tuple(evidence))
 
     def evaluate_all(self) -> list[tuple[int, VerificationResult]]:
         with self.ledger.transaction() as connection:
@@ -1852,11 +1995,11 @@ class RecoveryVerifier:
                 "AND generation <= ? ORDER BY generation DESC, id DESC LIMIT 1",
                 (incident_id, incident["policy_revision"], max(1, generation - 1), generation),
             ).fetchone()
+            if invocation is None:
+                return None
             if result.recovered:
-                if invocation is None:
-                    return "false_positive", f"verification:{generation}"
                 return "stable_recovery", f"invocation:{int(invocation['id'])}"
-            if invocation is None or "hold_down" in result.reasons:
+            if not _is_fresh_contradiction(result, now=now):
                 return None
             delay = max(self.hold_down_seconds, self.freshness_seconds)
             if now - float(incident["updated_at"]) < delay:
@@ -2245,7 +2388,9 @@ class RecoveryService:
                         name, dedupe_key = classification
                         if name == "missed_recovery":
                             self.verifier.coordinator.mark_missed_recovery(
-                                incident_id, dedupe_key=dedupe_key
+                                incident_id,
+                                dedupe_key=dedupe_key,
+                                result=result,
                             )
             except LedgerError:
                 self.emergency.emit("ledger_unavailable")
@@ -2524,6 +2669,21 @@ def _build_recovery_service(
             else ()
         ),
         source_ids=source_ids,
+        cadence_seconds=(
+            configured.runtime_doctor_cadence_seconds
+            if configured is not None
+            else DEFAULT_RUNTIME_DOCTOR_CADENCE_SECONDS
+        ),
+        freshness_seconds=(
+            configured.verification_freshness_seconds
+            if configured is not None
+            else DEFAULT_VERIFICATION_FRESHNESS_SECONDS
+        ),
+        hold_down_seconds=(
+            configured.verification_hold_down_seconds
+            if configured is not None
+            else DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS
+        ),
     )
     service = RecoveryService(
         ledger,

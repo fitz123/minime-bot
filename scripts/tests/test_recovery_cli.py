@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+import plistlib
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,9 @@ def config_document(mode: str = "observe") -> dict[str, object]:
         ],
         "sourceIds": ["alertmanager", "runtime_doctor"],
         "probes": [],
+        "runtimeDoctorCadenceSeconds": 300,
+        "verificationFreshnessSeconds": 660,
+        "verificationHoldDownSeconds": 60,
     }
 
 
@@ -76,12 +80,24 @@ class RecoveryConfigTests(unittest.TestCase):
             )
             self.assertEqual(loaded.mode, "observe")
             self.assertEqual(len(loaded.probes), 1)
+            self.assertEqual(loaded.runtime_doctor_cadence_seconds, 300)
+            self.assertEqual(loaded.verification_freshness_seconds, 660)
+            self.assertEqual(loaded.verification_hold_down_seconds, 60)
             self.assertEqual(
                 loaded.database, root.resolve() / "var/recovery/ledger.sqlite3"
             )
             self.assertEqual(
                 set(recovery_config.recovery_static_policy(loaded)),
-                {"version", "mode", "correlationRules", "sourceIds", "probes"},
+                {
+                    "version",
+                    "mode",
+                    "correlationRules",
+                    "sourceIds",
+                    "probes",
+                    "runtimeDoctorCadenceSeconds",
+                    "verificationFreshnessSeconds",
+                    "verificationHoldDownSeconds",
+                },
             )
 
             for legacy_mode in ("plan", "enabled"):
@@ -159,6 +175,78 @@ class RecoveryConfigTests(unittest.TestCase):
                         root / "recovery.json", root
                     )
 
+    def test_timing_fields_are_required_bounded_and_relationship_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            timing_fields = (
+                "runtimeDoctorCadenceSeconds",
+                "verificationFreshnessSeconds",
+                "verificationHoldDownSeconds",
+            )
+            for field in timing_fields:
+                document = config_document()
+                del document[field]
+                (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(missing=field), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(root / "recovery.json", root)
+
+            invalid_values = (
+                ("runtimeDoctorCadenceSeconds", True),
+                ("runtimeDoctorCadenceSeconds", 29),
+                ("runtimeDoctorCadenceSeconds", 3_601),
+                ("verificationFreshnessSeconds", 59),
+                ("verificationFreshnessSeconds", 86_401),
+                ("verificationHoldDownSeconds", -1),
+                ("verificationHoldDownSeconds", 86_401),
+                ("verificationHoldDownSeconds", 1.5),
+            )
+            for field, value in invalid_values:
+                document = config_document()
+                document[field] = value
+                (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(field=field, value=value), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(root / "recovery.json", root)
+
+            too_tight = config_document()
+            too_tight["verificationFreshnessSeconds"] = 600
+            (root / "recovery.json").write_text(json.dumps(too_tight), encoding="utf-8")
+            with self.assertRaisesRegex(
+                recovery_config.RecoveryConfigError, "must exceed two"
+            ):
+                recovery_config.load_recovery_config(root / "recovery.json", root)
+
+            lower_bounds = config_document()
+            lower_bounds["runtimeDoctorCadenceSeconds"] = 30
+            lower_bounds["verificationFreshnessSeconds"] = 61
+            lower_bounds["verificationHoldDownSeconds"] = 0
+            (root / "recovery.json").write_text(json.dumps(lower_bounds), encoding="utf-8")
+            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            self.assertEqual(
+                (
+                    loaded.runtime_doctor_cadence_seconds,
+                    loaded.verification_freshness_seconds,
+                    loaded.verification_hold_down_seconds,
+                ),
+                (30, 61, 0),
+            )
+
+    def test_shadow_launchd_cadence_matches_shipped_configuration(self) -> None:
+        example = json.loads(
+            (SCRIPTS.parent / "examples/recovery/recovery.json").read_text(encoding="utf-8")
+        )
+        with (SCRIPTS.parent / "examples/recovery/ai.minime.runtime-doctor-shadow.plist").open(
+            "rb"
+        ) as source:
+            shadow = plistlib.load(source)
+        self.assertEqual(
+            shadow["StartInterval"],
+            example["runtimeDoctorCadenceSeconds"],
+        )
+
 
 class RecoveryCliTests(unittest.TestCase):
     def test_retained_commands_are_bounded_and_removed_commands_are_rejected(self) -> None:
@@ -175,6 +263,9 @@ class RecoveryCliTests(unittest.TestCase):
                     "mode": "observe",
                     "ok": True,
                     "probes": 0,
+                    "runtimeDoctorCadenceSeconds": 300,
+                    "verificationFreshnessSeconds": 660,
+                    "verificationHoldDownSeconds": 60,
                 },
             )
 

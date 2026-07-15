@@ -151,8 +151,15 @@ direct native behavior above. Recovery shadowing adds these settings:
 - `MINIME_DOCTOR_RECOVERY_TOKEN_FILE` must be an owner-only, non-symlink token
   file; `MINIME_DOCTOR_RECOVERY_ATTEMPTS` is bounded to 1-10.
 
-In recovery-only mode, exhausted supervisor delivery triggers a throttled fixed
-native Telegram alert without including monitoring payload data. Keep the
+The recovery shadow plist runs every 300 seconds. Keep its `StartInterval`
+equal to the recovery configuration's required
+`runtimeDoctorCadenceSeconds`. The shipped
+`verificationFreshnessSeconds` is 660 seconds, strictly more than two doctor
+cadences, so normal scheduling jitter does not make a source stale. A future,
+missing, or expired heartbeat defers verification; it is never failure evidence.
+
+In tee and recovery modes, exhausted supervisor delivery triggers a throttled
+fixed native Telegram alert without including monitoring payload data. Keep the
 doctor's native Telegram/SOPS settings configured after changing sinks.
 
 Tee and recovery modes also send an authenticated heartbeat on every doctor

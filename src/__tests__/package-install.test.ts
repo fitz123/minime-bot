@@ -304,6 +304,9 @@ describe("package artifact install", () => {
         }],
         sourceIds: ["alertmanager", "runtime_doctor"],
         probes: [],
+        runtimeDoctorCadenceSeconds: 300,
+        verificationFreshnessSeconds: 660,
+        verificationHoldDownSeconds: 60,
       }),
     );
     assert.deepEqual(collectSchemaFiles(workspace), [], "installed workspace fixture must not contain schema.md");
@@ -354,6 +357,7 @@ describe("package artifact install", () => {
         "utf8",
       );
       assert.match(doctorShadow, /<string>ai\.minime\.runtime-doctor<\/string>/);
+      assert.match(doctorShadow, /<key>StartInterval<\/key>\s*<integer>300<\/integer>/);
       for (const requiredSetting of [
         "MINIME_DOCTOR_LAUNCHD_LABEL",
         "MINIME_DOCTOR_BOT_METRICS_URL",
@@ -606,7 +610,9 @@ workspace = Path(sys.argv[1])
 config = recovery_config.load_recovery_config(workspace / "recovery.json", workspace)
 assert config.mode == "observe"
 assert set(recovery_config.recovery_static_policy(config)) == {
-    "version", "mode", "correlationRules", "sourceIds", "probes"
+    "version", "mode", "correlationRules", "sourceIds", "probes",
+    "runtimeDoctorCadenceSeconds", "verificationFreshnessSeconds",
+    "verificationHoldDownSeconds"
 }
 ledger = recovery_ledger.RecoveryLedger(config.database)
 policy = recovery_supervisor.RecoveryPolicy(
@@ -666,6 +672,7 @@ verifier = recovery_supervisor.RecoveryVerifier(
     ledger,
     observer,
     source_ids=("alertmanager",),
+    cadence_seconds=4,
     freshness_seconds=10,
     hold_down_seconds=0,
     clock=lambda: 300.0,

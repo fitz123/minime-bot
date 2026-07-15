@@ -45,6 +45,15 @@ must be loopback; and the port is bounded. Source IDs are unique values from
 `alertmanager` and `runtime_doctor`. Correlation rules have a unique
 component/failure-class identity, an incident key, and impact from 0 through 3.
 
+The required timing fields are `runtimeDoctorCadenceSeconds`,
+`verificationFreshnessSeconds`, and `verificationHoldDownSeconds`. The shipped
+values are 300, 660, and 60 seconds. Cadence is bounded from 30 through 3,600
+seconds, freshness from 60 through 86,400 seconds, and hold-down from 0 through
+86,400 seconds. Freshness must be strictly greater than two doctor cadences, so
+two successive delayed or missed five-minute observations do not immediately
+turn a quiet source stale. The runtime-doctor launchd `StartInterval` must match
+the configured cadence.
+
 The optional `probes` registry is limited to 128 unique IDs. A probe has this
 closed shape:
 
@@ -100,9 +109,13 @@ lease or inserts an invocation.
 A resolved episode enters verification. Recovery is declared only after every
 correlated firing episode resolves, required probes are healthy, source and
 supervisor heartbeats are fresh, and the hold-down elapses. Missing or stale
-monitoring is insufficient evidence and never means recovered. Confirmed impact,
-failed verification, exhausted crash retries, supervisor unavailability, and
-persistence failures use the immediate native escalation path.
+monitoring is insufficient evidence: evaluation defers and cannot classify or
+mark a missed recovery. A future-dated observation is stale rather than fresh.
+Only a fresh unhealthy observation that contradicts a recorded completed fixer
+claim can use the guarded missed-recovery seam; observe mode never creates such
+a claim. Confirmed impact, failed verification, exhausted crash retries,
+supervisor unavailability, and persistence failures use the immediate native
+escalation path.
 
 The trusted Pi fixer, exact-session re-entry, action journal, independent
 two-slot recovery capsule, and offline bot rollback are explicitly deferred to

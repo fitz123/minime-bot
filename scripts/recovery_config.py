@@ -11,6 +11,12 @@ from typing import Any
 
 
 RECOVERY_MODES = frozenset({"observe"})
+DEFAULT_RUNTIME_DOCTOR_CADENCE_SECONDS = 300
+DEFAULT_VERIFICATION_FRESHNESS_SECONDS = 660
+DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS = 60
+RUNTIME_DOCTOR_CADENCE_BOUNDS = (30, 3_600)
+VERIFICATION_FRESHNESS_BOUNDS = (60, 86_400)
+VERIFICATION_HOLD_DOWN_BOUNDS = (0, 86_400)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _SENSITIVE = re.compile(r"AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
@@ -78,6 +84,9 @@ _ROOT_KEYS = {
     "correlationRules",
     "sourceIds",
     "probes",
+    "runtimeDoctorCadenceSeconds",
+    "verificationFreshnessSeconds",
+    "verificationHoldDownSeconds",
 }
 
 
@@ -98,6 +107,9 @@ class RecoveryConfig:
     correlation_rules: tuple[dict[str, Any], ...]
     source_ids: tuple[str, ...]
     probes: tuple[dict[str, Any], ...]
+    runtime_doctor_cadence_seconds: int
+    verification_freshness_seconds: int
+    verification_hold_down_seconds: int
 
 
 def _object(value: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -174,6 +186,12 @@ def _command(value: Any) -> dict[str, Any]:
     return dict(item)
 
 
+def _bounded_seconds(value: Any, bounds: tuple[int, int], name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not bounds[0] <= value <= bounds[1]:
+        raise RecoveryConfigError(f"recovery {name} is invalid")
+    return value
+
+
 def recovery_static_policy(config: RecoveryConfig) -> dict[str, Any]:
     """Return the canonical dispatch-relevant configuration for durable fencing."""
 
@@ -183,6 +201,9 @@ def recovery_static_policy(config: RecoveryConfig) -> dict[str, Any]:
         "correlationRules": [dict(rule) for rule in config.correlation_rules],
         "sourceIds": list(config.source_ids),
         "probes": [dict(probe) for probe in config.probes],
+        "runtimeDoctorCadenceSeconds": config.runtime_doctor_cadence_seconds,
+        "verificationFreshnessSeconds": config.verification_freshness_seconds,
+        "verificationHoldDownSeconds": config.verification_hold_down_seconds,
     }
 
 
@@ -202,6 +223,26 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     port = document["port"]
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise RecoveryConfigError("recovery port is invalid")
+
+    cadence_seconds = _bounded_seconds(
+        document["runtimeDoctorCadenceSeconds"],
+        RUNTIME_DOCTOR_CADENCE_BOUNDS,
+        "runtime doctor cadence",
+    )
+    freshness_seconds = _bounded_seconds(
+        document["verificationFreshnessSeconds"],
+        VERIFICATION_FRESHNESS_BOUNDS,
+        "verification freshness",
+    )
+    hold_down_seconds = _bounded_seconds(
+        document["verificationHoldDownSeconds"],
+        VERIFICATION_HOLD_DOWN_BOUNDS,
+        "verification hold-down",
+    )
+    if freshness_seconds <= cadence_seconds * 2:
+        raise RecoveryConfigError(
+            "recovery verification freshness must exceed two runtime doctor cadences"
+        )
 
     raw_rules = document["correlationRules"]
     if not isinstance(raw_rules, list) or len(raw_rules) > 128:
@@ -258,4 +299,7 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
         correlation_rules=tuple(rules),
         source_ids=sources,
         probes=probes,
+        runtime_doctor_cadence_seconds=cadence_seconds,
+        verification_freshness_seconds=freshness_seconds,
+        verification_hold_down_seconds=hold_down_seconds,
     )
