@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Bounded operator CLI for the same-host recovery ledger."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+from recovery_config import (
+    RecoveryConfig,
+    RecoveryConfigError,
+    load_recovery_config,
+)
+from recovery_ledger import LedgerError, RecoveryLedger
+from recovery_supervisor import (
+    AtomicJsonSpool,
+    CorrelationRule,
+    EmergencyNotifier,
+    IncidentCoordinator,
+    RecoveryControls,
+    RecoveryPolicy,
+    _build_recovery_service,
+    safe_field,
+)
+
+
+MAX_LIST_LIMIT = 100
+MAX_TTL_SECONDS = 31 * 86_400
+
+
+def _json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+
+
+def _positive_id(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _bounded_limit(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= MAX_LIST_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_LIST_LIMIT}")
+    return parsed
+
+
+def _ttl(value: str) -> float:
+    parsed = float(value)
+    if not 1 <= parsed <= MAX_TTL_SECONDS:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_TTL_SECONDS}")
+    return parsed
+
+
+def _safe_text(value: str, name: str, limit: int) -> str:
+    if safe_field(value, limit=limit, default="") != value:
+        raise ValueError(f"recovery {name} is invalid")
+    return value
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Inspect and control the observe-only same-host recovery foundation",
+        epilog=(
+            "The foundation performs native intake, verification, controls, and "
+            "escalation only. Fixer execution and remediation actions are not available."
+        ),
+    )
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--config", default="recovery.json")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    config = sub.add_parser("config")
+    config.add_subparsers(dest="action", required=True).add_parser("validate")
+    sub.add_parser("status")
+
+    for name in ("incidents", "invocations"):
+        inspect = sub.add_parser(name)
+        inspect.add_argument("--id", type=_positive_id)
+        inspect.add_argument("--limit", type=_bounded_limit, default=25)
+
+    dispatch = sub.add_parser("dispatch")
+    dispatch.add_argument("state", choices=("enable", "disable"))
+    dispatch.add_argument("--ttl", type=_ttl)
+    _operator_options(dispatch)
+
+    controls = sub.add_parser("controls")
+    controls.add_argument("control", choices=("confirmation-count", "cooldown", "retry-budget"))
+    controls.add_argument("value", type=float)
+    controls.add_argument("--ttl", type=_ttl)
+    _operator_options(controls)
+
+    silence = sub.add_parser("silence")
+    silence.add_argument("incident_key")
+    silence.add_argument("--ttl", type=_ttl, required=True)
+    _operator_options(silence)
+
+    retry = sub.add_parser("retry")
+    retry.add_argument("incident_id", type=_positive_id)
+    _operator_options(retry)
+
+    policy = sub.add_parser("policy")
+    policy_sub = policy.add_subparsers(dest="action", required=True)
+    history = policy_sub.add_parser("history")
+    history.add_argument("--limit", type=_bounded_limit, default=25)
+    rollback = policy_sub.add_parser("rollback")
+    rollback.add_argument("revision", type=_positive_id)
+    _operator_options(rollback)
+
+    process = sub.add_parser("process")
+    process.add_argument("--once", action="store_true", required=True)
+    return parser
+
+
+def _operator_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--reason", required=True)
+
+
+def _config(args: argparse.Namespace) -> RecoveryConfig:
+    workspace = Path(args.workspace).resolve()
+    raw_path = Path(args.config)
+    path = raw_path if raw_path.is_absolute() else workspace / raw_path
+    return load_recovery_config(path, workspace)
+
+
+def _policy(config: RecoveryConfig, revision: int = 1) -> RecoveryPolicy:
+    return RecoveryPolicy(
+        revision=revision,
+        rules=tuple(
+            CorrelationRule(
+                component=str(rule["component"]),
+                failure_class=str(rule["failureClass"]),
+                incident_key=str(rule["incidentKey"]),
+                impact=int(rule["impact"]),
+            )
+            for rule in config.correlation_rules
+        ),
+    )
+
+
+def _rows(rows: Any) -> list[dict[str, Any]]:
+    return [{key: row[key] for key in row.keys()} for row in rows]
+
+
+def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: RecoveryConfig) -> dict[str, Any]:
+    snapshot = controls.current()
+    connection = ledger.connection
+    return {
+        "mode": config.mode,
+        "database": str(config.database),
+        "foundation": {
+            "fixerAvailable": False,
+            "nativeVerification": True,
+            "observeOnly": True,
+            "remediationActionsAvailable": False,
+        },
+        "emergencyDeliveryConfigured": bool(
+            os.environ.get("MINIME_TELEGRAM_CHAT_ID", "").strip()
+            and os.environ.get("MINIME_TELEGRAM_SOPS_FILE", "").strip()
+            and os.environ.get("MINIME_TELEGRAM_SOPS_KEY", "").strip()
+        ),
+        "controls": asdict(snapshot),
+        "counts": {
+            "events": connection.execute("SELECT count(*) FROM events").fetchone()[0],
+            "incidents": connection.execute("SELECT count(*) FROM incidents").fetchone()[0],
+            "activeInvocations": connection.execute(
+                "SELECT count(*) FROM invocations WHERE state = 'active'"
+            ).fetchone()[0],
+            "pendingNotifications": connection.execute(
+                "SELECT count(*) FROM notification_outbox WHERE delivered_at IS NULL"
+            ).fetchone()[0],
+        },
+    }
+
+
+def _inspect(ledger: RecoveryLedger, table: str, identifier: int | None, limit: int) -> list[dict[str, Any]]:
+    if table not in {"incidents", "invocations"}:
+        raise ValueError("recovery inspection target is invalid")
+    columns = (
+        "id, correlation_key, state, generation, evidence_hash, policy_revision, opened_at, updated_at"
+        if table == "incidents"
+        else "id, incident_id, generation, evidence_hash, policy_revision, state, created_at, updated_at"
+    )
+    if identifier is None:
+        rows = ledger.connection.execute(
+            f"SELECT {columns} FROM {table} ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    else:
+        rows = ledger.connection.execute(
+            f"SELECT {columns} FROM {table} WHERE id = ?", (identifier,)
+        ).fetchall()
+    return _rows(rows)
+
+
+def _operator(args: argparse.Namespace) -> tuple[str, str]:
+    return (
+        _safe_text(args.actor, "actor", 80),
+        _safe_text(args.reason, "reason", 160),
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    config = _config(args)
+    if args.command == "config":
+        _json({
+            "ok": True,
+            "mode": config.mode,
+            "config": str(config.path),
+            "probes": len(config.probes),
+            "runtimeDoctorCadenceSeconds": config.runtime_doctor_cadence_seconds,
+            "verificationFreshnessSeconds": config.verification_freshness_seconds,
+            "verificationHoldDownSeconds": config.verification_hold_down_seconds,
+        })
+        return 0
+
+    with RecoveryLedger(config.database) as ledger:
+        controls = RecoveryControls(ledger)
+        if args.command == "process":
+            service = _build_recovery_service(
+                ledger,
+                AtomicJsonSpool(config.spool_directory / "events"),
+                EmergencyNotifier(
+                    config.spool_directory / "notifications", delivery=None
+                ),
+                configured=config,
+            )
+            summary = service.maintenance()
+            _json({"ok": True, "mode": config.mode, **summary})
+            return 0
+        revision = controls.current().revision
+        coordinator = IncidentCoordinator(
+            ledger,
+            _policy(config, revision),
+            owner="recovery-cli",
+            controls=controls,
+            mode=config.mode,
+        )
+        if args.command == "status":
+            _json(_status(ledger, controls, config))
+        elif args.command in {"incidents", "invocations"}:
+            _json(_inspect(ledger, args.command, args.id, args.limit))
+        elif args.command == "dispatch":
+            actor, reason = _operator(args)
+            expiry = None if args.ttl is None else time.time() + args.ttl
+            revision = controls.set_dispatch(
+                args.state == "enable", actor=actor, reason=reason, expires_at=expiry
+            )
+            _json({"ok": True, "revision": revision})
+        elif args.command == "controls":
+            actor, reason = _operator(args)
+            expiry = None if args.ttl is None else time.time() + args.ttl
+            if args.control == "confirmation-count":
+                if not args.value.is_integer():
+                    raise ValueError("recovery confirmation count is invalid")
+                revision = controls.set_confirmation_count(
+                    int(args.value), actor=actor, reason=reason, expires_at=expiry
+                )
+            elif args.control == "cooldown":
+                revision = controls.set_cooldown(
+                    args.value, actor=actor, reason=reason, expires_at=expiry
+                )
+            else:
+                if not args.value.is_integer():
+                    raise ValueError("recovery retry budget is invalid")
+                revision = controls.set_retry_budget(
+                    int(args.value), actor=actor, reason=reason, expires_at=expiry
+                )
+            _json({"ok": True, "revision": revision})
+        elif args.command == "silence":
+            actor, reason = _operator(args)
+            revision = controls.silence(
+                _safe_text(args.incident_key, "silence target", 160),
+                actor=actor,
+                reason=reason,
+                expires_at=time.time() + args.ttl,
+            )
+            _json({"ok": True, "revision": revision})
+        elif args.command == "retry":
+            actor, reason = _operator(args)
+            if not coordinator.explicit_retry(args.incident_id, actor=actor, reason=reason):
+                raise ValueError("recovery incident is not eligible for explicit retry")
+            _json({"ok": True})
+        elif args.command == "policy" and args.action == "history":
+            rows = ledger.connection.execute(
+                "SELECT revision, created_at, actor, reason FROM policy_revisions "
+                "ORDER BY revision DESC LIMIT ?", (args.limit,)
+            ).fetchall()
+            _json(_rows(rows))
+        elif args.command == "policy" and args.action == "rollback":
+            actor, reason = _operator(args)
+            _json({"ok": True, "revision": controls.rollback(args.revision, actor=actor, reason=reason)})
+        else:
+            raise ValueError("unknown recovery command")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        try:
+            args = _parser().parse_args(argv)
+        except SystemExit as exc:
+            return int(exc.code)
+        return run(args)
+    except (RecoveryConfigError, LedgerError, ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

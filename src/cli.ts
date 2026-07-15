@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
 import {
@@ -48,7 +49,21 @@ export interface CliRunOptions {
   launchdCommandRunner?: LaunchdCommandRunner;
   launchdHomeDir?: string;
   launchdUid?: number;
+  recoveryCommandRunner?: RecoveryCommandRunner;
 }
+
+export interface RecoveryCommandResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+export type RecoveryCommandRunner = (
+  command: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv },
+) => RecoveryCommandResult;
 
 interface ParsedArgs {
   command: string[];
@@ -80,6 +95,16 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]
+  minime-bot recovery config validate --workspace <control-workspace> [--config <path>]
+  minime-bot recovery status --workspace <control-workspace> [--config <path>]
+  minime-bot recovery incidents|invocations --workspace <control-workspace> [--config <path>] [--id <id>] [--limit <1-100>]
+  minime-bot recovery dispatch enable|disable --actor <actor> --reason <reason> [--ttl <seconds>]
+  minime-bot recovery controls confirmation-count|cooldown|retry-budget <value> --actor <actor> --reason <reason> [--ttl <seconds>]
+  minime-bot recovery silence <incident-key> --ttl <seconds> --actor <actor> --reason <reason>
+  minime-bot recovery retry <incident-id> --actor <actor> --reason <reason>
+  minime-bot recovery policy history [--limit <1-100>]
+  minime-bot recovery policy rollback <revision> --actor <actor> --reason <reason>
+  minime-bot recovery process --once [--config <path>]
 
 Options:
   --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
@@ -87,6 +112,8 @@ Options:
 
 Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
+Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
+Recovery foundation: observe-only native intake, verification, controls, and escalation; no fixer or remediation actions. Trusted fixer, exact-session, action-journal, two-slot capsule, and offline rollback support are deferred.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
@@ -105,7 +132,11 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
-      help = true;
+      if (command[0] === "recovery") {
+        command.push(arg);
+      } else {
+        help = true;
+      }
       continue;
     }
     if (arg === "--workspace") {
@@ -534,6 +565,89 @@ function runLaunchdCommand(
   return 0;
 }
 
+function recoveryScriptPath(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "recovery_cli.py");
+}
+
+function arrangeRecoveryArgs(args: readonly string[]): { configArgs: string[]; commandArgs: string[] } {
+  const configArgs: string[] = [];
+  const commandArgs: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--config") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new CliUsageError("--config requires a path");
+      }
+      configArgs.push("--config", value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--config=")) {
+      const value = arg.slice("--config=".length).trim();
+      if (!value) {
+        throw new CliUsageError("--config requires a path");
+      }
+      configArgs.push("--config", value);
+      continue;
+    }
+    commandArgs.push(arg);
+  }
+  return { configArgs, commandArgs };
+}
+
+function runRecoveryCommand(
+  action: string | undefined,
+  args: readonly string[],
+  parsed: ParsedArgs,
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  if (!action) {
+    throw new CliUsageError("recovery command is required");
+  }
+  const contract = resolveForCli(parsed, options);
+  const arranged = arrangeRecoveryArgs([action, ...args]);
+  const python = options.env?.PYTHON?.trim() || process.env.PYTHON?.trim() || "/usr/bin/python3";
+  const runner: RecoveryCommandRunner = options.recoveryCommandRunner ?? ((command, commandArgs, runOptions) => {
+    const result = spawnSync(command, commandArgs, {
+      cwd: runOptions.cwd,
+      env: runOptions.env,
+      encoding: "utf8",
+      shell: false,
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      error: result.error,
+    };
+  });
+  const cwd = cwdForCli(options);
+  const result = runner(
+    python,
+    [
+      recoveryScriptPath(),
+      "--workspace",
+      contract.paths.workspaceRoot,
+      ...arranged.configArgs,
+      ...arranged.commandArgs,
+    ],
+    { cwd, env: options.env ?? process.env },
+  );
+  if (result.stdout) {
+    stdout(result.stdout);
+  }
+  if (result.stderr) {
+    stderr(result.stderr);
+  }
+  if (result.error) {
+    throw new Error("recovery command failed to start");
+  }
+  return result.status ?? 1;
+}
+
 function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
   const diagnostics = contract.effectivePaths;
   return [
@@ -633,6 +747,9 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
     }
     if (scope === "launchd") {
       return runLaunchdCommand(action, rest, parsed, options, stdout);
+    }
+    if (scope === "recovery") {
+      return runRecoveryCommand(action, rest, parsed, options, stdout, stderr);
     }
 
     if (rest.length > 0) {

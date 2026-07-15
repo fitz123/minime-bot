@@ -1,0 +1,17 @@
+route:
+  receiver: existing-native-telegram
+  routes:
+    - receiver: recovery-shadow
+      continue: true
+
+receivers:
+  - name: existing-native-telegram
+    # Keep the existing direct native Telegram receiver unchanged during shadowing.
+  - name: recovery-shadow
+    webhook_configs:
+      - url: http://127.0.0.1:9877/v1/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: __CONTROL_WORKSPACE_ROOT__/config/recovery-auth-token

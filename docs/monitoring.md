@@ -139,6 +139,47 @@ run the doctor. Telegram delivery must still work. Restore health and run it
 again to confirm exactly one recovery. The doctor never reads or edits TCC
 databases and must not be used to trigger permission prompts.
 
+The runtime doctor defaults to `MINIME_DOCTOR_SINK=telegram`, preserving the
+direct native behavior above. Recovery shadowing adds these settings:
+
+- `MINIME_DOCTOR_SINK=tee` sends the native notification once, then retries the
+  same durable recovery transition without duplicating Telegram delivery.
+- `MINIME_DOCTOR_SINK=recovery` transfers routine transition delivery to the
+  recovery supervisor; use it only after the shadow gates pass.
+- `MINIME_DOCTOR_RECOVERY_URL` must be the loopback
+  `http://.../v1/runtime-doctor` endpoint.
+- `MINIME_DOCTOR_RECOVERY_TOKEN_FILE` must be an owner-only, non-symlink token
+  file; `MINIME_DOCTOR_RECOVERY_ATTEMPTS` is bounded to 1-10.
+
+During a prolonged recovery-sink outage, the doctor keeps the current pending
+head in its owner-only state file and spills additional transitions into an
+ordered owner-only sidecar queue. Recovery requests contain at most 64 events;
+each acknowledged prefix is removed durably, and stable transition IDs make a
+crash replay idempotent. Do not delete the state file or its
+`.recovery-queue` sidecar while recovery delivery is pending.
+
+The recovery shadow plist runs every 300 seconds. Keep its `StartInterval`
+equal to the recovery configuration's required
+`runtimeDoctorCadenceSeconds`. The shipped
+`verificationFreshnessSeconds` is 660 seconds, strictly more than two doctor
+cadences, so normal scheduling jitter does not make a source stale. A future,
+missing, or expired heartbeat defers verification; it is never failure evidence.
+
+In tee and recovery modes, exhausted supervisor delivery triggers a throttled
+fixed native Telegram alert without including monitoring payload data. Keep the
+doctor's native Telegram/SOPS settings configured after changing sinks.
+
+These sink modes feed the observe-only recovery foundation. They do not enable
+Pi or Node remediation, model-selected actions, or mutating commands. A trusted
+Pi fixer, exact-session re-entry, action journal, independent two-slot recovery
+capsule, and offline bot rollback are deferred to a follow-up change.
+
+Tee and recovery modes also send an authenticated heartbeat on every doctor
+run, including unchanged healthy runs. Configure `MINIME_DOCTOR_ALERTMANAGER_URL`
+so the same post carries a deterministic Alertmanager-health observation; this
+prevents quiet sources from being mistaken for stale sources during recovery
+verification.
+
 ## Diagnostics and recovery
 
 If notifications stop, test the native delivery CLI first, then inspect the

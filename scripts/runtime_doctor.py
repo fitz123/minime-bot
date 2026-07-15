@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import http.client
 import json
 import logging
@@ -12,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import math
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -19,12 +21,14 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from monitoring_native import (
     DeliveryConfig,
     MonitoringError,
+    read_private_ascii_token,
     request_with_deadline,
     send_telegram,
 )
@@ -32,6 +36,10 @@ from monitoring_native import (
 STATE_VERSION = 1
 TCC_STATUS_MAX_BYTES = 1024
 STATE_MAX_BYTES = 64 * 1024
+RECOVERY_TOKEN_MAX_BYTES = 4 * 1024
+RECOVERY_BATCH_MAX_EVENTS = 64
+RECOVERY_FALLBACK_COOLDOWN_SECONDS = 300.0
+SUPERVISOR_UNAVAILABLE_MESSAGE = "MINIME RECOVERY SUPERVISOR\nsupervisor unavailable"
 ENV_PREFIX = "MINIME_DOCTOR_"
 INCIDENT_ACTIONS = {
     "alertmanager_unhealthy": "check Alertmanager health and recreate its current service",
@@ -66,6 +74,10 @@ class DoctorConfig:
     runtime_max_age: float
     tcc_status_path: Path | None
     log_path: Path | None
+    sink_mode: str
+    recovery_url: str | None
+    recovery_token_file: Path | None
+    recovery_attempts: int
 
     @classmethod
     def from_environ(cls, env: dict[str, str] | os._Environ[str] = os.environ) -> "DoctorConfig":
@@ -81,6 +93,34 @@ class DoctorConfig:
         runtime = env.get(f"{ENV_PREFIX}RUNTIME_STATE_PATH")
         tcc = env.get(f"{ENV_PREFIX}TCC_STATUS_PATH")
         log = env.get(f"{ENV_PREFIX}LOG_PATH")
+        sink_mode = env.get(f"{ENV_PREFIX}SINK", "telegram")
+        if sink_mode not in {"telegram", "tee", "recovery"}:
+            raise ValueError("sink mode is invalid")
+        recovery_url = env.get(f"{ENV_PREFIX}RECOVERY_URL") or None
+        recovery_token = env.get(f"{ENV_PREFIX}RECOVERY_TOKEN_FILE") or None
+        recovery_attempts = int(env.get(f"{ENV_PREFIX}RECOVERY_ATTEMPTS", "3"))
+        if not 1 <= recovery_attempts <= 10:
+            raise ValueError("recovery attempts are invalid")
+        if sink_mode in {"tee", "recovery"}:
+            if not recovery_url or not recovery_token:
+                raise ValueError("recovery sink is not configured")
+            parsed_recovery = urllib.parse.urlsplit(recovery_url)
+            if (
+                parsed_recovery.scheme != "http"
+                or parsed_recovery.hostname not in {"127.0.0.1", "localhost"}
+                or parsed_recovery.username is not None
+                or parsed_recovery.password is not None
+                or parsed_recovery.path != "/v1/runtime-doctor"
+                or parsed_recovery.query
+                or parsed_recovery.fragment
+            ):
+                raise ValueError("recovery URL is invalid")
+            try:
+                recovery_port = parsed_recovery.port
+            except ValueError:
+                raise ValueError("recovery URL is invalid") from None
+            if recovery_port is None or not 1 <= recovery_port <= 65535:
+                raise ValueError("recovery URL is invalid")
         urls = {
             name: env.get(f"{ENV_PREFIX}{name}") or None
             for name in ("BOT_METRICS_URL", "PROMETHEUS_URL", "ALERTMANAGER_URL")
@@ -111,6 +151,10 @@ class DoctorConfig:
             runtime_max_age=runtime_max_age,
             tcc_status_path=Path(tcc) if tcc else None,
             log_path=Path(log) if log else None,
+            sink_mode=sink_mode,
+            recovery_url=recovery_url,
+            recovery_token_file=Path(recovery_token) if recovery_token else None,
+            recovery_attempts=recovery_attempts,
         )
 
 
@@ -250,36 +294,62 @@ def incident_message(incidents: set[str]) -> str:
     return "\n".join(lines)
 
 
-def read_state(path: Path) -> tuple[set[str], bool]:
+def _read_state_document(path: Path) -> tuple[dict[str, Any] | None, bool]:
     descriptor: int | None = None
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > STATE_MAX_BYTES:
-            return set(), True
+            return None, True
         raw = os.read(descriptor, STATE_MAX_BYTES + 1)
         if len(raw) > STATE_MAX_BYTES:
-            return set(), True
+            return None, True
         value = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
-        return set(), False
+        return None, False
     except (OSError, UnicodeError, ValueError):
-        return set(), True
+        return None, True
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    incidents = value.get("incidents") if isinstance(value, dict) and value.get("version") == STATE_VERSION else None
+    incidents = (
+        value.get("incidents")
+        if isinstance(value, dict) and value.get("version") == STATE_VERSION
+        else None
+    )
     if not isinstance(incidents, list) or not all(
         isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents
     ):
-        return set(), True
-    return set(incidents), False
+        return None, True
+    pending = value.get("pending")
+    if pending is not None and not _valid_pending(pending):
+        return None, True
+    return value, False
 
 
-def write_state(path: Path, incidents: set[str]) -> None:
+def read_state(path: Path) -> tuple[set[str], bool]:
+    value, corrupt = _read_state_document(path)
+    if corrupt or value is None:
+        return set(), corrupt
+    pending = value.get("pending")
+    if isinstance(pending, dict) and pending["native_delivered"]:
+        return set(pending["target_incidents"]), False
+    return set(value["incidents"]), False
+
+
+def _write_state_document(
+    path: Path, incidents: set[str], pending: dict[str, Any] | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    document: dict[str, Any] = {
+        "version": STATE_VERSION,
+        "incidents": sorted(incidents),
+        "updated_at": int(time.time()),
+    }
+    if pending is not None:
+        document["pending"] = pending
     payload = json.dumps(
-        {"version": STATE_VERSION, "incidents": sorted(incidents), "updated_at": int(time.time())},
+        document,
         separators=(",", ":"),
     ) + "\n"
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
@@ -290,11 +360,393 @@ def write_state(path: Path, incidents: set[str]) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def write_state(path: Path, incidents: set[str]) -> None:
+    _write_state_document(path, incidents)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def doctor_transition_id(code: str, status: str, transition: str) -> str:
+    canonical = json.dumps(
+        ["runtime_doctor", code, status, transition],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _transition_events(previous: set[str], current: set[str]) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    for status, codes in (("resolved", previous - current), ("firing", current - previous)):
+        for code in sorted(codes):
+            transition = uuid.uuid4().hex
+            events.append(
+                {
+                    "code": code,
+                    "status": status,
+                    "transition": transition,
+                    "transition_id": doctor_transition_id(code, status, transition),
+                }
+            )
+    return events
+
+
+def _source_snapshot_events(current: set[str]) -> list[dict[str, str]]:
+    """Reconcile every known doctor code after local delivery state is lost."""
+
+    events: list[dict[str, str]] = []
+    for code in sorted(INCIDENT_ACTIONS):
+        status = "firing" if code in current else "resolved"
+        transition = uuid.uuid4().hex
+        events.append(
+            {
+                "code": code,
+                "status": status,
+                "transition": transition,
+                "transition_id": doctor_transition_id(code, status, transition),
+            }
+        )
+    return events
+
+
+def _recovery_queue_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.recovery-queue")
+
+
+def _valid_transition_event(event: Any) -> bool:
+    if not isinstance(event, dict) or set(event) != {
+        "code",
+        "status",
+        "transition",
+        "transition_id",
+    }:
+        return False
+    code = event.get("code")
+    status_value = event.get("status")
+    transition = event.get("transition")
+    supplied = event.get("transition_id")
+    return bool(
+        isinstance(code, str)
+        and code in INCIDENT_ACTIONS
+        and status_value in {"firing", "resolved"}
+        and isinstance(transition, str)
+        and transition
+        and isinstance(supplied, str)
+        and supplied == doctor_transition_id(code, status_value, transition)
+    )
+
+
+def _recovery_queue_items(
+    state_path: Path,
+) -> list[tuple[Path, list[dict[str, str]], set[str]]]:
+    queue_path = _recovery_queue_path(state_path)
+    if not queue_path.exists():
+        return []
+    if not queue_path.is_dir():
+        raise OSError("recovery queue is invalid")
+    items: list[tuple[Path, list[dict[str, str]], set[str]]] = []
+    for path in sorted(queue_path.glob("*.json")):
+        if (
+            not path.is_file()
+            or not re.fullmatch(r"[0-9]{20}\.json", path.name)
+            or path.stat().st_size > STATE_MAX_BYTES
+        ):
+            raise OSError("recovery queue is invalid")
+        try:
+            document = json.loads(path.read_text("ascii"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise OSError("recovery queue is invalid") from exc
+        events = document.get("events") if isinstance(document, dict) else None
+        target = document.get("target_incidents") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"events", "target_incidents", "version"}
+            or document.get("version") != 1
+            or not isinstance(events, list)
+            or not 1 <= len(events) <= RECOVERY_BATCH_MAX_EVENTS
+            or not all(_valid_transition_event(event) for event in events)
+            or not isinstance(target, list)
+            or not all(
+                isinstance(item, str) and item in INCIDENT_ACTIONS for item in target
+            )
+            or len(target) != len(set(target))
+        ):
+            raise OSError("recovery queue is invalid")
+        items.append((path, [dict(event) for event in events], set(target)))
+    return items
+
+
+def _enqueue_recovery_events(
+    state_path: Path, events: list[dict[str, str]], target: set[str]
+) -> None:
+    if not events:
+        return
+    queue_path = _recovery_queue_path(state_path)
+    queue_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(queue_path, 0o700)
+    existing = _recovery_queue_items(state_path)
+    sequence = int(existing[-1][0].stem) + 1 if existing else 1
+    for offset in range(0, len(events), RECOVERY_BATCH_MAX_EVENTS):
+        chunk = events[offset : offset + RECOVERY_BATCH_MAX_EVENTS]
+        destination = queue_path / f"{sequence:020d}.json"
+        document = {
+            "version": 1,
+            "events": chunk,
+            "target_incidents": sorted(target),
+        }
+        payload = json.dumps(
+            document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
+        descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=queue_path)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            _fsync_directory(queue_path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        sequence += 1
+
+
+def _remove_recovery_queue_item(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _advance_pending(
+    pending: dict[str, Any], current: set[str], state_path: Path
+) -> dict[str, Any]:
+    """Append transitions observed after an undelivered recovery batch."""
+
+    if pending.get("queue_first", False):
+        if current == set(pending["target_incidents"]):
+            return pending
+        # A reconciliation snapshot is authoritative only after every surviving
+        # older queue item. Replace the still-unsent snapshot with the newest
+        # complete source state instead of appending transitions ahead of it.
+        return {
+            "events": _source_snapshot_events(current),
+            "native_delivered": False,
+            "queue_first": True,
+            "target_incidents": sorted(current),
+        }
+
+    queued = _recovery_queue_items(state_path)
+    target = queued[-1][2] if queued else set(pending["target_incidents"])
+    reconciled = target != set(pending["target_incidents"])
+    if current == target:
+        if not reconciled:
+            return pending
+        return {
+            "events": list(pending["events"]),
+            "native_delivered": False,
+            "queue_first": False,
+            "target_incidents": sorted(target),
+        }
+
+    transitions = _transition_events(target, current)
+    inline = list(pending["events"])
+    if queued or len(inline) + len(transitions) > RECOVERY_BATCH_MAX_EVENTS:
+        _enqueue_recovery_events(state_path, transitions, current)
+    else:
+        inline.extend(transitions)
+    return {
+        "events": inline,
+        "native_delivered": False,
+        "queue_first": False,
+        "target_incidents": sorted(current),
+    }
+
+
+def _valid_pending(value: Any) -> bool:
+    required = {
+        "events",
+        "native_delivered",
+        "target_incidents",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(required),
+        frozenset({*required, "queue_first"}),
+    }:
+        return False
+    target = value.get("target_incidents")
+    events = value.get("events")
+    if (
+        not isinstance(target, list)
+        or not all(isinstance(item, str) and item in INCIDENT_ACTIONS for item in target)
+        or not isinstance(events, list)
+        or len(events) > RECOVERY_BATCH_MAX_EVENTS
+        or not isinstance(value.get("native_delivered"), bool)
+        or not isinstance(value.get("queue_first", False), bool)
+    ):
+        return False
+    return len(target) == len(set(target)) and all(
+        _valid_transition_event(event) for event in events
+    )
+
+
+def read_delivery_state(path: Path) -> tuple[set[str], dict[str, Any] | None, bool]:
+    value, corrupt = _read_state_document(path)
+    if corrupt or value is None:
+        return set(), None, corrupt
+    pending = value.get("pending")
+    if pending is not None and not isinstance(pending, dict):
+        return set(), None, True
+    if isinstance(pending, dict) and "queue_first" not in pending:
+        pending = {**pending, "queue_first": False}
+    return set(value["incidents"]), pending, False
+
+
+def write_delivery_state(
+    path: Path,
+    incidents: set[str],
+    pending: dict[str, Any] | None,
+) -> None:
+    _write_state_document(path, incidents, pending)
+
+
+def _read_recovery_token(path: Path) -> str:
+    try:
+        return read_private_ascii_token(path, max_bytes=RECOVERY_TOKEN_MAX_BYTES)
+    except MonitoringError as exc:
+        raise MonitoringError("recovery authentication is unavailable") from exc
+
+
+def send_recovery_events(
+    events: list[dict[str, str]],
+    config: DoctorConfig,
+    *,
+    heartbeats: dict[str, bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    if config.recovery_url is None or config.recovery_token_file is None:
+        raise MonitoringError("recovery sink is not configured")
+    token = _read_recovery_token(config.recovery_token_file)
+    body = json.dumps(
+        {
+            "version": 1,
+            "events": events,
+            "heartbeats": heartbeats or {"runtime_doctor": True},
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    for attempt in range(config.recovery_attempts):
+        retryable = True
+        try:
+            response = request_with_deadline(
+                config.recovery_url,
+                method="POST",
+                timeout=config.timeout,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                max_body=1024,
+            )
+            if 200 <= response.status < 300:
+                return
+            retryable = response.status in {408, 429} or response.status >= 500
+        except (http.client.HTTPException, TimeoutError, OSError):
+            pass
+        if not retryable or attempt + 1 >= config.recovery_attempts:
+            break
+        sleep(min(0.1 * (2**attempt), 1.0))
+    raise MonitoringError("recovery delivery failed")
+
+
+def _recovery_fallback_state_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.recovery-fallback")
+
+
+def _read_recovery_fallback_timestamp(path: Path) -> float:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 128:
+            return 0.0
+        value = float(os.read(descriptor, 129).decode("ascii").strip())
+        return value if math.isfinite(value) and value >= 0 else 0.0
+    except (OSError, UnicodeError, ValueError):
+        return 0.0
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_recovery_fallback_timestamp(path: Path, timestamp: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(f"{timestamp:.6f}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _notify_supervisor_unavailable(
+    config: DoctorConfig,
+    notify: Callable[[str], None],
+    logger: logging.Logger,
+    *,
+    now: float | None = None,
+) -> None:
+    timestamp = time.time() if now is None else now
+    state_path = _recovery_fallback_state_path(config.state_path)
+    last_notification = _read_recovery_fallback_timestamp(state_path)
+    if (
+        last_notification > 0
+        and timestamp - last_notification < RECOVERY_FALLBACK_COOLDOWN_SECONDS
+    ):
+        return
+    try:
+        notify(SUPERVISOR_UNAVAILABLE_MESSAGE)
+        _write_recovery_fallback_timestamp(state_path, timestamp)
+    except (MonitoringError, OSError):
+        logger.error("doctor_recovery_fallback_failed")
+
+
+def _clear_recovery_fallback(config: DoctorConfig) -> None:
+    try:
+        _recovery_fallback_state_path(config.state_path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def acquire_lock(path: Path) -> int | None:
@@ -316,6 +768,7 @@ def run_doctor(
     config: DoctorConfig,
     *,
     deliver: Callable[[str], None] | None = None,
+    deliver_recovery: Callable[[list[dict[str, str]]], None] | None = None,
     logger: logging.Logger | None = None,
 ) -> int:
     active_logger = logger or make_logger(config.log_path)
@@ -326,25 +779,156 @@ def run_doctor(
         return 0
     try:
         incidents = collect_incidents(config)
-        previous, corrupt = read_state(config.state_path)
-        if corrupt:
-            active_logger.error("doctor_state_corrupt_reset")
-            write_state(config.state_path, set())
+        notify = deliver or (lambda message: send_telegram(message, DeliveryConfig(config.chat_id, config.thread_id)))
+        if config.sink_mode == "telegram":
+            previous, corrupt = read_state(config.state_path)
+            if corrupt:
+                active_logger.error("doctor_state_corrupt_reset")
+                write_state(config.state_path, set())
+                return 0
+            if incidents == previous:
+                if not config.state_path.exists():
+                    write_state(config.state_path, incidents)
+                active_logger.info("doctor_state_unchanged codes=%s", ",".join(sorted(incidents)) or "healthy")
+                return 0
+            try:
+                notify(incident_message(incidents))
+            except (MonitoringError, OSError):
+                active_logger.error("doctor_notification_failed")
+                return 1
+            write_state(config.state_path, incidents)
+            active_logger.info("doctor_transition_notified codes=%s", ",".join(sorted(incidents)) or "recovered")
             return 0
+
+        state_missing = not config.state_path.exists()
+        previous, pending, corrupt = read_delivery_state(config.state_path)
+        if corrupt:
+            active_logger.error("doctor_state_corrupt_reconcile")
+        source_heartbeats = {"runtime_doctor": True}
+        if config.alertmanager_url is not None:
+            source_heartbeats["alertmanager"] = "alertmanager_unhealthy" not in incidents
+        recovery_notify = deliver_recovery or (
+            lambda events: send_recovery_events(
+                events, config, heartbeats=source_heartbeats
+            )
+        )
+        recovery_delivered = False
+
+        def recovery_sink_failed() -> None:
+            active_logger.error("doctor_recovery_sink_failed")
+            _notify_supervisor_unavailable(config, notify, active_logger)
+
+        def finish_pending(active: dict[str, Any]) -> tuple[bool, set[str]]:
+            nonlocal recovery_delivered
+            target = set(active["target_incidents"])
+            if config.sink_mode == "tee" and not active["native_delivered"]:
+                try:
+                    notify(incident_message(target))
+                except (MonitoringError, OSError):
+                    active_logger.error("doctor_notification_failed")
+                    return False, previous
+                active["native_delivered"] = True
+                write_delivery_state(config.state_path, previous, active)
+
+            def deliver_active_events() -> bool:
+                if not active["events"]:
+                    return True
+                try:
+                    recovery_notify(active["events"])
+                except (MonitoringError, OSError):
+                    recovery_sink_failed()
+                    return False
+                active["events"] = []
+                write_delivery_state(config.state_path, previous, active)
+                return True
+
+            def deliver_queued_events() -> bool:
+                try:
+                    queued = _recovery_queue_items(config.state_path)
+                except OSError:
+                    recovery_sink_failed()
+                    return False
+                for path, events, _queued_target in queued:
+                    try:
+                        recovery_notify(events)
+                        _remove_recovery_queue_item(path)
+                    except (MonitoringError, OSError):
+                        recovery_sink_failed()
+                        return False
+                return True
+
+            delivery_steps = (
+                (deliver_queued_events, deliver_active_events)
+                if active.get("queue_first", False)
+                else (deliver_active_events, deliver_queued_events)
+            )
+            if not all(step() for step in delivery_steps):
+                return False, previous
+            recovery_delivered = True
+            _clear_recovery_fallback(config)
+            write_delivery_state(config.state_path, target, None)
+            active_logger.info(
+                "doctor_transition_notified codes=%s",
+                ",".join(sorted(target)) or "recovered",
+            )
+            return True, target
+
+        if corrupt or state_missing:
+            pending = {
+                "events": _source_snapshot_events(incidents),
+                # A healthy first observation is source reconciliation, not a
+                # native recovery transition. Active incidents still preserve
+                # tee's direct native notification behavior.
+                "native_delivered": not incidents,
+                # Any surviving sidecar predates this authoritative snapshot.
+                "queue_first": True,
+                "target_incidents": sorted(incidents),
+            }
+            write_delivery_state(config.state_path, set(), pending)
+            completed, _target = finish_pending(pending)
+            return 0 if completed else 1
+
+        if pending is not None:
+            try:
+                advanced = _advance_pending(pending, incidents, config.state_path)
+            except OSError:
+                # A sidecar failure must not suppress tee's newest native state.
+                # Preserve a complete final reconciliation after the older queue
+                # so recovery can converge if the sidecar becomes readable again.
+                recovery_sink_failed()
+                advanced = {
+                    "events": _source_snapshot_events(incidents),
+                    "native_delivered": False,
+                    "queue_first": True,
+                    "target_incidents": sorted(incidents),
+                }
+            if advanced is not pending:
+                pending = advanced
+                write_delivery_state(config.state_path, previous, pending)
+            completed, previous = finish_pending(pending)
+            if not completed:
+                return 1
         if incidents == previous:
             if not config.state_path.exists():
-                write_state(config.state_path, incidents)
+                write_delivery_state(config.state_path, incidents, None)
+            if not recovery_delivered:
+                try:
+                    recovery_notify([])
+                except (MonitoringError, OSError):
+                    recovery_sink_failed()
+                    return 1
+                _clear_recovery_fallback(config)
             active_logger.info("doctor_state_unchanged codes=%s", ",".join(sorted(incidents)) or "healthy")
             return 0
-        notify = deliver or (lambda message: send_telegram(message, DeliveryConfig(config.chat_id, config.thread_id)))
-        try:
-            notify(incident_message(incidents))
-        except (MonitoringError, OSError):
-            active_logger.error("doctor_notification_failed")
-            return 1
-        write_state(config.state_path, incidents)
-        active_logger.info("doctor_transition_notified codes=%s", ",".join(sorted(incidents)) or "recovered")
-        return 0
+        pending = {
+            "events": _transition_events(previous, incidents),
+            "native_delivered": False,
+            "queue_first": False,
+            "target_incidents": sorted(incidents),
+        }
+        write_delivery_state(config.state_path, previous, pending)
+        completed, _target = finish_pending(pending)
+        return 0 if completed else 1
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)

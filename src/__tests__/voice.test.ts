@@ -282,11 +282,13 @@ describe("downloadFile", () => {
   it("creates fresh timeout state for every attempt", async () => {
     const originalFetch = globalThis.fetch;
     const signals: AbortSignal[] = [];
+    const initiallyAborted: boolean[] = [];
     let calls = 0;
     globalThis.fetch = ((_url, init) => {
       calls += 1;
       const signal = init?.signal as AbortSignal;
       signals.push(signal);
+      initiallyAborted.push(signal.aborted);
       if (calls === 1) {
         return new Promise((_resolve, reject) => {
           signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
@@ -299,8 +301,8 @@ describe("downloadFile", () => {
       await downloadFile("https://example.com/timeout", testDest, { timeoutMs: 5 });
       assert.strictEqual(calls, 2);
       assert.notStrictEqual(signals[0], signals[1]);
+      assert.deepStrictEqual(initiallyAborted, [false, false]);
       assert.strictEqual(signals[0].aborted, true);
-      assert.strictEqual(signals[1].aborted, false);
     } finally {
       globalThis.fetch = originalFetch;
     }

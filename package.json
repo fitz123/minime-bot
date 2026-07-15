@@ -38,11 +38,17 @@
     "scripts/monitoring_native.py",
     "scripts/alertmanager_webhook.py",
     "scripts/runtime_doctor.py",
+    "scripts/recovery_config.py",
+    "scripts/recovery_ledger.py",
+    "scripts/recovery_supervisor.py",
+    "scripts/recovery_cli.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/monitoring.md",
+    "docs/recovery.md",
+    "examples/recovery/*",
     "examples/monitoring/*"
   ],
   "keywords": [
