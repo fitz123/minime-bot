@@ -20,6 +20,7 @@ import {
   forbiddenRecoveryBashReason,
   isReadOnlyRecoveryBash,
   readRecoveryRuntimeContract,
+  type RecoveryRuntimeContract,
 } from "../../src/pi-extensions/recovery-protocol.js";
 
 function result(ok: boolean, message: string, details: Record<string, unknown> = {}) {
@@ -30,12 +31,14 @@ function result(ok: boolean, message: string, details: Record<string, unknown> =
   };
 }
 
-export default function (pi: ExtensionAPI): void {
+export function registerRecoveryExtension(
+  pi: ExtensionAPI,
+  contract: RecoveryRuntimeContract = readRecoveryRuntimeContract(),
+  client: RecoveryProtocolClient = new RecoveryProtocolClient(contract),
+): void {
   // Parse eagerly. A missing or malformed contract aborts extension loading,
   // which makes the recovery spawn fail closed before default tools are usable.
-  const contract = readRecoveryRuntimeContract();
-  const client = new RecoveryProtocolClient(contract);
-  const journal = new RecoveryToolJournal(client);
+  const journal = new RecoveryToolJournal(client, contract.mode);
 
   pi.on("tool_call", async (event: ToolCallEvent) => journal.before(event));
   pi.on("tool_result", async (event: ToolResultEvent) => journal.after(event));
@@ -241,4 +244,8 @@ export default function (pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+export default function (pi: ExtensionAPI): void {
+  registerRecoveryExtension(pi);
 }

@@ -115,10 +115,16 @@ spawn must carry the recovery-only extension; a missing wrapper or
 
 Install the package first, then copy `examples/recovery/recovery.json` and
 `examples/recovery/ai.minime.recovery-supervisor.plist` from that installed
-package. Replace every plist placeholder with the installed package root and
-control-workspace values. The supervisor requires both `--workspace` (or
-`MINIME_CONTROL_WORKSPACE_ROOT`) and `--config`; there is no raw path/timing
-fallback.
+package. Create an owner-only stable bootstrap directory outside the package,
+capsule, and bot release roots; copy `scripts/recovery_slots.py` and
+`scripts/recovery_config.py` into it and make both files read-only. Replace the
+plist's `__RECOVERY_BOOTSTRAP_ROOT__` with that directory and replace the
+control-workspace placeholders. The launch agent must enter through this stable
+copy of `recovery_slots.py ... capsule-bootstrap`, never through the mutable
+package's `recovery_supervisor.py`; bootstrap then validates and launches only
+the capsule `current` or its one `previous` fallback. The supervisor requires
+both `--workspace` (or `MINIME_CONTROL_WORKSPACE_ROOT`) and `--config`; there is
+no raw path/timing fallback.
 
 Create the dedicated private directories and both authentication tokens as the
 same account that runs the launch agent:
@@ -126,6 +132,10 @@ same account that runs the launch agent:
 ```sh
 umask 077
 mkdir -p /path/to/control-workspace/config /path/to/control-workspace/var/recovery
+mkdir -p /path/to/stable-recovery-bootstrap
+cp /path/to/installed/minime-bot/scripts/recovery_slots.py /path/to/installed/minime-bot/scripts/recovery_config.py /path/to/stable-recovery-bootstrap/
+chmod 500 /path/to/stable-recovery-bootstrap
+chmod 400 /path/to/stable-recovery-bootstrap/recovery_slots.py /path/to/stable-recovery-bootstrap/recovery_config.py
 chmod 700 /path/to/control-workspace/config /path/to/control-workspace/var/recovery
 /usr/bin/uuidgen > /path/to/control-workspace/config/recovery-auth-token
 /usr/bin/uuidgen > /path/to/control-workspace/config/recovery-fixer-auth-token

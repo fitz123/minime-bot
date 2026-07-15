@@ -471,7 +471,6 @@ describe("package artifact install", () => {
         Object.keys(recoveryProcessJson).sort(),
         [
           "activeIncidents",
-          "fixer",
           "mode",
           "ok",
           "reportsDelivered",
@@ -479,7 +478,6 @@ describe("package artifact install", () => {
           "verification",
         ],
       );
-      assert.equal(recoveryProcessJson.fixer, "idle");
       assert.equal(recoveryProcessJson.reportsQueued, 0);
       assert.equal(recoveryProcessJson.reportsDelivered, 0);
 
@@ -941,6 +939,7 @@ with tempfile.TemporaryDirectory() as directory:
                 probe_config.spool_directory / "notifications", delivery=None
             ),
             configured=probe_config,
+            verify_active_slots=False,
         )
         assert probe_service.accept(events, heartbeats={"alertmanager": True}).status == 200
         assert probe_service.accept(

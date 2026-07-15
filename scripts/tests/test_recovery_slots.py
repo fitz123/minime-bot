@@ -66,6 +66,12 @@ def runtime_tree(root: Path, *, domain: str, version: str) -> Path:
         write_file(source / "dist/recovery/fixer-session.js", "export {};\n", executable=True)
         write_file(source / "dist/extensions/pi/recovery.js", "export {};\n")
         for name in (
+            "codex-transport-overflow.js",
+            "knowledge-tools.js",
+            "web-tools.js",
+        ):
+            write_file(source / "dist/extensions/pi" / name, "export {};\n")
+        for name in (
             "config.js",
             "pi-rpc-protocol.js",
             "pi-extensions/recovery-mode.js",
@@ -95,8 +101,8 @@ def runtime_tree(root: Path, *, domain: str, version: str) -> Path:
 def runtime_policy(root: Path) -> tuple[dict[str, object], recovery_slots.CommandRunner]:
     node = root / "host/bin/node"
     pi = root / "host/bin/pi"
-    write_file(node, "node fixture\n", executable=True)
-    write_file(pi, "pi fixture\n", executable=True)
+    write_file(node, "#!/bin/sh\necho v22.19.0\n", executable=True)
+    write_file(pi, "#!/bin/sh\necho 0.80.6\n", executable=True)
 
     def runner(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[bytes]:
         if argv[1] == "--check":
@@ -241,15 +247,42 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
             slots.activate("previous")
             slots.activate("current")
             launched: list[str] = []
+            failed_process = mock.Mock(pid=4815)
+            failed_process.poll.return_value = None
 
             def launch(release: Path, _timeout: int) -> recovery_slots.StartupAttempt:
                 launched.append(release.name)
-                return recovery_slots.StartupAttempt(release.name == "previous", 1)
+                return recovery_slots.StartupAttempt(
+                    release.name == "previous",
+                    1,
+                    failed_process if release.name == "current" else None,
+                )
 
-            result = slots.boot_with(launch)
+            with mock.patch.object(
+                recovery_slots, "_terminate_startup_process"
+            ) as terminate:
+                result = slots.boot_with(launch)
             self.assertEqual(result.release_id, "previous")
             self.assertEqual(launched, ["current", "previous"])
+            terminate.assert_called_once_with(failed_process)
             self.assertTrue(slots.state.reconcile()["fallbackAttempted"])
+
+    def test_startup_process_cleanup_escalates_to_process_group_kill(self) -> None:
+        process = mock.Mock(pid=8123)
+        process.wait.side_effect = [subprocess.TimeoutExpired("capsule", 5), 0]
+        with mock.patch.object(recovery_slots.os, "killpg") as killpg:
+            recovery_slots._terminate_startup_process(process)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(8123, recovery_slots.signal.SIGTERM),
+                mock.call(8123, recovery_slots.signal.SIGKILL),
+            ],
+        )
+        self.assertEqual(
+            process.wait.call_args_list,
+            [mock.call(timeout=5), mock.call(timeout=5)],
+        )
 
     def test_stable_launcher_requires_authenticated_loopback_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -313,6 +346,87 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
 
 
 class RecoverySlotTransitionTests(unittest.TestCase):
+    def test_active_slot_release_revalidates_manifest_and_exact_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, runner = runtime_policy(root)
+            slot_policy = {
+                **policy,
+                "capsuleRoot": str(root / "capsules"),
+                "botReleaseRoot": str(root / "bots"),
+                "stateDirectory": str(root / "state"),
+                "startupHealthTimeoutSeconds": 5,
+            }
+            capsules = recovery_slots.CapsuleSlots(
+                root / "capsules",
+                root / "state",
+                startup_timeout_seconds=5,
+                command_runner=runner,
+            )
+            bots = recovery_slots.BotReleaseSlots(root / "bots", root / "state", ())
+            capsules.stage(
+                runtime_tree(root, domain="capsule", version="1.0.0"),
+                "capsule-active",
+                slot_policy,
+            )
+            capsules.activate("capsule-active")
+            bots.stage(
+                runtime_tree(root, domain="bot", version="1.0.0"),
+                "bot-active",
+            )
+            bots.activate("bot-active")
+            configured = SimpleNamespace(
+                slot_policy=slot_policy,
+                reviewed_operations=(),
+            )
+            self.assertEqual(
+                recovery_slots.active_slot_release(configured, "capsule")["releaseId"],
+                "capsule-active",
+            )
+            self.assertEqual(
+                recovery_slots.active_slot_release(configured, "bot")["releaseId"],
+                "bot-active",
+            )
+            corrupt(bots.store.release_path("bot-active") / "dist/main.js")
+            with self.assertRaises(recovery_slots.SlotValidationError):
+                recovery_slots.active_slot_release(configured, "bot")
+
+    def test_runtime_inventory_accepts_contained_links_and_rejects_unsafe_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = recovery_slots.BotReleaseSlots(root / "bot", root / "state", ())
+
+            contained = runtime_tree(root, domain="bot", version="1.0.0")
+            (contained / "dist/alias.js").symlink_to("main.js")
+            manifest = slots.stage(contained, "contained")
+            self.assertIn(
+                {"path": "dist/alias.js", "type": "symlink", "target": "main.js"},
+                manifest["files"],
+            )
+            self.assertTrue(
+                (slots.store.release_path("contained") / "dist/alias.js").is_symlink()
+            )
+
+            cases = (
+                ("absolute", "/tmp/minime-outside"),
+                ("escaping", "../../outside"),
+                ("dangling", "missing.js"),
+            )
+            (root / "outside").write_text("outside\n", encoding="utf-8")
+            for index, (name, target) in enumerate(cases, start=2):
+                source = runtime_tree(root, domain="bot", version=f"{index}.0.0")
+                (source / "dist/unsafe.js").symlink_to(target)
+                with self.subTest(name=name), self.assertRaises(
+                    recovery_slots.SlotValidationError
+                ):
+                    slots.stage(source, name)
+
+            if hasattr(os, "mkfifo"):
+                source = runtime_tree(root, domain="bot", version="5.0.0")
+                os.mkfifo(source / "dist/special")
+                with self.assertRaises(recovery_slots.SlotValidationError):
+                    slots.stage(source, "special")
+
     def test_interrupted_switch_is_completed_from_durable_intent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

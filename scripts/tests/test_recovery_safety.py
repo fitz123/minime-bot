@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -239,6 +240,78 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
                 )
                 self.assertEqual((status, result["code"]), (422, "manifest_invalid"))
 
+    def test_quarantine_detects_source_replacement_and_restore_never_clobbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            allowed = root / "allowed"
+            allowed.mkdir(mode=0o700)
+            source = allowed / "racy.bin"
+            source.write_bytes(b"original")
+            source.chmod(0o600)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                _coordinator, fence = active_fence(ledger)
+                quarantine = recovery_supervisor.RecoveryQuarantine(
+                    quarantine_policy(root, allowed)
+                )
+                quarantine_id, _intent = quarantine.request_description(
+                    fence,
+                    idempotency_key="racy-source",
+                    source_path=str(source),
+                )
+                saved_original = allowed / "saved-original.bin"
+                replacement = allowed / "replacement.bin"
+                real_rename = os.rename
+
+                def replace_before_rename(src: object, dst: object) -> None:
+                    if Path(src) == source:
+                        real_rename(source, saved_original)
+                        replacement.write_bytes(b"replacement")
+                        replacement.chmod(0o600)
+                        real_rename(replacement, source)
+                    real_rename(src, dst)
+
+                with mock.patch.object(
+                    recovery_supervisor.os,
+                    "rename",
+                    side_effect=replace_before_rename,
+                ), self.assertRaises(recovery_supervisor.RecoveryMutationUnknown):
+                    quarantine.quarantine(
+                        fence,
+                        quarantine_id=quarantine_id,
+                        source_path=str(source),
+                    )
+                self.assertEqual(saved_original.read_bytes(), b"original")
+                self.assertFalse(
+                    (
+                        root
+                        / "quarantine"
+                        / f"incident-{fence.incident_id}"
+                        / f"{quarantine_id}.item"
+                    ).exists()
+                )
+
+                clean_source = allowed / "clean.bin"
+                clean_source.write_bytes(b"clean")
+                clean_source.chmod(0o600)
+                clean_id, _intent = quarantine.request_description(
+                    fence,
+                    idempotency_key="restore-no-clobber",
+                    source_path=str(clean_source),
+                )
+                quarantine.quarantine(
+                    fence,
+                    quarantine_id=clean_id,
+                    source_path=str(clean_source),
+                )
+                clean_source.write_bytes(b"concurrent")
+                clean_source.chmod(0o600)
+                with self.assertRaisesRegex(
+                    recovery_supervisor.RecoverySafetyError,
+                    "restore_target_exists",
+                ):
+                    quarantine.restore(fence, quarantine_id=clean_id)
+                self.assertEqual(clean_source.read_bytes(), b"concurrent")
+
 
 class RecoveryReviewedOperationTests(unittest.TestCase):
     def test_static_id_execution_has_no_mutable_command_surface(self) -> None:
@@ -429,6 +502,40 @@ class RecoveryRootctlTests(unittest.TestCase):
                 recovery_rootctl.RootctlRequestError
             ):
                 recovery_rootctl.validate_request(request)
+
+    def test_rootctl_entrypoint_is_bounded_and_fail_closed(self) -> None:
+        command = [sys.executable, str(Path(recovery_rootctl.__file__).resolve())]
+        accepted = subprocess.run(
+            command,
+            input=json.dumps(self.request()).encode("ascii"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 3)
+        self.assertEqual(
+            accepted.stdout,
+            b'{"capabilityId":"restart-system-service","ok":false,"status":"unsupported_capability"}\n',
+        )
+        self.assertEqual(accepted.stderr, b"")
+
+        malformed = subprocess.run(
+            command,
+            input=b"{",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual((malformed.returncode, malformed.stdout), (2, b'{"ok":false,"status":"invalid_request"}\n'))
+
+        oversized = subprocess.run(
+            command,
+            input=b"x" * (recovery_rootctl.MAX_REQUEST_BYTES + 1),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual((oversized.returncode, oversized.stdout), (2, b'{"ok":false,"status":"invalid_request"}\n'))
 
 
 if __name__ == "__main__":

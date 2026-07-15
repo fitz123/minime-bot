@@ -1,11 +1,25 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  fchmodSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { request as httpRequest, type RequestOptions } from "node:http";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import {
   assertRecoveryToolCallAllowed,
   parseRecoveryMode,
-  recoveryModeAllowsMutation,
   type RecoveryMode,
 } from "./recovery-mode.js";
 
@@ -19,6 +33,8 @@ export const RECOVERY_ENV = Object.freeze({
   evidenceHash: "MINIME_RECOVERY_EVIDENCE_HASH",
   policyRevision: "MINIME_RECOVERY_POLICY_REVISION",
   leaseToken: "MINIME_RECOVERY_LEASE_TOKEN",
+  preimageDirectory: "MINIME_RECOVERY_PREIMAGE_DIRECTORY",
+  preimageMaxBytes: "MINIME_RECOVERY_PREIMAGE_MAX_BYTES",
 } as const);
 
 const MAX_TOKEN_BYTES = 4_096;
@@ -42,6 +58,15 @@ export interface RecoveryRuntimeContract {
   fixerCredentialFile: string;
   mode: "diagnose" | "enabled";
   fence: RecoveryFenceContract;
+  preimageDirectory: string;
+  preimageMaxBytes: number;
+}
+
+export interface RecoveryRuntimeVersions {
+  model: string;
+  node: string;
+  package: string;
+  pi: string;
 }
 
 export interface RecoverySessionBinding {
@@ -111,6 +136,26 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string): number {
   return parsed;
 }
 
+function nonNegativeInteger(env: NodeJS.ProcessEnv, name: string, maximum: number): number {
+  const value = requiredText(env, name, 32);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`Recovery fixer environment is invalid: ${name}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > maximum) {
+    throw new Error(`Recovery fixer environment is invalid: ${name}`);
+  }
+  return parsed;
+}
+
+function absolutePathEnv(env: NodeJS.ProcessEnv, name: string): string {
+  const value = requiredText(env, name);
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error(`Recovery fixer environment is invalid: ${name}`);
+  }
+  return value;
+}
+
 function loopbackEndpoint(value: string): URL {
   let endpoint: URL;
   try {
@@ -149,6 +194,8 @@ export function readRecoveryRuntimeContract(env: NodeJS.ProcessEnv = process.env
     endpoint: loopbackEndpoint(requiredText(env, RECOVERY_ENV.endpoint)),
     fixerCredentialFile: requiredText(env, RECOVERY_ENV.fixerCredentialFile),
     mode,
+    preimageDirectory: absolutePathEnv(env, RECOVERY_ENV.preimageDirectory),
+    preimageMaxBytes: nonNegativeInteger(env, RECOVERY_ENV.preimageMaxBytes, 16 * 1024 * 1024),
     fence: {
       invocationId: positiveInteger(env, RECOVERY_ENV.invocationId),
       incidentId: positiveInteger(env, RECOVERY_ENV.incidentId),
@@ -161,18 +208,21 @@ export function readRecoveryRuntimeContract(env: NodeJS.ProcessEnv = process.env
 }
 
 export function readPrivateRecoveryCredential(path: string): string {
+  let descriptor: number | undefined;
   let details;
   let raw: Buffer;
   try {
-    details = lstatSync(path);
-    raw = readFileSync(path);
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    details = fstatSync(descriptor);
+    raw = readFileSync(descriptor);
   } catch {
     throw new Error("Recovery fixer credential file is unavailable");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : details.uid;
   if (
     !details.isFile() ||
-    details.isSymbolicLink() ||
     details.uid !== uid ||
     (details.mode & 0o077) !== 0 ||
     raw.length < 16 ||
@@ -271,7 +321,9 @@ export class RecoveryProtocolClient {
     return (await this.request("/v1/fixer/heartbeat", {})).ok;
   }
 
-  async bindSession(binding: Omit<RecoverySessionBinding, "bindingId" | "generation">): Promise<number> {
+  async bindSession(
+    binding: Omit<RecoverySessionBinding, "bindingId" | "generation"> & { runtime: RecoveryRuntimeVersions },
+  ): Promise<number> {
     const response = await this.request("/v1/fixer/session/bind", binding);
     const bindingId = response.body.bindingId;
     if (!response.ok || !Number.isSafeInteger(bindingId) || Number(bindingId) < 1) {
@@ -291,6 +343,7 @@ export class RecoveryProtocolClient {
     transcriptPath: string;
     startupClassifier: "no_session_found";
     journalDigest: string;
+    runtime: RecoveryRuntimeVersions;
   }): Promise<number> {
     const response = await this.request("/v1/fixer/session/replace", payload);
     const bindingId = response.body.bindingId;
@@ -373,6 +426,8 @@ const READ_ONLY_TOOLS = new Set([
   "knowledge_search",
   "ls",
   "read",
+  "web_fetch",
+  "web_search",
 ]);
 
 const READ_ONLY_COMMANDS = new Set([
@@ -466,6 +521,21 @@ const PACKAGE_MUTATORS = new Set([
 ]);
 const DELETERS = new Set(["rm", "rmdir", "shred", "unlink"]);
 const SECRET_EXECUTABLES = new Set(["gpg", "openssl", "pass", "security", "ssh-keygen"]);
+const OPAQUE_COMMAND_WRAPPERS = new Set([
+  "builtin", "command", "exec", "nice", "nohup", "time", "xargs",
+]);
+const NESTED_SHELLS = new Set(["bash", "dash", "fish", "ksh", "sh", "zsh"]);
+const EVALUATOR_FLAGS = new Map<string, Set<string>>([
+  ["node", new Set(["-e", "--eval"])],
+  ["perl", new Set(["-e"])],
+  ["python", new Set(["-c"])],
+  ["python3", new Set(["-c"])],
+  ["ruby", new Set(["-e"])],
+]);
+const NETWORK_GIT = new Set([
+  "archive", "clone", "fetch", "ls-remote", "pull", "push", "send-email", "submodule",
+]);
+const LOCAL_GIT = new Set([...READ_ONLY_GIT, "add", "commit"]);
 const SECRET_ARGUMENT = /(?:^|[./_-])(?:auth|credential|id_rsa|password|private[-_]?key|secret|token)(?:$|[./_=-])|(?:^|\/)\.env(?:$|[./_-])/i;
 const SUPERVISOR_RECOVERY_TOOLS = new Set([
   "recovery_blocked",
@@ -503,6 +573,11 @@ export function forbiddenRecoveryBashReason(command: unknown): RecoveryGuardCate
     const executable = (words[0].split("/").pop() ?? words[0]);
     const args = words.slice(1);
     if (words.includes("sudo") || executable === "sudo") return "privilege-escalation";
+    if (NESTED_SHELLS.has(executable) || OPAQUE_COMMAND_WRAPPERS.has(executable)) {
+      return "ambiguous-shell";
+    }
+    const evaluatorFlags = EVALUATOR_FLAGS.get(executable);
+    if (evaluatorFlags && args.some((arg) => evaluatorFlags.has(arg))) return "ambiguous-shell";
     if (DELETERS.has(executable) || ["dd", "mkfs", "truncate", "wipefs"].includes(executable) || (executable === "find" && args.some((arg) =>
       ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg)))) {
       return "irreversible-deletion";
@@ -512,11 +587,13 @@ export function forbiddenRecoveryBashReason(command: unknown): RecoveryGuardCate
       return "package-or-image-download";
     }
     if (executable === "git") {
+      if (args.includes("-c")) return "ambiguous-shell";
       const subcommand = gitSubcommand(segment.slice(1))?.toLowerCase();
-      if (["push", "send-email"].includes(subcommand ?? "")) return "external-mutation";
+      if (NETWORK_GIT.has(subcommand ?? "")) return "external-mutation";
       if (["clean"].includes(subcommand ?? "") || (subcommand === "reset" && args.includes("--hard"))) {
         return "irreversible-deletion";
       }
+      if (!LOCAL_GIT.has(subcommand ?? "")) return "ambiguous-shell";
     }
     if (executable === "docker" || executable === "podman") {
       if (args.includes("prune") || args[0] === "volume") return "prune-or-volume";
@@ -545,6 +622,7 @@ export function forbiddenRecoveryToolReason(
   event: Pick<ToolCallEvent, "toolName" | "input">,
 ): RecoveryGuardCategory | undefined {
   const input = event.input as Record<string, unknown>;
+  if (["web_fetch", "web_search"].includes(event.toolName)) return undefined;
   if (event.toolName === "bash") return forbiddenRecoveryBashReason(input.command);
   if (["edit", "write", "read"].includes(event.toolName)) {
     const path = typeof input.path === "string" ? input.path : "";
@@ -614,6 +692,135 @@ export function summarizeRecoveryIntent(event: Pick<ToolCallEvent, "toolName" | 
   return summary;
 }
 
+function privatePreimageDirectory(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const descriptor = openSync(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const details = fstatSync(descriptor);
+    const uid = typeof process.getuid === "function" ? process.getuid() : details.uid;
+    if (!details.isDirectory() || details.uid !== uid) {
+      throw new Error("Recovery preimage directory is unsafe");
+    }
+    fchmodSync(descriptor, 0o700);
+    if ((fstatSync(descriptor).mode & 0o077) !== 0) {
+      throw new Error("Recovery preimage directory is unsafe");
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function existingPreimageMatches(path: string, expectedSha256: string): boolean {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const details = fstatSync(descriptor);
+    const uid = typeof process.getuid === "function" ? process.getuid() : details.uid;
+    if (!details.isFile() || details.uid !== uid || (details.mode & 0o077) !== 0) return false;
+    return createHash("sha256").update(readFileSync(descriptor)).digest("hex") === expectedSha256;
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function writePrivatePreimage(path: string, content: Buffer, expectedSha256: string): void {
+  privatePreimageDirectory(dirname(path));
+  if (existsSync(path)) {
+    if (!existingPreimageMatches(path, expectedSha256)) {
+      throw new Error("Recovery preimage conflicts with an existing capture");
+    }
+    return;
+  }
+  const temporary = `${path}.pending-${process.pid}`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    let offset = 0;
+    while (offset < content.length) {
+      offset += writeSync(descriptor, content, offset, content.length - offset);
+    }
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    try {
+      linkSync(temporary, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !existingPreimageMatches(path, expectedSha256)) {
+        throw error;
+      }
+    }
+    const directory = openSync(dirname(path), fsConstants.O_RDONLY);
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The temporary was renamed or cleanup is best effort after a failed write.
+    }
+  }
+}
+
+function captureRecoveryPreimage(
+  event: Pick<ToolCallEvent, "toolCallId" | "toolName" | "input">,
+  contract: RecoveryRuntimeContract,
+): Record<string, unknown> | undefined {
+  if (!new Set(["edit", "write"]).has(event.toolName)) return undefined;
+  const input = event.input as Record<string, unknown>;
+  if (typeof input.path !== "string" || !input.path || input.path.includes("\0")) {
+    throw new Error("Recovery mutation path is invalid");
+  }
+  const target = resolve(input.path);
+  let details;
+  try {
+    details = lstatSync(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { state: "absent", pathSha256: digest(target) };
+    }
+    throw error;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : details.uid;
+  if (!details.isFile() || details.isSymbolicLink() || details.uid !== uid || details.size > contract.preimageMaxBytes) {
+    throw new Error("Recovery mutation preimage is unavailable or exceeds policy");
+  }
+  const descriptor = openSync(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let content: Buffer;
+  try {
+    const opened = fstatSync(descriptor);
+    if (opened.dev !== details.dev || opened.ino !== details.ino || opened.size > contract.preimageMaxBytes) {
+      throw new Error("Recovery mutation preimage changed during capture");
+    }
+    content = readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  const contentSha256 = createHash("sha256").update(content).digest("hex");
+  const name = `${digest(`${contract.fence.invocationId}:${event.toolCallId}:${target}`)}.preimage`;
+  const reference = join(contract.preimageDirectory, name);
+  writePrivatePreimage(reference, content, contentSha256);
+  return {
+    state: "captured",
+    reference,
+    contentSha256,
+    sizeBytes: content.length,
+    pathSha256: digest(target),
+  };
+}
+
 export function summarizeRecoveryOutcome(event: Pick<ToolResultEvent, "isError" | "content">): Record<string, unknown> {
   return {
     isError: event.isError,
@@ -658,7 +865,10 @@ export class RecoveryToolJournal {
     const actionKey = event.toolCallId;
     let accepted = false;
     try {
-      accepted = await this.client.intent(actionKey, event.toolName, summarizeRecoveryIntent(event));
+      const summary = summarizeRecoveryIntent(event);
+      const preimage = captureRecoveryPreimage(event, this.client.contract);
+      if (preimage) summary.preimage = preimage;
+      accepted = await this.client.intent(actionKey, event.toolName, summary);
     } catch {
       accepted = false;
     }
@@ -685,8 +895,4 @@ export class RecoveryToolJournal {
       throw new Error("Recovery mutation outcome was not durably journaled");
     }
   }
-}
-
-export function recoveryMutationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return recoveryModeAllowsMutation(readRecoveryRuntimeContract(env).mode);
 }

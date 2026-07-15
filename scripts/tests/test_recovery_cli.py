@@ -783,7 +783,6 @@ class RecoveryCliTests(unittest.TestCase):
                     "mode",
                     "activeIncidents",
                     "verification",
-                    "fixer",
                     "reportsQueued",
                     "reportsDelivered",
                 },
@@ -791,7 +790,6 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(result["mode"], "observe")
             self.assertEqual(result["activeIncidents"], 1)
             self.assertEqual(result["verification"], [])
-            self.assertEqual(result["fixer"], "idle")
             self.assertEqual(result["reportsQueued"], 0)
             self.assertEqual(result["reportsDelivered"], 0)
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:

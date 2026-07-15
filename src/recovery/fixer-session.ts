@@ -8,18 +8,21 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   realpathSync,
   statSync,
 } from "node:fs";
-import { basename, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.js";
 import {
   NewlineOnlyJsonlSplitter,
+  PI_RECOVERY_WRAPPER_RELPATHS,
   PiStartupBlockingUiError,
+  normalizePiModel,
   parsePiStartupRecord,
   piExtensionRelpathForDir,
   readPiStream,
@@ -30,17 +33,15 @@ import {
   type PiSpawnRuntimeEnvOptions,
   type PiStartupDiagnostics,
 } from "../pi-rpc-protocol.js";
-import {
-  assertRequiredRecoveryExtensionLoaded,
-  resolveRequiredRecoveryExtensionArgs,
-  type RecoveryMode,
-} from "../pi-extensions/recovery-mode.js";
+import { resolveRequiredRecoveryExtensionArgs, type RecoveryMode } from "../pi-extensions/recovery-mode.js";
 import {
   RecoveryProtocolClient,
   readRecoveryRuntimeContract,
   type RecoveryFixerState,
+  type RecoveryRuntimeVersions,
   type RecoverySessionBinding,
 } from "../pi-extensions/recovery-protocol.js";
+import { EXPECTED_PI_PACKAGE_VERSION } from "../pi-runtime.js";
 import { waitForSpawn } from "../session-manager.js";
 import type { AgentConfig, ResultMessage } from "../types.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
@@ -49,8 +50,10 @@ export const RECOVERY_RUNNER_ENV = Object.freeze({
   agentId: "MINIME_RECOVERY_AGENT_ID",
   sessionRoot: "MINIME_RECOVERY_SESSION_ROOT",
   startupTimeoutSeconds: "MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS",
+  resumeTimeoutSeconds: "MINIME_RECOVERY_RESUME_TIMEOUT_SECONDS",
   renewSeconds: "MINIME_RECOVERY_RENEW_SECONDS",
   runTimeoutSeconds: "MINIME_RECOVERY_RUN_TIMEOUT_SECONDS",
+  piExecutable: "MINIME_RECOVERY_PI_EXECUTABLE",
   supervisorProcessGroup: "MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP",
 } as const);
 
@@ -100,8 +103,10 @@ interface RecoveryRunnerContract {
   agentId: string;
   sessionRoot: string;
   startupTimeoutMs: number;
+  resumeTimeoutMs: number;
   renewMs: number;
   runTimeoutMs: number;
+  piExecutable: string;
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -123,14 +128,24 @@ function secondsEnv(env: NodeJS.ProcessEnv, key: string, fallbackMs: number, max
   return seconds * 1_000;
 }
 
+function absoluteRunnerPath(env: NodeJS.ProcessEnv, key: string): string {
+  const value = requiredEnv(env, key);
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error(`Recovery runner environment is invalid: ${key}`);
+  }
+  return value;
+}
+
 export function readRecoveryRunnerContract(env: NodeJS.ProcessEnv = process.env): RecoveryRunnerContract {
-  const sessionRoot = normalize(resolve(requiredEnv(env, RECOVERY_RUNNER_ENV.sessionRoot)));
+  const sessionRoot = absoluteRunnerPath(env, RECOVERY_RUNNER_ENV.sessionRoot);
   return {
     agentId: requiredEnv(env, RECOVERY_RUNNER_ENV.agentId),
     sessionRoot,
     startupTimeoutMs: secondsEnv(env, RECOVERY_RUNNER_ENV.startupTimeoutSeconds, DEFAULT_STARTUP_TIMEOUT_MS, 300),
+    resumeTimeoutMs: secondsEnv(env, RECOVERY_RUNNER_ENV.resumeTimeoutSeconds, DEFAULT_STARTUP_TIMEOUT_MS, 300),
     renewMs: secondsEnv(env, RECOVERY_RUNNER_ENV.renewSeconds, DEFAULT_RENEW_MS, 3_600),
     runTimeoutMs: secondsEnv(env, RECOVERY_RUNNER_ENV.runTimeoutSeconds, DEFAULT_RUN_TIMEOUT_MS, 86_400),
+    piExecutable: absoluteRunnerPath(env, RECOVERY_RUNNER_ENV.piExecutable),
   };
 }
 
@@ -280,11 +295,12 @@ export async function captureRecoverySessionId(child: ChildProcess, timeoutMs: n
 export async function terminateRecoveryProcessGroup(
   child: ChildProcess,
   processKill: (pid: number, signal: NodeJS.Signals) => void = process.kill,
+  ownsProcessGroup = true,
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const pid = child.pid;
   try {
-    if (pid) processKill(-pid, "SIGTERM");
+    if (pid && ownsProcessGroup) processKill(-pid, "SIGTERM");
     else child.kill("SIGTERM");
   } catch {
     child.kill("SIGTERM");
@@ -299,7 +315,7 @@ export async function terminateRecoveryProcessGroup(
     killTimer = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
         try {
-          if (pid) processKill(-pid, "SIGKILL");
+          if (pid && ownsProcessGroup) processKill(-pid, "SIGKILL");
           else child.kill("SIGKILL");
         } catch {
           child.kill("SIGKILL");
@@ -326,11 +342,11 @@ export function recoveryExtensionOptions(
   const relpath = piExtensionRelpathForDir(contract.paths.piExtensionDir, "recovery.ts");
   const extensionPath = resolve(contract.paths.piExtensionDir, relpath);
   resolveRequiredRecoveryExtensionArgs(mode, extensionPath, { env });
-  const options: PiSpawnExtensionOptions = { extraExtensions: [extensionPath], env };
-  // This also provides a direct test of the actual spawn argument contract and
-  // guarantees the recovery wrapper is not merely present on disk.
-  assertRequiredRecoveryExtensionLoaded(mode, extensionPath, ["--extension", extensionPath], { env });
-  return options;
+  return {
+    extraExtensions: [extensionPath],
+    relpaths: PI_RECOVERY_WRAPPER_RELPATHS,
+    env,
+  };
 }
 
 export function recoveryStartsNewPiProcessGroup(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -341,6 +357,7 @@ function runtimeEnv(
   contract: ReturnType<typeof readRecoveryRuntimeContract>,
   sessionDirectory: string,
   agentId: string,
+  piExecutable: string,
   env: NodeJS.ProcessEnv = process.env,
 ): PiSpawnRuntimeEnvOptions {
   return {
@@ -361,7 +378,28 @@ function runtimeEnv(
       policyRevision: contract.fence.policyRevision,
       leaseToken: contract.fence.leaseToken,
       sessionDirectory,
+      piExecutable,
+      preimageDirectory: contract.preimageDirectory,
+      preimageMaxBytes: contract.preimageMaxBytes,
     },
+  };
+}
+
+function recoveryRuntimeVersions(agent: AgentConfig): RecoveryRuntimeVersions {
+  let packageVersion = "unreported";
+  try {
+    const manifest = JSON.parse(
+      readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
+    ) as { version?: unknown };
+    if (typeof manifest.version === "string" && manifest.version.trim()) packageVersion = manifest.version.trim();
+  } catch {
+    // Binding remains available with an explicit degraded package version.
+  }
+  return {
+    model: normalizePiModel(agent.model),
+    node: process.version,
+    package: packageVersion,
+    pi: EXPECTED_PI_PACKAGE_VERSION,
   };
 }
 
@@ -406,6 +444,7 @@ async function spawnBoundSession(
   const extensionOptions = recoveryExtensionOptions(protocol.mode, options.env);
   const spawn = options.spawn ?? spawnPiRpcSession;
   const prior = state.currentSession ?? state.resumeSession;
+  const runtime = recoveryRuntimeVersions(agent);
   let previousInspection: RecoveryTranscriptInspection | undefined;
   if (prior) {
     previousInspection = inspectRecoveryTranscript(prior.sessionDirectory, prior.transcriptPath, prior.sessionId);
@@ -414,15 +453,15 @@ async function spawnBoundSession(
       agent,
       prior.sessionId,
       extensionOptions,
-      runtimeEnv(protocol, prior.sessionDirectory, runner.agentId, options.env),
+      runtimeEnv(protocol, prior.sessionDirectory, runner.agentId, runner.piExecutable, options.env),
     );
     try {
-      const observedId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
+      const observedId = await captureRecoverySessionId(child, runner.resumeTimeoutMs);
       if (observedId !== prior.sessionId) throw new Error("Recovery Pi resumed a different session id");
       const transcriptPath = await discoverCanonicalRecoveryTranscript(
         prior.sessionDirectory,
         prior.sessionId,
-        runner.startupTimeoutMs,
+        runner.resumeTimeoutMs,
         options,
       );
       if (normalize(transcriptPath) !== normalize(prior.transcriptPath)) {
@@ -434,6 +473,7 @@ async function spawnBoundSession(
           sessionId: prior.sessionId,
           sessionDirectory: prior.sessionDirectory,
           transcriptPath,
+          runtime,
         });
       if (!(await client.markSessionResumed(bindingId))) {
         throw new Error("Recovery session resume was not durably recorded");
@@ -448,7 +488,11 @@ async function spawnBoundSession(
       };
     } catch (error) {
       const classified = hasNoSessionFoundClassifier(child);
-      await terminateRecoveryProcessGroup(child, options.processKill);
+      await terminateRecoveryProcessGroup(
+        child,
+        options.processKill,
+        recoveryStartsNewPiProcessGroup(options.env),
+      );
       if (previousInspection.readable || !classified) throw error;
     }
   }
@@ -463,7 +507,7 @@ async function spawnBoundSession(
     agent,
     undefined,
     extensionOptions,
-    runtimeEnv(protocol, sessionDirectory, runner.agentId, options.env),
+    runtimeEnv(protocol, sessionDirectory, runner.agentId, runner.piExecutable, options.env),
   );
   try {
     const sessionId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
@@ -481,11 +525,16 @@ async function spawnBoundSession(
         transcriptPath,
         startupClassifier: "no_session_found",
         journalDigest: state.journalDigest,
+        runtime,
       })
-      : await client.bindSession({ sessionId, sessionDirectory, transcriptPath });
+      : await client.bindSession({ sessionId, sessionDirectory, transcriptPath, runtime });
     return { child, bindingId, sessionId, sessionDirectory, transcriptPath, replaced: Boolean(prior) };
   } catch (error) {
-    await terminateRecoveryProcessGroup(child, options.processKill);
+    await terminateRecoveryProcessGroup(
+      child,
+      options.processKill,
+      recoveryStartsNewPiProcessGroup(options.env),
+    );
     throw error;
   }
 }
@@ -518,18 +567,30 @@ export async function runRecoveryFixer(options: RecoveryFixerRunnerOptions = {})
     try {
       if (!(await client.heartbeat())) {
         terminal = "lease_lost";
-        await terminateRecoveryProcessGroup(handle.child, options.processKill);
+        await terminateRecoveryProcessGroup(
+          handle.child,
+          options.processKill,
+          recoveryStartsNewPiProcessGroup(options.env),
+        );
       }
     } catch {
       terminal = "lease_lost";
-      await terminateRecoveryProcessGroup(handle.child, options.processKill);
+      await terminateRecoveryProcessGroup(
+        handle.child,
+        options.processKill,
+        recoveryStartsNewPiProcessGroup(options.env),
+      );
     } finally {
       renewing = false;
     }
   }, runner.renewMs);
   const timeout = setTimeout(async () => {
     terminal = "timed_out";
-    await terminateRecoveryProcessGroup(handle.child, options.processKill);
+    await terminateRecoveryProcessGroup(
+      handle.child,
+      options.processKill,
+      recoveryStartsNewPiProcessGroup(options.env),
+    );
   }, runner.runTimeoutMs);
   try {
     const promptId = sendPiPrompt(handle.child, buildIncidentPrompt(state));
@@ -546,7 +607,11 @@ export async function runRecoveryFixer(options: RecoveryFixerRunnerOptions = {})
   } finally {
     clearInterval(renewTimer);
     clearTimeout(timeout);
-    await terminateRecoveryProcessGroup(handle.child, options.processKill);
+    await terminateRecoveryProcessGroup(
+      handle.child,
+      options.processKill,
+      recoveryStartsNewPiProcessGroup(options.env),
+    );
   }
 }
 

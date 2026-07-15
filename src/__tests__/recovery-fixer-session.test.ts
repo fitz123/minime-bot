@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import {
   chmodSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -11,11 +14,13 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import type { ChildProcess } from "node:child_process";
-import type { ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import {
   PI_EXTENSION_WRAPPER_RELPATHS,
+  PI_RECOVERY_WRAPPER_RELPATHS,
   buildPiSpawnArgs,
   buildPiSpawnEnv,
   type PiStartupDiagnostics,
@@ -26,6 +31,7 @@ import {
   forbiddenRecoveryBashReason,
   forbiddenRecoveryToolReason,
   isReadOnlyRecoveryBash,
+  readPrivateRecoveryCredential,
   readRecoveryRuntimeContract,
   summarizeRecoveryIntent,
 } from "../pi-extensions/recovery-protocol.js";
@@ -35,6 +41,7 @@ import {
   discoverCanonicalRecoveryTranscript,
   hasNoSessionFoundClassifier,
   inspectRecoveryTranscript,
+  runRecoveryFixer,
   recoveryStartsNewPiProcessGroup,
   terminateRecoveryProcessGroup,
 } from "../recovery/fixer-session.js";
@@ -45,9 +52,12 @@ afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function runtimeEnv(mode: "diagnose" | "enabled" = "enabled"): NodeJS.ProcessEnv {
+function runtimeEnv(
+  mode: "diagnose" | "enabled" = "enabled",
+  endpoint = "http://127.0.0.1:9877",
+): NodeJS.ProcessEnv {
   return {
-    MINIME_RECOVERY_ENDPOINT: "http://127.0.0.1:9877",
+    MINIME_RECOVERY_ENDPOINT: endpoint,
     MINIME_RECOVERY_FIXER_CREDENTIAL_FILE: "/private/fixer-token",
     MINIME_RECOVERY_MODE: mode,
     MINIME_RECOVERY_INVOCATION_ID: "7",
@@ -56,6 +66,8 @@ function runtimeEnv(mode: "diagnose" | "enabled" = "enabled"): NodeJS.ProcessEnv
     MINIME_RECOVERY_EVIDENCE_HASH: "a".repeat(64),
     MINIME_RECOVERY_POLICY_REVISION: "2",
     MINIME_RECOVERY_LEASE_TOKEN: "b".repeat(48),
+    MINIME_RECOVERY_PREIMAGE_DIRECTORY: "/private/preimages",
+    MINIME_RECOVERY_PREIMAGE_MAX_BYTES: "1048576",
   };
 }
 
@@ -116,6 +128,9 @@ describe("exact-session recovery fixer", () => {
         policyRevision: contract.fence.policyRevision,
         leaseToken: contract.fence.leaseToken,
         sessionDirectory: "/private/sessions/incident-4",
+        piExecutable: "/usr/local/bin/pi",
+        preimageDirectory: "/private/preimages",
+        preimageMaxBytes: 1_048_576,
       },
     });
     assert.equal(env.MINIME_RECOVERY_FIXER_CREDENTIAL_FILE, "/private/fixer-token");
@@ -214,6 +229,12 @@ describe("exact-session recovery fixer", () => {
 
   it("keeps the recovery wrapper non-default and the runner independent of chat bindings", () => {
     assert.equal(PI_EXTENSION_WRAPPER_RELPATHS.some((path) => path.includes("recovery")), false);
+    assert.deepEqual(PI_RECOVERY_WRAPPER_RELPATHS, [
+      "codex-transport-overflow.ts",
+      "web-tools.ts",
+      "knowledge-tools.ts",
+    ]);
+    assert.equal(PI_RECOVERY_WRAPPER_RELPATHS.some((path) => /subagent|ask-agent/.test(path)), false);
     const source = readFileSync(resolve("src/recovery/fixer-session.ts"), "utf8");
     assert.doesNotMatch(source, /new SessionManager|chatId|--no-session/);
     assert.match(source, /sendPiGetState|sendPiPrompt/);
@@ -235,6 +256,217 @@ describe("exact-session recovery fixer", () => {
     assert.match(vendorMain, /PI_CODING_AGENT_SESSION_DIR|ENV_SESSION_DIR/);
     assert.match(vendorMain, /No session found matching/);
     assert.match(vendorRpc, /sessionId: session\.sessionId/);
+  });
+
+  it("validates private credentials and every fenced protocol route over loopback HTTP", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-client-"));
+    temporary.push(root);
+    const tokenPath = join(root, "fixer-token");
+    writeFileSync(tokenPath, "synthetic-fixer-token-value\n", { mode: 0o600 });
+    assert.equal(readPrivateRecoveryCredential(tokenPath), "synthetic-fixer-token-value");
+    chmodSync(tokenPath, 0o644);
+    assert.throws(() => readPrivateRecoveryCredential(tokenPath), /invalid/);
+    chmodSync(tokenPath, 0o600);
+
+    const requests: Array<{ path: string; authorization: string; body: Record<string, unknown> }> = [];
+    let responseMode: "normal" | "invalid" | "oversized" | "timeout" = "normal";
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        if (responseMode === "timeout") return;
+        if (responseMode === "invalid") {
+          response.end("not-json");
+          return;
+        }
+        if (responseMode === "oversized") {
+          response.end("x".repeat(256 * 1024 + 1));
+          return;
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        requests.push({
+          path: request.url ?? "",
+          authorization: String(request.headers.authorization ?? ""),
+          body,
+        });
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify(
+          request.url === "/v1/fixer/state"
+            ? { mode: "enabled", evidence: [], unknownActions: [], journalDigest: "" }
+            : request.url?.includes("session/")
+              ? { ok: true, bindingId: 9 }
+              : { ok: true },
+        ));
+      });
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const env = runtimeEnv("enabled", `http://127.0.0.1:${address.port}`);
+    env.MINIME_RECOVERY_FIXER_CREDENTIAL_FILE = tokenPath;
+    env.MINIME_RECOVERY_PREIMAGE_DIRECTORY = join(root, "preimages");
+    const contract = readRecoveryRuntimeContract(env);
+    const client = new RecoveryProtocolClient(contract, { timeoutMs: 50 });
+    const runtime = { model: "openai-codex/gpt-5.5", node: "v22.0.0", package: "1.0.0", pi: "0.80.6" };
+    await client.state();
+    await client.heartbeat();
+    await client.bindSession({ sessionId: "s", sessionDirectory: "/s", transcriptPath: "/s/s.jsonl", runtime });
+    await client.markSessionResumed(9);
+    await client.replaceSession({
+      previousBindingId: 9,
+      sessionId: "s2",
+      sessionDirectory: "/s2",
+      transcriptPath: "/s2/s2.jsonl",
+      startupClassifier: "no_session_found",
+      journalDigest: "digest",
+      runtime,
+    });
+    await client.intent("a", "edit", {});
+    await client.outcome("a", "succeeded", {});
+    await client.reconcile("a", "r", "applied", {});
+    await client.guardRejected("g", "ambiguous-shell", "bash", "a".repeat(64));
+    await client.quarantine("q", "/tmp/q");
+    await client.restore("r", "qid");
+    await client.operation("o", "restart-bot");
+    await client.blocked("b", "blocked");
+    await client.finish("f", { summary: "done" });
+    assert.deepEqual(requests.map((item) => item.path), [
+      "/v1/fixer/state",
+      "/v1/fixer/heartbeat",
+      "/v1/fixer/session/bind",
+      "/v1/fixer/session/resumed",
+      "/v1/fixer/session/replace",
+      "/v1/fixer/action/intent",
+      "/v1/fixer/action/outcome",
+      "/v1/fixer/action/reconcile",
+      "/v1/fixer/guard/rejection",
+      "/v1/fixer/quarantine",
+      "/v1/fixer/restore",
+      "/v1/fixer/operation",
+      "/v1/fixer/blocked",
+      "/v1/fixer/finish",
+    ]);
+    assert.ok(requests.every((item) => item.authorization === "Bearer synthetic-fixer-token-value"));
+    assert.ok(requests.every((item) => item.body.invocationId === 7 && item.body.leaseToken === "b".repeat(48)));
+
+    responseMode = "invalid";
+    await assert.rejects(client.state(), /invalid response/);
+    responseMode = "oversized";
+    await assert.rejects(client.state(), /too large/);
+    responseMode = "timeout";
+    await assert.rejects(client.state(), /timed out/);
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  });
+
+  it("runs the bind-before-prompt fixer flow with the recovery-only wrapper set", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-runner-"));
+    temporary.push(root);
+    const agentWorkspace = join(root, "agent");
+    const sessionRoot = join(root, "sessions");
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(sessionRoot, { recursive: true, mode: 0o700 });
+    chmodSync(sessionRoot, 0o700);
+    const configPath = join(root, "config.yaml");
+    writeFileSync(configPath, [
+      "agents:",
+      "  recovery-fixer:",
+      `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
+      "    model: gpt-5.5",
+      "  chat-agent:",
+      `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
+      "    model: gpt-5.5",
+      "telegramTokenEnv: MINIME_TEST_RECOVERY_TELEGRAM_TOKEN",
+      "bindings:",
+      "  - chatId: 111",
+      "    agentId: chat-agent",
+      "    kind: dm",
+      "",
+    ].join("\n"));
+    const env: NodeJS.ProcessEnv = {
+      ...runtimeEnv("enabled"),
+      MINIME_CONFIG_PATH: configPath,
+      MINIME_CONTROL_WORKSPACE_ROOT: root,
+      MINIME_RECOVERY_AGENT_ID: "recovery-fixer",
+      MINIME_RECOVERY_SESSION_ROOT: sessionRoot,
+      MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS: "1",
+      MINIME_RECOVERY_RESUME_TIMEOUT_SECONDS: "2",
+      MINIME_RECOVERY_RENEW_SECONDS: "10",
+      MINIME_RECOVERY_RUN_TIMEOUT_SECONDS: "10",
+      MINIME_RECOVERY_PI_EXECUTABLE: "/usr/local/bin/pi",
+      MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP: "1",
+      MINIME_RECOVERY_PREIMAGE_DIRECTORY: join(root, "preimages"),
+    };
+    const order: string[] = [];
+    let boundRuntime: Record<string, unknown> | undefined;
+    const client = {
+      contract: readRecoveryRuntimeContract(env),
+      state: async () => ({ mode: "enabled", evidence: [], unknownActions: [], journalDigest: "" }),
+      bindSession: async (binding: { runtime: Record<string, unknown> }) => {
+        order.push("bind");
+        boundRuntime = binding.runtime;
+        return 11;
+      },
+      heartbeat: async () => true,
+    } as unknown as RecoveryProtocolClient;
+    const spawn = ((_agent: unknown, _session: unknown, extensions: { relpaths?: readonly string[] }, runtime: {
+      recovery?: { sessionDirectory: string; piExecutable: string };
+      startNewProcessGroup?: boolean;
+    }) => {
+      assert.deepEqual(extensions.relpaths, PI_RECOVERY_WRAPPER_RELPATHS);
+      assert.equal(runtime.recovery?.piExecutable, "/usr/local/bin/pi");
+      assert.equal(runtime.startNewProcessGroup, false);
+      const child = fakeChild();
+      child.kill = ((signal?: NodeJS.Signals) => {
+        Object.defineProperty(child, "signalCode", { value: signal ?? "SIGTERM", configurable: true });
+        setImmediate(() => child.emit("exit", null, signal));
+        return true;
+      }) as ChildProcess["kill"];
+      child.stdin?.on("data", (chunk) => {
+        const command = JSON.parse(chunk.toString()) as { type: string; id?: string };
+        if (command.type === "get_state") {
+          if (command.id === "recovery-session-binding") order.push("get_state");
+          const sessionId = "bound-session";
+          transcript(runtime.recovery?.sessionDirectory ?? "", sessionId);
+          child.stdout?.push(`${JSON.stringify({
+            type: "response",
+            id: command.id,
+            command: "get_state",
+            success: true,
+            data: { sessionId },
+          })}\n`);
+        } else if (command.type === "prompt") {
+          order.push("prompt");
+          child.stdout?.push(`${JSON.stringify({
+            type: "response",
+            command: "prompt",
+            success: true,
+            id: command.id,
+          })}\n`);
+          child.stdout?.push(`${JSON.stringify({ type: "agent_start" })}\n`);
+          child.stdout?.push(`${JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+          })}\n`);
+          child.stdout?.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+        }
+      });
+      setImmediate(() => child.emit("spawn"));
+      return child;
+    }) as never;
+    const previousToken = process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN;
+    process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN = "synthetic-test-token";
+    const result = await (async () => {
+      try {
+        return await runRecoveryFixer({ env, client, spawn, startupTimeoutMs: 1_000 });
+      } finally {
+        if (previousToken === undefined) delete process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN;
+        else process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN = previousToken;
+      }
+    })();
+    assert.equal(result.status, "settled");
+    assert.deepEqual(order, ["get_state", "bind", "prompt"]);
+    assert.equal(boundRuntime?.model, "openai-codex/gpt-5.5");
+    assert.equal(boundRuntime?.pi, "0.80.6");
   });
 });
 
@@ -295,6 +527,48 @@ describe("recovery action journaling", () => {
     assert.deepEqual(calls, ["intent", "outcome"]);
   });
 
+  it("captures a bounded owner-only preimage before accepting edit intent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-preimage-"));
+    temporary.push(root);
+    const target = join(root, "config.yaml");
+    const preimages = join(root, "preimages");
+    writeFileSync(target, "before\n", { mode: 0o600 });
+    const env = runtimeEnv("enabled");
+    env.MINIME_RECOVERY_PREIMAGE_DIRECTORY = preimages;
+    env.MINIME_RECOVERY_PREIMAGE_MAX_BYTES = "64";
+    let intent: Record<string, unknown> | undefined;
+    const fakeClient = {
+      contract: readRecoveryRuntimeContract(env),
+      intent: async (_key: string, _tool: string, value: Record<string, unknown>) => {
+        intent = value;
+        return true;
+      },
+    } as unknown as RecoveryProtocolClient;
+    const journal = new RecoveryToolJournal(fakeClient, "enabled");
+    assert.equal(await journal.before({
+      type: "tool_call",
+      toolCallId: "preimage-1",
+      toolName: "edit",
+      input: { path: target, oldText: "before", newText: "after" },
+    } as ToolCallEvent), undefined);
+    const preimage = intent?.preimage as Record<string, unknown>;
+    assert.equal(preimage.state, "captured");
+    assert.equal(readFileSync(String(preimage.reference), "utf8"), "before\n");
+    assert.equal(lstatSync(String(preimage.reference)).mode & 0o077, 0);
+
+    env.MINIME_RECOVERY_PREIMAGE_MAX_BYTES = "1";
+    const blocked = new RecoveryToolJournal({
+      ...fakeClient,
+      contract: readRecoveryRuntimeContract(env),
+    } as RecoveryProtocolClient, "enabled");
+    assert.match((await blocked.before({
+      type: "tool_call",
+      toolCallId: "preimage-2",
+      toolName: "write",
+      input: { path: target, content: "after" },
+    } as ToolCallEvent))?.reason ?? "", /not durably journaled/);
+  });
+
   it("blocks and audits every trusted-agent forbidden action category", async () => {
     const fixtures: Array<[string, string]> = [
       ["sudo launchctl kickstart gui/501/example", "privilege-escalation"],
@@ -308,6 +582,12 @@ describe("recovery action journaling", () => {
       ["security find-generic-password -s bot", "secret-operation"],
       ["telegram getUpdates", "competing-polling"],
       ["printf value > config.yaml", "ambiguous-shell"],
+      ["bash -lc 'rm -rf cache'", "ambiguous-shell"],
+      ["sh -c 'sudo true'", "ambiguous-shell"],
+      ["node -e 'process.exit()'", "ambiguous-shell"],
+      ["git -c alias.x='!sudo true' x", "ambiguous-shell"],
+      ["git fetch origin", "external-mutation"],
+      ["git clone https://example.invalid/repo", "external-mutation"],
     ];
     for (const [command, category] of fixtures) {
       assert.equal(forbiddenRecoveryBashReason(command), category, command);
@@ -317,6 +597,10 @@ describe("recovery action journaling", () => {
     assert.equal(forbiddenRecoveryToolReason({
       toolName: "edit",
       input: { path: "/agent/config.yaml" },
+    } as unknown as ToolCallEvent), undefined);
+    assert.equal(forbiddenRecoveryToolReason({
+      toolName: "web_search",
+      input: { query: "service failure signature" },
     } as unknown as ToolCallEvent), undefined);
     assert.equal(forbiddenRecoveryToolReason({
       toolName: "read",
@@ -354,5 +638,127 @@ describe("recovery action journaling", () => {
     const parameters = definition.slice(parameterStart, parameterEnd);
     assert.match(parameters, /operationId/);
     assert.doesNotMatch(parameters, /\bargv\b|\bshell\b|\bsourcePath\b|\btargetPath\b/);
+  });
+});
+
+describe("recovery extension behavior", () => {
+  it("executes every registered protocol tool and blocks the user-bash side channel", async () => {
+    const extensionModule = await import(
+      pathToFileURL(resolve("extensions/pi/recovery.ts")).href
+    ) as {
+      registerRecoveryExtension: (
+        pi: ExtensionAPI,
+        contract: ReturnType<typeof readRecoveryRuntimeContract>,
+        client: RecoveryProtocolClient,
+      ) => void;
+    };
+    const { registerRecoveryExtension } = extensionModule;
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-extension-"));
+    temporary.push(root);
+    const env = runtimeEnv("enabled");
+    env.MINIME_RECOVERY_PREIMAGE_DIRECTORY = join(root, "preimages");
+    const contract = readRecoveryRuntimeContract(env);
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const registered = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+      registerTool: (tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) => {
+        registered.set(tool.name, tool);
+      },
+    } as unknown as ExtensionAPI;
+    const calls: string[] = [];
+    const response = { ok: true, status: 200, body: { ok: true } };
+    const client = {
+      contract,
+      state: async () => { calls.push("state"); return { mode: "enabled" }; },
+      heartbeat: async () => { calls.push("heartbeat"); return true; },
+      reconcile: async () => { calls.push("reconcile"); return true; },
+      quarantine: async () => { calls.push("quarantine"); return response; },
+      restore: async () => { calls.push("restore"); return response; },
+      operation: async () => { calls.push("operation"); return response; },
+      blocked: async () => { calls.push("blocked"); return true; },
+      finish: async () => { calls.push("finish"); return true; },
+      intent: async () => { calls.push("intent"); return true; },
+      outcome: async () => { calls.push("outcome"); return true; },
+    } as unknown as RecoveryProtocolClient;
+    registerRecoveryExtension(pi, contract, client);
+    assert.deepEqual([...registered.keys()].sort(), [
+      "recovery_blocked",
+      "recovery_finish",
+      "recovery_heartbeat",
+      "recovery_inspect",
+      "recovery_operation",
+      "recovery_quarantine",
+      "recovery_reconcile",
+      "recovery_restore",
+    ]);
+    const execute = async (name: string, params: Record<string, unknown> = {}) => {
+      const tool = registered.get(name);
+      assert.ok(tool);
+      return tool.execute("tool-call", params);
+    };
+    await execute("recovery_inspect");
+    await execute("recovery_heartbeat");
+    await execute("recovery_reconcile", {
+      actionKey: "a", idempotencyKey: "r", result: "applied", summary: "checked",
+    });
+    await execute("recovery_quarantine", { idempotencyKey: "q", sourcePath: "/tmp/q" });
+    await execute("recovery_restore", { idempotencyKey: "r", quarantineId: "qid" });
+    await execute("recovery_operation", { idempotencyKey: "o", operationId: "restart-bot" });
+    await execute("recovery_blocked", { claimKey: "b", reason: "blocked" });
+    await execute("recovery_finish", {
+      claimKey: "f",
+      summary: "done",
+      rootCause: "cause",
+      confidence: "high",
+      changedFiles: [],
+      changedServices: [],
+      verification: [],
+      residualRisk: "none",
+      references: [],
+    });
+    assert.deepEqual(calls.slice(0, 8), [
+      "state", "heartbeat", "reconcile", "quarantine", "restore", "operation", "blocked", "finish",
+    ]);
+    const userBash = handlers.get("user_bash");
+    assert.ok(userBash);
+    assert.equal(userBash({ command: "git status" }), undefined);
+    assert.match(JSON.stringify(userBash({ command: "rm -rf cache" })), /irreversible-deletion/);
+    const toolCall = handlers.get("tool_call");
+    const toolResult = handlers.get("tool_result");
+    assert.ok(toolCall && toolResult);
+    assert.equal(await toolCall({
+      type: "tool_call",
+      toolCallId: "mutation",
+      toolName: "write",
+      input: { path: join(root, "new-file"), content: "new" },
+    }), undefined);
+    await toolResult({
+      type: "tool_result",
+      toolCallId: "mutation",
+      toolName: "write",
+      input: {},
+      content: [],
+      details: undefined,
+      isError: false,
+    });
+    assert.deepEqual(calls.slice(-2), ["intent", "outcome"]);
+
+    const diagnoseContract = readRecoveryRuntimeContract({
+      ...env,
+      MINIME_RECOVERY_MODE: "diagnose",
+    });
+    const diagnoseTools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+    registerRecoveryExtension({
+      on: () => undefined,
+      registerTool: (tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) => {
+        diagnoseTools.set(tool.name, tool);
+      },
+    } as unknown as ExtensionAPI, diagnoseContract, client);
+    const diagnosed = await diagnoseTools.get("recovery_quarantine")?.execute(
+      "tool-call",
+      { idempotencyKey: "q", sourcePath: "/tmp/q" },
+    );
+    assert.match(JSON.stringify(diagnosed), /diagnose mode/);
   });
 });

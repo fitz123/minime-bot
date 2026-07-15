@@ -43,8 +43,11 @@ _MAX_JSON_BYTES = 4 * 1024 * 1024
 _CAPSULE_FILES = (
     "package.json",
     "dist/config.js",
+    "dist/extensions/pi/codex-transport-overflow.js",
+    "dist/extensions/pi/knowledge-tools.js",
     "dist/recovery/fixer-session.js",
     "dist/extensions/pi/recovery.js",
+    "dist/extensions/pi/web-tools.js",
     "dist/pi-rpc-protocol.js",
     "dist/pi-extensions/recovery-mode.js",
     "dist/pi-extensions/recovery-protocol.js",
@@ -454,14 +457,20 @@ def _copy_runtime(source: Path, destination: Path, domain: str) -> None:
                     return {".bin"}
                 return set()
 
-            shutil.copytree(
-                source_item,
-                target,
-                symlinks=True,
-                ignore=ignore_shims if name == "node_modules" else None,
-            )
+            try:
+                shutil.copytree(
+                    source_item,
+                    target,
+                    symlinks=True,
+                    ignore=ignore_shims if name == "node_modules" else None,
+                )
+            except (OSError, shutil.Error) as exc:
+                raise SlotValidationError("runtime source cannot be copied safely") from exc
         elif stat.S_ISREG(item_details.st_mode):
-            shutil.copy2(source_item, target, follow_symlinks=False)
+            try:
+                shutil.copy2(source_item, target, follow_symlinks=False)
+            except OSError as exc:
+                raise SlotValidationError("runtime source cannot be copied safely") from exc
         else:
             raise SlotValidationError("runtime source contains a special item")
     _inventory(destination)
@@ -576,7 +585,13 @@ class ReleaseStore:
                     node,
                     "--input-type=module",
                     "--eval",
-                    f"await import({json.dumps((root / 'dist/recovery/fixer-session.js').as_uri())})",
+                    (
+                        f"const fixer=await import({json.dumps((root / 'dist/recovery/fixer-session.js').as_uri())});"
+                        f"const rpc=await import({json.dumps((root / 'dist/pi-rpc-protocol.js').as_uri())});"
+                        "const options=fixer.recoveryExtensionOptions('diagnose',process.env);"
+                        "const args=rpc.resolvePiExtensionArgs(options);"
+                        "if(!args.includes('--extension')||options.extraExtensions.length!==1)process.exit(2);"
+                    ),
                 ],
                 30.0,
             )
@@ -1228,20 +1243,61 @@ def _bot_slots(config: RecoveryConfig) -> BotReleaseSlots:
     )
 
 
-def _private_token(path: Path) -> str:
+def active_slot_release(config: RecoveryConfig, domain: str) -> dict[str, Any]:
+    """Return one freshly manifest-validated active slot and exact link target."""
+
+    if domain == "capsule":
+        slots: CapsuleSlots | BotReleaseSlots = _capsule_slots(config)
+    elif domain == "bot":
+        slots = _bot_slots(config)
+    else:
+        raise SlotValidationError("slot domain is invalid")
+    state = slots.state.reconcile()
+    current = state["current"]
+    if not isinstance(current, str):
+        raise SlotValidationError("slot has no active release")
+    manifest = slots.store.validate(current)
+    link = slots.store.root / "current"
+    expected = slots.store.release_path(current).resolve(strict=True)
     try:
-        details = path.lstat()
+        details = link.lstat()
+        actual = link.resolve(strict=True)
+    except OSError as exc:
+        raise SlotValidationError("active slot link is unavailable") from exc
+    if not stat.S_ISLNK(details.st_mode) or actual != expected:
+        raise SlotValidationError("active slot link is invalid")
+    return {
+        "domain": domain,
+        "releaseId": current,
+        "packageVersion": str(manifest["packageVersion"]),
+        "generation": int(state["generation"]),
+    }
+
+
+def _private_token(path: Path) -> str:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        details = os.fstat(descriptor)
         if (
             not stat.S_ISREG(details.st_mode)
-            or stat.S_ISLNK(details.st_mode)
             or not _same_owner(details)
             or stat.S_IMODE(details.st_mode) & 0o077
             or not 16 <= details.st_size <= 4096
         ):
             raise SlotValidationError("capsule health credential is unsafe")
-        token = path.read_text("ascii").strip()
+        raw = os.read(descriptor, 4097)
+        if len(raw) != details.st_size:
+            raise SlotValidationError("capsule health credential changed while reading")
+        token = raw.decode("ascii").strip()
     except (OSError, UnicodeError) as exc:
         raise SlotValidationError("capsule health credential is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if (
         not 16 <= len(token.encode("ascii")) <= 4096
         or any(character.isspace() for character in token)

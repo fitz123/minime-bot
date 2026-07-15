@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Iterable, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
 DEFAULT_EVENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_BATCH_SIZE = 256
@@ -140,6 +140,7 @@ _SCHEMA = (
         session_id TEXT NOT NULL,
         session_directory TEXT NOT NULL,
         transcript_path TEXT NOT NULL,
+        runtime_json TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('current', 'replaced', 'unreadable')),
         bound_at REAL NOT NULL,
         last_resumed_at REAL,

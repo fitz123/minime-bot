@@ -320,6 +320,12 @@ class InstalledRecoveryAcceptanceTests(unittest.TestCase):
         self._write(source / "dist/recovery/fixer-session.js", "export {};\n", executable=True)
         self._write(source / "dist/extensions/pi/recovery.js", "export {};\n")
         for name in (
+            "codex-transport-overflow.js",
+            "knowledge-tools.js",
+            "web-tools.js",
+        ):
+            self._write(source / "dist/extensions/pi" / name, "export {};\n")
+        for name in (
             "config.js",
             "pi-rpc-protocol.js",
             "pi-extensions/recovery-mode.js",
@@ -454,6 +460,24 @@ class InstalledRecoveryAcceptanceTests(unittest.TestCase):
         )
         with self.assertRaises(self.rootctl.RootctlRequestError):
             self.rootctl.validate_request({**request, "argv": ["unsafe"]}, current_uid=uid)
+
+        executed = subprocess.run(
+            [sys.executable, str(Path(self.rootctl.__file__).resolve())],
+            input=json.dumps(request).encode("ascii"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(executed.returncode, 3)
+        self.assertEqual(
+            json.loads(executed.stdout),
+            {
+                "ok": False,
+                "status": "unsupported_capability",
+                "capabilityId": "restart-host-service",
+            },
+        )
+        self.assertEqual(executed.stderr, b"")
 
 
 if __name__ == "__main__":

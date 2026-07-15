@@ -201,12 +201,6 @@ def validated_probe_command(value: Any) -> dict[str, Any]:
     return dict(item)
 
 
-def _bounded_seconds(value: Any, bounds: tuple[int, int], name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not bounds[0] <= value <= bounds[1]:
-        raise RecoveryConfigError(f"recovery {name} is invalid")
-    return value
-
-
 def _bounded_integer(value: Any, bounds: tuple[int, int], name: str) -> int:
     if (
         isinstance(value, bool)
@@ -457,17 +451,17 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RecoveryConfigError("recovery port is invalid")
 
-    cadence_seconds = _bounded_seconds(
+    cadence_seconds = _bounded_integer(
         document["runtimeDoctorCadenceSeconds"],
         RUNTIME_DOCTOR_CADENCE_BOUNDS,
         "runtime doctor cadence",
     )
-    freshness_seconds = _bounded_seconds(
+    freshness_seconds = _bounded_integer(
         document["verificationFreshnessSeconds"],
         VERIFICATION_FRESHNESS_BOUNDS,
         "verification freshness",
     )
-    hold_down_seconds = _bounded_seconds(
+    hold_down_seconds = _bounded_integer(
         document["verificationHoldDownSeconds"],
         VERIFICATION_HOLD_DOWN_BOUNDS,
         "verification hold-down",
@@ -478,10 +472,10 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
         )
 
     internal_agent_id = _safe_id(document["internalAgentId"], "internal agent id")
-    fixer_lease_seconds = _bounded_seconds(
+    fixer_lease_seconds = _bounded_integer(
         document["fixerLeaseSeconds"], (10, 3_600), "fixer lease"
     )
-    fixer_renew_seconds = _bounded_seconds(
+    fixer_renew_seconds = _bounded_integer(
         document["fixerRenewSeconds"], (1, 1_800), "fixer renew interval"
     )
     if fixer_renew_seconds * 2 >= fixer_lease_seconds:

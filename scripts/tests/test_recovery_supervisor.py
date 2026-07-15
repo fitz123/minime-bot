@@ -189,7 +189,7 @@ class FailingLedger:
 class RecoveryLedgerTests(unittest.TestCase):
     def test_fixed_schema_pragmas_and_restart_idempotency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(recovery_ledger.SCHEMA_VERSION, 3)
+            self.assertEqual(recovery_ledger.SCHEMA_VERSION, 4)
             path = Path(directory) / "ledger.sqlite3"
             events = recovery_supervisor.normalize_alertmanager(
                 alert_body(firing_alert("one"), firing_alert("two"))
@@ -1774,6 +1774,76 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
         def poll(self) -> int | None:
             return self.returncode
 
+    def test_process_manager_enforces_host_deadline_and_recomputes_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wall_clock = [100.0]
+            monotonic = [0.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="process-deadline",
+                    mode="enabled",
+                    clock=lambda: wall_clock[0],
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("manager-deadline"))
+                    )
+                )
+                processes: list[RecoveryOutcomeAuthorityTests._Process] = []
+
+                def spawn(
+                    _argv: object, **_kwargs: object
+                ) -> RecoveryOutcomeAuthorityTests._Process:
+                    process = self._Process(60_000 + len(processes))
+                    processes.append(process)
+                    return process
+
+                manager = recovery_supervisor.RecoveryFixerProcessManager(
+                    coordinator,
+                    runner_argv=("/usr/bin/node", "/opt/recovery/fixer-session.js"),
+                    package_root=root,
+                    control_workspace=root,
+                    endpoint="http://127.0.0.1:9877",
+                    fixer_credential_file=root / "fixer-token",
+                    agent_id="recovery-fixer",
+                    session_root=root / "sessions",
+                    startup_timeout_seconds=5,
+                    resume_timeout_seconds=6,
+                    renew_seconds=7,
+                    run_timeout_seconds=10,
+                    pi_executable=root / "host/bin/pi",
+                    preimage_directory=root / "preimages",
+                    preimage_max_bytes=4096,
+                    inherited_env={},
+                    popen=spawn,
+                    monotonic=lambda: monotonic[0],
+                )
+                self.assertEqual(manager.tick(), "started")
+                monotonic[0] = 10.0
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "timed_out")
+                terminate.assert_called_once_with(processes[0])
+
+                monotonic[0] = 11.0
+                self.assertEqual(manager.tick(), "started")
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(resolved_alert("manager-deadline"))
+                    )
+                )
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "fence_lost")
+                terminate.assert_called_once_with(processes[1])
+
     def test_process_manager_serializes_claims_and_consumes_static_retry_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1810,8 +1880,12 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                     agent_id="recovery-fixer",
                     session_root=root / "sessions",
                     startup_timeout_seconds=30,
+                    resume_timeout_seconds=30,
                     renew_seconds=20,
                     run_timeout_seconds=300,
+                    pi_executable=root / "host/bin/pi",
+                    preimage_directory=root / "preimages",
+                    preimage_max_bytes=1_048_576,
                     inherited_env={
                         "HOME": str(root),
                         "PATH": "/usr/bin:/bin",
@@ -1906,6 +1980,12 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                 session_id="full-lifecycle-session",
                 session_directory=str(session_directory),
                 transcript_path=str(transcript),
+                runtime={
+                    "model": "openai-codex/gpt-5.5",
+                    "node": "v22.19.0",
+                    "package": "2026.7.7",
+                    "pi": "0.80.6",
+                },
             )
             self.assertIsNotNone(first_binding)
             self.assertIsNotNone(
@@ -2002,10 +2082,36 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                 session_id="full-lifecycle-session",
                 session_directory=str(session_directory),
                 transcript_path=str(transcript),
+                runtime={
+                    "model": "openai-codex/gpt-5.5",
+                    "node": "v22.19.0",
+                    "package": "2026.7.7",
+                    "pi": "0.80.6",
+                },
             )
             self.assertIsNotNone(second_binding)
             self.assertTrue(
                 coordinator.mark_session_resumed(second, int(second_binding or 0))
+            )
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="rollback-bot-release",
+                    tool_name="recovery_operation",
+                    intent={"kind": "rollback", "operationId": "rollback-bot"},
+                )
+            )
+            self.assertTrue(
+                coordinator.record_action_outcome(
+                    second,
+                    action_key="rollback-bot-release",
+                    outcome="succeeded",
+                    details={
+                        "summary": "activated verified previous bot release",
+                        "previousRelease": "bot-broken",
+                        "activeRelease": "bot-stable",
+                    },
+                )
             )
             self.assertTrue(
                 coordinator.accept_completion_claim(
@@ -2058,6 +2164,15 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
             self.assertEqual(report["incident"]["sessions"][0]["sessionId"], "full-lifecycle-session")
             self.assertTrue(report["actions"])
             self.assertTrue(report["verification"])
+            self.assertEqual(
+                report["changedReleases"],
+                [{"domain": "bot", "from": "bot-broken", "to": "bot-stable"}],
+            )
+            self.assertEqual(report["versions"]["model"], "openai-codex/gpt-5.5")
+            self.assertEqual(
+                report["versions"]["runtime"],
+                {"node": "v22.19.0", "package": "2026.7.7", "pi": "0.80.6"},
+            )
             self.assertNotIn("private-value", json.dumps(report))
             self.assertNotIn("/private/synthetic", json.dumps(report))
             tiny_store = recovery_supervisor.RecoveryReportStore(
@@ -2351,6 +2466,39 @@ class RecoveryVerificationTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_verification_requires_freshly_validated_bot_and_capsule_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            slot_health = {"bot": True, "capsule": False}
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    source_ids=(),
+                    cadence_seconds=10,
+                    freshness_seconds=30,
+                    hold_down_seconds=0,
+                    slot_validator=lambda: dict(slot_health),
+                    clock=lambda: clock[0],
+                )
+                verifier.record_heartbeat("supervisor")
+                unhealthy = verifier.evaluate(incident_id)
+                self.assertFalse(unhealthy.recovered)
+                self.assertIn("slot_unhealthy:capsule", unhealthy.reasons)
+                self.assertEqual(
+                    self._evidence_states(unhealthy),
+                    {
+                        ("heartbeat", "supervisor"): "fresh_healthy",
+                        ("slot", "bot"): "fresh_healthy",
+                        ("slot", "capsule"): "fresh_unhealthy",
+                    },
+                )
+                slot_health["capsule"] = True
+                self.assertTrue(verifier.evaluate(incident_id).recovered)
 
     def test_missing_or_stale_evidence_never_creates_a_completion_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2709,6 +2857,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                             config.spool_directory / "notifications", delivery=None
                         ),
                         configured=config,
+                        verify_active_slots=False,
                     )
                     self.assertIsInstance(
                         service.probe_runner, recovery_supervisor.PythonProbeRunner
@@ -3213,6 +3362,7 @@ class RecoveryFoundationTests(unittest.TestCase):
                 **fixer_config_fields(root),
             )
             with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                report_delivery = mock.Mock()
                 service = recovery_supervisor._build_recovery_service(
                     ledger,
                     recovery_supervisor.AtomicJsonSpool(config.spool_directory / "events"),
@@ -3220,9 +3370,14 @@ class RecoveryFoundationTests(unittest.TestCase):
                         config.spool_directory / "notifications", delivery=None
                     ),
                     configured=config,
+                    report_delivery=report_delivery,
                 )
                 self.assertIsNotNone(service.verifier)
+                self.assertIsNotNone(service.reports)
                 assert service.verifier is not None
+                assert service.reports is not None
+                self.assertIs(service.reports.delivery, report_delivery)
+                self.assertEqual(service.reports.enrichers, {})
                 self.assertEqual(service.verifier.cadence_seconds, 300.0)
                 self.assertEqual(service.verifier.freshness_seconds, 660.0)
                 self.assertEqual(service.verifier.hold_down_seconds, 60.0)
@@ -3389,6 +3544,12 @@ class RecoveryHttpTests(unittest.TestCase):
                     "sessionId": "session-http",
                     "sessionDirectory": str(session_dir),
                     "transcriptPath": str(transcript),
+                    "runtime": {
+                        "model": "anthropic/claude-sonnet-4-5",
+                        "node": "v22.19.0",
+                        "package": "0.1.0",
+                        "pi": "0.80.6",
+                    },
                 }
                 status, bound = request("/v1/fixer/session/bind", bind, fixer_token)
                 self.assertEqual(status, 200)

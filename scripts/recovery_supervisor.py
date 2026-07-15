@@ -17,7 +17,6 @@ from pathlib import Path
 import re
 import secrets
 import signal
-import shutil
 import socket
 import stat
 import subprocess
@@ -52,6 +51,7 @@ from recovery_ledger import (
     LedgerUnavailable,
     RecoveryLedger,
 )
+from recovery_slots import RecoverySlotError, active_slot_release
 
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 16
@@ -115,7 +115,7 @@ _FIXER_ENDPOINT_FIELDS = {
     "/v1/fixer/state": frozenset(),
     "/v1/fixer/heartbeat": frozenset(),
     "/v1/fixer/session/bind": frozenset(
-        {"sessionId", "sessionDirectory", "transcriptPath"}
+        {"sessionId", "sessionDirectory", "transcriptPath", "runtime"}
     ),
     "/v1/fixer/session/resumed": frozenset({"bindingId"}),
     "/v1/fixer/session/replace": frozenset(
@@ -126,6 +126,7 @@ _FIXER_ENDPOINT_FIELDS = {
             "transcriptPath",
             "startupClassifier",
             "journalDigest",
+            "runtime",
         }
     ),
     "/v1/fixer/action/intent": frozenset({"actionKey", "toolName", "intent"}),
@@ -1450,6 +1451,13 @@ class IncidentCoordinator:
             )
             return True
 
+    def invocation_fence_valid(self, fence: InvocationFence) -> bool:
+        """Recompute the complete durable fixer fence without renewing it."""
+
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            return self._fence_valid(connection, fence, now)
+
     def invocation_evidence(self, fence: InvocationFence) -> list[dict[str, Any]]:
         """Return at most 32 normalized firing observations for the claimed incident."""
 
@@ -1578,7 +1586,19 @@ class IncidentCoordinator:
             "sessionDirectory": str(row["session_directory"]),
             "transcriptPath": str(row["transcript_path"]),
             "generation": int(row["generation"]),
+            "runtime": json.loads(str(row["runtime_json"])),
         }
+
+    def _runtime_versions(self, value: Any) -> tuple[dict[str, str], str]:
+        if value is None:
+            value = {name: "unreported" for name in ("model", "node", "package", "pi")}
+        if not isinstance(value, dict) or set(value) != {"model", "node", "package", "pi"}:
+            raise ValueError("recovery runtime versions are invalid")
+        normalized = {
+            name: self._journal_text(value[name], f"runtime {name}", limit=160)
+            for name in ("model", "node", "package", "pi")
+        }
+        return normalized, _canonical_json(normalized)
 
     def fixer_state(self, fence: InvocationFence) -> dict[str, Any] | None:
         """Return bounded, redacted state needed to resume and reconcile one fixer."""
@@ -1719,6 +1739,7 @@ class IncidentCoordinator:
         transcript_path: str,
         startup_classifier: str,
         journal_digest: str,
+        runtime: dict[str, Any] | None = None,
     ) -> int | None:
         if startup_classifier != "no_session_found":
             return None
@@ -1738,6 +1759,7 @@ class IncidentCoordinator:
             transcript_path=transcript_path,
             reason="transcript_unusable_and_resume_not_found",
             journal_digest=journal_digest,
+            runtime=runtime,
             max_replacements=self.max_session_replacements,
         )
 
@@ -1748,10 +1770,12 @@ class IncidentCoordinator:
         session_id: str,
         session_directory: str,
         transcript_path: str,
+        runtime: dict[str, Any] | None = None,
     ) -> int | None:
         """Idempotently commit the first exact-session binding behind a live fence."""
 
         identifier = self._journal_text(session_id, "session id", limit=128)
+        _runtime, runtime_json = self._runtime_versions(runtime)
         directory = self._session_path(session_directory, "session directory")
         transcript = self._session_path(transcript_path, "session transcript path")
         try:
@@ -1792,13 +1816,14 @@ class IncidentCoordinator:
                     and existing["session_id"] == identifier
                     and existing["session_directory"] == directory
                     and existing["transcript_path"] == transcript
+                    and existing["runtime_json"] == runtime_json
                 ):
                     return int(existing["id"])
                 raise ValueError("recovery session generation is already bound")
             cursor = connection.execute(
                 "INSERT INTO session_bindings(incident_id, generation, evidence_hash, "
                 "policy_revision, invocation_id, session_id, session_directory, transcript_path, "
-                "state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
+                "runtime_json, state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
                 (
                     fence.incident_id,
                     fence.generation,
@@ -1808,6 +1833,7 @@ class IncidentCoordinator:
                     identifier,
                     directory,
                     transcript,
+                    runtime_json,
                     now,
                 ),
             )
@@ -1824,6 +1850,7 @@ class IncidentCoordinator:
         reason: str,
         journal_digest: str,
         max_replacements: int,
+        runtime: dict[str, Any] | None = None,
     ) -> int | None:
         """Record an explicitly bounded replacement without losing the prior binding."""
 
@@ -1837,6 +1864,7 @@ class IncidentCoordinator:
         ):
             raise ValueError("recovery session replacement is invalid")
         identifier = self._journal_text(session_id, "session id", limit=128)
+        _runtime, runtime_json = self._runtime_versions(runtime)
         directory = self._session_path(session_directory, "session directory")
         transcript = self._session_path(transcript_path, "session transcript path")
         replacement_reason = self._journal_text(reason, "session replacement reason")
@@ -1902,7 +1930,7 @@ class IncidentCoordinator:
             cursor = connection.execute(
                 "INSERT INTO session_bindings(incident_id, generation, evidence_hash, "
                 "policy_revision, invocation_id, session_id, session_directory, transcript_path, "
-                "state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
+                "runtime_json, state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
                 (
                     fence.incident_id,
                     fence.generation,
@@ -1912,6 +1940,7 @@ class IncidentCoordinator:
                     identifier,
                     directory,
                     transcript,
+                    runtime_json,
                     now,
                 ),
             )
@@ -2990,7 +3019,6 @@ class RecoveryQuarantine:
         descriptor = os.open(source, flags)
         mutated = False
         manifest_written = False
-        destination_created = False
         try:
             opened = os.fstat(descriptor)
             if (opened.st_dev, opened.st_ino) != (source_details.st_dev, source_details.st_ino):
@@ -3027,9 +3055,19 @@ class RecoveryQuarantine:
             current = source.lstat()
             if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
                 raise RecoverySafetyError("source_changed")
+            staged = source.parent / f".{source.name}.minime-quarantine-{quarantine_id}"
+            if staged.exists() or staged.is_symlink():
+                raise RecoverySafetyError("quarantine_staging_exists")
+            os.rename(source, staged)
+            mutated = True
+            staged_details = staged.lstat()
+            if (staged_details.st_dev, staged_details.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                raise RecoveryMutationUnknown("quarantine source changed during move")
             if method == "rename":
-                os.rename(source, destination)
-                mutated = True
+                os.rename(staged, destination)
                 os.chmod(destination, 0o600)
             else:
                 output = os.open(
@@ -3037,7 +3075,6 @@ class RecoveryQuarantine:
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                     0o600,
                 )
-                destination_created = True
                 try:
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     while True:
@@ -3057,8 +3094,7 @@ class RecoveryQuarantine:
                         raise RecoverySafetyError("copy_verification_failed")
                 finally:
                     os.close(output)
-                os.unlink(source)
-                mutated = True
+                os.unlink(staged)
             _fsync_directory(source.parent)
             _fsync_directory(incident_directory)
             manifest["state"] = "quarantined"
@@ -3074,11 +3110,6 @@ class RecoveryQuarantine:
         except RecoverySafetyError:
             if mutated:
                 raise RecoveryMutationUnknown("quarantine state is unknown") from None
-            if destination_created:
-                try:
-                    destination.unlink()
-                except FileNotFoundError:
-                    pass
             if manifest_written:
                 try:
                     manifest_path.unlink()
@@ -3088,11 +3119,6 @@ class RecoveryQuarantine:
         except OSError as exc:
             if mutated:
                 raise RecoveryMutationUnknown("quarantine state is unknown") from exc
-            if destination_created:
-                try:
-                    destination.unlink()
-                except FileNotFoundError:
-                    pass
             if manifest_written:
                 try:
                     manifest_path.unlink()
@@ -3155,7 +3181,15 @@ class RecoveryQuarantine:
             ):
                 raise RecoverySafetyError("quarantined_item_checksum_mismatch")
             if details.st_dev == canonical_source.parent.stat().st_dev:
-                os.rename(quarantined, canonical_source)
+                os.link(quarantined, canonical_source, follow_symlinks=False)
+                target_created = True
+                linked_details = canonical_source.lstat()
+                if (linked_details.st_dev, linked_details.st_ino) != (
+                    details.st_dev,
+                    details.st_ino,
+                ):
+                    raise RecoverySafetyError("restore_target_changed")
+                os.unlink(quarantined)
                 mutated = True
             else:
                 output = os.open(
@@ -3184,9 +3218,7 @@ class RecoveryQuarantine:
                 finally:
                     os.close(restored_descriptor)
                 if restored_hash != digest or restored_size != size:
-                    canonical_source.unlink()
-                    target_created = False
-                    raise RecoverySafetyError("copy_verification_failed")
+                    raise RecoveryMutationUnknown("restore copy verification is unknown")
                 os.unlink(quarantined)
                 mutated = True
             os.chmod(canonical_source, int(manifest["sourceMode"]))
@@ -3197,22 +3229,12 @@ class RecoveryQuarantine:
             self._write_manifest(manifest_path, manifest)
             return {"ok": True, "quarantineId": identifier, "replayed": False}
         except RecoverySafetyError:
-            if mutated:
+            if mutated or target_created:
                 raise RecoveryMutationUnknown("restore state is unknown") from None
-            if target_created:
-                try:
-                    canonical_source.unlink()
-                except FileNotFoundError:
-                    pass
             raise
         except OSError as exc:
-            if mutated:
+            if mutated or target_created:
                 raise RecoveryMutationUnknown("restore state is unknown") from exc
-            if target_created:
-                try:
-                    canonical_source.unlink()
-                except FileNotFoundError:
-                    pass
             raise RecoverySafetyError("restore_failed") from exc
         finally:
             os.close(descriptor)
@@ -3221,10 +3243,16 @@ class RecoveryQuarantine:
 class ReviewedOperationExecutor:
     """Run only immutable, configuration-reviewed argv selected by operation ID."""
 
-    def __init__(self, operations: tuple[dict[str, Any], ...]):
+    def __init__(
+        self,
+        operations: tuple[dict[str, Any], ...],
+        *,
+        active_bot_release: Callable[[], str | None] | None = None,
+    ):
         self.operations = {str(item["id"]): dict(item) for item in operations}
         if len(self.operations) != len(operations):
             raise ValueError("recovery reviewed operation IDs overlap")
+        self.active_bot_release = active_bot_release
 
     def description(self, operation_id: Any) -> dict[str, Any]:
         if not isinstance(operation_id, str) or safe_field(operation_id, default="") != operation_id:
@@ -3239,6 +3267,9 @@ class ReviewedOperationExecutor:
 
     def execute(self, operation_id: str) -> dict[str, Any]:
         operation = self.operations[operation_id]
+        previous_release = (
+            None if self.active_bot_release is None else self.active_bot_release()
+        )
         try:
             completed = subprocess.run(
                 [str(operation["executable"]), *map(str, operation["argv"])],
@@ -3256,26 +3287,31 @@ class ReviewedOperationExecutor:
                 close_fds=True,
             )
         except subprocess.TimeoutExpired:
-            return {
+            result = {
                 "ok": False,
                 "operationId": operation_id,
                 "kind": operation["kind"],
                 "code": "timeout",
             }
         except OSError:
-            return {
+            result = {
                 "ok": False,
                 "operationId": operation_id,
                 "kind": operation["kind"],
                 "code": "execution_failed",
             }
-        return {
-            "ok": completed.returncode == 0,
-            "operationId": operation_id,
-            "kind": operation["kind"],
-            "code": "completed" if completed.returncode == 0 else "nonzero_exit",
-            "exitCode": completed.returncode,
-        }
+        else:
+            result = {
+                "ok": completed.returncode == 0,
+                "operationId": operation_id,
+                "kind": operation["kind"],
+                "code": "completed" if completed.returncode == 0 else "nonzero_exit",
+                "exitCode": completed.returncode,
+            }
+        if operation["kind"] == "rollback" and self.active_bot_release is not None:
+            result["previousRelease"] = previous_release
+            result["activeRelease"] = self.active_bot_release()
+        return result
 
 
 class RecoveryActuator:
@@ -3479,6 +3515,10 @@ def _current_evidence_matches(
             observation = RecoveryVerifier._probe_observation(
                 connection, fence, item.identifier
             )
+        elif item.kind == "slot":
+            observation = RecoveryVerifier._observation(
+                connection, f"verification:slot:{item.identifier}"
+            )
         else:
             return False
         if observation != (item.state == "fresh_healthy", item.observed_at):
@@ -3499,6 +3539,7 @@ class RecoveryVerifier:
         cadence_seconds: float,
         freshness_seconds: float,
         hold_down_seconds: float,
+        slot_validator: Callable[[], dict[str, bool]] | None = None,
         clock: Callable[[], float] = time.time,
     ):
         identifiers = probe_ids + source_ids
@@ -3526,6 +3567,7 @@ class RecoveryVerifier:
         self.cadence_seconds = float(cadence_seconds)
         self.freshness_seconds = float(freshness_seconds)
         self.hold_down_seconds = float(hold_down_seconds)
+        self.slot_validator = slot_validator
         self.clock = clock
 
     def _record_heartbeat(self, identifier: str, healthy: bool, observed_at: float) -> None:
@@ -3893,6 +3935,16 @@ class RecoveryVerifier:
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery verification incident is invalid")
         now = self.clock()
+        slot_health: dict[str, bool] = {}
+        if self.slot_validator is not None:
+            try:
+                slot_health = self.slot_validator()
+            except Exception:
+                slot_health = {"bot": False, "capsule": False}
+            if set(slot_health) != {"bot", "capsule"} or any(
+                not isinstance(value, bool) for value in slot_health.values()
+            ):
+                raise ValueError("recovery slot verification result is invalid")
         with self.ledger.transaction() as connection:
             incident = connection.execute(
                 "SELECT * FROM incidents WHERE id = ?", (incident_id,)
@@ -3962,6 +4014,28 @@ class RecoveryVerifier:
                         state,
                         observed_at,
                         None if observed_at is None else observed_at + self.freshness_seconds,
+                    )
+                )
+            for domain in sorted(slot_health):
+                healthy = slot_health[domain]
+                state = "fresh_healthy" if healthy else "fresh_unhealthy"
+                if not healthy:
+                    reasons.append(f"slot_unhealthy:{domain}")
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (
+                        f"verification:slot:{domain}",
+                        _canonical_json({"healthy": healthy, "observed_at": now}),
+                    ),
+                )
+                evidence.append(
+                    VerificationEvidence(
+                        "slot",
+                        domain,
+                        state,
+                        now,
+                        now + self.freshness_seconds,
                     )
                 )
             if now - float(incident["updated_at"]) < self.hold_down_seconds:
@@ -4299,10 +4373,15 @@ class RecoveryFixerProcessManager:
         agent_id: str,
         session_root: Path,
         startup_timeout_seconds: int,
+        resume_timeout_seconds: int,
         renew_seconds: int,
         run_timeout_seconds: int,
+        pi_executable: Path,
+        preimage_directory: Path,
+        preimage_max_bytes: int,
         inherited_env: dict[str, str] | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         if runner_argv is not None and (
             len(runner_argv) != 2
@@ -4315,7 +4394,12 @@ class RecoveryFixerProcessManager:
         ):
             if not isinstance(value, str) or safe_field(value, limit=512, default="") != value:
                 raise ValueError(f"recovery fixer runner {name} is invalid")
-        for value in (startup_timeout_seconds, renew_seconds, run_timeout_seconds):
+        for value in (
+            startup_timeout_seconds,
+            resume_timeout_seconds,
+            renew_seconds,
+            run_timeout_seconds,
+        ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 86_400:
                 raise ValueError("recovery fixer runner timeout is invalid")
         self.coordinator = coordinator
@@ -4327,8 +4411,18 @@ class RecoveryFixerProcessManager:
         self.agent_id = agent_id
         self.session_root = session_root.resolve()
         self.startup_timeout_seconds = startup_timeout_seconds
+        self.resume_timeout_seconds = resume_timeout_seconds
         self.renew_seconds = renew_seconds
         self.run_timeout_seconds = run_timeout_seconds
+        self.pi_executable = pi_executable.resolve()
+        self.preimage_directory = preimage_directory.resolve()
+        if (
+            isinstance(preimage_max_bytes, bool)
+            or not isinstance(preimage_max_bytes, int)
+            or not 0 <= preimage_max_bytes <= 16 * 1024 * 1024
+        ):
+            raise ValueError("recovery fixer preimage bound is invalid")
+        self.preimage_max_bytes = preimage_max_bytes
         source_env = dict(os.environ) if inherited_env is None else inherited_env
         self.base_env = {
             key: value
@@ -4342,8 +4436,10 @@ class RecoveryFixerProcessManager:
         self.base_env.pop("MINIME_AGENT_WORKSPACE_CWD", None)
         self.base_env["MINIME_CONTROL_WORKSPACE_ROOT"] = str(self.control_workspace)
         self.popen = popen
+        self.monotonic = monotonic
         self.process: subprocess.Popen[bytes] | None = None
         self.fence: InvocationFence | None = None
+        self.deadline: float | None = None
 
     @property
     def active(self) -> bool:
@@ -4368,8 +4464,14 @@ class RecoveryFixerProcessManager:
             "MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS": str(
                 self.startup_timeout_seconds
             ),
+            "MINIME_RECOVERY_RESUME_TIMEOUT_SECONDS": str(
+                self.resume_timeout_seconds
+            ),
             "MINIME_RECOVERY_RENEW_SECONDS": str(self.renew_seconds),
             "MINIME_RECOVERY_RUN_TIMEOUT_SECONDS": str(self.run_timeout_seconds),
+            "MINIME_RECOVERY_PI_EXECUTABLE": str(self.pi_executable),
+            "MINIME_RECOVERY_PREIMAGE_DIRECTORY": str(self.preimage_directory),
+            "MINIME_RECOVERY_PREIMAGE_MAX_BYTES": str(self.preimage_max_bytes),
             "MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP": "1",
         }
 
@@ -4397,6 +4499,7 @@ class RecoveryFixerProcessManager:
             self.process = None
             return False
         self.fence = fence
+        self.deadline = self.monotonic() + self.run_timeout_seconds
         return True
 
     def tick(self) -> str:
@@ -4404,12 +4507,28 @@ class RecoveryFixerProcessManager:
 
         if self.process is not None:
             if self.process.poll() is None:
-                return "running"
+                fence = self.fence
+                timed_out = self.deadline is not None and self.monotonic() >= self.deadline
+                fence_lost = fence is None or not self.coordinator.invocation_fence_valid(fence)
+                if not timed_out and not fence_lost:
+                    return "running"
+                process = self.process
+                self.process = None
+                self.fence = None
+                self.deadline = None
+                PythonProbeRunner._terminate_process_group(process)
+                if fence is not None:
+                    self.coordinator.interrupt_invocation(
+                        fence,
+                        reason="runner_timeout" if timed_out else "fence_lost",
+                    )
+                return "timed_out" if timed_out else "fence_lost"
             PythonProbeRunner._terminate_process_group(self.process)
             fence = self.fence
             return_code = int(self.process.returncode or 0)
             self.process = None
             self.fence = None
+            self.deadline = None
             if fence is not None:
                 self.coordinator.interrupt_invocation(
                     fence,
@@ -4426,6 +4545,7 @@ class RecoveryFixerProcessManager:
         fence = self.fence
         self.process = None
         self.fence = None
+        self.deadline = None
         if process is None:
             return
         PythonProbeRunner._terminate_process_group(process)
@@ -4879,12 +4999,13 @@ class RecoveryReportStore:
     def state(self, report_key: str) -> str | None:
         if not isinstance(report_key, str) or safe_field(report_key, default="") != report_key:
             raise ValueError("recovery report key is invalid")
-        row = self.ledger.connection.execute(
-            "SELECT report_outbox.state FROM report_outbox "
-            "JOIN incident_reports ON incident_reports.id = report_outbox.report_id "
-            "WHERE incident_reports.report_key = ?",
-            (report_key,),
-        ).fetchone()
+        with self.ledger.transaction() as connection:
+            row = connection.execute(
+                "SELECT report_outbox.state FROM report_outbox "
+                "JOIN incident_reports ON incident_reports.id = report_outbox.report_id "
+                "WHERE incident_reports.report_key = ?",
+                (report_key,),
+            ).fetchone()
         return None if row is None else str(row["state"])
 
     def mark_reported(self, report_key: str) -> bool:
@@ -4925,14 +5046,15 @@ class RecoveryReportStore:
     def due(self, *, limit: int = 16) -> list[tuple[str, dict[str, Any]]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
             raise ValueError("recovery report delivery limit is invalid")
-        rows = self.ledger.connection.execute(
-            "SELECT incident_reports.report_key, incident_reports.body_json "
-            "FROM report_outbox JOIN incident_reports "
-            "ON incident_reports.id = report_outbox.report_id "
-            "WHERE report_outbox.state = ? AND report_outbox.available_at <= ? "
-            "ORDER BY report_outbox.available_at, report_outbox.id LIMIT ?",
-            (REPORT_PENDING, self.clock(), limit),
-        ).fetchall()
+        with self.ledger.transaction() as connection:
+            rows = connection.execute(
+                "SELECT incident_reports.report_key, incident_reports.body_json "
+                "FROM report_outbox JOIN incident_reports "
+                "ON incident_reports.id = report_outbox.report_id "
+                "WHERE report_outbox.state = ? AND report_outbox.available_at <= ? "
+                "ORDER BY report_outbox.available_at, report_outbox.id LIMIT ?",
+                (REPORT_PENDING, self.clock(), limit),
+            ).fetchall()
         pending: list[tuple[str, dict[str, Any]]] = []
         for row in rows:
             try:
@@ -5023,6 +5145,7 @@ class RecoveryReportAuthority:
         compact["actions"] = compact["actions"][-32:]
         compact["changedFiles"] = compact["changedFiles"][-32:]
         compact["changedServices"] = compact["changedServices"][-32:]
+        compact["changedReleases"] = compact["changedReleases"][-32:]
         compact["preimages"] = compact["preimages"][-32:]
         compact["quarantine"] = compact["quarantine"][-32:]
         compact["rollback"] = compact["rollback"][-32:]
@@ -5159,6 +5282,7 @@ class RecoveryReportAuthority:
             for name in ("knowledge", "beads"):
                 enricher = self.enrichers.get(name)
                 if enricher is None:
+                    degraded.append(name)
                     continue
                 try:
                     extra = enricher(dict(context))
@@ -5173,22 +5297,29 @@ class RecoveryReportAuthority:
             event_refs, impact, timeline = self._trigger_evidence(
                 connection, str(incident["correlation_key"])
             )
+            session_rows = connection.execute(
+                "SELECT generation, session_id, state, runtime_json FROM session_bindings "
+                "WHERE incident_id = ? ORDER BY generation, id",
+                (incident_id,),
+            ).fetchall()
             sessions = [
                 {
                     "generation": int(row["generation"]),
                     "sessionId": _redact_report_text(row["session_id"], limit=128),
                     "state": str(row["state"]),
                 }
-                for row in connection.execute(
-                    "SELECT generation, session_id, state FROM session_bindings "
-                    "WHERE incident_id = ? ORDER BY generation, id",
-                    (incident_id,),
-                ).fetchall()
+                for row in session_rows
             ]
+            runtime_versions = (
+                {name: "unreported" for name in ("model", "node", "package", "pi")}
+                if not session_rows
+                else self._document(session_rows[-1]["runtime_json"], "report runtime")
+            )
             actions: list[dict[str, Any]] = []
             preimages: list[dict[str, str]] = []
             quarantine_records: list[dict[str, Any]] = []
             rollback_records: list[dict[str, Any]] = []
+            changed_releases: list[dict[str, str]] = []
             action_rows = connection.execute(
                 "SELECT action_intents.*, action_outcomes.outcome, "
                 "action_outcomes.outcome_json, action_outcomes.created_at AS outcome_at, "
@@ -5246,8 +5377,29 @@ class RecoveryReportAuthority:
                                 intent.get("operationId"), limit=128
                             ),
                             "outcome": action["outcome"],
+                            "previousRelease": _redact_report_text(
+                                outcome.get("previousRelease"), limit=128
+                            ),
+                            "activeRelease": _redact_report_text(
+                                outcome.get("activeRelease"), limit=128
+                            ),
                         }
                     )
+                    if (
+                        isinstance(outcome.get("activeRelease"), str)
+                        and outcome.get("activeRelease") != outcome.get("previousRelease")
+                    ):
+                        changed_releases.append(
+                            {
+                                "domain": "bot",
+                                "from": _redact_report_text(
+                                    outcome.get("previousRelease"), limit=128
+                                ),
+                                "to": _redact_report_text(
+                                    outcome.get("activeRelease"), limit=128
+                                ),
+                            }
+                        )
                 timeline.append(
                     {
                         "at": float(row["created_at"]),
@@ -5337,7 +5489,7 @@ class RecoveryReportAuthority:
                 "changedServices": self._text_list(
                     claim.get("changedServices"), limit=256
                 ),
-                "changedReleases": [],
+                "changedReleases": changed_releases,
                 "preimages": preimages,
                 "quarantine": quarantine_records,
                 "rollback": rollback_records,
@@ -5345,9 +5497,13 @@ class RecoveryReportAuthority:
                 "residualRisk": _redact_report_text(claim.get("residualRisk")),
                 "references": reference_groups,
                 "versions": {
-                    "model": "unreported",
+                    "model": _redact_report_text(runtime_versions.get("model"), limit=160),
                     "policy": int(incident["policy_revision"]),
-                    "runtime": "python-supervisor/package-fixer",
+                    "runtime": {
+                        "node": _redact_report_text(runtime_versions.get("node"), limit=80),
+                        "package": _redact_report_text(runtime_versions.get("package"), limit=80),
+                        "pi": _redact_report_text(runtime_versions.get("pi"), limit=80),
+                    },
                 },
                 "degradedMetadata": sorted(degraded),
                 "outcome": {
@@ -5376,19 +5532,20 @@ class RecoveryReportAuthority:
         return report_key, generation, invocation_id, self._bounded_body(body)
 
     def queue_ready(self) -> int:
-        rows = self.ledger.connection.execute(
-            "SELECT incidents.id FROM incidents WHERE incidents.state IN "
-            "('recovered', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted') "
-            "AND EXISTS (SELECT 1 FROM fixer_claims JOIN invocations "
-            "ON invocations.id = fixer_claims.invocation_id "
-            "WHERE fixer_claims.incident_id = incidents.id "
-            "AND invocations.state IN "
-            "('completed', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted')) "
-            "AND NOT EXISTS (SELECT 1 FROM incident_reports "
-            "WHERE incident_reports.incident_id = incidents.id "
-            "AND incident_reports.generation = incidents.generation) "
-            "ORDER BY incidents.id"
-        ).fetchall()
+        with self.ledger.transaction() as connection:
+            rows = connection.execute(
+                "SELECT incidents.id FROM incidents WHERE incidents.state IN "
+                "('recovered', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted') "
+                "AND EXISTS (SELECT 1 FROM fixer_claims JOIN invocations "
+                "ON invocations.id = fixer_claims.invocation_id "
+                "WHERE fixer_claims.incident_id = incidents.id "
+                "AND invocations.state IN "
+                "('completed', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted')) "
+                "AND NOT EXISTS (SELECT 1 FROM incident_reports "
+                "WHERE incident_reports.incident_id = incidents.id "
+                "AND incident_reports.generation = incidents.generation) "
+                "ORDER BY incidents.id"
+            ).fetchall()
         queued = 0
         for row in rows:
             incident_id = int(row["id"])
@@ -5700,6 +5857,7 @@ class RecoveryService:
                     session_id=payload["sessionId"],
                     session_directory=payload["sessionDirectory"],
                     transcript_path=payload["transcriptPath"],
+                    runtime=payload["runtime"],
                 )
                 return (
                     FixerResult(200, {"ok": True, "bindingId": binding_id})
@@ -5718,6 +5876,7 @@ class RecoveryService:
                     transcript_path=payload["transcriptPath"],
                     startup_classifier=payload["startupClassifier"],
                     journal_digest=payload["journalDigest"],
+                    runtime=payload["runtime"],
                 )
                 return (
                     FixerResult(200, {"ok": True, "bindingId": binding_id})
@@ -6186,14 +6345,16 @@ class _UnavailableLedger:
         raise LedgerUnavailable("ledger startup is unavailable")
 
 
-def _installed_fixer_runner() -> tuple[Path, tuple[str, str] | None]:
+def _installed_fixer_runner(
+    configured: RecoveryConfig,
+) -> tuple[Path, tuple[str, str] | None]:
     package_root = Path(__file__).resolve().parent.parent
     runner = package_root / "dist" / "recovery" / "fixer-session.js"
-    node = shutil.which("node")
-    if node is None or not runner.is_file():
+    node = Path(str(configured.slot_policy["nodeExecutable"]))
+    if not runner.is_file():
         return package_root, None
     try:
-        executable = Path(node).resolve(strict=True)
+        executable = node.resolve(strict=True)
         runner = runner.resolve(strict=True)
         if not executable.is_file() or not os.access(executable, os.X_OK):
             return package_root, None
@@ -6202,12 +6363,59 @@ def _installed_fixer_runner() -> tuple[Path, tuple[str, str] | None]:
     return package_root, (str(executable), str(runner))
 
 
+def _active_slot_health(configured: RecoveryConfig) -> dict[str, bool]:
+    health: dict[str, bool] = {}
+    for domain in ("bot", "capsule"):
+        try:
+            active_slot_release(configured, domain)
+        except (RecoverySlotError, OSError, ValueError, KeyError, TypeError):
+            health[domain] = False
+        else:
+            health[domain] = True
+    return health
+
+
+def _active_bot_release(configured: RecoveryConfig) -> str | None:
+    try:
+        return str(active_slot_release(configured, "bot")["releaseId"])
+    except (RecoverySlotError, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _report_delivery_message(report_key: str, body: dict[str, Any]) -> str:
+    """Build one bounded Telegram handoff while the full report stays durable."""
+
+    summary = {
+        "reportKey": report_key,
+        "incident": body.get("incident"),
+        "trigger": body.get("trigger"),
+        "rootCause": body.get("rootCause"),
+        "confidence": body.get("confidence"),
+        "changedFiles": body.get("changedFiles"),
+        "changedServices": body.get("changedServices"),
+        "changedReleases": body.get("changedReleases"),
+        "residualRisk": body.get("residualRisk"),
+        "degradedMetadata": body.get("degradedMetadata"),
+        "outcome": body.get("outcome"),
+    }
+    encoded = _canonical_json(summary)
+    prefix = "MINIME RECOVERY REPORT\n"
+    suffix = "\nFull redacted report remains in the durable local outbox."
+    maximum = 4_096 - len(prefix) - len(suffix)
+    if len(encoded) > maximum:
+        encoded = encoded[: max(0, maximum - 16)] + "...[truncated]"
+    return f"{prefix}{encoded}{suffix}"
+
+
 def _build_recovery_service(
     ledger: RecoveryLedger,
     event_spool: AtomicJsonSpool,
     emergency: EmergencyNotifier,
     *,
     configured: RecoveryConfig,
+    report_delivery: Callable[[str, dict[str, Any]], None] | None = None,
+    allow_fixer_dispatch: bool = True,
+    verify_active_slots: bool = True,
 ) -> RecoveryService:
     controls = RecoveryControls(ledger)
     static_policy = recovery_static_policy(configured)
@@ -6254,9 +6462,14 @@ def _build_recovery_service(
         cadence_seconds=configured.runtime_doctor_cadence_seconds,
         freshness_seconds=configured.verification_freshness_seconds,
         hold_down_seconds=configured.verification_hold_down_seconds,
+        slot_validator=(
+            (lambda: _active_slot_health(configured))
+            if verify_active_slots
+            else None
+        ),
     )
     probe_runner = PythonProbeRunner(verifier, configured.probes)
-    package_root, runner_argv = _installed_fixer_runner()
+    package_root, runner_argv = _installed_fixer_runner(configured)
     fixer_process = RecoveryFixerProcessManager(
         coordinator,
         runner_argv=runner_argv,
@@ -6269,10 +6482,17 @@ def _build_recovery_service(
         startup_timeout_seconds=int(
             configured.session_policy["startupTimeoutSeconds"]
         ),
+        resume_timeout_seconds=int(
+            configured.session_policy["resumeTimeoutSeconds"]
+        ),
         renew_seconds=configured.fixer_renew_seconds,
         run_timeout_seconds=int(
             configured.action_policy["reconciliationTimeoutSeconds"]
         ),
+        pi_executable=Path(str(configured.slot_policy["piExecutable"])),
+        preimage_directory=Path(str(configured.session_policy["directory"]))
+        / "preimages",
+        preimage_max_bytes=int(configured.action_policy["preimageMaxBytes"]),
     )
     report_store = RecoveryReportStore(
         ledger,
@@ -6284,11 +6504,15 @@ def _build_recovery_service(
         coordinator,
         report_store,
         max_timeline_entries=int(configured.report_policy["maxTimelineEntries"]),
+        delivery=report_delivery,
     )
     actuator = RecoveryActuator(
         coordinator,
         RecoveryQuarantine(configured.quarantine_policy),
-        ReviewedOperationExecutor(configured.reviewed_operations),
+        ReviewedOperationExecutor(
+            configured.reviewed_operations,
+            active_bot_release=lambda: _active_bot_release(configured),
+        ),
     )
     service = RecoveryService(
         ledger,
@@ -6298,7 +6522,7 @@ def _build_recovery_service(
         verifier=verifier,
         probe_runner=probe_runner,
         notifications=notifications,
-        fixer_process=fixer_process,
+        fixer_process=fixer_process if allow_fixer_dispatch else None,
         reports=reports,
         actuator=actuator,
     )
@@ -6342,9 +6566,13 @@ def main(argv: list[str] | None = None) -> int:
     spool_root = configured.spool_directory
     event_spool = AtomicJsonSpool(spool_root / "events")
     delivery = None
+    report_delivery = None
     if args.chat_id:
         telegram_config = DeliveryConfig(args.chat_id, args.thread_id)
         delivery = lambda message: send_telegram(message, telegram_config)
+        report_delivery = lambda report_key, body: send_telegram(
+            _report_delivery_message(report_key, body), telegram_config
+        )
     emergency = EmergencyNotifier(
         spool_root / "notifications",
         delivery=delivery,
@@ -6411,6 +6639,7 @@ def main(argv: list[str] | None = None) -> int:
                 event_spool,
                 emergency,
                 configured=configured,
+                report_delivery=report_delivery,
             )
             app.service = service
         except LedgerUnavailable:
@@ -6460,6 +6689,7 @@ def main(argv: list[str] | None = None) -> int:
                         event_spool,
                         emergency,
                         configured=configured,
+                        report_delivery=report_delivery,
                     )
                 except LedgerUnavailable:
                     if recovered_ledger is not None:
