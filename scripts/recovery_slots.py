@@ -32,6 +32,7 @@ from recovery_config import (
     RecoveryConfig,
     RecoveryConfigError,
     load_recovery_config,
+    reviewed_operation_executable_matches,
     validated_reviewed_operation,
 )
 
@@ -1190,7 +1191,17 @@ class ReviewedRestartRegistry:
         *,
         runner: RestartRunner = _default_restart_runner,
     ):
-        validated = [validated_reviewed_operation(dict(item)) for item in operations]
+        validated: list[dict[str, Any]] = []
+        for item in operations:
+            if "executableSha256" in item:
+                pinned = dict(item)
+                if not reviewed_operation_executable_matches(pinned):
+                    raise SlotValidationError(
+                        "bot restart operation executable changed"
+                    )
+            else:
+                pinned = validated_reviewed_operation(dict(item))
+            validated.append(pinned)
         self.operations = {str(item["id"]): item for item in validated}
         if len(self.operations) != len(validated):
             raise SlotValidationError("bot restart operation IDs overlap")
@@ -1204,6 +1215,14 @@ class ReviewedRestartRegistry:
 
     def execute(self, operation_id: str) -> dict[str, Any]:
         operation = self.require(operation_id)
+        if not reviewed_operation_executable_matches(operation):
+            return {
+                "ok": False,
+                "operationId": operation_id,
+                "timedOut": False,
+                "exitCode": None,
+                "code": "executable_changed",
+            }
         argv = [str(operation["executable"]), *map(str, operation["argv"])]
         try:
             result = self.runner(argv, int(operation["timeoutSeconds"]))

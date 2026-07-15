@@ -17,6 +17,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
+import recovery_config
 import recovery_slots
 
 
@@ -620,6 +621,26 @@ class RecoverySlotTransitionTests(unittest.TestCase):
 
 
 class RecoveryBotRollbackTests(unittest.TestCase):
+    def test_config_pinned_restart_operation_is_reused_and_rechecked(self) -> None:
+        calls: list[list[str]] = []
+
+        def restart(argv: list[str], _timeout: int) -> subprocess.CompletedProcess[bytes]:
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        pinned = recovery_config.validated_reviewed_operation(operation())
+        registry = recovery_slots.ReviewedRestartRegistry((pinned,), runner=restart)
+        self.assertTrue(registry.execute("restart-bot")["ok"])
+        self.assertEqual(calls, [["/usr/bin/true"]])
+        with mock.patch.object(
+            recovery_slots,
+            "reviewed_operation_executable_matches",
+            return_value=False,
+        ):
+            result = registry.execute("restart-bot")
+        self.assertEqual(result["code"], "executable_changed")
+        self.assertEqual(calls, [["/usr/bin/true"]])
+
     def _slots(
         self,
         root: Path,

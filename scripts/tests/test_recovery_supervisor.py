@@ -189,7 +189,7 @@ class FailingLedger:
 class RecoveryLedgerTests(unittest.TestCase):
     def test_fixed_schema_pragmas_and_restart_idempotency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(recovery_ledger.SCHEMA_VERSION, 4)
+            self.assertEqual(recovery_ledger.SCHEMA_VERSION, 5)
             path = Path(directory) / "ledger.sqlite3"
             events = recovery_supervisor.normalize_alertmanager(
                 alert_body(firing_alert("one"), firing_alert("two"))
@@ -1482,6 +1482,86 @@ class RecoveryDurableFixerContractTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_reconciliation_and_claim_keys_are_scoped_to_their_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = recovery_supervisor.RecoveryPolicy(
+                revision=1,
+                rules=(
+                    recovery_supervisor.CorrelationRule(
+                        "first", "unavailable", "first-incident", impact=3
+                    ),
+                    recovery_supervisor.CorrelationRule(
+                        "second", "unavailable", "second-incident", impact=3
+                    ),
+                ),
+                lease_seconds=120,
+            )
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, policy, owner="scoped-keys", mode="enabled"
+                )
+                ledger.record_events(
+                    [
+                        recovery_supervisor._normalized_event(
+                            source="alertmanager",
+                            fingerprint=f"scoped-{component}",
+                            code="SyntheticDown",
+                            status="firing",
+                            transition=f"scoped-{component}",
+                            occurred_at="2026-07-15T00:00:00Z",
+                            component=component,
+                            failure_class="unavailable",
+                        )
+                        for component in ("first", "second")
+                    ]
+                )
+                for _index in range(2):
+                    fence = coordinator.claim_next()
+                    assert fence is not None
+                    self.assertIsNotNone(
+                        coordinator.record_action_intent(
+                            fence,
+                            action_key="shared-action",
+                            tool_name="edit",
+                            intent={"reconciliation": {"path": "/synthetic/config"}},
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.mark_action_unknown(
+                            fence, action_key="shared-action"
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.reconcile_action(
+                            fence,
+                            action_key="shared-action",
+                            idempotency_key="shared-reconciliation",
+                            result="not_applied",
+                            details={"summary": "checked"},
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.accept_completion_claim(
+                            fence,
+                            claim_key="shared-finish",
+                            claim={"summary": "complete"},
+                        )
+                    )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM action_reconciliations "
+                        "WHERE idempotency_key = 'shared-reconciliation'"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM fixer_claims WHERE claim_key = 'shared-finish'"
+                    ).fetchone()[0],
+                    2,
+                )
+
     def test_crash_window_becomes_unknown_and_blocks_until_reconciliation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1987,6 +2067,9 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                 self.assertNotIn("MINIME_WORKSPACE_ROOT", runner_env)
                 self.assertNotIn("must-not-reach-runner", runner_env.values())
                 self.assertEqual(
+                    runner_env["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin"
+                )
+                self.assertEqual(
                     runner_env["MINIME_RECOVERY_FIXER_CREDENTIAL_FILE"],
                     str((root / "fixer-token").resolve()),
                 )
@@ -2360,6 +2443,67 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                 self.assertEqual(restarted.deliver_due(), 0)
                 self.assertEqual(delivered, [report_key])
                 self.assertEqual(restarted_store.state(report_key), "REPORTED")
+
+    def test_terminal_failure_without_claim_queues_redacted_authoritative_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="claimless-report",
+                    mode="enabled",
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("claimless-report"))
+                    )
+                )
+                fence = coordinator.claim_next()
+                assert fence is not None
+                self.assertTrue(coordinator.finish(fence, "retries_exhausted"))
+                store = recovery_supervisor.RecoveryReportStore(ledger)
+                authority = recovery_supervisor.RecoveryReportAuthority(
+                    ledger,
+                    coordinator,
+                    store,
+                    max_timeline_entries=64,
+                    enrichers={"knowledge": lambda _context: [], "beads": lambda _context: []},
+                )
+                self.assertEqual(authority.queue_ready(), 1)
+                self.assertEqual(authority.queue_ready(), 0)
+                row = ledger.connection.execute(
+                    "SELECT invocation_id, body_json FROM incident_reports"
+                ).fetchone()
+                self.assertEqual(row["invocation_id"], fence.invocation_id)
+                report = json.loads(str(row["body_json"]))
+                self.assertEqual(report["outcome"], "escalated")
+                self.assertEqual(report["claimSummary"], "fixer claim unavailable")
+                self.assertIn("fixer-claim", report["degradedMetadata"])
+
+                credentials = [
+                    "ghp_" + "a" * 36,
+                    "AKIA" + "A" * 16,
+                    "sk-" + "a" * 48,
+                    "https://user:" + "password" + "@example.invalid/path",
+                ]
+                for credential in credentials:
+                    with self.subTest(credential=credential[:4]):
+                        self.assertNotIn(
+                            credential,
+                            recovery_supervisor._redact_report_text(credential),
+                        )
+                message = recovery_supervisor._report_delivery_message(
+                    "incident:1:generation:1:report:v1",
+                    {
+                        **report,
+                        "rootCause": credentials[0],
+                        "residualRisk": credentials[-1],
+                    },
+                )
+                self.assertNotIn("rootCause", message)
+                self.assertNotIn(credentials[0], message)
+                self.assertNotIn("password", message)
 
 
 class RecoveryControlTests(unittest.TestCase):

@@ -41,6 +41,8 @@ from recovery_config import (
     recovery_endpoint_allowed,
     recovery_mode_allows_dispatch,
     recovery_static_policy,
+    reviewed_operation_executable_matches,
+    validated_reviewed_operation,
     validated_probe_command,
 )
 from recovery_ledger import (
@@ -199,7 +201,19 @@ _FIXER_RUNNER_ENV_KEYS = frozenset(
     }
 )
 _REPORT_SECRET = re.compile(
-    r"(?i)(?:bearer\s+|(?:password|secret|token|credential)\s*[:=]\s*)[^\s,;]+"
+    r"(?i)(?:bearer\s+|(?:api[-_]?key|auth|password|secret|token|credential)\s*[:=]\s*)[^\s,;]+"
+)
+_REPORT_KNOWN_CREDENTIAL = re.compile(
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|"
+    r"sk-[A-Za-z0-9_-]{20,255}|xox[baprs]-[A-Za-z0-9-]{10,255}|"
+    r"AIza[0-9A-Za-z_-]{35})\b|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+)
+_REPORT_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_REPORT_PRIVATE_KEY = re.compile(
+    r"(?i)-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?"
+    r"(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY-----|$)"
 )
 _REPORT_HOME_PATH = re.compile(r"/(?:Users|home)/[^/\s]+(?:/[^\s,;]*)?")
 _REPORT_ABSOLUTE_PATH = re.compile(r"(?<![:/A-Za-z0-9])/(?:[^\s,;]+)")
@@ -3428,7 +3442,21 @@ class ReviewedOperationExecutor:
         *,
         active_bot_release: Callable[[], str | None] | None = None,
     ):
-        self.operations = {str(item["id"]): dict(item) for item in operations}
+        normalized: list[dict[str, Any]] = []
+        for item in operations:
+            if "executableSha256" in item:
+                pinned = dict(item)
+                if not reviewed_operation_executable_matches(pinned):
+                    raise ValueError("recovery reviewed operation executable changed")
+            else:
+                pinned = validated_reviewed_operation(
+                    {
+                        key: item[key]
+                        for key in ("id", "kind", "executable", "argv", "timeoutSeconds")
+                    }
+                )
+            normalized.append(pinned)
+        self.operations = {str(item["id"]): item for item in normalized}
         if len(self.operations) != len(operations):
             raise ValueError("recovery reviewed operation IDs overlap")
         self.active_bot_release = active_bot_release
@@ -3448,6 +3476,13 @@ class ReviewedOperationExecutor:
         self, operation_id: str, *, fence_valid: Callable[[], bool]
     ) -> dict[str, Any]:
         operation = self.operations[operation_id]
+        if not reviewed_operation_executable_matches(operation):
+            return {
+                "ok": False,
+                "operationId": operation_id,
+                "kind": operation["kind"],
+                "code": "executable_changed",
+            }
         previous_release = (
             None if self.active_bot_release is None else self.active_bot_release()
         )
@@ -4659,6 +4694,7 @@ class RecoveryFixerProcessManager:
         self.base_env.pop("MINIME_WORKSPACE_ROOT", None)
         self.base_env.pop("MINIME_AGENT_WORKSPACE_CWD", None)
         self.base_env["MINIME_CONTROL_WORKSPACE_ROOT"] = str(self.control_workspace)
+        self.base_env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         self.popen = popen
         self.monotonic = monotonic
         self.process: subprocess.Popen[bytes] | None = None
@@ -5311,7 +5347,10 @@ def _redact_report_text(value: Any, *, limit: int = 8_192) -> str:
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
         return "unreported"
     text = str(value).replace("\0", "").replace("\r", " ").replace("\n", " ")
+    text = _REPORT_PRIVATE_KEY.sub("[redacted-private-key]", text)
+    text = _REPORT_URL_USERINFO.sub(r"\1[redacted]@", text)
     text = _REPORT_SECRET.sub("[redacted]", text)
+    text = _REPORT_KNOWN_CREDENTIAL.sub("[redacted]", text)
     text = _REPORT_HOME_PATH.sub("[private-path]", text)
     text = _REPORT_ABSOLUTE_PATH.sub("[absolute-path]", text)
     return text[:limit].strip() or "unreported"
@@ -5510,7 +5549,7 @@ class RecoveryReportAuthority:
             )
         return references[-256:], impact, timeline
 
-    def _build(self, incident_id: int) -> tuple[str, int, int, dict[str, Any]]:
+    def _build(self, incident_id: int) -> tuple[str, int, int | None, dict[str, Any]]:
         degraded: list[str] = []
         with self.ledger.transaction() as connection:
             incident = connection.execute(
@@ -5532,9 +5571,24 @@ class RecoveryReportAuthority:
                 "ORDER BY fixer_claims.generation DESC, fixer_claims.id DESC LIMIT 1",
                 (incident_id,),
             ).fetchone()
+            latest_invocation = connection.execute(
+                "SELECT id FROM invocations WHERE incident_id = ? "
+                "ORDER BY generation DESC, id DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
             if claim_row is None:
-                raise ValueError("recovery report completion claim is unavailable")
-            claim = self._document(claim_row["claim_json"], "report claim")
+                claim = {
+                    "summary": "fixer claim unavailable",
+                    "rootCause": "unreported",
+                    "residualRisk": "unreported",
+                }
+                degraded.append("fixer-claim")
+                invocation_id = (
+                    None if latest_invocation is None else int(latest_invocation["id"])
+                )
+            else:
+                claim = self._document(claim_row["claim_json"], "report claim")
+                invocation_id = int(claim_row["invocation_id"])
             references = self._text_list(
                 claim.get("references"), limit=1_024, references=True
             )
@@ -5559,7 +5613,7 @@ class RecoveryReportAuthority:
             context = {
                 "incidentId": incident_id,
                 "generation": int(incident["generation"]),
-                "invocationId": int(claim_row["invocation_id"]),
+                "invocationId": invocation_id,
             }
             for name in ("knowledge", "beads"):
                 enricher = self.enrichers.get(name)
@@ -5731,7 +5785,6 @@ class RecoveryReportAuthority:
 
             timeline.sort(key=lambda item: (item["at"], item["kind"], item["ref"]))
             generation = int(incident["generation"])
-            invocation_id = int(claim_row["invocation_id"])
             report_key = f"incident:{incident_id}:generation:{generation}:report:v1"
             body = {
                 "version": 1,
@@ -5813,11 +5866,6 @@ class RecoveryReportAuthority:
             rows = connection.execute(
                 "SELECT incidents.id FROM incidents WHERE incidents.state IN "
                 "('recovered', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted') "
-                "AND EXISTS (SELECT 1 FROM fixer_claims JOIN invocations "
-                "ON invocations.id = fixer_claims.invocation_id "
-                "WHERE fixer_claims.incident_id = incidents.id "
-                "AND invocations.state IN "
-                "('completed', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted')) "
                 "AND NOT EXISTS (SELECT 1 FROM incident_reports "
                 "WHERE incident_reports.incident_id = incidents.id "
                 "AND incident_reports.generation = incidents.generation) "
@@ -6699,16 +6747,14 @@ def _active_bot_release(configured: RecoveryConfig) -> str | None:
 def _report_delivery_message(report_key: str, body: dict[str, Any]) -> str:
     """Build one bounded Telegram handoff while the full report stays durable."""
 
+    incident = body.get("incident")
+    incident_summary = {
+        "id": incident.get("id"),
+        "generation": incident.get("generation"),
+    } if isinstance(incident, dict) else None
     summary = {
-        "reportKey": report_key,
-        "incident": body.get("incident"),
-        "trigger": body.get("trigger"),
-        "rootCause": body.get("rootCause"),
-        "confidence": body.get("confidence"),
-        "changedFiles": body.get("changedFiles"),
-        "changedServices": body.get("changedServices"),
-        "changedReleases": body.get("changedReleases"),
-        "residualRisk": body.get("residualRisk"),
+        "reportKey": safe_field(report_key, limit=256),
+        "incident": incident_summary,
         "degradedMetadata": body.get("degradedMetadata"),
         "outcome": body.get("outcome"),
     }

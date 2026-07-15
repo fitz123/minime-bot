@@ -254,7 +254,7 @@ Alert timestamps more than five minutes ahead of their receive time are not
 trusted for semantic ordering; the ledger conservatively orders those events by
 receive time so a malformed future transition cannot mask later input.
 
-The version-3 ledger stores exact-session bindings/replacements, action
+The version-5 ledger stores exact-session bindings/replacements, action
 intents/outcomes/reconciliations, completion claims, verification history, and
 independent report/outbox state. A fixer `finish` is only a claim: it can never
 mark the incident recovered. Fresh host evidence, hold-down, active-slot state,
@@ -281,7 +281,12 @@ idempotent reconcile endpoint remain available, but every later mutation is
 blocked until all unknown actions are reconciled against host state. Diagnose
 mode enforces the same journal but blocks mutation. Quarantine and reviewed
 restart/rollback IDs execute in Python; the extension cannot submit argv, shell,
-or path policy for those operations.
+or path policy for those operations. Action intents retain a bounded,
+credential-redacted command or target descriptor so a replacement session can
+inspect the relevant host state. Reviewed executables must resolve to canonical,
+non-symlink system-owned files under non-writable parents; their identity and
+checksum are pinned at configuration load and checked again immediately before
+execution.
 
 The trusted fixer may repair ordinary-user configuration, create preimages,
 quarantine bounded temporary/cache files, make local commits, and request
@@ -292,14 +297,16 @@ poller. This is a same-UID safety contract, not a hostile-process sandbox.
 
 ## Reports and degraded enrichment
 
-After independent verification, the supervisor merges the model claim with the
-authoritative event, action, session, quarantine, slot, and verification journal.
-It redacts secrets and private paths, bounds the document, and queues one durable
-report key. `REPORT_PENDING` and `REPORTED` belong to report/outbox rows and
-never replace the incident's `recovered` outcome. Delivery failure leaves the
-report pending across restart. Knowledge or Beads enrichment failure is listed
-under degraded metadata and never blocks repair, verification, or report
-creation.
+After any terminal verdict, the supervisor merges an available model claim with
+the authoritative event, action, session, quarantine, slot, and verification
+journal. A runner or provider failure that never produced a claim is reported
+with explicit degraded metadata. The supervisor redacts secrets and private
+paths, bounds the document, and queues one durable report key; external delivery
+contains only the report key and authoritative status fields. `REPORT_PENDING`
+and `REPORTED` belong to report/outbox rows and never replace the incident's
+terminal outcome. Delivery failure leaves the report pending across restart.
+Knowledge or Beads enrichment failure is listed under degraded metadata and
+never blocks repair, verification, or report creation.
 
 ## Recovery capsule and bot release slots
 

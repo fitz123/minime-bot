@@ -43,6 +43,10 @@ const MAX_PROTOCOL_TEXT = 4_096;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const SECRET_KEY = /(?:auth|credential|password|secret|token)/i;
+const ENVIRONMENT_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const RECONCILIATION_SECRET = /(?:bearer\s+|(?:api[-_]?key|auth|credential|password|secret|token)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+const RECONCILIATION_KNOWN_CREDENTIAL = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|sk-[A-Za-z0-9_-]{20,255}|xox[baprs]-[A-Za-z0-9-]{10,255})\b/g;
+const RECONCILIATION_URL_USERINFO = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+@/g;
 
 export interface RecoveryFenceContract {
   invocationId: number;
@@ -441,6 +445,11 @@ const READ_ONLY_GIT = new Set([
   "show", "show-ref", "status",
 ]);
 
+const SHELL_CONTROL_WORDS = new Set([
+  "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function",
+  "if", "in", "select", "then", "until", "while",
+]);
+
 function shellWords(command: string): string[] | undefined {
   // Expansion and process/group syntax can hide additional commands or
   // mutation flags. Treat them as mutating instead of attempting a shell
@@ -506,9 +515,13 @@ function gitSubcommand(args: string[]): string | undefined {
 }
 
 function readOnlySegment(segment: string[]): boolean {
-  while (segment[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(segment[0])) segment.shift();
   if (segment.length === 0) return true;
-  const executable = segment[0].split("/").pop() ?? segment[0];
+  if (ENVIRONMENT_ASSIGNMENT.test(segment[0])) return false;
+  const executable = segment[0];
+  // The supervisor gives the fixer a fixed system PATH. Path-qualified
+  // lookalikes and per-command environment overrides must still be journaled
+  // (and are therefore blocked in diagnose mode).
+  if (executable.includes("/") || SHELL_CONTROL_WORDS.has(executable.toLowerCase())) return false;
   const args = segment.slice(1);
   if (executable === "git") return READ_ONLY_GIT.has(gitSubcommand(args) ?? "");
   if (executable === "find") return !args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg));
@@ -575,9 +588,10 @@ export function forbiddenRecoveryBashReason(command: unknown): RecoveryGuardCate
   if (!segments) return "ambiguous-shell";
   for (const rawSegment of segments) {
     const segment = [...rawSegment];
-    while (segment[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(segment[0])) segment.shift();
     if (segment.length === 0) continue;
+    if (ENVIRONMENT_ASSIGNMENT.test(segment[0])) return "ambiguous-shell";
     const words = segment.map((word) => word.toLowerCase());
+    if (SHELL_CONTROL_WORDS.has(words[0])) return "ambiguous-shell";
     const executable = (words[0].split("/").pop() ?? words[0]);
     const args = words.slice(1);
     if (words.includes("sudo") || executable === "sudo") return "privilege-escalation";
@@ -672,6 +686,19 @@ function boundedText(value: unknown, limit = 512): string | undefined {
   return value.length <= limit ? value : `${value.slice(0, limit)}...`;
 }
 
+function reconciliationText(value: unknown, limit: number): string | undefined {
+  const bounded = boundedText(value, limit);
+  if (bounded === undefined) return undefined;
+  return bounded
+    .replace(/\0/g, "")
+    .replace(RECONCILIATION_URL_USERINFO, "$1[redacted]@")
+    .replace(RECONCILIATION_SECRET, (match) => {
+      const separator = match.search(/[:=]|\s/);
+      return separator < 0 ? "[redacted]" : `${match.slice(0, separator + 1)}[redacted]`;
+    })
+    .replace(RECONCILIATION_KNOWN_CREDENTIAL, "[redacted]");
+}
+
 export function summarizeRecoveryIntent(event: Pick<ToolCallEvent, "toolName" | "input">): Record<string, unknown> {
   const input = event.input as Record<string, unknown>;
   const nonSecretKeys = Object.keys(input).filter((key) => !SECRET_KEY.test(key)).sort().slice(0, 64);
@@ -680,23 +707,28 @@ export function summarizeRecoveryIntent(event: Pick<ToolCallEvent, "toolName" | 
     inputKeyCount: Object.keys(input).length,
     inputSchemaSha256: digest(nonSecretKeys),
   };
+  const reconciliation: Record<string, string> = {};
   const path = boundedText(input.path, 2_048);
   if (path) {
     summary.pathBytes = Buffer.byteLength(path, "utf8");
     summary.pathSha256 = digest(path);
+    reconciliation.path = reconciliationText(path, 2_048) ?? "[redacted]";
   }
   if (event.toolName === "bash") {
     const command = typeof input.command === "string" ? input.command : "";
     summary.commandBytes = Buffer.byteLength(command, "utf8");
     summary.commandSha256 = digest(command);
+    reconciliation.command = reconciliationText(command, 4_096) ?? "[redacted]";
   }
   for (const key of ["op", "type", "slug"] as const) {
     const value = boundedText(input[key], 160);
     if (value) {
       summary[`${key}Bytes`] = Buffer.byteLength(value, "utf8");
       summary[`${key}Sha256`] = digest(value);
+      reconciliation[key] = reconciliationText(value, 160) ?? "[redacted]";
     }
   }
+  if (Object.keys(reconciliation).length > 0) summary.reconciliation = reconciliation;
   return summary;
 }
 

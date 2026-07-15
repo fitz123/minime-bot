@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Iterable, Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
 DEFAULT_EVENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_BATCH_SIZE = 256
@@ -195,7 +195,7 @@ _SCHEMA = (
     CREATE TABLE action_reconciliations (
         id INTEGER PRIMARY KEY,
         action_intent_id INTEGER NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL,
         result TEXT NOT NULL CHECK (result IN ('applied', 'not_applied')),
         details_json TEXT NOT NULL,
         created_at REAL NOT NULL,
@@ -210,7 +210,7 @@ _SCHEMA = (
         generation INTEGER NOT NULL CHECK (generation > 0),
         evidence_hash TEXT NOT NULL,
         policy_revision INTEGER NOT NULL,
-        claim_key TEXT NOT NULL UNIQUE,
+        claim_key TEXT NOT NULL,
         claim_json TEXT NOT NULL,
         claimed_at REAL NOT NULL,
         FOREIGN KEY (invocation_id) REFERENCES invocations(id),

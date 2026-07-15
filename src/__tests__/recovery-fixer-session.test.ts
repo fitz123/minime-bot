@@ -494,19 +494,27 @@ describe("recovery action journaling", () => {
     assert.equal(isReadOnlyRecoveryBash("cat config.yaml & rm config.yaml"), false);
     assert.equal(isReadOnlyRecoveryBash("cat <(rm config.yaml)"), false);
     assert.equal(isReadOnlyRecoveryBash("find . $RECOVERY_FIND_FLAGS"), false);
+    assert.equal(isReadOnlyRecoveryBash("/tmp/cat config.yaml"), false);
+    assert.equal(isReadOnlyRecoveryBash("./git status"), false);
+    assert.equal(isReadOnlyRecoveryBash("PATH=/tmp git status"), false);
+    assert.equal(forbiddenRecoveryBashReason("PATH=/tmp git status"), "ambiguous-shell");
+    assert.equal(forbiddenRecoveryBashReason("if rm -rf /tmp/target; then true; fi"), "ambiguous-shell");
+    assert.equal(forbiddenRecoveryBashReason("! rm -rf /tmp/target"), "ambiguous-shell");
 
     const summary = summarizeRecoveryIntent({
       toolName: "bash",
       input: {
-        command: "write-sensitive-value",
+        command: "repair-config --token=must-not-persist",
         path: "/private/identity/config.yaml",
         token: "must-not-persist",
       },
     } as unknown as ToolCallEvent);
     assert.equal(JSON.stringify(summary).includes("must-not-persist"), false);
-    assert.equal(JSON.stringify(summary).includes("write-sensitive-value"), false);
-    assert.equal(JSON.stringify(summary).includes("/private/identity"), false);
     assert.equal(typeof summary.commandSha256, "string");
+    assert.deepEqual(summary.reconciliation, {
+      command: "repair-config --token=[redacted]",
+      path: "/private/identity/config.yaml",
+    });
   });
 
   it("blocks diagnose mutations and journals enabled intent before outcome", async () => {

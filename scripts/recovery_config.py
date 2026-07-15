@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 
@@ -327,6 +330,107 @@ def _reviewed_operation_argv_valid(
     return name not in _FORBIDDEN_OPERATION_EXECUTABLES
 
 
+_REVIEWED_EXECUTABLE_IDENTITY_KEYS = (
+    "executableDevice",
+    "executableInode",
+    "executableMode",
+    "executableMtimeNs",
+    "executableSha256",
+    "executableSize",
+    "executableUid",
+)
+
+
+def _reviewed_operation_executable_identity(executable: str) -> dict[str, Any]:
+    """Pin one executable that the same-UID fixer cannot replace or rewrite."""
+
+    path = Path(executable)
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise RecoveryConfigError(
+                "recovery reviewed operation executable is not canonical"
+            )
+        parent = path.parent
+        while True:
+            parent_details = parent.lstat()
+            if (
+                not stat.S_ISDIR(parent_details.st_mode)
+                or stat.S_ISLNK(parent_details.st_mode)
+                or os.access(parent, os.W_OK)
+            ):
+                raise RecoveryConfigError(
+                    "recovery reviewed operation executable parent is mutable"
+                )
+            if parent == parent.parent:
+                break
+            parent = parent.parent
+
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid == os.geteuid()
+            or details.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+            or os.access(path, os.W_OK)
+            or not os.access(path, os.X_OK)
+        ):
+            raise RecoveryConfigError(
+                "recovery reviewed operation executable is mutable or unsafe"
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
+                raise RecoveryConfigError(
+                    "recovery reviewed operation executable changed during validation"
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            ):
+                raise RecoveryConfigError(
+                    "recovery reviewed operation executable changed during validation"
+                )
+        finally:
+            os.close(descriptor)
+    except RecoveryConfigError:
+        raise
+    except OSError as exc:
+        raise RecoveryConfigError(
+            "recovery reviewed operation executable is unavailable"
+        ) from exc
+    return {
+        "executableDevice": int(after.st_dev),
+        "executableInode": int(after.st_ino),
+        "executableMode": int(stat.S_IMODE(after.st_mode)),
+        "executableMtimeNs": int(after.st_mtime_ns),
+        "executableSha256": digest.hexdigest(),
+        "executableSize": int(after.st_size),
+        "executableUid": int(after.st_uid),
+    }
+
+
+def reviewed_operation_executable_matches(operation: dict[str, Any]) -> bool:
+    """Fail closed when a pinned reviewed executable changes before launch."""
+
+    try:
+        current = _reviewed_operation_executable_identity(str(operation["executable"]))
+    except (KeyError, RecoveryConfigError):
+        return False
+    return all(operation.get(key) == current[key] for key in _REVIEWED_EXECUTABLE_IDENTITY_KEYS)
+
+
 def validated_reviewed_operation(value: Any) -> dict[str, Any]:
     """Return one closed static supervisor operation without shell semantics."""
 
@@ -368,13 +472,15 @@ def validated_reviewed_operation(value: Any) -> dict[str, Any]:
     timeout = _bounded_integer(
         item["timeoutSeconds"], (1, 300), "reviewed operation timeout"
     )
-    return {
+    result = {
         "id": identifier,
         "kind": str(kind),
         "executable": executable,
         "argv": list(argv),
         "timeoutSeconds": timeout,
     }
+    result.update(_reviewed_operation_executable_identity(executable))
+    return result
 
 
 def recovery_mode_allows_dispatch(mode: str) -> bool:

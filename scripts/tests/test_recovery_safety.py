@@ -424,6 +424,52 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
 
 
 class RecoveryReviewedOperationTests(unittest.TestCase):
+    def test_reviewed_executable_must_be_immutable_and_remain_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mutable = Path(directory) / "mutable-wrapper"
+            mutable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            mutable.chmod(0o700)
+            with self.assertRaises(recovery_config.RecoveryConfigError):
+                recovery_config.validated_reviewed_operation(
+                    {
+                        "id": "mutable",
+                        "kind": "restart",
+                        "executable": str(mutable),
+                        "argv": [],
+                        "timeoutSeconds": 10,
+                    }
+                )
+            with self.assertRaises(recovery_config.RecoveryConfigError):
+                recovery_config.validated_reviewed_operation(
+                    {
+                        "id": "missing",
+                        "kind": "restart",
+                        "executable": str(Path(directory) / "missing-wrapper"),
+                        "argv": [],
+                        "timeoutSeconds": 10,
+                    }
+                )
+
+        executor = recovery_supervisor.ReviewedOperationExecutor(
+            (
+                {
+                    "id": "restart-bot",
+                    "kind": "restart",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "timeoutSeconds": 10,
+                },
+            )
+        )
+        with mock.patch.object(
+            recovery_supervisor,
+            "reviewed_operation_executable_matches",
+            return_value=False,
+        ), mock.patch.object(recovery_supervisor.subprocess, "Popen") as popen:
+            result = executor.execute("restart-bot", fence_valid=lambda: True)
+        self.assertEqual(result["code"], "executable_changed")
+        popen.assert_not_called()
+
     def test_static_id_execution_has_no_mutable_command_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -570,14 +616,14 @@ class RecoveryReviewedOperationTests(unittest.TestCase):
         self.assertEqual(
             recovery_config.validated_reviewed_operation(
                 {
-                    "id": "restart-container",
+                    "id": "restart-wrapper",
                     "kind": "restart",
-                    "executable": "/usr/local/bin/docker",
-                    "argv": ["restart", "minime-bot"],
+                    "executable": "/usr/bin/true",
+                    "argv": [],
                     "timeoutSeconds": 30,
                 }
             )["id"],
-            "restart-container",
+            "restart-wrapper",
         )
 
 
