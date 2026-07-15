@@ -107,11 +107,11 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 - [x] Test false success, full lifecycle, deterministic verification, resume, report exactly-once/pending across restart, delivery outage, and Knowledge/Beads failure; run lifecycle tests.
 
 ### Task 4: Add supervisor-owned quarantine, reviewed operations, and zero-capability rootctl
-- [ ] Implement fenced canonical-path quarantine/restore with ownership/mode/symlink/size/item guards and checksummed `0600` restore metadata.
-- [ ] Implement supervisor-owned static-ID restart/rollback execution and prevent the Node extension from accepting mutable argv/shell/path policy.
-- [ ] Add trusted-agent rules and audited guards for literal `sudo`, irreversible deletion, public/external mutation, secret operations, package/image download, prune/volume operations, and competing Telegram polling.
-- [ ] Add `scripts/recovery_rootctl.py` with empty registry and fence/idempotency/UID/rate validation, no privileged listener, and no generic command/argv/path.
-- [ ] Test quarantine/restore/rejections, allowed user config/restart, forbidden deletion/public/network actions, and inability to bypass empty root capability; run safety tests.
+- [x] Implement fenced canonical-path quarantine/restore with ownership/mode/symlink/size/item guards and checksummed `0600` restore metadata.
+- [x] Implement supervisor-owned static-ID restart/rollback execution and prevent the Node extension from accepting mutable argv/shell/path policy.
+- [x] Add trusted-agent rules and audited guards for literal `sudo`, irreversible deletion, public/external mutation, secret operations, package/image download, prune/volume operations, and competing Telegram polling.
+- [x] Add `scripts/recovery_rootctl.py` with empty registry and fence/idempotency/UID/rate validation, no privileged listener, and no generic command/argv/path.
+- [x] Test quarantine/restore/rejections, allowed user config/restart, forbidden deletion/public/network actions, and inability to bypass empty root capability; run safety tests.
 
 ### Task 5: Add independent recovery-capsule and bot-release slots
 - [ ] Implement validated local recovery staging plus stable bootstrap/current/previous/state, atomic switch/fsync, self-check, and one previous fallback.

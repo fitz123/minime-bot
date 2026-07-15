@@ -23,6 +23,8 @@ import {
 import {
   RecoveryProtocolClient,
   RecoveryToolJournal,
+  forbiddenRecoveryBashReason,
+  forbiddenRecoveryToolReason,
   isReadOnlyRecoveryBash,
   readRecoveryRuntimeContract,
   summarizeRecoveryIntent,
@@ -291,5 +293,66 @@ describe("recovery action journaling", () => {
     const diagnose = new RecoveryToolJournal(fakeClient, "diagnose");
     assert.match((await diagnose.before(call))?.reason ?? "", /diagnose/);
     assert.deepEqual(calls, ["intent", "outcome"]);
+  });
+
+  it("blocks and audits every trusted-agent forbidden action category", async () => {
+    const fixtures: Array<[string, string]> = [
+      ["sudo launchctl kickstart gui/501/example", "privilege-escalation"],
+      ["rm -rf cache", "irreversible-deletion"],
+      ["git push origin repair", "external-mutation"],
+      ["curl -X POST https://example.invalid", "external-mutation"],
+      ["npm install package", "package-or-image-download"],
+      ["docker image prune -a", "prune-or-volume"],
+      ["docker volume rm data", "prune-or-volume"],
+      ["docker restart minime", "supervisor-owned-operation"],
+      ["security find-generic-password -s bot", "secret-operation"],
+      ["telegram getUpdates", "competing-polling"],
+      ["printf value > config.yaml", "ambiguous-shell"],
+    ];
+    for (const [command, category] of fixtures) {
+      assert.equal(forbiddenRecoveryBashReason(command), category, command);
+    }
+    assert.equal(forbiddenRecoveryBashReason("git commit -am repair"), undefined);
+    assert.equal(forbiddenRecoveryBashReason("launchctl print gui/501/example"), undefined);
+    assert.equal(forbiddenRecoveryToolReason({
+      toolName: "edit",
+      input: { path: "/agent/config.yaml" },
+    } as unknown as ToolCallEvent), undefined);
+    assert.equal(forbiddenRecoveryToolReason({
+      toolName: "read",
+      input: { path: "/agent/recovery-auth-token" },
+    } as unknown as ToolCallEvent), "secret-operation");
+
+    const calls: string[] = [];
+    const fakeClient = {
+      contract: readRecoveryRuntimeContract(runtimeEnv("enabled")),
+      guardRejected: async (_key: string, category: string) => {
+        calls.push(`guard:${category}`);
+        return true;
+      },
+      intent: async () => { calls.push("intent"); return true; },
+    } as unknown as RecoveryProtocolClient;
+    const journal = new RecoveryToolJournal(fakeClient, "enabled");
+    const blocked = await journal.before({
+      type: "tool_call",
+      toolCallId: "forbidden-1",
+      toolName: "bash",
+      input: { command: "git push origin repair" },
+    } as ToolCallEvent);
+    assert.match(blocked?.reason ?? "", /external-mutation/);
+    assert.deepEqual(calls, ["guard:external-mutation"]);
+  });
+
+  it("exposes reviewed operations by ID without argv, shell, or path policy", () => {
+    const source = readFileSync(resolve("extensions/pi/recovery.ts"), "utf8");
+    const start = source.indexOf('name: "recovery_operation"');
+    const end = source.indexOf("pi.registerTool", start + 1);
+    assert.ok(start >= 0 && end > start);
+    const definition = source.slice(start, end);
+    const parameterStart = definition.indexOf("parameters: Type.Object");
+    const parameterEnd = definition.indexOf("execute:", parameterStart);
+    const parameters = definition.slice(parameterStart, parameterEnd);
+    assert.match(parameters, /operationId/);
+    assert.doesNotMatch(parameters, /\bargv\b|\bshell\b|\bsourcePath\b|\btargetPath\b/);
   });
 });

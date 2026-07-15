@@ -234,23 +234,91 @@ def _absolute_policy_path(value: Any, name: str) -> str:
 
 
 _FORBIDDEN_OPERATION_EXECUTABLES = {
+    "apt",
+    "apt-get",
     "bash",
+    "brew",
     "curl",
+    "dnf",
     "env",
     "fish",
+    "gh",
+    "git",
     "node",
     "npm",
     "npx",
+    "pip",
+    "pip3",
     "perl",
+    "podman",
     "python",
     "python3",
+    "rm",
     "ruby",
+    "scp",
     "sh",
+    "shred",
+    "ssh",
     "sudo",
+    "unlink",
     "wget",
+    "yum",
     "zsh",
 }
 _SHELL_FRAGMENT = re.compile(r"(?:[;&|`<>\n\r]|\$\(|\$\{|\x00)")
+_REVIEWED_SECRET_ARGUMENT = re.compile(
+    r"(?:^|[-_.])(?:auth|credential|password|secret|token)(?:$|[-_.=])",
+    re.IGNORECASE,
+)
+_SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _reviewed_operation_argv_valid(
+    kind: str, executable: str, argv: list[str]
+) -> bool:
+    """Reject reviewed commands that cross the phase-1 trusted-agent boundary."""
+
+    name = Path(executable).name.lower()
+    lowered = [argument.lower() for argument in argv]
+    if any(
+        _REVIEWED_SECRET_ARGUMENT.search(argument) is not None
+        or argument in {"sudo", "getupdates"}
+        for argument in lowered
+    ):
+        return False
+    if any(
+        argument in {
+            "build",
+            "download",
+            "install",
+            "prune",
+            "pull",
+            "push",
+            "volume",
+        }
+        for argument in lowered
+    ):
+        return False
+    if name == "launchctl":
+        return bool(
+            kind == "restart"
+            and len(argv) in {2, 3}
+            and argv[0] == "kickstart"
+            and (len(argv) == 2 or argv[1] == "-k")
+            and _LAUNCHD_TARGET.fullmatch(argv[-1])
+            and argv[-1].split("/", 1)[0] in {"user", "gui"}
+        )
+    if name == "docker":
+        return bool(
+            kind == "restart"
+            and len(argv) == 2
+            and argv[0] == "restart"
+            and _SAFE_CONTAINER_NAME.fullmatch(argv[1])
+        )
+    # A deployment-specific rollback/restart wrapper is allowed only as an
+    # immutable absolute executable selected by ID. It still cannot contain
+    # shell syntax or any of the forbidden operation vocabulary above.
+    return name not in _FORBIDDEN_OPERATION_EXECUTABLES
 
 
 def validated_reviewed_operation(value: Any) -> dict[str, Any]:
@@ -288,6 +356,7 @@ def validated_reviewed_operation(value: Any) -> dict[str, Any]:
             for arg in argv
         )
         or sum(len(arg.encode("utf-8")) for arg in argv) > 16 * 1024
+        or not _reviewed_operation_argv_valid(str(kind), executable, argv)
     ):
         raise RecoveryConfigError("recovery reviewed operation argv is invalid")
     timeout = _bounded_integer(

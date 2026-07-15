@@ -74,6 +74,17 @@ export interface RecoveryProtocolResponse {
   body: Record<string, unknown>;
 }
 
+export type RecoveryGuardCategory =
+  | "ambiguous-shell"
+  | "competing-polling"
+  | "external-mutation"
+  | "irreversible-deletion"
+  | "package-or-image-download"
+  | "privilege-escalation"
+  | "prune-or-volume"
+  | "secret-operation"
+  | "supervisor-owned-operation";
+
 interface RecoveryProtocolClientOptions {
   timeoutMs?: number;
   readToken?: (path: string) => string;
@@ -316,6 +327,32 @@ export class RecoveryProtocolClient {
     })).ok;
   }
 
+  async guardRejected(
+    eventKey: string,
+    category: RecoveryGuardCategory,
+    toolName: string,
+    inputSha256: string,
+  ): Promise<boolean> {
+    return (await this.request("/v1/fixer/guard/rejection", {
+      eventKey,
+      category,
+      toolName,
+      inputSha256,
+    })).ok;
+  }
+
+  async quarantine(idempotencyKey: string, sourcePath: string): Promise<RecoveryProtocolResponse> {
+    return this.request("/v1/fixer/quarantine", { idempotencyKey, sourcePath });
+  }
+
+  async restore(idempotencyKey: string, quarantineId: string): Promise<RecoveryProtocolResponse> {
+    return this.request("/v1/fixer/restore", { idempotencyKey, quarantineId });
+  }
+
+  async operation(idempotencyKey: string, operationId: string): Promise<RecoveryProtocolResponse> {
+    return this.request("/v1/fixer/operation", { idempotencyKey, operationId });
+  }
+
   async blocked(claimKey: string, reason: string, residualRisk?: string): Promise<boolean> {
     return (await this.request("/v1/fixer/blocked", {
       claimKey,
@@ -423,6 +460,102 @@ function readOnlySegment(segment: string[]): boolean {
   return READ_ONLY_COMMANDS.has(executable);
 }
 
+const NETWORK_MUTATORS = new Set(["curl", "gh", "rsync", "scp", "sftp", "ssh", "wget"]);
+const PACKAGE_MUTATORS = new Set([
+  "apt", "apt-get", "brew", "bun", "dnf", "npm", "npx", "pip", "pip3", "pnpm", "yarn", "yum",
+]);
+const DELETERS = new Set(["rm", "rmdir", "shred", "unlink"]);
+const SECRET_EXECUTABLES = new Set(["gpg", "openssl", "pass", "security", "ssh-keygen"]);
+const SECRET_ARGUMENT = /(?:^|[./_-])(?:auth|credential|id_rsa|password|private[-_]?key|secret|token)(?:$|[./_=-])|(?:^|\/)\.env(?:$|[./_-])/i;
+const SUPERVISOR_RECOVERY_TOOLS = new Set([
+  "recovery_blocked",
+  "recovery_finish",
+  "recovery_heartbeat",
+  "recovery_inspect",
+  "recovery_operation",
+  "recovery_quarantine",
+  "recovery_reconcile",
+  "recovery_restore",
+]);
+
+function commandSegments(command: string): string[][] | undefined {
+  const words = shellWords(command);
+  if (!words) return undefined;
+  const segments: string[][] = [[]];
+  for (const word of words) {
+    if (word === ";") segments.push([]);
+    else segments.at(-1)?.push(word);
+  }
+  return segments;
+}
+
+/** Return the fixed safety category for a command that must never execute. */
+export function forbiddenRecoveryBashReason(command: unknown): RecoveryGuardCategory | undefined {
+  if (typeof command !== "string" || !command.trim()) return "ambiguous-shell";
+  if (/getupdates/i.test(command)) return "competing-polling";
+  const segments = commandSegments(command);
+  if (!segments) return "ambiguous-shell";
+  for (const rawSegment of segments) {
+    const segment = [...rawSegment];
+    while (segment[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(segment[0])) segment.shift();
+    if (segment.length === 0) continue;
+    const words = segment.map((word) => word.toLowerCase());
+    const executable = (words[0].split("/").pop() ?? words[0]);
+    const args = words.slice(1);
+    if (words.includes("sudo") || executable === "sudo") return "privilege-escalation";
+    if (DELETERS.has(executable) || ["dd", "mkfs", "truncate", "wipefs"].includes(executable) || (executable === "find" && args.some((arg) =>
+      ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg)))) {
+      return "irreversible-deletion";
+    }
+    if (NETWORK_MUTATORS.has(executable)) return "external-mutation";
+    if (PACKAGE_MUTATORS.has(executable) || (executable === "python" || executable === "python3") && args[0] === "-m" && args[1] === "pip") {
+      return "package-or-image-download";
+    }
+    if (executable === "git") {
+      const subcommand = gitSubcommand(segment.slice(1))?.toLowerCase();
+      if (["push", "send-email"].includes(subcommand ?? "")) return "external-mutation";
+      if (["clean"].includes(subcommand ?? "") || (subcommand === "reset" && args.includes("--hard"))) {
+        return "irreversible-deletion";
+      }
+    }
+    if (executable === "docker" || executable === "podman") {
+      if (args.includes("prune") || args[0] === "volume") return "prune-or-volume";
+      if (args[0] === "rmi" || (args[0] === "image" && args[1] === "rm")) {
+        return "irreversible-deletion";
+      }
+      if (["build", "compose", "create", "exec", "kill", "pull", "push", "restart", "rm", "run", "start", "stop"].includes(args[0] ?? "")) {
+        return args[0] === "build" || args[0] === "pull"
+          ? "package-or-image-download"
+          : "supervisor-owned-operation";
+      }
+    }
+    if (["launchctl", "systemctl"].includes(executable) && !readOnlySegment([...segment])) {
+      return "supervisor-owned-operation";
+    }
+    if (["env", "export", "printenv", "set"].includes(executable) || SECRET_EXECUTABLES.has(executable) || words.some((word) => SECRET_ARGUMENT.test(word))) {
+      return "secret-operation";
+    }
+    if (["kill", "killall", "pkill"].includes(executable)) return "supervisor-owned-operation";
+  }
+  return undefined;
+}
+
+/** Guard non-bash tools that could rotate or expose known secret stores. */
+export function forbiddenRecoveryToolReason(
+  event: Pick<ToolCallEvent, "toolName" | "input">,
+): RecoveryGuardCategory | undefined {
+  const input = event.input as Record<string, unknown>;
+  if (event.toolName === "bash") return forbiddenRecoveryBashReason(input.command);
+  if (["edit", "write", "read"].includes(event.toolName)) {
+    const path = typeof input.path === "string" ? input.path : "";
+    if (path && SECRET_ARGUMENT.test(path)) return "secret-operation";
+  }
+  if (/^(?:browser|email|github|http|slack|telegram|web)_/i.test(event.toolName)) {
+    return "external-mutation";
+  }
+  return undefined;
+}
+
 export function isReadOnlyRecoveryBash(command: unknown): boolean {
   if (typeof command !== "string" || !command.trim()) return false;
   const words = shellWords(command);
@@ -436,7 +569,7 @@ export function isReadOnlyRecoveryBash(command: unknown): boolean {
 }
 
 export function recoveryToolMutates(event: Pick<ToolCallEvent, "toolName" | "input">): boolean {
-  if (event.toolName.startsWith("recovery_")) return false;
+  if (SUPERVISOR_RECOVERY_TOOLS.has(event.toolName)) return false;
   if (READ_ONLY_TOOLS.has(event.toolName)) return false;
   if (event.toolName === "bash") {
     return !isReadOnlyRecoveryBash((event.input as Record<string, unknown>).command);
@@ -498,6 +631,24 @@ export class RecoveryToolJournal {
   ) {}
 
   async before(event: ToolCallEvent): Promise<{ block: true; reason: string } | undefined> {
+    const forbidden = forbiddenRecoveryToolReason(event);
+    if (forbidden) {
+      const summary = summarizeRecoveryIntent(event);
+      try {
+        await this.client.guardRejected(
+          event.toolCallId,
+          forbidden,
+          event.toolName,
+          String(summary.inputSha256),
+        );
+      } catch {
+        // Guard availability never weakens the local block.
+      }
+      return {
+        block: true,
+        reason: `Recovery safety policy blocked ${forbidden}`,
+      };
+    }
     if (!recoveryToolMutates(event)) return undefined;
     try {
       assertRecoveryToolCallAllowed(this.mode, true);

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import dataclass
+import errno
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -132,6 +133,12 @@ _FIXER_ENDPOINT_FIELDS = {
     "/v1/fixer/action/reconcile": frozenset(
         {"actionKey", "idempotencyKey", "result", "details"}
     ),
+    "/v1/fixer/guard/rejection": frozenset(
+        {"eventKey", "category", "toolName", "inputSha256"}
+    ),
+    "/v1/fixer/quarantine": frozenset({"idempotencyKey", "sourcePath"}),
+    "/v1/fixer/restore": frozenset({"idempotencyKey", "quarantineId"}),
+    "/v1/fixer/operation": frozenset({"idempotencyKey", "operationId"}),
     "/v1/fixer/blocked": frozenset({"claimKey", "reason", "residualRisk"}),
     "/v1/fixer/finish": frozenset({"claimKey", "claim"}),
 }
@@ -144,6 +151,10 @@ _FIXER_ENDPOINT_OPERATIONS = {
     "/v1/fixer/action/intent": "mutate",
     "/v1/fixer/action/outcome": "mutate",
     "/v1/fixer/action/reconcile": "reconcile",
+    "/v1/fixer/guard/rejection": "reconcile",
+    "/v1/fixer/quarantine": "mutate",
+    "/v1/fixer/restore": "mutate",
+    "/v1/fixer/operation": "mutate",
     "/v1/fixer/blocked": "blocked",
     "/v1/fixer/finish": "finish",
 }
@@ -2073,6 +2084,97 @@ class IncidentCoordinator:
             )
             return True
 
+    def action_status(
+        self, fence: InvocationFence, action_key: str
+    ) -> tuple[str, str, dict[str, Any], str | None, dict[str, Any] | None] | None:
+        """Inspect one supervisor-owned action without exposing mutable inputs."""
+
+        key = self._journal_text(action_key, "action key")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return None
+            row = connection.execute(
+                "SELECT action_intents.state, action_intents.tool_name, "
+                "action_intents.intent_json, action_outcomes.outcome, "
+                "action_outcomes.outcome_json FROM action_intents "
+                "LEFT JOIN action_outcomes "
+                "ON action_outcomes.action_intent_id = action_intents.id "
+                "WHERE action_intents.invocation_id = ? "
+                "AND action_intents.action_key = ?",
+                (fence.invocation_id, key),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                intent = json.loads(str(row["intent_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise LedgerCorrupt("recovery action intent is invalid") from exc
+            if not isinstance(intent, dict):
+                raise LedgerCorrupt("recovery action intent is invalid")
+            details: dict[str, Any] | None = None
+            if row["outcome_json"] is not None:
+                try:
+                    parsed = json.loads(str(row["outcome_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise LedgerCorrupt("recovery action outcome is invalid") from exc
+                if not isinstance(parsed, dict):
+                    raise LedgerCorrupt("recovery action outcome is invalid")
+                details = parsed
+            return (
+                str(row["state"]),
+                str(row["tool_name"]),
+                intent,
+                None if row["outcome"] is None else str(row["outcome"]),
+                details,
+            )
+
+    def record_guard_rejection(
+        self,
+        fence: InvocationFence,
+        *,
+        event_key: str,
+        category: str,
+        tool_name: str,
+        input_sha256: str,
+    ) -> bool:
+        """Audit a rejected tool call; the rejected host mutation never runs."""
+
+        if not self.endpoint_allowed("reconcile"):
+            return False
+        event = self._journal_text(event_key, "guard event key")
+        guard_category = self._journal_text(category, "guard category", limit=80)
+        tool = self._journal_text(tool_name, "guard tool", limit=80)
+        if not isinstance(input_sha256, str) or _TRANSITION_ID.fullmatch(input_sha256) is None:
+            raise ValueError("recovery guard input digest is invalid")
+        now = self.clock()
+        target = f"invocation:{fence.invocation_id}:guard:{event}"
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return False
+            existing = connection.execute(
+                "SELECT details_json FROM audit WHERE operation = 'guard_rejected' "
+                "AND target = ?",
+                (target,),
+            ).fetchone()
+            details = _canonical_json(
+                {
+                    "category": guard_category,
+                    "inputSha256": input_sha256,
+                    "toolName": tool,
+                }
+            )
+            if existing is not None:
+                if existing["details_json"] != details:
+                    raise ValueError("recovery guard event key was reused")
+                return True
+            connection.execute(
+                "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                "VALUES (?, 'fixer-extension', 'guard_rejected', ?, ?)",
+                (now, target, details),
+            )
+            return True
+
     def record_completion_claim(
         self,
         fence: InvocationFence,
@@ -2559,6 +2661,755 @@ class IncidentCoordinator:
         if exhausted and self.immediate_escalation is not None:
             self.immediate_escalation("retries_exhausted")
         return True
+
+
+class RecoverySafetyError(ValueError):
+    """A fixed recovery actuator request failed a safety boundary."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class RecoveryMutationUnknown(RuntimeError):
+    """Host state may have changed and requires explicit reconciliation."""
+
+
+def _sha256_file_descriptor(descriptor: int, *, byte_limit: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 128 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > byte_limit:
+            raise RecoverySafetyError("item_too_large")
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest(), size
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("short recovery quarantine write")
+        offset += written
+
+
+class RecoveryQuarantine:
+    """Owner-only, checksummed quarantine with no automatic purge path."""
+
+    _MANIFEST_KEYS = frozenset(
+        {
+            "version",
+            "quarantineId",
+            "incidentId",
+            "generation",
+            "sourcePath",
+            "sourceMode",
+            "sourceUid",
+            "sourceGid",
+            "sizeBytes",
+            "contentSha256",
+            "quarantinedPath",
+            "method",
+            "state",
+            "createdAt",
+            "restoredAt",
+            "manifestChecksum",
+        }
+    )
+
+    def __init__(
+        self,
+        policy: dict[str, Any],
+        *,
+        clock: Callable[[], float] = time.time,
+        uid: int | None = None,
+    ):
+        self.root = Path(str(policy["directory"]))
+        self.allowed_roots = tuple(Path(str(root)) for root in policy["allowedRoots"])
+        self.max_items = int(policy["maxItemsPerIncident"])
+        self.max_item_bytes = int(policy["maxItemBytes"])
+        self.max_incident_bytes = int(policy["maxIncidentBytes"])
+        self.clock = clock
+        self.uid = os.getuid() if uid is None else uid
+
+    @staticmethod
+    def _safe_identifier(value: Any, name: str) -> str:
+        if (
+            not isinstance(value, str)
+            or safe_field(value, limit=160, default="") != value
+        ):
+            raise RecoverySafetyError(name)
+        return value
+
+    def _private_directory(self, path: Path, *, create: bool) -> Path:
+        if create:
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            details = path.lstat()
+            canonical = path.resolve(strict=True)
+        except OSError as exc:
+            raise RecoverySafetyError("quarantine_storage_unavailable") from exc
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != self.uid
+            or details.st_mode & 0o077
+            or canonical != path.absolute()
+        ):
+            raise RecoverySafetyError("quarantine_storage_unsafe")
+        return canonical
+
+    def _incident_directory(self, incident_id: int, *, create: bool = True) -> Path:
+        root = self._private_directory(self.root, create=create)
+        return self._private_directory(root / f"incident-{incident_id}", create=create)
+
+    def _allowed_root(self, path: Path, *, require_source: bool) -> tuple[Path, Path]:
+        if not path.is_absolute() or ".." in path.parts or "\0" in str(path):
+            raise RecoverySafetyError("path_invalid")
+        candidate = path
+        try:
+            canonical_candidate = (
+                candidate.resolve(strict=True)
+                if require_source
+                else candidate.parent.resolve(strict=True) / candidate.name
+            )
+        except OSError as exc:
+            raise RecoverySafetyError("path_unavailable") from exc
+        for configured_root in self.allowed_roots:
+            try:
+                root_details = configured_root.lstat()
+                canonical_root = configured_root.resolve(strict=True)
+                lexical_relative = candidate.absolute().relative_to(
+                    configured_root.absolute()
+                )
+                canonical_candidate.relative_to(canonical_root)
+            except (OSError, ValueError):
+                continue
+            if (
+                not stat.S_ISDIR(root_details.st_mode)
+                or stat.S_ISLNK(root_details.st_mode)
+                or root_details.st_uid != self.uid
+                or root_details.st_mode & 0o022
+                or canonical_root != configured_root.absolute()
+            ):
+                continue
+            current = configured_root.absolute()
+            components = (
+                lexical_relative.parts
+                if require_source
+                else lexical_relative.parts[:-1]
+            )
+            try:
+                for index, component in enumerate(components):
+                    current = current / component
+                    details = current.lstat()
+                    if stat.S_ISLNK(details.st_mode):
+                        raise RecoverySafetyError("symlink_rejected")
+                    if (
+                        (not require_source or index < len(components) - 1)
+                        and (
+                            not stat.S_ISDIR(details.st_mode)
+                            or details.st_uid != self.uid
+                            or details.st_mode & 0o022
+                        )
+                    ):
+                        raise RecoverySafetyError("path_component_unsafe")
+            except OSError as exc:
+                raise RecoverySafetyError("path_unavailable") from exc
+            return canonical_root, canonical_candidate
+        raise RecoverySafetyError("path_outside_allowed_roots")
+
+    @staticmethod
+    def _manifest_checksum(value: dict[str, Any]) -> str:
+        unsigned = {key: item for key, item in value.items() if key != "manifestChecksum"}
+        return hashlib.sha256(_canonical_json(unsigned).encode("ascii")).hexdigest()
+
+    def _write_manifest(self, path: Path, value: dict[str, Any]) -> None:
+        document = dict(value)
+        document["manifestChecksum"] = self._manifest_checksum(document)
+        _atomic_json(path, document)
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != self.uid
+            or details.st_mode & 0o077
+        ):
+            raise RecoveryMutationUnknown("quarantine manifest mode is unknown")
+
+    def _load_manifest(self, path: Path) -> dict[str, Any]:
+        try:
+            details = path.lstat()
+            raw = path.read_bytes()
+            document = json.loads(raw)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RecoverySafetyError("manifest_unreadable") from exc
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != self.uid
+            or details.st_mode & 0o077
+            or len(raw) > 64 * 1024
+            or not isinstance(document, dict)
+            or set(document) != self._MANIFEST_KEYS
+            or document.get("version") != 1
+            or document.get("state") not in {"pending", "quarantined", "restored"}
+            or document.get("method") not in {"rename", "copy_verify"}
+            or not isinstance(document.get("quarantineId"), str)
+            or re.fullmatch(r"[a-f0-9]{40}", str(document.get("quarantineId"))) is None
+            or isinstance(document.get("incidentId"), bool)
+            or not isinstance(document.get("incidentId"), int)
+            or int(document["incidentId"]) < 1
+            or isinstance(document.get("generation"), bool)
+            or not isinstance(document.get("generation"), int)
+            or int(document["generation"]) < 1
+            or not isinstance(document.get("sourcePath"), str)
+            or not Path(str(document["sourcePath"])).is_absolute()
+            or not isinstance(document.get("quarantinedPath"), str)
+            or not Path(str(document["quarantinedPath"])).is_absolute()
+            or isinstance(document.get("sourceMode"), bool)
+            or not isinstance(document.get("sourceMode"), int)
+            or not 0 <= int(document["sourceMode"]) <= 0o777
+            or any(
+                isinstance(document.get(key), bool)
+                or not isinstance(document.get(key), int)
+                or int(document[key]) < 0
+                for key in ("sourceUid", "sourceGid", "sizeBytes")
+            )
+            or int(document["sourceUid"]) != self.uid
+            or int(document["sizeBytes"]) > self.max_item_bytes
+            or not isinstance(document.get("contentSha256"), str)
+            or _TRANSITION_ID.fullmatch(str(document["contentSha256"])) is None
+            or isinstance(document.get("createdAt"), bool)
+            or not isinstance(document.get("createdAt"), (int, float))
+            or not math.isfinite(float(document["createdAt"]))
+            or (
+                document.get("restoredAt") is not None
+                and (
+                    isinstance(document.get("restoredAt"), bool)
+                    or not isinstance(document.get("restoredAt"), (int, float))
+                    or not math.isfinite(float(document["restoredAt"]))
+                )
+            )
+            or (document.get("state") == "restored") != (document.get("restoredAt") is not None)
+            or not isinstance(document.get("manifestChecksum"), str)
+            or not hmac.compare_digest(
+                str(document["manifestChecksum"]), self._manifest_checksum(document)
+            )
+        ):
+            raise RecoverySafetyError("manifest_invalid")
+        return document
+
+    def _manifests(self, incident_id: int) -> list[dict[str, Any]]:
+        directory = self._incident_directory(incident_id)
+        manifests: list[dict[str, Any]] = []
+        try:
+            paths = sorted(directory.glob("*.json"))
+        except OSError as exc:
+            raise RecoverySafetyError("quarantine_storage_unavailable") from exc
+        for path in paths:
+            manifests.append(self._load_manifest(path))
+        return manifests
+
+    def request_description(
+        self,
+        fence: InvocationFence,
+        *,
+        idempotency_key: str,
+        source_path: str,
+    ) -> tuple[str, dict[str, Any]]:
+        idempotency = self._safe_identifier(idempotency_key, "idempotency_key_invalid")
+        if not isinstance(source_path, str) or len(source_path.encode("utf-8")) > 4_096:
+            raise RecoverySafetyError("path_invalid")
+        quarantine_id = hashlib.sha256(
+            f"{fence.incident_id}\0{fence.generation}\0{idempotency}".encode("utf-8")
+        ).hexdigest()[:40]
+        return quarantine_id, {
+            "kind": "quarantine",
+            "quarantineId": quarantine_id,
+            "sourcePathSha256": hashlib.sha256(source_path.encode("utf-8")).hexdigest(),
+        }
+
+    def quarantine(
+        self,
+        fence: InvocationFence,
+        *,
+        quarantine_id: str,
+        source_path: str,
+    ) -> dict[str, Any]:
+        incident_directory = self._incident_directory(fence.incident_id)
+        manifest_path = incident_directory / f"{quarantine_id}.json"
+        destination = incident_directory / f"{quarantine_id}.item"
+        if manifest_path.exists():
+            existing = self._load_manifest(manifest_path)
+            if (
+                existing["quarantineId"] != quarantine_id
+                or existing["incidentId"] != fence.incident_id
+                or existing["generation"] != fence.generation
+                or existing["sourcePath"] != source_path
+            ):
+                raise RecoverySafetyError("idempotency_key_reused")
+            if existing["state"] != "quarantined":
+                raise RecoveryMutationUnknown("quarantine request needs reconciliation")
+            return {
+                "ok": True,
+                "quarantineId": quarantine_id,
+                "contentSha256": existing["contentSha256"],
+                "sizeBytes": existing["sizeBytes"],
+                "method": existing["method"],
+                "replayed": True,
+            }
+        manifests = self._manifests(fence.incident_id)
+        if len(manifests) >= self.max_items:
+            raise RecoverySafetyError("incident_item_limit")
+        used_bytes = sum(
+            int(item["sizeBytes"])
+            for item in manifests
+            if isinstance(item.get("sizeBytes"), int)
+        )
+        _root, source = self._allowed_root(Path(source_path), require_source=True)
+        try:
+            source_details = source.lstat()
+        except OSError as exc:
+            raise RecoverySafetyError("path_unavailable") from exc
+        if (
+            not stat.S_ISREG(source_details.st_mode)
+            or stat.S_ISLNK(source_details.st_mode)
+            or source_details.st_uid != self.uid
+            or source_details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022)
+        ):
+            raise RecoverySafetyError("source_unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        mutated = False
+        manifest_written = False
+        destination_created = False
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (source_details.st_dev, source_details.st_ino):
+                raise RecoverySafetyError("source_changed")
+            content_sha256, size = _sha256_file_descriptor(
+                descriptor, byte_limit=self.max_item_bytes
+            )
+            if used_bytes + size > self.max_incident_bytes:
+                raise RecoverySafetyError("incident_byte_limit")
+            method = (
+                "rename"
+                if source_details.st_dev == incident_directory.stat().st_dev
+                else "copy_verify"
+            )
+            manifest = {
+                "version": 1,
+                "quarantineId": quarantine_id,
+                "incidentId": fence.incident_id,
+                "generation": fence.generation,
+                "sourcePath": str(source),
+                "sourceMode": stat.S_IMODE(source_details.st_mode),
+                "sourceUid": source_details.st_uid,
+                "sourceGid": source_details.st_gid,
+                "sizeBytes": size,
+                "contentSha256": content_sha256,
+                "quarantinedPath": str(destination),
+                "method": method,
+                "state": "pending",
+                "createdAt": self.clock(),
+                "restoredAt": None,
+            }
+            self._write_manifest(manifest_path, manifest)
+            manifest_written = True
+            current = source.lstat()
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RecoverySafetyError("source_changed")
+            if method == "rename":
+                os.rename(source, destination)
+                mutated = True
+                os.chmod(destination, 0o600)
+            else:
+                output = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                destination_created = True
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    while True:
+                        chunk = os.read(descriptor, 128 * 1024)
+                        if not chunk:
+                            break
+                        _write_all(output, chunk)
+                    os.fsync(output)
+                    copied_descriptor = os.open(destination, flags)
+                    try:
+                        copied_hash, copied_size = _sha256_file_descriptor(
+                            copied_descriptor, byte_limit=self.max_item_bytes
+                        )
+                    finally:
+                        os.close(copied_descriptor)
+                    if copied_hash != content_sha256 or copied_size != size:
+                        raise RecoverySafetyError("copy_verification_failed")
+                finally:
+                    os.close(output)
+                os.unlink(source)
+                mutated = True
+            _fsync_directory(source.parent)
+            _fsync_directory(incident_directory)
+            manifest["state"] = "quarantined"
+            self._write_manifest(manifest_path, manifest)
+            return {
+                "ok": True,
+                "quarantineId": quarantine_id,
+                "contentSha256": content_sha256,
+                "sizeBytes": size,
+                "method": method,
+                "replayed": False,
+            }
+        except RecoverySafetyError:
+            if mutated:
+                raise RecoveryMutationUnknown("quarantine state is unknown") from None
+            if destination_created:
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+            if manifest_written:
+                try:
+                    manifest_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        except OSError as exc:
+            if mutated:
+                raise RecoveryMutationUnknown("quarantine state is unknown") from exc
+            if destination_created:
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+            if manifest_written:
+                try:
+                    manifest_path.unlink()
+                except FileNotFoundError:
+                    pass
+            if exc.errno == errno.EXDEV:
+                raise RecoverySafetyError("copy_fallback_unavailable") from exc
+            raise RecoverySafetyError("quarantine_failed") from exc
+        finally:
+            os.close(descriptor)
+
+    def restore(
+        self,
+        fence: InvocationFence,
+        *,
+        quarantine_id: str,
+    ) -> dict[str, Any]:
+        identifier = self._safe_identifier(quarantine_id, "quarantine_id_invalid")
+        incident_directory = self._incident_directory(fence.incident_id)
+        manifest_path = incident_directory / f"{identifier}.json"
+        manifest = self._load_manifest(manifest_path)
+        if (
+            manifest["quarantineId"] != identifier
+            or manifest["incidentId"] != fence.incident_id
+        ):
+            raise RecoverySafetyError("manifest_invalid")
+        if manifest["state"] == "restored":
+            return {"ok": True, "quarantineId": identifier, "replayed": True}
+        if manifest["state"] != "quarantined":
+            raise RecoveryMutationUnknown("restore request needs reconciliation")
+        source = Path(str(manifest["sourcePath"]))
+        _root, canonical_source = self._allowed_root(source, require_source=False)
+        if canonical_source.exists() or canonical_source.is_symlink():
+            raise RecoverySafetyError("restore_target_exists")
+        quarantined = Path(str(manifest["quarantinedPath"]))
+        try:
+            quarantined.relative_to(incident_directory)
+            if quarantined != incident_directory / f"{identifier}.item":
+                raise ValueError
+            details = quarantined.lstat()
+        except (OSError, ValueError) as exc:
+            raise RecoverySafetyError("quarantined_item_unavailable") from exc
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != self.uid
+            or details.st_mode & 0o077
+        ):
+            raise RecoverySafetyError("quarantined_item_unsafe")
+        descriptor = os.open(quarantined, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        mutated = False
+        target_created = False
+        try:
+            digest, size = _sha256_file_descriptor(
+                descriptor, byte_limit=self.max_item_bytes
+            )
+            if (
+                digest != manifest["contentSha256"]
+                or size != manifest["sizeBytes"]
+            ):
+                raise RecoverySafetyError("quarantined_item_checksum_mismatch")
+            if details.st_dev == canonical_source.parent.stat().st_dev:
+                os.rename(quarantined, canonical_source)
+                mutated = True
+            else:
+                output = os.open(
+                    canonical_source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    int(manifest["sourceMode"]),
+                )
+                target_created = True
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    while True:
+                        chunk = os.read(descriptor, 128 * 1024)
+                        if not chunk:
+                            break
+                        _write_all(output, chunk)
+                    os.fsync(output)
+                finally:
+                    os.close(output)
+                restored_descriptor = os.open(
+                    canonical_source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    restored_hash, restored_size = _sha256_file_descriptor(
+                        restored_descriptor, byte_limit=self.max_item_bytes
+                    )
+                finally:
+                    os.close(restored_descriptor)
+                if restored_hash != digest or restored_size != size:
+                    canonical_source.unlink()
+                    target_created = False
+                    raise RecoverySafetyError("copy_verification_failed")
+                os.unlink(quarantined)
+                mutated = True
+            os.chmod(canonical_source, int(manifest["sourceMode"]))
+            _fsync_directory(canonical_source.parent)
+            _fsync_directory(incident_directory)
+            manifest["state"] = "restored"
+            manifest["restoredAt"] = self.clock()
+            self._write_manifest(manifest_path, manifest)
+            return {"ok": True, "quarantineId": identifier, "replayed": False}
+        except RecoverySafetyError:
+            if mutated:
+                raise RecoveryMutationUnknown("restore state is unknown") from None
+            if target_created:
+                try:
+                    canonical_source.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        except OSError as exc:
+            if mutated:
+                raise RecoveryMutationUnknown("restore state is unknown") from exc
+            if target_created:
+                try:
+                    canonical_source.unlink()
+                except FileNotFoundError:
+                    pass
+            raise RecoverySafetyError("restore_failed") from exc
+        finally:
+            os.close(descriptor)
+
+
+class ReviewedOperationExecutor:
+    """Run only immutable, configuration-reviewed argv selected by operation ID."""
+
+    def __init__(self, operations: tuple[dict[str, Any], ...]):
+        self.operations = {str(item["id"]): dict(item) for item in operations}
+        if len(self.operations) != len(operations):
+            raise ValueError("recovery reviewed operation IDs overlap")
+
+    def description(self, operation_id: Any) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or safe_field(operation_id, default="") != operation_id:
+            raise RecoverySafetyError("operation_id_invalid")
+        operation = self.operations.get(operation_id)
+        if operation is None:
+            raise RecoverySafetyError("operation_not_reviewed")
+        return {
+            "kind": str(operation["kind"]),
+            "operationId": operation_id,
+        }
+
+    def execute(self, operation_id: str) -> dict[str, Any]:
+        operation = self.operations[operation_id]
+        try:
+            completed = subprocess.run(
+                [str(operation["executable"]), *map(str, operation["argv"])],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                env={
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                },
+                timeout=int(operation["timeoutSeconds"]),
+                check=False,
+                close_fds=True,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "operationId": operation_id,
+                "kind": operation["kind"],
+                "code": "timeout",
+            }
+        except OSError:
+            return {
+                "ok": False,
+                "operationId": operation_id,
+                "kind": operation["kind"],
+                "code": "execution_failed",
+            }
+        return {
+            "ok": completed.returncode == 0,
+            "operationId": operation_id,
+            "kind": operation["kind"],
+            "code": "completed" if completed.returncode == 0 else "nonzero_exit",
+            "exitCode": completed.returncode,
+        }
+
+
+class RecoveryActuator:
+    """Journal and execute the small supervisor-owned mutation surface."""
+
+    def __init__(
+        self,
+        coordinator: IncidentCoordinator,
+        quarantine: RecoveryQuarantine,
+        operations: ReviewedOperationExecutor,
+    ):
+        self.coordinator = coordinator
+        self.quarantine = quarantine
+        self.operations = operations
+        self._lock = threading.Lock()
+
+    def _run(
+        self,
+        fence: InvocationFence,
+        *,
+        action_key: str,
+        tool_name: str,
+        intent: dict[str, Any],
+        execute: Callable[[], dict[str, Any]],
+    ) -> tuple[int, dict[str, Any]]:
+        with self._lock:
+            status = self.coordinator.action_status(fence, action_key)
+            if status is not None:
+                state, recorded_tool, recorded_intent, outcome, details = status
+                if recorded_tool != tool_name or recorded_intent != intent:
+                    return 409, {"ok": False, "code": "idempotency_key_reused"}
+                if state == "completed" and outcome is not None and details is not None:
+                    return (
+                        200 if outcome == "succeeded" else 422,
+                        {**details, "ok": outcome == "succeeded", "replayed": True},
+                    )
+                return 409, {"ok": False, "code": "action_unresolved"}
+            action_id = self.coordinator.record_action_intent(
+                fence,
+                action_key=action_key,
+                tool_name=tool_name,
+                intent=intent,
+            )
+            if action_id is None:
+                return 409, {"ok": False, "code": "intent_rejected"}
+            try:
+                details = execute()
+            except RecoveryMutationUnknown:
+                return 409, {"ok": False, "code": "action_unknown"}
+            except RecoverySafetyError as exc:
+                details = {"ok": False, "code": exc.code}
+            outcome = "succeeded" if details.get("ok") is True else "failed"
+            if not self.coordinator.record_action_outcome(
+                fence,
+                action_key=action_key,
+                outcome=outcome,
+                details=details,
+            ):
+                return 409, {"ok": False, "code": "outcome_uncommitted"}
+            return (200 if outcome == "succeeded" else 422), details
+
+    @staticmethod
+    def _action_key(kind: str, idempotency_key: Any) -> str:
+        if (
+            not isinstance(idempotency_key, str)
+            or safe_field(idempotency_key, limit=120, default="") != idempotency_key
+        ):
+            raise RecoverySafetyError("idempotency_key_invalid")
+        return f"supervisor:{kind}:{idempotency_key}"
+
+    def quarantine_file(
+        self,
+        fence: InvocationFence,
+        *,
+        idempotency_key: Any,
+        source_path: Any,
+    ) -> tuple[int, dict[str, Any]]:
+        if not isinstance(source_path, str):
+            raise RecoverySafetyError("path_invalid")
+        action_key = self._action_key("quarantine", idempotency_key)
+        quarantine_id, intent = self.quarantine.request_description(
+            fence,
+            idempotency_key=str(idempotency_key),
+            source_path=source_path,
+        )
+        return self._run(
+            fence,
+            action_key=action_key,
+            tool_name="recovery_quarantine",
+            intent=intent,
+            execute=lambda: self.quarantine.quarantine(
+                fence,
+                quarantine_id=quarantine_id,
+                source_path=source_path,
+            ),
+        )
+
+    def restore_file(
+        self,
+        fence: InvocationFence,
+        *,
+        idempotency_key: Any,
+        quarantine_id: Any,
+    ) -> tuple[int, dict[str, Any]]:
+        identifier = self.quarantine._safe_identifier(
+            quarantine_id, "quarantine_id_invalid"
+        )
+        action_key = self._action_key("restore", idempotency_key)
+        return self._run(
+            fence,
+            action_key=action_key,
+            tool_name="recovery_restore",
+            intent={"kind": "restore", "quarantineId": identifier},
+            execute=lambda: self.quarantine.restore(
+                fence, quarantine_id=identifier
+            ),
+        )
+
+    def reviewed_operation(
+        self,
+        fence: InvocationFence,
+        *,
+        idempotency_key: Any,
+        operation_id: Any,
+    ) -> tuple[int, dict[str, Any]]:
+        action_key = self._action_key("operation", idempotency_key)
+        intent = self.operations.description(operation_id)
+        return self._run(
+            fence,
+            action_key=action_key,
+            tool_name="recovery_operation",
+            intent=intent,
+            execute=lambda: self.operations.execute(str(operation_id)),
+        )
 
 
 @dataclass(frozen=True)
@@ -4173,6 +5024,8 @@ class RecoveryReportAuthority:
         compact["changedFiles"] = compact["changedFiles"][-32:]
         compact["changedServices"] = compact["changedServices"][-32:]
         compact["preimages"] = compact["preimages"][-32:]
+        compact["quarantine"] = compact["quarantine"][-32:]
+        compact["rollback"] = compact["rollback"][-32:]
         compact["verification"] = [
             {
                 "attempt": item["attempt"],
@@ -4334,6 +5187,8 @@ class RecoveryReportAuthority:
             ]
             actions: list[dict[str, Any]] = []
             preimages: list[dict[str, str]] = []
+            quarantine_records: list[dict[str, Any]] = []
+            rollback_records: list[dict[str, Any]] = []
             action_rows = connection.execute(
                 "SELECT action_intents.*, action_outcomes.outcome, "
                 "action_outcomes.outcome_json, action_outcomes.created_at AS outcome_at, "
@@ -4366,6 +5221,33 @@ class RecoveryReportAuthority:
                     ),
                 }
                 actions.append(action)
+                if row["tool_name"] in {"recovery_quarantine", "recovery_restore"}:
+                    quarantine_records.append(
+                        {
+                            "actionKey": action["actionKey"],
+                            "kind": intent.get("kind"),
+                            "quarantineId": _redact_report_text(
+                                outcome.get(
+                                    "quarantineId", intent.get("quarantineId", "unreported")
+                                ),
+                                limit=80,
+                            ),
+                            "outcome": action["outcome"],
+                        }
+                    )
+                if (
+                    row["tool_name"] == "recovery_operation"
+                    and intent.get("kind") == "rollback"
+                ):
+                    rollback_records.append(
+                        {
+                            "actionKey": action["actionKey"],
+                            "operationId": _redact_report_text(
+                                intent.get("operationId"), limit=128
+                            ),
+                            "outcome": action["outcome"],
+                        }
+                    )
                 timeline.append(
                     {
                         "at": float(row["created_at"]),
@@ -4457,8 +5339,8 @@ class RecoveryReportAuthority:
                 ),
                 "changedReleases": [],
                 "preimages": preimages,
-                "quarantine": [],
-                "rollback": [],
+                "quarantine": quarantine_records,
+                "rollback": rollback_records,
                 "verification": verification,
                 "residualRisk": _redact_report_text(claim.get("residualRisk")),
                 "references": reference_groups,
@@ -4635,6 +5517,7 @@ class RecoveryService:
         notifications: RecoveryNotificationOutbox | None = None,
         fixer_process: RecoveryFixerProcessManager | None = None,
         reports: RecoveryReportAuthority | None = None,
+        actuator: RecoveryActuator | None = None,
         event_retention_seconds: float = DEFAULT_EVENT_RETENTION_SECONDS,
         event_retention_batch_size: int = DEFAULT_EVENT_RETENTION_BATCH_SIZE,
     ):
@@ -4651,8 +5534,11 @@ class RecoveryService:
             raise ValueError("recovery fixer process does not match coordinator")
         if reports is not None and reports.coordinator is not coordinator:
             raise ValueError("recovery report authority does not match coordinator")
+        if actuator is not None and actuator.coordinator is not coordinator:
+            raise ValueError("recovery actuator does not match coordinator")
         self.fixer_process = fixer_process
         self.reports = reports
+        self.actuator = actuator
         self.event_retention_seconds = event_retention_seconds
         self.event_retention_batch_size = event_retention_batch_size
         self._ledger_corrupt = False
@@ -4867,6 +5753,41 @@ class RecoveryService:
                     details=payload["details"],
                 )
                 return FixerResult(200 if ok else 409, {"ok": ok})
+            if path == "/v1/fixer/guard/rejection":
+                ok = self.coordinator.record_guard_rejection(
+                    fence,
+                    event_key=payload["eventKey"],
+                    category=payload["category"],
+                    tool_name=payload["toolName"],
+                    input_sha256=payload["inputSha256"],
+                )
+                return FixerResult(200 if ok else 409, {"ok": ok})
+            if path in {
+                "/v1/fixer/quarantine",
+                "/v1/fixer/restore",
+                "/v1/fixer/operation",
+            }:
+                if self.actuator is None:
+                    return FixerResult(503, {"ok": False})
+                if path == "/v1/fixer/quarantine":
+                    status, result = self.actuator.quarantine_file(
+                        fence,
+                        idempotency_key=payload["idempotencyKey"],
+                        source_path=payload["sourcePath"],
+                    )
+                elif path == "/v1/fixer/restore":
+                    status, result = self.actuator.restore_file(
+                        fence,
+                        idempotency_key=payload["idempotencyKey"],
+                        quarantine_id=payload["quarantineId"],
+                    )
+                else:
+                    status, result = self.actuator.reviewed_operation(
+                        fence,
+                        idempotency_key=payload["idempotencyKey"],
+                        operation_id=payload["operationId"],
+                    )
+                return FixerResult(status, result)
             if path == "/v1/fixer/blocked":
                 ok = self.coordinator.accept_blocked_claim(
                     fence,
@@ -5364,6 +6285,11 @@ def _build_recovery_service(
         report_store,
         max_timeline_entries=int(configured.report_policy["maxTimelineEntries"]),
     )
+    actuator = RecoveryActuator(
+        coordinator,
+        RecoveryQuarantine(configured.quarantine_policy),
+        ReviewedOperationExecutor(configured.reviewed_operations),
+    )
     service = RecoveryService(
         ledger,
         event_spool,
@@ -5374,6 +6300,7 @@ def _build_recovery_service(
         notifications=notifications,
         fixer_process=fixer_process,
         reports=reports,
+        actuator=actuator,
     )
     return service
 
