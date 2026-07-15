@@ -96,13 +96,15 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]
   minime-bot recovery config validate --workspace <control-workspace> [--config <path>]
-  minime-bot recovery status|incidents|invocations --workspace <control-workspace>
+  minime-bot recovery status --workspace <control-workspace> [--config <path>]
+  minime-bot recovery incidents|invocations --workspace <control-workspace> [--config <path>] [--id <id>] [--limit <1-100>]
   minime-bot recovery dispatch enable|disable --actor <actor> --reason <reason> [--ttl <seconds>]
   minime-bot recovery controls confirmation-count|cooldown|retry-budget <value> --actor <actor> --reason <reason> [--ttl <seconds>]
   minime-bot recovery silence <incident-key> --ttl <seconds> --actor <actor> --reason <reason>
   minime-bot recovery retry <incident-id> --actor <actor> --reason <reason>
-  minime-bot recovery policy history|rollback [revision] [--limit N] [--actor <actor> --reason <reason>]
-  minime-bot recovery process --once
+  minime-bot recovery policy history [--limit <1-100>]
+  minime-bot recovery policy rollback <revision> --actor <actor> --reason <reason>
+  minime-bot recovery process --once [--config <path>]
 
 Options:
   --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
@@ -130,7 +132,11 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
-      help = true;
+      if (command[0] === "recovery") {
+        command.push(arg);
+      } else {
+        help = true;
+      }
       continue;
     }
     if (arg === "--workspace") {

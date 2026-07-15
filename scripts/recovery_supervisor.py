@@ -32,9 +32,6 @@ from monitoring_native import (
     send_telegram,
 )
 from recovery_config import (
-    DEFAULT_RUNTIME_DOCTOR_CADENCE_SECONDS,
-    DEFAULT_VERIFICATION_FRESHNESS_SECONDS,
-    DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS,
     RECOVERY_MODES,
     RecoveryConfig,
     RecoveryConfigError,
@@ -765,6 +762,11 @@ class RecoveryControls:
         self._expiry(expires_at, now, required=True)
 
         def mutate(state: dict[str, Any]) -> tuple[Any, Any]:
+            if (
+                correlation_key not in state["silences"]
+                and len(state["silences"]) >= 128
+            ):
+                raise ValueError("recovery silence limit is exceeded")
             before = state["silences"].get(correlation_key)
             state["silences"][correlation_key] = float(expires_at)
             return before, float(expires_at)
@@ -1664,6 +1666,15 @@ class RecoveryVerifier:
         key = f"verification:heartbeat:{identifier}"
         value = _canonical_json({"healthy": healthy, "observed_at": float(observed_at)})
         with self.ledger.transaction() as connection:
+            current = self._observation(connection, key)
+            if current is not None:
+                current_healthy, current_observed_at = current
+                if observed_at < current_observed_at or (
+                    observed_at == current_observed_at
+                    and not current_healthy
+                    and healthy
+                ):
+                    return
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2220,7 +2231,7 @@ class AtomicJsonSpool:
         self.max_item_bytes = max_item_bytes
         self._lock = threading.Lock()
 
-    def put(self, key: str, value: dict[str, Any]) -> None:
+    def put(self, key: str, value: dict[str, Any], *, replace: bool = False) -> None:
         data = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
         if not data or len(data) > self.max_item_bytes:
             raise SpoolError("spool item is invalid")
@@ -2228,7 +2239,7 @@ class AtomicJsonSpool:
         with self._lock:
             try:
                 self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if destination.exists():
+                if destination.exists() and not replace:
                     return
                 descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=self.path)
                 try:
@@ -2340,25 +2351,44 @@ class EmergencyNotifier:
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
             return {}
 
-    def emit(self, code: str) -> None:
+    def emit(self, code: str) -> bool:
         if code not in _EMERGENCY_MESSAGES:
             raise ValueError("emergency code is invalid")
         with self._lock:
             now = self.clock()
             state = self._state()
             if now - state.get(code, 0.0) < self.cooldown:
-                return
+                return True
             try:
                 self.spool.put(code, {"code": code})
-                self._drain_locked(state)
             except SpoolError:
                 if self.delivery is not None:
                     try:
                         self.delivery(_EMERGENCY_MESSAGES[code])
                         state[code] = now
-                        _atomic_json(self.state_path, state)
+                        try:
+                            _atomic_json(self.state_path, state)
+                        except OSError:
+                            pass
+                        return True
+                    except (MonitoringError, OSError):
+                        return False
+                return False
+            try:
+                self._drain_locked(state)
+            except SpoolError:
+                # The new item is already durably owned by the emergency spool.
+                if self.delivery is not None:
+                    try:
+                        self.delivery(_EMERGENCY_MESSAGES[code])
+                        state[code] = now
+                        try:
+                            _atomic_json(self.state_path, state)
+                        except OSError:
+                            pass
                     except (MonitoringError, OSError):
                         pass
+            return True
 
     def drain(self) -> None:
         with self._lock:
@@ -2437,7 +2467,8 @@ class RecoveryNotificationOutbox:
                 or body["version"] != 1
             ):
                 raise LedgerCorrupt("recovery notification body is invalid")
-            self.emergency.emit(str(body["reason"]))
+            if not self.emergency.emit(str(body["reason"])):
+                continue
             with self.ledger.transaction() as connection:
                 cursor = connection.execute(
                     "UPDATE notification_outbox SET delivered_at = ? "
@@ -2478,6 +2509,17 @@ class RecoveryService:
         self.notifications = notifications
         self.event_retention_seconds = event_retention_seconds
         self.event_retention_batch_size = event_retention_batch_size
+        self._ledger_corrupt = False
+
+    def _report_ledger_error(self, error: LedgerError) -> None:
+        if isinstance(error, LedgerCorrupt) or self._ledger_corrupt:
+            self._ledger_corrupt = True
+            close = getattr(self.ledger, "close", None)
+            if callable(close):
+                close()
+            self.emergency.emit("ledger_corrupt")
+            return
+        self.emergency.emit("ledger_unavailable")
 
     @staticmethod
     def _intake_envelope(
@@ -2523,13 +2565,14 @@ class RecoveryService:
         *,
         heartbeats: dict[str, bool] | None = None,
     ) -> IntakeResult:
-        try:
-            self._drain_events()
-        except LedgerError:
-            pass
-        except SpoolError:
-            self.emergency.emit("spool_corrupt")
-            return IntakeResult(503, "persistence unavailable")
+        if not self._ledger_corrupt:
+            try:
+                self._drain_events()
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
+            except SpoolError:
+                self.emergency.emit("spool_corrupt")
+                return IntakeResult(503, "persistence unavailable")
         envelope = self._intake_envelope(events, heartbeats)
         durable_identity = {
             "events": envelope["events"],
@@ -2541,22 +2584,27 @@ class RecoveryService:
             + hashlib.sha256(_canonical_json(durable_identity).encode("ascii")).hexdigest()
         )
         try:
-            self.event_spool.put(spool_key, envelope)
+            self.event_spool.put(spool_key, envelope, replace=True)
         except SpoolError:
             self.emergency.emit("persistence_failed")
             return IntakeResult(503, "persistence unavailable")
+        if self._ledger_corrupt:
+            return IntakeResult(202, "durably spooled")
         try:
             inserted = self._persist_intake(envelope)
             self.event_spool.remove_key(spool_key)
             return IntakeResult(200, "accepted" if inserted else "duplicate")
-        except LedgerError:
-            self.emergency.emit("ledger_unavailable")
+        except LedgerError as exc:
+            self._report_ledger_error(exc)
             return IntakeResult(202, "durably spooled")
         except SpoolError:
             self.emergency.emit("spool_corrupt")
             return IntakeResult(503, "persistence unavailable")
 
     def health(self) -> IntakeResult:
+        if self._ledger_corrupt:
+            self.emergency.emit("ledger_corrupt")
+            return IntakeResult(503, "unhealthy")
         try:
             self.ledger.ping()
             self._drain_events()
@@ -2565,33 +2613,60 @@ class RecoveryService:
             if self.coordinator is not None:
                 self.coordinator.reconcile()
             self.emergency.drain()
-        except LedgerError:
-            self.emergency.emit("ledger_unavailable")
+        except LedgerError as exc:
+            self._report_ledger_error(exc)
             return IntakeResult(503, "unhealthy")
         except SpoolError:
             self.emergency.emit("spool_corrupt")
             return IntakeResult(503, "unhealthy")
         return IntakeResult(200, "ok")
 
-    def maintenance(self) -> None:
+    def maintenance(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {"activeIncidents": 0, "verification": []}
+        if self._ledger_corrupt:
+            self.emergency.emit("ledger_corrupt")
+            try:
+                self.emergency.drain()
+            except SpoolError:
+                pass
+            return summary
         try:
             self._drain_events()
             if self.coordinator is not None:
-                self.coordinator.reconcile()
+                self.coordinator.controls.expire()
+                summary["activeIncidents"] = self.coordinator.reconcile()
             self.ledger.prune_event_history(
                 retention_seconds=self.event_retention_seconds,
                 batch_size=self.event_retention_batch_size,
             )
-        except LedgerError:
-            self.emergency.emit("ledger_unavailable")
+        except LedgerError as exc:
+            self._report_ledger_error(exc)
         except SpoolError:
             self.emergency.emit("spool_corrupt")
+        if self._ledger_corrupt:
+            return summary
         if self.verifier is not None:
             try:
                 self.verifier.record_heartbeat("supervisor")
                 if self.probe_runner is not None:
                     self.probe_runner.refresh_due()
                 verification_results = self.verifier.evaluate_all()
+                summary["verification"] = [
+                    {
+                        "incidentId": incident_id,
+                        "recovered": result.recovered,
+                        "reasons": list(result.reasons),
+                        "evidence": [
+                            {
+                                "kind": item.kind,
+                                "id": item.identifier,
+                                "state": item.state,
+                            }
+                            for item in result.evidence
+                        ],
+                    }
+                    for incident_id, result in verification_results
+                ]
                 for incident_id, result in verification_results:
                     classification = self.verifier.mechanical_classification(incident_id, result)
                     if classification is not None:
@@ -2602,17 +2677,20 @@ class RecoveryService:
                                 dedupe_key=dedupe_key,
                                 result=result,
                             )
-            except LedgerError:
-                self.emergency.emit("ledger_unavailable")
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
+        if self._ledger_corrupt:
+            return summary
         if self.notifications is not None:
             try:
                 self.notifications.deliver_due()
-            except LedgerError:
-                self.emergency.emit("ledger_unavailable")
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
         try:
             self.emergency.drain()
         except SpoolError:
             self.emergency.emit("spool_corrupt")
+        return summary
 
 
 def _valid_spooled_event(event: dict[str, Any]) -> bool:
@@ -2814,17 +2892,9 @@ def read_auth_token(path: Path) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the same-host minime recovery supervisor")
-    parser.add_argument("--config", default="")
+    parser.add_argument("--config", required=True)
     parser.add_argument(
         "--workspace", default=os.environ.get("MINIME_CONTROL_WORKSPACE_ROOT", "")
-    )
-    parser.add_argument("--mode", choices=sorted(RECOVERY_MODES), default="observe")
-    parser.add_argument("--host", default=os.environ.get("MINIME_RECOVERY_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=os.environ.get("MINIME_RECOVERY_PORT", "9877"))
-    parser.add_argument("--db", default=os.environ.get("MINIME_RECOVERY_DB_PATH", ""))
-    parser.add_argument("--spool-dir", default=os.environ.get("MINIME_RECOVERY_SPOOL_DIR", ""))
-    parser.add_argument(
-        "--auth-token-file", default=os.environ.get("MINIME_RECOVERY_AUTH_TOKEN_FILE", "")
     )
     parser.add_argument("--max-body", type=int, default=MAX_BODY_DEFAULT)
     parser.add_argument("--body-timeout", type=float, default=5.0)
@@ -2849,56 +2919,41 @@ def _build_recovery_service(
     event_spool: AtomicJsonSpool,
     emergency: EmergencyNotifier,
     *,
-    configured: RecoveryConfig | None,
-    configured_rules: tuple[CorrelationRule, ...],
-    source_ids: tuple[str, ...],
-    mode: str,
+    configured: RecoveryConfig,
 ) -> RecoveryService:
     controls = RecoveryControls(ledger)
-    static_policy = None
-    if configured is not None:
-        static_policy = recovery_static_policy(configured)
-        controls.ensure_static_policy(static_policy)
+    static_policy = recovery_static_policy(configured)
+    controls.ensure_static_policy(static_policy)
     revision = controls.current().revision
     notifications = RecoveryNotificationOutbox(ledger, emergency=emergency)
+    configured_rules = tuple(
+        CorrelationRule(
+            component=str(rule["component"]),
+            failure_class=str(rule["failureClass"]),
+            incident_key=str(rule["incidentKey"]),
+            impact=int(rule["impact"]),
+        )
+        for rule in configured.correlation_rules
+    )
     coordinator = IncidentCoordinator(
         ledger,
         RecoveryPolicy(revision=revision, rules=configured_rules),
         owner=f"supervisor-{os.getpid()}",
         controls=controls,
         immediate_escalation=notifications.immediate_escalation,
-        mode=mode,
+        mode=configured.mode,
         static_policy=static_policy,
     )
     verifier = RecoveryVerifier(
         ledger,
         coordinator,
-        probe_ids=(
-            tuple(str(probe["id"]) for probe in configured.probes)
-            if configured is not None
-            else ()
-        ),
-        source_ids=source_ids,
-        cadence_seconds=(
-            configured.runtime_doctor_cadence_seconds
-            if configured is not None
-            else DEFAULT_RUNTIME_DOCTOR_CADENCE_SECONDS
-        ),
-        freshness_seconds=(
-            configured.verification_freshness_seconds
-            if configured is not None
-            else DEFAULT_VERIFICATION_FRESHNESS_SECONDS
-        ),
-        hold_down_seconds=(
-            configured.verification_hold_down_seconds
-            if configured is not None
-            else DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS
-        ),
+        probe_ids=tuple(str(probe["id"]) for probe in configured.probes),
+        source_ids=configured.source_ids,
+        cadence_seconds=configured.runtime_doctor_cadence_seconds,
+        freshness_seconds=configured.verification_freshness_seconds,
+        hold_down_seconds=configured.verification_hold_down_seconds,
     )
-    probe_runner = PythonProbeRunner(
-        verifier,
-        configured.probes if configured is not None else (),
-    )
+    probe_runner = PythonProbeRunner(verifier, configured.probes)
     service = RecoveryService(
         ledger,
         event_spool,
@@ -2913,42 +2968,20 @@ def _build_recovery_service(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configured: RecoveryConfig | None = None
-    configured_rules: tuple[CorrelationRule, ...] = ()
-    source_ids = ("alertmanager", "runtime_doctor")
-    if args.config:
-        workspace = Path(args.workspace).resolve() if args.workspace else Path.cwd().resolve()
-        config_path = Path(args.config)
-        if not config_path.is_absolute():
-            config_path = workspace / config_path
-        try:
-            configured = load_recovery_config(config_path, workspace)
-        except RecoveryConfigError:
-            print("recovery supervisor configuration rejected", file=sys.stderr)
-            return 2
-        args.host = configured.host
-        args.port = configured.port
-        args.db = str(configured.database)
-        args.spool_dir = str(configured.spool_directory)
-        args.auth_token_file = str(configured.auth_token_file)
-        args.mode = configured.mode
-        source_ids = configured.source_ids
-        configured_rules = tuple(
-            CorrelationRule(
-                component=str(rule["component"]),
-                failure_class=str(rule["failureClass"]),
-                incident_key=str(rule["incidentKey"]),
-                impact=int(rule["impact"]),
-            )
-            for rule in configured.correlation_rules
-        )
+    if not args.workspace:
+        print("recovery supervisor configuration rejected", file=sys.stderr)
+        return 2
+    workspace = Path(args.workspace).resolve()
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = workspace / config_path
+    try:
+        configured = load_recovery_config(config_path, workspace)
+    except RecoveryConfigError:
+        print("recovery supervisor configuration rejected", file=sys.stderr)
+        return 2
     if (
-        args.host not in {"127.0.0.1", "localhost"}
-        or not 0 <= args.port <= 65535
-        or not args.db
-        or not args.spool_dir
-        or not args.auth_token_file
-        or not 1 <= args.max_body <= 4 * 1024 * 1024
+        not 1 <= args.max_body <= 4 * 1024 * 1024
         or not 1 <= args.max_concurrent <= 128
         or not 1 <= args.busy_timeout_ms <= 30_000
         or not math.isfinite(args.body_timeout)
@@ -2959,12 +2992,12 @@ def main(argv: list[str] | None = None) -> int:
         print("recovery supervisor configuration rejected", file=sys.stderr)
         return 2
     try:
-        token = read_auth_token(Path(args.auth_token_file))
+        token = read_auth_token(configured.auth_token_file)
     except ValueError:
         print("recovery supervisor configuration rejected", file=sys.stderr)
         return 2
 
-    spool_root = Path(args.spool_dir)
+    spool_root = configured.spool_directory
     event_spool = AtomicJsonSpool(spool_root / "events")
     delivery = None
     if args.chat_id:
@@ -2977,7 +3010,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ledger: RecoveryLedger | None
     try:
-        ledger = RecoveryLedger(Path(args.db), busy_timeout_ms=args.busy_timeout_ms)
+        ledger = RecoveryLedger(configured.database, busy_timeout_ms=args.busy_timeout_ms)
     except LedgerCorrupt:
         emergency.emit("ledger_corrupt")
         print("recovery supervisor ledger validation failed", file=sys.stderr)
@@ -3011,7 +3044,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         server = BoundedThreadingHTTPServer(
-            (args.host, args.port),
+            (configured.host, configured.port),
             handler_for(app),
             max_concurrent_requests=args.max_concurrent,
         )
@@ -3028,9 +3061,6 @@ def main(argv: list[str] | None = None) -> int:
                 event_spool,
                 emergency,
                 configured=configured,
-                configured_rules=configured_rules,
-                source_ids=source_ids,
-                mode=args.mode,
             )
             app.service = service
         except LedgerUnavailable:
@@ -3044,29 +3074,36 @@ def main(argv: list[str] | None = None) -> int:
             emergency.emit("ledger_corrupt")
             print("recovery supervisor ledger validation failed", file=sys.stderr)
             return 1
-    server.timeout = 1.0
+    def serve_requests() -> None:
+        try:
+            server.serve_forever(poll_interval=0.2)
+        finally:
+            stop_requested.set()
+
+    request_thread = threading.Thread(
+        target=serve_requests,
+        name="recovery-http",
+        daemon=True,
+    )
+    request_thread.start()
     print("recovery supervisor ready", flush=True)
     next_ledger_retry = time.monotonic()
     try:
         while not stop_requested.is_set():
-            server.handle_request()
-            if stop_requested.is_set():
+            if stop_requested.wait(1.0):
                 break
             if ledger is None and time.monotonic() >= next_ledger_retry:
                 next_ledger_retry = time.monotonic() + 5.0
                 recovered_ledger: RecoveryLedger | None = None
                 try:
                     recovered_ledger = RecoveryLedger(
-                        Path(args.db), busy_timeout_ms=args.busy_timeout_ms
+                        configured.database, busy_timeout_ms=args.busy_timeout_ms
                     )
                     recovered_service = _build_recovery_service(
                         recovered_ledger,
                         event_spool,
                         emergency,
                         configured=configured,
-                        configured_rules=configured_rules,
-                        source_ids=source_ids,
-                        mode=args.mode,
                     )
                 except LedgerUnavailable:
                     if recovered_ledger is not None:
@@ -3084,6 +3121,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         stop_requested.set()
     finally:
+        server.shutdown()
+        request_thread.join(timeout=5.0)
         server.server_close()
         if ledger is not None:
             ledger.close()

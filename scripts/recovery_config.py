@@ -18,61 +18,20 @@ RUNTIME_DOCTOR_CADENCE_BOUNDS = (30, 3_600)
 VERIFICATION_FRESHNESS_BOUNDS = (60, 86_400)
 VERIFICATION_HOLD_DOWN_BOUNDS = (0, 86_400)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
-_SENSITIVE = re.compile(r"AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
-_SENSITIVE_ARG = re.compile(
-    r"^--?(?:api[-_]?key|authorization|credential|password|secret|token)(?:=|$)",
-    re.IGNORECASE,
+_LOCALE_VALUE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
+_LAUNCHD_TARGET = re.compile(
+    r"^(?:system|user/[0-9]+|gui/[0-9]+|pid/[0-9]+)/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 )
-_INDIRECTION_EXECUTABLES = frozenset(
-    {
-        "bash",
-        "dash",
-        "env",
-        "expect",
-        "find",
-        "fish",
-        "ksh",
-        "node",
-        "osascript",
-        "parallel",
-        "perl",
-        "php",
-        "python",
-        "python3",
-        "ruby",
-        "script",
-        "sh",
-        "sudo",
-        "xargs",
-        "zsh",
-    }
-)
-_MUTATING_EXECUTABLES = frozenset(
-    {
-        "apt",
-        "apt-get",
-        "brew",
-        "dnf",
-        "doas",
-        "halt",
-        "launchctl",
-        "npm",
-        "pip",
-        "pip3",
-        "pnpm",
-        "poweroff",
-        "reboot",
-        "rpm",
-        "service",
-        "shutdown",
-        "sops",
-        "su",
-        "systemctl",
-        "yum",
-        "yarn",
-    }
-)
+_SLEEP_SECONDS = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.[0-9]{1,3})?$")
+_READ_ONLY_PROBE_EXECUTABLES = {
+    "/bin/false": "constant",
+    "/bin/launchctl": "launchctl-print",
+    "/bin/sleep": "sleep",
+    "/bin/true": "constant",
+    "/usr/bin/false": "constant",
+    "/usr/bin/sleep": "sleep",
+    "/usr/bin/true": "constant",
+}
 _ROOT_KEYS = {
     "version",
     "mode",
@@ -125,7 +84,12 @@ def _safe_id(value: Any, name: str) -> str:
 
 
 def _workspace_path(workspace: Path, value: Any, name: str) -> Path:
-    if not isinstance(value, str) or not value or "\0" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\0" in value
+        or not _utf8_within(value, 4096)
+    ):
         raise RecoveryConfigError(f"recovery {name} is invalid")
     candidate = Path(value)
     if candidate.is_absolute() or ".." in candidate.parts:
@@ -138,6 +102,28 @@ def _workspace_path(workspace: Path, value: Any, name: str) -> Path:
     return resolved
 
 
+def _utf8_within(value: str, limit: int) -> bool:
+    try:
+        return len(value.encode("utf-8")) <= limit
+    except UnicodeEncodeError:
+        return False
+
+
+def _probe_argv_valid(executable: str, argv: list[str]) -> bool:
+    contract = _READ_ONLY_PROBE_EXECUTABLES.get(executable)
+    if contract == "constant":
+        return not argv
+    if contract == "sleep":
+        return bool(len(argv) == 1 and _SLEEP_SECONDS.fullmatch(argv[0]))
+    if contract == "launchctl-print":
+        return bool(
+            len(argv) == 2
+            and argv[0] == "print"
+            and _LAUNCHD_TARGET.fullmatch(argv[1])
+        )
+    return False
+
+
 def validated_probe_command(value: Any) -> dict[str, Any]:
     """Return one closed, non-mutating host-native probe definition."""
 
@@ -145,13 +131,13 @@ def validated_probe_command(value: Any) -> dict[str, Any]:
     item = _object(value, keys, "probe")
     _safe_id(item["id"], "command id")
     executable = item["executable"]
-    executable_name = Path(executable).name.lower() if isinstance(executable, str) else ""
     if (
         not isinstance(executable, str)
         or not Path(executable).is_absolute()
         or ".." in Path(executable).parts
         or "\0" in executable
-        or executable_name in _INDIRECTION_EXECUTABLES
+        or not _utf8_within(executable, 4096)
+        or executable not in _READ_ONLY_PROBE_EXECUTABLES
     ):
         raise RecoveryConfigError("recovery command executable is invalid")
     argv = item["argv"]
@@ -161,11 +147,11 @@ def validated_probe_command(value: Any) -> dict[str, Any]:
         or not all(
             isinstance(arg, str)
             and "\0" not in arg
-            and len(arg.encode()) <= 4096
-            and _SENSITIVE_ARG.search(arg) is None
+            and _utf8_within(arg, 4096)
             for arg in argv
         )
-        or sum(len(arg.encode()) for arg in argv) > 16 * 1024
+        or sum(len(arg.encode("utf-8")) for arg in argv) > 16 * 1024
+        or not _probe_argv_valid(executable, argv)
     ):
         raise RecoveryConfigError("recovery command argv is invalid")
     env = item["env"]
@@ -173,19 +159,16 @@ def validated_probe_command(value: Any) -> dict[str, Any]:
         raise RecoveryConfigError("recovery command environment is invalid")
     for key, env_value in env.items():
         if (
-            not isinstance(key, str)
-            or _ENV_KEY.fullmatch(key) is None
-            or _SENSITIVE.search(key) is not None
+            key not in {"LANG", "LC_ALL"}
             or not isinstance(env_value, str)
             or "\0" in env_value
-            or len(env_value.encode()) > 4096
+            or _LOCALE_VALUE.fullmatch(env_value) is None
+            or not _utf8_within(env_value, 64)
         ):
             raise RecoveryConfigError("recovery command environment is invalid")
     timeout = item["timeoutMs"]
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 100 <= timeout <= 300_000:
         raise RecoveryConfigError("recovery command timeout is invalid")
-    if executable_name in _MUTATING_EXECUTABLES:
-        raise RecoveryConfigError("recovery probe executable is invalid")
     return dict(item)
 
 
@@ -219,9 +202,17 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RecoveryConfigError("recovery configuration could not be read") from exc
     document = _object(raw, _ROOT_KEYS, "configuration")
-    if document["version"] != 1 or document["mode"] not in RECOVERY_MODES:
+    if (
+        isinstance(document["version"], bool)
+        or document["version"] != 1
+        or not isinstance(document["mode"], str)
+        or document["mode"] not in RECOVERY_MODES
+    ):
         raise RecoveryConfigError("recovery configuration version or mode is invalid")
-    if document["host"] not in {"127.0.0.1", "localhost"}:
+    if (
+        not isinstance(document["host"], str)
+        or document["host"] not in {"127.0.0.1", "localhost"}
+    ):
         raise RecoveryConfigError("recovery host must be loopback")
     port = document["port"]
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
@@ -275,11 +266,12 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     if (
         not isinstance(raw_sources, list)
         or not 1 <= len(raw_sources) <= 16
-        or len(set(raw_sources)) != len(raw_sources)
     ):
         raise RecoveryConfigError("recovery source IDs are invalid")
     sources = tuple(_safe_id(source, "source id") for source in raw_sources)
-    if not set(sources).issubset({"alertmanager", "runtime_doctor"}):
+    if len(set(sources)) != len(sources) or not set(sources).issubset(
+        {"alertmanager", "runtime_doctor"}
+    ):
         raise RecoveryConfigError("recovery source IDs are invalid")
 
     raw_probes = document["probes"]

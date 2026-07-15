@@ -7,8 +7,10 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import threading
 import time
 from typing import Any, Iterable, Iterator
@@ -17,8 +19,8 @@ SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
 DEFAULT_EVENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_BATCH_SIZE = 256
+MAX_EVENT_FUTURE_SKEW_SECONDS = 300
 EXPECTED_TABLES = {
-    "actions",
     "audit",
     "events",
     "fixer_lease",
@@ -105,18 +107,6 @@ _SCHEMA = (
         FOREIGN KEY (incident_id) REFERENCES incidents(id),
         FOREIGN KEY (policy_revision) REFERENCES policy_revisions(revision),
         UNIQUE (incident_id, generation)
-    ) STRICT
-    """,
-    """
-    CREATE TABLE actions (
-        id INTEGER PRIMARY KEY,
-        invocation_id INTEGER NOT NULL,
-        runbook_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        started_at REAL,
-        finished_at REAL,
-        result_code TEXT,
-        FOREIGN KEY (invocation_id) REFERENCES invocations(id)
     ) STRICT
     """,
     """
@@ -212,7 +202,10 @@ def _event_timestamp(event: dict[str, Any], received_at: float) -> float:
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             timestamp = parsed.timestamp()
-            if math.isfinite(timestamp):
+            if (
+                math.isfinite(timestamp)
+                and timestamp <= received_at + MAX_EVENT_FUTURE_SKEW_SECONDS
+            ):
                 return timestamp
         except (OverflowError, ValueError):
             pass
@@ -229,7 +222,7 @@ class RecoveryLedger:
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_private_storage()
             connection = sqlite3.connect(
                 path,
                 timeout=busy_timeout_ms / 1000,
@@ -245,6 +238,7 @@ class RecoveryLedger:
                 raise LedgerCorrupt("ledger WAL mode is unavailable")
             connection.execute("PRAGMA synchronous=FULL")
             self._initialize_or_validate()
+            self._verify_private_storage()
         except LedgerError:
             self.close()
             raise
@@ -254,6 +248,57 @@ class RecoveryLedger:
         except (OSError, sqlite3.DatabaseError) as exc:
             self.close()
             raise LedgerCorrupt("ledger startup validation failed") from exc
+
+    @staticmethod
+    def _private_directory(path: Path) -> None:
+        details = path.lstat()
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or details.st_mode & 0o077
+        ):
+            raise LedgerCorrupt("ledger directory permissions are unsafe")
+
+    @staticmethod
+    def _private_file(path: Path) -> None:
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or details.st_mode & 0o077
+        ):
+            raise LedgerCorrupt("ledger file permissions are unsafe")
+
+    def _prepare_private_storage(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._private_directory(self.path.parent)
+        try:
+            self._private_file(self.path)
+        except FileNotFoundError:
+            descriptor = os.open(
+                self.path,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_RDWR
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            self._private_file(self.path)
+
+    def _verify_private_storage(self) -> None:
+        self._private_directory(self.path.parent)
+        self._private_file(self.path)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            try:
+                self._private_file(sidecar)
+            except FileNotFoundError:
+                continue
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -478,60 +523,13 @@ class RecoveryLedger:
                     pass
                 raise
 
-    def add_policy_revision(
-        self,
-        revision: int,
-        policy: dict[str, Any],
-        *,
-        actor: str = "operator",
-        reason: str = "configured policy",
-        now: float | None = None,
-    ) -> None:
-        """Add an immutable policy revision for later invocation fencing."""
-
-        if not isinstance(revision, int) or revision < 1:
-            raise ValueError("policy revision is invalid")
-        document = _canonical_event(policy)
-        with self.transaction() as connection:
-            pointer = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'effective_policy_revision'"
-            ).fetchone()
-            try:
-                effective_revision = int(pointer[0]) if pointer is not None else 0
-            except (TypeError, ValueError) as exc:
-                raise LedgerCorrupt("effective recovery policy revision is invalid") from exc
-            existing = connection.execute(
-                "SELECT policy_json FROM policy_revisions WHERE revision = ?",
-                (revision,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != document:
-                    raise LedgerCorrupt("policy revision is immutable")
-                if revision > effective_revision:
-                    connection.execute(
-                        "INSERT INTO metadata(key, value) VALUES "
-                        "('effective_policy_revision', ?) ON CONFLICT(key) DO UPDATE "
-                        "SET value = excluded.value",
-                        (str(revision),),
-                    )
-                return
-            connection.execute(
-                "INSERT INTO policy_revisions(revision, created_at, actor, reason, policy_json) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (revision, time.time() if now is None else now, actor, reason, document),
-            )
-            if revision > effective_revision:
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES "
-                    "('effective_policy_revision', ?) ON CONFLICT(key) DO UPDATE "
-                    "SET value = excluded.value",
-                    (str(revision),),
-                )
-
     def ping(self) -> None:
         with self._lock:
             try:
+                self._verify_private_storage()
                 row = self.connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+            except LedgerCorrupt:
+                raise
             except sqlite3.DatabaseError as exc:
                 raise LedgerUnavailable("ledger health check failed") from exc
             if row is None or row[0] != str(SCHEMA_VERSION):

@@ -168,6 +168,27 @@ class RecoveryConfigTests(unittest.TestCase):
                     "env": {"API_TOKEN": "not-allowed"},
                     "timeoutMs": 1000,
                 },
+                {
+                    "id": "filesystem-mutation",
+                    "executable": "/bin/rm",
+                    "argv": ["-f", "/tmp/example"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "network-mutation",
+                    "executable": "/usr/bin/curl",
+                    "argv": ["-X", "POST", "http://127.0.0.1:9877/example"],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
+                    "id": "loader-injection",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {"DYLD_INSERT_LIBRARIES": "/tmp/example"},
+                    "timeoutMs": 1000,
+                },
             ]
             for probe in unsafe_shapes:
                 invalid = config_document()
@@ -176,6 +197,54 @@ class RecoveryConfigTests(unittest.TestCase):
                     json.dumps(invalid), encoding="utf-8"
                 )
                 with self.subTest(probe=probe["id"]), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    )
+
+    def test_malformed_config_types_and_unicode_are_bounded_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed: list[tuple[str, dict[str, object]]] = []
+            for name, field, value in (
+                ("mode", "mode", []),
+                ("host", "host", []),
+                ("source", "sourceIds", [{}]),
+            ):
+                document = config_document()
+                document[field] = value
+                malformed.append((name, document))
+            for name, probe in (
+                (
+                    "argv-unicode",
+                    {
+                        "id": "unicode",
+                        "executable": "/usr/bin/true",
+                        "argv": ["\ud800"],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                ),
+                (
+                    "env-unicode",
+                    {
+                        "id": "unicode",
+                        "executable": "/usr/bin/true",
+                        "argv": [],
+                        "env": {"LANG": "\ud800"},
+                        "timeoutMs": 1000,
+                    },
+                ),
+            ):
+                document = config_document()
+                document["probes"] = [probe]
+                malformed.append((name, document))
+            for name, document in malformed:
+                (root / "recovery.json").write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                with self.subTest(case=name), self.assertRaises(
                     recovery_config.RecoveryConfigError
                 ):
                     recovery_config.load_recovery_config(
@@ -304,11 +373,146 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             self.assertGreater(json.loads(output)["revision"], 1)
 
+            for control, value in (
+                ("confirmation-count", "2"),
+                ("cooldown", "30"),
+                ("retry-budget", "2"),
+            ):
+                code, output, error = call_cli(
+                    root,
+                    "controls",
+                    control,
+                    value,
+                    "--actor",
+                    "operator",
+                    "--reason",
+                    "bounded control",
+                )
+                self.assertEqual((code, error), (0, ""))
+                self.assertTrue(json.loads(output)["ok"])
+
+            code, output, error = call_cli(
+                root,
+                "silence",
+                "bot-unavailable",
+                "--ttl",
+                "60",
+                "--actor",
+                "operator",
+                "--reason",
+                "known maintenance",
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertTrue(json.loads(output)["ok"])
+
+            loaded = recovery_config.load_recovery_config(
+                root / "recovery.json", root
+            )
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    recovery_cli._policy(loaded, controls.current().revision),
+                    owner="cli-fixture",
+                    controls=controls,
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        json.dumps(
+                            {
+                                "alerts": [
+                                    {
+                                        "status": "firing",
+                                        "fingerprint": "cli-retained",
+                                        "startsAt": "2026-07-14T00:00:00Z",
+                                        "labels": {
+                                            "alertname": "BotUnavailable",
+                                            "component": "bot",
+                                            "failure_class": "unavailable",
+                                        },
+                                    }
+                                ]
+                            }
+                        ).encode()
+                    )
+                )
+                coordinator.reconcile()
+                incident = ledger.connection.execute(
+                    "SELECT * FROM incidents"
+                ).fetchone()
+                ledger.connection.execute(
+                    "INSERT INTO invocations(incident_id, generation, evidence_hash, "
+                    "policy_revision, lease_token, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'inspection-token', 'interrupted', 1, 1)",
+                    (
+                        incident["id"],
+                        incident["generation"],
+                        incident["evidence_hash"],
+                        incident["policy_revision"],
+                    ),
+                )
+                incident_id = int(incident["id"])
+
+            code, incidents, error = call_cli(
+                root, "incidents", "--id", str(incident_id), "--limit", "1"
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(incidents)[0]["id"], incident_id)
+            code, invocations, error = call_cli(
+                root, "invocations", "--limit", "1"
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(invocations)[0]["incident_id"], incident_id)
+
+            code, output, error = call_cli(
+                root,
+                "retry",
+                str(incident_id),
+                "--actor",
+                "operator",
+                "--reason",
+                "explicit retry drill",
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertTrue(json.loads(output)["ok"])
+
             code, history, error = call_cli(
                 root, "policy", "history", "--limit", "2"
             )
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(len(json.loads(history)), 2)
+
+            code, output, error = call_cli(
+                root,
+                "policy",
+                "rollback",
+                "1",
+                "--actor",
+                "operator",
+                "--reason",
+                "restore baseline",
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertTrue(json.loads(output)["ok"])
+
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                operations = {
+                    row[0]
+                    for row in ledger.connection.execute(
+                        "SELECT operation FROM audit"
+                    )
+                }
+            self.assertTrue(
+                {
+                    "confirmation_control",
+                    "cooldown_control",
+                    "dispatch_control",
+                    "explicit_retry",
+                    "policy_rollback",
+                    "retry_budget_control",
+                    "silence_control",
+                }.issubset(operations)
+            )
 
             for removed in (("approve", "1"), ("reject", "1"), ("digest", "preview")):
                 code, _output, error = call_cli(root, *removed)
@@ -370,7 +574,8 @@ class RecoveryCliTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     ledger.connection.execute(
-                        "SELECT count(*) FROM actions"
+                        "SELECT count(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'actions'"
                     ).fetchone()[0],
                     0,
                 )

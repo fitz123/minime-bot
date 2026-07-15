@@ -16,16 +16,16 @@ from recovery_config import (
     RecoveryConfig,
     RecoveryConfigError,
     load_recovery_config,
-    recovery_static_policy,
 )
 from recovery_ledger import LedgerError, RecoveryLedger
 from recovery_supervisor import (
+    AtomicJsonSpool,
     CorrelationRule,
+    EmergencyNotifier,
     IncidentCoordinator,
     RecoveryControls,
     RecoveryPolicy,
-    RecoveryVerifier,
-    PythonProbeRunner,
+    _build_recovery_service,
     safe_field,
 )
 
@@ -223,19 +223,25 @@ def run(args: argparse.Namespace) -> int:
 
     with RecoveryLedger(config.database) as ledger:
         controls = RecoveryControls(ledger)
-        static_policy = recovery_static_policy(config)
-        revision = (
-            controls.ensure_static_policy(static_policy)
-            if args.command == "process"
-            else controls.current().revision
-        )
+        if args.command == "process":
+            service = _build_recovery_service(
+                ledger,
+                AtomicJsonSpool(config.spool_directory / "events"),
+                EmergencyNotifier(
+                    config.spool_directory / "notifications", delivery=None
+                ),
+                configured=config,
+            )
+            summary = service.maintenance()
+            _json({"ok": True, "mode": config.mode, **summary})
+            return 0
+        revision = controls.current().revision
         coordinator = IncidentCoordinator(
             ledger,
             _policy(config, revision),
             owner="recovery-cli",
             controls=controls,
             mode=config.mode,
-            static_policy=static_policy if args.command == "process" else None,
         )
         if args.command == "status":
             _json(_status(ledger, controls, config))
@@ -291,43 +297,6 @@ def run(args: argparse.Namespace) -> int:
         elif args.command == "policy" and args.action == "rollback":
             actor, reason = _operator(args)
             _json({"ok": True, "revision": controls.rollback(args.revision, actor=actor, reason=reason)})
-        elif args.command == "process":
-            active = coordinator.reconcile()
-            controls.expire()
-            verifier = RecoveryVerifier(
-                ledger,
-                coordinator,
-                probe_ids=tuple(str(probe["id"]) for probe in config.probes),
-                source_ids=config.source_ids,
-                cadence_seconds=config.runtime_doctor_cadence_seconds,
-                freshness_seconds=config.verification_freshness_seconds,
-                hold_down_seconds=config.verification_hold_down_seconds,
-            )
-            PythonProbeRunner(verifier, config.probes).refresh_due()
-            verification = [
-                {
-                    "incidentId": incident_id,
-                    "recovered": result.recovered,
-                    "reasons": list(result.reasons),
-                    "evidence": [
-                        {
-                            "kind": item.kind,
-                            "id": item.identifier,
-                            "state": item.state,
-                        }
-                        for item in result.evidence
-                    ],
-                }
-                for incident_id, result in verifier.evaluate_all()
-            ]
-            _json(
-                {
-                    "ok": True,
-                    "mode": config.mode,
-                    "activeIncidents": active,
-                    "verification": verification,
-                }
-            )
         else:
             raise ValueError("unknown recovery command")
     return 0

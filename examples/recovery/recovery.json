@@ -6,7 +6,20 @@
   "authTokenFile": "config/recovery-auth-token",
   "host": "127.0.0.1",
   "port": 9877,
-  "correlationRules": [],
+  "correlationRules": [
+    {
+      "component": "bot",
+      "failureClass": "unavailable",
+      "incidentKey": "bot-unavailable",
+      "impact": 2
+    },
+    {
+      "component": "runtime",
+      "failureClass": "node_unavailable",
+      "incidentKey": "runtime-node-unavailable",
+      "impact": 2
+    }
+  ],
   "sourceIds": [
     "alertmanager",
     "runtime_doctor"

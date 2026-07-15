@@ -220,6 +220,33 @@ describe("minime-bot CLI", () => {
     }
   });
 
+  it("forwards recovery subcommand help to the recovery CLI", () => {
+    const workspace = createWorkspace();
+    const calls: CommandCall[] = [];
+    const recoveryCommandRunner: RecoveryCommandRunner = (command, args) => {
+      calls.push({ command, args: [...args] });
+      return { status: 0, stdout: "recovery incidents help\n", stderr: "" };
+    };
+    try {
+      const result = runWithCapture(
+        ["recovery", "incidents", "--help", "--workspace", workspace],
+        workspace,
+        { PYTHON: "/usr/bin/python3" },
+        { recoveryCommandRunner },
+      );
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "recovery incidents help\n");
+      assert.deepEqual(calls[0].args.slice(1), [
+        "--workspace",
+        workspace,
+        "incidents",
+        "--help",
+      ]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("dry-runs launchd cron sync with option parsing and LaunchAgents override", () => {
     const workspace = createWorkspace();
     const home = join(workspace, "home");

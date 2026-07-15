@@ -151,6 +151,13 @@ direct native behavior above. Recovery shadowing adds these settings:
 - `MINIME_DOCTOR_RECOVERY_TOKEN_FILE` must be an owner-only, non-symlink token
   file; `MINIME_DOCTOR_RECOVERY_ATTEMPTS` is bounded to 1-10.
 
+During a prolonged recovery-sink outage, the doctor keeps the current pending
+head in its owner-only state file and spills additional transitions into an
+ordered owner-only sidecar queue. Recovery requests contain at most 64 events;
+each acknowledged prefix is removed durably, and stable transition IDs make a
+crash replay idempotent. Do not delete the state file or its
+`.recovery-queue` sidecar while recovery delivery is pending.
+
 The recovery shadow plist runs every 300 seconds. Keep its `StartInterval`
 equal to the recovery configuration's required
 `runtimeDoctorCadenceSeconds`. The shipped

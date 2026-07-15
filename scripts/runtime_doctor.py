@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import math
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,7 @@ STATE_VERSION = 1
 TCC_STATUS_MAX_BYTES = 1024
 STATE_MAX_BYTES = 64 * 1024
 RECOVERY_TOKEN_MAX_BYTES = 4 * 1024
+RECOVERY_BATCH_MAX_EVENTS = 64
 RECOVERY_FALLBACK_COOLDOWN_SECONDS = 300.0
 SUPERVISOR_UNAVAILABLE_MESSAGE = "MINIME RECOVERY SUPERVISOR\nsupervisor unavailable"
 ENV_PREFIX = "MINIME_DOCTOR_"
@@ -114,9 +116,11 @@ class DoctorConfig:
             ):
                 raise ValueError("recovery URL is invalid")
             try:
-                parsed_recovery.port
+                recovery_port = parsed_recovery.port
             except ValueError:
                 raise ValueError("recovery URL is invalid") from None
+            if recovery_port is None or not 1 <= recovery_port <= 65535:
+                raise ValueError("recovery URL is invalid")
         urls = {
             name: env.get(f"{ENV_PREFIX}{name}") or None
             for name in ("BOT_METRICS_URL", "PROMETHEUS_URL", "ALERTMANAGER_URL")
@@ -419,23 +423,145 @@ def _source_snapshot_events(current: set[str]) -> list[dict[str, str]]:
     return events
 
 
-def _advance_pending(pending: dict[str, Any], current: set[str]) -> dict[str, Any]:
+def _recovery_queue_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.recovery-queue")
+
+
+def _valid_transition_event(event: Any) -> bool:
+    if not isinstance(event, dict) or set(event) != {
+        "code",
+        "status",
+        "transition",
+        "transition_id",
+    }:
+        return False
+    code = event.get("code")
+    status_value = event.get("status")
+    transition = event.get("transition")
+    supplied = event.get("transition_id")
+    return bool(
+        isinstance(code, str)
+        and code in INCIDENT_ACTIONS
+        and status_value in {"firing", "resolved"}
+        and isinstance(transition, str)
+        and transition
+        and isinstance(supplied, str)
+        and supplied == doctor_transition_id(code, status_value, transition)
+    )
+
+
+def _recovery_queue_items(
+    state_path: Path,
+) -> list[tuple[Path, list[dict[str, str]], set[str]]]:
+    queue_path = _recovery_queue_path(state_path)
+    if not queue_path.exists():
+        return []
+    if not queue_path.is_dir():
+        raise OSError("recovery queue is invalid")
+    items: list[tuple[Path, list[dict[str, str]], set[str]]] = []
+    for path in sorted(queue_path.glob("*.json")):
+        if (
+            not path.is_file()
+            or not re.fullmatch(r"[0-9]{20}\.json", path.name)
+            or path.stat().st_size > STATE_MAX_BYTES
+        ):
+            raise OSError("recovery queue is invalid")
+        try:
+            document = json.loads(path.read_text("ascii"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise OSError("recovery queue is invalid") from exc
+        events = document.get("events") if isinstance(document, dict) else None
+        target = document.get("target_incidents") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"events", "target_incidents", "version"}
+            or document.get("version") != 1
+            or not isinstance(events, list)
+            or not 1 <= len(events) <= RECOVERY_BATCH_MAX_EVENTS
+            or not all(_valid_transition_event(event) for event in events)
+            or not isinstance(target, list)
+            or not all(
+                isinstance(item, str) and item in INCIDENT_ACTIONS for item in target
+            )
+            or len(target) != len(set(target))
+        ):
+            raise OSError("recovery queue is invalid")
+        items.append((path, [dict(event) for event in events], set(target)))
+    return items
+
+
+def _enqueue_recovery_events(
+    state_path: Path, events: list[dict[str, str]], target: set[str]
+) -> None:
+    if not events:
+        return
+    queue_path = _recovery_queue_path(state_path)
+    queue_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(queue_path, 0o700)
+    existing = _recovery_queue_items(state_path)
+    sequence = int(existing[-1][0].stem) + 1 if existing else 1
+    for offset in range(0, len(events), RECOVERY_BATCH_MAX_EVENTS):
+        chunk = events[offset : offset + RECOVERY_BATCH_MAX_EVENTS]
+        destination = queue_path / f"{sequence:020d}.json"
+        document = {
+            "version": 1,
+            "events": chunk,
+            "target_incidents": sorted(target),
+        }
+        payload = json.dumps(
+            document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
+        descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=queue_path)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            _fsync_directory(queue_path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        sequence += 1
+
+
+def _remove_recovery_queue_item(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _advance_pending(
+    pending: dict[str, Any], current: set[str], state_path: Path
+) -> dict[str, Any]:
     """Append transitions observed after an undelivered recovery batch."""
 
-    target = set(pending["target_incidents"])
+    queued = _recovery_queue_items(state_path)
+    target = queued[-1][2] if queued else set(pending["target_incidents"])
+    reconciled = target != set(pending["target_incidents"])
     if current == target:
-        return pending
+        if not reconciled:
+            return pending
+        return {
+            "events": list(pending["events"]),
+            "native_delivered": False,
+            "target_incidents": sorted(target),
+        }
 
-    events: list[dict[str, str]] = []
-    transition_ids: set[str] = set()
-    for event in [*pending["events"], *_transition_events(target, current)]:
-        transition_id = event["transition_id"]
-        if transition_id in transition_ids:
-            continue
-        transition_ids.add(transition_id)
-        events.append(event)
+    transitions = _transition_events(target, current)
+    inline = list(pending["events"])
+    if queued or len(inline) + len(transitions) > RECOVERY_BATCH_MAX_EVENTS:
+        _enqueue_recovery_events(state_path, transitions, current)
+    else:
+        inline.extend(transitions)
     return {
-        "events": events,
+        "events": inline,
         "native_delivered": False,
         "target_incidents": sorted(current),
     }
@@ -454,33 +580,13 @@ def _valid_pending(value: Any) -> bool:
         not isinstance(target, list)
         or not all(isinstance(item, str) and item in INCIDENT_ACTIONS for item in target)
         or not isinstance(events, list)
-        or not events
+        or len(events) > RECOVERY_BATCH_MAX_EVENTS
         or not isinstance(value.get("native_delivered"), bool)
     ):
         return False
-    for event in events:
-        if not isinstance(event, dict) or set(event) != {
-            "code",
-            "status",
-            "transition",
-            "transition_id",
-        }:
-            return False
-        code = event.get("code")
-        status_value = event.get("status")
-        transition = event.get("transition")
-        supplied = event.get("transition_id")
-        if (
-            not isinstance(code, str)
-            or code not in INCIDENT_ACTIONS
-            or status_value not in {"firing", "resolved"}
-            or not isinstance(transition, str)
-            or not transition
-            or not isinstance(supplied, str)
-            or supplied != doctor_transition_id(code, status_value, transition)
-        ):
-            return False
-    return True
+    return len(target) == len(set(target)) and all(
+        _valid_transition_event(event) for event in events
+    )
 
 
 def read_delivery_state(path: Path) -> tuple[set[str], dict[str, Any] | None, bool]:
@@ -701,11 +807,26 @@ def run_doctor(
                     return False, previous
                 active["native_delivered"] = True
                 write_delivery_state(config.state_path, previous, active)
+            if active["events"]:
+                try:
+                    recovery_notify(active["events"])
+                except (MonitoringError, OSError):
+                    recovery_sink_failed()
+                    return False, previous
+                active["events"] = []
+                write_delivery_state(config.state_path, previous, active)
             try:
-                recovery_notify(active["events"])
-            except (MonitoringError, OSError):
+                queued = _recovery_queue_items(config.state_path)
+            except OSError:
                 recovery_sink_failed()
                 return False, previous
+            for path, events, _queued_target in queued:
+                try:
+                    recovery_notify(events)
+                    _remove_recovery_queue_item(path)
+                except (MonitoringError, OSError):
+                    recovery_sink_failed()
+                    return False, previous
             recovery_delivered = True
             _clear_recovery_fallback(config)
             write_delivery_state(config.state_path, target, None)
@@ -729,7 +850,7 @@ def run_doctor(
             return 0 if completed else 1
 
         if pending is not None:
-            advanced = _advance_pending(pending, incidents)
+            advanced = _advance_pending(pending, incidents, config.state_path)
             if advanced is not pending:
                 pending = advanced
                 write_delivery_state(config.state_path, previous, pending)

@@ -662,7 +662,9 @@ observer = recovery_supervisor.IncidentCoordinator(
 assert observer.reconcile() == 1
 assert observer.claim_next() is None
 assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
-assert ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 0
+assert ledger.connection.execute(
+    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'"
+).fetchone()[0] == 0
 
 resolved = json.dumps({"alerts": [{
     "status": "resolved",
@@ -718,7 +720,9 @@ assert "heartbeat_stale:supervisor" in stale_result.reasons
 assert "heartbeat_stale:alertmanager" in stale_result.reasons
 assert verifier.mechanical_classification(int(incident["id"]), stale_result) is None
 assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
-assert ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 0
+assert ledger.connection.execute(
+    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'"
+).fetchone()[0] == 0
 
 controls_clock = [200.0]
 controls = recovery_supervisor.RecoveryControls(ledger, clock=lambda: controls_clock[0])
@@ -819,9 +823,6 @@ with tempfile.TemporaryDirectory() as directory:
                 probe_config.spool_directory / "notifications", delivery=None
             ),
             configured=probe_config,
-            configured_rules=policy.rules,
-            source_ids=probe_config.source_ids,
-            mode=probe_config.mode,
         )
         assert probe_service.accept(events, heartbeats={"alertmanager": True}).status == 200
         assert probe_service.accept(
@@ -868,7 +869,7 @@ with tempfile.TemporaryDirectory() as directory:
             "SELECT count(*) FROM invocations"
         ).fetchone()[0] == 0
         assert probe_ledger.connection.execute(
-            "SELECT count(*) FROM actions"
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'"
         ).fetchone()[0] == 0
 
 with tempfile.TemporaryDirectory() as directory:

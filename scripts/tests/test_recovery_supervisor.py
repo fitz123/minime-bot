@@ -164,6 +164,73 @@ class RecoveryLedgerTests(unittest.TestCase):
             self.assertTrue(all("private_payload" not in row[0] for row in stored))
             reopened.close()
 
+    def test_ledger_storage_is_owner_only_and_rejects_unsafe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            path = private / "ledger.sqlite3"
+            with recovery_ledger.RecoveryLedger(path):
+                self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                for suffix in ("-wal", "-shm"):
+                    sidecar = Path(f"{path}{suffix}")
+                    if sidecar.exists():
+                        self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+
+            unsafe_directory = root / "unsafe-directory"
+            unsafe_directory.mkdir()
+            unsafe_directory.chmod(0o755)
+            with self.assertRaises(recovery_ledger.LedgerCorrupt):
+                recovery_ledger.RecoveryLedger(
+                    unsafe_directory / "ledger.sqlite3"
+                )
+
+            unsafe_file = root / "unsafe.sqlite3"
+            unsafe_file.write_bytes(b"")
+            unsafe_file.chmod(0o644)
+            with self.assertRaises(recovery_ledger.LedgerCorrupt):
+                recovery_ledger.RecoveryLedger(unsafe_file)
+
+            target = root / "target.sqlite3"
+            target.write_bytes(b"")
+            target.chmod(0o600)
+            link = root / "link.sqlite3"
+            link.symlink_to(target)
+            with self.assertRaises(recovery_ledger.LedgerCorrupt):
+                recovery_ledger.RecoveryLedger(link)
+
+    def test_implausible_future_event_time_cannot_mask_later_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                future = recovery_supervisor.normalize_alertmanager(
+                    alert_body(
+                        firing_alert(
+                            "future-skew", starts_at="2100-01-01T00:00:00Z"
+                        )
+                    )
+                )
+                resolved = recovery_supervisor.normalize_alertmanager(
+                    alert_body(
+                        resolved_alert(
+                            "future-skew",
+                            starts_at="1970-01-01T00:16:40Z",
+                            ends_at="1970-01-01T00:16:41Z",
+                        )
+                    )
+                )
+                with mock.patch.object(
+                    recovery_ledger.time, "time", return_value=1000.0
+                ):
+                    ledger.record_events(future)
+                    ledger.record_events(resolved)
+                future_row = ledger.connection.execute(
+                    "SELECT event_at FROM events WHERE status = 'firing'"
+                ).fetchone()
+                self.assertEqual(future_row[0], 1000.0)
+                self.assertEqual(ledger.latest_events()[0]["status"], "resolved")
+
     def test_schema_mismatch_corruption_and_lock_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -231,7 +298,9 @@ class RecoveryLedgerTests(unittest.TestCase):
                 for index in range(4)
             ]
             # Deliberately receive semantic latest state before older history.
-            with mock.patch.object(recovery_ledger.time, "time", return_value=0.0):
+            with mock.patch.object(
+                recovery_ledger.time, "time", return_value=1_769_990_400.0
+            ):
                 self.assertEqual(
                     ledger.record_events(
                         [active_latest, *active_history, resolved_latest, *resolved_history]
@@ -329,8 +398,8 @@ class RecoveryLedgerTests(unittest.TestCase):
                 with mock.patch.object(recovery_ledger.time, "time", return_value=0.0):
                     ledger.record_events(
                         [
-                            history_event("indexed", "firing", "2026-01-02T00:00:00Z"),
-                            history_event("indexed", "resolved", "2026-01-01T00:00:00Z"),
+                            history_event("indexed", "firing", "1970-01-01T00:00:02Z"),
+                            history_event("indexed", "resolved", "1970-01-01T00:00:01Z"),
                         ]
                     )
                 latest_plan = ledger.connection.execute(
@@ -386,12 +455,14 @@ class RecoveryLedgerTests(unittest.TestCase):
                     event_retention_batch_size=1,
                 )
                 service.maintenance()
+                self.assertEqual(service.health().status, 503)
+            with recovery_ledger.RecoveryLedger(path) as reopened:
                 self.assertEqual(
-                    ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                    reopened.connection.execute("SELECT count(*) FROM events").fetchone()[0],
                     2,
                 )
                 self.assertEqual(
-                    ledger.connection.execute(
+                    reopened.connection.execute(
                         "SELECT count(*) FROM audit "
                         "WHERE operation = 'event_history_pruned'"
                     ).fetchone()[0],
@@ -511,6 +582,97 @@ class RecoveryServiceTests(unittest.TestCase):
                 )
                 self.assertFalse(observation["healthy"])
 
+    def test_heartbeat_spool_and_ledger_keep_newest_conservative_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, correlation_policy(), owner="heartbeat-order"
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    source_ids=("runtime_doctor",),
+                    cadence_seconds=300,
+                    freshness_seconds=660,
+                    hold_down_seconds=60,
+                )
+                event_spool = recovery_supervisor.AtomicJsonSpool(root / "events")
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    event_spool,
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                    coordinator=coordinator,
+                    verifier=verifier,
+                )
+                with mock.patch.object(
+                    verifier,
+                    "record_heartbeat",
+                    side_effect=recovery_ledger.LedgerUnavailable("synthetic outage"),
+                ), mock.patch.object(
+                    service,
+                    "_intake_envelope",
+                    side_effect=(
+                        {
+                            "version": 1,
+                            "events": [],
+                            "heartbeats": {"runtime_doctor": True},
+                            "observed_at": 100.0,
+                        },
+                        {
+                            "version": 1,
+                            "events": [],
+                            "heartbeats": {"runtime_doctor": True},
+                            "observed_at": 200.0,
+                        },
+                    ),
+                ):
+                    self.assertEqual(
+                        service.accept(
+                            [], heartbeats={"runtime_doctor": True}
+                        ).status,
+                        202,
+                    )
+                    self.assertEqual(
+                        service.accept(
+                            [], heartbeats={"runtime_doctor": True}
+                        ).status,
+                        202,
+                    )
+                queued = event_spool.items()
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0][1]["observed_at"], 200.0)
+                self.assertEqual(service.health().status, 200)
+
+                verifier.record_heartbeat(
+                    "runtime_doctor", healthy=False, observed_at=300.0
+                )
+                verifier.record_heartbeat(
+                    "runtime_doctor", healthy=True, observed_at=250.0
+                )
+                verifier.record_heartbeat(
+                    "runtime_doctor", healthy=True, observed_at=300.0
+                )
+                self.assertEqual(
+                    verifier._observation(
+                        ledger.connection,
+                        "verification:heartbeat:runtime_doctor",
+                    ),
+                    (False, 300.0),
+                )
+                verifier.record_heartbeat(
+                    "runtime_doctor", healthy=True, observed_at=301.0
+                )
+                self.assertEqual(
+                    verifier._observation(
+                        ledger.connection,
+                        "verification:heartbeat:runtime_doctor",
+                    ),
+                    (True, 301.0),
+                )
+
     def test_emergency_delivery_is_atomic_throttled_and_drained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -533,6 +695,76 @@ class RecoveryServiceTests(unittest.TestCase):
             self.assertEqual(list((root / "notifications").glob("*.json")), [])
             notifier.emit("ledger_corrupt")
             self.assertEqual(len(delivered), 1)
+
+    def test_notification_outbox_retries_when_spool_and_delivery_both_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocker = root / "blocked"
+            blocker.write_text("not a directory", encoding="utf-8")
+            available = False
+            delivered: list[str] = []
+
+            def delivery(message: str) -> None:
+                if not available:
+                    raise monitoring_native.DeliveryError("synthetic outage")
+                delivered.append(message)
+
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                notifier = recovery_supervisor.EmergencyNotifier(
+                    blocker / "notifications", delivery=delivery, cooldown=0
+                )
+                outbox = recovery_supervisor.RecoveryNotificationOutbox(
+                    ledger, emergency=notifier
+                )
+                self.assertFalse(outbox.immediate_escalation("recovery_failed"))
+                self.assertIsNone(
+                    ledger.connection.execute(
+                        "SELECT delivered_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+                blocker.unlink()
+                available = True
+                self.assertEqual(outbox.deliver_due(), 1)
+                self.assertEqual(len(delivered), 1)
+                self.assertIsNotNone(
+                    ledger.connection.execute(
+                        "SELECT delivered_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+
+    def test_runtime_ledger_corruption_closes_ledger_and_keeps_intake_spooled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            messages: list[str] = []
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger, correlation_policy(), owner="corrupt-runtime"
+            )
+            event_spool = recovery_supervisor.AtomicJsonSpool(root / "events")
+            service = recovery_supervisor.RecoveryService(
+                ledger,
+                event_spool,
+                recovery_supervisor.EmergencyNotifier(
+                    root / "notifications", delivery=messages.append, cooldown=0
+                ),
+                coordinator=coordinator,
+            )
+            with mock.patch.object(
+                coordinator,
+                "reconcile",
+                side_effect=recovery_ledger.LedgerCorrupt("synthetic corruption"),
+            ):
+                result = service.accept(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("runtime-corrupt"))
+                    )
+                )
+            self.assertEqual((result.status, result.text), (202, "durably spooled"))
+            self.assertEqual(len(event_spool.items()), 1)
+            self.assertEqual(service.health().status, 503)
+            with self.assertRaises(recovery_ledger.LedgerUnavailable):
+                _ = ledger.connection
+            self.assertTrue(any("integrity" in message for message in messages))
 
     def test_corrupt_emergency_spool_does_not_terminate_maintenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -559,6 +791,123 @@ class RecoveryServiceTests(unittest.TestCase):
 
 
 class IncidentCoordinatorTests(unittest.TestCase):
+    def test_retained_invocation_fences_renew_evidence_finish_and_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=30),
+                    owner="future-fixer",
+                    clock=lambda: clock[0],
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("fenced-invocation"))
+                    )
+                )
+                coordinator.reconcile()
+                incident = ledger.connection.execute(
+                    "SELECT * FROM incidents"
+                ).fetchone()
+                token = "synthetic-lease-token"
+                with ledger.transaction() as connection:
+                    connection.execute(
+                        "UPDATE incidents SET state = 'invoking' WHERE id = ?",
+                        (incident["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE fixer_lease SET owner = ?, token = ?, acquired_at = ?, "
+                        "expires_at = ? WHERE singleton = 1",
+                        ("future-fixer", token, 100.0, 120.0),
+                    )
+                    cursor = connection.execute(
+                        "INSERT INTO invocations(incident_id, generation, evidence_hash, "
+                        "policy_revision, lease_token, state, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'active', 100, 100)",
+                        (
+                            incident["id"],
+                            incident["generation"],
+                            incident["evidence_hash"],
+                            incident["policy_revision"],
+                            token,
+                        ),
+                    )
+                fence = recovery_supervisor.InvocationFence(
+                    int(cursor.lastrowid),
+                    int(incident["id"]),
+                    int(incident["generation"]),
+                    str(incident["evidence_hash"]),
+                    int(incident["policy_revision"]),
+                    token,
+                    "future-fixer",
+                )
+                evidence = coordinator.invocation_evidence(fence)
+                self.assertEqual(len(evidence), 1)
+                latest = json.loads(ledger.latest_events()[0]["normalized_json"])
+                self.assertEqual(evidence[0]["transitionId"], latest["transition_id"])
+                self.assertTrue(coordinator.renew_lease(fence))
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT expires_at FROM fixer_lease WHERE singleton = 1"
+                    ).fetchone()[0],
+                    130.0,
+                )
+                stale = recovery_supervisor.InvocationFence(
+                    fence.invocation_id,
+                    fence.incident_id,
+                    fence.generation,
+                    fence.evidence_hash,
+                    fence.policy_revision,
+                    "wrong-token",
+                    fence.owner,
+                )
+                self.assertFalse(coordinator.renew_lease(stale))
+                self.assertFalse(coordinator.finish(stale, "completed"))
+                self.assertTrue(coordinator.finish(fence, "completed"))
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM invocations WHERE id = ?",
+                        (fence.invocation_id,),
+                    ).fetchone()[0],
+                    "completed",
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM incidents WHERE id = ?",
+                        (fence.incident_id,),
+                    ).fetchone()[0],
+                    "verifying",
+                )
+
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("fenced-invocation-retry"))
+                    )
+                )
+                coordinator.reconcile()
+                retried = ledger.connection.execute(
+                    "SELECT id, generation FROM incidents WHERE state = 'eligible'"
+                ).fetchone()
+                self.assertTrue(
+                    coordinator.explicit_retry(
+                        int(retried["id"]), actor="operator", reason="bounded retry"
+                    )
+                )
+                self.assertFalse(
+                    coordinator.explicit_retry(
+                        int(retried["id"]), actor="operator", reason="budget exhausted"
+                    )
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM audit WHERE operation = 'explicit_retry'"
+                    ).fetchone()[0],
+                    1,
+                )
+
     def test_observe_reconciles_generations_without_claims_or_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -584,7 +933,9 @@ class IncidentCoordinatorTests(unittest.TestCase):
                     0,
                 )
                 self.assertEqual(
-                    ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0],
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'"
+                    ).fetchone()[0],
                     0,
                 )
 
@@ -695,6 +1046,38 @@ class IncidentCoordinatorTests(unittest.TestCase):
 
 
 class RecoveryControlTests(unittest.TestCase):
+    def test_silence_limit_rejects_new_target_without_corrupting_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                controls = recovery_supervisor.RecoveryControls(
+                    ledger, clock=lambda: clock[0]
+                )
+                for index in range(128):
+                    controls.silence(
+                        f"incident-{index}",
+                        actor="operator",
+                        reason="bounded silence fixture",
+                        expires_at=200.0,
+                    )
+                with self.assertRaisesRegex(ValueError, "limit"):
+                    controls.silence(
+                        "incident-overflow",
+                        actor="operator",
+                        reason="must fail",
+                        expires_at=200.0,
+                    )
+                self.assertEqual(len(controls.current().silences), 128)
+                controls.silence(
+                    "incident-0",
+                    actor="operator",
+                    reason="replacement remains allowed",
+                    expires_at=201.0,
+                )
+                self.assertEqual(len(controls.current().silences), 128)
+
     def test_static_controls_expire_and_rollback_without_enabling_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             clock = [100.0]
@@ -939,7 +1322,8 @@ class RecoveryVerificationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     ledger.connection.execute(
-                        "SELECT count(*) FROM actions"
+                        "SELECT count(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'actions'"
                     ).fetchone()[0],
                     0,
                 )
@@ -1016,6 +1400,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                     {"stale"},
                 )
 
+                clock[0] = 1_373.0
                 verifier.record_heartbeat("supervisor", healthy=False)
                 verifier.record_heartbeat("runtime_doctor", healthy=False)
                 self.assertTrue(verifier.record_probe(fence, "health", False))
@@ -1221,9 +1606,6 @@ class RecoveryVerificationTests(unittest.TestCase):
                             config.spool_directory / "notifications", delivery=None
                         ),
                         configured=config,
-                        configured_rules=correlation_policy().rules,
-                        source_ids=config.source_ids,
-                        mode=config.mode,
                     )
                     self.assertIsInstance(
                         service.probe_runner, recovery_supervisor.PythonProbeRunner
@@ -1282,7 +1664,8 @@ class RecoveryVerificationTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         ledger.connection.execute(
-                            "SELECT count(*) FROM actions"
+                            "SELECT count(*) FROM sqlite_master "
+                            "WHERE type = 'table' AND name = 'actions'"
                         ).fetchone()[0],
                         0,
                     )
@@ -1295,8 +1678,8 @@ class RecoveryVerificationTests(unittest.TestCase):
                 coordinator, incident_id = self._verifying_incident(ledger, clock)
                 probe = {
                     "id": "bounded-output",
-                    "executable": self._native_executable("yes"),
-                    "argv": [],
+                    "executable": self._native_executable("sleep"),
+                    "argv": ["5"],
                     "env": {},
                     "timeoutMs": 100,
                 }
@@ -1344,7 +1727,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                 assert observation is not None
                 self.assertFalse(observation[0])
 
-    def test_probe_runner_rejects_interpreter_scripts_and_missing_artifacts(self) -> None:
+    def test_probe_runner_rejects_unreviewed_paths_and_handles_missing_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             clock = [100.0]
@@ -1354,7 +1737,7 @@ class RecoveryVerificationTests(unittest.TestCase):
             script.chmod(0o700)
             with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
                 coordinator, incident_id = self._verifying_incident(ledger, clock)
-                probes = (
+                unsafe_probes = (
                     {
                         "id": "script",
                         "executable": str(script),
@@ -1370,10 +1753,24 @@ class RecoveryVerificationTests(unittest.TestCase):
                         "timeoutMs": 1000,
                     },
                 )
+                for probe in unsafe_probes:
+                    with self.subTest(probe=probe["id"]), self.assertRaises(
+                        recovery_config.RecoveryConfigError
+                    ):
+                        recovery_config.validated_probe_command(probe)
+                probes = (
+                    {
+                        "id": "missing-native-probe",
+                        "executable": self._native_executable("true"),
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                )
                 verifier = recovery_supervisor.RecoveryVerifier(
                     ledger,
                     coordinator,
-                    probe_ids=("script", "missing-package-probe"),
+                    probe_ids=("missing-native-probe",),
                     cadence_seconds=30,
                     freshness_seconds=120,
                     hold_down_seconds=0,
@@ -1381,7 +1778,11 @@ class RecoveryVerificationTests(unittest.TestCase):
                 )
                 runner = recovery_supervisor.PythonProbeRunner(verifier, probes)
                 fence = self._fence(ledger, incident_id)
-                with mock.patch.object(recovery_supervisor.subprocess, "Popen") as popen:
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_resolved_executable",
+                    return_value=None,
+                ), mock.patch.object(recovery_supervisor.subprocess, "Popen") as popen:
                     self.assertTrue(runner.refresh(fence))
                 popen.assert_not_called()
                 self.assertFalse(marker.exists())
@@ -1580,9 +1981,6 @@ class RecoveryFoundationTests(unittest.TestCase):
                         config.spool_directory / "notifications", delivery=None
                     ),
                     configured=config,
-                    configured_rules=correlation_policy().rules,
-                    source_ids=config.source_ids,
-                    mode=config.mode,
                 )
                 self.assertIsNotNone(service.verifier)
                 assert service.verifier is not None
@@ -1602,7 +2000,9 @@ class RecoveryFoundationTests(unittest.TestCase):
                     0,
                 )
                 self.assertEqual(
-                    ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0],
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'"
+                    ).fetchone()[0],
                     0,
                 )
                 self.assertEqual(
@@ -1807,6 +2207,40 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                 "MINIME_TELEGRAM_CHAT_ID": "10001",
             }
         )
+
+    def test_recovery_sink_configuration_rejects_malformed_boundaries(self) -> None:
+        base = {
+            "MINIME_DOCTOR_STATE_PATH": "/tmp/minime-doctor-test-state",
+            "MINIME_DOCTOR_SINK": "tee",
+            "MINIME_DOCTOR_RECOVERY_URL": (
+                "http://127.0.0.1:9877/v1/runtime-doctor"
+            ),
+            "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": "/tmp/minime-doctor-test-token",
+        }
+        invalid: list[tuple[str, dict[str, str]]] = []
+        for name, updates, removed in (
+            ("sink", {"MINIME_DOCTOR_SINK": "invalid"}, ()),
+            ("missing-url", {}, ("MINIME_DOCTOR_RECOVERY_URL",)),
+            ("missing-token", {}, ("MINIME_DOCTOR_RECOVERY_TOKEN_FILE",)),
+            ("https", {"MINIME_DOCTOR_RECOVERY_URL": "https://127.0.0.1:9877/v1/runtime-doctor"}, ()),
+            ("remote", {"MINIME_DOCTOR_RECOVERY_URL": "http://example.com:9877/v1/runtime-doctor"}, ()),
+            ("credentials", {"MINIME_DOCTOR_RECOVERY_URL": "http://user@127.0.0.1:9877/v1/runtime-doctor"}, ()),
+            ("path", {"MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1:9877/healthz"}, ()),
+            ("query", {"MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1:9877/v1/runtime-doctor?x=1"}, ()),
+            ("fragment", {"MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1:9877/v1/runtime-doctor#x"}, ()),
+            ("missing-port", {"MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1/v1/runtime-doctor"}, ()),
+            ("zero-port", {"MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1:0/v1/runtime-doctor"}, ()),
+            ("attempt-zero", {"MINIME_DOCTOR_RECOVERY_ATTEMPTS": "0"}, ()),
+            ("attempt-eleven", {"MINIME_DOCTOR_RECOVERY_ATTEMPTS": "11"}, ()),
+        ):
+            environment = dict(base)
+            environment.update(updates)
+            for key in removed:
+                environment.pop(key)
+            invalid.append((name, environment))
+        for name, environment in invalid:
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                runtime_doctor.DoctorConfig.from_environ(environment)
 
     def test_default_telegram_behavior_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2270,6 +2704,128 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                 {"runtime_doctor": True, "alertmanager": True},
             )
 
+    def test_run_doctor_production_sender_posts_heartbeat_only_and_health_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            received: list[dict[str, object]] = []
+
+            class Handler(recovery_supervisor.BaseHTTPRequestHandler):
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+                def do_POST(self) -> None:  # noqa: N802
+                    length = int(self.headers["Content-Length"])
+                    received.append(json.loads(self.rfile.read(length).decode("ascii")))
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            server = recovery_supervisor.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
+            config = runtime_doctor.DoctorConfig.from_environ(
+                {
+                    "MINIME_DOCTOR_STATE_PATH": str(root / "doctor.json"),
+                    "MINIME_DOCTOR_SINK": "recovery",
+                    "MINIME_DOCTOR_RECOVERY_URL": (
+                        f"http://127.0.0.1:{server.server_address[1]}/v1/runtime-doctor"
+                    ),
+                    "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": str(token),
+                    "MINIME_DOCTOR_ALERTMANAGER_URL": "http://127.0.0.1:1/-/healthy",
+                    "MINIME_DOCTOR_TIMEOUT": "1",
+                }
+            )
+            observations = (set(), set(), {"alertmanager_unhealthy"})
+            try:
+                with mock.patch.object(
+                    runtime_doctor, "collect_incidents", side_effect=observations
+                ):
+                    for _observation in observations:
+                        self.assertEqual(runtime_doctor.run_doctor(config), 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertEqual(len(received), 3)
+            self.assertEqual(received[0]["heartbeats"], {
+                "runtime_doctor": True,
+                "alertmanager": True,
+            })
+            self.assertEqual(received[1]["events"], [])
+            self.assertEqual(received[1]["heartbeats"], {
+                "runtime_doctor": True,
+                "alertmanager": True,
+            })
+            self.assertEqual(received[2]["heartbeats"], {
+                "runtime_doctor": True,
+                "alertmanager": False,
+            })
+
+    def test_pending_recovery_history_is_chunked_without_state_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "recovery")
+            runtime_doctor.write_delivery_state(config.state_path, set(), None)
+            all_incidents = set(runtime_doctor.INCIDENT_ACTIONS)
+            observations = [all_incidents if index % 2 == 0 else set() for index in range(7)]
+
+            def unavailable(_events: list[dict[str, str]]) -> None:
+                raise monitoring_native.DeliveryError("synthetic outage")
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", side_effect=observations
+            ):
+                for _observation in observations:
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config,
+                            deliver=lambda _message: None,
+                            deliver_recovery=unavailable,
+                        ),
+                        1,
+                    )
+            state = json.loads(config.state_path.read_text("utf-8"))
+            self.assertLess(config.state_path.stat().st_size, runtime_doctor.STATE_MAX_BYTES)
+            self.assertLessEqual(
+                len(state["pending"]["events"]),
+                runtime_doctor.RECOVERY_BATCH_MAX_EVENTS,
+            )
+            self.assertTrue(runtime_doctor._recovery_queue_items(config.state_path))
+
+            delivered: list[list[dict[str, str]]] = []
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=observations[-1]
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=lambda _message: None,
+                        deliver_recovery=lambda events: delivered.append(
+                            [dict(event) for event in events]
+                        ),
+                    ),
+                    0,
+                )
+            self.assertTrue(delivered)
+            self.assertTrue(
+                all(
+                    1 <= len(batch) <= runtime_doctor.RECOVERY_BATCH_MAX_EVENTS
+                    for batch in delivered
+                )
+            )
+            transition_ids = [
+                event["transition_id"] for batch in delivered for event in batch
+            ]
+            self.assertEqual(len(transition_ids), 77)
+            self.assertEqual(len(transition_ids), len(set(transition_ids)))
+            self.assertNotIn(
+                "pending", json.loads(config.state_path.read_text("utf-8"))
+            )
+            self.assertFalse(runtime_doctor._recovery_queue_path(config.state_path).exists())
+
     def test_real_recovery_http_does_not_retry_terminal_4xx_or_network_exhaustion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2349,6 +2905,29 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
 
 
 class SupervisorStartupTests(unittest.TestCase):
+    @staticmethod
+    def _write_config(root: Path, *, port: int = 9877) -> None:
+        (root / "recovery.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "mode": "observe",
+                    "database": "ledger.sqlite3",
+                    "spoolDirectory": "spool",
+                    "authTokenFile": "auth-token",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "correlationRules": [],
+                    "sourceIds": ["alertmanager", "runtime_doctor"],
+                    "probes": [],
+                    "runtimeDoctorCadenceSeconds": 300,
+                    "verificationFreshnessSeconds": 660,
+                    "verificationHoldDownSeconds": 60,
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_listener_ownership_precedes_policy_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2403,23 +2982,41 @@ class SupervisorStartupTests(unittest.TestCase):
                     1,
                 )
 
+    def test_startup_requires_closed_config_and_rejects_legacy_raw_flags(self) -> None:
+        with self.assertRaises(SystemExit) as missing:
+            recovery_supervisor.main(["--workspace", "/tmp/example"])
+        self.assertEqual(missing.exception.code, 2)
+        with self.assertRaises(SystemExit) as legacy:
+            recovery_supervisor.main(
+                [
+                    "--workspace",
+                    "/tmp/example",
+                    "--config",
+                    "recovery.json",
+                    "--db",
+                    "/tmp/example/ledger.sqlite3",
+                ]
+            )
+        self.assertEqual(legacy.exception.code, 2)
+
     def test_sigterm_requests_graceful_service_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
             token.chmod(0o600)
+            self._write_config(root)
             server = mock.Mock()
             service = mock.Mock()
 
-            def terminate_during_request() -> None:
+            def terminate_during_request(**_kwargs: object) -> None:
                 handler = recovery_supervisor.signal.getsignal(
                     recovery_supervisor.signal.SIGTERM
                 )
                 self.assertTrue(callable(handler))
                 handler(recovery_supervisor.signal.SIGTERM, None)
 
-            server.handle_request.side_effect = terminate_during_request
+            server.serve_forever.side_effect = terminate_during_request
             with (
                 mock.patch.object(
                     recovery_supervisor, "BoundedThreadingHTTPServer", return_value=server
@@ -2432,18 +3029,67 @@ class SupervisorStartupTests(unittest.TestCase):
             ):
                 result = recovery_supervisor.main(
                     [
-                        "--mode",
-                        "observe",
-                        "--db",
-                        str(root / "ledger.sqlite3"),
-                        "--spool-dir",
-                        str(root / "spool"),
-                        "--auth-token-file",
-                        str(token),
+                        "--workspace",
+                        str(root),
+                        "--config",
+                        "recovery.json",
                     ]
                 )
             self.assertEqual(result, 0)
             server.server_close.assert_called_once_with()
+
+    def test_http_acceptance_continues_while_maintenance_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "auth-token"
+            token.write_text("synthetic-auth-token-value", encoding="utf-8")
+            token.chmod(0o600)
+            reservation = socket.socket()
+            reservation.bind(("127.0.0.1", 0))
+            port = int(reservation.getsockname()[1])
+            reservation.close()
+            self._write_config(root, port=port)
+            maintenance_started = threading.Event()
+            release_maintenance = threading.Event()
+            service = mock.Mock()
+            service.health.return_value = recovery_supervisor.IntakeResult(200, "ok")
+
+            def blocked_maintenance() -> None:
+                maintenance_started.set()
+                release_maintenance.wait(3)
+                raise KeyboardInterrupt
+
+            service.maintenance.side_effect = blocked_maintenance
+            result: list[int] = []
+            with mock.patch.object(
+                recovery_supervisor, "_build_recovery_service", return_value=service
+            ):
+                supervisor = threading.Thread(
+                    target=lambda: result.append(
+                        recovery_supervisor.main(
+                            [
+                                "--workspace",
+                                str(root),
+                                "--config",
+                                "recovery.json",
+                            ]
+                        )
+                    )
+                )
+                supervisor.start()
+                self.assertTrue(maintenance_started.wait(3))
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                connection.request(
+                    "GET",
+                    "/healthz",
+                    headers={"Authorization": "Bearer synthetic-auth-token-value"},
+                )
+                self.assertEqual(connection.getresponse().status, 200)
+                connection.close()
+                release_maintenance.set()
+                supervisor.join(timeout=5)
+            self.assertFalse(supervisor.is_alive())
+            self.assertEqual(result, [0])
 
     def test_temporary_startup_ledger_failure_keeps_spool_only_intake_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2451,6 +3097,7 @@ class SupervisorStartupTests(unittest.TestCase):
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
             token.chmod(0o600)
+            self._write_config(root)
             captured: list[recovery_supervisor.RecoveryApplication] = []
             server = mock.Mock()
             server.handle_request.side_effect = KeyboardInterrupt
@@ -2472,14 +3119,10 @@ class SupervisorStartupTests(unittest.TestCase):
             ):
                 result = recovery_supervisor.main(
                     [
-                        "--mode",
-                        "observe",
-                        "--db",
-                        str(root / "ledger.sqlite3"),
-                        "--spool-dir",
-                        str(root / "spool"),
-                        "--auth-token-file",
-                        str(token),
+                        "--workspace",
+                        str(root),
+                        "--config",
+                        "recovery.json",
                     ]
                 )
             self.assertEqual(result, 0)
@@ -2498,18 +3141,15 @@ class SupervisorStartupTests(unittest.TestCase):
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
             token.chmod(0o600)
+            self._write_config(root)
             messages: list[str] = []
             with mock.patch.object(recovery_supervisor, "send_telegram", side_effect=lambda message, _config: messages.append(message)):
                 result = recovery_supervisor.main(
                     [
-                        "--mode",
-                        "observe",
-                        "--db",
-                        str(database),
-                        "--spool-dir",
-                        str(root / "spool"),
-                        "--auth-token-file",
-                        str(token),
+                        "--workspace",
+                        str(root),
+                        "--config",
+                        "recovery.json",
                         "--chat-id",
                         "10001",
                     ]
