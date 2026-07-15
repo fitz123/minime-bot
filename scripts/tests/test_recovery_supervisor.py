@@ -114,6 +114,67 @@ def correlation_policy(
     )
 
 
+def fixer_config_fields(root: Path) -> dict[str, object]:
+    return {
+        "fixer_auth_token_file": root / "fixer-token",
+        "internal_agent_id": "recovery-fixer",
+        "session_policy": {
+            "directory": str(root / "sessions"),
+            "startupTimeoutSeconds": 30,
+            "resumeTimeoutSeconds": 30,
+            "maxReplacementsPerGeneration": 1,
+            "journalDigestMaxBytes": 32_768,
+        },
+        "action_policy": {
+            "maxActionsPerInvocation": 128,
+            "preimageMaxBytes": 1024 * 1024,
+            "reconciliationTimeoutSeconds": 300,
+        },
+        "quarantine_policy": {
+            "directory": str(root / "quarantine"),
+            "allowedRoots": (),
+            "maxItemsPerIncident": 64,
+            "maxItemBytes": 10 * 1024 * 1024,
+            "maxIncidentBytes": 50 * 1024 * 1024,
+        },
+        "report_policy": {
+            "maxBytes": 256 * 1024,
+            "maxTimelineEntries": 256,
+            "retrySeconds": 300,
+        },
+        "slot_policy": {
+            "stateDirectory": str(root / "slots"),
+            "capsuleRoot": str(root / "capsule"),
+            "botReleaseRoot": str(root / "releases"),
+            "startupHealthTimeoutSeconds": 60,
+            "nodeExecutable": "/usr/local/bin/node",
+            "nodeVersion": "22.19.0",
+            "piExecutable": "/usr/local/bin/pi",
+            "piVersion": "0.80.6",
+        },
+        "reviewed_operations": (),
+        "fixer_lease_seconds": 120,
+        "fixer_renew_seconds": 30,
+    }
+
+
+def supervisor_config_document(*, port: int = 9877) -> dict[str, object]:
+    from scripts.tests.test_recovery_cli import config_document
+
+    document = config_document()
+    document.update(
+        {
+            "database": "ledger.sqlite3",
+            "spoolDirectory": "spool",
+            "authTokenFile": "auth-token",
+            "fixerAuthTokenFile": "fixer-auth-token",
+            "port": port,
+            "correlationRules": [],
+        }
+    )
+    return document
+
+
 class FailingLedger:
     def record_events(
         self, _events: object, *, observed_at: float | None = None
@@ -128,6 +189,7 @@ class FailingLedger:
 class RecoveryLedgerTests(unittest.TestCase):
     def test_fixed_schema_pragmas_and_restart_idempotency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(recovery_ledger.SCHEMA_VERSION, 5)
             path = Path(directory) / "ledger.sqlite3"
             events = recovery_supervisor.normalize_alertmanager(
                 alert_body(firing_alert("one"), firing_alert("two"))
@@ -1229,6 +1291,1221 @@ class IncidentCoordinatorTests(unittest.TestCase):
                 self.assertIsNone(coordinator.claim_next())
 
 
+class RecoveryDurableFixerContractTests(unittest.TestCase):
+    @staticmethod
+    def _claimed(
+        root: Path,
+        *,
+        mode: str,
+        clock: list[float] | None = None,
+    ) -> tuple[
+        recovery_ledger.RecoveryLedger,
+        recovery_supervisor.IncidentCoordinator,
+        recovery_supervisor.InvocationFence | None,
+    ]:
+        current = [100.0] if clock is None else clock
+        ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+        coordinator = recovery_supervisor.IncidentCoordinator(
+            ledger,
+            correlation_policy(lease_seconds=120),
+            owner="fixer-contract",
+            mode=mode,
+            clock=lambda: current[0],
+        )
+        ledger.record_events(
+            recovery_supervisor.normalize_alertmanager(
+                alert_body(firing_alert(f"mode-{mode}"))
+            )
+        )
+        return ledger, coordinator, coordinator.claim_next()
+
+    def test_exact_modes_gate_claim_endpoints_and_host_mutation(self) -> None:
+        for mode, dispatches, mutates in (
+            ("observe", False, False),
+            ("diagnose", True, False),
+            ("enabled", True, True),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ledger, coordinator, fence = self._claimed(root, mode=mode)
+                try:
+                    self.assertEqual(fence is not None, dispatches)
+                    self.assertEqual(coordinator.endpoint_allowed("inspect"), dispatches)
+                    self.assertEqual(coordinator.endpoint_allowed("reconcile"), dispatches)
+                    self.assertEqual(coordinator.endpoint_allowed("mutate"), mutates)
+                    if fence is not None:
+                        action = coordinator.record_action_intent(
+                            fence,
+                            action_key="action-one",
+                            tool_name="edit",
+                            intent={"pathRef": "config:bot"},
+                        )
+                        self.assertEqual(action is not None, mutates)
+                finally:
+                    ledger.close()
+
+    def test_session_action_claim_journal_is_idempotent_fenced_and_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger, coordinator, fence = self._claimed(root, mode="enabled", clock=clock)
+            assert fence is not None
+            session_dir = root / "sessions" / "incident-1"
+            transcript = session_dir / "session-one.jsonl"
+            binding = coordinator.bind_session(
+                fence,
+                session_id="session-one",
+                session_directory=str(session_dir),
+                transcript_path=str(transcript),
+            )
+            self.assertIsNotNone(binding)
+            self.assertEqual(
+                coordinator.bind_session(
+                    fence,
+                    session_id="session-one",
+                    session_directory=str(session_dir),
+                    transcript_path=str(transcript),
+                ),
+                binding,
+            )
+
+            stale = recovery_supervisor.InvocationFence(
+                fence.invocation_id,
+                fence.incident_id,
+                fence.generation + 1,
+                fence.evidence_hash,
+                fence.policy_revision,
+                fence.lease_token,
+                fence.owner,
+            )
+            self.assertIsNone(
+                coordinator.bind_session(
+                    stale,
+                    session_id="stale-session",
+                    session_directory=str(session_dir),
+                    transcript_path=str(session_dir / "stale.jsonl"),
+                )
+            )
+            replacement_dir = root / "sessions" / "incident-1-replacement"
+            replacement = coordinator.replace_session(
+                fence,
+                previous_binding_id=int(binding or 0),
+                session_id="session-two",
+                session_directory=str(replacement_dir),
+                transcript_path=str(replacement_dir / "session-two.jsonl"),
+                reason="transcript unreadable",
+                journal_digest="bounded synthetic journal digest",
+                max_replacements=1,
+            )
+            self.assertIsNotNone(replacement)
+            self.assertIsNone(
+                coordinator.replace_session(
+                    fence,
+                    previous_binding_id=int(replacement or 0),
+                    session_id="session-three",
+                    session_directory=str(root / "sessions" / "third"),
+                    transcript_path=str(root / "sessions" / "third" / "session-three.jsonl"),
+                    reason="second replacement",
+                    journal_digest="bounded digest",
+                    max_replacements=1,
+                )
+            )
+
+            action = coordinator.record_action_intent(
+                fence,
+                action_key="edit-config",
+                tool_name="edit",
+                intent={"pathRef": "config:bot", "preimage": "sha256:synthetic"},
+            )
+            self.assertIsNotNone(action)
+            self.assertEqual(
+                coordinator.record_action_intent(
+                    fence,
+                    action_key="edit-config",
+                    tool_name="edit",
+                    intent={"pathRef": "config:bot", "preimage": "sha256:synthetic"},
+                ),
+                action,
+            )
+            self.assertIsNone(
+                coordinator.record_action_intent(
+                    fence,
+                    action_key="second-action",
+                    tool_name="write",
+                    intent={"pathRef": "config:other"},
+                )
+            )
+            self.assertTrue(
+                coordinator.record_action_outcome(
+                    fence,
+                    action_key="edit-config",
+                    outcome="succeeded",
+                    details={"changed": True},
+                )
+            )
+            claim = coordinator.record_completion_claim(
+                fence,
+                claim_key="claim-one",
+                claim={"outcome": "fixed"},
+            )
+            self.assertIsNotNone(claim)
+            self.assertEqual(
+                coordinator.record_completion_claim(
+                    fence,
+                    claim_key="claim-one",
+                    claim={"outcome": "fixed"},
+                ),
+                claim,
+            )
+            ledger.close()
+
+            reopened = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            try:
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT count(*) FROM session_bindings"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT count(*) FROM session_replacements"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT count(*) FROM fixer_claims"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                reopened.close()
+
+    def test_reconciliation_and_claim_keys_are_scoped_to_their_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = recovery_supervisor.RecoveryPolicy(
+                revision=1,
+                rules=(
+                    recovery_supervisor.CorrelationRule(
+                        "first", "unavailable", "first-incident", impact=3
+                    ),
+                    recovery_supervisor.CorrelationRule(
+                        "second", "unavailable", "second-incident", impact=3
+                    ),
+                ),
+                lease_seconds=120,
+            )
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger, policy, owner="scoped-keys", mode="enabled"
+                )
+                ledger.record_events(
+                    [
+                        recovery_supervisor._normalized_event(
+                            source="alertmanager",
+                            fingerprint=f"scoped-{component}",
+                            code="SyntheticDown",
+                            status="firing",
+                            transition=f"scoped-{component}",
+                            occurred_at="2026-07-15T00:00:00Z",
+                            component=component,
+                            failure_class="unavailable",
+                        )
+                        for component in ("first", "second")
+                    ]
+                )
+                for _index in range(2):
+                    fence = coordinator.claim_next()
+                    assert fence is not None
+                    self.assertIsNotNone(
+                        coordinator.record_action_intent(
+                            fence,
+                            action_key="shared-action",
+                            tool_name="edit",
+                            intent={"reconciliation": {"path": "/synthetic/config"}},
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.mark_action_unknown(
+                            fence, action_key="shared-action"
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.reconcile_action(
+                            fence,
+                            action_key="shared-action",
+                            idempotency_key="shared-reconciliation",
+                            result="not_applied",
+                            details={"summary": "checked"},
+                        )
+                    )
+                    self.assertTrue(
+                        coordinator.accept_completion_claim(
+                            fence,
+                            claim_key="shared-finish",
+                            claim={"summary": "complete"},
+                        )
+                    )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM action_reconciliations "
+                        "WHERE idempotency_key = 'shared-reconciliation'"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM fixer_claims WHERE claim_key = 'shared-finish'"
+                    ).fetchone()[0],
+                    2,
+                )
+
+    def test_crash_window_becomes_unknown_and_blocks_until_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger, coordinator, fence = self._claimed(root, mode="enabled", clock=clock)
+            assert fence is not None
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    fence,
+                    action_key="crash-window",
+                    tool_name="write",
+                    intent={"pathRef": "config:bot"},
+                )
+            )
+            ledger.close()
+
+            inspector = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            self.assertEqual(
+                inspector.connection.execute(
+                    "SELECT state FROM action_intents WHERE action_key = 'crash-window'"
+                ).fetchone()[0],
+                "pending",
+            )
+            inspector.close()
+            reopened = recovery_ledger.RecoveryLedger(
+                root / "ledger.sqlite3", recover_unfinished_actions=True
+            )
+            resumed = recovery_supervisor.IncidentCoordinator(
+                reopened,
+                correlation_policy(lease_seconds=120),
+                owner="fixer-contract",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            try:
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT state FROM action_intents WHERE action_key = 'crash-window'"
+                    ).fetchone()[0],
+                    "unknown",
+                )
+                self.assertIsNone(
+                    resumed.record_action_intent(
+                        fence,
+                        action_key="blocked-action",
+                        tool_name="edit",
+                        intent={"pathRef": "config:other"},
+                    )
+                )
+                self.assertTrue(
+                    resumed.reconcile_action(
+                        fence,
+                        action_key="crash-window",
+                        idempotency_key="reconcile-crash-window",
+                        result="not_applied",
+                        details={"observed": "preimage"},
+                    )
+                )
+                self.assertIsNotNone(
+                    resumed.record_action_intent(
+                        fence,
+                        action_key="after-reconcile",
+                        tool_name="edit",
+                        intent={"pathRef": "config:other"},
+                    )
+                )
+            finally:
+                reopened.close()
+
+    def test_crash_retry_carries_unknown_actions_across_invocation_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=10),
+                owner="fixer-contract",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("cross-generation-crash"))
+                )
+            )
+            first = coordinator.claim_next()
+            assert first is not None
+            first_binding = coordinator.bind_session(
+                first,
+                session_id="cross-generation-session",
+                session_directory=str(root / "sessions" / "cross-generation"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "cross-generation"
+                    / "cross-generation-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(first_binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="crashed-edit",
+                    tool_name="edit",
+                    intent={"path": "config"},
+                )
+            )
+            clock[0] = 200.0
+            coordinator.reconcile()
+            second = coordinator.claim_next()
+            assert second is not None
+            self.assertNotEqual(first.invocation_id, second.invocation_id)
+            state = coordinator.fixer_state(second)
+            assert state is not None
+            self.assertEqual(
+                [item["actionKey"] for item in state["unknownActions"]],
+                ["crashed-edit"],
+            )
+            self.assertNotIn("currentSession", state)
+            self.assertEqual(
+                state["resumeSession"]["bindingId"],
+                first_binding,
+            )
+            resumed_binding = coordinator.bind_session(
+                second,
+                session_id="cross-generation-session",
+                session_directory=str(root / "sessions" / "cross-generation"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "cross-generation"
+                    / "cross-generation-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(resumed_binding)
+            self.assertTrue(
+                coordinator.mark_session_resumed(second, int(resumed_binding or 0))
+            )
+            self.assertIsNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="must-wait",
+                    tool_name="write",
+                    intent={"path": "other"},
+                )
+            )
+            self.assertTrue(
+                coordinator.reconcile_action(
+                    second,
+                    action_key="crashed-edit",
+                    idempotency_key="cross-generation-reconcile",
+                    result="not_applied",
+                    details={"inspection": "preimage intact"},
+                )
+            )
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="after-cross-generation-reconcile",
+                    tool_name="write",
+                    intent={"path": "other"},
+                )
+            )
+            ledger.close()
+
+    def test_resolved_evidence_dispatches_the_same_session_for_unknown_action_reconciliation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger, coordinator, first = self._claimed(
+                root, mode="enabled", clock=clock
+            )
+            assert first is not None
+            binding = coordinator.bind_session(
+                first,
+                session_id="resolved-action-session",
+                session_directory=str(root / "sessions" / "resolved-action"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "resolved-action"
+                    / "resolved-action-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="mutation-during-resolution",
+                    tool_name="edit",
+                    intent={"pathRef": "config:bot"},
+                )
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("mode-enabled"))
+                )
+            )
+            coordinator.reconcile()
+            incident = ledger.connection.execute(
+                "SELECT state, evidence_hash FROM incidents"
+            ).fetchone()
+            self.assertEqual(incident["state"], "eligible")
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM action_intents"
+                ).fetchone()[0],
+                "unknown",
+            )
+            second = coordinator.claim_next()
+            assert second is not None
+            state = coordinator.fixer_state(second)
+            assert state is not None
+            self.assertEqual(
+                [item["actionKey"] for item in state["unknownActions"]],
+                ["mutation-during-resolution"],
+            )
+            self.assertEqual(state["resumeSession"]["bindingId"], binding)
+            self.assertTrue(
+                coordinator.reconcile_action(
+                    second,
+                    action_key="mutation-during-resolution",
+                    idempotency_key="resolved-action-reconciliation",
+                    result="not_applied",
+                    details={"observed": "preimage_intact"},
+                )
+            )
+            ledger.close()
+
+    def test_report_outbox_state_is_idempotent_and_never_an_incident_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger, coordinator, _fence = self._claimed(root, mode="observe")
+            incident = ledger.connection.execute("SELECT * FROM incidents").fetchone()
+            store = recovery_supervisor.RecoveryReportStore(
+                ledger, clock=lambda: 100.0, retry_seconds=30
+            )
+            report_id = store.queue(
+                report_key="incident-report-one",
+                incident_id=int(incident["id"]),
+                generation=int(incident["generation"]),
+                body={"outcome": "blocked", "timeline": []},
+            )
+            self.assertEqual(
+                store.queue(
+                    report_key="incident-report-one",
+                    incident_id=int(incident["id"]),
+                    generation=int(incident["generation"]),
+                    body={"outcome": "blocked", "timeline": []},
+                ),
+                report_id,
+            )
+            self.assertEqual(store.state("incident-report-one"), "REPORT_PENDING")
+            self.assertTrue(store.defer("incident-report-one"))
+            self.assertEqual(store.state("incident-report-one"), "REPORT_PENDING")
+            self.assertTrue(store.mark_reported("incident-report-one"))
+            self.assertTrue(store.mark_reported("incident-report-one"))
+            self.assertEqual(store.state("incident-report-one"), "REPORTED")
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM incidents WHERE id = ?", (incident["id"],)
+                ).fetchone()[0],
+                "eligible",
+            )
+            with self.assertRaises(ValueError):
+                store.queue(
+                    report_key="incident-report-one",
+                    incident_id=int(incident["id"]),
+                    generation=int(incident["generation"]),
+                    body={"outcome": "different"},
+                )
+            ledger.close()
+
+    def test_presentation_mapping_derives_observed_confirming_and_lifecycle_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = recovery_ledger.RecoveryLedger(Path(directory) / "ledger.sqlite3")
+            clock = [100.0]
+            controls = recovery_supervisor.RecoveryControls(ledger, clock=lambda: clock[0])
+            controls.set_confirmation_count(
+                3, actor="operator", reason="multi-signal confirmation"
+            )
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(),
+                owner="presentation",
+                controls=controls,
+                mode="diagnose",
+                clock=lambda: clock[0],
+            )
+            for index, expected in ((1, "OBSERVED"), (2, "CONFIRMING"), (3, "ELIGIBLE")):
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert(f"presentation-{index}"))
+                    )
+                )
+                coordinator.reconcile()
+                incident_id = int(
+                    ledger.connection.execute("SELECT id FROM incidents").fetchone()[0]
+                )
+                self.assertEqual(coordinator.presentation_state(incident_id), expected)
+            fence = coordinator.claim_next()
+            assert fence is not None
+            self.assertEqual(coordinator.presentation_state(fence.incident_id), "RUNNING")
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(
+                        resolved_alert("presentation-1"),
+                        resolved_alert("presentation-2"),
+                        resolved_alert("presentation-3"),
+                    )
+                )
+            )
+            coordinator.reconcile()
+            self.assertEqual(coordinator.presentation_state(fence.incident_id), "VERIFYING")
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                source_ids=(),
+                cadence_seconds=30,
+                freshness_seconds=61,
+                hold_down_seconds=0,
+                clock=lambda: clock[0],
+            )
+            verifier.record_heartbeat("supervisor")
+            self.assertTrue(verifier.evaluate(fence.incident_id).recovered)
+            self.assertEqual(coordinator.presentation_state(fence.incident_id), "RECOVERED")
+            history = ledger.connection.execute(
+                "SELECT result FROM verification_attempts WHERE incident_id = ?",
+                (fence.incident_id,),
+            ).fetchall()
+            self.assertEqual([row[0] for row in history], ["recovered"])
+            for durable, presented in (
+                ("recovery_unsafe", "BLOCKED"),
+                ("recovery_failed", "FAILED"),
+                ("retries_exhausted", "ESCALATED"),
+            ):
+                ledger.connection.execute(
+                    "UPDATE incidents SET state = ? WHERE id = ?",
+                    (durable, fence.incident_id),
+                )
+                self.assertEqual(
+                    coordinator.presentation_state(fence.incident_id), presented
+                )
+            ledger.close()
+
+
+class RecoveryOutcomeAuthorityTests(unittest.TestCase):
+    class _Process:
+        def __init__(self, pid: int):
+            self.pid = pid
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    def test_process_manager_enforces_host_deadline_and_recomputes_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wall_clock = [100.0]
+            monotonic = [0.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="process-deadline",
+                    mode="enabled",
+                    clock=lambda: wall_clock[0],
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("manager-deadline"))
+                    )
+                )
+                processes: list[RecoveryOutcomeAuthorityTests._Process] = []
+
+                def spawn(
+                    _argv: object, **_kwargs: object
+                ) -> RecoveryOutcomeAuthorityTests._Process:
+                    process = self._Process(60_000 + len(processes))
+                    processes.append(process)
+                    return process
+
+                manager = recovery_supervisor.RecoveryFixerProcessManager(
+                    coordinator,
+                    runner_argv=("/usr/bin/node", "/opt/recovery/fixer-session.js"),
+                    package_root=root,
+                    control_workspace=root,
+                    endpoint="http://127.0.0.1:9877",
+                    fixer_credential_file=root / "fixer-token",
+                    agent_id="recovery-fixer",
+                    session_root=root / "sessions",
+                    startup_timeout_seconds=5,
+                    resume_timeout_seconds=6,
+                    renew_seconds=7,
+                    run_timeout_seconds=10,
+                    pi_executable=root / "host/bin/pi",
+                    preimage_directory=root / "preimages",
+                    preimage_max_bytes=4096,
+                    inherited_env={},
+                    popen=spawn,
+                    monotonic=lambda: monotonic[0],
+                )
+                self.assertEqual(manager.tick(), "started")
+                monotonic[0] = 7.0
+                with mock.patch.object(
+                    coordinator, "renew_lease", wraps=coordinator.renew_lease
+                ) as renew:
+                    self.assertEqual(manager.tick(), "running")
+                renew.assert_called_once_with(manager.fence)
+                monotonic[0] = 10.0
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "timed_out")
+                terminate.assert_called_once_with(processes[0])
+
+                monotonic[0] = 11.0
+                self.assertEqual(manager.tick(), "started")
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(resolved_alert("manager-deadline"))
+                    )
+                )
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "fence_lost")
+                terminate.assert_called_once_with(processes[1])
+
+    def test_process_manager_serializes_claims_and_consumes_static_retry_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="process-manager",
+                    mode="enabled",
+                    clock=lambda: clock[0],
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("managed-runner"))
+                    )
+                )
+                processes: list[RecoveryOutcomeAuthorityTests._Process] = []
+                spawns: list[dict[str, object]] = []
+
+                def spawn(_argv: object, **kwargs: object) -> RecoveryOutcomeAuthorityTests._Process:
+                    process = self._Process(50_000 + len(processes))
+                    processes.append(process)
+                    spawns.append(kwargs)
+                    return process
+
+                manager = recovery_supervisor.RecoveryFixerProcessManager(
+                    coordinator,
+                    runner_argv=("/usr/bin/node", "/opt/recovery/fixer-session.js"),
+                    package_root=root,
+                    control_workspace=root,
+                    endpoint="http://127.0.0.1:9877",
+                    fixer_credential_file=root / "fixer-token",
+                    agent_id="recovery-fixer",
+                    session_root=root / "sessions",
+                    startup_timeout_seconds=30,
+                    resume_timeout_seconds=30,
+                    renew_seconds=20,
+                    run_timeout_seconds=300,
+                    pi_executable=root / "host/bin/pi",
+                    preimage_directory=root / "preimages",
+                    preimage_max_bytes=1_048_576,
+                    inherited_env={
+                        "HOME": str(root),
+                        "PATH": "/usr/bin:/bin",
+                        "ANTHROPIC_API_KEY": "must-not-reach-runner",
+                        "MINIME_WORKSPACE_ROOT": "/retired",
+                    },
+                    popen=spawn,
+                )
+                self.assertEqual(manager.tick(), "started")
+                self.assertEqual(manager.tick(), "running")
+                self.assertEqual(len(processes), 1)
+                first_fence = manager.fence
+                assert first_fence is not None
+                self.assertIsNotNone(
+                    coordinator.bind_session(
+                        first_fence,
+                        session_id="managed-session",
+                        session_directory=str(root / "sessions" / "managed"),
+                        transcript_path=str(
+                            root / "sessions" / "managed" / "managed-session.jsonl"
+                        ),
+                    )
+                )
+                runner_env = spawns[0]["env"]
+                assert isinstance(runner_env, dict)
+                self.assertNotIn("ANTHROPIC_API_KEY", runner_env)
+                self.assertNotIn("MINIME_WORKSPACE_ROOT", runner_env)
+                self.assertNotIn("must-not-reach-runner", runner_env.values())
+                self.assertEqual(
+                    runner_env["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin"
+                )
+                self.assertEqual(
+                    runner_env["MINIME_RECOVERY_FIXER_CREDENTIAL_FILE"],
+                    str((root / "fixer-token").resolve()),
+                )
+                self.assertEqual(
+                    runner_env["MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP"], "1"
+                )
+
+                processes[0].returncode = 1
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "settled")
+                terminate.assert_called_once_with(processes[0])
+                first_retry = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents"
+                ).fetchone()
+                self.assertEqual(tuple(first_retry), ("eligible", 2))
+                self.assertEqual(manager.tick(), "started")
+                second_fence = manager.fence
+                assert second_fence is not None
+                state = coordinator.fixer_state(second_fence)
+                assert state is not None
+                self.assertEqual(state["resumeSession"]["sessionId"], "managed-session")
+                self.assertEqual(len(processes), 2)
+
+                processes[1].returncode = 1
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "settled")
+                terminate.assert_called_once_with(processes[1])
+                exhausted = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents"
+                ).fetchone()
+                self.assertEqual(tuple(exhausted), ("retries_exhausted", 3))
+                self.assertEqual(manager.tick(), "idle")
+
+    def test_maintenance_fences_the_fixer_before_running_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="maintenance-order",
+                    mode="enabled",
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    source_ids=(),
+                    cadence_seconds=10,
+                    freshness_seconds=30,
+                    hold_down_seconds=0,
+                )
+                order: list[str] = []
+                fixer_process = mock.Mock(coordinator=coordinator)
+                fixer_process.tick.side_effect = lambda: order.append("fixer") or "idle"
+                probe_runner = mock.Mock(verifier=verifier)
+                probe_runner.refresh_due.side_effect = lambda: order.append("probe") or 0
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                    coordinator=coordinator,
+                    verifier=verifier,
+                    probe_runner=probe_runner,
+                    fixer_process=fixer_process,
+                )
+                service.maintenance()
+                self.assertEqual(order, ["fixer", "probe"])
+
+    def test_false_success_resumes_same_session_then_reports_once_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="outcome-authority",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("full-lifecycle"))
+                )
+            )
+            first = coordinator.claim_next()
+            assert first is not None
+            session_directory = root / "sessions" / "full-lifecycle"
+            transcript = session_directory / "session.jsonl"
+            first_binding = coordinator.bind_session(
+                first,
+                session_id="full-lifecycle-session",
+                session_directory=str(session_directory),
+                transcript_path=str(transcript),
+                runtime={
+                    "model": "openai-codex/gpt-5.5",
+                    "node": "v22.19.0",
+                    "package": "2026.7.7",
+                    "pi": "0.80.6",
+                },
+            )
+            self.assertIsNotNone(first_binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="repair-config",
+                    tool_name="edit",
+                    intent={
+                        "pathRef": "config:bot",
+                        "preimage": {
+                            "state": "captured",
+                            "reference": f"/private/synthetic/preimages/{'e' * 64}.preimage",
+                            "contentSha256": "c" * 64,
+                            "sizeBytes": 42,
+                            "pathSha256": "d" * 64,
+                        },
+                    },
+                )
+            )
+            self.assertTrue(
+                coordinator.record_action_outcome(
+                    first,
+                    action_key="repair-config",
+                    outcome="succeeded",
+                    details={"summary": "updated local configuration"},
+                )
+            )
+            claim = {
+                "summary": "configuration repaired",
+                "rootCause": "token=private-value was copied from /private/synthetic/config",
+                "confidence": "high",
+                "changedFiles": ["/private/synthetic/config.yaml"],
+                "changedServices": ["bot-service"],
+                "verification": ["model-side check only"],
+                "residualRisk": "none observed",
+                "references": [
+                    "knowledge:recovery-page",
+                    "beads:issue-58",
+                    "adr:0001",
+                    "commit:abc123",
+                ],
+            }
+            self.assertTrue(
+                coordinator.accept_completion_claim(
+                    first, claim_key="first-finish", claim=claim
+                )
+            )
+
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("full-lifecycle"))
+                )
+            )
+            coordinator.reconcile()
+            verifying = ledger.connection.execute(
+                "SELECT generation, state FROM incidents WHERE id = ?", (first.incident_id,)
+            ).fetchone()
+            self.assertEqual(tuple(verifying), (2, "verifying"))
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                probe_ids=("host-health",),
+                cadence_seconds=1,
+                freshness_seconds=3,
+                hold_down_seconds=0,
+                clock=lambda: clock[0],
+            )
+            clock[0] = 104.0
+            failed_fence = recovery_supervisor.VerificationFence(
+                first.incident_id, 2, first.policy_revision
+            )
+            verifier.record_heartbeat("supervisor")
+            self.assertTrue(verifier.record_probe(failed_fence, "host-health", False))
+            contradiction = verifier.evaluate(first.incident_id)
+            classification = verifier.mechanical_classification(
+                first.incident_id, contradiction
+            )
+            self.assertEqual(
+                classification,
+                ("missed_recovery", f"invocation:{first.invocation_id}:verification:2"),
+            )
+            assert classification is not None
+            self.assertTrue(
+                coordinator.mark_missed_recovery(
+                    first.incident_id,
+                    dedupe_key=classification[1],
+                    result=contradiction,
+                )
+            )
+
+            second = coordinator.claim_next()
+            assert second is not None
+            retry_state = coordinator.fixer_state(second)
+            assert retry_state is not None
+            self.assertEqual(
+                retry_state["resumeSession"]["bindingId"], first_binding
+            )
+            self.assertEqual(
+                retry_state["evidence"][0]["kind"], "deterministicContradiction"
+            )
+            second_binding = coordinator.bind_session(
+                second,
+                session_id="full-lifecycle-session",
+                session_directory=str(session_directory),
+                transcript_path=str(transcript),
+                runtime={
+                    "model": "openai-codex/gpt-5.5",
+                    "node": "v22.19.0",
+                    "package": "2026.7.7",
+                    "pi": "0.80.6",
+                },
+            )
+            self.assertIsNotNone(second_binding)
+            self.assertTrue(
+                coordinator.mark_session_resumed(second, int(second_binding or 0))
+            )
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="rollback-bot-release",
+                    tool_name="recovery_operation",
+                    intent={"kind": "rollback", "operationId": "rollback-bot"},
+                )
+            )
+            self.assertTrue(
+                coordinator.record_action_outcome(
+                    second,
+                    action_key="rollback-bot-release",
+                    outcome="succeeded",
+                    details={
+                        "summary": "activated verified previous bot release",
+                        "previousRelease": "bot-broken",
+                        "activeRelease": "bot-stable",
+                    },
+                )
+            )
+            self.assertTrue(
+                coordinator.accept_completion_claim(
+                    second,
+                    claim_key="second-finish",
+                    claim={**claim, "summary": "configuration repair verified after retry"},
+                )
+            )
+
+            clock[0] = 105.0
+            healthy_fence = recovery_supervisor.VerificationFence(
+                second.incident_id, second.generation, second.policy_revision
+            )
+            verifier.record_heartbeat("supervisor")
+            self.assertTrue(verifier.record_probe(healthy_fence, "host-health", True))
+            recovered = verifier.evaluate(second.incident_id)
+            self.assertTrue(recovered.recovered)
+
+            store = recovery_supervisor.RecoveryReportStore(
+                ledger, retry_seconds=1, clock=lambda: clock[0]
+            )
+
+            def unavailable(_key: str, _body: dict[str, object]) -> None:
+                raise OSError("synthetic delivery outage")
+
+            authority = recovery_supervisor.RecoveryReportAuthority(
+                ledger,
+                coordinator,
+                store,
+                max_timeline_entries=64,
+                delivery=unavailable,
+                enrichers={
+                    "knowledge": lambda _context: (_ for _ in ()).throw(
+                        RuntimeError("synthetic knowledge outage")
+                    ),
+                    "beads": lambda _context: (_ for _ in ()).throw(
+                        RuntimeError("synthetic beads outage")
+                    ),
+                },
+                clock=lambda: clock[0],
+            )
+            self.assertEqual(authority.queue_ready(), 1)
+            report_row = ledger.connection.execute(
+                "SELECT report_key, body_json FROM incident_reports"
+            ).fetchone()
+            report_key = str(report_row["report_key"])
+            report = json.loads(str(report_row["body_json"]))
+            self.assertEqual(report["outcome"], "recovered")
+            self.assertEqual(report["degradedMetadata"], ["beads", "knowledge"])
+            self.assertEqual(report["incident"]["sessions"][0]["sessionId"], "full-lifecycle-session")
+            self.assertTrue(report["actions"])
+            self.assertTrue(report["verification"])
+            self.assertEqual(
+                report["preimages"],
+                [
+                    {
+                        "actionKey": "repair-config",
+                        "state": "captured",
+                        "reference": f"[absolute-path]/{'e' * 64}.preimage",
+                        "contentSha256": "c" * 64,
+                        "sizeBytes": 42,
+                        "pathSha256": "d" * 64,
+                    }
+                ],
+            )
+            self.assertEqual(
+                report["changedReleases"],
+                [{"domain": "bot", "from": "bot-broken", "to": "bot-stable"}],
+            )
+            self.assertEqual(report["versions"]["model"], "openai-codex/gpt-5.5")
+            self.assertEqual(
+                report["versions"]["runtime"],
+                {"node": "v22.19.0", "package": "2026.7.7", "pi": "0.80.6"},
+            )
+            self.assertNotIn("private-value", json.dumps(report))
+            self.assertNotIn("/private/synthetic", json.dumps(report))
+            tiny_store = recovery_supervisor.RecoveryReportStore(
+                ledger, max_bytes=1_024, retry_seconds=1, clock=lambda: clock[0]
+            )
+            tiny_authority = recovery_supervisor.RecoveryReportAuthority(
+                ledger,
+                coordinator,
+                tiny_store,
+                max_timeline_entries=64,
+                clock=lambda: clock[0],
+            )
+            bounded = tiny_authority._bounded_body(
+                {**report, "rootCause": "x" * 64_000}
+            )
+            self.assertLessEqual(
+                len(recovery_supervisor._canonical_json(bounded).encode("utf-8")),
+                1_024,
+            )
+            self.assertTrue(bounded["truncated"])
+            self.assertEqual(authority.deliver_due(), 0)
+            self.assertEqual(store.state(report_key), "REPORT_PENDING")
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM incidents WHERE id = ?", (second.incident_id,)
+                ).fetchone()[0],
+                "recovered",
+            )
+            ledger.close()
+
+            clock[0] = 107.0
+            delivered: list[str] = []
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as reopened:
+                restarted_coordinator = recovery_supervisor.IncidentCoordinator(
+                    reopened,
+                    correlation_policy(lease_seconds=120),
+                    owner="outcome-authority-restarted",
+                    mode="enabled",
+                    clock=lambda: clock[0],
+                )
+                restarted_store = recovery_supervisor.RecoveryReportStore(
+                    reopened, retry_seconds=1, clock=lambda: clock[0]
+                )
+                restarted = recovery_supervisor.RecoveryReportAuthority(
+                    reopened,
+                    restarted_coordinator,
+                    restarted_store,
+                    max_timeline_entries=64,
+                    delivery=lambda key, _body: delivered.append(key),
+                    clock=lambda: clock[0],
+                )
+                self.assertEqual(restarted.queue_ready(), 0)
+                self.assertEqual(restarted.deliver_due(), 1)
+                self.assertEqual(restarted.deliver_due(), 0)
+                self.assertEqual(delivered, [report_key])
+                self.assertEqual(restarted_store.state(report_key), "REPORTED")
+
+    def test_terminal_failure_without_claim_queues_redacted_authoritative_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="claimless-report",
+                    mode="enabled",
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("claimless-report"))
+                    )
+                )
+                fence = coordinator.claim_next()
+                assert fence is not None
+                self.assertTrue(coordinator.finish(fence, "retries_exhausted"))
+                store = recovery_supervisor.RecoveryReportStore(ledger)
+                authority = recovery_supervisor.RecoveryReportAuthority(
+                    ledger,
+                    coordinator,
+                    store,
+                    max_timeline_entries=64,
+                    enrichers={"knowledge": lambda _context: [], "beads": lambda _context: []},
+                )
+                self.assertEqual(authority.queue_ready(), 1)
+                self.assertEqual(authority.queue_ready(), 0)
+                row = ledger.connection.execute(
+                    "SELECT invocation_id, body_json FROM incident_reports"
+                ).fetchone()
+                self.assertEqual(row["invocation_id"], fence.invocation_id)
+                report = json.loads(str(row["body_json"]))
+                self.assertEqual(report["outcome"], "escalated")
+                self.assertEqual(report["claimSummary"], "fixer claim unavailable")
+                self.assertIn("fixer-claim", report["degradedMetadata"])
+
+                credentials = [
+                    "ghp_" + "a" * 36,
+                    "AKIA" + "A" * 16,
+                    "sk-" + "a" * 48,
+                    "https://user:" + "password" + "@example.invalid/path",
+                ]
+                for credential in credentials:
+                    with self.subTest(credential=credential[:4]):
+                        self.assertNotIn(
+                            credential,
+                            recovery_supervisor._redact_report_text(credential),
+                        )
+                message = recovery_supervisor._report_delivery_message(
+                    "incident:1:generation:1:report:v1",
+                    {
+                        **report,
+                        "rootCause": credentials[0],
+                        "residualRisk": credentials[-1],
+                    },
+                )
+                self.assertNotIn("rootCause", message)
+                self.assertNotIn(credentials[0], message)
+                self.assertNotIn("password", message)
+
+
 class RecoveryControlTests(unittest.TestCase):
     def test_silence_limit_rejects_new_target_without_corrupting_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1322,7 +2599,7 @@ class RecoveryControlTests(unittest.TestCase):
                     0,
                 )
 
-    def test_closed_static_policy_contains_only_observe_probes_and_correlation(self) -> None:
+    def test_closed_static_policy_contains_fenced_fixer_and_host_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = recovery_config.RecoveryConfig(
@@ -1348,6 +2625,7 @@ class RecoveryControlTests(unittest.TestCase):
                 runtime_doctor_cadence_seconds=300,
                 verification_freshness_seconds=660,
                 verification_hold_down_seconds=60,
+                **fixer_config_fields(root),
             )
             policy = recovery_config.recovery_static_policy(config)
             self.assertEqual(
@@ -1361,6 +2639,15 @@ class RecoveryControlTests(unittest.TestCase):
                     "runtimeDoctorCadenceSeconds",
                     "verificationFreshnessSeconds",
                     "verificationHoldDownSeconds",
+                    "internalAgentId",
+                    "sessionPolicy",
+                    "actionPolicy",
+                    "quarantinePolicy",
+                    "reportPolicy",
+                    "slotPolicy",
+                    "reviewedOperations",
+                    "fixerLeaseSeconds",
+                    "fixerRenewSeconds",
                 },
             )
             self.assertEqual(policy["mode"], "observe")
@@ -1454,6 +2741,98 @@ class RecoveryVerificationTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_verification_never_recovers_with_an_unresolved_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="unresolved-verification",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("unresolved-verification"))
+                )
+            )
+            active = coordinator.claim_next()
+            assert active is not None
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    active,
+                    action_key="unknown-before-verification",
+                    tool_name="write",
+                    intent={"pathRef": "config:bot"},
+                )
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("unresolved-verification"))
+                )
+            )
+            coordinator.reconcile()
+            with ledger.transaction() as connection:
+                connection.execute("UPDATE incidents SET state = 'verifying'")
+            incident_id = int(
+                ledger.connection.execute("SELECT id FROM incidents").fetchone()[0]
+            )
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                source_ids=(),
+                cadence_seconds=10,
+                freshness_seconds=30,
+                hold_down_seconds=0,
+                clock=lambda: clock[0],
+            )
+            verifier.record_heartbeat("supervisor")
+            result = verifier.evaluate(incident_id)
+            self.assertFalse(result.recovered)
+            self.assertIn("actions_unresolved", result.reasons)
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                ).fetchone()[0],
+                "verifying",
+            )
+            ledger.close()
+
+    def test_verification_requires_freshly_validated_bot_and_capsule_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            slot_health = {"bot": True, "capsule": False}
+            with recovery_ledger.RecoveryLedger(
+                Path(directory) / "ledger.sqlite3"
+            ) as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    source_ids=(),
+                    cadence_seconds=10,
+                    freshness_seconds=30,
+                    hold_down_seconds=0,
+                    slot_validator=lambda: dict(slot_health),
+                    clock=lambda: clock[0],
+                )
+                verifier.record_heartbeat("supervisor")
+                unhealthy = verifier.evaluate(incident_id)
+                self.assertFalse(unhealthy.recovered)
+                self.assertIn("slot_unhealthy:capsule", unhealthy.reasons)
+                self.assertEqual(
+                    self._evidence_states(unhealthy),
+                    {
+                        ("heartbeat", "supervisor"): "fresh_healthy",
+                        ("slot", "bot"): "fresh_healthy",
+                        ("slot", "capsule"): "fresh_unhealthy",
+                    },
+                )
+                slot_health["capsule"] = True
+                self.assertTrue(verifier.evaluate(incident_id).recovered)
 
     def test_missing_or_stale_evidence_never_creates_a_completion_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1649,6 +3028,19 @@ class RecoveryVerificationTests(unittest.TestCase):
                         ),
                     )
                     invocation_id = int(cursor.lastrowid)
+                    connection.execute(
+                        "INSERT INTO fixer_claims(invocation_id, incident_id, generation, "
+                        "evidence_hash, policy_revision, claim_key, claim_json, claimed_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'verification-claim', '{}', ?)",
+                        (
+                            invocation_id,
+                            incident_id,
+                            incident["generation"],
+                            incident["evidence_hash"],
+                            incident["policy_revision"],
+                            clock[0],
+                        ),
+                    )
 
                 service = recovery_supervisor.RecoveryService(
                     ledger,
@@ -1700,11 +3092,19 @@ class RecoveryVerificationTests(unittest.TestCase):
                 verifier.record_heartbeat("runtime_doctor")
                 self.assertTrue(verifier.record_probe(fence, "health", False))
                 service.maintenance()
+                retried = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents WHERE id = ?", (incident_id,)
+                ).fetchone()
+                self.assertEqual(
+                    (retried["state"], retried["generation"]),
+                    ("eligible", fence.generation + 1),
+                )
                 self.assertEqual(
                     ledger.connection.execute(
-                        "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                        "SELECT count(*) FROM audit "
+                        "WHERE operation = 'verification_retry_scheduled'"
                     ).fetchone()[0],
-                    "recovery_failed",
+                    1,
                 )
 
     def test_probe_results_are_fenced_to_the_verification_generation(self) -> None:
@@ -1779,6 +3179,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                     runtime_doctor_cadence_seconds=30,
                     verification_freshness_seconds=120,
                     verification_hold_down_seconds=0,
+                    **fixer_config_fields(root),
                 )
                 with recovery_ledger.RecoveryLedger(config.database) as ledger:
                     service = recovery_supervisor._build_recovery_service(
@@ -1790,6 +3191,7 @@ class RecoveryVerificationTests(unittest.TestCase):
                             config.spool_directory / "notifications", delivery=None
                         ),
                         configured=config,
+                        verify_active_slots=False,
                     )
                     self.assertIsInstance(
                         service.probe_runner, recovery_supervisor.PythonProbeRunner
@@ -2291,8 +3693,10 @@ class RecoveryFoundationTests(unittest.TestCase):
                 runtime_doctor_cadence_seconds=300,
                 verification_freshness_seconds=660,
                 verification_hold_down_seconds=60,
+                **fixer_config_fields(root),
             )
             with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                report_delivery = mock.Mock()
                 service = recovery_supervisor._build_recovery_service(
                     ledger,
                     recovery_supervisor.AtomicJsonSpool(config.spool_directory / "events"),
@@ -2300,9 +3704,14 @@ class RecoveryFoundationTests(unittest.TestCase):
                         config.spool_directory / "notifications", delivery=None
                     ),
                     configured=config,
+                    report_delivery=report_delivery,
                 )
                 self.assertIsNotNone(service.verifier)
+                self.assertIsNotNone(service.reports)
                 assert service.verifier is not None
+                assert service.reports is not None
+                self.assertIs(service.reports.delivery, report_delivery)
+                self.assertEqual(service.reports.enrichers, {})
                 self.assertEqual(service.verifier.cadence_seconds, 300.0)
                 self.assertEqual(service.verifier.freshness_seconds, 660.0)
                 self.assertEqual(service.verifier.hold_down_seconds, 60.0)
@@ -2333,6 +3742,281 @@ class RecoveryFoundationTests(unittest.TestCase):
 
 
 class RecoveryHttpTests(unittest.TestCase):
+    def test_intake_and_fixer_credentials_cannot_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "credentials overlap"):
+                    recovery_supervisor.RecoveryApplication(
+                        auth_token="synthetic-shared-token",
+                        fixer_auth_token="synthetic-shared-token",
+                        max_body=64 * 1024,
+                        body_timeout=1,
+                        service=service,
+                    )
+
+    def test_fixer_routes_separate_credentials_and_enforce_fenced_idempotent_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_root = root / "sessions"
+            session_root.mkdir(mode=0o700)
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="http-fixer",
+                mode="enabled",
+                session_root=session_root,
+                max_session_replacements=1,
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("fixer-http"))
+                )
+            )
+            fence = coordinator.claim_next()
+            assert fence is not None
+            service = recovery_supervisor.RecoveryService(
+                ledger,
+                recovery_supervisor.AtomicJsonSpool(root / "events"),
+                recovery_supervisor.EmergencyNotifier(root / "notifications", delivery=None),
+                coordinator=coordinator,
+            )
+            intake_token = "synthetic-intake-token-value"
+            fixer_token = "synthetic-fixer-token-value"
+            app = recovery_supervisor.RecoveryApplication(
+                auth_token=intake_token,
+                fixer_auth_token=fixer_token,
+                max_body=64 * 1024,
+                body_timeout=1,
+                service=service,
+            )
+            server = recovery_supervisor.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), recovery_supervisor.handler_for(app)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            def request(path: str, value: dict[str, object], token: str) -> tuple[int, dict[str, object]]:
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                body = json.dumps(value).encode()
+                connection.request(
+                    "POST",
+                    path,
+                    body=body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response_body = response.read()
+                connection.close()
+                try:
+                    decoded = json.loads(response_body)
+                except json.JSONDecodeError:
+                    decoded = {}
+                return response.status, decoded
+
+            fence_body: dict[str, object] = {
+                "invocationId": fence.invocation_id,
+                "incidentId": fence.incident_id,
+                "generation": fence.generation,
+                "evidenceHash": fence.evidence_hash,
+                "policyRevision": fence.policy_revision,
+                "leaseToken": fence.lease_token,
+            }
+            try:
+                self.assertEqual(request("/v1/fixer/state", fence_body, intake_token)[0], 401)
+                intake_body = json.dumps({}).encode()
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                connection.request(
+                    "POST",
+                    "/v1/alertmanager",
+                    body=intake_body,
+                    headers={
+                        "Authorization": f"Bearer {fixer_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(connection.getresponse().status, 401)
+                connection.close()
+
+                status, state = request("/v1/fixer/state", fence_body, fixer_token)
+                self.assertEqual(status, 200)
+                self.assertEqual(state["mode"], "enabled")
+                self.assertTrue(state["evidence"])
+
+                session_dir = session_root / "primary"
+                session_dir.mkdir(mode=0o700)
+                transcript = session_dir / "session-http.jsonl"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": "session-http",
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "cwd": "/agent",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                transcript.chmod(0o600)
+                bind = {
+                    **fence_body,
+                    "sessionId": "session-http",
+                    "sessionDirectory": str(session_dir),
+                    "transcriptPath": str(transcript),
+                    "runtime": {
+                        "model": "anthropic/claude-sonnet-4-5",
+                        "node": "v22.19.0",
+                        "package": "0.1.0",
+                        "pi": "0.80.6",
+                    },
+                }
+                status, bound = request("/v1/fixer/session/bind", bind, fixer_token)
+                self.assertEqual(status, 200)
+                binding_id = int(bound["bindingId"])
+                self.assertEqual(request("/v1/fixer/session/bind", bind, fixer_token)[0], 200)
+                self.assertEqual(
+                    request(
+                        "/v1/fixer/session/resumed",
+                        {**fence_body, "bindingId": binding_id},
+                        fixer_token,
+                    )[0],
+                    200,
+                )
+
+                intent = {
+                    **fence_body,
+                    "actionKey": "tool-call-one",
+                    "toolName": "edit",
+                    "intent": {"path": "config", "inputSha256": "a" * 64},
+                }
+                self.assertEqual(request("/v1/fixer/action/intent", intent, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/action/intent", intent, fixer_token)[0], 200)
+                self.assertEqual(
+                    request(
+                        "/v1/fixer/action/intent",
+                        {
+                            **fence_body,
+                            "actionKey": "tool-call-two",
+                            "toolName": "write",
+                            "intent": {"path": "other"},
+                        },
+                        fixer_token,
+                    )[0],
+                    409,
+                )
+                outcome = {
+                    **fence_body,
+                    "actionKey": "tool-call-one",
+                    "outcome": "succeeded",
+                    "details": {"isError": False},
+                }
+                self.assertEqual(request("/v1/fixer/action/outcome", outcome, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/action/outcome", outcome, fixer_token)[0], 200)
+
+                finish = {
+                    **fence_body,
+                    "claimKey": "claim-http-one",
+                    "claim": {"summary": "repair complete", "confidence": "high"},
+                }
+                self.assertEqual(request("/v1/fixer/finish", finish, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/finish", finish, fixer_token)[0], 200)
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM invocations WHERE id = ?", (fence.invocation_id,)
+                    ).fetchone()[0],
+                    "completed",
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                ledger.close()
+
+    def test_session_replacement_requires_host_unreadability_and_resume_classifier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_root = root / "sessions"
+            session_root.mkdir(mode=0o700)
+            ledger, coordinator, fence = RecoveryDurableFixerContractTests._claimed(
+                root, mode="enabled"
+            )
+            assert fence is not None
+            coordinator.session_root = session_root.resolve()
+            coordinator.max_session_replacements = 1
+            first_dir = session_root / "first"
+            first_dir.mkdir(mode=0o700)
+            first_path = first_dir / "first.jsonl"
+            first_path.write_text(
+                json.dumps({"type": "session", "id": "first-session"}) + "\n",
+                encoding="utf-8",
+            )
+            first_path.chmod(0o600)
+            first_id = coordinator.bind_session(
+                fence,
+                session_id="first-session",
+                session_directory=str(first_dir),
+                transcript_path=str(first_path),
+            )
+            assert first_id is not None
+            second_dir = session_root / "second"
+            second_dir.mkdir(mode=0o700)
+            second_path = second_dir / "second.jsonl"
+            second_path.write_text(
+                json.dumps({"type": "session", "id": "second-session"}) + "\n",
+                encoding="utf-8",
+            )
+            second_path.chmod(0o600)
+            self.assertIsNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="no_session_found",
+                    journal_digest="digest",
+                )
+            )
+            first_path.unlink()
+            self.assertIsNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="provider_failure",
+                    journal_digest="digest",
+                )
+            )
+            self.assertIsNotNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="no_session_found",
+                    journal_digest="digest",
+                )
+            )
+            ledger.close()
+
     def test_authenticated_health_and_input_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2364,6 +4048,8 @@ class RecoveryHttpTests(unittest.TestCase):
                 max_body=1_024,
                 body_timeout=1,
                 service=service,
+                startup_nonce="e" * 64,
+                capsule_release_id="capsule-test",
             )
             server = recovery_supervisor.BoundedThreadingHTTPServer(
                 ("127.0.0.1", 0), recovery_supervisor.handler_for(app), max_concurrent_requests=2
@@ -2393,6 +4079,29 @@ class RecoveryHttpTests(unittest.TestCase):
             try:
                 self.assertEqual(request("GET", "/healthz", authorized=False)[0], 401)
                 self.assertEqual(request("GET", "/healthz")[0], 200)
+                startup_health = http.client.HTTPConnection(
+                    "127.0.0.1", port, timeout=2
+                )
+                startup_health.request(
+                    "GET",
+                    "/healthz",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                startup_response = startup_health.getresponse()
+                self.assertEqual(
+                    startup_response.getheader(
+                        recovery_supervisor._STARTUP_NONCE_HEADER
+                    ),
+                    "e" * 64,
+                )
+                self.assertEqual(
+                    startup_response.getheader(
+                        recovery_supervisor._STARTUP_RELEASE_HEADER
+                    ),
+                    "capsule-test",
+                )
+                startup_response.read()
+                startup_health.close()
                 self.assertEqual(request("POST", "/v1/alertmanager", b"{}", authorized=False)[0], 401)
                 self.assertEqual(request("POST", "/v1/alertmanager", b"not-json")[0], 400)
                 self.assertEqual(request("POST", "/v1/alertmanager", b"x" * 1_025)[0], 413)
@@ -3362,24 +5071,11 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
 class SupervisorStartupTests(unittest.TestCase):
     @staticmethod
     def _write_config(root: Path, *, port: int = 9877) -> None:
+        fixer_token = root / "fixer-auth-token"
+        fixer_token.write_text("synthetic-fixer-auth-token-value", encoding="utf-8")
+        fixer_token.chmod(0o600)
         (root / "recovery.json").write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "mode": "observe",
-                    "database": "ledger.sqlite3",
-                    "spoolDirectory": "spool",
-                    "authTokenFile": "auth-token",
-                    "host": "127.0.0.1",
-                    "port": port,
-                    "correlationRules": [],
-                    "sourceIds": ["alertmanager", "runtime_doctor"],
-                    "probes": [],
-                    "runtimeDoctorCadenceSeconds": 300,
-                    "verificationFreshnessSeconds": 660,
-                    "verificationHoldDownSeconds": 60,
-                }
-            ),
+            json.dumps(supervisor_config_document(port=port)),
             encoding="utf-8",
         )
 
@@ -3389,24 +5085,11 @@ class SupervisorStartupTests(unittest.TestCase):
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
             token.chmod(0o600)
+            fixer_token = root / "fixer-auth-token"
+            fixer_token.write_text("synthetic-fixer-auth-token-value", encoding="utf-8")
+            fixer_token.chmod(0o600)
             (root / "recovery.json").write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "mode": "observe",
-                        "database": "ledger.sqlite3",
-                        "spoolDirectory": "spool",
-                        "authTokenFile": "auth-token",
-                        "host": "127.0.0.1",
-                        "port": 9877,
-                        "correlationRules": [],
-                        "sourceIds": ["alertmanager", "runtime_doctor"],
-                        "probes": [],
-                        "runtimeDoctorCadenceSeconds": 300,
-                        "verificationFreshnessSeconds": 660,
-                        "verificationHoldDownSeconds": 60,
-                    }
-                ),
+                json.dumps(supervisor_config_document()),
                 encoding="utf-8",
             )
             with (

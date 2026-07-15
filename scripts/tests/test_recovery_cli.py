@@ -21,11 +21,12 @@ import recovery_supervisor
 
 def config_document(mode: str = "observe") -> dict[str, object]:
     return {
-        "version": 1,
+        "version": 2,
         "mode": mode,
         "database": "var/recovery/ledger.sqlite3",
         "spoolDirectory": "var/recovery/spool",
         "authTokenFile": "config/recovery-auth-token",
+        "fixerAuthTokenFile": "config/recovery-fixer-auth-token",
         "host": "127.0.0.1",
         "port": 9877,
         "correlationRules": [
@@ -41,6 +42,44 @@ def config_document(mode: str = "observe") -> dict[str, object]:
         "runtimeDoctorCadenceSeconds": 300,
         "verificationFreshnessSeconds": 660,
         "verificationHoldDownSeconds": 60,
+        "internalAgentId": "recovery-fixer",
+        "sessionPolicy": {
+            "directory": "var/recovery/sessions",
+            "startupTimeoutSeconds": 30,
+            "resumeTimeoutSeconds": 30,
+            "maxReplacementsPerGeneration": 1,
+            "journalDigestMaxBytes": 32_768,
+        },
+        "actionPolicy": {
+            "maxActionsPerInvocation": 128,
+            "preimageMaxBytes": 1024 * 1024,
+            "reconciliationTimeoutSeconds": 300,
+        },
+        "quarantinePolicy": {
+            "directory": "var/recovery/quarantine",
+            "allowedRoots": [],
+            "maxItemsPerIncident": 64,
+            "maxItemBytes": 10 * 1024 * 1024,
+            "maxIncidentBytes": 50 * 1024 * 1024,
+        },
+        "reportPolicy": {
+            "maxBytes": 256 * 1024,
+            "maxTimelineEntries": 256,
+            "retrySeconds": 300,
+        },
+        "slotPolicy": {
+            "stateDirectory": "var/recovery/slots",
+            "capsuleRoot": "var/recovery/capsule",
+            "botReleaseRoot": "var/releases",
+            "startupHealthTimeoutSeconds": 60,
+            "nodeExecutable": "/usr/local/bin/node",
+            "nodeVersion": "22.19.0",
+            "piExecutable": "/usr/local/bin/pi",
+            "piVersion": "0.80.6",
+        },
+        "reviewedOperations": [],
+        "fixerLeaseSeconds": 120,
+        "fixerRenewSeconds": 30,
     }
 
 
@@ -59,7 +98,7 @@ def call_cli(root: Path, *args: str) -> tuple[int, str, str]:
 
 
 class RecoveryConfigTests(unittest.TestCase):
-    def test_foundation_config_accepts_only_observe_and_validated_probes(self) -> None:
+    def test_version_two_config_accepts_exact_modes_and_static_fixer_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             document = config_document()
@@ -97,20 +136,57 @@ class RecoveryConfigTests(unittest.TestCase):
                     "runtimeDoctorCadenceSeconds",
                     "verificationFreshnessSeconds",
                     "verificationHoldDownSeconds",
+                    "internalAgentId",
+                    "sessionPolicy",
+                    "actionPolicy",
+                    "quarantinePolicy",
+                    "reportPolicy",
+                    "slotPolicy",
+                    "reviewedOperations",
+                    "fixerLeaseSeconds",
+                    "fixerRenewSeconds",
                 },
             )
 
-            for legacy_mode in ("plan", "enabled"):
-                invalid = config_document(legacy_mode)
+            for mode in ("diagnose", "enabled"):
+                valid = config_document(mode)
+                (root / "recovery.json").write_text(
+                    json.dumps(valid), encoding="utf-8"
+                )
+                self.assertEqual(
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    ).mode,
+                    mode,
+                )
+
+            for invalid_mode in ("plan", "disabled", "OBSERVE"):
+                invalid = config_document(invalid_mode)
                 (root / "recovery.json").write_text(
                     json.dumps(invalid), encoding="utf-8"
                 )
-                with self.subTest(mode=legacy_mode), self.assertRaises(
+                with self.subTest(mode=invalid_mode), self.assertRaises(
                     recovery_config.RecoveryConfigError
                 ):
                     recovery_config.load_recovery_config(
                         root / "recovery.json", root
                     )
+
+            old_version = config_document()
+            old_version["version"] = 1
+            (root / "recovery.json").write_text(json.dumps(old_version), encoding="utf-8")
+            with self.assertRaises(recovery_config.RecoveryConfigError):
+                recovery_config.load_recovery_config(root / "recovery.json", root)
+
+    def test_mode_endpoint_authorization_matrix_is_closed(self) -> None:
+        for operation in ("inspect", "reconcile", "blocked", "finish"):
+            self.assertFalse(recovery_config.recovery_endpoint_allowed("observe", operation))
+            self.assertTrue(recovery_config.recovery_endpoint_allowed("diagnose", operation))
+            self.assertTrue(recovery_config.recovery_endpoint_allowed("enabled", operation))
+        self.assertFalse(recovery_config.recovery_endpoint_allowed("diagnose", "mutate"))
+        self.assertTrue(recovery_config.recovery_endpoint_allowed("enabled", "mutate"))
+        with self.assertRaises(ValueError):
+            recovery_config.recovery_endpoint_allowed("enabled", "arbitrary")
 
     def test_closed_config_rejects_actuator_fields_and_unsafe_probe_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -202,6 +278,112 @@ class RecoveryConfigTests(unittest.TestCase):
                     recovery_config.load_recovery_config(
                         root / "recovery.json", root
                     )
+
+    def test_closed_fixer_policy_rejects_unknown_adaptive_paths_and_shell_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_documents: list[tuple[str, dict[str, object]]] = []
+
+            adaptive = config_document()
+            adaptive["adaptivePolicy"] = {"enabled": True}
+            invalid_documents.append(("adaptive-root", adaptive))
+
+            unknown_nested = config_document()
+            assert isinstance(unknown_nested["sessionPolicy"], dict)
+            unknown_nested["sessionPolicy"]["adaptiveTimeout"] = 1
+            invalid_documents.append(("unknown-nested", unknown_nested))
+
+            unsafe_root = config_document()
+            assert isinstance(unsafe_root["quarantinePolicy"], dict)
+            unsafe_root["quarantinePolicy"]["allowedRoots"] = ["../private"]
+            invalid_documents.append(("unsafe-root", unsafe_root))
+
+            same_token = config_document()
+            same_token["fixerAuthTokenFile"] = same_token["authTokenFile"]
+            invalid_documents.append(("shared-credential", same_token))
+
+            bad_renew = config_document()
+            bad_renew["fixerRenewSeconds"] = 60
+            invalid_documents.append(("unsafe-renew", bad_renew))
+
+            short_host_deadline = config_document()
+            assert isinstance(short_host_deadline["actionPolicy"], dict)
+            short_host_deadline["actionPolicy"]["reconciliationTimeoutSeconds"] = 100
+            invalid_documents.append(("short-host-deadline", short_host_deadline))
+
+            relative_node = config_document()
+            assert isinstance(relative_node["slotPolicy"], dict)
+            relative_node["slotPolicy"]["nodeExecutable"] = "bin/node"
+            invalid_documents.append(("relative-slot-node", relative_node))
+
+            unpinned_pi = config_document()
+            assert isinstance(unpinned_pi["slotPolicy"], dict)
+            unpinned_pi["slotPolicy"]["piVersion"] = "0.80.7"
+            invalid_documents.append(("unpinned-slot-pi", unpinned_pi))
+
+            overlapping_slots = config_document()
+            assert isinstance(overlapping_slots["slotPolicy"], dict)
+            overlapping_slots["slotPolicy"]["botReleaseRoot"] = "var/recovery/capsule/bot"
+            invalid_documents.append(("overlapping-slot-roots", overlapping_slots))
+
+            slotted_runtime = config_document()
+            assert isinstance(slotted_runtime["slotPolicy"], dict)
+            slotted_runtime["slotPolicy"]["piExecutable"] = str(
+                root.resolve() / "var/releases/current/bin/pi"
+            )
+            invalid_documents.append(("slotted-runtime-prerequisite", slotted_runtime))
+
+            shell_operation = config_document()
+            shell_operation["reviewedOperations"] = [
+                {
+                    "id": "restart",
+                    "kind": "restart",
+                    "executable": "/bin/sh",
+                    "argv": ["-c", "service restart; echo secret"],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            invalid_documents.append(("shell-operation", shell_operation))
+
+            malformed_operation = config_document()
+            malformed_operation["reviewedOperations"] = [
+                {
+                    "id": "restart",
+                    "kind": [],
+                    "executable": "/bin/launchctl",
+                    "argv": ["kickstart", "-k", "gui/501/ai.minime.bot"],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            invalid_documents.append(("malformed-operation", malformed_operation))
+
+            valid_executable = next(
+                str(candidate)
+                for candidate in (Path("/usr/bin/true"), Path("/bin/true"))
+                if candidate.is_file() and candidate.resolve() == candidate
+            )
+            valid_operation = config_document("enabled")
+            valid_operation["reviewedOperations"] = [
+                {
+                    "id": "restart-bot",
+                    "kind": "restart",
+                    "executable": valid_executable,
+                    "argv": [],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            (root / "recovery.json").write_text(
+                json.dumps(valid_operation), encoding="utf-8"
+            )
+            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            self.assertEqual(loaded.reviewed_operations[0]["id"], "restart-bot")
+
+            for name, document in invalid_documents:
+                (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(case=name), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(root / "recovery.json", root)
 
     def test_config_rejects_zero_port_and_excessive_total_probe_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -397,6 +579,8 @@ class RecoveryCliTests(unittest.TestCase):
                 status_result["foundation"],
                 {
                     "fixerAvailable": False,
+                    "fixerDispatchAllowed": False,
+                    "mutationAllowed": False,
                     "nativeVerification": True,
                     "observeOnly": True,
                     "remediationActionsAvailable": False,
@@ -567,7 +751,7 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("must be between 1 and 100", error)
 
-    def test_process_once_reports_foundation_state_without_launch_contract(self) -> None:
+    def test_process_once_reports_idle_observe_state_without_launching_fixer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_config(root)
@@ -604,11 +788,20 @@ class RecoveryCliTests(unittest.TestCase):
             result = json.loads(output)
             self.assertEqual(
                 set(result),
-                {"ok", "mode", "activeIncidents", "verification"},
+                {
+                    "ok",
+                    "mode",
+                    "activeIncidents",
+                    "verification",
+                    "reportsQueued",
+                    "reportsDelivered",
+                },
             )
             self.assertEqual(result["mode"], "observe")
             self.assertEqual(result["activeIncidents"], 1)
             self.assertEqual(result["verification"], [])
+            self.assertEqual(result["reportsQueued"], 0)
+            self.assertEqual(result["reportsDelivered"], 0)
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
                 self.assertEqual(
                     ledger.connection.execute(

@@ -366,16 +366,18 @@ for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
 
 An opt-in same-host recovery supervisor can durably correlate and verify those
-native signals while exposing bounded controls and native fallback. The shipped
-foundation is observe-only: it starts no Pi/Node remediation and performs no
-mutating action. Direct Telegram remains the default. A trusted Pi fixer,
-exact-session re-entry, action journal, independent two-slot recovery capsule,
-and offline bot rollback remain follow-up work and are not present in this
-package foundation.
+native signals while exposing bounded controls and native fallback. `observe`
+keeps fixer dispatch off, `diagnose` permits the exact-session fixer to inspect
+and reconcile without mutation, and `enabled` permits durably journaled repair.
+Fresh host-native probes and active-slot validation, not the model's finish
+claim, decide recovery. The package also ships a stable two-slot recovery
+capsule plus manifest-verified bot staging and offline rollback commands.
+Direct Telegram remains the default monitoring path.
 Start with `minime-bot recovery config validate --workspace /path/to/control-workspace`
 and `minime-bot recovery status --workspace /path/to/control-workspace`; see
 [Same-host recovery supervisor](docs/recovery.md) for configuration, safety
-boundaries, drills, and rollback.
+boundaries, `capsule-stage`/`capsule-bootstrap`, `bot-stage`/`bot-rollback`,
+drills, and rollback.
 
 ## Repository Boundaries
 

@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Iterable, Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
 DEFAULT_EVENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_EVENT_RETENTION_BATCH_SIZE = 256
@@ -23,17 +23,31 @@ MAX_EVENT_FUTURE_SKEW_SECONDS = 300
 EXPECTED_TABLES = {
     "audit",
     "events",
+    "action_intents",
+    "action_outcomes",
+    "action_reconciliations",
+    "fixer_claims",
     "fixer_lease",
     "incidents",
+    "incident_reports",
     "invocations",
     "metadata",
     "notification_outbox",
     "policy_revisions",
+    "report_outbox",
+    "session_bindings",
+    "session_replacements",
+    "verification_attempts",
 }
 EXPECTED_INDEXES = {
+    "action_intents_unresolved",
     "events_latest_source_fingerprint",
     "events_received_at",
     "outbox_available",
+    "report_outbox_available",
+    "session_current_generation",
+    "sessions_incident_generation",
+    "verification_attempts_incident",
 }
 
 
@@ -84,7 +98,10 @@ _SCHEMA = (
     CREATE TABLE incidents (
         id INTEGER PRIMARY KEY,
         correlation_key TEXT NOT NULL UNIQUE,
-        state TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'eligible', 'invoking', 'verifying', 'recovered',
+            'recovery_failed', 'recovery_unsafe', 'retries_exhausted'
+        )),
         generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
         evidence_hash TEXT NOT NULL,
         policy_revision INTEGER NOT NULL,
@@ -101,12 +118,150 @@ _SCHEMA = (
         evidence_hash TEXT NOT NULL,
         policy_revision INTEGER NOT NULL,
         lease_token TEXT NOT NULL,
-        state TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'active', 'interrupted', 'stale', 'completed',
+            'recovery_failed', 'recovery_unsafe', 'retries_exhausted'
+        )),
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         FOREIGN KEY (incident_id) REFERENCES incidents(id),
         FOREIGN KEY (policy_revision) REFERENCES policy_revisions(revision),
         UNIQUE (incident_id, generation)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE session_bindings (
+        id INTEGER PRIMARY KEY,
+        incident_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        evidence_hash TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        invocation_id INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        session_directory TEXT NOT NULL,
+        transcript_path TEXT NOT NULL,
+        runtime_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('current', 'replaced', 'unreadable')),
+        bound_at REAL NOT NULL,
+        last_resumed_at REAL,
+        FOREIGN KEY (incident_id) REFERENCES incidents(id),
+        FOREIGN KEY (invocation_id) REFERENCES invocations(id),
+        FOREIGN KEY (policy_revision) REFERENCES policy_revisions(revision),
+        UNIQUE (incident_id, generation, session_id),
+        UNIQUE (incident_id, generation, transcript_path)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE session_replacements (
+        id INTEGER PRIMARY KEY,
+        incident_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        previous_binding_id INTEGER NOT NULL UNIQUE,
+        replacement_binding_id INTEGER NOT NULL UNIQUE,
+        reason TEXT NOT NULL,
+        journal_digest TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents(id),
+        FOREIGN KEY (previous_binding_id) REFERENCES session_bindings(id),
+        FOREIGN KEY (replacement_binding_id) REFERENCES session_bindings(id),
+        CHECK (previous_binding_id != replacement_binding_id)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE action_intents (
+        id INTEGER PRIMARY KEY,
+        invocation_id INTEGER NOT NULL,
+        action_key TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        intent_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'unknown', 'completed', 'reconciled')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        FOREIGN KEY (invocation_id) REFERENCES invocations(id),
+        UNIQUE (invocation_id, action_key)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE action_outcomes (
+        id INTEGER PRIMARY KEY,
+        action_intent_id INTEGER NOT NULL UNIQUE,
+        outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed')),
+        outcome_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (action_intent_id) REFERENCES action_intents(id)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE action_reconciliations (
+        id INTEGER PRIMARY KEY,
+        action_intent_id INTEGER NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL,
+        result TEXT NOT NULL CHECK (result IN ('applied', 'not_applied')),
+        details_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (action_intent_id) REFERENCES action_intents(id)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE fixer_claims (
+        id INTEGER PRIMARY KEY,
+        invocation_id INTEGER NOT NULL UNIQUE,
+        incident_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        evidence_hash TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        claim_key TEXT NOT NULL,
+        claim_json TEXT NOT NULL,
+        claimed_at REAL NOT NULL,
+        FOREIGN KEY (invocation_id) REFERENCES invocations(id),
+        FOREIGN KEY (incident_id) REFERENCES incidents(id),
+        FOREIGN KEY (policy_revision) REFERENCES policy_revisions(revision)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE verification_attempts (
+        id INTEGER PRIMARY KEY,
+        incident_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        evidence_hash TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        invocation_id INTEGER,
+        attempt INTEGER NOT NULL CHECK (attempt > 0),
+        result TEXT NOT NULL CHECK (result IN ('deferred', 'contradicted', 'recovered', 'failed')),
+        reasons_json TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        started_at REAL NOT NULL,
+        completed_at REAL NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents(id),
+        FOREIGN KEY (invocation_id) REFERENCES invocations(id),
+        FOREIGN KEY (policy_revision) REFERENCES policy_revisions(revision),
+        UNIQUE (incident_id, generation, attempt)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE incident_reports (
+        id INTEGER PRIMARY KEY,
+        report_key TEXT NOT NULL UNIQUE,
+        incident_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        invocation_id INTEGER,
+        body_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (incident_id) REFERENCES incidents(id),
+        FOREIGN KEY (invocation_id) REFERENCES invocations(id),
+        UNIQUE (incident_id, generation)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE report_outbox (
+        id INTEGER PRIMARY KEY,
+        report_id INTEGER NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('REPORT_PENDING', 'REPORTED')),
+        created_at REAL NOT NULL,
+        available_at REAL NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        delivered_at REAL,
+        FOREIGN KEY (report_id) REFERENCES incident_reports(id)
     ) STRICT
     """,
     """
@@ -144,6 +299,16 @@ _SCHEMA = (
     "ON events(source, fingerprint, event_at DESC, status DESC, id DESC)",
     "CREATE INDEX events_received_at ON events(received_at, id)",
     "CREATE INDEX outbox_available ON notification_outbox(delivered_at, available_at, id)",
+    "CREATE INDEX sessions_incident_generation "
+    "ON session_bindings(incident_id, generation, state, id)",
+    "CREATE UNIQUE INDEX session_current_generation "
+    "ON session_bindings(incident_id, generation) WHERE state = 'current'",
+    "CREATE INDEX action_intents_unresolved "
+    "ON action_intents(invocation_id, state, id)",
+    "CREATE INDEX verification_attempts_incident "
+    "ON verification_attempts(incident_id, generation, attempt)",
+    "CREATE INDEX report_outbox_available "
+    "ON report_outbox(state, available_at, id)",
 )
 
 LATEST_EVENTS_QUERY = """
@@ -223,10 +388,19 @@ def _event_timestamp(
 class RecoveryLedger:
     """One-process connection wrapper with fail-closed startup validation."""
 
-    def __init__(self, path: Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        recover_unfinished_actions: bool = False,
+    ):
         if not isinstance(busy_timeout_ms, int) or not 1 <= busy_timeout_ms <= 30_000:
             raise ValueError("ledger busy timeout is invalid")
+        if not isinstance(recover_unfinished_actions, bool):
+            raise ValueError("ledger action recovery setting is invalid")
         self.path = path
+        self._recover_unfinished_actions_on_open = recover_unfinished_actions
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         try:
@@ -351,6 +525,40 @@ class RecoveryLedger:
             raise LedgerCorrupt("ledger schema metadata is invalid") from exc
         if version_row is None or version_row[0] != str(SCHEMA_VERSION) or user_version != SCHEMA_VERSION:
             raise LedgerCorrupt("ledger schema version mismatch")
+        if self._recover_unfinished_actions_on_open:
+            self.recover_unfinished_actions()
+
+    def recover_unfinished_actions(self) -> None:
+        """Turn every crash-window intent into a durable reconciliation gate."""
+
+        connection = self.connection
+        now = time.time()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE action_intents SET state = 'unknown', updated_at = ? "
+                "WHERE state = 'pending'",
+                (now,),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                    "VALUES (?, 'system', 'unfinished_actions_unknown', 'action_intents', ?)",
+                    (now, _canonical_event({"count": int(cursor.rowcount)})),
+                )
+            connection.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise LedgerUnavailable("ledger action recovery is unavailable") from exc
+        except sqlite3.DatabaseError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise LedgerCorrupt("ledger action recovery failed") from exc
 
     def _create_schema(self) -> None:
         connection = self.connection

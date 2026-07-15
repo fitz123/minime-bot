@@ -198,6 +198,9 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
+    "dist/pi-extensions/recovery-mode.js",
+    "dist/pi-extensions/recovery-protocol.js",
+    "dist/recovery/fixer-session.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -205,6 +208,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
+    "dist/extensions/pi/recovery.js",
     "scripts/deliver.sh",
     "scripts/monitoring_native.py",
     "scripts/alertmanager_webhook.py",
@@ -213,6 +217,8 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/recovery_ledger.py",
     "scripts/recovery_supervisor.py",
     "scripts/recovery_cli.py",
+    "scripts/recovery_rootctl.py",
+    "scripts/recovery_slots.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
@@ -235,7 +241,6 @@ function assertPackFiles(files: readonly string[]): void {
   }
 
   assert.ok(!files.some((file) => file.includes(RETIRED_GUARD_WRAPPER)), "guard extension should not be packed");
-  assert.ok(!files.some((file) => file.startsWith("dist/recovery/")), "recovery worker artifacts should not be packed");
   const retiredOutputExtension = ["recovery", "plan"].join("-");
   const retiredKnowledgeWrapper = ["recovery", "knowledge", "tools"].join("-");
   assert.ok(!files.some((file) => file.includes(retiredOutputExtension)), "recovery output extension should not be packed");
@@ -247,6 +252,11 @@ function assertPackFiles(files: readonly string[]): void {
   assert.ok(!files.some((file) => file.startsWith("dist/__tests__/")), "compiled tests should not be packed");
   assert.ok(!files.includes("schema.md"), "retired root schema contract should not be packed");
   assert.ok(!files.some((file) => RETIRED_GUARD_WRAPPER_PATTERN.test(file)), "retired guard contract should not be packed");
+  assert.equal(
+    files.filter((file) => file === "dist/extensions/pi/recovery.js").length,
+    1,
+    "recovery wrapper must be packaged exactly once without a dangling source artifact",
+  );
 }
 
 describe("package artifact install", () => {
@@ -289,11 +299,12 @@ describe("package artifact install", () => {
       workspace,
       "recovery.json",
       JSON.stringify({
-        version: 1,
+        version: 2,
         mode: "observe",
         database: "var/recovery/ledger.sqlite3",
         spoolDirectory: "var/recovery/spool",
         authTokenFile: "config/recovery-auth-token",
+        fixerAuthTokenFile: "config/recovery-fixer-auth-token",
         host: "127.0.0.1",
         port: 9877,
         correlationRules: [{
@@ -307,6 +318,44 @@ describe("package artifact install", () => {
         runtimeDoctorCadenceSeconds: 300,
         verificationFreshnessSeconds: 660,
         verificationHoldDownSeconds: 60,
+        internalAgentId: "recovery-fixer",
+        sessionPolicy: {
+          directory: "var/recovery/sessions",
+          startupTimeoutSeconds: 30,
+          resumeTimeoutSeconds: 30,
+          maxReplacementsPerGeneration: 1,
+          journalDigestMaxBytes: 32768,
+        },
+        actionPolicy: {
+          maxActionsPerInvocation: 128,
+          preimageMaxBytes: 1048576,
+          reconciliationTimeoutSeconds: 300,
+        },
+        quarantinePolicy: {
+          directory: "var/recovery/quarantine",
+          allowedRoots: [],
+          maxItemsPerIncident: 64,
+          maxItemBytes: 10485760,
+          maxIncidentBytes: 52428800,
+        },
+        reportPolicy: {
+          maxBytes: 262144,
+          maxTimelineEntries: 256,
+          retrySeconds: 300,
+        },
+        slotPolicy: {
+          stateDirectory: "var/recovery/slots",
+          capsuleRoot: "var/recovery/capsule",
+          botReleaseRoot: "var/releases",
+          startupHealthTimeoutSeconds: 60,
+          nodeExecutable: process.execPath,
+          nodeVersion: process.versions.node,
+          piExecutable: "/usr/local/bin/pi",
+          piVersion: "0.80.6",
+        },
+        reviewedOperations: [],
+        fixerLeaseSeconds: 120,
+        fixerRenewSeconds: 30,
       }),
     );
     assert.deepEqual(collectSchemaFiles(workspace), [], "installed workspace fixture must not contain schema.md");
@@ -333,6 +382,7 @@ describe("package artifact install", () => {
         "runtime_doctor.py",
         "recovery_supervisor.py",
         "recovery_cli.py",
+        "recovery_slots.py",
       ]) {
         const helperPath = join(installedPackage, "scripts", helper);
         assert.ok(existsSync(helperPath), `expected installed native helper ${helper}`);
@@ -383,8 +433,9 @@ describe("package artifact install", () => {
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
       assert.match(help.stdout, /minime-bot recovery config validate/);
-      assert.match(help.stdout, /observe-only native intake/);
-      assert.match(help.stdout, /no fixer or remediation actions/);
+      assert.match(help.stdout, /closed observe, diagnose, and enabled mode gates/);
+      assert.match(help.stdout, /recovery capsule-stage\|bot-stage/);
+      assert.match(help.stdout, /recovery-only wrapper/);
 
       const recoveryValidate = runInstalledBin(
         projectDir,
@@ -401,7 +452,9 @@ describe("package artifact install", () => {
       );
       assert.equal(recoveryStatus.status, 0, recoveryStatus.stderr || recoveryStatus.stdout);
       assert.deepEqual(JSON.parse(recoveryStatus.stdout).foundation, {
-        fixerAvailable: false,
+        fixerAvailable: true,
+        fixerDispatchAllowed: false,
+        mutationAllowed: false,
         nativeVerification: true,
         observeOnly: true,
         remediationActionsAvailable: false,
@@ -416,8 +469,17 @@ describe("package artifact install", () => {
       const recoveryProcessJson = JSON.parse(recoveryProcess.stdout) as Record<string, unknown>;
       assert.deepEqual(
         Object.keys(recoveryProcessJson).sort(),
-        ["activeIncidents", "mode", "ok", "verification"],
+        [
+          "activeIncidents",
+          "mode",
+          "ok",
+          "reportsDelivered",
+          "reportsQueued",
+          "verification",
+        ],
       );
+      assert.equal(recoveryProcessJson.reportsQueued, 0);
+      assert.equal(recoveryProcessJson.reportsDelivered, 0);
 
       const recoveryE2e = spawnSync(
         "python3",
@@ -429,6 +491,23 @@ describe("package artifact install", () => {
         },
       );
       assert.equal(recoveryE2e.status, 0, recoveryE2e.stderr || recoveryE2e.stdout || String(recoveryE2e.error));
+
+      const installedRecoveryAcceptance = spawnSync(
+        "python3",
+        [join(BOT_ROOT, "scripts", "tests", "test_recovery_installed_acceptance.py")],
+        {
+          cwd: join(installedPackage, "scripts"),
+          encoding: "utf8",
+          env: commandEnv({ MINIME_INSTALLED_PACKAGE_ROOT: installedPackage }),
+        },
+      );
+      assert.equal(
+        installedRecoveryAcceptance.status,
+        0,
+        installedRecoveryAcceptance.stderr
+          || installedRecoveryAcceptance.stdout
+          || String(installedRecoveryAcceptance.error),
+      );
 
       const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
@@ -632,7 +711,9 @@ assert config.mode == "observe"
 assert set(recovery_config.recovery_static_policy(config)) == {
     "version", "mode", "correlationRules", "sourceIds", "probes",
     "runtimeDoctorCadenceSeconds", "verificationFreshnessSeconds",
-    "verificationHoldDownSeconds"
+    "verificationHoldDownSeconds", "internalAgentId", "sessionPolicy",
+    "actionPolicy", "quarantinePolicy", "reportPolicy", "slotPolicy",
+    "reviewedOperations", "fixerLeaseSeconds", "fixerRenewSeconds"
 }
 ledger = recovery_ledger.RecoveryLedger(config.database)
 policy = recovery_supervisor.RecoveryPolicy(
@@ -800,6 +881,7 @@ with tempfile.TemporaryDirectory() as directory:
         database=root / "ledger.sqlite3",
         spool_directory=root / "spool",
         auth_token_file=root / "auth-token",
+        fixer_auth_token_file=root / "fixer-auth-token",
         host="127.0.0.1",
         port=9877,
         correlation_rules=config.correlation_rules,
@@ -814,6 +896,40 @@ with tempfile.TemporaryDirectory() as directory:
         runtime_doctor_cadence_seconds=300,
         verification_freshness_seconds=660,
         verification_hold_down_seconds=0,
+        internal_agent_id="recovery-fixer",
+        session_policy={
+            "directory": str(root / "sessions"),
+            "startupTimeoutSeconds": 30,
+            "resumeTimeoutSeconds": 30,
+            "maxReplacementsPerGeneration": 1,
+            "journalDigestMaxBytes": 32768,
+        },
+        action_policy={
+            "maxActionsPerInvocation": 128,
+            "preimageMaxBytes": 1048576,
+            "reconciliationTimeoutSeconds": 300,
+        },
+        quarantine_policy={
+            "directory": str(root / "quarantine"),
+            "allowedRoots": (),
+            "maxItemsPerIncident": 64,
+            "maxItemBytes": 10485760,
+            "maxIncidentBytes": 52428800,
+        },
+        report_policy={"maxBytes": 262144, "maxTimelineEntries": 256, "retrySeconds": 300},
+        slot_policy={
+            "stateDirectory": str(root / "slots"),
+            "capsuleRoot": str(root / "capsule"),
+            "botReleaseRoot": str(root / "releases"),
+            "startupHealthTimeoutSeconds": 60,
+            "nodeExecutable": "/usr/local/bin/node",
+            "nodeVersion": "22.19.0",
+            "piExecutable": "/usr/local/bin/pi",
+            "piVersion": "0.80.6",
+        },
+        reviewed_operations=(),
+        fixer_lease_seconds=120,
+        fixer_renew_seconds=30,
     )
     with recovery_ledger.RecoveryLedger(probe_config.database) as probe_ledger:
         probe_service = recovery_supervisor._build_recovery_service(
@@ -823,6 +939,7 @@ with tempfile.TemporaryDirectory() as directory:
                 probe_config.spool_directory / "notifications", delivery=None
             ),
             configured=probe_config,
+            verify_active_slots=False,
         )
         assert probe_service.accept(events, heartbeats={"alertmanager": True}).status == 200
         assert probe_service.accept(
@@ -1081,13 +1198,36 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
+const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-protocol.js");
+const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
+assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
+assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
+assert.equal(recoveryFixer.classifyRecoveryFixerResult({ is_error: true }), "provider_error");
+assert.ok(existsSync(join(artifactDir, "recovery.js")));
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
+assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
+
+for (const [command, category] of [
+  ["sudo launchctl kickstart gui/501/example", "privilege-escalation"],
+  ["rm -rf cache", "irreversible-deletion"],
+  ["git push origin repair", "external-mutation"],
+  ["curl -X POST https://example.invalid", "external-mutation"],
+  ["npm install package", "package-or-image-download"],
+  ["docker pull example/image", "package-or-image-download"],
+  ["docker volume rm data", "prune-or-volume"],
+  ["telegram getUpdates", "competing-polling"],
+  ["/bin/r? -rf cache", "ambiguous-shell"],
+  ["{rm,-rf,cache}", "ambiguous-shell"],
+  ["eval rm -rf cache", "ambiguous-shell"],
+]) {
+  assert.equal(recoveryProtocol.forbiddenRecoveryBashReason(command), category, command);
+}
 
 const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
   env: {},

@@ -7,11 +7,12 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>__PACKAGE_INSTALL_ROOT__/scripts/recovery_supervisor.py</string>
+    <string>__RECOVERY_BOOTSTRAP_ROOT__/recovery_slots.py</string>
     <string>--workspace</string>
     <string>__CONTROL_WORKSPACE_ROOT__</string>
     <string>--config</string>
     <string>recovery.json</string>
+    <string>capsule-bootstrap</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

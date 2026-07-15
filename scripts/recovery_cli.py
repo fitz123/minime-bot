@@ -16,6 +16,8 @@ from recovery_config import (
     RecoveryConfig,
     RecoveryConfigError,
     load_recovery_config,
+    recovery_mode_allows_dispatch,
+    recovery_mode_allows_mutation,
 )
 from recovery_ledger import LedgerError, RecoveryLedger
 from recovery_supervisor import (
@@ -26,6 +28,7 @@ from recovery_supervisor import (
     RecoveryControls,
     RecoveryPolicy,
     _build_recovery_service,
+    _installed_fixer_runner,
     safe_field,
 )
 
@@ -67,10 +70,10 @@ def _safe_text(value: str, name: str, limit: int) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect and control the observe-only same-host recovery foundation",
+        description="Inspect and control the mode-gated same-host recovery supervisor",
         epilog=(
-            "The foundation performs native intake, verification, controls, and "
-            "escalation only. Fixer execution and remediation actions are not available."
+            "Observe disables fixer dispatch, diagnose permits inspection only, and "
+            "enabled permits durably journaled repair plus reviewed supervisor actuators."
         ),
     )
     parser.add_argument("--workspace", required=True)
@@ -143,6 +146,7 @@ def _policy(config: RecoveryConfig, revision: int = 1) -> RecoveryPolicy:
             )
             for rule in config.correlation_rules
         ),
+        lease_seconds=config.fixer_lease_seconds,
     )
 
 
@@ -153,14 +157,20 @@ def _rows(rows: Any) -> list[dict[str, Any]]:
 def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: RecoveryConfig) -> dict[str, Any]:
     snapshot = controls.current()
     connection = ledger.connection
+    _package_root, runner = _installed_fixer_runner(config)
+    fixer_available = runner is not None
     return {
         "mode": config.mode,
         "database": str(config.database),
         "foundation": {
-            "fixerAvailable": False,
+            "fixerAvailable": fixer_available,
+            "fixerDispatchAllowed": recovery_mode_allows_dispatch(config.mode),
+            "mutationAllowed": recovery_mode_allows_mutation(config.mode),
             "nativeVerification": True,
-            "observeOnly": True,
-            "remediationActionsAvailable": False,
+            "observeOnly": config.mode == "observe",
+            "remediationActionsAvailable": bool(
+                fixer_available and recovery_mode_allows_mutation(config.mode)
+            ),
         },
         "emergencyDeliveryConfigured": bool(
             os.environ.get("MINIME_TELEGRAM_CHAT_ID", "").strip()
@@ -231,10 +241,14 @@ def run(args: argparse.Namespace) -> int:
                     config.spool_directory / "notifications", delivery=None
                 ),
                 configured=config,
+                allow_fixer_dispatch=False,
             )
-            summary = service.maintenance()
-            _json({"ok": True, "mode": config.mode, **summary})
-            return 0
+            try:
+                summary = service.maintenance()
+                _json({"ok": True, "mode": config.mode, **summary})
+                return 0
+            finally:
+                service.close()
         revision = controls.current().revision
         coordinator = IncidentCoordinator(
             ledger,

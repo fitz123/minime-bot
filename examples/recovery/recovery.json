@@ -1,9 +1,10 @@
 {
-  "version": 1,
+  "version": 2,
   "mode": "observe",
   "database": "var/recovery/ledger.sqlite3",
   "spoolDirectory": "var/recovery/spool",
   "authTokenFile": "config/recovery-auth-token",
+  "fixerAuthTokenFile": "config/recovery-fixer-auth-token",
   "host": "127.0.0.1",
   "port": 9877,
   "correlationRules": [
@@ -27,5 +28,43 @@
   "probes": [],
   "runtimeDoctorCadenceSeconds": 300,
   "verificationFreshnessSeconds": 660,
-  "verificationHoldDownSeconds": 60
+  "verificationHoldDownSeconds": 60,
+  "internalAgentId": "recovery-fixer",
+  "sessionPolicy": {
+    "directory": "var/recovery/sessions",
+    "startupTimeoutSeconds": 30,
+    "resumeTimeoutSeconds": 30,
+    "maxReplacementsPerGeneration": 1,
+    "journalDigestMaxBytes": 32768
+  },
+  "actionPolicy": {
+    "maxActionsPerInvocation": 128,
+    "preimageMaxBytes": 1048576,
+    "reconciliationTimeoutSeconds": 300
+  },
+  "quarantinePolicy": {
+    "directory": "var/recovery/quarantine",
+    "allowedRoots": [],
+    "maxItemsPerIncident": 64,
+    "maxItemBytes": 10485760,
+    "maxIncidentBytes": 52428800
+  },
+  "reportPolicy": {
+    "maxBytes": 262144,
+    "maxTimelineEntries": 256,
+    "retrySeconds": 300
+  },
+  "slotPolicy": {
+    "stateDirectory": "var/recovery/slots",
+    "capsuleRoot": "var/recovery/capsule",
+    "botReleaseRoot": "var/releases",
+    "startupHealthTimeoutSeconds": 60,
+    "nodeExecutable": "/usr/local/bin/node",
+    "nodeVersion": "22.19.0",
+    "piExecutable": "/usr/local/bin/pi",
+    "piVersion": "0.80.6"
+  },
+  "reviewedOperations": [],
+  "fixerLeaseSeconds": 120,
+  "fixerRenewSeconds": 30
 }
