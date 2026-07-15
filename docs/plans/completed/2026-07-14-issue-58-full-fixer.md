@@ -121,8 +121,8 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 - [x] Test broken active bot package, broken capsule current-to-previous, manifests/checksums, interrupted switch, offline bot rollback, and restart restoration; run slot/bootstrap tests.
 
 ### Task 6: Complete package integration, documentation, and acceptance coverage
-- [ ] Wire runner, non-default extension wrapper, Python modules, capsule/slot commands, and package files without private deployment details.
-- [ ] Document exact mode gates, session mechanics, credential separation, reconciliation, reports, capsule upgrade/rollback, offline bot rollback, empty rootctl, and dispatch-off/native-fallback rollback.
-- [ ] Add installed-tarball lifecycle tests for duplicate/out-of-order intake, broken package/capsule, Pi/provider outage, quarantine, forbidden actions, local rollback, verification, report pending/dedupe, Knowledge/Beads failure, and root boundary.
-- [ ] Assert no competing `getUpdates`, Node verification, incident download, literal `sudo` invocation, stale-data failure, model-authoritative success, default recovery-wrapper loading, or dangling package artifact.
-- [ ] Run all validation, installed-package checks, offline fixtures, privacy scans, and exact `git diff --stat main...HEAD`; leave the branch clean and move the plan only after every gate passes.
+- [x] Wire runner, non-default extension wrapper, Python modules, capsule/slot commands, and package files without private deployment details.
+- [x] Document exact mode gates, session mechanics, credential separation, reconciliation, reports, capsule upgrade/rollback, offline bot rollback, empty rootctl, and dispatch-off/native-fallback rollback.
+- [x] Add installed-tarball lifecycle tests for duplicate/out-of-order intake, broken package/capsule, Pi/provider outage, quarantine, forbidden actions, local rollback, verification, report pending/dedupe, Knowledge/Beads failure, and root boundary.
+- [x] Assert no competing `getUpdates`, Node verification, incident download, literal `sudo` invocation, stale-data failure, model-authoritative success, default recovery-wrapper loading, or dangling package artifact.
+- [x] Run all validation, installed-package checks, offline fixtures, privacy scans, and exact `git diff --stat main...HEAD`; leave the branch clean and move the plan only after every gate passes.

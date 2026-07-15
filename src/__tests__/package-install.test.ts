@@ -198,6 +198,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
+    "dist/pi-extensions/recovery-mode.js",
     "dist/pi-extensions/recovery-protocol.js",
     "dist/recovery/fixer-session.js",
     "dist/extensions/pi/codex-usage.js",
@@ -216,6 +217,8 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/recovery_ledger.py",
     "scripts/recovery_supervisor.py",
     "scripts/recovery_cli.py",
+    "scripts/recovery_rootctl.py",
+    "scripts/recovery_slots.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
@@ -249,6 +252,11 @@ function assertPackFiles(files: readonly string[]): void {
   assert.ok(!files.some((file) => file.startsWith("dist/__tests__/")), "compiled tests should not be packed");
   assert.ok(!files.includes("schema.md"), "retired root schema contract should not be packed");
   assert.ok(!files.some((file) => RETIRED_GUARD_WRAPPER_PATTERN.test(file)), "retired guard contract should not be packed");
+  assert.equal(
+    files.filter((file) => file === "dist/extensions/pi/recovery.js").length,
+    1,
+    "recovery wrapper must be packaged exactly once without a dangling source artifact",
+  );
 }
 
 describe("package artifact install", () => {
@@ -374,6 +382,7 @@ describe("package artifact install", () => {
         "runtime_doctor.py",
         "recovery_supervisor.py",
         "recovery_cli.py",
+        "recovery_slots.py",
       ]) {
         const helperPath = join(installedPackage, "scripts", helper);
         assert.ok(existsSync(helperPath), `expected installed native helper ${helper}`);
@@ -425,7 +434,8 @@ describe("package artifact install", () => {
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
       assert.match(help.stdout, /minime-bot recovery config validate/);
       assert.match(help.stdout, /closed observe, diagnose, and enabled mode gates/);
-      assert.match(help.stdout, /full fixer runner, two-slot capsule, and offline rollback/);
+      assert.match(help.stdout, /recovery capsule-stage\|bot-stage/);
+      assert.match(help.stdout, /recovery-only wrapper/);
 
       const recoveryValidate = runInstalledBin(
         projectDir,
@@ -483,6 +493,23 @@ describe("package artifact install", () => {
         },
       );
       assert.equal(recoveryE2e.status, 0, recoveryE2e.stderr || recoveryE2e.stdout || String(recoveryE2e.error));
+
+      const installedRecoveryAcceptance = spawnSync(
+        "python3",
+        [join(BOT_ROOT, "scripts", "tests", "test_recovery_installed_acceptance.py")],
+        {
+          cwd: join(installedPackage, "scripts"),
+          encoding: "utf8",
+          env: commandEnv({ MINIME_INSTALLED_PACKAGE_ROOT: installedPackage }),
+        },
+      );
+      assert.equal(
+        installedRecoveryAcceptance.status,
+        0,
+        installedRecoveryAcceptance.stderr
+          || installedRecoveryAcceptance.stdout
+          || String(installedRecoveryAcceptance.error),
+      );
 
       const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
@@ -1176,6 +1203,7 @@ const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-pr
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
 assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
 assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
+assert.equal(recoveryFixer.classifyRecoveryFixerResult({ is_error: true }), "provider_error");
 assert.ok(existsSync(join(artifactDir, "recovery.js")));
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
@@ -1183,7 +1211,21 @@ assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
+assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
+
+for (const [command, category] of [
+  ["sudo launchctl kickstart gui/501/example", "privilege-escalation"],
+  ["rm -rf cache", "irreversible-deletion"],
+  ["git push origin repair", "external-mutation"],
+  ["curl -X POST https://example.invalid", "external-mutation"],
+  ["npm install package", "package-or-image-download"],
+  ["docker pull example/image", "package-or-image-download"],
+  ["docker volume rm data", "prune-or-volume"],
+  ["telegram getUpdates", "competing-polling"],
+]) {
+  assert.equal(recoveryProtocol.forbiddenRecoveryBashReason(command), category, command);
+}
 
 const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
   env: {},

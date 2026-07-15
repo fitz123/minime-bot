@@ -105,6 +105,10 @@ const HELP_TEXT = `Usage:
   minime-bot recovery policy history [--limit <1-100>]
   minime-bot recovery policy rollback <revision> --actor <actor> --reason <reason>
   minime-bot recovery process --once [--config <path>]
+  minime-bot recovery capsule-stage|bot-stage --source <local-runtime> --release-id <id>
+  minime-bot recovery capsule-activate|bot-activate --release-id <id>
+  minime-bot recovery capsule-bootstrap
+  minime-bot recovery bot-rollback --restart-operation-id <reviewed-id>
 
 Options:
   --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
@@ -113,7 +117,7 @@ Options:
 Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
-Recovery control plane: host-native intake and verification with closed observe, diagnose, and enabled mode gates. The full fixer runner, two-slot capsule, and offline rollback are added by the staged recovery implementation.
+Recovery control plane: host-native intake and verification with closed observe, diagnose, and enabled mode gates. Fixer execution uses a recovery-only wrapper; capsule and bot slot commands consume only staged local runtimes.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
@@ -565,8 +569,18 @@ function runLaunchdCommand(
   return 0;
 }
 
-function recoveryScriptPath(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "recovery_cli.py");
+const RECOVERY_SLOT_COMMANDS = new Set([
+  "capsule-stage",
+  "capsule-activate",
+  "capsule-bootstrap",
+  "bot-stage",
+  "bot-activate",
+  "bot-rollback",
+]);
+
+function recoveryScriptPath(action: string): string {
+  const script = RECOVERY_SLOT_COMMANDS.has(action) ? "recovery_slots.py" : "recovery_cli.py";
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "scripts", script);
 }
 
 function arrangeRecoveryArgs(args: readonly string[]): { configArgs: string[]; commandArgs: string[] } {
@@ -628,7 +642,7 @@ function runRecoveryCommand(
   const result = runner(
     python,
     [
-      recoveryScriptPath(),
+      recoveryScriptPath(action),
       "--workspace",
       contract.paths.workspaceRoot,
       ...arranged.configArgs,

@@ -45,6 +45,8 @@
     "scripts/recovery_ledger.py",
     "scripts/recovery_supervisor.py",
     "scripts/recovery_cli.py",
+    "scripts/recovery_rootctl.py",
+    "scripts/recovery_slots.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",

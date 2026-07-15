@@ -1,10 +1,11 @@
 # Same-host recovery supervisor
 
-The recovery supervisor is an opt-in, host-native safety foundation around the
-existing monitoring path. Direct native Telegram delivery remains the default.
-The shipped foundation observes, persists, correlates, verifies, exposes static
-controls, and escalates. It does not start Pi or Node remediation, interpret
-model output, or execute mutating commands.
+The recovery supervisor is an opt-in, host-native authority around the existing
+monitoring path. Direct native Telegram delivery remains the fallback. The
+supervisor persists and correlates incidents, dispatches a mode-gated trusted Pi
+fixer, independently verifies results, and queues redacted reports. Detection,
+intake, native fallback, probes, and the recovery verdict stay in standard-library
+Python and do not depend on Node, Pi, or the active bot release.
 
 ## Limits and security model
 
@@ -119,20 +120,24 @@ control-workspace values. The supervisor requires both `--workspace` (or
 `MINIME_CONTROL_WORKSPACE_ROOT`) and `--config`; there is no raw path/timing
 fallback.
 
-Create the dedicated private directories and authentication token as the same
-account that runs the launch agent:
+Create the dedicated private directories and both authentication tokens as the
+same account that runs the launch agent:
 
 ```sh
 umask 077
 mkdir -p /path/to/control-workspace/config /path/to/control-workspace/var/recovery
 chmod 700 /path/to/control-workspace/config /path/to/control-workspace/var/recovery
 /usr/bin/uuidgen > /path/to/control-workspace/config/recovery-auth-token
-chmod 600 /path/to/control-workspace/config/recovery-auth-token
+/usr/bin/uuidgen > /path/to/control-workspace/config/recovery-fixer-auth-token
+chmod 600 /path/to/control-workspace/config/recovery-auth-token /path/to/control-workspace/config/recovery-fixer-auth-token
 ```
 
-The token reader requires an owner-owned, regular, non-symlink ASCII file with
-no group/other permission and a trimmed value from 16 through 4,096 bytes. Do
-not put the token in the plist, logs, shell arguments, or recovery JSON.
+Each token reader requires an owner-owned, regular, non-symlink ASCII file with
+no group/other permission and a trimmed value from 16 through 4,096 bytes. The
+intake token is accepted only by intake/control routes; the distinct fixer token
+is accepted only by `/v1/fixer/*`. The supervisor passes the fixer credential
+file path, never the token value, to the recovery process. Do not put either
+token in the plist, logs, shell arguments, or recovery JSON.
 Ledger and spool directories and their files also fail closed unless they are
 owner-owned, regular non-symlink storage with no group/other permission. The
 supervisor creates spool directories as mode `0700` and items as mode `0600`.
@@ -179,8 +184,8 @@ token.
 
 ## Controls and inspection
 
-Static controls remain available even though remediation dispatch is absent.
-Dispatch can be disabled with a TTL while intake and verification continue:
+Static controls remain available in every mode. Dispatch can be disabled with a
+TTL while intake, native fallback, and verification continue:
 
 ```sh
 minime-bot recovery dispatch disable --actor operator --reason maintenance --ttl 3600
@@ -204,6 +209,10 @@ minime-bot recovery retry INCIDENT_ID --actor ACTOR --reason REASON
 minime-bot recovery policy history [--limit 1-100]
 minime-bot recovery policy rollback REVISION --actor ACTOR --reason REASON
 minime-bot recovery process --once
+minime-bot recovery capsule-stage|bot-stage --source LOCAL_RUNTIME --release-id RELEASE
+minime-bot recovery capsule-activate|bot-activate --release-id RELEASE
+minime-bot recovery capsule-bootstrap
+minime-bot recovery bot-rollback --restart-operation-id REVIEWED_ID
 ```
 
 Every command accepts the global `--workspace WORKSPACE` and optional
@@ -214,9 +223,11 @@ CLI for subcommand help.
 
 Allowlisted component/failure-class pairs correlate into deterministic
 incidents. Material evidence or policy changes advance the incident generation.
-The ledger retains one-owner lease and generation/evidence/policy fencing as
-substrate for the follow-up trusted fixer, but observe mode never claims that
-lease or inserts an invocation.
+The ledger retains one-owner lease and generation/evidence/policy fencing.
+`observe` never claims fixer work. `diagnose` and `enabled` claim eligible work
+only while dispatch is on; disabling dispatch immediately restores observe-style
+native fallback. The supervisor launches one fixer process group from the
+recovery capsule and terminates it on timeout or fence loss.
 
 A resolved episode enters verification. Recovery is declared only after every
 correlated firing episode resolves, required probes are healthy, source and
@@ -233,11 +244,97 @@ Alert timestamps more than five minutes ahead of their receive time are not
 trusted for semantic ordering; the ledger conservatively orders those events by
 receive time so a malformed future transition cannot mask later input.
 
-The version-3 ledger reserves durable exact-session bindings/replacements,
-action intents/outcomes/reconciliations, completion claims, verification
-history, and independent report/outbox state. The runnable Pi fixer,
-recovery-only wrapper, two-slot recovery capsule, and offline bot rollback are
-added by the remaining staged recovery tasks.
+The version-3 ledger stores exact-session bindings/replacements, action
+intents/outcomes/reconciliations, completion claims, verification history, and
+independent report/outbox state. A fixer `finish` is only a claim: it can never
+mark the incident recovered. Fresh host evidence, hold-down, active-slot state,
+and deterministic probes alone establish the terminal verdict. A contradiction
+creates another fenced generation and resumes the same Pi session.
+
+## Exact fixer session and action reconciliation
+
+The fixer uses normal Pi context and tools plus the non-default
+`dist/extensions/pi/recovery.js` wrapper. Recovery fails closed if that wrapper
+cannot load or `PI_EXTENSIONS_DISABLED=1`; normal bot, cron, subagent, and
+ask-agent invocations never load it by default. The runner uses the pinned Pi
+mechanics: an owner-only `PI_CODING_AGENT_SESSION_DIR`, RPC `get_state` to obtain
+`data.sessionId`, and exactly one canonical owner-only JSONL transcript. The
+supervisor commits that binding before the incident prompt. A retry uses
+`--session ID` and the same directory, never `--no-session`. Replacement is
+allowed only after host inspection proves the transcript unreadable and Pi
+returns its explicit no-session startup classifier.
+
+Before every mutating `bash`, `edit`, `write`, Knowledge update, recovery tool,
+or other mutating tool, the extension commits an intent. It commits an outcome
+after the call. A crash leaves an `unknown` intent; inspection and the
+idempotent reconcile endpoint remain available, but every later mutation is
+blocked until all unknown actions are reconciled against host state. Diagnose
+mode enforces the same journal but blocks mutation. Quarantine and reviewed
+restart/rollback IDs execute in Python; the extension cannot submit argv, shell,
+or path policy for those operations.
+
+The trusted fixer may repair ordinary-user configuration, create preimages,
+quarantine bounded temporary/cache files, make local commits, and request
+reviewed user-service operations. Guards reject privilege escalation,
+irreversible deletion, public or external mutation, secret access/rotation,
+package or image download, prune/volume operations, and a competing Telegram
+poller. This is a same-UID safety contract, not a hostile-process sandbox.
+
+## Reports and degraded enrichment
+
+After independent verification, the supervisor merges the model claim with the
+authoritative event, action, session, quarantine, slot, and verification journal.
+It redacts secrets and private paths, bounds the document, and queues one durable
+report key. `REPORT_PENDING` and `REPORTED` belong to report/outbox rows and
+never replace the incident's `recovered` outcome. Delivery failure leaves the
+report pending across restart. Knowledge or Beads enrichment failure is listed
+under degraded metadata and never blocks repair, verification, or report
+creation.
+
+## Recovery capsule and bot release slots
+
+Capsule upgrade and bot deploy are separate offline operations. Stage only an
+already installed, locally validated runtime tree; incident handling never
+builds, downloads, runs a package manager, pulls an image, or switches both
+domains. Capsule staging copies the recovery Python files, compiled fixer and
+wrapper artifacts, and installed dependency closure into an immutable release.
+Its manifest records checksums plus absolute, version-checked Node and Pi host
+prerequisites. Activate only after staging succeeds:
+
+```sh
+minime-bot recovery capsule-stage --workspace /path/to/control-workspace --source /path/to/local/runtime --release-id capsule-2026-07
+minime-bot recovery capsule-activate --workspace /path/to/control-workspace --release-id capsule-2026-07
+minime-bot recovery capsule-bootstrap --workspace /path/to/control-workspace
+```
+
+The stable bootstrap validates `current`, starts it, and checks the authenticated
+loopback health endpoint. Manifest or startup-health failure performs exactly one
+`current -> previous` fallback for that generation. A second failure stops and
+escalates. Atomic relative symlinks, a checksummed owner-only state file,
+directory fsync, and pending-transition reconciliation make interrupted switches
+recoverable.
+
+Bot releases use a different slot root and the same immutable manifest rules.
+Stage and activate local releases during deployment. During an incident,
+`bot-rollback` verifies `previous`, switches atomically, and invokes only a
+configured static restart operation ID. If restart fails and the former release
+still verifies, it restores that release and invokes the same reviewed restart:
+
+```sh
+minime-bot recovery bot-stage --workspace /path/to/control-workspace --source /path/to/local/runtime --release-id bot-2026-07
+minime-bot recovery bot-activate --workspace /path/to/control-workspace --release-id bot-2026-07
+minime-bot recovery bot-rollback --workspace /path/to/control-workspace --restart-operation-id restart-bot
+```
+
+## Root capability boundary
+
+The installed `scripts/recovery_rootctl.py` is an ordinary-user protocol
+validator, not a privileged helper or listener. Phase 1 has an immutable empty
+capability registry. Requests contain only a capability ID, incident ID,
+idempotency key, active fence, current/peer UID, and rate-limit state; generic
+command, argv, shell, and path fields are rejected. Every capability request is
+therefore unsupported and must be blocked or escalated. No installation or
+runtime path invokes privilege elevation.
 
 ## Shadow acceptance drills
 
@@ -246,17 +343,22 @@ added by the remaining staged recovery tasks.
 2. Configure Alertmanager's shadow receiver with `continue: true` and run the
    runtime doctor with `MINIME_DOCTOR_SINK=tee`. Treat the supplied plist as a
    replacement for the existing doctor job, not a second parallel job.
-3. Send duplicate and out-of-order firing/resolved transitions. Verify one
-   durable event per transition ID, deterministic correlation, zero invocations,
-   and zero remediation processes.
+3. In `observe`, send duplicate and out-of-order firing/resolved transitions.
+   Verify one durable event per transition ID, deterministic correlation, zero
+   invocations, and zero remediation processes.
 4. Restart with unacknowledged intake, a synthetic stale lease, and queued
    emergency notification state. Verify spool drain, crash reconciliation,
    fencing, and fallback retry while Node, Pi, and the bot package are absent.
 5. Exercise ledger and delivery failure. Verify retryable intake or durable
    spool, compact fallback without raw payload, and later delivery. Never
    replace or delete a corrupt ledger during the drill.
-6. Exercise source freshness, hold-down, control expiry, retry bounds, and policy
-   rollback. Confirm that no control can enable remediation.
+6. In `diagnose`, confirm that the full fixer can inspect and finish but every
+   mutating tool is rejected. In `enabled`, crash after an intent, confirm all
+   later mutation stays blocked, reconcile it, and then permit the next intent.
+7. Exercise false success, stale telemetry, Pi/provider failure, quarantine,
+   forbidden commands, report delivery failure/deduplication, degraded
+   Knowledge/Beads enrichment, capsule fallback, offline bot rollback, and the
+   empty root capability registry.
 
 Self-monitor the authenticated `/healthz` endpoint, process liveness, source
 heartbeats, ledger/spool disk space, pending immediate escalation age, and
@@ -265,11 +367,11 @@ emergency delivery.
 ## Upgrade and rollback
 
 Before an upgrade, disable dispatch with a TTL, keep shadow intake running, take
-a filesystem-consistent backup of the stopped ledger and spool, install the new
-package, validate configuration, and restart. The schema has no migration
-ladder: a version mismatch fails closed, so restore the matching package and
-ledger together. Policy rollback changes static controls only; it does not
-rewrite event history.
+a filesystem-consistent backup of the stopped ledger and spool, stage and
+self-check a new capsule, then activate it. Upgrade the bot release separately.
+The schema has no migration ladder: a version mismatch fails closed, so restore
+the matching capsule and ledger together. Policy rollback changes static
+controls only; it does not rewrite event history or switch release slots.
 
 To abandon recovery, restore the runtime doctor to its default `telegram`
 sink, remove the Alertmanager shadow route while retaining the native Telegram
