@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,7 +42,14 @@ from recovery_config import (
     recovery_static_policy,
     validated_probe_command,
 )
-from recovery_ledger import LedgerCorrupt, LedgerError, LedgerUnavailable, RecoveryLedger
+from recovery_ledger import (
+    DEFAULT_EVENT_RETENTION_BATCH_SIZE,
+    DEFAULT_EVENT_RETENTION_SECONDS,
+    LedgerCorrupt,
+    LedgerError,
+    LedgerUnavailable,
+    RecoveryLedger,
+)
 
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 16
@@ -843,20 +849,6 @@ class RecoveryControls:
             )
 
 
-def _event_time(row: Any, event: dict[str, Any]) -> tuple[float, int, int]:
-    timestamp = float(row["received_at"])
-    occurred_at = event.get("occurred_at")
-    if isinstance(occurred_at, str) and occurred_at:
-        try:
-            parsed = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            timestamp = parsed.timestamp()
-        except (OverflowError, ValueError):
-            pass
-    return timestamp, 1 if event.get("status") == "resolved" else 0, int(row["id"])
-
-
 @dataclass(frozen=True)
 class IncidentEvidence:
     evidence_hash: str
@@ -922,10 +914,8 @@ class IncidentCoordinator:
         return current is not None and _canonical_json(current) == self._static_policy
 
     def _active_evidence_details(self, connection: Any) -> dict[str, IncidentEvidence]:
-        latest: dict[tuple[str, str], tuple[tuple[float, int, int], dict[str, Any]]] = {}
-        rows = connection.execute(
-            "SELECT id, source, fingerprint, status, received_at, normalized_json FROM events"
-        ).fetchall()
+        latest: list[dict[str, Any]] = []
+        rows = self.ledger.latest_events(connection)
         for row in rows:
             try:
                 event = json.loads(row["normalized_json"])
@@ -939,14 +929,10 @@ class IncidentCoordinator:
                 or event["status"] != row["status"]
             ):
                 raise LedgerCorrupt("normalized recovery evidence is invalid")
-            identity = (str(row["source"]), str(row["fingerprint"]))
-            order = _event_time(row, event)
-            previous = latest.get(identity)
-            if previous is None or order > previous[0]:
-                latest[identity] = (order, event)
+            latest.append(event)
 
         grouped: dict[str, list[list[Any]]] = {}
-        for _order, event in latest.values():
+        for event in latest:
             if event["status"] != "firing":
                 continue
             rule = self._rules.get((event["component"], event["failure_class"]))
@@ -1287,24 +1273,24 @@ class IncidentCoordinator:
                 "SELECT correlation_key FROM incidents WHERE id = ?", (fence.incident_id,)
             ).fetchone()
             assert incident is not None
-            latest: dict[tuple[str, str], tuple[tuple[float, int, int], Any, dict[str, Any]]] = {}
-            rows = connection.execute(
-                "SELECT id, source, fingerprint, status, received_at, normalized_json FROM events"
-            ).fetchall()
+            latest: list[tuple[Any, dict[str, Any]]] = []
+            rows = self.ledger.latest_events(connection)
             for row in rows:
                 try:
                     event = json.loads(str(row["normalized_json"]))
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise LedgerCorrupt("normalized recovery evidence is invalid") from exc
-                if not isinstance(event, dict) or not _valid_spooled_event(event):
+                if (
+                    not isinstance(event, dict)
+                    or not _valid_spooled_event(event)
+                    or event["source"] != row["source"]
+                    or event["fingerprint"] != row["fingerprint"]
+                    or event["status"] != row["status"]
+                ):
                     raise LedgerCorrupt("normalized recovery evidence is invalid")
-                identity = (str(row["source"]), str(row["fingerprint"]))
-                order = _event_time(row, event)
-                previous = latest.get(identity)
-                if previous is None or order > previous[0]:
-                    latest[identity] = (order, row, event)
+                latest.append((row, event))
             evidence: list[dict[str, Any]] = []
-            for _order, row, event in latest.values():
+            for row, event in latest:
                 if event["status"] != "firing":
                     continue
                 rule = self._rules.get((event["component"], event["failure_class"]))
@@ -2478,6 +2464,8 @@ class RecoveryService:
         verifier: RecoveryVerifier | None = None,
         probe_runner: PythonProbeRunner | None = None,
         notifications: RecoveryNotificationOutbox | None = None,
+        event_retention_seconds: float = DEFAULT_EVENT_RETENTION_SECONDS,
+        event_retention_batch_size: int = DEFAULT_EVENT_RETENTION_BATCH_SIZE,
     ):
         self.ledger = ledger
         self.event_spool = event_spool
@@ -2488,6 +2476,8 @@ class RecoveryService:
             raise ValueError("recovery probe runner does not match verifier")
         self.probe_runner = probe_runner
         self.notifications = notifications
+        self.event_retention_seconds = event_retention_seconds
+        self.event_retention_batch_size = event_retention_batch_size
 
     @staticmethod
     def _intake_envelope(
@@ -2588,6 +2578,10 @@ class RecoveryService:
             self._drain_events()
             if self.coordinator is not None:
                 self.coordinator.reconcile()
+            self.ledger.prune_event_history(
+                retention_seconds=self.event_retention_seconds,
+                batch_size=self.event_retention_batch_size,
+            )
         except LedgerError:
             self.emergency.emit("ledger_unavailable")
         except SpoolError:

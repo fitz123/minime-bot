@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sqlite3
 import threading
 import time
 from typing import Any, Iterable, Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 2_000
+DEFAULT_EVENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
+DEFAULT_EVENT_RETENTION_BATCH_SIZE = 256
 EXPECTED_TABLES = {
     "actions",
     "audit",
@@ -23,6 +27,11 @@ EXPECTED_TABLES = {
     "metadata",
     "notification_outbox",
     "policy_revisions",
+}
+EXPECTED_INDEXES = {
+    "events_latest_source_fingerprint",
+    "events_received_at",
+    "outbox_available",
 }
 
 
@@ -64,6 +73,7 @@ _SCHEMA = (
         status TEXT NOT NULL CHECK (status IN ('firing', 'resolved')),
         transition TEXT NOT NULL,
         occurred_at TEXT,
+        event_at REAL NOT NULL,
         received_at REAL NOT NULL,
         normalized_json TEXT NOT NULL
     ) STRICT
@@ -140,13 +150,73 @@ _SCHEMA = (
         details_json TEXT NOT NULL
     ) STRICT
     """,
-    "CREATE INDEX events_source_fingerprint ON events(source, fingerprint, id)",
+    "CREATE INDEX events_latest_source_fingerprint "
+    "ON events(source, fingerprint, event_at DESC, status DESC, id DESC)",
+    "CREATE INDEX events_received_at ON events(received_at, id)",
     "CREATE INDEX outbox_available ON notification_outbox(delivered_at, available_at, id)",
 )
+
+LATEST_EVENTS_QUERY = """
+    SELECT id, source, fingerprint, code, status, transition, occurred_at,
+           event_at, received_at, normalized_json
+    FROM (
+        SELECT id, source, fingerprint, code, status, transition, occurred_at,
+               event_at, received_at, normalized_json,
+               row_number() OVER (
+                   PARTITION BY source, fingerprint
+                   ORDER BY event_at DESC, status DESC, id DESC
+               ) AS event_rank
+        FROM events INDEXED BY events_latest_source_fingerprint
+    )
+    WHERE event_rank = 1
+    ORDER BY source, fingerprint
+"""
+
+_RETENTION_CANDIDATES_QUERY = """
+    SELECT candidate.id, candidate.received_at
+    FROM events AS candidate INDEXED BY events_received_at
+    WHERE candidate.received_at < ?
+      AND EXISTS (
+          SELECT 1
+          FROM events AS newer INDEXED BY events_latest_source_fingerprint
+          WHERE newer.source = candidate.source
+            AND newer.fingerprint = candidate.fingerprint
+            AND (
+                newer.event_at > candidate.event_at
+                OR (
+                    newer.event_at = candidate.event_at
+                    AND newer.status > candidate.status
+                )
+                OR (
+                    newer.event_at = candidate.event_at
+                    AND newer.status = candidate.status
+                    AND newer.id > candidate.id
+                )
+            )
+          LIMIT 1
+      )
+    ORDER BY candidate.received_at, candidate.id
+    LIMIT ?
+"""
 
 
 def _canonical_event(event: dict[str, Any]) -> str:
     return json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _event_timestamp(event: dict[str, Any], received_at: float) -> float:
+    occurred_at = event.get("occurred_at")
+    if isinstance(occurred_at, str) and occurred_at:
+        try:
+            parsed = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            timestamp = parsed.timestamp()
+            if math.isfinite(timestamp):
+                return timestamp
+        except (OverflowError, ValueError):
+            pass
+    return received_at
 
 
 class RecoveryLedger:
@@ -210,6 +280,15 @@ class RecoveryLedger:
             tables = EXPECTED_TABLES
         if tables != EXPECTED_TABLES:
             raise LedgerCorrupt("ledger schema is incomplete")
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type='index' AND sql IS NOT NULL"
+            )
+        }
+        if indexes != EXPECTED_INDEXES:
+            raise LedgerCorrupt("ledger indexes are incomplete")
         try:
             version_row = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
@@ -265,12 +344,13 @@ class RecoveryLedger:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 for event in rows:
+                    received_at = time.time()
                     cursor = connection.execute(
                         """
                         INSERT OR IGNORE INTO events(
                             transition_id, source, fingerprint, code, status,
-                            transition, occurred_at, received_at, normalized_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            transition, occurred_at, event_at, received_at, normalized_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             event["transition_id"],
@@ -280,7 +360,8 @@ class RecoveryLedger:
                             event["status"],
                             event["transition"],
                             event.get("occurred_at"),
-                            time.time(),
+                            _event_timestamp(event, received_at),
+                            received_at,
                             _canonical_event(event),
                         ),
                     )
@@ -299,6 +380,74 @@ class RecoveryLedger:
                 except sqlite3.DatabaseError:
                     pass
                 raise LedgerUnavailable("ledger write failed") from exc
+
+    def latest_events(
+        self, connection: sqlite3.Connection | None = None
+    ) -> list[sqlite3.Row]:
+        """Return the one semantic latest state required for every event identity."""
+
+        with self._lock:
+            current = self.connection if connection is None else connection
+            try:
+                return current.execute(LATEST_EVENTS_QUERY).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise LedgerUnavailable("ledger latest-event lookup failed") from exc
+
+    def prune_event_history(
+        self,
+        *,
+        now: float | None = None,
+        retention_seconds: float = DEFAULT_EVENT_RETENTION_SECONDS,
+        batch_size: int = DEFAULT_EVENT_RETENTION_BATCH_SIZE,
+    ) -> int:
+        """Transactionally prune one bounded batch of old, superseded events."""
+
+        timestamp = time.time() if now is None else now
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, (int, float))
+            or not math.isfinite(retention_seconds)
+            or retention_seconds < 1
+            or isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= 10_000
+        ):
+            raise ValueError("event retention settings are invalid")
+        cutoff = float(timestamp) - float(retention_seconds)
+        with self.transaction() as connection:
+            candidates = connection.execute(
+                _RETENTION_CANDIDATES_QUERY,
+                (cutoff, batch_size),
+            ).fetchall()
+            if not candidates:
+                return 0
+            identifiers = [int(row["id"]) for row in candidates]
+            placeholders = ",".join("?" for _identifier in identifiers)
+            cursor = connection.execute(
+                f"DELETE FROM events WHERE id IN ({placeholders})",
+                identifiers,
+            )
+            if cursor.rowcount != len(identifiers):
+                raise LedgerCorrupt("event retention delete was incomplete")
+            connection.execute(
+                "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                "VALUES (?, 'system', 'event_history_pruned', 'events', ?)",
+                (
+                    float(timestamp),
+                    _canonical_event(
+                        {
+                            "batch_limit": batch_size,
+                            "cutoff_received_at": cutoff,
+                            "deleted": len(identifiers),
+                            "retention_seconds": float(retention_seconds),
+                        }
+                    ),
+                ),
+            )
+            return len(identifiers)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -68,11 +68,11 @@ npm pack --json --dry-run
 - [x] Run focused Python tests before continuing.
 
 ### Task 5: Bound event history without losing active episode state
-- [ ] Add minimum-sufficient SQLite indexes for received-time and latest source/fingerprint lookups used by reconciliation and CLI queries.
-- [ ] Add deterministic maintenance retention with conservative reviewed defaults, preserving the newest state for every source/fingerprint and all rows required by active incidents while pruning only superseded history.
-- [ ] Keep retention transactional, bounded per maintenance pass, audited/observable, and fail-safe under lock/full/corrupt-ledger conditions.
-- [ ] Add tests for high-volume history, active firing preservation, out-of-order input, bounded maintenance batches, restart reconstruction, and query-plan/index use where stable.
-- [ ] Run focused ledger/supervisor tests before continuing.
+- [x] Add minimum-sufficient SQLite indexes for received-time and latest source/fingerprint lookups used by reconciliation and CLI queries.
+- [x] Add deterministic maintenance retention with conservative reviewed defaults, preserving the newest state for every source/fingerprint and all rows required by active incidents while pruning only superseded history.
+- [x] Keep retention transactional, bounded per maintenance pass, audited/observable, and fail-safe under lock/full/corrupt-ledger conditions.
+- [x] Add tests for high-volume history, active firing preservation, out-of-order input, bounded maintenance batches, restart reconstruction, and query-plan/index use where stable.
+- [x] Run focused ledger/supervisor tests before continuing.
 
 ### Task 6: Align the public foundation contract, package, and validation
 - [ ] Update recovery config examples, CLI help/status, docs, monitoring docs, README, package artifacts, and installed-tarball expectations to describe only the foundation and the follow-up full-fixer/exact-session/action-journal/two-slot-capsule/offline-bot-rollback boundary.

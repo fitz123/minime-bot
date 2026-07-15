@@ -22,6 +22,14 @@ WAL, full synchronous writes, foreign keys, a bounded busy timeout, and startup
 integrity checks. Corruption or a schema mismatch fails closed and is never
 reset automatically.
 
+Event retention runs during maintenance with conservative fixed defaults: only
+superseded rows received more than 90 days ago are eligible, and at most 256
+rows are removed per transaction. The semantic latest state for every
+source/fingerprint is always retained, including the firing evidence needed to
+reconstruct active incidents after restart. Each non-empty pass writes its
+audit record in the same transaction; lock, disk-full, or ledger failures roll
+the entire pass back.
+
 Monitoring payloads are untrusted. Secrets belong in files resolved by the
 native monitoring secret contract; never put them in configuration, argv, logs,
 or event fields. The control workspace, installed package, and source checkout

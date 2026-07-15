@@ -79,6 +79,23 @@ def doctor_events(*events: tuple[str, str, str]) -> list[dict[str, object]]:
     )
 
 
+def history_event(
+    fingerprint: str,
+    status: str,
+    occurred_at: str,
+) -> dict[str, object]:
+    return recovery_supervisor._normalized_event(
+        source="alertmanager",
+        fingerprint=fingerprint,
+        code="SyntheticDown",
+        status=status,
+        transition=occurred_at,
+        occurred_at=occurred_at,
+        component="synthetic",
+        failure_class="unavailable",
+    )
+
+
 def correlation_policy(
     *,
     lease_seconds: float = 30,
@@ -126,6 +143,16 @@ class RecoveryLedgerTests(unittest.TestCase):
             self.assertEqual(ledger.connection.execute("PRAGMA synchronous").fetchone()[0], 2)
             self.assertEqual(ledger.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertGreater(ledger.connection.execute("PRAGMA busy_timeout").fetchone()[0], 0)
+            self.assertEqual(
+                {
+                    row[0]
+                    for row in ledger.connection.execute(
+                        "SELECT name FROM sqlite_schema "
+                        "WHERE type='index' AND sql IS NOT NULL"
+                    )
+                },
+                recovery_ledger.EXPECTED_INDEXES,
+            )
             self.assertEqual(ledger.record_events(events), 2)
             self.assertEqual(ledger.record_events(events[:1]), 0)
             ledger.close()
@@ -142,9 +169,17 @@ class RecoveryLedgerTests(unittest.TestCase):
             root = Path(directory)
             version_path = root / "version.sqlite3"
             with recovery_ledger.RecoveryLedger(version_path) as ledger:
-                ledger.connection.execute("PRAGMA user_version=2")
+                ledger.connection.execute(
+                    f"PRAGMA user_version={recovery_ledger.SCHEMA_VERSION + 1}"
+                )
             with self.assertRaises(recovery_ledger.LedgerCorrupt):
                 recovery_ledger.RecoveryLedger(version_path)
+
+            index_path = root / "index.sqlite3"
+            with recovery_ledger.RecoveryLedger(index_path) as ledger:
+                ledger.connection.execute("DROP INDEX events_received_at")
+            with self.assertRaises(recovery_ledger.LedgerCorrupt):
+                recovery_ledger.RecoveryLedger(index_path)
 
             corrupt_path = root / "corrupt.sqlite3"
             corrupt_path.write_bytes(b"not a sqlite database")
@@ -161,10 +196,207 @@ class RecoveryLedgerTests(unittest.TestCase):
                     ledger.record_events(
                         recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
                     )
+                with self.assertRaises(recovery_ledger.LedgerUnavailable):
+                    ledger.prune_event_history(now=10, retention_seconds=1)
             finally:
                 locker.execute("ROLLBACK")
                 locker.close()
                 ledger.close()
+
+    def test_retention_is_bounded_audited_and_preserves_restart_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ledger.sqlite3"
+            ledger = recovery_ledger.RecoveryLedger(path)
+            active_latest = history_event(
+                "active", "firing", "2026-02-01T00:00:00Z"
+            )
+            active_history = [
+                history_event(
+                    "active",
+                    "firing" if index % 2 == 0 else "resolved",
+                    f"2026-01-01T{index // 3600:02d}:{(index // 60) % 60:02d}:{index % 60:02d}Z",
+                )
+                for index in range(300)
+            ]
+            resolved_latest = history_event(
+                "resolved", "resolved", "2026-02-01T00:00:00Z"
+            )
+            resolved_history = [
+                history_event(
+                    "resolved",
+                    "firing" if index % 2 == 0 else "resolved",
+                    f"2026-01-01T00:00:0{index}Z",
+                )
+                for index in range(4)
+            ]
+            # Deliberately receive semantic latest state before older history.
+            with mock.patch.object(recovery_ledger.time, "time", return_value=0.0):
+                self.assertEqual(
+                    ledger.record_events(
+                        [active_latest, *active_history, resolved_latest, *resolved_history]
+                    ),
+                    306,
+                )
+
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(),
+                owner="retention-test",
+                clock=lambda: 2_000_000_000.0,
+            )
+            self.assertEqual(coordinator.reconcile(), 1)
+            incident_before = ledger.connection.execute(
+                "SELECT evidence_hash, generation, state FROM incidents"
+            ).fetchone()
+            assert incident_before is not None
+            active_latest_id = int(
+                ledger.connection.execute(
+                    "SELECT id FROM events WHERE transition_id = ?",
+                    (active_latest["transition_id"],),
+                ).fetchone()[0]
+            )
+
+            service = recovery_supervisor.RecoveryService(
+                ledger,
+                recovery_supervisor.AtomicJsonSpool(root / "events"),
+                recovery_supervisor.EmergencyNotifier(root / "notifications", delivery=None),
+                coordinator=coordinator,
+                event_retention_seconds=1,
+                event_retention_batch_size=128,
+            )
+            service.maintenance()
+            self.assertEqual(
+                ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                178,
+            )
+            service.maintenance()
+            self.assertEqual(
+                ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                50,
+            )
+            service.maintenance()
+            self.assertEqual(
+                ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                2,
+            )
+            self.assertIsNotNone(
+                ledger.connection.execute(
+                    "SELECT 1 FROM events WHERE id = ?", (active_latest_id,)
+                ).fetchone()
+            )
+            self.assertEqual(
+                {
+                    (str(row["fingerprint"]), str(row["status"]))
+                    for row in ledger.latest_events()
+                },
+                {("active", "firing"), ("resolved", "resolved")},
+            )
+            audits = ledger.connection.execute(
+                "SELECT details_json FROM audit "
+                "WHERE operation = 'event_history_pruned' ORDER BY id"
+            ).fetchall()
+            self.assertEqual(
+                [json.loads(row[0])["deleted"] for row in audits],
+                [128, 128, 48],
+            )
+            self.assertTrue(
+                all(json.loads(row[0])["batch_limit"] == 128 for row in audits)
+            )
+            incident_after = ledger.connection.execute(
+                "SELECT evidence_hash, generation, state FROM incidents"
+            ).fetchone()
+            self.assertEqual(tuple(incident_after), tuple(incident_before))
+            ledger.close()
+
+            with recovery_ledger.RecoveryLedger(path) as reopened:
+                restarted = recovery_supervisor.IncidentCoordinator(
+                    reopened,
+                    correlation_policy(),
+                    owner="retention-restart-test",
+                    clock=lambda: 2_000_000_001.0,
+                )
+                self.assertEqual(restarted.reconcile(), 1)
+                incident_restarted = reopened.connection.execute(
+                    "SELECT evidence_hash, generation, state FROM incidents"
+                ).fetchone()
+                self.assertEqual(tuple(incident_restarted), tuple(incident_before))
+
+    def test_retention_uses_indexes_and_rolls_back_on_audit_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            with recovery_ledger.RecoveryLedger(path) as ledger:
+                with mock.patch.object(recovery_ledger.time, "time", return_value=0.0):
+                    ledger.record_events(
+                        [
+                            history_event("indexed", "firing", "2026-01-02T00:00:00Z"),
+                            history_event("indexed", "resolved", "2026-01-01T00:00:00Z"),
+                        ]
+                    )
+                latest_plan = ledger.connection.execute(
+                    "EXPLAIN QUERY PLAN " + recovery_ledger.LATEST_EVENTS_QUERY
+                ).fetchall()
+                retention_plan = ledger.connection.execute(
+                    "EXPLAIN QUERY PLAN " + recovery_ledger._RETENTION_CANDIDATES_QUERY,
+                    (1.0, 1),
+                ).fetchall()
+                latest_details = " ".join(str(row[3]) for row in latest_plan)
+                retention_details = " ".join(str(row[3]) for row in retention_plan)
+                self.assertIn("events_latest_source_fingerprint", latest_details)
+                self.assertIn("events_received_at", retention_details)
+                self.assertIn("events_latest_source_fingerprint", retention_details)
+
+                ledger.connection.execute(
+                    "CREATE TRIGGER fail_retention_audit "
+                    "BEFORE INSERT ON audit "
+                    "WHEN NEW.operation = 'event_history_pruned' "
+                    "BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END"
+                )
+                with self.assertRaises(recovery_ledger.LedgerUnavailable):
+                    ledger.prune_event_history(now=2.0, retention_seconds=1, batch_size=1)
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM audit "
+                        "WHERE operation = 'event_history_pruned'"
+                    ).fetchone()[0],
+                    0,
+                )
+                ledger.connection.execute("DROP TRIGGER fail_retention_audit")
+                ledger.connection.execute(
+                    "UPDATE events SET normalized_json = '{}' WHERE status = 'firing'"
+                )
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(),
+                    owner="corrupt-retention-test",
+                    clock=lambda: 2.0,
+                )
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(Path(directory) / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        Path(directory) / "notifications", delivery=None
+                    ),
+                    coordinator=coordinator,
+                    event_retention_seconds=1,
+                    event_retention_batch_size=1,
+                )
+                service.maintenance()
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM audit "
+                        "WHERE operation = 'event_history_pruned'"
+                    ).fetchone()[0],
+                    0,
+                )
 
 
 class RecoveryServiceTests(unittest.TestCase):
