@@ -3174,6 +3174,16 @@ class _UnavailableLedger:
     def ping(self) -> None:
         raise LedgerUnavailable("ledger startup is unavailable")
 
+    def prune_event_history(
+        self,
+        *,
+        now: float | None = None,
+        retention_seconds: float = DEFAULT_EVENT_RETENTION_SECONDS,
+        batch_size: int = DEFAULT_EVENT_RETENTION_BATCH_SIZE,
+    ) -> int:
+        del now, retention_seconds, batch_size
+        raise LedgerUnavailable("ledger startup is unavailable")
+
 
 def _build_recovery_service(
     ledger: RecoveryLedger,

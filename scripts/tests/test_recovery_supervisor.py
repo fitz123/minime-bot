@@ -3546,7 +3546,7 @@ class SupervisorStartupTests(unittest.TestCase):
             self.assertFalse(supervisor.is_alive())
             self.assertEqual(result, [0])
 
-    def test_temporary_startup_ledger_failure_keeps_spool_only_intake_available(self) -> None:
+    def test_persistent_startup_ledger_failure_keeps_spool_only_intake_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             token = root / "auth-token"
@@ -3555,38 +3555,99 @@ class SupervisorStartupTests(unittest.TestCase):
             self._write_config(root)
             captured: list[recovery_supervisor.RecoveryApplication] = []
             server = mock.Mock()
-            server.handle_request.side_effect = KeyboardInterrupt
+            server_started = threading.Event()
+            release_server = threading.Event()
+            results: list[int] = []
+            errors: list[BaseException] = []
+            messages: list[str] = []
+            monotonic = 0.0
+
+            def serve_forever(**_kwargs: object) -> None:
+                server_started.set()
+                release_server.wait(5)
 
             def capture(app: recovery_supervisor.RecoveryApplication) -> object:
                 captured.append(app)
                 return object
+
+            def advancing_monotonic() -> float:
+                nonlocal monotonic
+                monotonic += 10.0
+                return monotonic
+
+            def run_supervisor() -> None:
+                try:
+                    results.append(
+                        recovery_supervisor.main(
+                            [
+                                "--workspace",
+                                str(root),
+                                "--config",
+                                "recovery.json",
+                                "--chat-id",
+                                "10001",
+                            ]
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            server.serve_forever.side_effect = serve_forever
 
             with (
                 mock.patch.object(
                     recovery_supervisor,
                     "RecoveryLedger",
                     side_effect=recovery_ledger.LedgerUnavailable("synthetic startup lock"),
-                ),
+                ) as open_ledger,
                 mock.patch.object(recovery_supervisor, "handler_for", side_effect=capture),
                 mock.patch.object(
                     recovery_supervisor, "BoundedThreadingHTTPServer", return_value=server
                 ),
+                mock.patch.object(
+                    recovery_supervisor.time,
+                    "monotonic",
+                    side_effect=advancing_monotonic,
+                ),
+                mock.patch.object(
+                    recovery_supervisor,
+                    "send_telegram",
+                    side_effect=lambda message, _config: messages.append(message),
+                ),
             ):
-                result = recovery_supervisor.main(
-                    [
-                        "--workspace",
-                        str(root),
-                        "--config",
-                        "recovery.json",
-                    ]
-                )
-            self.assertEqual(result, 0)
-            self.assertEqual(len(captured), 1)
-            intake = captured[0].service.accept(
-                recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
-            )
-            self.assertEqual(intake.status, 202)
-            self.assertEqual(len(list((root / "spool" / "events").glob("*.json"))), 1)
+                supervisor = threading.Thread(target=run_supervisor)
+                supervisor.start()
+                try:
+                    self.assertTrue(server_started.wait(2))
+                    self.assertEqual(len(captured), 1)
+                    intake = captured[0].service.accept(
+                        recovery_supervisor.normalize_alertmanager(alert_body(firing_alert()))
+                    )
+                    self.assertEqual(intake.status, 202)
+
+                    deadline = time.time() + 4
+                    while open_ledger.call_count < 3 and time.time() < deadline:
+                        time.sleep(0.01)
+                    self.assertGreaterEqual(open_ledger.call_count, 3)
+                    self.assertTrue(supervisor.is_alive())
+                    later_intake = captured[0].service.accept(
+                        recovery_supervisor.normalize_alertmanager(
+                            alert_body(firing_alert("synthetic-2"))
+                        )
+                    )
+                    self.assertEqual(later_intake.status, 202)
+
+                    while not messages and time.time() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(len(messages), 1)
+                finally:
+                    release_server.set()
+                    supervisor.join(timeout=5)
+
+            self.assertFalse(supervisor.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [0])
+            self.assertEqual(len(list((root / "spool" / "events").glob("*.json"))), 2)
 
     def test_corruption_triggers_only_compact_native_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
