@@ -148,6 +148,13 @@ class RecoveryConfigTests(unittest.TestCase):
                     "timeoutMs": 1000,
                 },
                 {
+                    "id": "path-traversal",
+                    "executable": "/usr/bin/../bin/true",
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 1000,
+                },
+                {
                     "id": "service-control",
                     "executable": "/bin/launchctl",
                     "argv": ["kickstart", "gui/501/example"],
@@ -354,6 +361,107 @@ class RecoveryCliTests(unittest.TestCase):
                 self.assertEqual(
                     ledger.connection.execute(
                         "SELECT count(*) FROM actions"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_process_once_refreshes_probes_with_python_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = config_document()
+            document["probes"] = [
+                {
+                    "id": "host-health",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 1000,
+                }
+            ]
+            (root / "recovery.json").write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+            loaded = recovery_config.load_recovery_config(
+                root / "recovery.json", root
+            )
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                controls = recovery_supervisor.RecoveryControls(ledger)
+                static_policy = recovery_config.recovery_static_policy(loaded)
+                revision = controls.ensure_static_policy(static_policy)
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    recovery_cli._policy(loaded, revision),
+                    owner="cli-probe-test",
+                    controls=controls,
+                    mode="observe",
+                    static_policy=static_policy,
+                )
+                firing = recovery_supervisor.normalize_alertmanager(
+                    json.dumps(
+                        {
+                            "alerts": [
+                                {
+                                    "status": "firing",
+                                    "fingerprint": "cli-probe",
+                                    "startsAt": "2026-07-14T00:00:00Z",
+                                    "labels": {
+                                        "alertname": "BotUnavailable",
+                                        "component": "bot",
+                                        "failure_class": "unavailable",
+                                    },
+                                }
+                            ]
+                        }
+                    ).encode()
+                )
+                ledger.record_events(firing)
+                coordinator.reconcile()
+                resolved = recovery_supervisor.normalize_alertmanager(
+                    json.dumps(
+                        {
+                            "alerts": [
+                                {
+                                    "status": "resolved",
+                                    "fingerprint": "cli-probe",
+                                    "startsAt": "2026-07-14T00:00:00Z",
+                                    "endsAt": "2026-07-14T00:10:00Z",
+                                    "labels": {
+                                        "alertname": "BotUnavailable",
+                                        "component": "bot",
+                                        "failure_class": "unavailable",
+                                    },
+                                }
+                            ]
+                        }
+                    ).encode()
+                )
+                ledger.record_events(resolved)
+                coordinator.reconcile()
+
+            code, output, error = call_cli(root, "process", "--once")
+            self.assertEqual((code, error), (0, ""))
+            result = json.loads(output)
+            self.assertEqual(len(result["verification"]), 1)
+            probe_evidence = [
+                item
+                for item in result["verification"][0]["evidence"]
+                if item["kind"] == "probe"
+            ]
+            self.assertEqual(
+                probe_evidence,
+                [{"id": "host-health", "kind": "probe", "state": "fresh_healthy"}],
+            )
+            with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM metadata "
+                        "WHERE key LIKE 'verification:probe:%:host-health'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM invocations"
                     ).fetchone()[0],
                     0,
                 )

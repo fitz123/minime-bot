@@ -60,12 +60,12 @@ npm pack --json --dry-run
 - [x] Run focused config, CLI, and supervisor tests before continuing.
 
 ### Task 4: Execute deterministic verification entirely in the Python supervisor
-- [ ] Replace Node-worker verification with a stdlib Python probe runner that accepts only validated absolute executables plus static argv/env, uses no shell or interpreter indirection, and applies bounded output and process-group timeouts.
-- [ ] Fence probe execution and result recording against incident generation/policy before launch and after completion; terminate/ignore stale work safely.
-- [ ] Run Python probe refresh and verification from the observe-mode maintenance loop, removing the legacy `mode == "enabled"` gate while keeping all remediation dispatch disabled.
-- [ ] Keep host-native intake, source heartbeats, probe refresh, hold-down, and notification fallback operable when Node, Pi, or the active bot package is unavailable.
-- [ ] Add tests for healthy/unhealthy probes, timeout/process cleanup, malformed configuration, stale fences, observe-mode refresh, broken/missing Node and package artifacts, and direct supervisor authority over recovery state.
-- [ ] Run focused Python tests before continuing.
+- [x] Replace Node-worker verification with a stdlib Python probe runner that accepts only validated absolute executables plus static argv/env, uses no shell or interpreter indirection, and applies bounded output and process-group timeouts.
+- [x] Fence probe execution and result recording against incident generation/policy before launch and after completion; terminate/ignore stale work safely.
+- [x] Run Python probe refresh and verification from the observe-mode maintenance loop, removing the legacy `mode == "enabled"` gate while keeping all remediation dispatch disabled.
+- [x] Keep host-native intake, source heartbeats, probe refresh, hold-down, and notification fallback operable when Node, Pi, or the active bot package is unavailable.
+- [x] Add tests for healthy/unhealthy probes, timeout/process cleanup, malformed configuration, stale fences, observe-mode refresh, broken/missing Node and package artifacts, and direct supervisor authority over recovery state.
+- [x] Run focused Python tests before continuing.
 
 ### Task 5: Bound event history without losing active episode state
 - [ ] Add minimum-sufficient SQLite indexes for received-time and latest source/fingerprint lookups used by reconciliation and CLI queries.

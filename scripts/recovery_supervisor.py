@@ -19,6 +19,7 @@ import secrets
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,6 +41,7 @@ from recovery_config import (
     RecoveryConfigError,
     load_recovery_config,
     recovery_static_policy,
+    validated_probe_command,
 )
 from recovery_ledger import LedgerCorrupt, LedgerError, LedgerUnavailable, RecoveryLedger
 
@@ -86,6 +88,9 @@ _CONFIRMATION_BOUNDS = (1, 5)
 _COOLDOWN_BOUNDS = (0.0, 86_400.0)
 _RETRY_BUDGET_BOUNDS = (0, 10)
 _MAX_CONTROL_TTL = 31 * 86_400.0
+PROBE_FENCE_POLL_SECONDS = 0.1
+PROBE_TERMINATION_GRACE_SECONDS = 0.25
+MAX_PROBE_REFRESHES_PER_MAINTENANCE = 32
 
 
 class IntakeError(ValueError):
@@ -1794,6 +1799,8 @@ class RecoveryVerifier:
                     int(incident["generation"]),
                     int(incident["policy_revision"]),
                 )
+                if not self._fence_valid(connection, fence):
+                    continue
                 observations = [
                     self._probe_observation(connection, fence, probe_id)
                     for probe_id in self.probe_ids
@@ -2008,6 +2015,209 @@ class RecoveryVerifier:
                 "missed_recovery",
                 f"invocation:{int(invocation['id'])}:verification:{generation}",
             )
+
+
+@dataclass(frozen=True)
+class ProbeCommand:
+    """Immutable execution form of one validated static probe definition."""
+
+    identifier: str
+    executable: str
+    argv: tuple[str, ...]
+    env: tuple[tuple[str, str], ...]
+    timeout_seconds: float
+
+    @classmethod
+    def from_config(cls, value: dict[str, Any]) -> ProbeCommand:
+        normalized = validated_probe_command(value)
+        return cls(
+            identifier=str(normalized["id"]),
+            executable=str(normalized["executable"]),
+            argv=tuple(str(arg) for arg in normalized["argv"]),
+            env=tuple(
+                sorted(
+                    (str(key), str(item))
+                    for key, item in normalized["env"].items()
+                )
+            ),
+            timeout_seconds=int(normalized["timeoutMs"]) / 1_000.0,
+        )
+
+
+class PythonProbeRunner:
+    """Run reviewed verification commands without Node, a shell, or inherited state."""
+
+    def __init__(
+        self,
+        verifier: RecoveryVerifier,
+        probes: tuple[dict[str, Any], ...],
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        commands = tuple(ProbeCommand.from_config(probe) for probe in probes)
+        if tuple(command.identifier for command in commands) != verifier.probe_ids:
+            raise ValueError("recovery probe runner definitions do not match verifier")
+        self.verifier = verifier
+        self.commands = commands
+        self.monotonic = monotonic
+        self.sleeper = sleeper
+
+    @staticmethod
+    def _resolved_executable(command: ProbeCommand) -> str | None:
+        """Resolve and revalidate the exact native executable immediately before launch."""
+
+        try:
+            resolved = Path(command.executable).resolve(strict=True)
+            details = resolved.stat()
+            if not stat.S_ISREG(details.st_mode) or not os.access(resolved, os.X_OK):
+                return None
+            with resolved.open("rb") as executable:
+                if executable.read(2) == b"#!":
+                    return None
+            validated_probe_command(
+                {
+                    "id": command.identifier,
+                    "executable": str(resolved),
+                    "argv": list(command.argv),
+                    "env": dict(command.env),
+                    "timeoutMs": int(command.timeout_seconds * 1_000),
+                }
+            )
+            return str(resolved)
+        except (OSError, RecoveryConfigError):
+            return None
+
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+        """Terminate every process left in the probe's isolated process group."""
+
+        if process.poll() is not None:
+            # A probe is not allowed to leave descendants behind after its
+            # direct child exits. Any remaining member still has the child's
+            # process-group ID because start_new_session created the group.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=PROBE_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=PROBE_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            # The process is already signalled. Never turn cleanup delay into
+            # unbounded maintenance work if the kernel has not reaped it yet.
+            pass
+
+    def _run_command(
+        self, fence: VerificationFence, command: ProbeCommand
+    ) -> dict[str, Any] | None:
+        if not self.verifier.fence_valid(fence):
+            return None
+        executable = self._resolved_executable(command)
+        if executable is None:
+            if not self.verifier.fence_valid(fence):
+                return None
+            return {"id": command.identifier, "exitCode": 126, "timedOut": False}
+        if not self.verifier.fence_valid(fence):
+            return None
+        # stdout/stderr are deliberately discarded. The retained output bound
+        # is therefore zero bytes and an unbounded writer cannot fill a pipe or
+        # consume supervisor memory. The absolute executable, static argv/env,
+        # root cwd, closed descriptors, and shell=False keep execution detached
+        # from Node, Pi, the active package checkout, and ambient credentials.
+        try:
+            process = subprocess.Popen(
+                (executable, *command.argv),
+                executable=executable,
+                cwd="/",
+                env=dict(command.env),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                shell=False,
+                start_new_session=True,
+            )
+        except OSError:
+            if not self.verifier.fence_valid(fence):
+                return None
+            return {"id": command.identifier, "exitCode": 127, "timedOut": False}
+
+        deadline = self.monotonic() + command.timeout_seconds
+        timed_out = False
+        stale = False
+        try:
+            while process.poll() is None:
+                if not self.verifier.fence_valid(fence):
+                    stale = True
+                    break
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                self.sleeper(min(PROBE_FENCE_POLL_SECONDS, remaining))
+        finally:
+            self._terminate_process_group(process)
+        if stale or not self.verifier.fence_valid(fence):
+            return None
+        return {
+            "id": command.identifier,
+            "exitCode": int(
+                process.returncode if process.returncode is not None else -1
+            ),
+            "timedOut": timed_out,
+        }
+
+    def refresh(self, fence: VerificationFence) -> bool:
+        """Execute and atomically record one fully fenced probe set."""
+
+        if not self.commands or not self.verifier.fence_valid(fence):
+            return False
+        results: list[dict[str, Any]] = []
+        for command in self.commands:
+            result = self._run_command(fence, command)
+            if result is None:
+                return False
+            results.append(result)
+        if not self.verifier.fence_valid(fence):
+            return False
+        return self.verifier.record_probe_results(fence, results)
+
+    def refresh_due(
+        self, *, limit: int = MAX_PROBE_REFRESHES_PER_MAINTENANCE
+    ) -> int:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("recovery probe refresh limit is invalid")
+        refreshed = 0
+        for _ in range(limit):
+            fence = self.verifier.next_probe_refresh()
+            if fence is None:
+                break
+            if self.refresh(fence):
+                refreshed += 1
+            elif self.verifier.fence_valid(fence):
+                # A valid fence with no recorded result would be selected again
+                # immediately; leave it for the next bounded maintenance pass.
+                break
+        return refreshed
 
 
 def _fsync_directory(path: Path) -> None:
@@ -2266,6 +2476,7 @@ class RecoveryService:
         emergency: EmergencyNotifier,
         coordinator: IncidentCoordinator | None = None,
         verifier: RecoveryVerifier | None = None,
+        probe_runner: PythonProbeRunner | None = None,
         notifications: RecoveryNotificationOutbox | None = None,
     ):
         self.ledger = ledger
@@ -2273,6 +2484,9 @@ class RecoveryService:
         self.emergency = emergency
         self.coordinator = coordinator
         self.verifier = verifier
+        if probe_runner is not None and probe_runner.verifier is not verifier:
+            raise ValueError("recovery probe runner does not match verifier")
+        self.probe_runner = probe_runner
         self.notifications = notifications
 
     @staticmethod
@@ -2381,6 +2595,8 @@ class RecoveryService:
         if self.verifier is not None:
             try:
                 self.verifier.record_heartbeat("supervisor")
+                if self.probe_runner is not None:
+                    self.probe_runner.refresh_due()
                 verification_results = self.verifier.evaluate_all()
                 for incident_id, result in verification_results:
                     classification = self.verifier.mechanical_classification(incident_id, result)
@@ -2685,12 +2901,17 @@ def _build_recovery_service(
             else DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS
         ),
     )
+    probe_runner = PythonProbeRunner(
+        verifier,
+        configured.probes if configured is not None else (),
+    )
     service = RecoveryService(
         ledger,
         event_spool,
         emergency,
         coordinator=coordinator,
         verifier=verifier,
+        probe_runner=probe_runner,
         notifications=notifications,
     )
     return service

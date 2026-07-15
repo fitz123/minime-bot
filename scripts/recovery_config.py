@@ -138,7 +138,9 @@ def _workspace_path(workspace: Path, value: Any, name: str) -> Path:
     return resolved
 
 
-def _command(value: Any) -> dict[str, Any]:
+def validated_probe_command(value: Any) -> dict[str, Any]:
+    """Return one closed, non-mutating host-native probe definition."""
+
     keys = {"id", "executable", "argv", "env", "timeoutMs"}
     item = _object(value, keys, "probe")
     _safe_id(item["id"], "command id")
@@ -147,6 +149,7 @@ def _command(value: Any) -> dict[str, Any]:
     if (
         not isinstance(executable, str)
         or not Path(executable).is_absolute()
+        or ".." in Path(executable).parts
         or "\0" in executable
         or executable_name in _INDIRECTION_EXECUTABLES
     ):
@@ -282,7 +285,7 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     raw_probes = document["probes"]
     if not isinstance(raw_probes, list) or len(raw_probes) > 128:
         raise RecoveryConfigError("recovery probes are invalid")
-    probes = tuple(_command(item) for item in raw_probes)
+    probes = tuple(validated_probe_command(item) for item in raw_probes)
     ids = [str(item["id"]) for item in probes]
     if len(ids) != len(set(ids)):
         raise RecoveryConfigError("recovery probes contain duplicate IDs")

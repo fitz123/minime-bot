@@ -71,7 +71,12 @@ IDs use letters, digits, `.`, `_`, `:`, and `-`. Executables must be
 absolute and cannot be shells, interpreters, process-indirection utilities, or
 known mutating service/package/privilege tools. Argv and environment are static,
 bounded, and reject credential-bearing flags and sensitive variable names.
-Timeouts are bounded. The public example configures no probes.
+Timeouts are bounded. The stdlib Python supervisor resolves and revalidates the
+native executable immediately before launch, supplies only the configured
+environment, uses no shell, runs from `/`, discards all output, and isolates the
+probe in a process group that is terminated on timeout or a stale
+generation/policy fence. Results are recorded only after the same fence is
+rechecked transactionally. The public example configures no probes.
 
 The supervisor has one mode: `observe`. It may intake, correlate, audit,
 report health, refresh deterministic probes, verify resolved episodes, and use

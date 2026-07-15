@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 from pathlib import Path
 import socket
 import sqlite3
@@ -928,6 +929,307 @@ class RecoveryVerificationTests(unittest.TestCase):
                         (incident_id,),
                     )
                 self.assertFalse(verifier.record_probe(stale, "health", True))
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT count(*) FROM metadata WHERE key LIKE 'verification:probe:%'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    @staticmethod
+    def _native_executable(name: str) -> str:
+        for parent in (Path("/usr/bin"), Path("/bin")):
+            candidate = parent / name
+            if candidate.is_file():
+                return str(candidate)
+        raise unittest.SkipTest(f"required native test executable is unavailable: {name}")
+
+    def test_observe_maintenance_runs_native_probes_without_node_or_package(self) -> None:
+        for executable_name, expected_healthy in (("true", True), ("false", False)):
+            with self.subTest(executable=executable_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = recovery_config.RecoveryConfig(
+                    path=root / "recovery.json",
+                    workspace=root,
+                    mode="observe",
+                    database=root / "ledger.sqlite3",
+                    spool_directory=root / "spool",
+                    auth_token_file=root / "token",
+                    host="127.0.0.1",
+                    port=9877,
+                    correlation_rules=(
+                        {
+                            "component": "synthetic",
+                            "failureClass": "unavailable",
+                            "incidentKey": "bot-unavailable",
+                            "impact": 2,
+                        },
+                    ),
+                    source_ids=("alertmanager",),
+                    probes=(
+                        {
+                            "id": "host-health",
+                            "executable": self._native_executable(executable_name),
+                            "argv": [],
+                            "env": {"LANG": "C"},
+                            "timeoutMs": 1000,
+                        },
+                    ),
+                    runtime_doctor_cadence_seconds=30,
+                    verification_freshness_seconds=120,
+                    verification_hold_down_seconds=0,
+                )
+                with recovery_ledger.RecoveryLedger(config.database) as ledger:
+                    service = recovery_supervisor._build_recovery_service(
+                        ledger,
+                        recovery_supervisor.AtomicJsonSpool(
+                            config.spool_directory / "events"
+                        ),
+                        recovery_supervisor.EmergencyNotifier(
+                            config.spool_directory / "notifications", delivery=None
+                        ),
+                        configured=config,
+                        configured_rules=correlation_policy().rules,
+                        source_ids=config.source_ids,
+                        mode=config.mode,
+                    )
+                    self.assertIsInstance(
+                        service.probe_runner, recovery_supervisor.PythonProbeRunner
+                    )
+                    service.accept(
+                        recovery_supervisor.normalize_alertmanager(
+                            alert_body(firing_alert())
+                        ),
+                        heartbeats={"alertmanager": True},
+                    )
+                    service.accept(
+                        recovery_supervisor.normalize_alertmanager(
+                            alert_body(resolved_alert())
+                        ),
+                        heartbeats={"alertmanager": True},
+                    )
+                    incident_id = int(
+                        ledger.connection.execute("SELECT id FROM incidents").fetchone()[0]
+                    )
+                    original_cwd = Path.cwd()
+                    isolated_cwd = root / "no-package-checkout"
+                    isolated_cwd.mkdir()
+                    try:
+                        os.chdir(isolated_cwd)
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                "PATH": str(root / "missing-bin"),
+                                "NODE": str(root / "missing-node"),
+                            },
+                            clear=True,
+                        ):
+                            service.maintenance()
+                    finally:
+                        os.chdir(original_cwd)
+                    assert service.verifier is not None
+                    verifier = service.verifier
+                    fence = self._fence(ledger, incident_id)
+                    observation = verifier._probe_observation(
+                        ledger.connection, fence, "host-health"
+                    )
+                    self.assertIsNotNone(observation)
+                    assert observation is not None
+                    self.assertEqual(observation[0], expected_healthy)
+                    state = ledger.connection.execute(
+                        "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                    ).fetchone()[0]
+                    self.assertEqual(
+                        state, "recovered" if expected_healthy else "verifying"
+                    )
+                    self.assertEqual(
+                        ledger.connection.execute(
+                            "SELECT count(*) FROM invocations"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        ledger.connection.execute(
+                            "SELECT count(*) FROM actions"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_probe_timeout_discards_output_and_reaps_the_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                probe = {
+                    "id": "bounded-output",
+                    "executable": self._native_executable("yes"),
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 100,
+                }
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("bounded-output",),
+                    cadence_seconds=30,
+                    freshness_seconds=120,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                runner = recovery_supervisor.PythonProbeRunner(verifier, (probe,))
+                fence = self._fence(ledger, incident_id)
+                spawned: list[object] = []
+                launch_options: list[dict[str, object]] = []
+                real_popen = recovery_supervisor.subprocess.Popen
+
+                def capture_process(*args: object, **kwargs: object) -> object:
+                    launch_options.append(dict(kwargs))
+                    process = real_popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                started = time.monotonic()
+                with mock.patch.object(
+                    recovery_supervisor.subprocess,
+                    "Popen",
+                    side_effect=capture_process,
+                ):
+                    self.assertTrue(runner.refresh(fence))
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertEqual(len(spawned), 1)
+                self.assertIsNotNone(spawned[0].poll())
+                self.assertEqual(launch_options[0]["stdout"], recovery_supervisor.subprocess.DEVNULL)
+                self.assertEqual(launch_options[0]["stderr"], recovery_supervisor.subprocess.DEVNULL)
+                self.assertEqual(launch_options[0]["env"], {})
+                self.assertEqual(launch_options[0]["cwd"], "/")
+                self.assertIs(launch_options[0]["shell"], False)
+                self.assertIs(launch_options[0]["start_new_session"], True)
+                observation = verifier._probe_observation(
+                    ledger.connection, fence, "bounded-output"
+                )
+                self.assertIsNotNone(observation)
+                assert observation is not None
+                self.assertFalse(observation[0])
+
+    def test_probe_runner_rejects_interpreter_scripts_and_missing_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            script = root / "probe-helper"
+            marker = root / "script-ran"
+            script.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+            script.chmod(0o700)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                probes = (
+                    {
+                        "id": "script",
+                        "executable": str(script),
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                    {
+                        "id": "missing-package-probe",
+                        "executable": str(root / "missing-package" / "probe"),
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    },
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("script", "missing-package-probe"),
+                    cadence_seconds=30,
+                    freshness_seconds=120,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                runner = recovery_supervisor.PythonProbeRunner(verifier, probes)
+                fence = self._fence(ledger, incident_id)
+                with mock.patch.object(recovery_supervisor.subprocess, "Popen") as popen:
+                    self.assertTrue(runner.refresh(fence))
+                popen.assert_not_called()
+                self.assertFalse(marker.exists())
+                for probe_id in verifier.probe_ids:
+                    observation = verifier._probe_observation(
+                        ledger.connection, fence, probe_id
+                    )
+                    self.assertIsNotNone(observation)
+                    assert observation is not None
+                    self.assertFalse(observation[0])
+
+    def test_probe_launch_and_recording_stop_on_generation_or_policy_staleness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                sleep_probe = {
+                    "id": "slow-health",
+                    "executable": self._native_executable("sleep"),
+                    "argv": ["5"],
+                    "env": {},
+                    "timeoutMs": 5000,
+                }
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("slow-health",),
+                    cadence_seconds=30,
+                    freshness_seconds=120,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                runner = recovery_supervisor.PythonProbeRunner(
+                    verifier, (sleep_probe,)
+                )
+                policy_stale = self._fence(ledger, incident_id)
+                coordinator.controls.set_dispatch(
+                    False,
+                    actor="operator",
+                    reason="synthetic policy change",
+                )
+                with mock.patch.object(recovery_supervisor.subprocess, "Popen") as popen:
+                    self.assertFalse(runner.refresh(policy_stale))
+                popen.assert_not_called()
+
+                coordinator.reconcile()
+                current = self._fence(ledger, incident_id)
+                started = threading.Event()
+                captured: list[object] = []
+                real_popen = recovery_supervisor.subprocess.Popen
+
+                def capture_process(*args: object, **kwargs: object) -> object:
+                    process = real_popen(*args, **kwargs)
+                    captured.append(process)
+                    started.set()
+                    return process
+
+                def invalidate_generation() -> None:
+                    self.assertTrue(started.wait(timeout=2.0))
+                    with ledger.transaction() as connection:
+                        connection.execute(
+                            "UPDATE incidents SET generation = generation + 1 WHERE id = ?",
+                            (incident_id,),
+                        )
+
+                invalidator = threading.Thread(target=invalidate_generation)
+                invalidator.start()
+                before = time.monotonic()
+                with mock.patch.object(
+                    recovery_supervisor.subprocess,
+                    "Popen",
+                    side_effect=capture_process,
+                ):
+                    self.assertFalse(runner.refresh(current))
+                invalidator.join(timeout=2.0)
+                self.assertFalse(invalidator.is_alive())
+                self.assertLess(time.monotonic() - before, 2.0)
+                self.assertEqual(len(captured), 1)
+                self.assertIsNotNone(captured[0].poll())
                 self.assertEqual(
                     ledger.connection.execute(
                         "SELECT count(*) FROM metadata WHERE key LIKE 'verification:probe:%'"

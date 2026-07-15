@@ -25,6 +25,7 @@ from recovery_supervisor import (
     RecoveryControls,
     RecoveryPolicy,
     RecoveryVerifier,
+    PythonProbeRunner,
     safe_field,
 )
 
@@ -290,6 +291,7 @@ def run(args: argparse.Namespace) -> int:
                 freshness_seconds=config.verification_freshness_seconds,
                 hold_down_seconds=config.verification_hold_down_seconds,
             )
+            PythonProbeRunner(verifier, config.probes).refresh_due()
             verification = [
                 {
                     "incidentId": incident_id,
