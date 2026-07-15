@@ -278,7 +278,17 @@ class RecoveryCliTests(unittest.TestCase):
 
             code, status, error = call_cli(root, "status")
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(status)["mode"], "observe")
+            status_result = json.loads(status)
+            self.assertEqual(status_result["mode"], "observe")
+            self.assertEqual(
+                status_result["foundation"],
+                {
+                    "fixerAvailable": False,
+                    "nativeVerification": True,
+                    "observeOnly": True,
+                    "remediationActionsAvailable": False,
+                },
+            )
 
             code, output, error = call_cli(
                 root,

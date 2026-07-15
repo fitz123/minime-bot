@@ -162,6 +162,11 @@ In tee and recovery modes, exhausted supervisor delivery triggers a throttled
 fixed native Telegram alert without including monitoring payload data. Keep the
 doctor's native Telegram/SOPS settings configured after changing sinks.
 
+These sink modes feed the observe-only recovery foundation. They do not enable
+Pi or Node remediation, model-selected actions, or mutating commands. A trusted
+Pi fixer, exact-session re-entry, action journal, independent two-slot recovery
+capsule, and offline bot rollback are deferred to a follow-up change.
+
 Tee and recovery modes also send an authenticated heartbeat on every doctor
 run, including unchanged healthy runs. Configure `MINIME_DOCTOR_ALERTMANAGER_URL`
 so the same post carries a deterministic Alertmanager-health observation; this

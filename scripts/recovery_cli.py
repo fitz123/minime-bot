@@ -66,7 +66,13 @@ def _safe_text(value: str, name: str, limit: int) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage same-host minime recovery")
+    parser = argparse.ArgumentParser(
+        description="Inspect and control the observe-only same-host recovery foundation",
+        epilog=(
+            "The foundation performs native intake, verification, controls, and "
+            "escalation only. Fixer execution and remediation actions are not available."
+        ),
+    )
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--config", default="recovery.json")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -150,6 +156,12 @@ def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: Recovery
     return {
         "mode": config.mode,
         "database": str(config.database),
+        "foundation": {
+            "fixerAvailable": False,
+            "nativeVerification": True,
+            "observeOnly": True,
+            "remediationActionsAvailable": False,
+        },
         "emergencyDeliveryConfigured": bool(
             os.environ.get("MINIME_TELEGRAM_CHAT_ID", "").strip()
             and os.environ.get("MINIME_TELEGRAM_SOPS_FILE", "").strip()

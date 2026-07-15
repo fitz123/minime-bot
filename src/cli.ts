@@ -111,6 +111,7 @@ Options:
 Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
+Recovery foundation: observe-only native intake, verification, controls, and escalation; no fixer or remediation actions. Trusted fixer, exact-session, action-journal, two-slot capsule, and offline rollback support are deferred.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {

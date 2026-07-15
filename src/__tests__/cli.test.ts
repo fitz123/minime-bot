@@ -156,6 +156,9 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
     assert.match(result.stdout, /minime-bot recovery config validate/);
     assert.match(result.stdout, /never SQL or shell/);
+    assert.match(result.stdout, /observe-only native intake/);
+    assert.match(result.stdout, /no fixer or remediation actions/);
+    assert.match(result.stdout, /two-slot capsule/);
     assert.match(result.stdout, /Knowledge commands do not resolve config secrets/);
     assert.match(result.stdout, /Control\/app workspace root/);
     assert.match(result.stdout, /MINIME_CONTROL_WORKSPACE_ROOT, then source repo root or package cwd\./);

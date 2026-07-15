@@ -383,6 +383,8 @@ describe("package artifact install", () => {
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
       assert.match(help.stdout, /minime-bot recovery config validate/);
+      assert.match(help.stdout, /observe-only native intake/);
+      assert.match(help.stdout, /no fixer or remediation actions/);
 
       const recoveryValidate = runInstalledBin(
         projectDir,
@@ -391,6 +393,19 @@ describe("package artifact install", () => {
       );
       assert.equal(recoveryValidate.status, 0, recoveryValidate.stderr || recoveryValidate.stdout);
       assert.equal(JSON.parse(recoveryValidate.stdout).mode, "observe");
+
+      const recoveryStatus = runInstalledBin(
+        projectDir,
+        ["recovery", "status", "--workspace", workspace],
+        workspace,
+      );
+      assert.equal(recoveryStatus.status, 0, recoveryStatus.stderr || recoveryStatus.stdout);
+      assert.deepEqual(JSON.parse(recoveryStatus.stdout).foundation, {
+        fixerAvailable: false,
+        nativeVerification: true,
+        observeOnly: true,
+        remediationActionsAvailable: false,
+      });
 
       const recoveryProcess = runInstalledBin(
         projectDir,
@@ -598,13 +613,18 @@ describe("package artifact install", () => {
 
 const INSTALLED_RECOVERY_E2E = String.raw`
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
+from unittest import mock
 
+import monitoring_native
 import recovery_config
 import recovery_ledger
 import recovery_supervisor
+import runtime_doctor
 
 workspace = Path(sys.argv[1])
 config = recovery_config.load_recovery_config(workspace / "recovery.json", workspace)
@@ -644,14 +664,6 @@ assert observer.claim_next() is None
 assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
 assert ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 0
 
-controls_clock = [200.0]
-controls = recovery_supervisor.RecoveryControls(ledger, clock=lambda: controls_clock[0])
-controls.set_dispatch(False, actor="operator", reason="installed bounded control", expires_at=210.0)
-assert controls.current().dispatch_enabled is False
-controls_clock[0] = 211.0
-assert controls.expire() is not None
-assert controls.current().dispatch_enabled is True
-
 resolved = json.dumps({"alerts": [{
     "status": "resolved",
     "fingerprint": "installed-episode",
@@ -664,24 +676,246 @@ resolved = json.dumps({"alerts": [{
         "instance": "local",
     },
 }]}).encode()
-assert ledger.record_events(recovery_supervisor.normalize_alertmanager(resolved)) == 1
+resolved_events = recovery_supervisor.normalize_alertmanager(resolved)
+assert ledger.record_events(resolved_events) == 1
+observer.reconcile()
+
+late_firing = json.dumps({"alerts": [{
+    "status": "firing",
+    "fingerprint": "installed-episode",
+    "startsAt": "2026-07-13T23:00:00Z",
+    "labels": {
+        "alertname": "BotUnavailable",
+        "component": "bot",
+        "failure_class": "unavailable",
+        "instance": "local",
+    },
+}]}).encode()
+assert ledger.record_events(recovery_supervisor.normalize_alertmanager(late_firing)) == 1
 observer.reconcile()
 incident = ledger.connection.execute("SELECT id, state FROM incidents").fetchone()
 assert incident["state"] == "verifying"
+latest = ledger.latest_events()
+assert len(latest) == 1
+assert latest[0]["status"] == "resolved"
+
+verification_clock = [2_000_000_000.0]
 verifier = recovery_supervisor.RecoveryVerifier(
     ledger,
     observer,
     source_ids=("alertmanager",),
-    cadence_seconds=4,
-    freshness_seconds=10,
+    cadence_seconds=config.runtime_doctor_cadence_seconds,
+    freshness_seconds=config.verification_freshness_seconds,
     hold_down_seconds=0,
-    clock=lambda: 300.0,
+    clock=lambda: verification_clock[0],
 )
-result = verifier.evaluate(int(incident["id"]))
-assert result.recovered is False
-assert "heartbeat_missing:alertmanager" in result.reasons
-assert verifier.mechanical_classification(int(incident["id"]), result) is None
+stale_at = verification_clock[0] - config.verification_freshness_seconds - 1
+verifier.record_heartbeat("supervisor", observed_at=stale_at)
+verifier.record_heartbeat("alertmanager", observed_at=stale_at)
+stale_result = verifier.evaluate(int(incident["id"]))
+assert stale_result.recovered is False
+assert "heartbeat_stale:supervisor" in stale_result.reasons
+assert "heartbeat_stale:alertmanager" in stale_result.reasons
+assert verifier.mechanical_classification(int(incident["id"]), stale_result) is None
 assert ledger.connection.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
+assert ledger.connection.execute("SELECT count(*) FROM actions").fetchone()[0] == 0
+
+controls_clock = [200.0]
+controls = recovery_supervisor.RecoveryControls(ledger, clock=lambda: controls_clock[0])
+controls.set_dispatch(False, actor="operator", reason="installed bounded control", expires_at=210.0)
+assert controls.current().dispatch_enabled is False
+controls_clock[0] = 211.0
+assert controls.expire() is not None
+assert controls.current().dispatch_enabled is True
+ledger.close()
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    token = root / "auth-token"
+    token.write_text("synthetic-auth-token-value", encoding="utf-8")
+    token.chmod(0o600)
+    doctor_env = {
+        "MINIME_DOCTOR_STATE_PATH": str(root / "doctor.json"),
+        "MINIME_DOCTOR_SINK": "tee",
+        "MINIME_DOCTOR_RECOVERY_URL": "http://127.0.0.1:9877/v1/runtime-doctor",
+        "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": str(token),
+        "MINIME_TELEGRAM_CHAT_ID": "DESTINATION_PLACEHOLDER",
+    }
+    doctor = runtime_doctor.DoctorConfig.from_environ(doctor_env)
+    runtime_doctor.write_delivery_state(doctor.state_path, set(), None)
+    native_messages = []
+    recovery_batches = []
+
+    def unavailable(batch):
+        recovery_batches.append([dict(event) for event in batch])
+        raise monitoring_native.DeliveryError("synthetic supervisor outage")
+
+    for observed in (
+        {"node_unavailable"},
+        {"node_unavailable", "prometheus_unhealthy"},
+        set(),
+    ):
+        with mock.patch.object(runtime_doctor, "collect_incidents", return_value=observed):
+            assert runtime_doctor.run_doctor(
+                doctor,
+                deliver=native_messages.append,
+                deliver_recovery=unavailable,
+            ) == 1
+
+    restarted_doctor = runtime_doctor.DoctorConfig.from_environ(doctor_env)
+    with mock.patch.object(runtime_doctor, "collect_incidents", return_value=set()):
+        assert runtime_doctor.run_doctor(
+            restarted_doctor,
+            deliver=native_messages.append,
+            deliver_recovery=lambda batch: recovery_batches.append(
+                [dict(event) for event in batch]
+            ),
+        ) == 0
+    final_batch = recovery_batches[-1]
+    assert [(event["code"], event["status"]) for event in final_batch] == [
+        ("node_unavailable", "firing"),
+        ("prometheus_unhealthy", "firing"),
+        ("node_unavailable", "resolved"),
+        ("prometheus_unhealthy", "resolved"),
+    ]
+    assert len({event["transition_id"] for event in final_batch}) == len(final_batch)
+    assert native_messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE) == 1
+    assert "pending" not in json.loads(doctor.state_path.read_text("utf-8"))
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    true_executable = next(
+        str(candidate)
+        for candidate in (Path("/usr/bin/true"), Path("/bin/true"))
+        if candidate.is_file()
+    )
+    probe_config = recovery_config.RecoveryConfig(
+        path=root / "recovery.json",
+        workspace=root,
+        mode="observe",
+        database=root / "ledger.sqlite3",
+        spool_directory=root / "spool",
+        auth_token_file=root / "auth-token",
+        host="127.0.0.1",
+        port=9877,
+        correlation_rules=config.correlation_rules,
+        source_ids=("alertmanager",),
+        probes=({
+            "id": "native-health",
+            "executable": true_executable,
+            "argv": [],
+            "env": {"LANG": "C"},
+            "timeoutMs": 1000,
+        },),
+        runtime_doctor_cadence_seconds=300,
+        verification_freshness_seconds=660,
+        verification_hold_down_seconds=0,
+    )
+    with recovery_ledger.RecoveryLedger(probe_config.database) as probe_ledger:
+        probe_service = recovery_supervisor._build_recovery_service(
+            probe_ledger,
+            recovery_supervisor.AtomicJsonSpool(probe_config.spool_directory / "events"),
+            recovery_supervisor.EmergencyNotifier(
+                probe_config.spool_directory / "notifications", delivery=None
+            ),
+            configured=probe_config,
+            configured_rules=policy.rules,
+            source_ids=probe_config.source_ids,
+            mode=probe_config.mode,
+        )
+        assert probe_service.accept(events, heartbeats={"alertmanager": True}).status == 200
+        assert probe_service.accept(
+            resolved_events, heartbeats={"alertmanager": True}
+        ).status == 200
+        isolated_cwd = root / "missing-active-package"
+        isolated_cwd.mkdir()
+        launches = []
+        real_popen = recovery_supervisor.subprocess.Popen
+
+        def capture_launch(*args, **kwargs):
+            launches.append(args[0])
+            return real_popen(*args, **kwargs)
+
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(isolated_cwd)
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": str(root / "missing-bin"), "NODE": str(root / "missing-node")},
+                clear=True,
+            ), mock.patch.object(
+                recovery_supervisor.subprocess, "Popen", side_effect=capture_launch
+            ):
+                probe_service.maintenance()
+        finally:
+            os.chdir(previous_cwd)
+        assert len(launches) == 1
+        assert tuple(launches[0]) == (true_executable,)
+        probe_incident = probe_ledger.connection.execute(
+            "SELECT id, generation, policy_revision, state FROM incidents"
+        ).fetchone()
+        assert probe_incident["state"] == "recovered"
+        probe_fence = recovery_supervisor.VerificationFence(
+            int(probe_incident["id"]),
+            int(probe_incident["generation"]),
+            int(probe_incident["policy_revision"]),
+        )
+        assert probe_service.verifier is not None
+        assert probe_service.verifier._probe_observation(
+            probe_ledger.connection, probe_fence, "native-health"
+        )[0] is True
+        assert probe_ledger.connection.execute(
+            "SELECT count(*) FROM invocations"
+        ).fetchone()[0] == 0
+        assert probe_ledger.connection.execute(
+            "SELECT count(*) FROM actions"
+        ).fetchone()[0] == 0
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as retention_ledger:
+        historical_payloads = (
+            ("firing", "2026-07-12T00:00:00Z"),
+            ("resolved", "2026-07-13T00:00:00Z"),
+            ("firing", "2026-07-14T00:00:00Z"),
+        )
+        for status, observed_at in historical_payloads:
+            alert = {
+                "status": status,
+                "fingerprint": "retained-active-episode",
+                "startsAt": observed_at,
+                "labels": {
+                    "alertname": "BotUnavailable",
+                    "component": "bot",
+                    "failure_class": "unavailable",
+                    "instance": "local",
+                },
+            }
+            if status == "resolved":
+                alert["endsAt"] = observed_at
+            payload = json.dumps({"alerts": [alert]}).encode()
+            assert retention_ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(payload)
+            ) == 1
+        prune_at = time.time() + 2
+        assert retention_ledger.prune_event_history(
+            now=prune_at, retention_seconds=1, batch_size=1
+        ) == 1
+        assert retention_ledger.connection.execute(
+            "SELECT count(*) FROM events"
+        ).fetchone()[0] == 2
+        assert retention_ledger.prune_event_history(
+            now=prune_at, retention_seconds=1, batch_size=1
+        ) == 1
+        assert retention_ledger.prune_event_history(
+            now=prune_at, retention_seconds=1, batch_size=1
+        ) == 0
+        retained = retention_ledger.latest_events()
+        assert len(retained) == 1
+        assert retained[0]["status"] == "firing"
+        assert retention_ledger.connection.execute(
+            "SELECT count(*) FROM audit WHERE operation = 'event_history_pruned'"
+        ).fetchone()[0] == 2
 
 class FailingLedger:
     def record_events(self, _events):
@@ -700,6 +934,59 @@ with tempfile.TemporaryDirectory() as directory:
     assert accepted.status == 202
     assert len(list((root / "events").glob("*.json"))) == 1
     assert len(delivered) == 1
+    assert "BotUnavailable" not in delivered[0]
+
+    recovered_ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+    recovered_service = recovery_supervisor.RecoveryService(
+        recovered_ledger, recovery_supervisor.AtomicJsonSpool(root / "events"), emergency
+    )
+    assert recovered_service.health().status == 200
+    assert recovered_ledger.connection.execute(
+        "SELECT count(*) FROM events"
+    ).fetchone()[0] == 1
+    assert list((root / "events").glob("*.json")) == []
+    recovered_ledger.close()
+
+    blocker = root / "blocked-spool"
+    blocker.write_text("not a directory", encoding="utf-8")
+    blocked_delivery = []
+    blocked_service = recovery_supervisor.RecoveryService(
+        FailingLedger(),
+        recovery_supervisor.AtomicJsonSpool(blocker / "events"),
+        recovery_supervisor.EmergencyNotifier(
+            root / "blocked-notifications", delivery=blocked_delivery.append, cooldown=0
+        ),
+    )
+    assert blocked_service.accept(events).status == 503
+    assert len(blocked_delivery) == 1
+    assert "BotUnavailable" not in blocked_delivery[0]
+
+    corrupt_spool = recovery_supervisor.AtomicJsonSpool(root / "corrupt-events")
+    corrupt_spool.path.mkdir()
+    (corrupt_spool.path / "invalid.json").write_text("not-json", encoding="ascii")
+    corrupt_delivery = []
+    with recovery_ledger.RecoveryLedger(root / "corrupt-spool-ledger.sqlite3") as healthy_ledger:
+        corrupt_service = recovery_supervisor.RecoveryService(
+            healthy_ledger,
+            corrupt_spool,
+            recovery_supervisor.EmergencyNotifier(
+                root / "corrupt-notifications", delivery=corrupt_delivery.append, cooldown=0
+            ),
+        )
+        assert corrupt_service.accept(events).status == 503
+    assert len(corrupt_delivery) == 1
+    assert "BotUnavailable" not in corrupt_delivery[0]
+
+    corrupt_database = root / "corrupt.sqlite3"
+    corrupt_bytes = b"invalid-ledger-fixture"
+    corrupt_database.write_bytes(corrupt_bytes)
+    try:
+        recovery_ledger.RecoveryLedger(corrupt_database)
+    except recovery_ledger.LedgerCorrupt:
+        pass
+    else:
+        raise AssertionError("corrupt installed ledger must fail closed")
+    assert corrupt_database.read_bytes() == corrupt_bytes
 
 removed = (
     "Recovery" + "Processor",
@@ -707,7 +994,6 @@ removed = (
     "Bounded" + "PolicyAdapter",
 )
 assert all(not hasattr(recovery_supervisor, name) for name in removed)
-ledger.close()
 `;
 
 const INSTALLED_ARTIFACT_CHECK = String.raw`
