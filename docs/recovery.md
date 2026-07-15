@@ -91,7 +91,10 @@ reviewed contracts are `/usr/bin/true` or `/bin/true` with no arguments,
 exactly `print` plus a bounded launchd target. Only `LANG` and `LC_ALL` locale
 variables are accepted. Shells, interpreters, arbitrary files, network clients,
 loader variables, and other executable/argument forms are rejected. Timeouts
-are bounded. The stdlib Python supervisor resolves and revalidates the native
+are bounded, and the cumulative timeout budget must fit within one configured
+runtime-doctor cadence. Each maintenance pass refreshes at most one incident's
+probe set and schedules its next refresh from the durable set-completion time.
+The stdlib Python supervisor resolves and revalidates the native
 executable immediately before launch, supplies only the configured environment,
 uses no shell, runs from `/`, discards all output, and isolates the probe in a
 process group that is terminated on timeout or a stale generation/policy fence.
@@ -126,6 +129,9 @@ chmod 600 /path/to/control-workspace/config/recovery-auth-token
 The token reader requires an owner-owned, regular, non-symlink ASCII file with
 no group/other permission and a trimmed value from 16 through 4,096 bytes. Do
 not put the token in the plist, logs, shell arguments, or recovery JSON.
+Ledger and spool directories and their files also fail closed unless they are
+owner-owned, regular non-symlink storage with no group/other permission. The
+supervisor creates spool directories as mode `0700` and items as mode `0600`.
 
 Validate the JSON, lint the filled plist, copy it into the account's
 `~/Library/LaunchAgents` directory, and bootstrap it:

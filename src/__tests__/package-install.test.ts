@@ -919,7 +919,8 @@ with tempfile.TemporaryDirectory() as directory:
         ).fetchone()[0] == 2
 
 class FailingLedger:
-    def record_events(self, _events):
+    def record_events(self, _events, *, observed_at=None):
+        del observed_at
         raise recovery_ledger.LedgerUnavailable("synthetic")
 
 with tempfile.TemporaryDirectory() as directory:
@@ -934,6 +935,8 @@ with tempfile.TemporaryDirectory() as directory:
     accepted = service.accept(events)
     assert accepted.status == 202
     assert len(list((root / "events").glob("*.json"))) == 1
+    assert len(delivered) == 0
+    emergency.drain()
     assert len(delivered) == 1
     assert "BotUnavailable" not in delivered[0]
 
@@ -959,6 +962,7 @@ with tempfile.TemporaryDirectory() as directory:
         ),
     )
     assert blocked_service.accept(events).status == 503
+    blocked_service.emergency.drain()
     assert len(blocked_delivery) == 1
     assert "BotUnavailable" not in blocked_delivery[0]
 
@@ -975,6 +979,7 @@ with tempfile.TemporaryDirectory() as directory:
             ),
         )
         assert corrupt_service.accept(events).status == 503
+        corrupt_service.emergency.drain()
     assert len(corrupt_delivery) == 1
     assert "BotUnavailable" not in corrupt_delivery[0]
 

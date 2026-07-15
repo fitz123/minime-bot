@@ -511,6 +511,8 @@ class RecoveryServiceTests(unittest.TestCase):
             result = service.accept(events)
             self.assertEqual((result.status, result.text), (202, "durably spooled"))
             self.assertEqual(len(list((root / "events").glob("*.json"))), 1)
+            self.assertEqual(messages, [])
+            emergency.drain()
             self.assertEqual(len(messages), 1)
             self.assertNotIn("SyntheticDown", messages[0])
 
@@ -529,8 +531,111 @@ class RecoveryServiceTests(unittest.TestCase):
                 emergency,
             ).accept(events)
             self.assertEqual(failed.status, 503)
-            self.assertIn("persistence failed", messages[-1].lower())
+            emergency.drain()
+            self.assertIn("spool validation failed", messages[-1].lower())
             self.assertNotIn("SyntheticDown", messages[-1])
+
+    def test_event_spool_rejects_unsafe_directories_and_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_spool = recovery_supervisor.AtomicJsonSpool(root / "private-events")
+            private_spool.put("safe", {"version": 1})
+            self.assertEqual(private_spool.path.stat().st_mode & 0o777, 0o700)
+            [(item_path, _value)] = private_spool.items()
+            self.assertEqual(item_path.stat().st_mode & 0o777, 0o600)
+
+            unsafe_directory = root / "unsafe-events"
+            unsafe_directory.mkdir()
+            unsafe_directory.chmod(0o755)
+            with self.assertRaises(recovery_supervisor.SpoolError):
+                recovery_supervisor.AtomicJsonSpool(unsafe_directory).items()
+
+            attacker_directory = root / "attacker-events"
+            attacker_directory.mkdir(mode=0o700)
+            linked_directory = root / "linked-events"
+            linked_directory.symlink_to(attacker_directory, target_is_directory=True)
+            with self.assertRaises(recovery_supervisor.SpoolError):
+                recovery_supervisor.AtomicJsonSpool(linked_directory).put(
+                    "unsafe", {"version": 1}
+                )
+
+            unsafe_item_spool = recovery_supervisor.AtomicJsonSpool(root / "unsafe-items")
+            unsafe_item_spool.path.mkdir(mode=0o700)
+            unsafe_item = unsafe_item_spool.path / "unsafe.json"
+            unsafe_item.write_text("{}", encoding="ascii")
+            unsafe_item.chmod(0o644)
+            with self.assertRaises(recovery_supervisor.SpoolError):
+                unsafe_item_spool.items()
+
+            unsafe_item.unlink()
+            target = root / "target.json"
+            target.write_text("{}", encoding="ascii")
+            target.chmod(0o600)
+            unsafe_item.symlink_to(target)
+            with self.assertRaises(recovery_supervisor.SpoolError):
+                unsafe_item_spool.items()
+
+    def test_symlinked_event_spool_cannot_inject_authenticated_intake(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attacker_directory = root / "attacker-events"
+            attacker_directory.mkdir(mode=0o700)
+            event_spool_path = root / "events"
+            event_spool_path.symlink_to(attacker_directory, target_is_directory=True)
+            event = recovery_supervisor._normalized_event(
+                source="runtime_doctor",
+                fingerprint="node_unavailable",
+                code="node_unavailable",
+                status="firing",
+                transition="forged-transition",
+                occurred_at=None,
+                component="runtime",
+                failure_class="node_unavailable",
+            )
+            envelope = recovery_supervisor.RecoveryService._intake_envelope(
+                [event], None
+            )
+            forged = attacker_directory / "forged.json"
+            forged.write_text(json.dumps(envelope), encoding="ascii")
+            forged.chmod(0o600)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(event_spool_path),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                )
+                self.assertEqual(service.health().status, 503)
+                self.assertEqual(
+                    ledger.connection.execute("SELECT count(*) FROM events").fetchone()[0],
+                    0,
+                )
+
+    def test_request_path_only_spools_emergency_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempts: list[str] = []
+
+            def unavailable(message: str) -> None:
+                attempts.append(message)
+                raise monitoring_native.DeliveryError("synthetic native outage")
+
+            emergency = recovery_supervisor.EmergencyNotifier(
+                root / "notifications", delivery=unavailable, cooldown=0
+            )
+            service = recovery_supervisor.RecoveryService(
+                FailingLedger(),  # type: ignore[arg-type]
+                recovery_supervisor.AtomicJsonSpool(root / "events"),
+                emergency,
+            )
+            events = recovery_supervisor.normalize_alertmanager(
+                alert_body(firing_alert())
+            )
+            self.assertEqual(service.accept(events).status, 202)
+            self.assertEqual(attempts, [])
+            emergency.drain()
+            self.assertEqual(len(attempts), 1)
 
     def test_spool_replay_uses_durable_observation_order_and_event_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -749,9 +854,11 @@ class RecoveryServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             delivered: list[str] = []
+            attempts = [0]
             available = False
 
             def delivery(message: str) -> None:
+                attempts[0] += 1
                 if not available:
                     raise monitoring_native.DeliveryError("synthetic outage")
                 delivered.append(message)
@@ -761,6 +868,7 @@ class RecoveryServiceTests(unittest.TestCase):
             )
             notifier.emit("ledger_corrupt")
             self.assertEqual(len(list((root / "notifications").glob("*.json"))), 1)
+            self.assertEqual(attempts[0], 0)
             available = True
             notifier.drain()
             self.assertEqual(len(delivered), 1)
@@ -797,6 +905,8 @@ class RecoveryServiceTests(unittest.TestCase):
                 blocker.unlink()
                 available = True
                 self.assertEqual(outbox.deliver_due(), 1)
+                self.assertEqual(delivered, [])
+                notifier.drain()
                 self.assertEqual(len(delivered), 1)
                 self.assertIsNotNone(
                     ledger.connection.execute(
@@ -836,6 +946,8 @@ class RecoveryServiceTests(unittest.TestCase):
             self.assertEqual(service.health().status, 503)
             with self.assertRaises(recovery_ledger.LedgerUnavailable):
                 _ = ledger.connection
+            self.assertEqual(messages, [])
+            service.maintenance()
             self.assertTrue(any("integrity" in message for message in messages))
 
     def test_corrupt_emergency_spool_does_not_terminate_maintenance(self) -> None:
@@ -1799,6 +1911,67 @@ class RecoveryVerificationTests(unittest.TestCase):
                 ]
                 self.assertEqual(observations, [(True, 100.0), (True, 500.0)])
 
+    def test_probe_refresh_is_scheduled_from_set_completion_once_per_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(ledger, clock)
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("first", "second"),
+                    cadence_seconds=30,
+                    freshness_seconds=120,
+                    hold_down_seconds=0,
+                    clock=lambda: clock[0],
+                )
+                executable = self._native_executable("true")
+                probes = tuple(
+                    {
+                        "id": probe_id,
+                        "executable": executable,
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    }
+                    for probe_id in verifier.probe_ids
+                )
+                runner = recovery_supervisor.PythonProbeRunner(verifier, probes)
+                fence = self._fence(ledger, incident_id)
+                with mock.patch.object(
+                    runner,
+                    "_run_command",
+                    side_effect=(
+                        {
+                            "id": "first",
+                            "exitCode": 0,
+                            "timedOut": False,
+                            "observedAt": 60.0,
+                        },
+                        {
+                            "id": "second",
+                            "exitCode": 0,
+                            "timedOut": False,
+                            "observedAt": 100.0,
+                        },
+                    ),
+                ):
+                    self.assertTrue(runner.refresh(fence))
+                self.assertIsNone(verifier.next_probe_refresh())
+                clock[0] = 141.0
+                self.assertEqual(verifier.next_probe_refresh(), fence)
+                with mock.patch.object(
+                    verifier, "next_probe_refresh", return_value=fence
+                ) as next_refresh, mock.patch.object(
+                    runner, "refresh", return_value=True
+                ) as refresh:
+                    self.assertEqual(runner.refresh_due(), 1)
+                next_refresh.assert_called_once_with()
+                refresh.assert_called_once_with(fence)
+                with self.assertRaises(ValueError):
+                    runner.refresh_due(limit=2)
+
     def test_probe_timeout_discards_output_and_reaps_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2021,6 +2194,8 @@ class RecoveryNotificationTests(unittest.TestCase):
                     outbox.deliver_due(),
                     len(recovery_supervisor._IMMEDIATE_ESCALATION_REASONS),
                 )
+                self.assertEqual(messages, [])
+                emergency.drain()
                 self.assertEqual(
                     len(messages), len(recovery_supervisor._IMMEDIATE_ESCALATION_REASONS)
                 )

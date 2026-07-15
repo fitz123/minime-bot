@@ -94,7 +94,7 @@ _RETRY_BUDGET_BOUNDS = (0, 10)
 _MAX_CONTROL_TTL = 31 * 86_400.0
 PROBE_FENCE_POLL_SECONDS = 0.1
 PROBE_TERMINATION_GRACE_SECONDS = 0.25
-MAX_PROBE_REFRESHES_PER_MAINTENANCE = 32
+MAX_PROBE_REFRESHES_PER_MAINTENANCE = 1
 
 
 class IntakeError(ValueError):
@@ -1734,6 +1734,13 @@ class RecoveryVerifier:
         )
 
     @staticmethod
+    def _probe_set_key(fence: VerificationFence) -> str:
+        return (
+            f"verification:probe-set:{fence.incident_id}:{fence.generation}:"
+            f"{fence.policy_revision}"
+        )
+
+    @staticmethod
     def _probe_observation(
         connection: Any, fence: VerificationFence, probe_id: str
     ) -> tuple[bool, float] | None:
@@ -1761,6 +1768,34 @@ class RecoveryVerifier:
         ):
             raise LedgerCorrupt("recovery probe observation is invalid")
         return bool(value["healthy"]), float(value["observed_at"])
+
+    @staticmethod
+    def _probe_set_observation(
+        connection: Any, fence: VerificationFence
+    ) -> float | None:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (RecoveryVerifier._probe_set_key(fence),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(str(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LedgerCorrupt("recovery probe-set observation is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {"completed_at", "generation", "incident_id", "policy_revision"}
+            or value["incident_id"] != fence.incident_id
+            or value["generation"] != fence.generation
+            or value["policy_revision"] != fence.policy_revision
+            or isinstance(value["completed_at"], bool)
+            or not isinstance(value["completed_at"], (int, float))
+            or not math.isfinite(value["completed_at"])
+        ):
+            raise LedgerCorrupt("recovery probe-set observation is invalid")
+        return float(value["completed_at"])
 
     def _fence_valid(self, connection: Any, fence: VerificationFence) -> bool:
         incident = connection.execute(
@@ -1806,8 +1841,15 @@ class RecoveryVerifier:
                 if any(
                     observation is None
                     or observation[1] > now + 1.0
-                    or now - observation[1] >= refresh_after
+                    or now - observation[1] >= self.freshness_seconds
                     for observation in observations
+                ):
+                    return fence
+                completed_at = self._probe_set_observation(connection, fence)
+                if (
+                    completed_at is None
+                    or completed_at > now + 1.0
+                    or now - completed_at >= refresh_after
                 ):
                     return fence
         return None
@@ -1882,6 +1924,20 @@ class RecoveryVerifier:
                     "INSERT INTO metadata(key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (self._probe_key(fence, probe_id), value),
+                )
+            if require_all:
+                completed = _canonical_json(
+                    {
+                        "completed_at": float(timestamp),
+                        "generation": fence.generation,
+                        "incident_id": fence.incident_id,
+                        "policy_revision": fence.policy_revision,
+                    }
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (self._probe_set_key(fence), completed),
                 )
         return True
 
@@ -2071,9 +2127,12 @@ class PythonProbeRunner:
         sleeper: Callable[[float], None] = time.sleep,
     ):
         commands = tuple(ProbeCommand.from_config(probe) for probe in probes)
-        if (
-            sum(int(round(command.timeout_seconds * 1_000)) for command in commands)
-            > MAX_PROBE_TOTAL_TIMEOUT_MS
+        timeout_budget_ms = sum(
+            int(round(command.timeout_seconds * 1_000)) for command in commands
+        )
+        if timeout_budget_ms > min(
+            MAX_PROBE_TOTAL_TIMEOUT_MS,
+            int(verifier.cadence_seconds * 1_000),
         ):
             raise ValueError("recovery probe runner timeout budget is invalid")
         if tuple(command.identifier for command in commands) != verifier.probe_ids:
@@ -2082,6 +2141,10 @@ class PythonProbeRunner:
         self.commands = commands
         self.monotonic = monotonic
         self.sleeper = sleeper
+        self.maintenance_budget_seconds = min(
+            MAX_PROBE_TOTAL_TIMEOUT_MS / 1_000.0,
+            verifier.cadence_seconds,
+        )
 
     @staticmethod
     def _resolved_executable(command: ProbeCommand) -> str | None:
@@ -2147,10 +2210,21 @@ class PythonProbeRunner:
             pass
 
     def _run_command(
-        self, fence: VerificationFence, command: ProbeCommand
+        self,
+        fence: VerificationFence,
+        command: ProbeCommand,
+        *,
+        maintenance_deadline: float,
     ) -> dict[str, Any] | None:
         if not self.verifier.fence_valid(fence):
             return None
+        if self.monotonic() >= maintenance_deadline:
+            return {
+                "id": command.identifier,
+                "exitCode": -1,
+                "timedOut": True,
+                "observedAt": self.verifier.clock(),
+            }
         executable = self._resolved_executable(command)
         if executable is None:
             if not self.verifier.fence_valid(fence):
@@ -2191,7 +2265,10 @@ class PythonProbeRunner:
                 "observedAt": self.verifier.clock(),
             }
 
-        deadline = self.monotonic() + command.timeout_seconds
+        deadline = min(
+            self.monotonic() + command.timeout_seconds,
+            maintenance_deadline,
+        )
         timed_out = False
         stale = False
         try:
@@ -2223,8 +2300,13 @@ class PythonProbeRunner:
         if not self.commands or not self.verifier.fence_valid(fence):
             return False
         results: list[dict[str, Any]] = []
+        maintenance_deadline = self.monotonic() + self.maintenance_budget_seconds
         for command in self.commands:
-            result = self._run_command(fence, command)
+            result = self._run_command(
+                fence,
+                command,
+                maintenance_deadline=maintenance_deadline,
+            )
             if result is None:
                 return False
             results.append(result)
@@ -2235,24 +2317,26 @@ class PythonProbeRunner:
     def refresh_due(
         self, *, limit: int = MAX_PROBE_REFRESHES_PER_MAINTENANCE
     ) -> int:
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit != MAX_PROBE_REFRESHES_PER_MAINTENANCE
+        ):
             raise ValueError("recovery probe refresh limit is invalid")
-        refreshed = 0
-        for _ in range(limit):
-            fence = self.verifier.next_probe_refresh()
-            if fence is None:
-                break
-            if self.refresh(fence):
-                refreshed += 1
-            elif self.verifier.fence_valid(fence):
-                # A valid fence with no recorded result would be selected again
-                # immediately; leave it for the next bounded maintenance pass.
-                break
-        return refreshed
+        fence = self.verifier.next_probe_refresh()
+        if fence is None:
+            return 0
+        return 1 if self.refresh(fence) else 0
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
         os.fsync(descriptor)
     finally:
@@ -2265,32 +2349,122 @@ class AtomicJsonSpool:
         self.max_item_bytes = max_item_bytes
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _validate_private_directory(details: os.stat_result) -> None:
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or details.st_mode & 0o077
+        ):
+            raise SpoolError("spool directory permissions are unsafe")
+
+    @staticmethod
+    def _validate_private_file(details: os.stat_result) -> None:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or details.st_mode & 0o077
+        ):
+            raise SpoolError("spool item permissions are unsafe")
+
+    def _directory_descriptor(self, *, create: bool) -> int | None:
+        try:
+            if create:
+                self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(
+                self.path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise SpoolError("spool directory is unavailable") from None
+        except OSError as exc:
+            raise SpoolError("spool directory validation failed") from exc
+        try:
+            self._validate_private_directory(os.fstat(descriptor))
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _entry_details(self, descriptor: int, name: str) -> os.stat_result | None:
+        try:
+            details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        self._validate_private_file(details)
+        return details
+
     def put(self, key: str, value: dict[str, Any], *, replace: bool = False) -> None:
         data = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
         if not data or len(data) > self.max_item_bytes:
             raise SpoolError("spool item is invalid")
         destination = self.path_for_key(key)
         with self._lock:
+            directory_descriptor: int | None = None
+            item_descriptor: int | None = None
+            temporary: str | None = None
             try:
-                self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if destination.exists() and not replace:
+                directory_descriptor = self._directory_descriptor(create=True)
+                assert directory_descriptor is not None
+                if (
+                    self._entry_details(directory_descriptor, destination.name)
+                    is not None
+                    and not replace
+                ):
                     return
-                descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=self.path)
-                try:
-                    os.fchmod(descriptor, 0o600)
-                    with os.fdopen(descriptor, "wb") as handle:
-                        handle.write(data)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, destination)
-                    _fsync_directory(self.path)
-                finally:
+                for _attempt in range(128):
+                    temporary = f".pending-{secrets.token_hex(16)}"
                     try:
-                        os.unlink(temporary)
+                        item_descriptor = os.open(
+                            temporary,
+                            os.O_WRONLY
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | os.O_CLOEXEC
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                            dir_fd=directory_descriptor,
+                        )
+                        break
+                    except FileExistsError:
+                        continue
+                else:
+                    raise SpoolError("spool temporary allocation failed")
+                assert item_descriptor is not None
+                os.fchmod(item_descriptor, 0o600)
+                handle = os.fdopen(item_descriptor, "wb")
+                item_descriptor = None
+                with handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(
+                    temporary,
+                    destination.name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                temporary = None
+                os.fsync(directory_descriptor)
+            except (OSError, UnicodeError, ValueError) as exc:
+                if isinstance(exc, SpoolError):
+                    raise
+                raise SpoolError("spool write failed") from exc
+            finally:
+                if temporary is not None and directory_descriptor is not None:
+                    try:
+                        os.unlink(temporary, dir_fd=directory_descriptor)
                     except FileNotFoundError:
                         pass
-            except (OSError, UnicodeError, ValueError) as exc:
-                raise SpoolError("spool write failed") from exc
+                if item_descriptor is not None:
+                    os.close(item_descriptor)
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
 
     def path_for_key(self, key: str) -> Path:
         name = f"{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
@@ -2301,32 +2475,85 @@ class AtomicJsonSpool:
 
     def items(self) -> list[tuple[Path, dict[str, Any]]]:
         with self._lock:
+            directory_descriptor: int | None = None
             try:
-                paths = sorted(self.path.glob("*.json")) if self.path.exists() else []
+                directory_descriptor = self._directory_descriptor(create=False)
+                if directory_descriptor is None:
+                    return []
+                names = sorted(
+                    name
+                    for name in os.listdir(directory_descriptor)
+                    if name.endswith(".json")
+                )
                 values: list[tuple[Path, dict[str, Any]]] = []
-                for path in paths:
-                    if not path.is_file() or path.stat().st_size > self.max_item_bytes:
+                for name in names:
+                    details = self._entry_details(directory_descriptor, name)
+                    if details is None or details.st_size > self.max_item_bytes:
                         raise SpoolError("spool item validation failed")
-                    raw = path.read_bytes()
+                    item_descriptor = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_CLOEXEC
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_descriptor,
+                    )
+                    try:
+                        opened_details = os.fstat(item_descriptor)
+                        self._validate_private_file(opened_details)
+                        if (
+                            opened_details.st_dev != details.st_dev
+                            or opened_details.st_ino != details.st_ino
+                            or opened_details.st_size > self.max_item_bytes
+                        ):
+                            raise SpoolError("spool item validation failed")
+                        chunks: list[bytes] = []
+                        remaining = self.max_item_bytes + 1
+                        while remaining:
+                            chunk = os.read(item_descriptor, remaining)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            remaining -= len(chunk)
+                        raw = b"".join(chunks)
+                    finally:
+                        os.close(item_descriptor)
+                    if len(raw) > self.max_item_bytes:
+                        raise SpoolError("spool item validation failed")
                     value = json.loads(raw.decode("ascii"))
                     if not isinstance(value, dict):
                         raise SpoolError("spool item validation failed")
-                    values.append((path, value))
+                    values.append((self.path / name, value))
                 return values
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
                 if isinstance(exc, SpoolError):
                     raise
                 raise SpoolError("spool read failed") from exc
+            finally:
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
 
     def remove(self, path: Path) -> None:
+        if path.parent != self.path or not path.name.endswith(".json"):
+            raise SpoolError("spool removal target is invalid")
         with self._lock:
+            directory_descriptor: int | None = None
             try:
-                path.unlink()
-                _fsync_directory(self.path)
+                directory_descriptor = self._directory_descriptor(create=False)
+                if directory_descriptor is None:
+                    return
+                if self._entry_details(directory_descriptor, path.name) is None:
+                    return
+                os.unlink(path.name, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
             except FileNotFoundError:
                 return
             except OSError as exc:
+                if isinstance(exc, SpoolError):
+                    raise
                 raise SpoolError("spool removal failed") from exc
+            finally:
+                if directory_descriptor is not None:
+                    os.close(directory_descriptor)
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -2408,20 +2635,9 @@ class EmergencyNotifier:
                     except (MonitoringError, OSError):
                         return False
                 return False
-            try:
-                self._drain_locked(state)
-            except SpoolError:
-                # The new item is already durably owned by the emergency spool.
-                if self.delivery is not None:
-                    try:
-                        self.delivery(_EMERGENCY_MESSAGES[code])
-                        state[code] = now
-                        try:
-                            _atomic_json(self.state_path, state)
-                        except OSError:
-                            pass
-                    except (MonitoringError, OSError):
-                        pass
+            # Request paths own only this durable handoff. Maintenance drains
+            # the native network delivery so an unavailable sink cannot occupy
+            # the bounded HTTP request pool.
             return True
 
     def drain(self) -> None:
@@ -2655,7 +2871,6 @@ class RecoveryService:
                 self.verifier.record_heartbeat("supervisor")
             if self.coordinator is not None:
                 self.coordinator.reconcile()
-            self.emergency.drain()
         except LedgerError as exc:
             self._report_ledger_error(exc)
             return IntakeResult(503, "unhealthy")
@@ -2684,6 +2899,17 @@ class RecoveryService:
             )
         except LedgerError as exc:
             self._report_ledger_error(exc)
+        except SpoolError:
+            self.emergency.emit("spool_corrupt")
+        if self._ledger_corrupt:
+            return summary
+        if self.notifications is not None:
+            try:
+                self.notifications.deliver_due()
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
+        try:
+            self.emergency.drain()
         except SpoolError:
             self.emergency.emit("spool_corrupt")
         if self._ledger_corrupt:
@@ -2722,17 +2948,6 @@ class RecoveryService:
                             )
             except LedgerError as exc:
                 self._report_ledger_error(exc)
-        if self._ledger_corrupt:
-            return summary
-        if self.notifications is not None:
-            try:
-                self.notifications.deliver_due()
-            except LedgerError as exc:
-                self._report_ledger_error(exc)
-        try:
-            self.emergency.drain()
-        except SpoolError:
-            self.emergency.emit("spool_corrupt")
         return summary
 
 
@@ -3059,6 +3274,10 @@ def main(argv: list[str] | None = None) -> int:
         ledger = RecoveryLedger(configured.database, busy_timeout_ms=args.busy_timeout_ms)
     except LedgerCorrupt:
         emergency.emit("ledger_corrupt")
+        try:
+            emergency.drain()
+        except SpoolError:
+            pass
         print("recovery supervisor ledger validation failed", file=sys.stderr)
         return 1
     except LedgerUnavailable:
@@ -3118,6 +3337,10 @@ def main(argv: list[str] | None = None) -> int:
             server.server_close()
             restore_signal_handlers()
             emergency.emit("ledger_corrupt")
+            try:
+                emergency.drain()
+            except SpoolError:
+                pass
             print("recovery supervisor ledger validation failed", file=sys.stderr)
             return 1
     def serve_requests() -> None:

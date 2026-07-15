@@ -279,7 +279,11 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     if not isinstance(raw_probes, list) or len(raw_probes) > 128:
         raise RecoveryConfigError("recovery probes are invalid")
     probes = tuple(validated_probe_command(item) for item in raw_probes)
-    if sum(int(item["timeoutMs"]) for item in probes) > MAX_PROBE_TOTAL_TIMEOUT_MS:
+    probe_timeout_budget_ms = sum(int(item["timeoutMs"]) for item in probes)
+    if probe_timeout_budget_ms > min(
+        MAX_PROBE_TOTAL_TIMEOUT_MS,
+        cadence_seconds * 1_000,
+    ):
         raise RecoveryConfigError("recovery probe timeout budget is invalid")
     ids = [str(item["id"]) for item in probes]
     if len(ids) != len(set(ids)):

@@ -219,9 +219,23 @@ class RecoveryConfigTests(unittest.TestCase):
                 }
                 for index in range(2)
             ]
+            cadence_exhausting_probes = config_document()
+            cadence_exhausting_probes["runtimeDoctorCadenceSeconds"] = 30
+            cadence_exhausting_probes["verificationFreshnessSeconds"] = 120
+            cadence_exhausting_probes["probes"] = [
+                {
+                    "id": f"cadence-probe-{index}",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 20_000,
+                }
+                for index in range(2)
+            ]
             for name, document in (
                 ("zero-port", zero_port),
                 ("probe-timeout-budget", excessive_probes),
+                ("probe-cadence-budget", cadence_exhausting_probes),
             ):
                 (root / "recovery.json").write_text(
                     json.dumps(document), encoding="utf-8"
