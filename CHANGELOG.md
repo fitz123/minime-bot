@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.8
+
+- Add the host-native recovery supervisor foundation with durable authenticated intake, incident correlation and fencing, deterministic verification, static controls, outboxes, automatic native fallback, bounded event retention, and stale-telemetry deferral.
+- Add the full iterative same-user Pi recovery fixer with exact per-generation session resume, crash-safe action reconciliation, recoverable quarantine, independently verified outcomes, and durable detailed incident reports.
+- Add independent two-slot recovery capsule and offline bot rollback tooling, plus an inert zero-capability root-helper protocol scaffold.
+
 ## 2026.7.7
 
 - Preserve active Telegram work during connectivity loss by treating an unreachable API as degraded state instead of restarting the process.
