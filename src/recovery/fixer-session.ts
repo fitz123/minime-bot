@@ -51,6 +51,7 @@ export const RECOVERY_RUNNER_ENV = Object.freeze({
   startupTimeoutSeconds: "MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS",
   renewSeconds: "MINIME_RECOVERY_RENEW_SECONDS",
   runTimeoutSeconds: "MINIME_RECOVERY_RUN_TIMEOUT_SECONDS",
+  supervisorProcessGroup: "MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP",
 } as const);
 
 const MAX_TRANSCRIPT_HEADER_BYTES = 64 * 1024;
@@ -332,14 +333,23 @@ export function recoveryExtensionOptions(
   return options;
 }
 
+export function recoveryStartsNewPiProcessGroup(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[RECOVERY_RUNNER_ENV.supervisorProcessGroup] !== "1";
+}
+
 function runtimeEnv(
   contract: ReturnType<typeof readRecoveryRuntimeContract>,
   sessionDirectory: string,
   agentId: string,
+  env: NodeJS.ProcessEnv = process.env,
 ): PiSpawnRuntimeEnvOptions {
   return {
     askCallerAgentId: agentId,
-    startNewProcessGroup: true,
+    // The Python supervisor starts the runner as a new session. In that mode
+    // Pi and its tool descendants must remain in the runner's process group so
+    // one host-native kill fences the entire tree. Standalone/test callers keep
+    // the Task-2 Pi-rooted group behavior.
+    startNewProcessGroup: recoveryStartsNewPiProcessGroup(env),
     recovery: {
       endpoint: contract.endpoint.origin,
       fixerCredentialFile: contract.fixerCredentialFile,
@@ -404,7 +414,7 @@ async function spawnBoundSession(
       agent,
       prior.sessionId,
       extensionOptions,
-      runtimeEnv(protocol, prior.sessionDirectory, runner.agentId),
+      runtimeEnv(protocol, prior.sessionDirectory, runner.agentId, options.env),
     );
     try {
       const observedId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
@@ -453,7 +463,7 @@ async function spawnBoundSession(
     agent,
     undefined,
     extensionOptions,
-    runtimeEnv(protocol, sessionDirectory, runner.agentId),
+    runtimeEnv(protocol, sessionDirectory, runner.agentId, options.env),
   );
   try {
     const sessionId = await captureRecoverySessionId(child, runner.startupTimeoutMs);

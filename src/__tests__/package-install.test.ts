@@ -455,8 +455,19 @@ describe("package artifact install", () => {
       const recoveryProcessJson = JSON.parse(recoveryProcess.stdout) as Record<string, unknown>;
       assert.deepEqual(
         Object.keys(recoveryProcessJson).sort(),
-        ["activeIncidents", "mode", "ok", "verification"],
+        [
+          "activeIncidents",
+          "fixer",
+          "mode",
+          "ok",
+          "reportsDelivered",
+          "reportsQueued",
+          "verification",
+        ],
       );
+      assert.equal(recoveryProcessJson.fixer, "idle");
+      assert.equal(recoveryProcessJson.reportsQueued, 0);
+      assert.equal(recoveryProcessJson.reportsDelivered, 0);
 
       const recoveryE2e = spawnSync(
         "python3",

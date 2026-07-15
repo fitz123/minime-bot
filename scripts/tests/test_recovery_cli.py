@@ -715,7 +715,7 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("must be between 1 and 100", error)
 
-    def test_process_once_reports_foundation_state_without_launch_contract(self) -> None:
+    def test_process_once_reports_idle_observe_state_without_launching_fixer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_config(root)
@@ -752,11 +752,22 @@ class RecoveryCliTests(unittest.TestCase):
             result = json.loads(output)
             self.assertEqual(
                 set(result),
-                {"ok", "mode", "activeIncidents", "verification"},
+                {
+                    "ok",
+                    "mode",
+                    "activeIncidents",
+                    "verification",
+                    "fixer",
+                    "reportsQueued",
+                    "reportsDelivered",
+                },
             )
             self.assertEqual(result["mode"], "observe")
             self.assertEqual(result["activeIncidents"], 1)
             self.assertEqual(result["verification"], [])
+            self.assertEqual(result["fixer"], "idle")
+            self.assertEqual(result["reportsQueued"], 0)
+            self.assertEqual(result["reportsDelivered"], 0)
             with recovery_ledger.RecoveryLedger(loaded.database) as ledger:
                 self.assertEqual(
                     ledger.connection.execute(

@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -146,6 +147,46 @@ _FIXER_ENDPOINT_OPERATIONS = {
     "/v1/fixer/blocked": "blocked",
     "/v1/fixer/finish": "finish",
 }
+_FIXER_RUNNER_ENV_KEYS = frozenset(
+    {
+        "CI",
+        "COLORTERM",
+        "FORCE_COLOR",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "MINIME_AGENT_WORKSPACE_ROOT",
+        "MINIME_CONFIG_PATH",
+        "MINIME_CONTROL_WORKSPACE_ROOT",
+        "MINIME_CRONS_PATH",
+        "NO_COLOR",
+        "PATH",
+        "PI_CODING_AGENT_DIR",
+        "PI_EXTENSIONS_DISABLED",
+        "PI_OFFLINE",
+        "PI_PACKAGE_DIR",
+        "PI_SHARE_VIEWER_URL",
+        "PI_SKIP_VERSION_CHECK",
+        "PI_TELEMETRY",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    }
+)
+_REPORT_SECRET = re.compile(
+    r"(?i)(?:bearer\s+|(?:password|secret|token|credential)\s*[:=]\s*)[^\s,;]+"
+)
+_REPORT_HOME_PATH = re.compile(r"/(?:Users|home)/[^/\s]+(?:/[^\s,;]*)?")
+_REPORT_ABSOLUTE_PATH = re.compile(r"(?<![:/A-Za-z0-9])/(?:[^\s,;]+)")
 
 
 class IntakeError(ValueError):
@@ -1037,6 +1078,15 @@ class IncidentCoordinator:
         }
 
     @staticmethod
+    def _verification_retry_pending(connection: Any, incident: Any) -> bool:
+        target = f"incident:{int(incident['id'])}:generation:{int(incident['generation'])}"
+        return connection.execute(
+            "SELECT 1 FROM audit WHERE operation = 'verification_retry_scheduled' "
+            "AND target = ?",
+            (target,),
+        ).fetchone() is not None
+
+    @staticmethod
     def _invalidate_invocation(connection: Any, incident_id: int, now: float) -> None:
         active = connection.execute(
             "SELECT id, lease_token FROM invocations WHERE incident_id = ? AND state = 'active'",
@@ -1178,6 +1228,16 @@ class IncidentCoordinator:
                 )
                 if correlation_key in evidence:
                     continue
+                if (
+                    incident["state"] in {"eligible", "invoking"}
+                    and incident["evidence_hash"] == _EMPTY_EVIDENCE_HASH
+                    and self._verification_retry_pending(connection, incident)
+                ):
+                    # A fresh deterministic contradiction may dispatch the same
+                    # bound session once more even though the original alert is
+                    # resolved. The durable audit marker is the closed reason
+                    # this otherwise-empty generation remains dispatchable.
+                    continue
                 if already_resolved:
                     if (
                         incident["state"] == "verifying"
@@ -1254,21 +1314,27 @@ class IncidentCoordinator:
             if lease["token"] is not None and float(lease["expires_at"]) > now:
                 return None
             candidates = connection.execute(
-                "SELECT * FROM incidents WHERE state = 'eligible' AND evidence_hash != ? "
-                "ORDER BY opened_at, id",
-                (_EMPTY_EVIDENCE_HASH,),
+                "SELECT * FROM incidents WHERE state = 'eligible' ORDER BY opened_at, id"
             ).fetchall()
             active = self._active_evidence_details(connection)
             incident = None
             for candidate in candidates:
                 correlation_key = str(candidate["correlation_key"])
                 details = active.get(correlation_key)
-                if details is None:
+                verification_retry = bool(
+                    candidate["evidence_hash"] == _EMPTY_EVIDENCE_HASH
+                    and self._verification_retry_pending(connection, candidate)
+                )
+                if details is None and not verification_retry:
                     continue
                 if control.silence_expiry(correlation_key, now) is not None:
                     continue
-                critical = details.max_impact >= 3
-                if not critical and details.confirmation_count < control.confirmation_count:
+                critical = verification_retry or bool(details and details.max_impact >= 3)
+                if (
+                    not critical
+                    and details is not None
+                    and details.confirmation_count < control.confirmation_count
+                ):
                     continue
                 last = connection.execute(
                     "SELECT max(updated_at) FROM invocations WHERE incident_id = ?",
@@ -1421,7 +1487,37 @@ class IncidentCoordinator:
                 )
             evidence.sort(key=lambda item: (item["source"], item["fingerprint"], item["ref"]))
             if not evidence:
-                raise ValueError("recovery invocation evidence is unavailable")
+                incident_row = connection.execute(
+                    "SELECT * FROM incidents WHERE id = ?", (fence.incident_id,)
+                ).fetchone()
+                retry = bool(
+                    incident_row is not None
+                    and incident_row["evidence_hash"] == _EMPTY_EVIDENCE_HASH
+                    and self._verification_retry_pending(connection, incident_row)
+                )
+                attempt = connection.execute(
+                    "SELECT id, result, reasons_json, evidence_json "
+                    "FROM verification_attempts WHERE incident_id = ? AND generation < ? "
+                    "AND result = 'contradicted' ORDER BY generation DESC, attempt DESC LIMIT 1",
+                    (fence.incident_id, fence.generation),
+                ).fetchone()
+                if not retry or attempt is None:
+                    raise ValueError("recovery invocation evidence is unavailable")
+                try:
+                    reasons = json.loads(str(attempt["reasons_json"]))
+                    observations = json.loads(str(attempt["evidence_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise LedgerCorrupt("recovery verification evidence is invalid") from exc
+                if not isinstance(reasons, list) or not isinstance(observations, list):
+                    raise LedgerCorrupt("recovery verification evidence is invalid")
+                return [
+                    {
+                        "ref": f"verification:{int(attempt['id'])}",
+                        "kind": "deterministicContradiction",
+                        "reasons": [safe_field(reason) for reason in reasons[:32]],
+                        "observations": observations[:32],
+                    }
+                ]
             return evidence[:32]
 
     @staticmethod
@@ -2213,6 +2309,74 @@ class IncidentCoordinator:
             self.immediate_escalation(escalation)
         return True
 
+    def interrupt_invocation(self, fence: InvocationFence, *, reason: str) -> bool:
+        """Classify one runner exit and consume only the static crash retry budget."""
+
+        interruption_reason = self._journal_text(
+            reason, "invocation interruption reason", limit=80
+        )
+        now = self.clock()
+        exhausted = False
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                invocation = connection.execute(
+                    "SELECT state FROM invocations WHERE id = ?", (fence.invocation_id,)
+                ).fetchone()
+                return bool(invocation is not None and invocation["state"] != "active")
+            control = self.controls.current(connection, now=now)
+            connection.execute(
+                "UPDATE action_intents SET state = 'unknown', updated_at = ? "
+                "WHERE invocation_id = ? AND state = 'pending'",
+                (now, fence.invocation_id),
+            )
+            connection.execute(
+                "UPDATE invocations SET state = 'interrupted', updated_at = ? WHERE id = ?",
+                (now, fence.invocation_id),
+            )
+            interruptions = int(
+                connection.execute(
+                    "SELECT count(*) FROM invocations WHERE incident_id = ? "
+                    "AND evidence_hash = ? AND policy_revision = ? "
+                    "AND state = 'interrupted'",
+                    (
+                        fence.incident_id,
+                        fence.evidence_hash,
+                        fence.policy_revision,
+                    ),
+                ).fetchone()[0]
+            )
+            retry_limit = min(self.policy.max_crash_retries, control.retry_budget)
+            next_state = "eligible" if interruptions <= retry_limit else "retries_exhausted"
+            exhausted = next_state == "retries_exhausted"
+            connection.execute(
+                "UPDATE incidents SET state = ?, generation = generation + 1, updated_at = ? "
+                "WHERE id = ?",
+                (next_state, now, fence.incident_id),
+            )
+            connection.execute(
+                "UPDATE fixer_lease SET owner = NULL, token = NULL, acquired_at = NULL, "
+                "expires_at = NULL WHERE singleton = 1 AND token = ?",
+                (fence.lease_token,),
+            )
+            connection.execute(
+                "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                "VALUES (?, 'system', 'fixer_interrupted', ?, ?)",
+                (
+                    now,
+                    f"invocation:{fence.invocation_id}",
+                    _canonical_json(
+                        {
+                            "reason": interruption_reason,
+                            "retry_limit": retry_limit,
+                            "state": next_state,
+                        }
+                    ),
+                ),
+            )
+        if exhausted and self.immediate_escalation is not None:
+            self.immediate_escalation("retries_exhausted")
+        return True
+
     def explicit_retry(
         self, incident_id: int, *, reason: str, actor: str | None = None
     ) -> bool:
@@ -2288,7 +2452,7 @@ class IncidentCoordinator:
         dedupe_key: str,
         result: VerificationResult,
     ) -> bool:
-        """Fail one overdue verification generation and escalate it exactly once."""
+        """Retry one fresh contradiction, or exhaust the closed retry budget."""
 
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery incident id is invalid")
@@ -2301,6 +2465,7 @@ class IncidentCoordinator:
         invocation_id = int(claim.group(1))
         verification_generation = int(claim.group(2))
         target = f"incident:{incident_id}:{dedupe_key}"
+        exhausted = False
         with self.ledger.transaction() as connection:
             if connection.execute(
                 "SELECT 1 FROM audit WHERE operation = 'verification_failed' AND target = ?",
@@ -2334,8 +2499,10 @@ class IncidentCoordinator:
             ):
                 return False
             invocation = connection.execute(
-                "SELECT generation FROM invocations WHERE id = ? AND incident_id = ? "
-                "AND state = 'completed' AND policy_revision = ?",
+                "SELECT invocations.generation FROM invocations JOIN fixer_claims "
+                "ON fixer_claims.invocation_id = invocations.id "
+                "WHERE invocations.id = ? AND invocations.incident_id = ? "
+                "AND invocations.state = 'completed' AND invocations.policy_revision = ?",
                 (invocation_id, incident_id, incident["policy_revision"]),
             ).fetchone()
             if (
@@ -2345,17 +2512,52 @@ class IncidentCoordinator:
                 <= verification_generation
             ):
                 return False
+            retries = int(
+                connection.execute(
+                    "SELECT count(*) FROM audit WHERE operation = "
+                    "'verification_retry_scheduled' AND target LIKE ?",
+                    (f"incident:{incident_id}:generation:%",),
+                ).fetchone()[0]
+            )
+            next_generation = verification_generation + 1
+            exhausted = retries >= control.retry_budget
+            next_state = "retries_exhausted" if exhausted else "eligible"
             connection.execute(
-                "UPDATE incidents SET state = 'recovery_failed', updated_at = ? WHERE id = ?",
-                (now, incident_id),
+                "UPDATE incidents SET state = ?, generation = ?, evidence_hash = ?, "
+                "updated_at = ? WHERE id = ?",
+                (next_state, next_generation, _EMPTY_EVIDENCE_HASH, now, incident_id),
             )
             connection.execute(
                 "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
                 "VALUES (?, 'system', 'verification_failed', ?, ?)",
-                (now, target, _canonical_json({"reason": "missed_recovery"})),
+                (
+                    now,
+                    target,
+                    _canonical_json(
+                        {
+                            "reason": "fresh_contradiction",
+                            "state": next_state,
+                        }
+                    ),
+                ),
             )
-        if self.immediate_escalation is not None:
-            self.immediate_escalation("recovery_failed")
+            if not exhausted:
+                connection.execute(
+                    "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                    "VALUES (?, 'system', 'verification_retry_scheduled', ?, ?)",
+                    (
+                        now,
+                        f"incident:{incident_id}:generation:{next_generation}",
+                        _canonical_json(
+                            {
+                                "prior_invocation_id": invocation_id,
+                                "prior_verification_generation": verification_generation,
+                            }
+                        ),
+                    ),
+                )
+        if exhausted and self.immediate_escalation is not None:
+            self.immediate_escalation("retries_exhausted")
         return True
 
 
@@ -2967,9 +3169,12 @@ class RecoveryVerifier:
                 raise ValueError("recovery verification incident is invalid")
             generation = int(incident["generation"])
             invocation = connection.execute(
-                "SELECT id, generation FROM invocations WHERE incident_id = ? "
-                "AND state = 'completed' AND policy_revision = ? AND generation >= ? "
-                "AND generation <= ? ORDER BY generation DESC, id DESC LIMIT 1",
+                "SELECT invocations.id, invocations.generation FROM invocations "
+                "JOIN fixer_claims ON fixer_claims.invocation_id = invocations.id "
+                "WHERE invocations.incident_id = ? AND invocations.state = 'completed' "
+                "AND invocations.policy_revision = ? AND invocations.generation >= ? "
+                "AND invocations.generation <= ? "
+                "ORDER BY invocations.generation DESC, invocations.id DESC LIMIT 1",
                 (incident_id, incident["policy_revision"], max(1, generation - 1), generation),
             ).fetchone()
             if invocation is None:
@@ -3226,6 +3431,157 @@ class PythonProbeRunner:
         if fence is None:
             return 0
         return 1 if self.refresh(fence) else 0
+
+
+class RecoveryFixerProcessManager:
+    """Own at most one recovery runner process behind the coordinator lease."""
+
+    def __init__(
+        self,
+        coordinator: IncidentCoordinator,
+        *,
+        runner_argv: tuple[str, str] | None,
+        package_root: Path,
+        control_workspace: Path,
+        endpoint: str,
+        fixer_credential_file: Path,
+        agent_id: str,
+        session_root: Path,
+        startup_timeout_seconds: int,
+        renew_seconds: int,
+        run_timeout_seconds: int,
+        inherited_env: dict[str, str] | None = None,
+        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    ):
+        if runner_argv is not None and (
+            len(runner_argv) != 2
+            or any(not Path(value).is_absolute() or "\0" in value for value in runner_argv)
+        ):
+            raise ValueError("recovery fixer runner command is invalid")
+        for value, name in (
+            (endpoint, "endpoint"),
+            (agent_id, "agent id"),
+        ):
+            if not isinstance(value, str) or safe_field(value, limit=512, default="") != value:
+                raise ValueError(f"recovery fixer runner {name} is invalid")
+        for value in (startup_timeout_seconds, renew_seconds, run_timeout_seconds):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 86_400:
+                raise ValueError("recovery fixer runner timeout is invalid")
+        self.coordinator = coordinator
+        self.runner_argv = runner_argv
+        self.package_root = package_root.resolve()
+        self.control_workspace = control_workspace.resolve()
+        self.endpoint = endpoint
+        self.fixer_credential_file = fixer_credential_file.resolve()
+        self.agent_id = agent_id
+        self.session_root = session_root.resolve()
+        self.startup_timeout_seconds = startup_timeout_seconds
+        self.renew_seconds = renew_seconds
+        self.run_timeout_seconds = run_timeout_seconds
+        source_env = dict(os.environ) if inherited_env is None else inherited_env
+        self.base_env = {
+            key: value
+            for key, value in source_env.items()
+            if isinstance(value, str)
+            and (key in _FIXER_RUNNER_ENV_KEYS or key.startswith("LC_"))
+        }
+        # Only the two unambiguous workspace roots are retained. Historical
+        # aliases are deliberately neither accepted nor synthesized here.
+        self.base_env.pop("MINIME_WORKSPACE_ROOT", None)
+        self.base_env.pop("MINIME_AGENT_WORKSPACE_CWD", None)
+        self.base_env["MINIME_CONTROL_WORKSPACE_ROOT"] = str(self.control_workspace)
+        self.popen = popen
+        self.process: subprocess.Popen[bytes] | None = None
+        self.fence: InvocationFence | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def _environment(self, fence: InvocationFence) -> dict[str, str]:
+        return {
+            **self.base_env,
+            "MINIME_RECOVERY_ENDPOINT": self.endpoint,
+            "MINIME_RECOVERY_FIXER_CREDENTIAL_FILE": str(
+                self.fixer_credential_file
+            ),
+            "MINIME_RECOVERY_MODE": self.coordinator.mode,
+            "MINIME_RECOVERY_INVOCATION_ID": str(fence.invocation_id),
+            "MINIME_RECOVERY_INCIDENT_ID": str(fence.incident_id),
+            "MINIME_RECOVERY_GENERATION": str(fence.generation),
+            "MINIME_RECOVERY_EVIDENCE_HASH": fence.evidence_hash,
+            "MINIME_RECOVERY_POLICY_REVISION": str(fence.policy_revision),
+            "MINIME_RECOVERY_LEASE_TOKEN": fence.lease_token,
+            "MINIME_RECOVERY_AGENT_ID": self.agent_id,
+            "MINIME_RECOVERY_SESSION_ROOT": str(self.session_root),
+            "MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS": str(
+                self.startup_timeout_seconds
+            ),
+            "MINIME_RECOVERY_RENEW_SECONDS": str(self.renew_seconds),
+            "MINIME_RECOVERY_RUN_TIMEOUT_SECONDS": str(self.run_timeout_seconds),
+            "MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP": "1",
+        }
+
+    def _spawn(self, fence: InvocationFence) -> bool:
+        if self.runner_argv is None:
+            self.coordinator.interrupt_invocation(
+                fence, reason="runner_unavailable"
+            )
+            return False
+        try:
+            self.process = self.popen(
+                self.runner_argv,
+                executable=self.runner_argv[0],
+                cwd=str(self.package_root),
+                env=self._environment(fence),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                shell=False,
+                start_new_session=True,
+            )
+        except OSError:
+            self.coordinator.interrupt_invocation(fence, reason="spawn_failed")
+            self.process = None
+            return False
+        self.fence = fence
+        return True
+
+    def tick(self) -> str:
+        """Poll the active runner, then claim at most one fenced invocation."""
+
+        if self.process is not None:
+            if self.process.poll() is None:
+                return "running"
+            PythonProbeRunner._terminate_process_group(self.process)
+            fence = self.fence
+            return_code = int(self.process.returncode or 0)
+            self.process = None
+            self.fence = None
+            if fence is not None:
+                self.coordinator.interrupt_invocation(
+                    fence,
+                    reason="runner_exited" if return_code == 0 else "runner_failed",
+                )
+            return "settled"
+        fence = self.coordinator.claim_next()
+        if fence is None:
+            return "idle"
+        return "started" if self._spawn(fence) else "failed"
+
+    def close(self) -> None:
+        process = self.process
+        fence = self.fence
+        self.process = None
+        self.fence = None
+        if process is None:
+            return
+        PythonProbeRunner._terminate_process_group(process)
+        if fence is not None:
+            self.coordinator.interrupt_invocation(
+                fence, reason="supervisor_stopping"
+            )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -3715,6 +4071,476 @@ class RecoveryReportStore:
             )
             return cursor.rowcount == 1
 
+    def due(self, *, limit: int = 16) -> list[tuple[str, dict[str, Any]]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 128:
+            raise ValueError("recovery report delivery limit is invalid")
+        rows = self.ledger.connection.execute(
+            "SELECT incident_reports.report_key, incident_reports.body_json "
+            "FROM report_outbox JOIN incident_reports "
+            "ON incident_reports.id = report_outbox.report_id "
+            "WHERE report_outbox.state = ? AND report_outbox.available_at <= ? "
+            "ORDER BY report_outbox.available_at, report_outbox.id LIMIT ?",
+            (REPORT_PENDING, self.clock(), limit),
+        ).fetchall()
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                body = json.loads(str(row["body_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise LedgerCorrupt("recovery report body is invalid") from exc
+            if not isinstance(body, dict):
+                raise LedgerCorrupt("recovery report body is invalid")
+            pending.append((str(row["report_key"]), body))
+        return pending
+
+
+def _redact_report_text(value: Any, *, limit: int = 8_192) -> str:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return "unreported"
+    text = str(value).replace("\0", "").replace("\r", " ").replace("\n", " ")
+    text = _REPORT_SECRET.sub("[redacted]", text)
+    text = _REPORT_HOME_PATH.sub("[private-path]", text)
+    text = _REPORT_ABSOLUTE_PATH.sub("[absolute-path]", text)
+    return text[:limit].strip() or "unreported"
+
+
+def _redact_report_reference(value: Any, *, limit: int = 1_024) -> str:
+    text = _redact_report_text(value, limit=limit)
+    path = Path(text)
+    if path.is_absolute():
+        return f"[absolute-path]/{path.name}"[:limit]
+    return text
+
+
+class RecoveryReportAuthority:
+    """Merge claims with durable host evidence and own report delivery state."""
+
+    def __init__(
+        self,
+        ledger: RecoveryLedger,
+        coordinator: IncidentCoordinator,
+        store: RecoveryReportStore,
+        *,
+        max_timeline_entries: int,
+        delivery: Callable[[str, dict[str, Any]], None] | None = None,
+        enrichers: dict[str, Callable[[dict[str, Any]], list[str]]] | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        if (
+            isinstance(max_timeline_entries, bool)
+            or not isinstance(max_timeline_entries, int)
+            or not 1 <= max_timeline_entries <= 2_000
+        ):
+            raise ValueError("recovery report timeline policy is invalid")
+        self.ledger = ledger
+        self.coordinator = coordinator
+        self.store = store
+        self.max_timeline_entries = max_timeline_entries
+        self.delivery = delivery
+        self.enrichers = {} if enrichers is None else dict(enrichers)
+        if any(name not in {"knowledge", "beads"} for name in self.enrichers):
+            raise ValueError("recovery report enricher is invalid")
+        self.clock = clock
+
+    @staticmethod
+    def _document(raw: Any, name: str) -> dict[str, Any]:
+        try:
+            value = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LedgerCorrupt(f"recovery {name} is invalid") from exc
+        if not isinstance(value, dict):
+            raise LedgerCorrupt(f"recovery {name} is invalid")
+        return value
+
+    @staticmethod
+    def _text_list(value: Any, *, limit: int, references: bool = False) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        redactor = _redact_report_reference if references else _redact_report_text
+        return [redactor(item, limit=limit) for item in value[:256]]
+
+    def _bounded_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        if len(_canonical_json(body).encode("utf-8")) <= self.store.max_bytes:
+            return body
+        compact = copy.deepcopy(body)
+        compact["truncated"] = True
+        compact["claimSummary"] = str(compact["claimSummary"])[:512]
+        compact["rootCause"] = str(compact["rootCause"])[:512]
+        compact["residualRisk"] = str(compact["residualRisk"])[:512]
+        compact["timeline"] = compact["timeline"][-32:]
+        compact["evidenceReferences"] = compact["evidenceReferences"][-64:]
+        compact["actions"] = compact["actions"][-32:]
+        compact["changedFiles"] = compact["changedFiles"][-32:]
+        compact["changedServices"] = compact["changedServices"][-32:]
+        compact["preimages"] = compact["preimages"][-32:]
+        compact["verification"] = [
+            {
+                "attempt": item["attempt"],
+                "generation": item["generation"],
+                "reasons": item["reasons"][:16],
+                "ref": item["ref"],
+                "result": item["result"],
+            }
+            for item in compact["verification"][-32:]
+        ]
+        compact["incident"]["sessions"] = compact["incident"]["sessions"][-16:]
+        compact["references"] = {
+            key: values[-32:] for key, values in compact["references"].items()
+        }
+        if len(_canonical_json(compact).encode("utf-8")) <= self.store.max_bytes:
+            return compact
+        # The configured lower bound is intentionally small. Preserve the
+        # complete authoritative shape and terminal outcome even when only a
+        # minimal, explicitly truncated report fits that bound.
+        minimal = {
+            "version": compact["version"],
+            "incident": {**compact["incident"], "sessions": compact["incident"]["sessions"][-1:]},
+            "trigger": compact["trigger"],
+            "claimSummary": str(compact["claimSummary"])[:128],
+            "rootCause": str(compact["rootCause"])[:128],
+            "confidence": compact["confidence"],
+            "timeline": [],
+            "evidenceReferences": compact["evidenceReferences"][-8:],
+            "actions": [],
+            "changedFiles": [],
+            "changedServices": [],
+            "changedReleases": [],
+            "preimages": [],
+            "quarantine": [],
+            "rollback": [],
+            "verification": [],
+            "residualRisk": str(compact["residualRisk"])[:128],
+            "references": {key: [] for key in compact["references"]},
+            "versions": compact["versions"],
+            "degradedMetadata": compact["degradedMetadata"],
+            "outcome": compact["outcome"],
+            "truncated": True,
+        }
+        if len(_canonical_json(minimal).encode("utf-8")) > self.store.max_bytes:
+            minimal["claimSummary"] = "truncated"
+            minimal["rootCause"] = "truncated"
+            minimal["residualRisk"] = "truncated"
+            minimal["evidenceReferences"] = []
+            minimal["incident"]["sessions"] = []
+        return minimal
+
+    def _trigger_evidence(
+        self, connection: Any, correlation_key: str
+    ) -> tuple[list[str], int, list[dict[str, Any]]]:
+        references: list[str] = []
+        impact = 0
+        timeline: list[dict[str, Any]] = []
+        for row in connection.execute(
+            "SELECT id, event_at, normalized_json FROM events ORDER BY event_at, id"
+        ).fetchall():
+            event = self._document(row["normalized_json"], "report event")
+            rule = self.coordinator._rules.get(
+                (str(event.get("component", "")), str(event.get("failure_class", "")))
+            )
+            if rule is None or rule.incident_key != correlation_key:
+                continue
+            reference = f"event:{int(row['id'])}"
+            references.append(reference)
+            impact = max(impact, rule.impact)
+            timeline.append(
+                {
+                    "at": float(row["event_at"]),
+                    "kind": "trigger",
+                    "ref": reference,
+                    "state": str(event.get("status", "unknown")),
+                }
+            )
+        return references[-256:], impact, timeline
+
+    def _build(self, incident_id: int) -> tuple[str, int, int, dict[str, Any]]:
+        degraded: list[str] = []
+        with self.ledger.transaction() as connection:
+            incident = connection.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            if incident is None or incident["state"] not in {
+                "recovered",
+                "recovery_failed",
+                "recovery_unsafe",
+                "retries_exhausted",
+            }:
+                raise ValueError("recovery report incident is not ready")
+            claim_row = connection.execute(
+                "SELECT fixer_claims.*, invocations.state AS invocation_state "
+                "FROM fixer_claims JOIN invocations "
+                "ON invocations.id = fixer_claims.invocation_id "
+                "WHERE fixer_claims.incident_id = ? AND invocations.state IN "
+                "('completed', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted') "
+                "ORDER BY fixer_claims.generation DESC, fixer_claims.id DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+            if claim_row is None:
+                raise ValueError("recovery report completion claim is unavailable")
+            claim = self._document(claim_row["claim_json"], "report claim")
+            references = self._text_list(
+                claim.get("references"), limit=1_024, references=True
+            )
+            reference_groups: dict[str, list[str]] = {
+                "knowledge": [],
+                "beads": [],
+                "adrs": [],
+                "localCommits": [],
+                "other": [],
+            }
+            for reference in references:
+                prefix = reference.split(":", 1)[0].lower()
+                target = {
+                    "knowledge": "knowledge",
+                    "beads": "beads",
+                    "adr": "adrs",
+                    "commit": "localCommits",
+                    "local-commit": "localCommits",
+                }.get(prefix, "other")
+                reference_groups[target].append(reference)
+
+            context = {
+                "incidentId": incident_id,
+                "generation": int(incident["generation"]),
+                "invocationId": int(claim_row["invocation_id"]),
+            }
+            for name in ("knowledge", "beads"):
+                enricher = self.enrichers.get(name)
+                if enricher is None:
+                    continue
+                try:
+                    extra = enricher(dict(context))
+                    if not isinstance(extra, list):
+                        raise ValueError("invalid enrichment")
+                    reference_groups[name].extend(
+                        _redact_report_reference(item) for item in extra[:256]
+                    )
+                except Exception:
+                    degraded.append(name)
+
+            event_refs, impact, timeline = self._trigger_evidence(
+                connection, str(incident["correlation_key"])
+            )
+            sessions = [
+                {
+                    "generation": int(row["generation"]),
+                    "sessionId": _redact_report_text(row["session_id"], limit=128),
+                    "state": str(row["state"]),
+                }
+                for row in connection.execute(
+                    "SELECT generation, session_id, state FROM session_bindings "
+                    "WHERE incident_id = ? ORDER BY generation, id",
+                    (incident_id,),
+                ).fetchall()
+            ]
+            actions: list[dict[str, Any]] = []
+            preimages: list[dict[str, str]] = []
+            action_rows = connection.execute(
+                "SELECT action_intents.*, action_outcomes.outcome, "
+                "action_outcomes.outcome_json, action_outcomes.created_at AS outcome_at, "
+                "action_reconciliations.result AS reconciliation_result "
+                "FROM action_intents JOIN invocations "
+                "ON invocations.id = action_intents.invocation_id "
+                "LEFT JOIN action_outcomes "
+                "ON action_outcomes.action_intent_id = action_intents.id "
+                "LEFT JOIN action_reconciliations "
+                "ON action_reconciliations.action_intent_id = action_intents.id "
+                "WHERE invocations.incident_id = ? ORDER BY action_intents.id",
+                (incident_id,),
+            ).fetchall()
+            for row in action_rows:
+                intent = self._document(row["intent_json"], "report action intent")
+                outcome = (
+                    {}
+                    if row["outcome_json"] is None
+                    else self._document(row["outcome_json"], "report action outcome")
+                )
+                action = {
+                    "actionKey": _redact_report_text(row["action_key"], limit=160),
+                    "tool": _redact_report_text(row["tool_name"], limit=80),
+                    "state": str(row["state"]),
+                    "outcome": None if row["outcome"] is None else str(row["outcome"]),
+                    "reconciliation": row["reconciliation_result"],
+                    "summary": _redact_report_text(
+                        outcome.get("summary", outcome.get("changed", "recorded")),
+                        limit=1_024,
+                    ),
+                }
+                actions.append(action)
+                timeline.append(
+                    {
+                        "at": float(row["created_at"]),
+                        "kind": "action",
+                        "ref": f"action:{int(row['id'])}",
+                        "state": action["outcome"] or action["state"],
+                    }
+                )
+                for key, value in intent.items():
+                    if "preimage" in str(key).lower():
+                        preimages.append(
+                            {
+                                "actionKey": action["actionKey"],
+                                "reference": _redact_report_reference(value),
+                            }
+                        )
+
+            verification: list[dict[str, Any]] = []
+            verification_refs: list[str] = []
+            for row in connection.execute(
+                "SELECT * FROM verification_attempts WHERE incident_id = ? "
+                "ORDER BY generation, attempt",
+                (incident_id,),
+            ).fetchall():
+                try:
+                    reasons = json.loads(str(row["reasons_json"]))
+                    evidence = json.loads(str(row["evidence_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise LedgerCorrupt("recovery report verification is invalid") from exc
+                if not isinstance(reasons, list) or not isinstance(evidence, list):
+                    raise LedgerCorrupt("recovery report verification is invalid")
+                reference = f"verification:{int(row['id'])}"
+                verification_refs.append(reference)
+                verification.append(
+                    {
+                        "attempt": int(row["attempt"]),
+                        "evidence": evidence[:256],
+                        "generation": int(row["generation"]),
+                        "reasons": [_redact_report_text(item, limit=256) for item in reasons[:256]],
+                        "ref": reference,
+                        "result": str(row["result"]),
+                    }
+                )
+                timeline.append(
+                    {
+                        "at": float(row["completed_at"]),
+                        "kind": "verification",
+                        "ref": reference,
+                        "state": str(row["result"]),
+                    }
+                )
+
+            timeline.sort(key=lambda item: (item["at"], item["kind"], item["ref"]))
+            generation = int(incident["generation"])
+            invocation_id = int(claim_row["invocation_id"])
+            report_key = f"incident:{incident_id}:generation:{generation}:report:v1"
+            body = {
+                "version": 1,
+                "incident": {
+                    "id": incident_id,
+                    "generation": generation,
+                    "sessions": sessions,
+                },
+                "trigger": {
+                    "correlationKey": _redact_report_text(
+                        incident["correlation_key"], limit=160
+                    ),
+                    "impact": impact,
+                },
+                "claimSummary": _redact_report_text(
+                    claim.get("summary", claim.get("reason"))
+                ),
+                "rootCause": _redact_report_text(
+                    claim.get("rootCause", claim.get("reason"))
+                ),
+                "confidence": (
+                    claim.get("confidence")
+                    if claim.get("confidence") in {"low", "medium", "high"}
+                    else "unreported"
+                ),
+                "timeline": timeline[-self.max_timeline_entries :],
+                "evidenceReferences": event_refs + verification_refs,
+                "actions": actions,
+                "changedFiles": self._text_list(
+                    claim.get("changedFiles"), limit=4_096, references=True
+                ),
+                "changedServices": self._text_list(
+                    claim.get("changedServices"), limit=256
+                ),
+                "changedReleases": [],
+                "preimages": preimages,
+                "quarantine": [],
+                "rollback": [],
+                "verification": verification,
+                "residualRisk": _redact_report_text(claim.get("residualRisk")),
+                "references": reference_groups,
+                "versions": {
+                    "model": "unreported",
+                    "policy": int(incident["policy_revision"]),
+                    "runtime": "python-supervisor/package-fixer",
+                },
+                "degradedMetadata": sorted(degraded),
+                "outcome": {
+                    "recovered": "recovered",
+                    "recovery_failed": "failed",
+                    "recovery_unsafe": "blocked",
+                    "retries_exhausted": "escalated",
+                }[str(incident["state"])],
+            }
+            if degraded:
+                target = f"report:{report_key}"
+                if connection.execute(
+                    "SELECT 1 FROM audit WHERE operation = 'report_enrichment_degraded' "
+                    "AND target = ?",
+                    (target,),
+                ).fetchone() is None:
+                    connection.execute(
+                        "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                        "VALUES (?, 'system', 'report_enrichment_degraded', ?, ?)",
+                        (
+                            self.clock(),
+                            target,
+                            _canonical_json({"sources": sorted(degraded)}),
+                        ),
+                    )
+        return report_key, generation, invocation_id, self._bounded_body(body)
+
+    def queue_ready(self) -> int:
+        rows = self.ledger.connection.execute(
+            "SELECT incidents.id FROM incidents WHERE incidents.state IN "
+            "('recovered', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted') "
+            "AND EXISTS (SELECT 1 FROM fixer_claims JOIN invocations "
+            "ON invocations.id = fixer_claims.invocation_id "
+            "WHERE fixer_claims.incident_id = incidents.id "
+            "AND invocations.state IN "
+            "('completed', 'recovery_failed', 'recovery_unsafe', 'retries_exhausted')) "
+            "AND NOT EXISTS (SELECT 1 FROM incident_reports "
+            "WHERE incident_reports.incident_id = incidents.id "
+            "AND incident_reports.generation = incidents.generation) "
+            "ORDER BY incidents.id"
+        ).fetchall()
+        queued = 0
+        for row in rows:
+            incident_id = int(row["id"])
+            try:
+                key, generation, invocation_id, body = self._build(incident_id)
+                self.store.queue(
+                    report_key=key,
+                    incident_id=incident_id,
+                    generation=generation,
+                    invocation_id=invocation_id,
+                    body=body,
+                )
+            except ValueError:
+                # Intake may advance the incident generation between the due
+                # scan and the fenced queue transaction. The next maintenance
+                # pass rebuilds only from the new authoritative state.
+                continue
+            queued += 1
+        return queued
+
+    def deliver_due(self) -> int:
+        if self.delivery is None:
+            return 0
+        delivered = 0
+        for report_key, body in self.store.due():
+            try:
+                self.delivery(report_key, body)
+            except Exception:
+                self.store.defer(report_key)
+                continue
+            if self.store.mark_reported(report_key):
+                delivered += 1
+        return delivered
+
 
 class RecoveryNotificationOutbox:
     """Durable immediate escalation handoff to the native notifier."""
@@ -3807,6 +4633,8 @@ class RecoveryService:
         verifier: RecoveryVerifier | None = None,
         probe_runner: PythonProbeRunner | None = None,
         notifications: RecoveryNotificationOutbox | None = None,
+        fixer_process: RecoveryFixerProcessManager | None = None,
+        reports: RecoveryReportAuthority | None = None,
         event_retention_seconds: float = DEFAULT_EVENT_RETENTION_SECONDS,
         event_retention_batch_size: int = DEFAULT_EVENT_RETENTION_BATCH_SIZE,
     ):
@@ -3819,6 +4647,12 @@ class RecoveryService:
             raise ValueError("recovery probe runner does not match verifier")
         self.probe_runner = probe_runner
         self.notifications = notifications
+        if fixer_process is not None and fixer_process.coordinator is not coordinator:
+            raise ValueError("recovery fixer process does not match coordinator")
+        if reports is not None and reports.coordinator is not coordinator:
+            raise ValueError("recovery report authority does not match coordinator")
+        self.fixer_process = fixer_process
+        self.reports = reports
         self.event_retention_seconds = event_retention_seconds
         self.event_retention_batch_size = event_retention_batch_size
         self._ledger_corrupt = False
@@ -4143,7 +4977,31 @@ class RecoveryService:
                             )
             except LedgerError as exc:
                 self._report_ledger_error(exc)
+        if self._ledger_corrupt:
+            return summary
+        if self.fixer_process is not None:
+            try:
+                summary["fixer"] = self.fixer_process.tick()
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
+        if self._ledger_corrupt:
+            return summary
+        if self.reports is not None:
+            try:
+                summary["reportsQueued"] = self.reports.queue_ready()
+                summary["reportsDelivered"] = self.reports.deliver_due()
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
         return summary
+
+    def close(self) -> None:
+        if self.fixer_process is not None:
+            try:
+                self.fixer_process.close()
+            except LedgerError:
+                # The process group has already been terminated; a ledger that
+                # failed closed cannot accept the optional interruption audit.
+                pass
 
 
 def _valid_spooled_event(event: dict[str, Any]) -> bool:
@@ -4407,6 +5265,22 @@ class _UnavailableLedger:
         raise LedgerUnavailable("ledger startup is unavailable")
 
 
+def _installed_fixer_runner() -> tuple[Path, tuple[str, str] | None]:
+    package_root = Path(__file__).resolve().parent.parent
+    runner = package_root / "dist" / "recovery" / "fixer-session.js"
+    node = shutil.which("node")
+    if node is None or not runner.is_file():
+        return package_root, None
+    try:
+        executable = Path(node).resolve(strict=True)
+        runner = runner.resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            return package_root, None
+    except OSError:
+        return package_root, None
+    return package_root, (str(executable), str(runner))
+
+
 def _build_recovery_service(
     ledger: RecoveryLedger,
     event_spool: AtomicJsonSpool,
@@ -4461,6 +5335,35 @@ def _build_recovery_service(
         hold_down_seconds=configured.verification_hold_down_seconds,
     )
     probe_runner = PythonProbeRunner(verifier, configured.probes)
+    package_root, runner_argv = _installed_fixer_runner()
+    fixer_process = RecoveryFixerProcessManager(
+        coordinator,
+        runner_argv=runner_argv,
+        package_root=package_root,
+        control_workspace=configured.workspace,
+        endpoint=f"http://{configured.host}:{configured.port}",
+        fixer_credential_file=configured.fixer_auth_token_file,
+        agent_id=configured.internal_agent_id,
+        session_root=Path(str(configured.session_policy["directory"])),
+        startup_timeout_seconds=int(
+            configured.session_policy["startupTimeoutSeconds"]
+        ),
+        renew_seconds=configured.fixer_renew_seconds,
+        run_timeout_seconds=int(
+            configured.action_policy["reconciliationTimeoutSeconds"]
+        ),
+    )
+    report_store = RecoveryReportStore(
+        ledger,
+        max_bytes=int(configured.report_policy["maxBytes"]),
+        retry_seconds=int(configured.report_policy["retrySeconds"]),
+    )
+    reports = RecoveryReportAuthority(
+        ledger,
+        coordinator,
+        report_store,
+        max_timeline_entries=int(configured.report_policy["maxTimelineEntries"]),
+    )
     service = RecoveryService(
         ledger,
         event_spool,
@@ -4469,6 +5372,8 @@ def _build_recovery_service(
         verifier=verifier,
         probe_runner=probe_runner,
         notifications=notifications,
+        fixer_process=fixer_process,
+        reports=reports,
     )
     return service
 
@@ -4648,6 +5553,7 @@ def main(argv: list[str] | None = None) -> int:
         server.shutdown()
         request_thread.join(timeout=5.0)
         server.server_close()
+        app.service.close()
         if ledger is not None:
             ledger.close()
         restore_signal_handlers()

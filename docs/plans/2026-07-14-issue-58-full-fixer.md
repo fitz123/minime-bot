@@ -100,11 +100,11 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 - [x] Test exact ID/path resume, unreadable degradation, crash unknowns, reconciliation-before-mutation, diagnose blocking, extension kill-switch rejection, process-group fencing, Pi/provider outage, credential separation, and no chat binding; run TypeScript/Python integration tests.
 
 ### Task 3: Make the supervisor outcome and report authority
-- [ ] Drive one fixer process from the global lease/static retry budget while intake, fallback, and probes remain Python-host-native.
-- [ ] Treat finish as a claim, verify independently with fresh evidence/hold-down, resume the same session on contradiction, and defer on stale/missing telemetry.
-- [ ] Merge claim plus authoritative journal/verification into one redacted report and durably queue/dedupe delivery without changing the incident outcome.
-- [ ] Record Knowledge/Beads enrichment failure as non-blocking degradation.
-- [ ] Test false success, full lifecycle, deterministic verification, resume, report exactly-once/pending across restart, delivery outage, and Knowledge/Beads failure; run lifecycle tests.
+- [x] Drive one fixer process from the global lease/static retry budget while intake, fallback, and probes remain Python-host-native.
+- [x] Treat finish as a claim, verify independently with fresh evidence/hold-down, resume the same session on contradiction, and defer on stale/missing telemetry.
+- [x] Merge claim plus authoritative journal/verification into one redacted report and durably queue/dedupe delivery without changing the incident outcome.
+- [x] Record Knowledge/Beads enrichment failure as non-blocking degradation.
+- [x] Test false success, full lifecycle, deterministic verification, resume, report exactly-once/pending across restart, delivery outage, and Knowledge/Beads failure; run lifecycle tests.
 
 ### Task 4: Add supervisor-owned quarantine, reviewed operations, and zero-capability rootctl
 - [ ] Implement fenced canonical-path quarantine/restore with ownership/mode/symlink/size/item guards and checksummed `0600` restore metadata.

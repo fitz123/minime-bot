@@ -33,6 +33,7 @@ import {
   discoverCanonicalRecoveryTranscript,
   hasNoSessionFoundClassifier,
   inspectRecoveryTranscript,
+  recoveryStartsNewPiProcessGroup,
   terminateRecoveryProcessGroup,
 } from "../recovery/fixer-session.js";
 
@@ -87,6 +88,13 @@ function fakeChild(): ChildProcess {
 }
 
 describe("exact-session recovery fixer", () => {
+  it("joins the supervisor-owned process group while preserving standalone fencing", () => {
+    assert.equal(recoveryStartsNewPiProcessGroup({}), true);
+    assert.equal(recoveryStartsNewPiProcessGroup({
+      MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP: "1",
+    }), false);
+  });
+
   it("validates the closed runtime fence and passes only a credential-file path to Pi", () => {
     const contract = readRecoveryRuntimeContract(runtimeEnv());
     assert.equal(contract.mode, "enabled");

@@ -1761,6 +1761,357 @@ class RecoveryDurableFixerContractTests(unittest.TestCase):
             ledger.close()
 
 
+class RecoveryOutcomeAuthorityTests(unittest.TestCase):
+    class _Process:
+        def __init__(self, pid: int):
+            self.pid = pid
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    def test_process_manager_serializes_claims_and_consumes_static_retry_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="process-manager",
+                    mode="enabled",
+                    clock=lambda: clock[0],
+                )
+                ledger.record_events(
+                    recovery_supervisor.normalize_alertmanager(
+                        alert_body(firing_alert("managed-runner"))
+                    )
+                )
+                processes: list[RecoveryOutcomeAuthorityTests._Process] = []
+                spawns: list[dict[str, object]] = []
+
+                def spawn(_argv: object, **kwargs: object) -> RecoveryOutcomeAuthorityTests._Process:
+                    process = self._Process(50_000 + len(processes))
+                    processes.append(process)
+                    spawns.append(kwargs)
+                    return process
+
+                manager = recovery_supervisor.RecoveryFixerProcessManager(
+                    coordinator,
+                    runner_argv=("/usr/bin/node", "/opt/recovery/fixer-session.js"),
+                    package_root=root,
+                    control_workspace=root,
+                    endpoint="http://127.0.0.1:9877",
+                    fixer_credential_file=root / "fixer-token",
+                    agent_id="recovery-fixer",
+                    session_root=root / "sessions",
+                    startup_timeout_seconds=30,
+                    renew_seconds=20,
+                    run_timeout_seconds=300,
+                    inherited_env={
+                        "HOME": str(root),
+                        "PATH": "/usr/bin:/bin",
+                        "ANTHROPIC_API_KEY": "must-not-reach-runner",
+                        "MINIME_WORKSPACE_ROOT": "/retired",
+                    },
+                    popen=spawn,
+                )
+                self.assertEqual(manager.tick(), "started")
+                self.assertEqual(manager.tick(), "running")
+                self.assertEqual(len(processes), 1)
+                first_fence = manager.fence
+                assert first_fence is not None
+                self.assertIsNotNone(
+                    coordinator.bind_session(
+                        first_fence,
+                        session_id="managed-session",
+                        session_directory=str(root / "sessions" / "managed"),
+                        transcript_path=str(
+                            root / "sessions" / "managed" / "managed-session.jsonl"
+                        ),
+                    )
+                )
+                runner_env = spawns[0]["env"]
+                assert isinstance(runner_env, dict)
+                self.assertNotIn("ANTHROPIC_API_KEY", runner_env)
+                self.assertNotIn("MINIME_WORKSPACE_ROOT", runner_env)
+                self.assertNotIn("must-not-reach-runner", runner_env.values())
+                self.assertEqual(
+                    runner_env["MINIME_RECOVERY_FIXER_CREDENTIAL_FILE"],
+                    str((root / "fixer-token").resolve()),
+                )
+                self.assertEqual(
+                    runner_env["MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP"], "1"
+                )
+
+                processes[0].returncode = 1
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "settled")
+                terminate.assert_called_once_with(processes[0])
+                first_retry = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents"
+                ).fetchone()
+                self.assertEqual(tuple(first_retry), ("eligible", 2))
+                self.assertEqual(manager.tick(), "started")
+                second_fence = manager.fence
+                assert second_fence is not None
+                state = coordinator.fixer_state(second_fence)
+                assert state is not None
+                self.assertEqual(state["resumeSession"]["sessionId"], "managed-session")
+                self.assertEqual(len(processes), 2)
+
+                processes[1].returncode = 1
+                with mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner,
+                    "_terminate_process_group",
+                ) as terminate:
+                    self.assertEqual(manager.tick(), "settled")
+                terminate.assert_called_once_with(processes[1])
+                exhausted = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents"
+                ).fetchone()
+                self.assertEqual(tuple(exhausted), ("retries_exhausted", 3))
+                self.assertEqual(manager.tick(), "idle")
+
+    def test_false_success_resumes_same_session_then_reports_once_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="outcome-authority",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("full-lifecycle"))
+                )
+            )
+            first = coordinator.claim_next()
+            assert first is not None
+            session_directory = root / "sessions" / "full-lifecycle"
+            transcript = session_directory / "session.jsonl"
+            first_binding = coordinator.bind_session(
+                first,
+                session_id="full-lifecycle-session",
+                session_directory=str(session_directory),
+                transcript_path=str(transcript),
+            )
+            self.assertIsNotNone(first_binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="repair-config",
+                    tool_name="edit",
+                    intent={"pathRef": "config:bot", "preimage": "sha256:before"},
+                )
+            )
+            self.assertTrue(
+                coordinator.record_action_outcome(
+                    first,
+                    action_key="repair-config",
+                    outcome="succeeded",
+                    details={"summary": "updated local configuration"},
+                )
+            )
+            claim = {
+                "summary": "configuration repaired",
+                "rootCause": "token=private-value was copied from /private/synthetic/config",
+                "confidence": "high",
+                "changedFiles": ["/private/synthetic/config.yaml"],
+                "changedServices": ["bot-service"],
+                "verification": ["model-side check only"],
+                "residualRisk": "none observed",
+                "references": [
+                    "knowledge:recovery-page",
+                    "beads:issue-58",
+                    "adr:0001",
+                    "commit:abc123",
+                ],
+            }
+            self.assertTrue(
+                coordinator.accept_completion_claim(
+                    first, claim_key="first-finish", claim=claim
+                )
+            )
+
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("full-lifecycle"))
+                )
+            )
+            coordinator.reconcile()
+            verifying = ledger.connection.execute(
+                "SELECT generation, state FROM incidents WHERE id = ?", (first.incident_id,)
+            ).fetchone()
+            self.assertEqual(tuple(verifying), (2, "verifying"))
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                probe_ids=("host-health",),
+                cadence_seconds=1,
+                freshness_seconds=3,
+                hold_down_seconds=0,
+                clock=lambda: clock[0],
+            )
+            clock[0] = 104.0
+            failed_fence = recovery_supervisor.VerificationFence(
+                first.incident_id, 2, first.policy_revision
+            )
+            verifier.record_heartbeat("supervisor")
+            self.assertTrue(verifier.record_probe(failed_fence, "host-health", False))
+            contradiction = verifier.evaluate(first.incident_id)
+            classification = verifier.mechanical_classification(
+                first.incident_id, contradiction
+            )
+            self.assertEqual(
+                classification,
+                ("missed_recovery", f"invocation:{first.invocation_id}:verification:2"),
+            )
+            assert classification is not None
+            self.assertTrue(
+                coordinator.mark_missed_recovery(
+                    first.incident_id,
+                    dedupe_key=classification[1],
+                    result=contradiction,
+                )
+            )
+
+            second = coordinator.claim_next()
+            assert second is not None
+            retry_state = coordinator.fixer_state(second)
+            assert retry_state is not None
+            self.assertEqual(
+                retry_state["resumeSession"]["bindingId"], first_binding
+            )
+            self.assertEqual(
+                retry_state["evidence"][0]["kind"], "deterministicContradiction"
+            )
+            second_binding = coordinator.bind_session(
+                second,
+                session_id="full-lifecycle-session",
+                session_directory=str(session_directory),
+                transcript_path=str(transcript),
+            )
+            self.assertIsNotNone(second_binding)
+            self.assertTrue(
+                coordinator.mark_session_resumed(second, int(second_binding or 0))
+            )
+            self.assertTrue(
+                coordinator.accept_completion_claim(
+                    second,
+                    claim_key="second-finish",
+                    claim={**claim, "summary": "configuration repair verified after retry"},
+                )
+            )
+
+            clock[0] = 105.0
+            healthy_fence = recovery_supervisor.VerificationFence(
+                second.incident_id, second.generation, second.policy_revision
+            )
+            verifier.record_heartbeat("supervisor")
+            self.assertTrue(verifier.record_probe(healthy_fence, "host-health", True))
+            recovered = verifier.evaluate(second.incident_id)
+            self.assertTrue(recovered.recovered)
+
+            store = recovery_supervisor.RecoveryReportStore(
+                ledger, retry_seconds=1, clock=lambda: clock[0]
+            )
+
+            def unavailable(_key: str, _body: dict[str, object]) -> None:
+                raise OSError("synthetic delivery outage")
+
+            authority = recovery_supervisor.RecoveryReportAuthority(
+                ledger,
+                coordinator,
+                store,
+                max_timeline_entries=64,
+                delivery=unavailable,
+                enrichers={
+                    "knowledge": lambda _context: (_ for _ in ()).throw(
+                        RuntimeError("synthetic knowledge outage")
+                    ),
+                    "beads": lambda _context: (_ for _ in ()).throw(
+                        RuntimeError("synthetic beads outage")
+                    ),
+                },
+                clock=lambda: clock[0],
+            )
+            self.assertEqual(authority.queue_ready(), 1)
+            report_row = ledger.connection.execute(
+                "SELECT report_key, body_json FROM incident_reports"
+            ).fetchone()
+            report_key = str(report_row["report_key"])
+            report = json.loads(str(report_row["body_json"]))
+            self.assertEqual(report["outcome"], "recovered")
+            self.assertEqual(report["degradedMetadata"], ["beads", "knowledge"])
+            self.assertEqual(report["incident"]["sessions"][0]["sessionId"], "full-lifecycle-session")
+            self.assertTrue(report["actions"])
+            self.assertTrue(report["verification"])
+            self.assertNotIn("private-value", json.dumps(report))
+            self.assertNotIn("/private/synthetic", json.dumps(report))
+            tiny_store = recovery_supervisor.RecoveryReportStore(
+                ledger, max_bytes=1_024, retry_seconds=1, clock=lambda: clock[0]
+            )
+            tiny_authority = recovery_supervisor.RecoveryReportAuthority(
+                ledger,
+                coordinator,
+                tiny_store,
+                max_timeline_entries=64,
+                clock=lambda: clock[0],
+            )
+            bounded = tiny_authority._bounded_body(
+                {**report, "rootCause": "x" * 64_000}
+            )
+            self.assertLessEqual(
+                len(recovery_supervisor._canonical_json(bounded).encode("utf-8")),
+                1_024,
+            )
+            self.assertTrue(bounded["truncated"])
+            self.assertEqual(authority.deliver_due(), 0)
+            self.assertEqual(store.state(report_key), "REPORT_PENDING")
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM incidents WHERE id = ?", (second.incident_id,)
+                ).fetchone()[0],
+                "recovered",
+            )
+            ledger.close()
+
+            clock[0] = 107.0
+            delivered: list[str] = []
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as reopened:
+                restarted_coordinator = recovery_supervisor.IncidentCoordinator(
+                    reopened,
+                    correlation_policy(lease_seconds=120),
+                    owner="outcome-authority-restarted",
+                    mode="enabled",
+                    clock=lambda: clock[0],
+                )
+                restarted_store = recovery_supervisor.RecoveryReportStore(
+                    reopened, retry_seconds=1, clock=lambda: clock[0]
+                )
+                restarted = recovery_supervisor.RecoveryReportAuthority(
+                    reopened,
+                    restarted_coordinator,
+                    restarted_store,
+                    max_timeline_entries=64,
+                    delivery=lambda key, _body: delivered.append(key),
+                    clock=lambda: clock[0],
+                )
+                self.assertEqual(restarted.queue_ready(), 0)
+                self.assertEqual(restarted.deliver_due(), 1)
+                self.assertEqual(restarted.deliver_due(), 0)
+                self.assertEqual(delivered, [report_key])
+                self.assertEqual(restarted_store.state(report_key), "REPORTED")
+
+
 class RecoveryControlTests(unittest.TestCase):
     def test_silence_limit_rejects_new_target_without_corrupting_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2191,6 +2542,19 @@ class RecoveryVerificationTests(unittest.TestCase):
                         ),
                     )
                     invocation_id = int(cursor.lastrowid)
+                    connection.execute(
+                        "INSERT INTO fixer_claims(invocation_id, incident_id, generation, "
+                        "evidence_hash, policy_revision, claim_key, claim_json, claimed_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'verification-claim', '{}', ?)",
+                        (
+                            invocation_id,
+                            incident_id,
+                            incident["generation"],
+                            incident["evidence_hash"],
+                            incident["policy_revision"],
+                            clock[0],
+                        ),
+                    )
 
                 service = recovery_supervisor.RecoveryService(
                     ledger,
@@ -2242,11 +2606,19 @@ class RecoveryVerificationTests(unittest.TestCase):
                 verifier.record_heartbeat("runtime_doctor")
                 self.assertTrue(verifier.record_probe(fence, "health", False))
                 service.maintenance()
+                retried = ledger.connection.execute(
+                    "SELECT state, generation FROM incidents WHERE id = ?", (incident_id,)
+                ).fetchone()
+                self.assertEqual(
+                    (retried["state"], retried["generation"]),
+                    ("eligible", fence.generation + 1),
+                )
                 self.assertEqual(
                     ledger.connection.execute(
-                        "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                        "SELECT count(*) FROM audit "
+                        "WHERE operation = 'verification_retry_scheduled'"
                     ).fetchone()[0],
-                    "recovery_failed",
+                    1,
                 )
 
     def test_probe_results_are_fenced_to_the_verification_generation(self) -> None:
