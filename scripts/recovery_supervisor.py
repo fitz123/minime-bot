@@ -60,6 +60,10 @@ SPOOL_ITEM_MAX_BYTES = 1024 * 1024
 AUTH_TOKEN_MAX_BYTES = 4 * 1024
 _SAFE_FIELD = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
 _TRANSITION_ID = re.compile(r"^[a-f0-9]{64}$")
+_CAPSULE_RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_PREIMAGE_FILE_NAME = re.compile(r"^[a-f0-9]{64}\.preimage$")
+_STARTUP_NONCE_HEADER = "X-Minime-Recovery-Startup-Nonce"
+_STARTUP_RELEASE_HEADER = "X-Minime-Recovery-Capsule-Release"
 _EMERGENCY_MESSAGES = {
     "ledger_corrupt": "MINIME RECOVERY SUPERVISOR\nledger integrity or schema validation failed",
     "ledger_unavailable": "MINIME RECOVERY SUPERVISOR\nledger unavailable; intake is using the durable spool",
@@ -2797,11 +2801,35 @@ class RecoveryMutationUnknown(RuntimeError):
     """Host state may have changed and requires explicit reconciliation."""
 
 
-def _sha256_file_descriptor(descriptor: int, *, byte_limit: int) -> tuple[str, int]:
+def _require_recovery_fence(
+    fence_valid: Callable[[], bool], *, mutation_started: bool
+) -> None:
+    try:
+        valid = fence_valid()
+    except Exception:
+        valid = False
+    if valid is True:
+        return
+    if mutation_started:
+        raise RecoveryMutationUnknown("recovery fence was lost during mutation")
+    raise RecoverySafetyError("fence_stale")
+
+
+def _sha256_file_descriptor(
+    descriptor: int,
+    *,
+    byte_limit: int,
+    fence_valid: Callable[[], bool] | None = None,
+    mutation_started: bool = False,
+) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     os.lseek(descriptor, 0, os.SEEK_SET)
     while True:
+        if fence_valid is not None:
+            _require_recovery_fence(
+                fence_valid, mutation_started=mutation_started
+            )
         chunk = os.read(descriptor, 128 * 1024)
         if not chunk:
             break
@@ -2809,13 +2837,25 @@ def _sha256_file_descriptor(descriptor: int, *, byte_limit: int) -> tuple[str, i
         if size > byte_limit:
             raise RecoverySafetyError("item_too_large")
         digest.update(chunk)
+    if fence_valid is not None:
+        _require_recovery_fence(fence_valid, mutation_started=mutation_started)
     os.lseek(descriptor, 0, os.SEEK_SET)
     return digest.hexdigest(), size
 
 
-def _write_all(descriptor: int, data: bytes) -> None:
+def _write_all(
+    descriptor: int,
+    data: bytes,
+    *,
+    fence_valid: Callable[[], bool] | None = None,
+    mutation_started: bool = False,
+) -> None:
     offset = 0
     while offset < len(data):
+        if fence_valid is not None:
+            _require_recovery_fence(
+                fence_valid, mutation_started=mutation_started
+            )
         written = os.write(descriptor, data[offset:])
         if written <= 0:
             raise OSError("short recovery quarantine write")
@@ -3065,7 +3105,9 @@ class RecoveryQuarantine:
         *,
         quarantine_id: str,
         source_path: str,
+        fence_valid: Callable[[], bool],
     ) -> dict[str, Any]:
+        _require_recovery_fence(fence_valid, mutation_started=False)
         incident_directory = self._incident_directory(fence.incident_id)
         manifest_path = incident_directory / f"{quarantine_id}.json"
         destination = incident_directory / f"{quarantine_id}.item"
@@ -3117,7 +3159,9 @@ class RecoveryQuarantine:
             if (opened.st_dev, opened.st_ino) != (source_details.st_dev, source_details.st_ino):
                 raise RecoverySafetyError("source_changed")
             content_sha256, size = _sha256_file_descriptor(
-                descriptor, byte_limit=self.max_item_bytes
+                descriptor,
+                byte_limit=self.max_item_bytes,
+                fence_valid=fence_valid,
             )
             if used_bytes + size > self.max_incident_bytes:
                 raise RecoverySafetyError("incident_byte_limit")
@@ -3143,6 +3187,7 @@ class RecoveryQuarantine:
                 "createdAt": self.clock(),
                 "restoredAt": None,
             }
+            _require_recovery_fence(fence_valid, mutation_started=False)
             self._write_manifest(manifest_path, manifest)
             manifest_written = True
             current = source.lstat()
@@ -3151,8 +3196,12 @@ class RecoveryQuarantine:
             staged = source.parent / f".{source.name}.minime-quarantine-{quarantine_id}"
             if staged.exists() or staged.is_symlink():
                 raise RecoverySafetyError("quarantine_staging_exists")
+            _require_recovery_fence(
+                fence_valid, mutation_started=manifest_written
+            )
             os.rename(source, staged)
             mutated = True
+            _require_recovery_fence(fence_valid, mutation_started=True)
             staged_details = staged.lstat()
             if (staged_details.st_dev, staged_details.st_ino) != (
                 opened.st_dev,
@@ -3160,9 +3209,12 @@ class RecoveryQuarantine:
             ):
                 raise RecoveryMutationUnknown("quarantine source changed during move")
             if method == "rename":
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 os.rename(staged, destination)
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 os.chmod(destination, 0o600)
             else:
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 output = os.open(
                     destination,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -3171,15 +3223,25 @@ class RecoveryQuarantine:
                 try:
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     while True:
+                        _require_recovery_fence(fence_valid, mutation_started=True)
                         chunk = os.read(descriptor, 128 * 1024)
                         if not chunk:
                             break
-                        _write_all(output, chunk)
+                        _write_all(
+                            output,
+                            chunk,
+                            fence_valid=fence_valid,
+                            mutation_started=True,
+                        )
+                    _require_recovery_fence(fence_valid, mutation_started=True)
                     os.fsync(output)
                     copied_descriptor = os.open(destination, flags)
                     try:
                         copied_hash, copied_size = _sha256_file_descriptor(
-                            copied_descriptor, byte_limit=self.max_item_bytes
+                            copied_descriptor,
+                            byte_limit=self.max_item_bytes,
+                            fence_valid=fence_valid,
+                            mutation_started=True,
                         )
                     finally:
                         os.close(copied_descriptor)
@@ -3187,10 +3249,13 @@ class RecoveryQuarantine:
                         raise RecoverySafetyError("copy_verification_failed")
                 finally:
                     os.close(output)
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 os.unlink(staged)
+            _require_recovery_fence(fence_valid, mutation_started=True)
             _fsync_directory(source.parent)
             _fsync_directory(incident_directory)
             manifest["state"] = "quarantined"
+            _require_recovery_fence(fence_valid, mutation_started=True)
             self._write_manifest(manifest_path, manifest)
             return {
                 "ok": True,
@@ -3228,7 +3293,9 @@ class RecoveryQuarantine:
         fence: InvocationFence,
         *,
         quarantine_id: str,
+        fence_valid: Callable[[], bool],
     ) -> dict[str, Any]:
+        _require_recovery_fence(fence_valid, mutation_started=False)
         identifier = self._safe_identifier(quarantine_id, "quarantine_id_invalid")
         incident_directory = self._incident_directory(fence.incident_id)
         manifest_path = incident_directory / f"{identifier}.json"
@@ -3266,7 +3333,9 @@ class RecoveryQuarantine:
         target_created = False
         try:
             digest, size = _sha256_file_descriptor(
-                descriptor, byte_limit=self.max_item_bytes
+                descriptor,
+                byte_limit=self.max_item_bytes,
+                fence_valid=fence_valid,
             )
             if (
                 digest != manifest["contentSha256"]
@@ -3274,17 +3343,21 @@ class RecoveryQuarantine:
             ):
                 raise RecoverySafetyError("quarantined_item_checksum_mismatch")
             if details.st_dev == canonical_source.parent.stat().st_dev:
+                _require_recovery_fence(fence_valid, mutation_started=False)
                 os.link(quarantined, canonical_source, follow_symlinks=False)
                 target_created = True
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 linked_details = canonical_source.lstat()
                 if (linked_details.st_dev, linked_details.st_ino) != (
                     details.st_dev,
                     details.st_ino,
                 ):
                     raise RecoverySafetyError("restore_target_changed")
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 os.unlink(quarantined)
                 mutated = True
             else:
+                _require_recovery_fence(fence_valid, mutation_started=False)
                 output = os.open(
                     canonical_source,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -3294,10 +3367,17 @@ class RecoveryQuarantine:
                 try:
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     while True:
+                        _require_recovery_fence(fence_valid, mutation_started=True)
                         chunk = os.read(descriptor, 128 * 1024)
                         if not chunk:
                             break
-                        _write_all(output, chunk)
+                        _write_all(
+                            output,
+                            chunk,
+                            fence_valid=fence_valid,
+                            mutation_started=True,
+                        )
+                    _require_recovery_fence(fence_valid, mutation_started=True)
                     os.fsync(output)
                 finally:
                     os.close(output)
@@ -3305,20 +3385,26 @@ class RecoveryQuarantine:
                     canonical_source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                 )
                 try:
-                    restored_hash, restored_size = _sha256_file_descriptor(
-                        restored_descriptor, byte_limit=self.max_item_bytes
-                    )
+                        restored_hash, restored_size = _sha256_file_descriptor(
+                            restored_descriptor,
+                            byte_limit=self.max_item_bytes,
+                            fence_valid=fence_valid,
+                            mutation_started=True,
+                        )
                 finally:
                     os.close(restored_descriptor)
                 if restored_hash != digest or restored_size != size:
                     raise RecoveryMutationUnknown("restore copy verification is unknown")
+                _require_recovery_fence(fence_valid, mutation_started=True)
                 os.unlink(quarantined)
                 mutated = True
+            _require_recovery_fence(fence_valid, mutation_started=True)
             os.chmod(canonical_source, int(manifest["sourceMode"]))
             _fsync_directory(canonical_source.parent)
             _fsync_directory(incident_directory)
             manifest["state"] = "restored"
             manifest["restoredAt"] = self.clock()
+            _require_recovery_fence(fence_valid, mutation_started=True)
             self._write_manifest(manifest_path, manifest)
             return {"ok": True, "quarantineId": identifier, "replayed": False}
         except RecoverySafetyError:
@@ -3536,6 +3622,7 @@ class RecoveryActuator:
                 fence,
                 quarantine_id=quarantine_id,
                 source_path=source_path,
+                fence_valid=lambda: self.coordinator.invocation_fence_valid(fence),
             ),
         )
 
@@ -3556,7 +3643,9 @@ class RecoveryActuator:
             tool_name="recovery_restore",
             intent={"kind": "restore", "quarantineId": identifier},
             execute=lambda: self.quarantine.restore(
-                fence, quarantine_id=identifier
+                fence,
+                quarantine_id=identifier,
+                fence_valid=lambda: self.coordinator.invocation_fence_valid(fence),
             ),
         )
 
@@ -5236,6 +5325,48 @@ def _redact_report_reference(value: Any, *, limit: int = 1_024) -> str:
     return text
 
 
+def _report_preimage(action_key: str, value: Any) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "actionKey": action_key,
+        "state": "unreported",
+        "reference": None,
+        "contentSha256": None,
+        "sizeBytes": None,
+        "pathSha256": None,
+    }
+    if not isinstance(value, dict):
+        record["reference"] = _redact_report_reference(value)
+        return record
+    state = value.get("state")
+    if state in {"absent", "captured"}:
+        record["state"] = state
+    path_sha256 = value.get("pathSha256")
+    if isinstance(path_sha256, str) and _TRANSITION_ID.fullmatch(path_sha256):
+        record["pathSha256"] = path_sha256
+    if state != "captured":
+        return record
+    reference = value.get("reference")
+    if isinstance(reference, str):
+        reference_path = Path(reference)
+        if reference_path.is_absolute() and _PREIMAGE_FILE_NAME.fullmatch(
+            reference_path.name
+        ):
+            record["reference"] = f"[absolute-path]/{reference_path.name}"
+        else:
+            record["reference"] = _redact_report_reference(reference)
+    content_sha256 = value.get("contentSha256")
+    if isinstance(content_sha256, str) and _TRANSITION_ID.fullmatch(content_sha256):
+        record["contentSha256"] = content_sha256
+    size_bytes = value.get("sizeBytes")
+    if (
+        not isinstance(size_bytes, bool)
+        and isinstance(size_bytes, int)
+        and size_bytes >= 0
+    ):
+        record["sizeBytes"] = size_bytes
+    return record
+
+
 class RecoveryReportAuthority:
     """Merge claims with durable host evidence and own report delivery state."""
 
@@ -5467,7 +5598,7 @@ class RecoveryReportAuthority:
                 else self._document(session_rows[-1]["runtime_json"], "report runtime")
             )
             actions: list[dict[str, Any]] = []
-            preimages: list[dict[str, str]] = []
+            preimages: list[dict[str, Any]] = []
             quarantine_records: list[dict[str, Any]] = []
             rollback_records: list[dict[str, Any]] = []
             changed_releases: list[dict[str, str]] = []
@@ -5561,12 +5692,7 @@ class RecoveryReportAuthority:
                 )
                 for key, value in intent.items():
                     if "preimage" in str(key).lower():
-                        preimages.append(
-                            {
-                                "actionKey": action["actionKey"],
-                                "reference": _redact_report_reference(value),
-                            }
-                        )
+                        preimages.append(_report_preimage(action["actionKey"], value))
 
             verification: list[dict[str, Any]] = []
             verification_refs: list[str] = []
@@ -6303,11 +6429,22 @@ class RecoveryApplication:
         max_body: int,
         body_timeout: float,
         service: RecoveryService,
+        startup_nonce: str | None = None,
+        capsule_release_id: str | None = None,
     ):
         if fixer_auth_token is not None and hmac.compare_digest(
             auth_token, fixer_auth_token
         ):
             raise ValueError("recovery credentials overlap")
+        if (startup_nonce is None) != (capsule_release_id is None) or (
+            startup_nonce is not None
+            and (
+                _TRANSITION_ID.fullmatch(startup_nonce) is None
+                or not isinstance(capsule_release_id, str)
+                or _CAPSULE_RELEASE_ID.fullmatch(capsule_release_id) is None
+            )
+        ):
+            raise ValueError("recovery startup identity is invalid")
         self.intake_auth_header = f"Bearer {auth_token}".encode("utf-8")
         self.fixer_auth_header = (
             None
@@ -6317,6 +6454,8 @@ class RecoveryApplication:
         self.max_body = max_body
         self.body_timeout = body_timeout
         self.service = service
+        self.startup_nonce = startup_nonce
+        self.capsule_release_id = capsule_release_id
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -6361,12 +6500,20 @@ def handler_for(app: RecoveryApplication) -> type[BaseHTTPRequestHandler]:
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
-        def _reply(self, status: int, text: str) -> None:
+        def _reply(
+            self,
+            status: int,
+            text: str,
+            *,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             body = text.encode("ascii")
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "text/plain; charset=us-ascii")
                 self.send_header("Content-Length", str(len(body)))
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionError, OSError):
@@ -6414,7 +6561,15 @@ def handler_for(app: RecoveryApplication) -> type[BaseHTTPRequestHandler]:
             if not self._authenticated():
                 return
             result = app.service.health()
-            self._reply(result.status, result.text)
+            identity_headers = (
+                {}
+                if app.startup_nonce is None or app.capsule_release_id is None
+                else {
+                    _STARTUP_NONCE_HEADER: app.startup_nonce,
+                    _STARTUP_RELEASE_HEADER: app.capsule_release_id,
+                }
+            )
+            self._reply(result.status, result.text, headers=identity_headers)
 
         def do_POST(self) -> None:  # noqa: N802
             fixer_request = self.path in _FIXER_ENDPOINT_FIELDS
@@ -6713,6 +6868,18 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print("recovery supervisor configuration rejected", file=sys.stderr)
         return 2
+    startup_nonce = os.environ.get("MINIME_RECOVERY_STARTUP_NONCE")
+    capsule_release_id = os.environ.get("MINIME_RECOVERY_CAPSULE_RELEASE_ID")
+    if (startup_nonce is None) != (capsule_release_id is None) or (
+        startup_nonce is not None
+        and (
+            _TRANSITION_ID.fullmatch(startup_nonce) is None
+            or not isinstance(capsule_release_id, str)
+            or _CAPSULE_RELEASE_ID.fullmatch(capsule_release_id) is None
+        )
+    ):
+        print("recovery supervisor configuration rejected", file=sys.stderr)
+        return 2
     try:
         token = read_auth_token(configured.auth_token_file)
         fixer_token = read_auth_token(configured.fixer_auth_token_file)
@@ -6777,6 +6944,8 @@ def main(argv: list[str] | None = None) -> int:
         max_body=args.max_body,
         body_timeout=args.body_timeout,
         service=service,
+        startup_nonce=startup_nonce,
+        capsule_release_id=capsule_release_id,
     )
     try:
         server = BoundedThreadingHTTPServer(

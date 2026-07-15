@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -267,6 +268,45 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
             terminate.assert_called_once_with(failed_process)
             self.assertTrue(slots.state.reconcile()["fallbackAttempted"])
 
+    def test_conflicting_supervisor_identity_never_switches_the_active_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, runner = runtime_policy(root)
+            slots = recovery_slots.CapsuleSlots(
+                root / "capsules",
+                root / "state",
+                startup_timeout_seconds=5,
+                command_runner=runner,
+            )
+            slots.stage(
+                runtime_tree(root, domain="capsule", version="1.0.0"),
+                "previous",
+                policy,
+            )
+            slots.stage(
+                runtime_tree(root, domain="capsule", version="2.0.0"),
+                "current",
+                policy,
+            )
+            slots.activate("previous")
+            slots.activate("current")
+            process = mock.Mock(pid=4816)
+            process.poll.return_value = None
+            with mock.patch.object(
+                recovery_slots, "_terminate_startup_process"
+            ) as terminate, self.assertRaisesRegex(
+                recovery_slots.SlotBootstrapError, "already active"
+            ):
+                slots.boot_with(
+                    lambda _release, _timeout: recovery_slots.StartupAttempt(
+                        False, None, process, identity_conflict=True
+                    )
+                )
+            terminate.assert_called_once_with(process)
+            state = slots.state.reconcile()
+            self.assertEqual((state["current"], state["previous"]), ("current", "previous"))
+            self.assertFalse(state["fallbackAttempted"])
+
     def test_startup_process_cleanup_escalates_to_process_group_kill(self) -> None:
         process = mock.Mock(pid=8123)
         process.wait.side_effect = [subprocess.TimeoutExpired("capsule", 5), 0]
@@ -308,6 +348,10 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
                 def read(_limit: int) -> bytes:
                     return b"{}"
 
+                @staticmethod
+                def getheader(name: str, default: str = "") -> str:
+                    return requests[-1][2].get(name, default)
+
             class Connection:
                 def __init__(self, host: str, port: int, timeout: float):
                     self.address = (host, port, timeout)
@@ -330,7 +374,9 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
                 host="127.0.0.1",
                 port=9877,
             )
-            with mock.patch.object(recovery_slots.subprocess, "Popen", return_value=process), mock.patch.object(
+            with mock.patch.object(
+                recovery_slots.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(
                 recovery_slots.http.client, "HTTPConnection", Connection
             ):
                 attempt = recovery_slots._capsule_launcher(
@@ -343,6 +389,38 @@ class RecoveryCapsuleSlotTests(unittest.TestCase):
                 requests[0][2]["Authorization"],
                 "Bearer 0123456789abcdef0123456789abcdef",
             )
+            nonce = requests[0][2][recovery_slots._STARTUP_NONCE_HEADER]
+            release_id = requests[0][2][recovery_slots._STARTUP_RELEASE_HEADER]
+            self.assertRegex(nonce, r"^[a-f0-9]{64}$")
+            self.assertEqual(release_id, "current")
+            environment = popen.call_args.kwargs["env"]
+            self.assertEqual(environment["MINIME_RECOVERY_STARTUP_NONCE"], nonce)
+            self.assertEqual(
+                environment["MINIME_RECOVERY_CAPSULE_RELEASE_ID"], release_id
+            )
+
+            class StaleResponse(Response):
+                @staticmethod
+                def getheader(_name: str, default: str = "") -> str:
+                    return default
+
+            class StaleConnection(Connection):
+                @staticmethod
+                def getresponse() -> StaleResponse:
+                    return StaleResponse()
+
+            with mock.patch.object(
+                recovery_slots.subprocess, "Popen", return_value=process
+            ), mock.patch.object(
+                recovery_slots.http.client, "HTTPConnection", StaleConnection
+            ), mock.patch.object(
+                recovery_slots.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+            ), mock.patch.object(recovery_slots.time, "sleep"):
+                stale = recovery_slots._capsule_launcher(
+                    root, root / "recovery.json", configured
+                )(release, 5)
+            self.assertFalse(stale.healthy)
+            self.assertTrue(stale.identity_conflict)
 
 
 class RecoverySlotTransitionTests(unittest.TestCase):
@@ -444,6 +522,58 @@ class RecoverySlotTransitionTests(unittest.TestCase):
             self.assertEqual((state["current"], state["previous"]), ("two", "one"))
             self.assertEqual(os.readlink(root / "bot/current"), "releases/two")
             self.assertEqual(os.readlink(root / "bot/previous"), "releases/one")
+
+    def test_domain_lock_serializes_complete_concurrent_transitions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = recovery_slots.BotReleaseSlots(root / "bot", root / "state", ())
+            slots.stage(runtime_tree(root, domain="bot", version="1.0.0"), "one")
+            slots.stage(runtime_tree(root, domain="bot", version="2.0.0"), "two")
+            slots.activate("one")
+            peer = recovery_slots.SlotState(slots.store, root / "state")
+            entered = threading.Event()
+            release = threading.Event()
+            second_completed = threading.Event()
+            errors: list[BaseException] = []
+            original_apply = slots.state._apply
+
+            def blocked_apply(current: str, previous: str | None) -> None:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("slot transition test lock was not released")
+                original_apply(current, previous)
+
+            def run(function: object, completed: threading.Event | None = None) -> None:
+                try:
+                    assert callable(function)
+                    function()
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    if completed is not None:
+                        completed.set()
+
+            with mock.patch.object(slots.state, "_apply", side_effect=blocked_apply):
+                first = threading.Thread(target=run, args=(lambda: slots.activate("two"),))
+                first.start()
+                self.assertTrue(entered.wait(2))
+                second = threading.Thread(
+                    target=run,
+                    args=(lambda: peer.activate("one"), second_completed),
+                )
+                second.start()
+                self.assertFalse(second_completed.wait(0.1))
+                release.set()
+                first.join(2)
+                second.join(2)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            state = slots.state.reconcile()
+            self.assertEqual((state["current"], state["previous"]), ("one", "two"))
+            self.assertEqual(os.readlink(root / "bot/current"), "releases/one")
+            self.assertEqual(os.readlink(root / "bot/previous"), "releases/two")
+            self.assertEqual(stat.S_IMODE(slots.state.lock_path.stat().st_mode), 0o600)
 
     def test_manifest_checksum_and_file_modes_detect_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

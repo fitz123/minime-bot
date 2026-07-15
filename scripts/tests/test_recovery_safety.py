@@ -330,6 +330,7 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
                         fence,
                         quarantine_id=quarantine_id,
                         source_path=str(source),
+                        fence_valid=lambda: True,
                     )
                 self.assertEqual(saved_original.read_bytes(), b"original")
                 self.assertFalse(
@@ -353,6 +354,7 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
                     fence,
                     quarantine_id=clean_id,
                     source_path=str(clean_source),
+                    fence_valid=lambda: True,
                 )
                 clean_source.write_bytes(b"concurrent")
                 clean_source.chmod(0o600)
@@ -360,8 +362,65 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
                     recovery_supervisor.RecoverySafetyError,
                     "restore_target_exists",
                 ):
-                    quarantine.restore(fence, quarantine_id=clean_id)
+                    quarantine.restore(
+                        fence, quarantine_id=clean_id, fence_valid=lambda: True
+                    )
                 self.assertEqual(clean_source.read_bytes(), b"concurrent")
+
+    def test_quarantine_and_restore_stop_when_the_fence_changes_mid_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            allowed = root / "allowed"
+            allowed.mkdir(mode=0o700)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                _coordinator, fence = active_fence(ledger)
+                quarantine = recovery_supervisor.RecoveryQuarantine(
+                    quarantine_policy(root, allowed)
+                )
+
+                source = allowed / "fence-loss.bin"
+                source.write_bytes(b"quarantine fence fixture")
+                source.chmod(0o600)
+                identifier, _intent = quarantine.request_description(
+                    fence,
+                    idempotency_key="quarantine-fence-loss",
+                    source_path=str(source),
+                )
+                with self.assertRaises(recovery_supervisor.RecoveryMutationUnknown):
+                    quarantine.quarantine(
+                        fence,
+                        quarantine_id=identifier,
+                        source_path=str(source),
+                        fence_valid=source.exists,
+                    )
+                incident = root / "quarantine" / f"incident-{fence.incident_id}"
+                self.assertFalse((incident / f"{identifier}.item").exists())
+                self.assertTrue(
+                    any(allowed.glob(f".{source.name}.minime-quarantine-*"))
+                )
+
+                restore_source = allowed / "restore-fence-loss.bin"
+                restore_source.write_bytes(b"restore fence fixture")
+                restore_source.chmod(0o600)
+                restore_id, _intent = quarantine.request_description(
+                    fence,
+                    idempotency_key="restore-fence-loss",
+                    source_path=str(restore_source),
+                )
+                quarantine.quarantine(
+                    fence,
+                    quarantine_id=restore_id,
+                    source_path=str(restore_source),
+                    fence_valid=lambda: True,
+                )
+                with self.assertRaises(recovery_supervisor.RecoveryMutationUnknown):
+                    quarantine.restore(
+                        fence,
+                        quarantine_id=restore_id,
+                        fence_valid=lambda: not restore_source.exists(),
+                    )
+                self.assertTrue(restore_source.exists())
+                self.assertTrue((incident / f"{restore_id}.item").exists())
 
 
 class RecoveryReviewedOperationTests(unittest.TestCase):

@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
+import hmac
 import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -20,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 from recovery_config import (
@@ -40,6 +44,8 @@ _SAFE_PACKAGE_NAME = re.compile(
 )
 _SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$")
 _MAX_JSON_BYTES = 4 * 1024 * 1024
+_STARTUP_NONCE_HEADER = "X-Minime-Recovery-Startup-Nonce"
+_STARTUP_RELEASE_HEADER = "X-Minime-Recovery-Capsule-Release"
 _CAPSULE_FILES = (
     "package.json",
     "dist/config.js",
@@ -118,6 +124,45 @@ def _private_directory(path: Path) -> Path:
     ):
         raise SlotValidationError("slot storage is not owner-only")
     return path.resolve()
+
+
+@contextmanager
+def _exclusive_slot_lock(path: Path) -> Iterator[None]:
+    """Serialize one domain's durable link/state transition across processes."""
+
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise SlotValidationError("slot transition lock is unavailable") from exc
+    try:
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or not _same_owner(details)
+            or stat.S_IMODE(details.st_mode) != 0o600
+        ):
+            raise SlotValidationError("slot transition lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except SlotValidationError:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise SlotValidationError("slot transition lock is unavailable") from exc
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _safe_release_id(value: Any) -> str:
@@ -767,26 +812,31 @@ class SlotState:
         self.domain = store.domain
         self.state_directory = _private_directory(state_directory)
         self.path = self.state_directory / f"{self.domain}-state.json"
-        if not self.path.exists():
-            if any(
-                (self.root / name).exists() or (self.root / name).is_symlink()
-                for name in ("current", "previous")
-            ):
-                raise SlotValidationError("slot state is missing for existing links")
-            self._write(
-                {
-                    "schemaVersion": SLOT_SCHEMA_VERSION,
-                    "domain": self.domain,
-                    "sequence": 0,
-                    "generation": 0,
-                    "current": None,
-                    "previous": None,
-                    "fallbackAttempted": False,
-                    "pending": None,
-                    "lastReason": "initialized",
-                }
-            )
-        self.reconcile()
+        self.lock_path = self.state_directory / f"{self.domain}.lock"
+        with self.locked():
+            if not self.path.exists():
+                if any(
+                    (self.root / name).exists() or (self.root / name).is_symlink()
+                    for name in ("current", "previous")
+                ):
+                    raise SlotValidationError("slot state is missing for existing links")
+                self._write(
+                    {
+                        "schemaVersion": SLOT_SCHEMA_VERSION,
+                        "domain": self.domain,
+                        "sequence": 0,
+                        "generation": 0,
+                        "current": None,
+                        "previous": None,
+                        "fallbackAttempted": False,
+                        "pending": None,
+                        "lastReason": "initialized",
+                    }
+                )
+            self._reconcile_locked()
+
+    def locked(self) -> Any:
+        return _exclusive_slot_lock(self.lock_path)
 
     def _write(self, value: dict[str, Any]) -> None:
         _atomic_private_json(self.path, value)
@@ -896,7 +946,7 @@ class SlotState:
         if not stat.S_ISLNK(details.st_mode) or target != f"releases/{release_id}":
             raise SlotValidationError("slot link is unsafe")
 
-    def reconcile(self) -> dict[str, Any]:
+    def _reconcile_locked(self) -> dict[str, Any]:
         state = self._load()
         pending = state["pending"]
         if pending is not None:
@@ -918,7 +968,11 @@ class SlotState:
         self._assert_link("previous", state["previous"])
         return state
 
-    def transition(
+    def reconcile(self) -> dict[str, Any]:
+        with self.locked():
+            return self._reconcile_locked()
+
+    def _transition_locked(
         self,
         *,
         current: str,
@@ -932,7 +986,7 @@ class SlotState:
             previous = _safe_release_id(previous)
         if current == previous or not isinstance(reason, str) or not reason or len(reason) > 128:
             raise SlotValidationError("slot transition is invalid")
-        state = self.reconcile()
+        state = self._reconcile_locked()
         if generation < int(state["generation"]):
             raise SlotValidationError("slot generation cannot move backward")
         for identifier in (current, previous):
@@ -946,24 +1000,43 @@ class SlotState:
             "reason": reason,
         }
         self._write({key: item for key, item in state.items() if key != "checksum"})
-        return self.reconcile()
+        return self._reconcile_locked()
+
+    def transition(
+        self,
+        *,
+        current: str,
+        previous: str | None,
+        generation: int,
+        fallback_attempted: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        with self.locked():
+            return self._transition_locked(
+                current=current,
+                previous=previous,
+                generation=generation,
+                fallback_attempted=fallback_attempted,
+                reason=reason,
+            )
 
     def activate(self, release_id: str) -> dict[str, Any]:
         identifier = _safe_release_id(release_id)
-        self.store.validate(identifier)
-        state = self.reconcile()
-        if state["current"] == identifier:
-            return state
-        return self.transition(
-            current=identifier,
-            previous=state["current"],
-            generation=int(state["generation"]) + 1,
-            fallback_attempted=False,
-            reason=f"{self.domain}_activate",
-        )
+        with self.locked():
+            self.store.validate(identifier)
+            state = self._reconcile_locked()
+            if state["current"] == identifier:
+                return state
+            return self._transition_locked(
+                current=identifier,
+                previous=state["current"],
+                generation=int(state["generation"]) + 1,
+                fallback_attempted=False,
+                reason=f"{self.domain}_activate",
+            )
 
-    def fallback(self, reason: str) -> dict[str, Any]:
-        state = self.reconcile()
+    def _fallback_locked(self, reason: str) -> dict[str, Any]:
+        state = self._reconcile_locked()
         if state["fallbackAttempted"]:
             raise SlotBootstrapError("capsule fallback was already attempted")
         previous = state["previous"]
@@ -971,7 +1044,7 @@ class SlotState:
         if previous is None or current is None:
             raise SlotBootstrapError("capsule has no previous release")
         self.store.validate(previous)
-        return self.transition(
+        return self._transition_locked(
             current=previous,
             previous=current,
             generation=int(state["generation"]),
@@ -979,12 +1052,17 @@ class SlotState:
             reason=reason,
         )
 
+    def fallback(self, reason: str) -> dict[str, Any]:
+        with self.locked():
+            return self._fallback_locked(reason)
+
 
 @dataclass
 class StartupAttempt:
     healthy: bool
     exit_code: int | None = None
     process: subprocess.Popen[bytes] | None = None
+    identity_conflict: bool = False
 
 
 @dataclass
@@ -1026,39 +1104,44 @@ class CapsuleSlots:
         return self.state.activate(release_id)
 
     def boot_with(self, launcher: StartupLauncher) -> CapsuleBootResult:
-        state = self.state.reconcile()
-        current = state["current"]
-        if current is None:
-            raise SlotBootstrapError("capsule has no active release")
-        fallback_used = False
-        try:
-            self.store.validate(current)
-        except SlotValidationError:
-            state = self.state.fallback("capsule_validation_fallback")
+        with self.state.locked():
+            state = self.state._reconcile_locked()
             current = state["current"]
-            fallback_used = True
-        assert isinstance(current, str)
-        attempt = launcher(self.store.release_path(current), self.startup_timeout_seconds)
-        if not isinstance(attempt, StartupAttempt):
-            raise SlotBootstrapError("capsule launcher returned an invalid result")
-        if not attempt.healthy:
-            if attempt.process is not None and attempt.process.poll() is None:
-                _terminate_startup_process(attempt.process)
-            state = self.state.fallback("capsule_startup_health_fallback")
-            current = state["current"]
+            if current is None:
+                raise SlotBootstrapError("capsule has no active release")
+            fallback_used = False
+            try:
+                self.store.validate(current)
+            except SlotValidationError:
+                state = self.state._fallback_locked("capsule_validation_fallback")
+                current = state["current"]
+                fallback_used = True
             assert isinstance(current, str)
-            fallback_used = True
             attempt = launcher(self.store.release_path(current), self.startup_timeout_seconds)
+            if not isinstance(attempt, StartupAttempt):
+                raise SlotBootstrapError("capsule launcher returned an invalid result")
             if not attempt.healthy:
                 if attempt.process is not None and attempt.process.poll() is None:
                     _terminate_startup_process(attempt.process)
-                raise SlotBootstrapError("capsule previous release failed startup health")
-        return CapsuleBootResult(
-            release_id=current,
-            release_path=self.store.release_path(current),
-            attempt=attempt,
-            fallback_used=fallback_used,
-        )
+                if attempt.identity_conflict:
+                    raise SlotBootstrapError(
+                        "a different recovery capsule supervisor is already active"
+                    )
+                state = self.state._fallback_locked("capsule_startup_health_fallback")
+                current = state["current"]
+                assert isinstance(current, str)
+                fallback_used = True
+                attempt = launcher(self.store.release_path(current), self.startup_timeout_seconds)
+                if not attempt.healthy:
+                    if attempt.process is not None and attempt.process.poll() is None:
+                        _terminate_startup_process(attempt.process)
+                    raise SlotBootstrapError("capsule previous release failed startup health")
+            return CapsuleBootResult(
+                release_id=current,
+                release_path=self.store.release_path(current),
+                attempt=attempt,
+                fallback_used=fallback_used,
+            )
 
 
 def _terminate_startup_process(process: subprocess.Popen[bytes]) -> None:
@@ -1156,68 +1239,73 @@ class BotReleaseSlots:
     def activate(self, release_id: str) -> dict[str, Any]:
         return self.state.activate(release_id)
 
-    def _record_evidence(self, evidence: dict[str, Any]) -> Path:
-        state = self.state.reconcile()
-        path = self.evidence_directory / f"{int(state['sequence']):08d}-{uuid.uuid4().hex}.json"
+    def _record_evidence(self, evidence: dict[str, Any], *, sequence: int) -> Path:
+        path = self.evidence_directory / f"{sequence:08d}-{uuid.uuid4().hex}.json"
         _atomic_private_json(path, evidence)
         return path
 
     def rollback(self, restart_operation_id: str) -> dict[str, Any]:
-        self.restarts.require(restart_operation_id)
-        state = self.state.reconcile()
-        former = state["current"]
-        target = state["previous"]
-        if former is None or target is None:
-            raise SlotValidationError("bot rollback requires current and previous releases")
-        self.store.validate(target)
-        former_valid = True
-        try:
-            self.store.validate(former)
-        except SlotValidationError:
-            former_valid = False
-        switched = self.state.transition(
-            current=target,
-            previous=former,
-            generation=int(state["generation"]) + 1,
-            fallback_attempted=False,
-            reason="bot_offline_rollback",
-        )
-        restart = self.restarts.execute(restart_operation_id)
-        restored = False
-        restore_restart: dict[str, Any] | None = None
-        if not restart["ok"] and former_valid:
-            self.store.validate(former)
-            self.state.transition(
-                current=former,
-                previous=target,
-                generation=int(switched["generation"]) + 1,
+        with self.state.locked():
+            self.restarts.require(restart_operation_id)
+            state = self.state._reconcile_locked()
+            former = state["current"]
+            target = state["previous"]
+            if former is None or target is None:
+                raise SlotValidationError("bot rollback requires current and previous releases")
+            self.store.validate(target)
+            former_valid = True
+            try:
+                self.store.validate(former)
+            except SlotValidationError:
+                former_valid = False
+            switched = self.state._transition_locked(
+                current=target,
+                previous=former,
+                generation=int(state["generation"]) + 1,
                 fallback_attempted=False,
-                reason="bot_failed_restart_restore",
+                reason="bot_offline_rollback",
             )
-            restored = True
-            restore_restart = self.restarts.execute(restart_operation_id)
-        evidence = {
-            "schemaVersion": SLOT_SCHEMA_VERSION,
-            "domain": "bot",
-            "recordedAt": _utc_now(),
-            "fromRelease": former,
-            "toRelease": target,
-            "targetManifestVerified": True,
-            "formerManifestVerified": former_valid,
-            "restart": restart,
-            "restoredFormerSlot": restored,
-            "restoreRestart": restore_restart,
-            "outcome": "rolled_back" if restart["ok"] else "restart_failed",
-        }
-        evidence_path = self._record_evidence(evidence)
-        return {
-            "ok": bool(restart["ok"]),
-            "outcome": evidence["outcome"],
-            "currentRelease": self.state.reconcile()["current"],
-            "restoredFormerSlot": restored,
-            "restoreRestartOk": None if restore_restart is None else bool(restore_restart["ok"]),
-            "evidenceFile": evidence_path.name,
-        }
+            restart = self.restarts.execute(restart_operation_id)
+            restored = False
+            restore_restart: dict[str, Any] | None = None
+            if not restart["ok"] and former_valid:
+                self.store.validate(former)
+                self.state._transition_locked(
+                    current=former,
+                    previous=target,
+                    generation=int(switched["generation"]) + 1,
+                    fallback_attempted=False,
+                    reason="bot_failed_restart_restore",
+                )
+                restored = True
+                restore_restart = self.restarts.execute(restart_operation_id)
+            final_state = self.state._reconcile_locked()
+            evidence = {
+                "schemaVersion": SLOT_SCHEMA_VERSION,
+                "domain": "bot",
+                "recordedAt": _utc_now(),
+                "fromRelease": former,
+                "toRelease": target,
+                "targetManifestVerified": True,
+                "formerManifestVerified": former_valid,
+                "restart": restart,
+                "restoredFormerSlot": restored,
+                "restoreRestart": restore_restart,
+                "outcome": "rolled_back" if restart["ok"] else "restart_failed",
+            }
+            evidence_path = self._record_evidence(
+                evidence, sequence=int(final_state["sequence"])
+            )
+            return {
+                "ok": bool(restart["ok"]),
+                "outcome": evidence["outcome"],
+                "currentRelease": final_state["current"],
+                "restoredFormerSlot": restored,
+                "restoreRestartOk": None
+                if restore_restart is None
+                else bool(restore_restart["ok"]),
+                "evidenceFile": evidence_path.name,
+            }
 
 
 def _slot_policy(config: RecoveryConfig) -> dict[str, Any]:
@@ -1252,26 +1340,27 @@ def active_slot_release(config: RecoveryConfig, domain: str) -> dict[str, Any]:
         slots = _bot_slots(config)
     else:
         raise SlotValidationError("slot domain is invalid")
-    state = slots.state.reconcile()
-    current = state["current"]
-    if not isinstance(current, str):
-        raise SlotValidationError("slot has no active release")
-    manifest = slots.store.validate(current)
-    link = slots.store.root / "current"
-    expected = slots.store.release_path(current).resolve(strict=True)
-    try:
-        details = link.lstat()
-        actual = link.resolve(strict=True)
-    except OSError as exc:
-        raise SlotValidationError("active slot link is unavailable") from exc
-    if not stat.S_ISLNK(details.st_mode) or actual != expected:
-        raise SlotValidationError("active slot link is invalid")
-    return {
-        "domain": domain,
-        "releaseId": current,
-        "packageVersion": str(manifest["packageVersion"]),
-        "generation": int(state["generation"]),
-    }
+    with slots.state.locked():
+        state = slots.state._reconcile_locked()
+        current = state["current"]
+        if not isinstance(current, str):
+            raise SlotValidationError("slot has no active release")
+        manifest = slots.store.validate(current)
+        link = slots.store.root / "current"
+        expected = slots.store.release_path(current).resolve(strict=True)
+        try:
+            details = link.lstat()
+            actual = link.resolve(strict=True)
+        except OSError as exc:
+            raise SlotValidationError("active slot link is unavailable") from exc
+        if not stat.S_ISLNK(details.st_mode) or actual != expected:
+            raise SlotValidationError("active slot link is invalid")
+        return {
+            "domain": domain,
+            "releaseId": current,
+            "packageVersion": str(manifest["packageVersion"]),
+            "generation": int(state["generation"]),
+        }
 
 
 def _private_token(path: Path) -> str:
@@ -1313,11 +1402,15 @@ def _capsule_launcher(
 
     def launch(release: Path, timeout: int) -> StartupAttempt:
         manifest = _read_json(release / MANIFEST_NAME, private=False)
+        release_id = _safe_release_id(manifest.get("releaseId"))
+        startup_nonce = secrets.token_hex(32)
         node_parent = str(Path(manifest["prerequisites"]["node"]["path"]).parent)
         pi_parent = str(Path(manifest["prerequisites"]["pi"]["path"]).parent)
         environment = dict(os.environ)
         environment["PATH"] = os.pathsep.join((node_parent, pi_parent, "/usr/bin", "/bin"))
         environment["MINIME_CONTROL_WORKSPACE_ROOT"] = str(workspace)
+        environment["MINIME_RECOVERY_STARTUP_NONCE"] = startup_nonce
+        environment["MINIME_RECOVERY_CAPSULE_RELEASE_ID"] = release_id
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -1344,12 +1437,34 @@ def _capsule_launcher(
             connection = http.client.HTTPConnection(configured.host, configured.port, timeout=0.5)
             try:
                 connection.request(
-                    "GET", "/healthz", headers={"Authorization": f"Bearer {token}"}
+                    "GET",
+                    "/healthz",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        _STARTUP_NONCE_HEADER: startup_nonce,
+                        _STARTUP_RELEASE_HEADER: release_id,
+                    },
                 )
                 response = connection.getresponse()
                 response.read(4096)
+                response_nonce = response.getheader(_STARTUP_NONCE_HEADER, "")
+                response_release = response.getheader(_STARTUP_RELEASE_HEADER, "")
                 if response.status == 200:
-                    return StartupAttempt(True, None, process)
+                    identity_matches = (
+                        isinstance(response_nonce, str)
+                        and hmac.compare_digest(response_nonce, startup_nonce)
+                        and isinstance(response_release, str)
+                        and hmac.compare_digest(response_release, release_id)
+                    )
+                    if identity_matches and process.poll() is None:
+                        return StartupAttempt(True, None, process)
+                    if not identity_matches:
+                        return StartupAttempt(
+                            False,
+                            None,
+                            process,
+                            identity_conflict=True,
+                        )
             except (OSError, http.client.HTTPException):
                 pass
             finally:
@@ -1423,10 +1538,6 @@ def main(argv: list[str] | None = None) -> int:
             result = _bot_slots(configured).rollback(args.restart_operation_id)
         else:
             capsules = _capsule_slots(configured)
-            state = capsules.state.reconcile()
-            current = state["current"]
-            if current is None:
-                raise SlotBootstrapError("capsule has no active release")
             boot = capsules.boot_with(
                 _capsule_launcher(workspace, config_path, configured)
             )

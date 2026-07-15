@@ -479,7 +479,10 @@ function shellWords(command: string): string[] | undefined {
       push();
       if (command[index + 1] === "&") index += 1;
       words.push(";");
-    } else if (char === ">" || char === "`") {
+    } else if (char === ">" || char === "`" || "*?[]{}".includes(char)) {
+      // Unquoted glob and brace expansion can rewrite both executables and
+      // arguments after this guard has inspected them. Fail closed rather
+      // than attempting to reproduce Bash expansion semantics.
       return undefined;
     } else {
       current += char;
@@ -522,7 +525,7 @@ const PACKAGE_MUTATORS = new Set([
 const DELETERS = new Set(["rm", "rmdir", "shred", "unlink"]);
 const SECRET_EXECUTABLES = new Set(["gpg", "openssl", "pass", "security", "ssh-keygen"]);
 const OPAQUE_COMMAND_WRAPPERS = new Set([
-  "builtin", "command", "exec", "nice", "nohup", "time", "xargs",
+  ".", "builtin", "command", "eval", "exec", "nice", "nohup", "source", "time", "xargs",
 ]);
 const NESTED_SHELLS = new Set(["bash", "dash", "fish", "ksh", "sh", "zsh"]);
 const EVALUATOR_FLAGS = new Map<string, Set<string>>([

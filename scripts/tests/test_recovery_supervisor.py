@@ -2102,7 +2102,16 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                     first,
                     action_key="repair-config",
                     tool_name="edit",
-                    intent={"pathRef": "config:bot", "preimage": "sha256:before"},
+                    intent={
+                        "pathRef": "config:bot",
+                        "preimage": {
+                            "state": "captured",
+                            "reference": f"/private/synthetic/preimages/{'e' * 64}.preimage",
+                            "contentSha256": "c" * 64,
+                            "sizeBytes": 42,
+                            "pathSha256": "d" * 64,
+                        },
+                    },
                 )
             )
             self.assertTrue(
@@ -2273,6 +2282,19 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
             self.assertEqual(report["incident"]["sessions"][0]["sessionId"], "full-lifecycle-session")
             self.assertTrue(report["actions"])
             self.assertTrue(report["verification"])
+            self.assertEqual(
+                report["preimages"],
+                [
+                    {
+                        "actionKey": "repair-config",
+                        "state": "captured",
+                        "reference": f"[absolute-path]/{'e' * 64}.preimage",
+                        "contentSha256": "c" * 64,
+                        "sizeBytes": 42,
+                        "pathSha256": "d" * 64,
+                    }
+                ],
+            )
             self.assertEqual(
                 report["changedReleases"],
                 [{"domain": "bot", "from": "bot-broken", "to": "bot-stable"}],
@@ -3882,6 +3904,8 @@ class RecoveryHttpTests(unittest.TestCase):
                 max_body=1_024,
                 body_timeout=1,
                 service=service,
+                startup_nonce="e" * 64,
+                capsule_release_id="capsule-test",
             )
             server = recovery_supervisor.BoundedThreadingHTTPServer(
                 ("127.0.0.1", 0), recovery_supervisor.handler_for(app), max_concurrent_requests=2
@@ -3911,6 +3935,29 @@ class RecoveryHttpTests(unittest.TestCase):
             try:
                 self.assertEqual(request("GET", "/healthz", authorized=False)[0], 401)
                 self.assertEqual(request("GET", "/healthz")[0], 200)
+                startup_health = http.client.HTTPConnection(
+                    "127.0.0.1", port, timeout=2
+                )
+                startup_health.request(
+                    "GET",
+                    "/healthz",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                startup_response = startup_health.getresponse()
+                self.assertEqual(
+                    startup_response.getheader(
+                        recovery_supervisor._STARTUP_NONCE_HEADER
+                    ),
+                    "e" * 64,
+                )
+                self.assertEqual(
+                    startup_response.getheader(
+                        recovery_supervisor._STARTUP_RELEASE_HEADER
+                    ),
+                    "capsule-test",
+                )
+                startup_response.read()
+                startup_health.close()
                 self.assertEqual(request("POST", "/v1/alertmanager", b"{}", authorized=False)[0], 401)
                 self.assertEqual(request("POST", "/v1/alertmanager", b"not-json")[0], 400)
                 self.assertEqual(request("POST", "/v1/alertmanager", b"x" * 1_025)[0], 413)

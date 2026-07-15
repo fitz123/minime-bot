@@ -1222,6 +1222,9 @@ for (const [command, category] of [
   ["docker pull example/image", "package-or-image-download"],
   ["docker volume rm data", "prune-or-volume"],
   ["telegram getUpdates", "competing-polling"],
+  ["/bin/r? -rf cache", "ambiguous-shell"],
+  ["{rm,-rf,cache}", "ambiguous-shell"],
+  ["eval rm -rf cache", "ambiguous-shell"],
 ]) {
   assert.equal(recoveryProtocol.forbiddenRecoveryBashReason(command), category, command);
 }
