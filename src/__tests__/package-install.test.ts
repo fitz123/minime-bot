@@ -348,8 +348,8 @@ describe("package artifact install", () => {
           capsuleRoot: "var/recovery/capsule",
           botReleaseRoot: "var/releases",
           startupHealthTimeoutSeconds: 60,
-          nodeExecutable: "/usr/local/bin/node",
-          nodeVersion: "22.19.0",
+          nodeExecutable: process.execPath,
+          nodeVersion: process.versions.node,
           piExecutable: "/usr/local/bin/pi",
           piVersion: "0.80.6",
         },
@@ -452,7 +452,7 @@ describe("package artifact install", () => {
       );
       assert.equal(recoveryStatus.status, 0, recoveryStatus.stderr || recoveryStatus.stdout);
       assert.deepEqual(JSON.parse(recoveryStatus.stdout).foundation, {
-        fixerAvailable: false,
+        fixerAvailable: true,
         fixerDispatchAllowed: false,
         mutationAllowed: false,
         nativeVerification: true,

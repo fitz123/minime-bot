@@ -357,13 +357,18 @@ class RecoveryConfigTests(unittest.TestCase):
             ]
             invalid_documents.append(("malformed-operation", malformed_operation))
 
+            valid_executable = next(
+                str(candidate)
+                for candidate in (Path("/usr/bin/true"), Path("/bin/true"))
+                if candidate.is_file() and candidate.resolve() == candidate
+            )
             valid_operation = config_document("enabled")
             valid_operation["reviewedOperations"] = [
                 {
                     "id": "restart-bot",
                     "kind": "restart",
-                    "executable": "/bin/launchctl",
-                    "argv": ["kickstart", "-k", "gui/501/ai.minime.bot"],
+                    "executable": valid_executable,
+                    "argv": [],
                     "timeoutSeconds": 30,
                 }
             ]
