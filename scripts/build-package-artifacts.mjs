@@ -14,6 +14,7 @@ const wrappers = [
   ["codex-transport-overflow.ts", "codex-transport-overflow.js"],
   ["web-tools.ts", "web-tools.js"],
   ["knowledge-tools.ts", "knowledge-tools.js"],
+  ["recovery.ts", "recovery.js"],
   [join("subagent", "agents.ts"), join("subagent", "agents.js")],
   [join("subagent", "index.ts"), join("subagent", "index.js")],
   [join("ask-agent", "index.ts"), join("ask-agent", "index.js")],
@@ -72,3 +73,4 @@ for (const rel of [
 
 chmodSync(join(packageRoot, "dist", "cli.js"), 0o755);
 chmodSync(join(packageRoot, "dist", "codex-quota-sampler.js"), 0o755);
+chmodSync(join(packageRoot, "dist", "recovery", "fixer-session.js"), 0o755);

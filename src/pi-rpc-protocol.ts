@@ -137,6 +137,21 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 export interface PiSpawnRuntimeEnvOptions {
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
+  /** Fixed recovery-only child contract. Arbitrary environment injection is deliberately unsupported. */
+  recovery?: {
+    endpoint: string;
+    fixerCredentialFile: string;
+    mode: "diagnose" | "enabled";
+    invocationId: number;
+    incidentId: number;
+    generation: number;
+    evidenceHash: string;
+    policyRevision: number;
+    leaseToken: string;
+    sessionDirectory: string;
+  };
+  /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
+  startNewProcessGroup?: boolean;
 }
 
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
@@ -629,6 +644,19 @@ function buildAllowedPiChildEnv(
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
+  const recovery = runtimeEnvOptions?.recovery;
+  if (recovery) {
+    env.PI_CODING_AGENT_SESSION_DIR = recovery.sessionDirectory;
+    env.MINIME_RECOVERY_ENDPOINT = recovery.endpoint;
+    env.MINIME_RECOVERY_FIXER_CREDENTIAL_FILE = recovery.fixerCredentialFile;
+    env.MINIME_RECOVERY_MODE = recovery.mode;
+    env.MINIME_RECOVERY_INVOCATION_ID = String(recovery.invocationId);
+    env.MINIME_RECOVERY_INCIDENT_ID = String(recovery.incidentId);
+    env.MINIME_RECOVERY_GENERATION = String(recovery.generation);
+    env.MINIME_RECOVERY_EVIDENCE_HASH = recovery.evidenceHash;
+    env.MINIME_RECOVERY_POLICY_REVISION = String(recovery.policyRevision);
+    env.MINIME_RECOVERY_LEASE_TOKEN = recovery.leaseToken;
+  }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
@@ -681,6 +709,7 @@ export function spawnPiRpcSession(
     env,
     cwd: workspaceCwd,
     stdio: ["pipe", "pipe", "pipe"],
+    detached: runtimeEnvOptions?.startNewProcessGroup === true,
   });
 
   // Buffer startup stderr so the spawn caller can classify a resume failure

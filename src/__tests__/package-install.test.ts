@@ -198,6 +198,8 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
     "dist/pi-extensions/tavily-secret.js",
+    "dist/pi-extensions/recovery-protocol.js",
+    "dist/recovery/fixer-session.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -205,6 +207,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/extensions/pi/ask-agent/index.js",
     "dist/extensions/pi/subagent/agents.js",
     "dist/extensions/pi/subagent/index.js",
+    "dist/extensions/pi/recovery.js",
     "scripts/deliver.sh",
     "scripts/monitoring_native.py",
     "scripts/alertmanager_webhook.py",
@@ -235,7 +238,6 @@ function assertPackFiles(files: readonly string[]): void {
   }
 
   assert.ok(!files.some((file) => file.includes(RETIRED_GUARD_WRAPPER)), "guard extension should not be packed");
-  assert.ok(!files.some((file) => file.startsWith("dist/recovery/")), "recovery worker artifacts should not be packed");
   const retiredOutputExtension = ["recovery", "plan"].join("-");
   const retiredKnowledgeWrapper = ["recovery", "knowledge", "tools"].join("-");
   assert.ok(!files.some((file) => file.includes(retiredOutputExtension)), "recovery output extension should not be packed");
@@ -1151,6 +1153,11 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
+const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-protocol.js");
+const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
+assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
+assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
+assert.ok(existsSync(join(artifactDir, "recovery.js")));
 const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(

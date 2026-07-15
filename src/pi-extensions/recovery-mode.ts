@@ -18,6 +18,13 @@ export function isRecoveryMode(value: unknown): value is RecoveryMode {
   return typeof value === "string" && (RECOVERY_MODES as readonly string[]).includes(value);
 }
 
+export function parseRecoveryMode(value: unknown): RecoveryMode {
+  if (!isRecoveryMode(value)) {
+    throw new Error("Recovery mode is invalid");
+  }
+  return value;
+}
+
 export function recoveryModeAllowsDispatch(mode: RecoveryMode): boolean {
   return mode === "diagnose" || mode === "enabled";
 }

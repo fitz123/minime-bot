@@ -93,11 +93,11 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 - [x] Add schema/version, mode, lifecycle, stale-fence, duplicate, corruption/full/lock, and report-state tests; run focused Python tests.
 
 ### Task 2: Add the full exact-session Pi fixer and separated action protocol
-- [ ] Add the full runner, shared helpers, and non-default recovery wrapper while preserving normal Pi tools/context and excluding the old planner/`--no-session` model.
-- [ ] Implement the verified `PI_CODING_AGENT_SESSION_DIR` + `get_state.data.sessionId` + one canonical JSONL binding flow, commit before first prompt, and exact `--session` resume; verify vendor APIs before using any alternative.
-- [ ] Add mutually exclusive intake/fixer credentials and fenced endpoints plus recovery intent/outcome/reconcile/blocked/finish tooling around all mutating tools.
-- [ ] Resume after verification/crash and permit a journal-digest replacement only after transcript readability and startup-classifier proof.
-- [ ] Test exact ID/path resume, unreadable degradation, crash unknowns, reconciliation-before-mutation, diagnose blocking, extension kill-switch rejection, process-group fencing, Pi/provider outage, credential separation, and no chat binding; run TypeScript/Python integration tests.
+- [x] Add the full runner, shared helpers, and non-default recovery wrapper while preserving normal Pi tools/context and excluding the old planner/`--no-session` model.
+- [x] Implement the verified `PI_CODING_AGENT_SESSION_DIR` + `get_state.data.sessionId` + one canonical JSONL binding flow, commit before first prompt, and exact `--session` resume; verify vendor APIs before using any alternative.
+- [x] Add mutually exclusive intake/fixer credentials and fenced endpoints plus recovery intent/outcome/reconcile/blocked/finish tooling around all mutating tools.
+- [x] Resume after verification/crash and permit a journal-digest replacement only after transcript readability and startup-classifier proof.
+- [x] Test exact ID/path resume, unreadable degradation, crash unknowns, reconciliation-before-mutation, diagnose blocking, extension kill-switch rejection, process-group fencing, Pi/provider outage, credential separation, and no chat binding; run TypeScript/Python integration tests.
 
 ### Task 3: Make the supervisor outcome and report authority
 - [ ] Drive one fixer process from the global lease/static retry budget while intake, fallback, and probes remain Python-host-native.

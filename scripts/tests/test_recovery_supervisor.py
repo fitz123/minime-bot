@@ -1547,6 +1547,103 @@ class RecoveryDurableFixerContractTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_crash_retry_carries_unknown_actions_across_invocation_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=10),
+                owner="fixer-contract",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("cross-generation-crash"))
+                )
+            )
+            first = coordinator.claim_next()
+            assert first is not None
+            first_binding = coordinator.bind_session(
+                first,
+                session_id="cross-generation-session",
+                session_directory=str(root / "sessions" / "cross-generation"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "cross-generation"
+                    / "cross-generation-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(first_binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="crashed-edit",
+                    tool_name="edit",
+                    intent={"path": "config"},
+                )
+            )
+            clock[0] = 200.0
+            coordinator.reconcile()
+            second = coordinator.claim_next()
+            assert second is not None
+            self.assertNotEqual(first.invocation_id, second.invocation_id)
+            state = coordinator.fixer_state(second)
+            assert state is not None
+            self.assertEqual(
+                [item["actionKey"] for item in state["unknownActions"]],
+                ["crashed-edit"],
+            )
+            self.assertNotIn("currentSession", state)
+            self.assertEqual(
+                state["resumeSession"]["bindingId"],
+                first_binding,
+            )
+            resumed_binding = coordinator.bind_session(
+                second,
+                session_id="cross-generation-session",
+                session_directory=str(root / "sessions" / "cross-generation"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "cross-generation"
+                    / "cross-generation-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(resumed_binding)
+            self.assertTrue(
+                coordinator.mark_session_resumed(second, int(resumed_binding or 0))
+            )
+            self.assertIsNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="must-wait",
+                    tool_name="write",
+                    intent={"path": "other"},
+                )
+            )
+            self.assertTrue(
+                coordinator.reconcile_action(
+                    second,
+                    action_key="crashed-edit",
+                    idempotency_key="cross-generation-reconcile",
+                    result="not_applied",
+                    details={"inspection": "preimage intact"},
+                )
+            )
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    second,
+                    action_key="after-cross-generation-reconcile",
+                    tool_name="write",
+                    intent={"path": "other"},
+                )
+            )
+            ledger.close()
+
     def test_report_outbox_state_is_idempotent_and_never_an_incident_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2780,6 +2877,275 @@ class RecoveryFoundationTests(unittest.TestCase):
 
 
 class RecoveryHttpTests(unittest.TestCase):
+    def test_intake_and_fixer_credentials_cannot_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "credentials overlap"):
+                    recovery_supervisor.RecoveryApplication(
+                        auth_token="synthetic-shared-token",
+                        fixer_auth_token="synthetic-shared-token",
+                        max_body=64 * 1024,
+                        body_timeout=1,
+                        service=service,
+                    )
+
+    def test_fixer_routes_separate_credentials_and_enforce_fenced_idempotent_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_root = root / "sessions"
+            session_root.mkdir(mode=0o700)
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="http-fixer",
+                mode="enabled",
+                session_root=session_root,
+                max_session_replacements=1,
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("fixer-http"))
+                )
+            )
+            fence = coordinator.claim_next()
+            assert fence is not None
+            service = recovery_supervisor.RecoveryService(
+                ledger,
+                recovery_supervisor.AtomicJsonSpool(root / "events"),
+                recovery_supervisor.EmergencyNotifier(root / "notifications", delivery=None),
+                coordinator=coordinator,
+            )
+            intake_token = "synthetic-intake-token-value"
+            fixer_token = "synthetic-fixer-token-value"
+            app = recovery_supervisor.RecoveryApplication(
+                auth_token=intake_token,
+                fixer_auth_token=fixer_token,
+                max_body=64 * 1024,
+                body_timeout=1,
+                service=service,
+            )
+            server = recovery_supervisor.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), recovery_supervisor.handler_for(app)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            def request(path: str, value: dict[str, object], token: str) -> tuple[int, dict[str, object]]:
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                body = json.dumps(value).encode()
+                connection.request(
+                    "POST",
+                    path,
+                    body=body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response_body = response.read()
+                connection.close()
+                try:
+                    decoded = json.loads(response_body)
+                except json.JSONDecodeError:
+                    decoded = {}
+                return response.status, decoded
+
+            fence_body: dict[str, object] = {
+                "invocationId": fence.invocation_id,
+                "incidentId": fence.incident_id,
+                "generation": fence.generation,
+                "evidenceHash": fence.evidence_hash,
+                "policyRevision": fence.policy_revision,
+                "leaseToken": fence.lease_token,
+            }
+            try:
+                self.assertEqual(request("/v1/fixer/state", fence_body, intake_token)[0], 401)
+                intake_body = json.dumps({}).encode()
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                connection.request(
+                    "POST",
+                    "/v1/alertmanager",
+                    body=intake_body,
+                    headers={
+                        "Authorization": f"Bearer {fixer_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(connection.getresponse().status, 401)
+                connection.close()
+
+                status, state = request("/v1/fixer/state", fence_body, fixer_token)
+                self.assertEqual(status, 200)
+                self.assertEqual(state["mode"], "enabled")
+                self.assertTrue(state["evidence"])
+
+                session_dir = session_root / "primary"
+                session_dir.mkdir(mode=0o700)
+                transcript = session_dir / "session-http.jsonl"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": "session-http",
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "cwd": "/agent",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                transcript.chmod(0o600)
+                bind = {
+                    **fence_body,
+                    "sessionId": "session-http",
+                    "sessionDirectory": str(session_dir),
+                    "transcriptPath": str(transcript),
+                }
+                status, bound = request("/v1/fixer/session/bind", bind, fixer_token)
+                self.assertEqual(status, 200)
+                binding_id = int(bound["bindingId"])
+                self.assertEqual(request("/v1/fixer/session/bind", bind, fixer_token)[0], 200)
+                self.assertEqual(
+                    request(
+                        "/v1/fixer/session/resumed",
+                        {**fence_body, "bindingId": binding_id},
+                        fixer_token,
+                    )[0],
+                    200,
+                )
+
+                intent = {
+                    **fence_body,
+                    "actionKey": "tool-call-one",
+                    "toolName": "edit",
+                    "intent": {"path": "config", "inputSha256": "a" * 64},
+                }
+                self.assertEqual(request("/v1/fixer/action/intent", intent, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/action/intent", intent, fixer_token)[0], 200)
+                self.assertEqual(
+                    request(
+                        "/v1/fixer/action/intent",
+                        {
+                            **fence_body,
+                            "actionKey": "tool-call-two",
+                            "toolName": "write",
+                            "intent": {"path": "other"},
+                        },
+                        fixer_token,
+                    )[0],
+                    409,
+                )
+                outcome = {
+                    **fence_body,
+                    "actionKey": "tool-call-one",
+                    "outcome": "succeeded",
+                    "details": {"isError": False},
+                }
+                self.assertEqual(request("/v1/fixer/action/outcome", outcome, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/action/outcome", outcome, fixer_token)[0], 200)
+
+                finish = {
+                    **fence_body,
+                    "claimKey": "claim-http-one",
+                    "claim": {"summary": "repair complete", "confidence": "high"},
+                }
+                self.assertEqual(request("/v1/fixer/finish", finish, fixer_token)[0], 200)
+                self.assertEqual(request("/v1/fixer/finish", finish, fixer_token)[0], 200)
+                self.assertEqual(
+                    ledger.connection.execute(
+                        "SELECT state FROM invocations WHERE id = ?", (fence.invocation_id,)
+                    ).fetchone()[0],
+                    "completed",
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                ledger.close()
+
+    def test_session_replacement_requires_host_unreadability_and_resume_classifier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_root = root / "sessions"
+            session_root.mkdir(mode=0o700)
+            ledger, coordinator, fence = RecoveryDurableFixerContractTests._claimed(
+                root, mode="enabled"
+            )
+            assert fence is not None
+            coordinator.session_root = session_root.resolve()
+            coordinator.max_session_replacements = 1
+            first_dir = session_root / "first"
+            first_dir.mkdir(mode=0o700)
+            first_path = first_dir / "first.jsonl"
+            first_path.write_text(
+                json.dumps({"type": "session", "id": "first-session"}) + "\n",
+                encoding="utf-8",
+            )
+            first_path.chmod(0o600)
+            first_id = coordinator.bind_session(
+                fence,
+                session_id="first-session",
+                session_directory=str(first_dir),
+                transcript_path=str(first_path),
+            )
+            assert first_id is not None
+            second_dir = session_root / "second"
+            second_dir.mkdir(mode=0o700)
+            second_path = second_dir / "second.jsonl"
+            second_path.write_text(
+                json.dumps({"type": "session", "id": "second-session"}) + "\n",
+                encoding="utf-8",
+            )
+            second_path.chmod(0o600)
+            self.assertIsNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="no_session_found",
+                    journal_digest="digest",
+                )
+            )
+            first_path.unlink()
+            self.assertIsNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="provider_failure",
+                    journal_digest="digest",
+                )
+            )
+            self.assertIsNotNone(
+                coordinator.replace_session_with_proof(
+                    fence,
+                    previous_binding_id=first_id,
+                    session_id="second-session",
+                    session_directory=str(second_dir),
+                    transcript_path=str(second_path),
+                    startup_classifier="no_session_found",
+                    journal_digest="digest",
+                )
+            )
+            ledger.close()
+
     def test_authenticated_health_and_input_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3809,6 +4175,9 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
 class SupervisorStartupTests(unittest.TestCase):
     @staticmethod
     def _write_config(root: Path, *, port: int = 9877) -> None:
+        fixer_token = root / "fixer-auth-token"
+        fixer_token.write_text("synthetic-fixer-auth-token-value", encoding="utf-8")
+        fixer_token.chmod(0o600)
         (root / "recovery.json").write_text(
             json.dumps(supervisor_config_document(port=port)),
             encoding="utf-8",
@@ -3820,6 +4189,9 @@ class SupervisorStartupTests(unittest.TestCase):
             token = root / "auth-token"
             token.write_text("synthetic-auth-token-value", encoding="utf-8")
             token.chmod(0o600)
+            fixer_token = root / "fixer-auth-token"
+            fixer_token.write_text("synthetic-fixer-auth-token-value", encoding="utf-8")
+            fixer_token.chmod(0o600)
             (root / "recovery.json").write_text(
                 json.dumps(supervisor_config_document()),
                 encoding="utf-8",
