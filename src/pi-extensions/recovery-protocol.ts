@@ -536,7 +536,12 @@ const NETWORK_GIT = new Set([
   "archive", "clone", "fetch", "ls-remote", "pull", "push", "send-email", "submodule",
 ]);
 const LOCAL_GIT = new Set([...READ_ONLY_GIT, "add", "commit"]);
-const SECRET_ARGUMENT = /(?:^|[./_-])(?:auth|credential|id_rsa|password|private[-_]?key|secret|token)(?:$|[./_=-])|(?:^|\/)\.env(?:$|[./_-])/i;
+const SECRET_ARGUMENT = /(?:^|[./_-])(?:auth|credentials?|id_(?:dsa|ecdsa|ed25519|rsa)|oauth|password|private[-_]?key|secrets?|tokens?)(?:$|[./_=-])|(?:^|\/)\.(?:env(?:$|[./_-])|git-credentials(?:$|\/)|netrc(?:$|\/)|npmrc(?:$|\/)|pypirc(?:$|\/))/i;
+const SECRET_STORE_PATH = /(?:^|\/)(?:~\/)?(?:\.aws|\.azure|\.gnupg|\.kube|\.password-store|\.ssh)(?:\/|$)|(?:^|\/)\.config\/(?:gcloud|gh)(?:\/|$)|(?:^|\/)\.docker\/config\.json(?:$|\/)|(?:^|\/)Library\/Keychains(?:\/|$)/i;
+
+function secretArgument(value: string): boolean {
+  return SECRET_ARGUMENT.test(value) || SECRET_STORE_PATH.test(value);
+}
 const SUPERVISOR_RECOVERY_TOOLS = new Set([
   "recovery_blocked",
   "recovery_finish",
@@ -609,7 +614,7 @@ export function forbiddenRecoveryBashReason(command: unknown): RecoveryGuardCate
     if (["launchctl", "systemctl"].includes(executable) && !readOnlySegment([...segment])) {
       return "supervisor-owned-operation";
     }
-    if (["env", "export", "printenv", "set"].includes(executable) || SECRET_EXECUTABLES.has(executable) || words.some((word) => SECRET_ARGUMENT.test(word))) {
+    if (["env", "export", "printenv", "set"].includes(executable) || SECRET_EXECUTABLES.has(executable) || words.some(secretArgument)) {
       return "secret-operation";
     }
     if (["kill", "killall", "pkill"].includes(executable)) return "supervisor-owned-operation";
@@ -626,7 +631,7 @@ export function forbiddenRecoveryToolReason(
   if (event.toolName === "bash") return forbiddenRecoveryBashReason(input.command);
   if (["edit", "write", "read"].includes(event.toolName)) {
     const path = typeof input.path === "string" ? input.path : "";
-    if (path && SECRET_ARGUMENT.test(path)) return "secret-operation";
+    if (path && secretArgument(path)) return "secret-operation";
   }
   if (/^(?:browser|email|github|http|slack|telegram|web)_/i.test(event.toolName)) {
     return "external-mutation";

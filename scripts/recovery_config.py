@@ -534,6 +534,15 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
             "action reconciliation timeout",
         ),
     }
+    session_setup_budget = max(
+        2 * int(session_policy["resumeTimeoutSeconds"]),
+        int(session_policy["resumeTimeoutSeconds"])
+        + 2 * int(session_policy["startupTimeoutSeconds"]),
+    ) + 15
+    if int(action_policy["reconciliationTimeoutSeconds"]) <= session_setup_budget:
+        raise RecoveryConfigError(
+            "recovery action reconciliation timeout must exceed the maximum session setup budget"
+        )
 
     raw_quarantine = _object(
         document["quarantinePolicy"],

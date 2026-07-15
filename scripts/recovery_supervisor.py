@@ -1099,6 +1099,16 @@ class IncidentCoordinator:
         ).fetchone() is not None
 
     @staticmethod
+    def _unresolved_actions(connection: Any, incident_id: int) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM action_intents JOIN invocations "
+            "ON invocations.id = action_intents.invocation_id "
+            "WHERE invocations.incident_id = ? "
+            "AND action_intents.state IN ('pending', 'unknown') LIMIT 1",
+            (incident_id,),
+        ).fetchone() is not None
+
+    @staticmethod
     def _invalidate_invocation(connection: Any, incident_id: int, now: float) -> None:
         active = connection.execute(
             "SELECT id, lease_token FROM invocations WHERE incident_id = ? AND state = 'active'",
@@ -1261,12 +1271,43 @@ class IncidentCoordinator:
                             (control.revision, now, incident["id"]),
                         )
                     continue
-                self._invalidate_invocation(connection, int(incident["id"]), now)
-                connection.execute(
-                    "UPDATE incidents SET state = 'verifying', generation = generation + 1, "
-                    "evidence_hash = ?, policy_revision = ?, updated_at = ? WHERE id = ?",
-                    (_EMPTY_EVIDENCE_HASH, control.revision, now, incident["id"]),
+                incident_id = int(incident["id"])
+                self._invalidate_invocation(connection, incident_id, now)
+                next_generation = int(incident["generation"]) + 1
+                reconciliation_required = self._unresolved_actions(
+                    connection, incident_id
                 )
+                next_state = (
+                    "eligible"
+                    if reconciliation_required and recovery_mode_allows_dispatch(self.mode)
+                    else "verifying"
+                )
+                connection.execute(
+                    "UPDATE incidents SET state = ?, generation = generation + 1, "
+                    "evidence_hash = ?, policy_revision = ?, updated_at = ? WHERE id = ?",
+                    (
+                        next_state,
+                        _EMPTY_EVIDENCE_HASH,
+                        control.revision,
+                        now,
+                        incident_id,
+                    ),
+                )
+                if next_state == "eligible":
+                    connection.execute(
+                        "INSERT INTO audit(occurred_at, actor, operation, target, details_json) "
+                        "VALUES (?, 'system', 'verification_retry_scheduled', ?, ?)",
+                        (
+                            now,
+                            f"incident:{incident_id}:generation:{next_generation}",
+                            _canonical_json(
+                                {
+                                    "prior_generation": int(incident["generation"]),
+                                    "reason": "action_reconciliation",
+                                }
+                            ),
+                        ),
+                    )
             active_count = len(evidence)
         if critical_impact and self.immediate_escalation is not None:
             self.immediate_escalation("confirmed_impact")
@@ -1520,6 +1561,25 @@ class IncidentCoordinator:
                     "AND result = 'contradicted' ORDER BY generation DESC, attempt DESC LIMIT 1",
                     (fence.incident_id, fence.generation),
                 ).fetchone()
+                if retry and attempt is None:
+                    unresolved = connection.execute(
+                        "SELECT action_intents.id, action_intents.action_key "
+                        "FROM action_intents JOIN invocations "
+                        "ON invocations.id = action_intents.invocation_id "
+                        "WHERE invocations.incident_id = ? "
+                        "AND action_intents.state IN ('pending', 'unknown') "
+                        "ORDER BY action_intents.id LIMIT 32",
+                        (fence.incident_id,),
+                    ).fetchall()
+                    if unresolved:
+                        return [
+                            {
+                                "ref": f"action:{int(row['id'])}",
+                                "kind": "actionReconciliation",
+                                "actionKey": str(row["action_key"]),
+                            }
+                            for row in unresolved
+                        ]
                 if not retry or attempt is None:
                     raise ValueError("recovery invocation evidence is unavailable")
                 try:
@@ -2052,6 +2112,39 @@ class IncidentCoordinator:
             connection.execute(
                 "UPDATE action_intents SET state = 'completed', updated_at = ? WHERE id = ?",
                 (now, intent["id"]),
+            )
+            return True
+
+    def mark_action_unknown(self, fence: InvocationFence, *, action_key: str) -> bool:
+        """Persist an ambiguous mutation even when host state invalidated its live fence."""
+
+        key = self._journal_text(action_key, "action key")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            row = connection.execute(
+                "SELECT action_intents.id, action_intents.state, invocations.incident_id, "
+                "invocations.generation, invocations.evidence_hash, "
+                "invocations.policy_revision, invocations.lease_token "
+                "FROM action_intents JOIN invocations "
+                "ON invocations.id = action_intents.invocation_id "
+                "WHERE action_intents.invocation_id = ? AND action_intents.action_key = ?",
+                (fence.invocation_id, key),
+            ).fetchone()
+            if row is None or (
+                int(row["incident_id"]) != fence.incident_id
+                or int(row["generation"]) != fence.generation
+                or str(row["evidence_hash"]) != fence.evidence_hash
+                or int(row["policy_revision"]) != fence.policy_revision
+                or str(row["lease_token"]) != fence.lease_token
+            ):
+                return False
+            if row["state"] == "unknown":
+                return True
+            if row["state"] != "pending":
+                return False
+            connection.execute(
+                "UPDATE action_intents SET state = 'unknown', updated_at = ? WHERE id = ?",
+                (now, row["id"]),
             )
             return True
 
@@ -3265,13 +3358,24 @@ class ReviewedOperationExecutor:
             "operationId": operation_id,
         }
 
-    def execute(self, operation_id: str) -> dict[str, Any]:
+    def execute(
+        self, operation_id: str, *, fence_valid: Callable[[], bool]
+    ) -> dict[str, Any]:
         operation = self.operations[operation_id]
         previous_release = (
             None if self.active_bot_release is None else self.active_bot_release()
         )
+        process: subprocess.Popen[bytes] | None = None
         try:
-            completed = subprocess.run(
+            if not fence_valid():
+                result = {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "kind": operation["kind"],
+                    "code": "fence_lost",
+                }
+                return result
+            process = subprocess.Popen(
                 [str(operation["executable"]), *map(str, operation["argv"])],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -3282,31 +3386,49 @@ class ReviewedOperationExecutor:
                     "LC_ALL": "C",
                     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 },
-                timeout=int(operation["timeoutSeconds"]),
-                check=False,
                 close_fds=True,
+                shell=False,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            result = {
-                "ok": False,
-                "operationId": operation_id,
-                "kind": operation["kind"],
-                "code": "timeout",
-            }
+            deadline = time.monotonic() + int(operation["timeoutSeconds"])
+            code = "completed"
+            while process.poll() is None:
+                if not fence_valid():
+                    code = "fence_lost"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    code = "timeout"
+                    break
+                time.sleep(min(0.1, remaining))
+            if code != "completed":
+                PythonProbeRunner._terminate_process_group(process)
+                result = {
+                    "ok": False,
+                    "operationId": operation_id,
+                    "kind": operation["kind"],
+                    "code": code,
+                }
+            else:
+                return_code = int(process.returncode or 0)
+                # A reviewed wrapper may have left descendants behind. The
+                # isolated group never survives the direct child.
+                PythonProbeRunner._terminate_process_group(process)
+                result = {
+                    "ok": return_code == 0,
+                    "operationId": operation_id,
+                    "kind": operation["kind"],
+                    "code": "completed" if return_code == 0 else "nonzero_exit",
+                    "exitCode": return_code,
+                }
         except OSError:
+            if process is not None:
+                PythonProbeRunner._terminate_process_group(process)
             result = {
                 "ok": False,
                 "operationId": operation_id,
                 "kind": operation["kind"],
                 "code": "execution_failed",
-            }
-        else:
-            result = {
-                "ok": completed.returncode == 0,
-                "operationId": operation_id,
-                "kind": operation["kind"],
-                "code": "completed" if completed.returncode == 0 else "nonzero_exit",
-                "exitCode": completed.returncode,
             }
         if operation["kind"] == "rollback" and self.active_bot_release is not None:
             result["previousRelease"] = previous_release
@@ -3360,6 +3482,10 @@ class RecoveryActuator:
             try:
                 details = execute()
             except RecoveryMutationUnknown:
+                if not self.coordinator.mark_action_unknown(
+                    fence, action_key=action_key
+                ):
+                    return 409, {"ok": False, "code": "outcome_uncommitted"}
                 return 409, {"ok": False, "code": "action_unknown"}
             except RecoverySafetyError as exc:
                 details = {"ok": False, "code": exc.code}
@@ -3370,6 +3496,10 @@ class RecoveryActuator:
                 outcome=outcome,
                 details=details,
             ):
+                if self.coordinator.mark_action_unknown(
+                    fence, action_key=action_key
+                ):
+                    return 409, {"ok": False, "code": "action_unknown"}
                 return 409, {"ok": False, "code": "outcome_uncommitted"}
             return (200 if outcome == "succeeded" else 422), details
 
@@ -3444,7 +3574,10 @@ class RecoveryActuator:
             action_key=action_key,
             tool_name="recovery_operation",
             intent=intent,
-            execute=lambda: self.operations.execute(str(operation_id)),
+            execute=lambda: self.operations.execute(
+                str(operation_id),
+                fence_valid=lambda: self.coordinator.invocation_fence_valid(fence),
+            ),
         )
 
 
@@ -3968,6 +4101,8 @@ class RecoveryVerifier:
                 reasons.append("episodes_firing")
             if incident["state"] != "verifying":
                 reasons.append("not_verifying")
+            if self.coordinator._unresolved_actions(connection, incident_id):
+                reasons.append("actions_unresolved")
             for source in ("supervisor",) + self.source_ids:
                 observation = self._observation(
                     connection, f"verification:heartbeat:{source}"
@@ -4440,6 +4575,7 @@ class RecoveryFixerProcessManager:
         self.process: subprocess.Popen[bytes] | None = None
         self.fence: InvocationFence | None = None
         self.deadline: float | None = None
+        self.next_renewal: float | None = None
 
     @property
     def active(self) -> bool:
@@ -4499,7 +4635,9 @@ class RecoveryFixerProcessManager:
             self.process = None
             return False
         self.fence = fence
-        self.deadline = self.monotonic() + self.run_timeout_seconds
+        started = self.monotonic()
+        self.deadline = started + self.run_timeout_seconds
+        self.next_renewal = started + self.renew_seconds
         return True
 
     def tick(self) -> str:
@@ -4508,14 +4646,25 @@ class RecoveryFixerProcessManager:
         if self.process is not None:
             if self.process.poll() is None:
                 fence = self.fence
-                timed_out = self.deadline is not None and self.monotonic() >= self.deadline
+                now = self.monotonic()
+                timed_out = self.deadline is not None and now >= self.deadline
                 fence_lost = fence is None or not self.coordinator.invocation_fence_valid(fence)
+                if (
+                    not timed_out
+                    and not fence_lost
+                    and self.next_renewal is not None
+                    and now >= self.next_renewal
+                ):
+                    fence_lost = fence is None or not self.coordinator.renew_lease(fence)
+                    if not fence_lost:
+                        self.next_renewal = now + self.renew_seconds
                 if not timed_out and not fence_lost:
                     return "running"
                 process = self.process
                 self.process = None
                 self.fence = None
                 self.deadline = None
+                self.next_renewal = None
                 PythonProbeRunner._terminate_process_group(process)
                 if fence is not None:
                     self.coordinator.interrupt_invocation(
@@ -4529,6 +4678,7 @@ class RecoveryFixerProcessManager:
             self.process = None
             self.fence = None
             self.deadline = None
+            self.next_renewal = None
             if fence is not None:
                 self.coordinator.interrupt_invocation(
                     fence,
@@ -4546,6 +4696,7 @@ class RecoveryFixerProcessManager:
         self.process = None
         self.fence = None
         self.deadline = None
+        self.next_renewal = None
         if process is None:
             return
         PythonProbeRunner._terminate_process_group(process)
@@ -6002,14 +6153,29 @@ class RecoveryService:
             if self.coordinator is not None:
                 self.coordinator.controls.expire()
                 summary["activeIncidents"] = self.coordinator.reconcile()
+        except LedgerError as exc:
+            self._report_ledger_error(exc)
+        except SpoolError:
+            self.emergency.emit("spool_corrupt")
+        if self._ledger_corrupt:
+            return summary
+        # Reconciliation can invalidate a live generation. Fence and terminate
+        # its process group before delivery or deterministic probes can block
+        # this maintenance pass.
+        if self.fixer_process is not None:
+            try:
+                summary["fixer"] = self.fixer_process.tick()
+            except LedgerError as exc:
+                self._report_ledger_error(exc)
+        if self._ledger_corrupt:
+            return summary
+        try:
             self.ledger.prune_event_history(
                 retention_seconds=self.event_retention_seconds,
                 batch_size=self.event_retention_batch_size,
             )
         except LedgerError as exc:
             self._report_ledger_error(exc)
-        except SpoolError:
-            self.emergency.emit("spool_corrupt")
         if self._ledger_corrupt:
             return summary
         if self.notifications is not None:
@@ -6055,13 +6221,6 @@ class RecoveryService:
                                 dedupe_key=dedupe_key,
                                 result=result,
                             )
-            except LedgerError as exc:
-                self._report_ledger_error(exc)
-        if self._ledger_corrupt:
-            return summary
-        if self.fixer_process is not None:
-            try:
-                summary["fixer"] = self.fixer_process.tick()
             except LedgerError as exc:
                 self._report_ledger_error(exc)
         if self._ledger_corrupt:

@@ -397,6 +397,7 @@ describe("exact-session recovery fixer", () => {
       MINIME_RECOVERY_PREIMAGE_DIRECTORY: join(root, "preimages"),
     };
     const order: string[] = [];
+    let heartbeatCount = 0;
     let boundRuntime: Record<string, unknown> | undefined;
     const client = {
       contract: readRecoveryRuntimeContract(env),
@@ -406,7 +407,10 @@ describe("exact-session recovery fixer", () => {
         boundRuntime = binding.runtime;
         return 11;
       },
-      heartbeat: async () => true,
+      heartbeat: async () => {
+        heartbeatCount += 1;
+        return true;
+      },
     } as unknown as RecoveryProtocolClient;
     const spawn = ((_agent: unknown, _session: unknown, extensions: { relpaths?: readonly string[] }, runtime: {
       recovery?: { sessionDirectory: string; piExecutable: string };
@@ -424,16 +428,19 @@ describe("exact-session recovery fixer", () => {
       child.stdin?.on("data", (chunk) => {
         const command = JSON.parse(chunk.toString()) as { type: string; id?: string };
         if (command.type === "get_state") {
-          if (command.id === "recovery-session-binding") order.push("get_state");
+          if (command.id !== "recovery-session-binding") return;
+          order.push("get_state");
           const sessionId = "bound-session";
-          transcript(runtime.recovery?.sessionDirectory ?? "", sessionId);
-          child.stdout?.push(`${JSON.stringify({
-            type: "response",
-            id: command.id,
-            command: "get_state",
-            success: true,
-            data: { sessionId },
-          })}\n`);
+          setTimeout(() => {
+            transcript(runtime.recovery?.sessionDirectory ?? "", sessionId);
+            child.stdout?.push(`${JSON.stringify({
+              type: "response",
+              id: command.id,
+              command: "get_state",
+              success: true,
+              data: { sessionId },
+            })}\n`);
+          }, 25);
         } else if (command.type === "prompt") {
           order.push("prompt");
           child.stdout?.push(`${JSON.stringify({
@@ -457,7 +464,13 @@ describe("exact-session recovery fixer", () => {
     process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN = "synthetic-test-token";
     const result = await (async () => {
       try {
-        return await runRecoveryFixer({ env, client, spawn, startupTimeoutMs: 1_000 });
+        return await runRecoveryFixer({
+          env,
+          client,
+          spawn,
+          startupTimeoutMs: 1_000,
+          renewMs: 5,
+        });
       } finally {
         if (previousToken === undefined) delete process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN;
         else process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN = previousToken;
@@ -465,6 +478,7 @@ describe("exact-session recovery fixer", () => {
     })();
     assert.equal(result.status, "settled");
     assert.deepEqual(order, ["get_state", "bind", "prompt"]);
+    assert.ok(heartbeatCount > 0, "the lease must renew while session binding is pending");
     assert.equal(boundRuntime?.model, "openai-codex/gpt-5.5");
     assert.equal(boundRuntime?.pi, "0.80.6");
   });
@@ -580,6 +594,10 @@ describe("recovery action journaling", () => {
       ["docker volume rm data", "prune-or-volume"],
       ["docker restart minime", "supervisor-owned-operation"],
       ["security find-generic-password -s bot", "secret-operation"],
+      ["cat ~/.ssh/*", "secret-operation"],
+      ["sed -n 1p ~/.aws/credentials", "secret-operation"],
+      ["find ~/.gnupg -type f", "secret-operation"],
+      ["cat ~/.config/gcloud/application_default_credentials.json", "secret-operation"],
       ["telegram getUpdates", "competing-polling"],
       ["printf value > config.yaml", "ambiguous-shell"],
       ["bash -lc 'rm -rf cache'", "ambiguous-shell"],
@@ -606,6 +624,17 @@ describe("recovery action journaling", () => {
       toolName: "read",
       input: { path: "/agent/recovery-auth-token" },
     } as unknown as ToolCallEvent), "secret-operation");
+    for (const path of [
+      "/Users/example/.ssh/id_ed25519",
+      "/Users/example/.aws/credentials",
+      "/Users/example/.kube/config",
+      "/Users/example/.docker/config.json",
+    ]) {
+      assert.equal(forbiddenRecoveryToolReason({
+        toolName: "read",
+        input: { path },
+      } as unknown as ToolCallEvent), "secret-operation", path);
+    }
 
     const calls: string[] = [];
     const fakeClient = {

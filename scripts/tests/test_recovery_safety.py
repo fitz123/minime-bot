@@ -240,6 +240,57 @@ class RecoveryQuarantineSafetyTests(unittest.TestCase):
                 )
                 self.assertEqual((status, result["code"]), (422, "manifest_invalid"))
 
+    def test_ambiguous_actuator_mutation_is_immediately_reconcilable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            allowed = root / "allowed"
+            allowed.mkdir(mode=0o700)
+            source = allowed / "ambiguous.bin"
+            source.write_bytes(b"ambiguous")
+            source.chmod(0o600)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, fence = active_fence(ledger)
+                quarantine = recovery_supervisor.RecoveryQuarantine(
+                    quarantine_policy(root, allowed)
+                )
+                actuator = recovery_supervisor.RecoveryActuator(
+                    coordinator,
+                    quarantine,
+                    recovery_supervisor.ReviewedOperationExecutor(()),
+                )
+                with mock.patch.object(
+                    quarantine,
+                    "quarantine",
+                    side_effect=recovery_supervisor.RecoveryMutationUnknown(
+                        "synthetic ambiguous mutation"
+                    ),
+                ):
+                    status, result = actuator.quarantine_file(
+                        fence,
+                        idempotency_key="ambiguous-once",
+                        source_path=str(source),
+                    )
+                self.assertEqual((status, result["code"]), (409, "action_unknown"))
+                action = ledger.connection.execute(
+                    "SELECT action_key, state FROM action_intents"
+                ).fetchone()
+                self.assertEqual(action["state"], "unknown")
+                state = coordinator.fixer_state(fence)
+                assert state is not None
+                self.assertEqual(
+                    [item["actionKey"] for item in state["unknownActions"]],
+                    [action["action_key"]],
+                )
+                self.assertTrue(
+                    coordinator.reconcile_action(
+                        fence,
+                        action_key=str(action["action_key"]),
+                        idempotency_key="reconcile-ambiguous-once",
+                        result="not_applied",
+                        details={"observed": "source_present"},
+                    )
+                )
+
     def test_quarantine_detects_source_replacement_and_restore_never_clobbers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -335,10 +386,13 @@ class RecoveryReviewedOperationTests(unittest.TestCase):
                     ),
                     recovery_supervisor.ReviewedOperationExecutor((operation,)),
                 )
-                completed = mock.Mock(returncode=0)
+                completed = mock.Mock(returncode=0, pid=60_001)
+                completed.poll.return_value = 0
                 with mock.patch.object(
-                    recovery_supervisor.subprocess, "run", return_value=completed
-                ) as run:
+                    recovery_supervisor.subprocess, "Popen", return_value=completed
+                ) as popen, mock.patch.object(
+                    recovery_supervisor.PythonProbeRunner, "_terminate_process_group"
+                ) as terminate:
                     status, result = actuator.reviewed_operation(
                         fence,
                         idempotency_key="restart-once",
@@ -346,8 +400,10 @@ class RecoveryReviewedOperationTests(unittest.TestCase):
                     )
                 self.assertEqual(status, 200)
                 self.assertTrue(result["ok"])
-                self.assertEqual(run.call_args.args[0], ["/usr/bin/true"])
-                self.assertNotIn("shell", run.call_args.kwargs)
+                self.assertEqual(popen.call_args.args[0], ["/usr/bin/true"])
+                self.assertFalse(popen.call_args.kwargs["shell"])
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                terminate.assert_called_once_with(completed)
                 intent = json.loads(
                     ledger.connection.execute(
                         "SELECT intent_json FROM action_intents"
@@ -399,6 +455,38 @@ class RecoveryReviewedOperationTests(unittest.TestCase):
                     json.loads(guard["details_json"])["category"],
                     "external-mutation",
                 )
+
+    def test_reviewed_operation_stops_the_process_group_on_fence_loss_and_timeout(self) -> None:
+        operation = {
+            "id": "restart-bot",
+            "kind": "restart",
+            "executable": "/usr/bin/true",
+            "argv": [],
+            "timeoutSeconds": 10,
+        }
+        executor = recovery_supervisor.ReviewedOperationExecutor((operation,))
+        for expected_code, fence_values, monotonic_values in (
+            ("fence_lost", [True, False], [0.0]),
+            ("timeout", [True, True], [0.0, 11.0]),
+        ):
+            process = mock.Mock(returncode=None, pid=60_002)
+            process.poll.return_value = None
+            with self.subTest(code=expected_code), mock.patch.object(
+                recovery_supervisor.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(
+                recovery_supervisor.PythonProbeRunner, "_terminate_process_group"
+            ) as terminate, mock.patch.object(
+                recovery_supervisor.time,
+                "monotonic",
+                side_effect=monotonic_values,
+            ), mock.patch.object(recovery_supervisor.time, "sleep"):
+                result = executor.execute(
+                    "restart-bot",
+                    fence_valid=mock.Mock(side_effect=fence_values),
+                )
+            self.assertEqual(result["code"], expected_code)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            terminate.assert_called_once_with(process)
 
     def test_config_rejects_unsafe_reviewed_operations(self) -> None:
         unsafe = [

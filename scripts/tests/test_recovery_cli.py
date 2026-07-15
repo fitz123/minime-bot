@@ -306,6 +306,11 @@ class RecoveryConfigTests(unittest.TestCase):
             bad_renew["fixerRenewSeconds"] = 60
             invalid_documents.append(("unsafe-renew", bad_renew))
 
+            short_host_deadline = config_document()
+            assert isinstance(short_host_deadline["actionPolicy"], dict)
+            short_host_deadline["actionPolicy"]["reconciliationTimeoutSeconds"] = 100
+            invalid_documents.append(("short-host-deadline", short_host_deadline))
+
             relative_node = config_document()
             assert isinstance(relative_node["slotPolicy"], dict)
             relative_node["slotPolicy"]["nodeExecutable"] = "bin/node"

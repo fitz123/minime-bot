@@ -1648,6 +1648,72 @@ class RecoveryDurableFixerContractTests(unittest.TestCase):
             )
             ledger.close()
 
+    def test_resolved_evidence_dispatches_the_same_session_for_unknown_action_reconciliation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger, coordinator, first = self._claimed(
+                root, mode="enabled", clock=clock
+            )
+            assert first is not None
+            binding = coordinator.bind_session(
+                first,
+                session_id="resolved-action-session",
+                session_directory=str(root / "sessions" / "resolved-action"),
+                transcript_path=str(
+                    root
+                    / "sessions"
+                    / "resolved-action"
+                    / "resolved-action-session.jsonl"
+                ),
+            )
+            self.assertIsNotNone(binding)
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    first,
+                    action_key="mutation-during-resolution",
+                    tool_name="edit",
+                    intent={"pathRef": "config:bot"},
+                )
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("mode-enabled"))
+                )
+            )
+            coordinator.reconcile()
+            incident = ledger.connection.execute(
+                "SELECT state, evidence_hash FROM incidents"
+            ).fetchone()
+            self.assertEqual(incident["state"], "eligible")
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM action_intents"
+                ).fetchone()[0],
+                "unknown",
+            )
+            second = coordinator.claim_next()
+            assert second is not None
+            state = coordinator.fixer_state(second)
+            assert state is not None
+            self.assertEqual(
+                [item["actionKey"] for item in state["unknownActions"]],
+                ["mutation-during-resolution"],
+            )
+            self.assertEqual(state["resumeSession"]["bindingId"], binding)
+            self.assertTrue(
+                coordinator.reconcile_action(
+                    second,
+                    action_key="mutation-during-resolution",
+                    idempotency_key="resolved-action-reconciliation",
+                    result="not_applied",
+                    details={"observed": "preimage_intact"},
+                )
+            )
+            ledger.close()
+
     def test_report_outbox_state_is_idempotent_and_never_an_incident_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1822,6 +1888,12 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                     monotonic=lambda: monotonic[0],
                 )
                 self.assertEqual(manager.tick(), "started")
+                monotonic[0] = 7.0
+                with mock.patch.object(
+                    coordinator, "renew_lease", wraps=coordinator.renew_lease
+                ) as renew:
+                    self.assertEqual(manager.tick(), "running")
+                renew.assert_called_once_with(manager.fence)
                 monotonic[0] = 10.0
                 with mock.patch.object(
                     recovery_supervisor.PythonProbeRunner,
@@ -1953,6 +2025,43 @@ class RecoveryOutcomeAuthorityTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(tuple(exhausted), ("retries_exhausted", 3))
                 self.assertEqual(manager.tick(), "idle")
+
+    def test_maintenance_fences_the_fixer_before_running_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator = recovery_supervisor.IncidentCoordinator(
+                    ledger,
+                    correlation_policy(lease_seconds=120),
+                    owner="maintenance-order",
+                    mode="enabled",
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    source_ids=(),
+                    cadence_seconds=10,
+                    freshness_seconds=30,
+                    hold_down_seconds=0,
+                )
+                order: list[str] = []
+                fixer_process = mock.Mock(coordinator=coordinator)
+                fixer_process.tick.side_effect = lambda: order.append("fixer") or "idle"
+                probe_runner = mock.Mock(verifier=verifier)
+                probe_runner.refresh_due.side_effect = lambda: order.append("probe") or 0
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    recovery_supervisor.AtomicJsonSpool(root / "events"),
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                    coordinator=coordinator,
+                    verifier=verifier,
+                    probe_runner=probe_runner,
+                    fixer_process=fixer_process,
+                )
+                service.maintenance()
+                self.assertEqual(order, ["fixer", "probe"])
 
     def test_false_success_resumes_same_session_then_reports_once_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2466,6 +2575,65 @@ class RecoveryVerificationTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_verification_never_recovers_with_an_unresolved_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = [100.0]
+            ledger = recovery_ledger.RecoveryLedger(root / "ledger.sqlite3")
+            coordinator = recovery_supervisor.IncidentCoordinator(
+                ledger,
+                correlation_policy(lease_seconds=120),
+                owner="unresolved-verification",
+                mode="enabled",
+                clock=lambda: clock[0],
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(firing_alert("unresolved-verification"))
+                )
+            )
+            active = coordinator.claim_next()
+            assert active is not None
+            self.assertIsNotNone(
+                coordinator.record_action_intent(
+                    active,
+                    action_key="unknown-before-verification",
+                    tool_name="write",
+                    intent={"pathRef": "config:bot"},
+                )
+            )
+            ledger.record_events(
+                recovery_supervisor.normalize_alertmanager(
+                    alert_body(resolved_alert("unresolved-verification"))
+                )
+            )
+            coordinator.reconcile()
+            with ledger.transaction() as connection:
+                connection.execute("UPDATE incidents SET state = 'verifying'")
+            incident_id = int(
+                ledger.connection.execute("SELECT id FROM incidents").fetchone()[0]
+            )
+            verifier = recovery_supervisor.RecoveryVerifier(
+                ledger,
+                coordinator,
+                source_ids=(),
+                cadence_seconds=10,
+                freshness_seconds=30,
+                hold_down_seconds=0,
+                clock=lambda: clock[0],
+            )
+            verifier.record_heartbeat("supervisor")
+            result = verifier.evaluate(incident_id)
+            self.assertFalse(result.recovered)
+            self.assertIn("actions_unresolved", result.reasons)
+            self.assertEqual(
+                ledger.connection.execute(
+                    "SELECT state FROM incidents WHERE id = ?", (incident_id,)
+                ).fetchone()[0],
+                "verifying",
+            )
+            ledger.close()
 
     def test_verification_requires_freshly_validated_bot_and_capsule_slots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

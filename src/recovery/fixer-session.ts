@@ -439,6 +439,7 @@ async function spawnBoundSession(
   client: RecoveryProtocolClient,
   runner: RecoveryRunnerContract,
   options: RecoveryFixerRunnerOptions,
+  observeChild: (child: ChildProcess | undefined) => void,
 ): Promise<RecoverySessionHandle> {
   const protocol = client.contract;
   const extensionOptions = recoveryExtensionOptions(protocol.mode, options.env);
@@ -455,6 +456,7 @@ async function spawnBoundSession(
       extensionOptions,
       runtimeEnv(protocol, prior.sessionDirectory, runner.agentId, runner.piExecutable, options.env),
     );
+    observeChild(child);
     try {
       const observedId = await captureRecoverySessionId(child, runner.resumeTimeoutMs);
       if (observedId !== prior.sessionId) throw new Error("Recovery Pi resumed a different session id");
@@ -493,6 +495,7 @@ async function spawnBoundSession(
         options.processKill,
         recoveryStartsNewPiProcessGroup(options.env),
       );
+      observeChild(undefined);
       if (previousInspection.readable || !classified) throw error;
     }
   }
@@ -509,6 +512,7 @@ async function spawnBoundSession(
     extensionOptions,
     runtimeEnv(protocol, sessionDirectory, runner.agentId, runner.piExecutable, options.env),
   );
+  observeChild(child);
   try {
     const sessionId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
     const transcriptPath = await discoverCanonicalRecoveryTranscript(
@@ -535,6 +539,7 @@ async function spawnBoundSession(
       options.processKill,
       recoveryStartsNewPiProcessGroup(options.env),
     );
+    observeChild(undefined);
     throw error;
   }
 }
@@ -549,69 +554,74 @@ export async function runRecoveryFixer(options: RecoveryFixerRunnerOptions = {})
   const client = options.client ?? new RecoveryProtocolClient(protocol);
   const configPath = env.MINIME_CONFIG_PATH;
   const agent = resolveRecoveryAgent(runner.agentId, configPath);
-  const state = await client.state();
-  if (state.mode !== protocol.mode) throw new Error("Recovery supervisor mode changed before spawn");
-  const handle = await spawnBoundSession(agent, state, client, runner, options);
-  const session = {
-    bindingId: handle.bindingId,
-    sessionId: handle.sessionId,
-    sessionDirectory: handle.sessionDirectory,
-    transcriptPath: handle.transcriptPath,
-    replaced: handle.replaced,
-  };
   let terminal: "lease_lost" | "timed_out" | undefined;
   let renewing = false;
+  let activeChild: ChildProcess | undefined;
+  let terminating: Promise<void> | undefined;
+  const terminateActiveChild = (): Promise<void> => {
+    if (!activeChild) return Promise.resolve();
+    terminating ??= terminateRecoveryProcessGroup(
+      activeChild,
+      options.processKill,
+      recoveryStartsNewPiProcessGroup(options.env),
+    );
+    return terminating;
+  };
+  const observeChild = (child: ChildProcess | undefined) => {
+    activeChild = child;
+    terminating = undefined;
+    if (child && terminal) void terminateActiveChild();
+  };
   const renewTimer = setInterval(async () => {
     if (renewing || terminal) return;
     renewing = true;
     try {
       if (!(await client.heartbeat())) {
         terminal = "lease_lost";
-        await terminateRecoveryProcessGroup(
-          handle.child,
-          options.processKill,
-          recoveryStartsNewPiProcessGroup(options.env),
-        );
+        await terminateActiveChild();
       }
     } catch {
       terminal = "lease_lost";
-      await terminateRecoveryProcessGroup(
-        handle.child,
-        options.processKill,
-        recoveryStartsNewPiProcessGroup(options.env),
-      );
+      await terminateActiveChild();
     } finally {
       renewing = false;
     }
   }, runner.renewMs);
-  const timeout = setTimeout(async () => {
-    terminal = "timed_out";
-    await terminateRecoveryProcessGroup(
-      handle.child,
-      options.processKill,
-      recoveryStartsNewPiProcessGroup(options.env),
-    );
-  }, runner.runTimeoutMs);
   try {
-    const promptId = sendPiPrompt(handle.child, buildIncidentPrompt(state));
-    let result: ResultMessage | undefined;
-    for await (const line of readPiStream(handle.child, undefined, promptId)) {
-      if (line.type === "result") result = line;
-    }
-    if (terminal) return { status: terminal, session, result };
-    return {
-      status: classifyRecoveryFixerResult(result),
-      session,
-      result,
+    const state = await client.state();
+    if (state.mode !== protocol.mode) throw new Error("Recovery supervisor mode changed before spawn");
+    if (terminal) throw new Error("Recovery fixer lease was lost during startup");
+    const handle = await spawnBoundSession(agent, state, client, runner, options, observeChild);
+    const session = {
+      bindingId: handle.bindingId,
+      sessionId: handle.sessionId,
+      sessionDirectory: handle.sessionDirectory,
+      transcriptPath: handle.transcriptPath,
+      replaced: handle.replaced,
     };
+    if (terminal) return { status: terminal, session };
+    const timeout = setTimeout(async () => {
+      terminal = "timed_out";
+      await terminateActiveChild();
+    }, runner.runTimeoutMs);
+    try {
+      const promptId = sendPiPrompt(handle.child, buildIncidentPrompt(state));
+      let result: ResultMessage | undefined;
+      for await (const line of readPiStream(handle.child, undefined, promptId)) {
+        if (line.type === "result") result = line;
+      }
+      if (terminal) return { status: terminal, session, result };
+      return {
+        status: classifyRecoveryFixerResult(result),
+        session,
+        result,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
   } finally {
     clearInterval(renewTimer);
-    clearTimeout(timeout);
-    await terminateRecoveryProcessGroup(
-      handle.child,
-      options.processKill,
-      recoveryStartsNewPiProcessGroup(options.env),
-    );
+    await terminateActiveChild();
   }
 }
 
