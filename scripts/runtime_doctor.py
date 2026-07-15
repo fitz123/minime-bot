@@ -419,6 +419,28 @@ def _source_snapshot_events(current: set[str]) -> list[dict[str, str]]:
     return events
 
 
+def _advance_pending(pending: dict[str, Any], current: set[str]) -> dict[str, Any]:
+    """Append transitions observed after an undelivered recovery batch."""
+
+    target = set(pending["target_incidents"])
+    if current == target:
+        return pending
+
+    events: list[dict[str, str]] = []
+    transition_ids: set[str] = set()
+    for event in [*pending["events"], *_transition_events(target, current)]:
+        transition_id = event["transition_id"]
+        if transition_id in transition_ids:
+            continue
+        transition_ids.add(transition_id)
+        events.append(event)
+    return {
+        "events": events,
+        "native_delivered": False,
+        "target_incidents": sorted(current),
+    }
+
+
 def _valid_pending(value: Any) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "events",
@@ -666,8 +688,7 @@ def run_doctor(
 
         def recovery_sink_failed() -> None:
             active_logger.error("doctor_recovery_sink_failed")
-            if config.sink_mode == "recovery":
-                _notify_supervisor_unavailable(config, notify, active_logger)
+            _notify_supervisor_unavailable(config, notify, active_logger)
 
         def finish_pending(active: dict[str, Any]) -> tuple[bool, set[str]]:
             nonlocal recovery_delivered
@@ -708,6 +729,10 @@ def run_doctor(
             return 0 if completed else 1
 
         if pending is not None:
+            advanced = _advance_pending(pending, incidents)
+            if advanced is not pending:
+                pending = advanced
+                write_delivery_state(config.state_path, previous, pending)
             completed, previous = finish_pending(pending)
             if not completed:
                 return 1

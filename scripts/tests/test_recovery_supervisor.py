@@ -1085,7 +1085,13 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                     ),
                     0,
                 )
-            self.assertEqual(len(messages), 1)
+            self.assertEqual(
+                messages,
+                [
+                    runtime_doctor.incident_message({"node_unavailable"}),
+                    runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
+                ],
+            )
             self.assertEqual(recovery_calls[0], recovery_calls[1])
             firing = next(
                 event
@@ -1109,8 +1115,197 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                     ),
                     0,
                 )
-            self.assertEqual(len(messages), 2)
+            self.assertEqual(
+                [
+                    message
+                    for message in messages
+                    if message != runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE
+                ],
+                [
+                    runtime_doctor.incident_message({"node_unavailable"}),
+                    runtime_doctor.incident_message(set()),
+                ],
+            )
+            self.assertEqual(
+                messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE), 1
+            )
             self.assertEqual(recovery_calls[-1][0]["status"], "resolved")
+
+    def test_tee_accumulates_each_transition_while_recovery_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "tee")
+            runtime_doctor.write_delivery_state(config.state_path, set(), None)
+            messages: list[str] = []
+            recovery_calls: list[list[dict[str, str]]] = []
+
+            def unavailable(events: list[dict[str, str]]) -> None:
+                recovery_calls.append([dict(event) for event in events])
+                raise monitoring_native.DeliveryError("synthetic supervisor outage")
+
+            observations = [
+                {"node_unavailable"},
+                {"node_unavailable", "prometheus_unhealthy"},
+                {"prometheus_unhealthy"},
+                set(),
+                set(),
+            ]
+            for incidents in observations:
+                with mock.patch.object(
+                    runtime_doctor, "collect_incidents", return_value=incidents
+                ):
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config,
+                            deliver=messages.append,
+                            deliver_recovery=unavailable,
+                        ),
+                        1,
+                    )
+
+            restarted = self.config(root, "tee")
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=set()
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        restarted,
+                        deliver=messages.append,
+                        deliver_recovery=lambda events: recovery_calls.append(
+                            [dict(event) for event in events]
+                        ),
+                    ),
+                    0,
+                )
+
+            native_states = [
+                message
+                for message in messages
+                if message != runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE
+            ]
+            self.assertEqual(
+                native_states,
+                [
+                    runtime_doctor.incident_message({"node_unavailable"}),
+                    runtime_doctor.incident_message(
+                        {"node_unavailable", "prometheus_unhealthy"}
+                    ),
+                    runtime_doctor.incident_message({"prometheus_unhealthy"}),
+                    runtime_doctor.incident_message(set()),
+                ],
+            )
+            self.assertEqual(
+                messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE), 1
+            )
+            final_batch = recovery_calls[-1]
+            self.assertEqual(
+                [(event["code"], event["status"]) for event in final_batch],
+                [
+                    ("node_unavailable", "firing"),
+                    ("prometheus_unhealthy", "firing"),
+                    ("node_unavailable", "resolved"),
+                    ("prometheus_unhealthy", "resolved"),
+                ],
+            )
+            self.assertEqual(
+                len({event["transition_id"] for event in final_batch}),
+                len(final_batch),
+            )
+            self.assertEqual(recovery_calls[-3:], [final_batch, final_batch, final_batch])
+            state = json.loads(config.state_path.read_text("utf-8"))
+            self.assertEqual(state["incidents"], [])
+            self.assertNotIn("pending", state)
+            self.assertFalse(
+                runtime_doctor._recovery_fallback_state_path(config.state_path).exists()
+            )
+
+    def test_tee_preserves_pending_batch_when_native_delivery_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "tee")
+            runtime_doctor.write_delivery_state(config.state_path, set(), None)
+            messages: list[str] = []
+            native_attempts: list[str] = []
+            recovery_calls: list[list[dict[str, str]]] = []
+
+            def native_failure(message: str) -> None:
+                native_attempts.append(message)
+                raise monitoring_native.DeliveryError("synthetic native outage")
+
+            def recovery_failure(events: list[dict[str, str]]) -> None:
+                recovery_calls.append([dict(event) for event in events])
+                raise monitoring_native.DeliveryError("synthetic supervisor outage")
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value={"node_unavailable"}
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=messages.append,
+                        deliver_recovery=recovery_failure,
+                    ),
+                    1,
+                )
+            self.assertEqual(len(recovery_calls), 1)
+
+            new_incidents = {"node_unavailable", "prometheus_unhealthy"}
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=new_incidents
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=native_failure,
+                        deliver_recovery=recovery_failure,
+                    ),
+                    1,
+                )
+            self.assertEqual(len(recovery_calls), 1)
+            pending = json.loads(config.state_path.read_text("utf-8"))["pending"]
+            self.assertFalse(pending["native_delivered"])
+            self.assertEqual(
+                pending["target_incidents"],
+                ["node_unavailable", "prometheus_unhealthy"],
+            )
+            self.assertEqual(len(pending["events"]), 2)
+
+            restarted = self.config(root, "tee")
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=new_incidents
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        restarted,
+                        deliver=messages.append,
+                        deliver_recovery=recovery_failure,
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        restarted,
+                        deliver=messages.append,
+                        deliver_recovery=lambda events: recovery_calls.append(
+                            [dict(event) for event in events]
+                        ),
+                    ),
+                    0,
+                )
+
+            expected_state = runtime_doctor.incident_message(new_incidents)
+            self.assertEqual(native_attempts, [expected_state])
+            self.assertEqual(messages.count(expected_state), 1)
+            self.assertEqual(
+                messages.count(
+                    runtime_doctor.incident_message({"node_unavailable"})
+                ),
+                1,
+            )
+            self.assertEqual(
+                messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE), 1
+            )
+            self.assertEqual(recovery_calls[1], recovery_calls[2])
 
     def test_recovery_mode_never_calls_native_notification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1186,53 +1381,63 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                 runtime_doctor.write_delivery_state(path, {"node_unavailable"}, None)
             self.assertEqual(fsync.call_count, 2)
 
-    def test_recovery_mode_uses_throttled_native_fallback_when_supervisor_is_down(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self.config(root, "recovery")
-            messages: list[str] = []
+    def test_recovery_and_tee_modes_throttle_native_fallback_when_supervisor_is_down(
+        self,
+    ) -> None:
+        for mode in ("recovery", "tee"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = self.config(root, mode)
+                runtime_doctor.write_delivery_state(
+                    config.state_path, {"node_unavailable"}, None
+                )
+                messages: list[str] = []
 
-            def unavailable(_events: list[dict[str, str]]) -> None:
-                raise monitoring_native.DeliveryError("synthetic supervisor outage")
+                def unavailable(_events: list[dict[str, str]]) -> None:
+                    raise monitoring_native.DeliveryError("synthetic supervisor outage")
 
-            with mock.patch.object(
-                runtime_doctor, "collect_incidents", return_value={"node_unavailable"}
-            ):
-                self.assertEqual(
-                    runtime_doctor.run_doctor(
-                        config, deliver=messages.append, deliver_recovery=unavailable
-                    ),
-                    1,
-                )
-                self.assertEqual(
-                    runtime_doctor.run_doctor(
-                        config, deliver=messages.append, deliver_recovery=unavailable
-                    ),
-                    1,
-                )
-                self.assertEqual(messages, [runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE])
+                with mock.patch.object(
+                    runtime_doctor,
+                    "collect_incidents",
+                    return_value={"node_unavailable"},
+                ):
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config, deliver=messages.append, deliver_recovery=unavailable
+                        ),
+                        1,
+                    )
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config, deliver=messages.append, deliver_recovery=unavailable
+                        ),
+                        1,
+                    )
+                    self.assertEqual(
+                        messages, [runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE]
+                    )
 
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config,
+                            deliver=messages.append,
+                            deliver_recovery=lambda _events: None,
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        runtime_doctor.run_doctor(
+                            config, deliver=messages.append, deliver_recovery=unavailable
+                        ),
+                        1,
+                    )
                 self.assertEqual(
-                    runtime_doctor.run_doctor(
-                        config,
-                        deliver=messages.append,
-                        deliver_recovery=lambda _events: None,
-                    ),
-                    0,
+                    messages,
+                    [
+                        runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
+                        runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
+                    ],
                 )
-                self.assertEqual(
-                    runtime_doctor.run_doctor(
-                        config, deliver=messages.append, deliver_recovery=unavailable
-                    ),
-                    1,
-                )
-            self.assertEqual(
-                messages,
-                [
-                    runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
-                    runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE,
-                ],
-            )
 
     def test_real_recovery_http_retries_and_sends_authenticated_heartbeats(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,7 +1534,7 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                         ),
                         "MINIME_DOCTOR_RECOVERY_TOKEN_FILE": str(token),
                         "MINIME_DOCTOR_RECOVERY_ATTEMPTS": "2",
-                        "MINIME_DOCTOR_TIMEOUT": "0.2",
+                        "MINIME_DOCTOR_TIMEOUT": "1",
                     }
                 )
 

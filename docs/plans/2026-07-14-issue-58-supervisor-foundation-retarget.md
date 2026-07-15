@@ -45,11 +45,11 @@ npm pack --json --dry-run
 - [x] Add regression assertions that observe/foundation operation launches no Pi/Node fixer, creates no completion claim, and performs no mutating action, then run focused tests.
 
 ### Task 2: Make tee delivery lossless across recovery-sink outages
-- [ ] Refactor `scripts/runtime_doctor.py` so a stuck recovery pending batch does not return before comparing the current incident set with the pending target in tee mode.
-- [ ] When new transitions occur while the recovery sink is down, deliver the new native state once, append/deduplicate those transitions into the durable pending recovery batch, and preserve retry state without duplicating earlier native notifications.
-- [ ] Invoke the existing throttled supervisor-unavailable native fallback on recovery-sink failure in both tee and recovery modes, while preserving default telegram-mode behavior.
-- [ ] Add tests for multiple firing/resolved transitions during a prolonged sink outage, restart from pending state, native-delivery failure, eventual recovery delivery, dedupe, and fallback throttling.
-- [ ] Run the runtime-doctor and supervisor focused tests before continuing.
+- [x] Refactor `scripts/runtime_doctor.py` so a stuck recovery pending batch does not return before comparing the current incident set with the pending target in tee mode.
+- [x] When new transitions occur while the recovery sink is down, deliver the new native state once, append/deduplicate those transitions into the durable pending recovery batch, and preserve retry state without duplicating earlier native notifications.
+- [x] Invoke the existing throttled supervisor-unavailable native fallback on recovery-sink failure in both tee and recovery modes, while preserving default telegram-mode behavior.
+- [x] Add tests for multiple firing/resolved transitions during a prolonged sink outage, restart from pending state, native-delivery failure, eventual recovery delivery, dedupe, and fallback throttling.
+- [x] Run the runtime-doctor and supervisor focused tests before continuing.
 
 ### Task 3: Configure 300-second cadence and 660-second freshness with stale-as-defer semantics
 - [ ] Add required closed-schema recovery config fields for runtime-doctor cadence and verification freshness, wire them into production construction, and ship/document defaults of 300 and 660 seconds respectively; retain a bounded configurable hold-down.
