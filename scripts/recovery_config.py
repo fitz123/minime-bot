@@ -17,6 +17,7 @@ DEFAULT_VERIFICATION_HOLD_DOWN_SECONDS = 60
 RUNTIME_DOCTOR_CADENCE_BOUNDS = (30, 3_600)
 VERIFICATION_FRESHNESS_BOUNDS = (60, 86_400)
 VERIFICATION_HOLD_DOWN_BOUNDS = (0, 86_400)
+MAX_PROBE_TOTAL_TIMEOUT_MS = 300_000
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _LOCALE_VALUE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 _LAUNCHD_TARGET = re.compile(
@@ -215,7 +216,7 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     ):
         raise RecoveryConfigError("recovery host must be loopback")
     port = document["port"]
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RecoveryConfigError("recovery port is invalid")
 
     cadence_seconds = _bounded_seconds(
@@ -278,6 +279,8 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     if not isinstance(raw_probes, list) or len(raw_probes) > 128:
         raise RecoveryConfigError("recovery probes are invalid")
     probes = tuple(validated_probe_command(item) for item in raw_probes)
+    if sum(int(item["timeoutMs"]) for item in probes) > MAX_PROBE_TOTAL_TIMEOUT_MS:
+        raise RecoveryConfigError("recovery probe timeout budget is invalid")
     ids = [str(item["id"]) for item in probes]
     if len(ids) != len(set(ids)):
         raise RecoveryConfigError("recovery probes contain duplicate IDs")

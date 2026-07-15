@@ -32,6 +32,7 @@ from monitoring_native import (
     send_telegram,
 )
 from recovery_config import (
+    MAX_PROBE_TOTAL_TIMEOUT_MS,
     RECOVERY_MODES,
     RecoveryConfig,
     RecoveryConfigError,
@@ -1821,13 +1822,14 @@ class RecoveryVerifier:
     ) -> bool:
         if not isinstance(fence, VerificationFence) or not isinstance(results, list):
             raise ValueError("recovery probe results are invalid")
-        normalized: dict[str, bool] = {}
+        normalized: dict[str, tuple[bool, float | None]] = {}
         for result in results:
             if not isinstance(result, dict):
                 raise ValueError("recovery probe result is invalid")
             probe_id = result.get("id")
             exit_code = result.get("exitCode")
             timed_out = result.get("timedOut")
+            result_observed_at = result.get("observedAt")
             if (
                 not isinstance(probe_id, str)
                 or probe_id not in self.probe_ids
@@ -1835,9 +1837,20 @@ class RecoveryVerifier:
                 or isinstance(exit_code, bool)
                 or not isinstance(exit_code, int)
                 or not isinstance(timed_out, bool)
+                or (
+                    result_observed_at is not None
+                    and (
+                        isinstance(result_observed_at, bool)
+                        or not isinstance(result_observed_at, (int, float))
+                        or not math.isfinite(result_observed_at)
+                    )
+                )
             ):
                 raise ValueError("recovery probe result is invalid")
-            normalized[probe_id] = exit_code == 0 and not timed_out
+            normalized[probe_id] = (
+                exit_code == 0 and not timed_out,
+                None if result_observed_at is None else float(result_observed_at),
+            )
         if require_all and set(normalized) != set(self.probe_ids):
             raise ValueError("recovery probe results are incomplete")
         timestamp = self.clock() if observed_at is None else observed_at
@@ -1850,13 +1863,18 @@ class RecoveryVerifier:
         with self.ledger.transaction() as connection:
             if not self._fence_valid(connection, fence):
                 return False
-            for probe_id, healthy in normalized.items():
+            for probe_id, (healthy, result_timestamp) in normalized.items():
+                probe_timestamp = (
+                    float(timestamp)
+                    if observed_at is not None or result_timestamp is None
+                    else result_timestamp
+                )
                 value = _canonical_json(
                     {
                         "generation": fence.generation,
                         "healthy": healthy,
                         "incident_id": fence.incident_id,
-                        "observed_at": float(timestamp),
+                        "observed_at": probe_timestamp,
                         "policy_revision": fence.policy_revision,
                     }
                 )
@@ -2053,6 +2071,11 @@ class PythonProbeRunner:
         sleeper: Callable[[float], None] = time.sleep,
     ):
         commands = tuple(ProbeCommand.from_config(probe) for probe in probes)
+        if (
+            sum(int(round(command.timeout_seconds * 1_000)) for command in commands)
+            > MAX_PROBE_TOTAL_TIMEOUT_MS
+        ):
+            raise ValueError("recovery probe runner timeout budget is invalid")
         if tuple(command.identifier for command in commands) != verifier.probe_ids:
             raise ValueError("recovery probe runner definitions do not match verifier")
         self.verifier = verifier
@@ -2132,7 +2155,12 @@ class PythonProbeRunner:
         if executable is None:
             if not self.verifier.fence_valid(fence):
                 return None
-            return {"id": command.identifier, "exitCode": 126, "timedOut": False}
+            return {
+                "id": command.identifier,
+                "exitCode": 126,
+                "timedOut": False,
+                "observedAt": self.verifier.clock(),
+            }
         if not self.verifier.fence_valid(fence):
             return None
         # stdout/stderr are deliberately discarded. The retained output bound
@@ -2156,7 +2184,12 @@ class PythonProbeRunner:
         except OSError:
             if not self.verifier.fence_valid(fence):
                 return None
-            return {"id": command.identifier, "exitCode": 127, "timedOut": False}
+            return {
+                "id": command.identifier,
+                "exitCode": 127,
+                "timedOut": False,
+                "observedAt": self.verifier.clock(),
+            }
 
         deadline = self.monotonic() + command.timeout_seconds
         timed_out = False
@@ -2181,6 +2214,7 @@ class PythonProbeRunner:
                 process.returncode if process.returncode is not None else -1
             ),
             "timedOut": timed_out,
+            "observedAt": self.verifier.clock(),
         }
 
     def refresh(self, fence: VerificationFence) -> bool:
@@ -2435,12 +2469,15 @@ class RecoveryNotificationOutbox:
         key = f"immediate:{reason}:{int(now // cooldown)}"
         body = _canonical_json({"kind": "immediate", "reason": reason, "version": 1})
         with self.ledger.transaction() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT OR IGNORE INTO notification_outbox(notification_key, kind, body_json, "
                 "created_at, available_at) VALUES (?, 'immediate', ?, ?, ?)",
                 (key, body, now, now),
             )
-        return self.deliver_due() > 0
+        # Intake and reconciliation only own the durable handoff. Network
+        # delivery belongs to maintenance so unavailable Telegram cannot consume
+        # the bounded HTTP request pool.
+        return cursor.rowcount > 0
 
     def deliver_due(self, *, limit: int = 32) -> int:
         if not isinstance(limit, int) or not 1 <= limit <= 128:
@@ -2536,11 +2573,11 @@ class RecoveryService:
 
     def _persist_intake(self, envelope: dict[str, Any]) -> int:
         events = envelope["events"]
-        inserted = self.ledger.record_events(events)
+        observed_at = float(envelope["observed_at"])
+        inserted = self.ledger.record_events(events, observed_at=observed_at)
         if self.coordinator is not None:
             self.coordinator.reconcile()
         if self.verifier is not None:
-            observed_at = float(envelope["observed_at"])
             for source, healthy in sorted(envelope["heartbeats"].items()):
                 if source in self.verifier.source_ids:
                     self.verifier.record_heartbeat(
@@ -2549,6 +2586,7 @@ class RecoveryService:
         return inserted
 
     def _drain_events(self) -> None:
+        pending: list[tuple[Path, dict[str, Any]]] = []
         for path, item in self.event_spool.items():
             if _valid_spooled_event(item):
                 envelope = self._intake_envelope([item], None)
@@ -2556,6 +2594,11 @@ class RecoveryService:
                 envelope = item
             else:
                 raise SpoolError("event spool item is invalid")
+            pending.append((path, envelope))
+        # Spool filenames are content hashes, not chronology. The durable intake
+        # observation orders replay after a ledger outage.
+        pending.sort(key=lambda entry: (float(entry[1]["observed_at"]), entry[0].name))
+        for path, envelope in pending:
             self._persist_intake(envelope)
             self.event_spool.remove(path)
 
@@ -2907,7 +2950,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 class _UnavailableLedger:
-    def record_events(self, _events: Any) -> int:
+    def record_events(
+        self, _events: Any, *, observed_at: float | None = None
+    ) -> int:
+        del observed_at
         raise LedgerUnavailable("ledger startup is unavailable")
 
     def ping(self) -> None:

@@ -203,6 +203,36 @@ class RecoveryConfigTests(unittest.TestCase):
                         root / "recovery.json", root
                     )
 
+    def test_config_rejects_zero_port_and_excessive_total_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zero_port = config_document()
+            zero_port["port"] = 0
+            excessive_probes = config_document()
+            excessive_probes["probes"] = [
+                {
+                    "id": f"probe-{index}",
+                    "executable": "/usr/bin/true",
+                    "argv": [],
+                    "env": {},
+                    "timeoutMs": 200_000,
+                }
+                for index in range(2)
+            ]
+            for name, document in (
+                ("zero-port", zero_port),
+                ("probe-timeout-budget", excessive_probes),
+            ):
+                (root / "recovery.json").write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                with self.subTest(case=name), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    )
+
     def test_malformed_config_types_and_unicode_are_bounded_rejections(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

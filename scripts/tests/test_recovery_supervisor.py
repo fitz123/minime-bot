@@ -115,7 +115,10 @@ def correlation_policy(
 
 
 class FailingLedger:
-    def record_events(self, _events: object) -> int:
+    def record_events(
+        self, _events: object, *, observed_at: float | None = None
+    ) -> int:
+        del observed_at
         raise recovery_ledger.LedgerUnavailable("database or disk is full")
 
     def ping(self) -> None:
@@ -529,6 +532,75 @@ class RecoveryServiceTests(unittest.TestCase):
             self.assertIn("persistence failed", messages[-1].lower())
             self.assertNotIn("SyntheticDown", messages[-1])
 
+    def test_spool_replay_uses_durable_observation_order_and_event_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spool = recovery_supervisor.AtomicJsonSpool(root / "events")
+            firing = recovery_supervisor._normalized_event(
+                source="runtime_doctor",
+                fingerprint="node_unavailable",
+                code="node_unavailable",
+                status="firing",
+                transition="firing-transition",
+                occurred_at=None,
+                component="runtime",
+                failure_class="node_unavailable",
+            )
+            resolved = recovery_supervisor._normalized_event(
+                source="runtime_doctor",
+                fingerprint="node_unavailable",
+                code="node_unavailable",
+                status="resolved",
+                transition="resolved-transition",
+                occurred_at=None,
+                component="runtime",
+                failure_class="node_unavailable",
+            )
+            first_key, second_key = "spool-first", "spool-second"
+            if spool.path_for_key(first_key).name < spool.path_for_key(second_key).name:
+                first_key, second_key = second_key, first_key
+            spool.put(
+                first_key,
+                {
+                    "version": 1,
+                    "events": [firing],
+                    "heartbeats": {"runtime_doctor": True},
+                    "observed_at": 100.0,
+                },
+            )
+            spool.put(
+                second_key,
+                {
+                    "version": 1,
+                    "events": [resolved],
+                    "heartbeats": {"runtime_doctor": True},
+                    "observed_at": 200.0,
+                },
+            )
+            self.assertGreater(
+                spool.path_for_key(first_key).name,
+                spool.path_for_key(second_key).name,
+            )
+
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                service = recovery_supervisor.RecoveryService(
+                    ledger,
+                    spool,
+                    recovery_supervisor.EmergencyNotifier(
+                        root / "notifications", delivery=None
+                    ),
+                )
+                self.assertEqual(service.health().status, 200)
+                rows = ledger.connection.execute(
+                    "SELECT status, event_at FROM events ORDER BY event_at"
+                ).fetchall()
+                self.assertEqual(
+                    [(row["status"], row["event_at"]) for row in rows],
+                    [("firing", 100.0), ("resolved", 200.0)],
+                )
+                self.assertEqual(ledger.latest_events()[0]["status"], "resolved")
+                self.assertEqual(spool.items(), [])
+
     def test_heartbeat_only_intake_is_spooled_until_heartbeat_persists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -716,7 +788,7 @@ class RecoveryServiceTests(unittest.TestCase):
                 outbox = recovery_supervisor.RecoveryNotificationOutbox(
                     ledger, emergency=notifier
                 )
-                self.assertFalse(outbox.immediate_escalation("recovery_failed"))
+                self.assertTrue(outbox.immediate_escalation("recovery_failed"))
                 self.assertIsNone(
                     ledger.connection.execute(
                         "SELECT delivered_at FROM notification_outbox"
@@ -1670,6 +1742,63 @@ class RecoveryVerificationTests(unittest.TestCase):
                         0,
                     )
 
+    def test_sequential_probes_keep_their_individual_completion_times(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incident_clock = [50.0]
+            with recovery_ledger.RecoveryLedger(root / "ledger.sqlite3") as ledger:
+                coordinator, incident_id = self._verifying_incident(
+                    ledger, incident_clock
+                )
+                verifier = recovery_supervisor.RecoveryVerifier(
+                    ledger,
+                    coordinator,
+                    probe_ids=("first", "second"),
+                    cadence_seconds=30,
+                    freshness_seconds=660,
+                    hold_down_seconds=0,
+                    clock=lambda: 900.0,
+                )
+                executable = self._native_executable("true")
+                probes = tuple(
+                    {
+                        "id": probe_id,
+                        "executable": executable,
+                        "argv": [],
+                        "env": {},
+                        "timeoutMs": 1000,
+                    }
+                    for probe_id in verifier.probe_ids
+                )
+                runner = recovery_supervisor.PythonProbeRunner(verifier, probes)
+                fence = self._fence(ledger, incident_id)
+                with mock.patch.object(
+                    runner,
+                    "_run_command",
+                    side_effect=(
+                        {
+                            "id": "first",
+                            "exitCode": 0,
+                            "timedOut": False,
+                            "observedAt": 100.0,
+                        },
+                        {
+                            "id": "second",
+                            "exitCode": 0,
+                            "timedOut": False,
+                            "observedAt": 500.0,
+                        },
+                    ),
+                ):
+                    self.assertTrue(runner.refresh(fence))
+                observations = [
+                    verifier._probe_observation(
+                        ledger.connection, fence, probe_id
+                    )
+                    for probe_id in verifier.probe_ids
+                ]
+                self.assertEqual(observations, [(True, 100.0), (True, 500.0)])
+
     def test_probe_timeout_discards_output_and_reaps_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1887,6 +2016,11 @@ class RecoveryNotificationTests(unittest.TestCase):
                 )
                 for reason in sorted(recovery_supervisor._IMMEDIATE_ESCALATION_REASONS):
                     self.assertTrue(outbox.immediate_escalation(reason))
+                self.assertEqual(messages, [])
+                self.assertEqual(
+                    outbox.deliver_due(),
+                    len(recovery_supervisor._IMMEDIATE_ESCALATION_REASONS),
+                )
                 self.assertEqual(
                     len(messages), len(recovery_supervisor._IMMEDIATE_ESCALATION_REASONS)
                 )
@@ -1911,14 +2045,24 @@ class RecoveryNotificationTests(unittest.TestCase):
                 )
                 self.assertTrue(outbox.immediate_escalation("recovery_failed"))
                 self.assertEqual(
-                    len(list((root / "notifications").glob("*.json"))),
-                    1,
+                    list((root / "notifications").glob("*.json")), []
                 )
                 stored = ledger.connection.execute(
                     "SELECT kind, delivered_at FROM notification_outbox"
                 ).fetchone()
                 self.assertEqual(stored["kind"], "immediate")
-                self.assertIsNotNone(stored["delivered_at"])
+                self.assertIsNone(stored["delivered_at"])
+
+                self.assertEqual(outbox.deliver_due(), 1)
+                self.assertEqual(
+                    len(list((root / "notifications").glob("*.json"))),
+                    1,
+                )
+                delivered = ledger.connection.execute(
+                    "SELECT kind, delivered_at FROM notification_outbox"
+                ).fetchone()
+                self.assertEqual(delivered["kind"], "immediate")
+                self.assertIsNotNone(delivered["delivered_at"])
 
     def test_immediate_escalation_waits_durably_for_a_delivery_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1930,7 +2074,7 @@ class RecoveryNotificationTests(unittest.TestCase):
                 outbox = recovery_supervisor.RecoveryNotificationOutbox(
                     ledger, emergency=emergency, clock=lambda: 100.0
                 )
-                self.assertFalse(outbox.immediate_escalation("supervisor_unavailable"))
+                self.assertTrue(outbox.immediate_escalation("supervisor_unavailable"))
                 pending = ledger.connection.execute(
                     "SELECT kind, delivered_at FROM notification_outbox"
                 ).fetchone()
@@ -2576,6 +2720,142 @@ class RuntimeDoctorRecoveryTests(unittest.TestCase):
                     0,
                 )
             self.assertEqual(recovery_calls[0], recovery_calls[1])
+            self.assertNotIn(
+                "pending", json.loads(config.state_path.read_text("utf-8"))
+            )
+
+    def test_surviving_queue_replays_before_lost_state_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "recovery")
+            older = runtime_doctor._transition_events(
+                set(), {"node_unavailable"}
+            )
+            runtime_doctor._enqueue_recovery_events(
+                config.state_path, older, {"node_unavailable"}
+            )
+            config.state_path.write_text("not-json", encoding="utf-8")
+            delivered: list[list[dict[str, str]]] = []
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=set()
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=lambda _message: None,
+                        deliver_recovery=lambda events: delivered.append(
+                            [dict(event) for event in events]
+                        ),
+                    ),
+                    0,
+                )
+            self.assertEqual(delivered[0], older)
+            final_snapshot = {
+                event["code"]: event["status"] for event in delivered[-1]
+            }
+            self.assertEqual(
+                set(final_snapshot), set(runtime_doctor.INCIDENT_ACTIONS)
+            )
+            self.assertTrue(
+                all(status == "resolved" for status in final_snapshot.values())
+            )
+            self.assertNotIn(
+                "pending", json.loads(config.state_path.read_text("utf-8"))
+            )
+
+    def test_malformed_recovery_queue_does_not_suppress_new_tee_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "tee")
+            pending = {
+                "events": runtime_doctor._transition_events(
+                    set(), {"node_unavailable"}
+                ),
+                "native_delivered": True,
+                "queue_first": False,
+                "target_incidents": ["node_unavailable"],
+            }
+            runtime_doctor.write_delivery_state(config.state_path, set(), pending)
+            queue_path = runtime_doctor._recovery_queue_path(config.state_path)
+            queue_path.mkdir()
+            (queue_path / "malformed.json").write_text("{}", encoding="ascii")
+            current = {"node_unavailable", "prometheus_unhealthy"}
+            messages: list[str] = []
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=current
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=messages.append,
+                        deliver_recovery=lambda _events: self.fail(
+                            "corrupt queue was delivered"
+                        ),
+                    ),
+                    1,
+                )
+            self.assertEqual(
+                messages.count(runtime_doctor.incident_message(current)), 1
+            )
+            self.assertEqual(
+                messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE), 1
+            )
+            stored = json.loads(config.state_path.read_text("utf-8"))["pending"]
+            self.assertTrue(stored["native_delivered"])
+            self.assertTrue(stored["queue_first"])
+            self.assertEqual(stored["target_incidents"], sorted(current))
+
+    def test_queue_enqueue_failure_preserves_tee_and_final_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, "tee")
+            older = runtime_doctor._transition_events(
+                set(), {"node_unavailable"}
+            )
+            pending = {
+                "events": older,
+                "native_delivered": True,
+                "queue_first": False,
+                "target_incidents": ["node_unavailable"],
+            }
+            runtime_doctor.write_delivery_state(config.state_path, set(), pending)
+            runtime_doctor._enqueue_recovery_events(
+                config.state_path, older, {"node_unavailable"}
+            )
+            current = {"node_unavailable", "prometheus_unhealthy"}
+            messages: list[str] = []
+            delivered: list[list[dict[str, str]]] = []
+
+            with mock.patch.object(
+                runtime_doctor, "collect_incidents", return_value=current
+            ), mock.patch.object(
+                runtime_doctor,
+                "_enqueue_recovery_events",
+                side_effect=OSError("synthetic queue write failure"),
+            ):
+                self.assertEqual(
+                    runtime_doctor.run_doctor(
+                        config,
+                        deliver=messages.append,
+                        deliver_recovery=lambda events: delivered.append(
+                            [dict(event) for event in events]
+                        ),
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                messages.count(runtime_doctor.incident_message(current)), 1
+            )
+            self.assertEqual(
+                messages.count(runtime_doctor.SUPERVISOR_UNAVAILABLE_MESSAGE), 1
+            )
+            final_snapshot = {
+                event["code"]: event["status"] for event in delivered[-1]
+            }
+            self.assertEqual(final_snapshot["node_unavailable"], "firing")
+            self.assertEqual(final_snapshot["prometheus_unhealthy"], "firing")
             self.assertNotIn(
                 "pending", json.loads(config.state_path.read_text("utf-8"))
             )

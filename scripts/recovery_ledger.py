@@ -194,7 +194,9 @@ def _canonical_event(event: dict[str, Any]) -> str:
     return json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
-def _event_timestamp(event: dict[str, Any], received_at: float) -> float:
+def _event_timestamp(
+    event: dict[str, Any], received_at: float, fallback_event_at: float | None = None
+) -> float:
     occurred_at = event.get("occurred_at")
     if isinstance(occurred_at, str) and occurred_at:
         try:
@@ -209,6 +211,12 @@ def _event_timestamp(event: dict[str, Any], received_at: float) -> float:
                 return timestamp
         except (OverflowError, ValueError):
             pass
+    if (
+        fallback_event_at is not None
+        and math.isfinite(fallback_event_at)
+        and 0 <= fallback_event_at <= received_at + MAX_EVENT_FUTURE_SKEW_SECONDS
+    ):
+        return fallback_event_at
     return received_at
 
 
@@ -379,17 +387,49 @@ class RecoveryLedger:
                 pass
             raise LedgerCorrupt("ledger schema initialization failed") from exc
 
-    def record_events(self, events: Iterable[dict[str, Any]]) -> int:
+    def record_events(
+        self,
+        events: Iterable[dict[str, Any]],
+        *,
+        observed_at: float | None = None,
+    ) -> int:
         rows = list(events)
         if not rows:
             return 0
+        if (
+            observed_at is not None
+            and (
+                isinstance(observed_at, bool)
+                or not isinstance(observed_at, (int, float))
+                or not math.isfinite(observed_at)
+                or observed_at < 0
+            )
+        ):
+            raise LedgerUnavailable("normalized event observation is invalid")
         with self._lock:
             connection = self.connection
             inserted = 0
+            last_fallback: float | None = None
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 for event in rows:
                     received_at = time.time()
+                    fallback_event_at: float | None = None
+                    if observed_at is not None:
+                        fallback_event_at = (
+                            float(observed_at)
+                            if float(observed_at)
+                            <= received_at + MAX_EVENT_FUTURE_SKEW_SECONDS
+                            else received_at
+                        )
+                        if (
+                            last_fallback is not None
+                            and fallback_event_at <= last_fallback
+                        ):
+                            fallback_event_at = math.nextafter(
+                                last_fallback, math.inf
+                            )
+                        last_fallback = fallback_event_at
                     cursor = connection.execute(
                         """
                         INSERT OR IGNORE INTO events(
@@ -405,7 +445,7 @@ class RecoveryLedger:
                             event["status"],
                             event["transition"],
                             event.get("occurred_at"),
-                            _event_timestamp(event, received_at),
+                            _event_timestamp(event, received_at, fallback_event_at),
                             received_at,
                             _canonical_event(event),
                         ),

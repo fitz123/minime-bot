@@ -542,6 +542,19 @@ def _advance_pending(
 ) -> dict[str, Any]:
     """Append transitions observed after an undelivered recovery batch."""
 
+    if pending.get("queue_first", False):
+        if current == set(pending["target_incidents"]):
+            return pending
+        # A reconciliation snapshot is authoritative only after every surviving
+        # older queue item. Replace the still-unsent snapshot with the newest
+        # complete source state instead of appending transitions ahead of it.
+        return {
+            "events": _source_snapshot_events(current),
+            "native_delivered": False,
+            "queue_first": True,
+            "target_incidents": sorted(current),
+        }
+
     queued = _recovery_queue_items(state_path)
     target = queued[-1][2] if queued else set(pending["target_incidents"])
     reconciled = target != set(pending["target_incidents"])
@@ -551,6 +564,7 @@ def _advance_pending(
         return {
             "events": list(pending["events"]),
             "native_delivered": False,
+            "queue_first": False,
             "target_incidents": sorted(target),
         }
 
@@ -563,15 +577,20 @@ def _advance_pending(
     return {
         "events": inline,
         "native_delivered": False,
+        "queue_first": False,
         "target_incidents": sorted(current),
     }
 
 
 def _valid_pending(value: Any) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    required = {
         "events",
         "native_delivered",
         "target_incidents",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(required),
+        frozenset({*required, "queue_first"}),
     }:
         return False
     target = value.get("target_incidents")
@@ -582,6 +601,7 @@ def _valid_pending(value: Any) -> bool:
         or not isinstance(events, list)
         or len(events) > RECOVERY_BATCH_MAX_EVENTS
         or not isinstance(value.get("native_delivered"), bool)
+        or not isinstance(value.get("queue_first", False), bool)
     ):
         return False
     return len(target) == len(set(target)) and all(
@@ -596,6 +616,8 @@ def read_delivery_state(path: Path) -> tuple[set[str], dict[str, Any] | None, bo
     pending = value.get("pending")
     if pending is not None and not isinstance(pending, dict):
         return set(), None, True
+    if isinstance(pending, dict) and "queue_first" not in pending:
+        pending = {**pending, "queue_first": False}
     return set(value["incidents"]), pending, False
 
 
@@ -807,26 +829,41 @@ def run_doctor(
                     return False, previous
                 active["native_delivered"] = True
                 write_delivery_state(config.state_path, previous, active)
-            if active["events"]:
+
+            def deliver_active_events() -> bool:
+                if not active["events"]:
+                    return True
                 try:
                     recovery_notify(active["events"])
                 except (MonitoringError, OSError):
                     recovery_sink_failed()
-                    return False, previous
+                    return False
                 active["events"] = []
                 write_delivery_state(config.state_path, previous, active)
-            try:
-                queued = _recovery_queue_items(config.state_path)
-            except OSError:
-                recovery_sink_failed()
-                return False, previous
-            for path, events, _queued_target in queued:
+                return True
+
+            def deliver_queued_events() -> bool:
                 try:
-                    recovery_notify(events)
-                    _remove_recovery_queue_item(path)
-                except (MonitoringError, OSError):
+                    queued = _recovery_queue_items(config.state_path)
+                except OSError:
                     recovery_sink_failed()
-                    return False, previous
+                    return False
+                for path, events, _queued_target in queued:
+                    try:
+                        recovery_notify(events)
+                        _remove_recovery_queue_item(path)
+                    except (MonitoringError, OSError):
+                        recovery_sink_failed()
+                        return False
+                return True
+
+            delivery_steps = (
+                (deliver_queued_events, deliver_active_events)
+                if active.get("queue_first", False)
+                else (deliver_active_events, deliver_queued_events)
+            )
+            if not all(step() for step in delivery_steps):
+                return False, previous
             recovery_delivered = True
             _clear_recovery_fallback(config)
             write_delivery_state(config.state_path, target, None)
@@ -843,6 +880,8 @@ def run_doctor(
                 # native recovery transition. Active incidents still preserve
                 # tee's direct native notification behavior.
                 "native_delivered": not incidents,
+                # Any surviving sidecar predates this authoritative snapshot.
+                "queue_first": True,
                 "target_incidents": sorted(incidents),
             }
             write_delivery_state(config.state_path, set(), pending)
@@ -850,7 +889,19 @@ def run_doctor(
             return 0 if completed else 1
 
         if pending is not None:
-            advanced = _advance_pending(pending, incidents, config.state_path)
+            try:
+                advanced = _advance_pending(pending, incidents, config.state_path)
+            except OSError:
+                # A sidecar failure must not suppress tee's newest native state.
+                # Preserve a complete final reconciliation after the older queue
+                # so recovery can converge if the sidecar becomes readable again.
+                recovery_sink_failed()
+                advanced = {
+                    "events": _source_snapshot_events(incidents),
+                    "native_delivered": False,
+                    "queue_first": True,
+                    "target_incidents": sorted(incidents),
+                }
             if advanced is not pending:
                 pending = advanced
                 write_delivery_state(config.state_path, previous, pending)
@@ -872,6 +923,7 @@ def run_doctor(
         pending = {
             "events": _transition_events(previous, incidents),
             "native_delivered": False,
+            "queue_first": False,
             "target_incidents": sorted(incidents),
         }
         write_delivery_state(config.state_path, previous, pending)
