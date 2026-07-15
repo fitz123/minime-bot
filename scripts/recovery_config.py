@@ -28,6 +28,10 @@ _LAUNCHD_TARGET = re.compile(
     r"^(?:system|user/[0-9]+|gui/[0-9]+|pid/[0-9]+)/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 )
 _SLEEP_SECONDS = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.[0-9]{1,3})?$")
+_RUNTIME_VERSION = re.compile(
+    r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,63})?$"
+)
+PINNED_PI_VERSION = "0.80.6"
 _READ_ONLY_PROBE_EXECUTABLES = {
     "/bin/false": "constant",
     "/bin/launchctl": "launchctl-print",
@@ -231,6 +235,14 @@ def _absolute_policy_path(value: Any, name: str) -> str:
     if not path.is_absolute() or ".." in path.parts or path == Path(path.anchor):
         raise RecoveryConfigError(f"recovery {name} must be a bounded absolute path")
     return str(path)
+
+
+def _path_contains(parent: str, child: str) -> bool:
+    try:
+        Path(child).resolve().relative_to(Path(parent).resolve())
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 _FORBIDDEN_OPERATION_EXECUTABLES = {
@@ -585,22 +597,65 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
 
     raw_slot = _object(
         document["slotPolicy"],
-        {"stateDirectory", "capsuleRoot", "botReleaseRoot", "startupHealthTimeoutSeconds"},
+        {
+            "stateDirectory",
+            "capsuleRoot",
+            "botReleaseRoot",
+            "startupHealthTimeoutSeconds",
+            "nodeExecutable",
+            "nodeVersion",
+            "piExecutable",
+            "piVersion",
+        },
         "slot policy",
     )
+    node_executable = _absolute_policy_path(
+        raw_slot["nodeExecutable"], "slot Node executable"
+    )
+    pi_executable = _absolute_policy_path(
+        raw_slot["piExecutable"], "slot Pi executable"
+    )
+    node_version = raw_slot["nodeVersion"]
+    pi_version = raw_slot["piVersion"]
+    if (
+        node_executable == pi_executable
+        or not isinstance(node_version, str)
+        or _RUNTIME_VERSION.fullmatch(node_version) is None
+        or not isinstance(pi_version, str)
+        or pi_version != PINNED_PI_VERSION
+    ):
+        raise RecoveryConfigError("recovery slot runtime prerequisites are invalid")
+    state_directory = _policy_workspace_path(
+        workspace, raw_slot["stateDirectory"], "slot state directory"
+    )
+    capsule_root = _policy_workspace_path(
+        workspace, raw_slot["capsuleRoot"], "capsule root"
+    )
+    bot_release_root = _policy_workspace_path(
+        workspace, raw_slot["botReleaseRoot"], "bot release root"
+    )
+    slot_roots = (state_directory, capsule_root, bot_release_root)
+    if len(set(slot_roots)) != len(slot_roots) or any(
+        _path_contains(left, right) or _path_contains(right, left)
+        for index, left in enumerate(slot_roots)
+        for right in slot_roots[index + 1 :]
+    ) or any(
+        _path_contains(root, executable)
+        for root in slot_roots
+        for executable in (node_executable, pi_executable)
+    ):
+        raise RecoveryConfigError("recovery slot roots and prerequisites overlap")
     slot_policy = {
-        "stateDirectory": _policy_workspace_path(
-            workspace, raw_slot["stateDirectory"], "slot state directory"
-        ),
-        "capsuleRoot": _policy_workspace_path(
-            workspace, raw_slot["capsuleRoot"], "capsule root"
-        ),
-        "botReleaseRoot": _policy_workspace_path(
-            workspace, raw_slot["botReleaseRoot"], "bot release root"
-        ),
+        "stateDirectory": state_directory,
+        "capsuleRoot": capsule_root,
+        "botReleaseRoot": bot_release_root,
         "startupHealthTimeoutSeconds": _bounded_integer(
             raw_slot["startupHealthTimeoutSeconds"], (1, 600), "slot health timeout"
         ),
+        "nodeExecutable": node_executable,
+        "nodeVersion": node_version,
+        "piExecutable": pi_executable,
+        "piVersion": pi_version,
     }
 
     raw_operations = document["reviewedOperations"]
@@ -612,6 +667,12 @@ def load_recovery_config(path: Path, workspace: Path) -> RecoveryConfig:
     operation_ids = [str(operation["id"]) for operation in reviewed_operations]
     if len(set(operation_ids)) != len(operation_ids):
         raise RecoveryConfigError("recovery reviewed operation IDs contain duplicates")
+    if any(
+        _path_contains(root, str(operation["executable"]))
+        for root in (capsule_root, bot_release_root)
+        for operation in reviewed_operations
+    ):
+        raise RecoveryConfigError("recovery reviewed operation is inside a release slot")
 
     raw_rules = document["correlationRules"]
     if not isinstance(raw_rules, list) or len(raw_rules) > 128:

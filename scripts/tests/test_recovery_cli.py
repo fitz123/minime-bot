@@ -72,6 +72,10 @@ def config_document(mode: str = "observe") -> dict[str, object]:
             "capsuleRoot": "var/recovery/capsule",
             "botReleaseRoot": "var/releases",
             "startupHealthTimeoutSeconds": 60,
+            "nodeExecutable": "/usr/local/bin/node",
+            "nodeVersion": "22.19.0",
+            "piExecutable": "/usr/local/bin/pi",
+            "piVersion": "0.80.6",
         },
         "reviewedOperations": [],
         "fixerLeaseSeconds": 120,
@@ -301,6 +305,28 @@ class RecoveryConfigTests(unittest.TestCase):
             bad_renew = config_document()
             bad_renew["fixerRenewSeconds"] = 60
             invalid_documents.append(("unsafe-renew", bad_renew))
+
+            relative_node = config_document()
+            assert isinstance(relative_node["slotPolicy"], dict)
+            relative_node["slotPolicy"]["nodeExecutable"] = "bin/node"
+            invalid_documents.append(("relative-slot-node", relative_node))
+
+            unpinned_pi = config_document()
+            assert isinstance(unpinned_pi["slotPolicy"], dict)
+            unpinned_pi["slotPolicy"]["piVersion"] = "0.80.7"
+            invalid_documents.append(("unpinned-slot-pi", unpinned_pi))
+
+            overlapping_slots = config_document()
+            assert isinstance(overlapping_slots["slotPolicy"], dict)
+            overlapping_slots["slotPolicy"]["botReleaseRoot"] = "var/recovery/capsule/bot"
+            invalid_documents.append(("overlapping-slot-roots", overlapping_slots))
+
+            slotted_runtime = config_document()
+            assert isinstance(slotted_runtime["slotPolicy"], dict)
+            slotted_runtime["slotPolicy"]["piExecutable"] = str(
+                root.resolve() / "var/releases/current/bin/pi"
+            )
+            invalid_documents.append(("slotted-runtime-prerequisite", slotted_runtime))
 
             shell_operation = config_document()
             shell_operation["reviewedOperations"] = [

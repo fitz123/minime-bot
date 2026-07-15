@@ -114,11 +114,11 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 - [x] Test quarantine/restore/rejections, allowed user config/restart, forbidden deletion/public/network actions, and inability to bypass empty root capability; run safety tests.
 
 ### Task 5: Add independent recovery-capsule and bot-release slots
-- [ ] Implement validated local recovery staging plus stable bootstrap/current/previous/state, atomic switch/fsync, self-check, and one previous fallback.
-- [ ] Stage an independent package artifact/dependency closure and validate configured absolute Node/Pi prerequisites and versions in the manifest.
-- [ ] Implement immutable bot slots and stable offline static-ID restart/rollback with evidence and safe failed-restart restoration.
-- [ ] Keep bot deploy and capsule upgrade separate and prohibit build/download/package/image operations during incident rollback.
-- [ ] Test broken active bot package, broken capsule current-to-previous, manifests/checksums, interrupted switch, offline bot rollback, and restart restoration; run slot/bootstrap tests.
+- [x] Implement validated local recovery staging plus stable bootstrap/current/previous/state, atomic switch/fsync, self-check, and one previous fallback.
+- [x] Stage an independent package artifact/dependency closure and validate configured absolute Node/Pi prerequisites and versions in the manifest.
+- [x] Implement immutable bot slots and stable offline static-ID restart/rollback with evidence and safe failed-restart restoration.
+- [x] Keep bot deploy and capsule upgrade separate and prohibit build/download/package/image operations during incident rollback.
+- [x] Test broken active bot package, broken capsule current-to-previous, manifests/checksums, interrupted switch, offline bot rollback, and restart restoration; run slot/bootstrap tests.
 
 ### Task 6: Complete package integration, documentation, and acceptance coverage
 - [ ] Wire runner, non-default extension wrapper, Python modules, capsule/slot commands, and package files without private deployment details.

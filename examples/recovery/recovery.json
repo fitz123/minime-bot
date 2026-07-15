@@ -58,7 +58,11 @@
     "stateDirectory": "var/recovery/slots",
     "capsuleRoot": "var/recovery/capsule",
     "botReleaseRoot": "var/releases",
-    "startupHealthTimeoutSeconds": 60
+    "startupHealthTimeoutSeconds": 60,
+    "nodeExecutable": "/usr/local/bin/node",
+    "nodeVersion": "22.19.0",
+    "piExecutable": "/usr/local/bin/pi",
+    "piVersion": "0.80.6"
   },
   "reviewedOperations": [],
   "fixerLeaseSeconds": 120,
