@@ -16,6 +16,8 @@ from recovery_config import (
     RecoveryConfig,
     RecoveryConfigError,
     load_recovery_config,
+    recovery_mode_allows_dispatch,
+    recovery_mode_allows_mutation,
 )
 from recovery_ledger import LedgerError, RecoveryLedger
 from recovery_supervisor import (
@@ -67,7 +69,7 @@ def _safe_text(value: str, name: str, limit: int) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect and control the observe-only same-host recovery foundation",
+        description="Inspect and control the mode-gated same-host recovery supervisor",
         epilog=(
             "The foundation performs native intake, verification, controls, and "
             "escalation only. Fixer execution and remediation actions are not available."
@@ -143,6 +145,7 @@ def _policy(config: RecoveryConfig, revision: int = 1) -> RecoveryPolicy:
             )
             for rule in config.correlation_rules
         ),
+        lease_seconds=config.fixer_lease_seconds,
     )
 
 
@@ -158,8 +161,10 @@ def _status(ledger: RecoveryLedger, controls: RecoveryControls, config: Recovery
         "database": str(config.database),
         "foundation": {
             "fixerAvailable": False,
+            "fixerDispatchAllowed": recovery_mode_allows_dispatch(config.mode),
+            "mutationAllowed": recovery_mode_allows_mutation(config.mode),
             "nativeVerification": True,
-            "observeOnly": True,
+            "observeOnly": config.mode == "observe",
             "remediationActionsAvailable": False,
         },
         "emergencyDeliveryConfigured": bool(

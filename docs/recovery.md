@@ -49,7 +49,8 @@ minime-bot recovery config validate --workspace /path/to/control-workspace
 ```
 
 The JSON object is closed and requires every field shown in the example.
-`version` is `1` and `mode` must be `observe`. Legacy modes are rejected.
+`version` is `2` and `mode` must be exactly `observe`, `diagnose`, or `enabled`.
+Legacy and unknown modes are rejected.
 Runtime paths are control-workspace-relative and cannot contain `..`; the host
 must be loopback; and the port is bounded. Source IDs are unique values from
 `alertmanager` and `runtime_doctor`. Correlation rules have a unique
@@ -101,10 +102,13 @@ process group that is terminated on timeout or a stale generation/policy fence.
 Results are recorded only after the same fence is rechecked transactionally.
 The public example configures no probes.
 
-The supervisor has one mode: `observe`. It may intake, correlate, audit,
-report health, refresh deterministic probes, verify resolved episodes, and use
-native escalation fallback. It never creates a fixer invocation or completion
-claim and never executes a remediation action.
+All modes may intake, correlate, audit, report health, refresh deterministic
+probes, verify resolved episodes, and use native escalation fallback. `observe`
+never claims fixer work. `diagnose` permits fixer dispatch and inspection,
+reconciliation, blocked, and finish protocol operations but rejects host
+mutation. `enabled` permits the same dispatch plus journaled mutation. A fixer
+spawn must carry the recovery-only extension; a missing wrapper or
+`PI_EXTENSIONS_DISABLED=1` is a hard failure, never a bare default-tool spawn.
 
 ## Installation
 
@@ -229,9 +233,11 @@ Alert timestamps more than five minutes ahead of their receive time are not
 trusted for semantic ordering; the ledger conservatively orders those events by
 receive time so a malformed future transition cannot mask later input.
 
-The trusted Pi fixer, exact-session re-entry, action journal, independent
-two-slot recovery capsule, and offline bot rollback are explicitly deferred to
-a follow-up change.
+The version-3 ledger reserves durable exact-session bindings/replacements,
+action intents/outcomes/reconciliations, completion claims, verification
+history, and independent report/outbox state. The runnable Pi fixer,
+recovery-only wrapper, two-slot recovery capsule, and offline bot rollback are
+added by the remaining staged recovery tasks.
 
 ## Shadow acceptance drills
 

@@ -86,11 +86,11 @@ Also run installed-tarball config/workspace/schema checks, package-content asser
 ## Tasks
 
 ### Task 1: Extend closed modes, durable ledger, static config, and lifecycle
-- [ ] Add the exact `observe`/`diagnose`/`enabled` dispatch and mutation semantics at config, claim, endpoint, and extension boundaries; fail closed on missing recovery extension or `PI_EXTENSIONS_DISABLED=1`.
-- [ ] Evolve SQLite for exact session binding/replacement, action intent/outcome/unknown reconciliation, claims, verification history, and independent report/outbox state while preserving foundation durability, fencing, lease, and retention invariants.
-- [ ] Keep existing incident states and implement the documented presentation mapping plus idempotent report states outside `incidents.state`.
-- [ ] Extend closed config with internal agent ID, fixer credential reference, session/action/quarantine/report/slot policy, reviewed operation IDs, and fixer lease/renew timing; reject unknown fields, unsafe paths, shell strings, and adaptive settings.
-- [ ] Add schema/version, mode, lifecycle, stale-fence, duplicate, corruption/full/lock, and report-state tests; run focused Python tests.
+- [x] Add the exact `observe`/`diagnose`/`enabled` dispatch and mutation semantics at config, claim, endpoint, and extension boundaries; fail closed on missing recovery extension or `PI_EXTENSIONS_DISABLED=1`.
+- [x] Evolve SQLite for exact session binding/replacement, action intent/outcome/unknown reconciliation, claims, verification history, and independent report/outbox state while preserving foundation durability, fencing, lease, and retention invariants.
+- [x] Keep existing incident states and implement the documented presentation mapping plus idempotent report states outside `incidents.state`.
+- [x] Extend closed config with internal agent ID, fixer credential reference, session/action/quarantine/report/slot policy, reviewed operation IDs, and fixer lease/renew timing; reject unknown fields, unsafe paths, shell strings, and adaptive settings.
+- [x] Add schema/version, mode, lifecycle, stale-fence, duplicate, corruption/full/lock, and report-state tests; run focused Python tests.
 
 ### Task 2: Add the full exact-session Pi fixer and separated action protocol
 - [ ] Add the full runner, shared helpers, and non-default recovery wrapper while preserving normal Pi tools/context and excluding the old planner/`--no-session` model.

@@ -289,11 +289,12 @@ describe("package artifact install", () => {
       workspace,
       "recovery.json",
       JSON.stringify({
-        version: 1,
+        version: 2,
         mode: "observe",
         database: "var/recovery/ledger.sqlite3",
         spoolDirectory: "var/recovery/spool",
         authTokenFile: "config/recovery-auth-token",
+        fixerAuthTokenFile: "config/recovery-fixer-auth-token",
         host: "127.0.0.1",
         port: 9877,
         correlationRules: [{
@@ -307,6 +308,40 @@ describe("package artifact install", () => {
         runtimeDoctorCadenceSeconds: 300,
         verificationFreshnessSeconds: 660,
         verificationHoldDownSeconds: 60,
+        internalAgentId: "recovery-fixer",
+        sessionPolicy: {
+          directory: "var/recovery/sessions",
+          startupTimeoutSeconds: 30,
+          resumeTimeoutSeconds: 30,
+          maxReplacementsPerGeneration: 1,
+          journalDigestMaxBytes: 32768,
+        },
+        actionPolicy: {
+          maxActionsPerInvocation: 128,
+          preimageMaxBytes: 1048576,
+          reconciliationTimeoutSeconds: 300,
+        },
+        quarantinePolicy: {
+          directory: "var/recovery/quarantine",
+          allowedRoots: [],
+          maxItemsPerIncident: 64,
+          maxItemBytes: 10485760,
+          maxIncidentBytes: 52428800,
+        },
+        reportPolicy: {
+          maxBytes: 262144,
+          maxTimelineEntries: 256,
+          retrySeconds: 300,
+        },
+        slotPolicy: {
+          stateDirectory: "var/recovery/slots",
+          capsuleRoot: "var/recovery/capsule",
+          botReleaseRoot: "var/releases",
+          startupHealthTimeoutSeconds: 60,
+        },
+        reviewedOperations: [],
+        fixerLeaseSeconds: 120,
+        fixerRenewSeconds: 30,
       }),
     );
     assert.deepEqual(collectSchemaFiles(workspace), [], "installed workspace fixture must not contain schema.md");
@@ -383,8 +418,8 @@ describe("package artifact install", () => {
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
       assert.match(help.stdout, /minime-bot recovery config validate/);
-      assert.match(help.stdout, /observe-only native intake/);
-      assert.match(help.stdout, /no fixer or remediation actions/);
+      assert.match(help.stdout, /closed observe, diagnose, and enabled mode gates/);
+      assert.match(help.stdout, /full fixer runner, two-slot capsule, and offline rollback/);
 
       const recoveryValidate = runInstalledBin(
         projectDir,
@@ -402,6 +437,8 @@ describe("package artifact install", () => {
       assert.equal(recoveryStatus.status, 0, recoveryStatus.stderr || recoveryStatus.stdout);
       assert.deepEqual(JSON.parse(recoveryStatus.stdout).foundation, {
         fixerAvailable: false,
+        fixerDispatchAllowed: false,
+        mutationAllowed: false,
         nativeVerification: true,
         observeOnly: true,
         remediationActionsAvailable: false,
@@ -632,7 +669,9 @@ assert config.mode == "observe"
 assert set(recovery_config.recovery_static_policy(config)) == {
     "version", "mode", "correlationRules", "sourceIds", "probes",
     "runtimeDoctorCadenceSeconds", "verificationFreshnessSeconds",
-    "verificationHoldDownSeconds"
+    "verificationHoldDownSeconds", "internalAgentId", "sessionPolicy",
+    "actionPolicy", "quarantinePolicy", "reportPolicy", "slotPolicy",
+    "reviewedOperations", "fixerLeaseSeconds", "fixerRenewSeconds"
 }
 ledger = recovery_ledger.RecoveryLedger(config.database)
 policy = recovery_supervisor.RecoveryPolicy(
@@ -800,6 +839,7 @@ with tempfile.TemporaryDirectory() as directory:
         database=root / "ledger.sqlite3",
         spool_directory=root / "spool",
         auth_token_file=root / "auth-token",
+        fixer_auth_token_file=root / "fixer-auth-token",
         host="127.0.0.1",
         port=9877,
         correlation_rules=config.correlation_rules,
@@ -814,6 +854,36 @@ with tempfile.TemporaryDirectory() as directory:
         runtime_doctor_cadence_seconds=300,
         verification_freshness_seconds=660,
         verification_hold_down_seconds=0,
+        internal_agent_id="recovery-fixer",
+        session_policy={
+            "directory": str(root / "sessions"),
+            "startupTimeoutSeconds": 30,
+            "resumeTimeoutSeconds": 30,
+            "maxReplacementsPerGeneration": 1,
+            "journalDigestMaxBytes": 32768,
+        },
+        action_policy={
+            "maxActionsPerInvocation": 128,
+            "preimageMaxBytes": 1048576,
+            "reconciliationTimeoutSeconds": 300,
+        },
+        quarantine_policy={
+            "directory": str(root / "quarantine"),
+            "allowedRoots": (),
+            "maxItemsPerIncident": 64,
+            "maxItemBytes": 10485760,
+            "maxIncidentBytes": 52428800,
+        },
+        report_policy={"maxBytes": 262144, "maxTimelineEntries": 256, "retrySeconds": 300},
+        slot_policy={
+            "stateDirectory": str(root / "slots"),
+            "capsuleRoot": str(root / "capsule"),
+            "botReleaseRoot": str(root / "releases"),
+            "startupHealthTimeoutSeconds": 60,
+        },
+        reviewed_operations=(),
+        fixer_lease_seconds=120,
+        fixer_renew_seconds=30,
     )
     with recovery_ledger.RecoveryLedger(probe_config.database) as probe_ledger:
         probe_service = recovery_supervisor._build_recovery_service(

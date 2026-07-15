@@ -37,6 +37,8 @@ from recovery_config import (
     RecoveryConfig,
     RecoveryConfigError,
     load_recovery_config,
+    recovery_endpoint_allowed,
+    recovery_mode_allows_dispatch,
     recovery_static_policy,
     validated_probe_command,
 )
@@ -88,6 +90,8 @@ _CONTROL_POLICY_KEY = "recovery_controls"
 _STATIC_POLICY_KEY = "recovery_static"
 _EFFECTIVE_POLICY_REVISION_KEY = "effective_policy_revision"
 _CONTROL_POLICY_VERSION = 1
+REPORT_PENDING = "REPORT_PENDING"
+REPORTED = "REPORTED"
 _CONFIRMATION_BOUNDS = (1, 5)
 _COOLDOWN_BOUNDS = (0.0, 86_400.0)
 _RETRY_BUDGET_BOUNDS = (0, 10)
@@ -873,11 +877,18 @@ class IncidentCoordinator:
         immediate_escalation: Callable[[str], Any] | None = None,
         mode: str = "observe",
         static_policy: dict[str, Any] | None = None,
+        max_actions_per_invocation: int = 128,
     ):
         if not isinstance(owner, str) or safe_field(owner, default="") != owner:
             raise ValueError("recovery owner is invalid")
         if mode not in RECOVERY_MODES:
             raise ValueError("recovery mode is invalid")
+        if (
+            isinstance(max_actions_per_invocation, bool)
+            or not isinstance(max_actions_per_invocation, int)
+            or not 1 <= max_actions_per_invocation <= 1_000
+        ):
+            raise ValueError("recovery action count bound is invalid")
         self.ledger = ledger
         self.policy = policy
         self.owner = owner
@@ -887,6 +898,7 @@ class IncidentCoordinator:
         )
         self.immediate_escalation = immediate_escalation
         self.mode = mode
+        self.max_actions_per_invocation = max_actions_per_invocation
         self._static_policy = (
             _canonical_json(static_policy) if static_policy is not None else None
         )
@@ -1126,11 +1138,43 @@ class IncidentCoordinator:
             self.immediate_escalation("retries_exhausted")
         return active_count
 
+    def presentation_state(self, incident_id: int) -> str:
+        """Map durable foundation states without storing presentation-only names."""
+
+        if not isinstance(incident_id, int) or incident_id < 1:
+            raise ValueError("recovery incident id is invalid")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            incident = connection.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            if incident is None:
+                raise ValueError("recovery incident id is invalid")
+            raw_state = str(incident["state"])
+            if raw_state == "eligible":
+                control = self.controls.current(connection, now=now)
+                detail = self._active_evidence_details(connection).get(
+                    str(incident["correlation_key"])
+                )
+                if detail is None:
+                    return "ELIGIBLE"
+                if detail.max_impact >= 3 or detail.confirmation_count >= control.confirmation_count:
+                    return "ELIGIBLE"
+                return "OBSERVED" if detail.confirmation_count == 1 else "CONFIRMING"
+            return {
+                "invoking": "RUNNING",
+                "verifying": "VERIFYING",
+                "recovered": "RECOVERED",
+                "recovery_unsafe": "BLOCKED",
+                "recovery_failed": "FAILED",
+                "retries_exhausted": "ESCALATED",
+            }.get(raw_state, raw_state.upper())
+
     def claim_next(self) -> InvocationFence | None:
         """Acquire the one global lease and atomically create one invocation."""
 
         self.reconcile()
-        if self.mode == "observe":
+        if not recovery_mode_allows_dispatch(self.mode):
             return None
         now = self.clock()
         with self.ledger.transaction() as connection:
@@ -1315,6 +1359,397 @@ class IncidentCoordinator:
             if not evidence:
                 raise ValueError("recovery invocation evidence is unavailable")
             return evidence[:32]
+
+    @staticmethod
+    def _journal_text(value: Any, name: str, *, limit: int = 160) -> str:
+        if not isinstance(value, str) or safe_field(value, limit=limit, default="") != value:
+            raise ValueError(f"recovery {name} is invalid")
+        return value
+
+    @staticmethod
+    def _journal_json(value: Any, name: str, *, limit: int = 256 * 1024) -> str:
+        if not isinstance(value, dict):
+            raise ValueError(f"recovery {name} is invalid")
+        try:
+            encoded = _canonical_json(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"recovery {name} is invalid") from exc
+        if len(encoded.encode("utf-8")) > limit:
+            raise ValueError(f"recovery {name} is too large")
+        return encoded
+
+    @staticmethod
+    def _session_path(value: Any, name: str) -> str:
+        try:
+            encoded_size = len(value.encode("utf-8")) if isinstance(value, str) else 0
+        except UnicodeEncodeError:
+            encoded_size = 4_097
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\0" in value
+            or encoded_size > 4_096
+        ):
+            raise ValueError(f"recovery {name} is invalid")
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"recovery {name} is invalid")
+        return str(path)
+
+    def endpoint_allowed(self, operation: str) -> bool:
+        return recovery_endpoint_allowed(self.mode, operation)
+
+    def bind_session(
+        self,
+        fence: InvocationFence,
+        *,
+        session_id: str,
+        session_directory: str,
+        transcript_path: str,
+    ) -> int | None:
+        """Idempotently commit the first exact-session binding behind a live fence."""
+
+        identifier = self._journal_text(session_id, "session id", limit=128)
+        directory = self._session_path(session_directory, "session directory")
+        transcript = self._session_path(transcript_path, "session transcript path")
+        try:
+            Path(transcript).relative_to(Path(directory))
+        except ValueError:
+            raise ValueError("recovery session transcript escapes its directory") from None
+        if Path(transcript).suffix != ".jsonl":
+            raise ValueError("recovery session transcript path is invalid")
+        if not recovery_mode_allows_dispatch(self.mode):
+            return None
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return None
+            existing = connection.execute(
+                "SELECT * FROM session_bindings WHERE incident_id = ? AND generation = ? "
+                "AND state = 'current' ORDER BY id DESC LIMIT 1",
+                (fence.incident_id, fence.generation),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["invocation_id"] == fence.invocation_id
+                    and existing["session_id"] == identifier
+                    and existing["session_directory"] == directory
+                    and existing["transcript_path"] == transcript
+                ):
+                    return int(existing["id"])
+                raise ValueError("recovery session generation is already bound")
+            cursor = connection.execute(
+                "INSERT INTO session_bindings(incident_id, generation, evidence_hash, "
+                "policy_revision, invocation_id, session_id, session_directory, transcript_path, "
+                "state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
+                (
+                    fence.incident_id,
+                    fence.generation,
+                    fence.evidence_hash,
+                    fence.policy_revision,
+                    fence.invocation_id,
+                    identifier,
+                    directory,
+                    transcript,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def replace_session(
+        self,
+        fence: InvocationFence,
+        *,
+        previous_binding_id: int,
+        session_id: str,
+        session_directory: str,
+        transcript_path: str,
+        reason: str,
+        journal_digest: str,
+        max_replacements: int,
+    ) -> int | None:
+        """Record an explicitly bounded replacement without losing the prior binding."""
+
+        if (
+            isinstance(previous_binding_id, bool)
+            or not isinstance(previous_binding_id, int)
+            or previous_binding_id < 1
+            or isinstance(max_replacements, bool)
+            or not isinstance(max_replacements, int)
+            or not 0 <= max_replacements <= 10
+        ):
+            raise ValueError("recovery session replacement is invalid")
+        identifier = self._journal_text(session_id, "session id", limit=128)
+        directory = self._session_path(session_directory, "session directory")
+        transcript = self._session_path(transcript_path, "session transcript path")
+        replacement_reason = self._journal_text(reason, "session replacement reason")
+        try:
+            digest_size = (
+                len(journal_digest.encode("utf-8"))
+                if isinstance(journal_digest, str)
+                else 262_145
+            )
+        except UnicodeEncodeError:
+            digest_size = 262_145
+        if not isinstance(journal_digest, str) or digest_size > 262_144:
+            raise ValueError("recovery session journal digest is invalid")
+        try:
+            Path(transcript).relative_to(Path(directory))
+        except ValueError:
+            raise ValueError("recovery session transcript escapes its directory") from None
+        if Path(transcript).suffix != ".jsonl":
+            raise ValueError("recovery session transcript path is invalid")
+        if not recovery_mode_allows_dispatch(self.mode):
+            return None
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return None
+            previous = connection.execute(
+                "SELECT * FROM session_bindings WHERE id = ? AND incident_id = ? "
+                "AND generation = ? AND state = 'current'",
+                (previous_binding_id, fence.incident_id, fence.generation),
+            ).fetchone()
+            if previous is None:
+                return None
+            replacements = int(
+                connection.execute(
+                    "SELECT count(*) FROM session_replacements WHERE incident_id = ? "
+                    "AND generation = ?",
+                    (fence.incident_id, fence.generation),
+                ).fetchone()[0]
+            )
+            if replacements >= max_replacements:
+                return None
+            if previous["session_id"] == identifier or previous["transcript_path"] == transcript:
+                raise ValueError("recovery replacement session must be distinct")
+            connection.execute(
+                "UPDATE session_bindings SET state = 'replaced' WHERE id = ?",
+                (previous_binding_id,),
+            )
+            cursor = connection.execute(
+                "INSERT INTO session_bindings(incident_id, generation, evidence_hash, "
+                "policy_revision, invocation_id, session_id, session_directory, transcript_path, "
+                "state, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)",
+                (
+                    fence.incident_id,
+                    fence.generation,
+                    fence.evidence_hash,
+                    fence.policy_revision,
+                    fence.invocation_id,
+                    identifier,
+                    directory,
+                    transcript,
+                    now,
+                ),
+            )
+            replacement_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO session_replacements(incident_id, generation, previous_binding_id, "
+                "replacement_binding_id, reason, journal_digest, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    fence.incident_id,
+                    fence.generation,
+                    previous_binding_id,
+                    replacement_id,
+                    replacement_reason,
+                    journal_digest,
+                    now,
+                ),
+            )
+            return replacement_id
+
+    def record_action_intent(
+        self,
+        fence: InvocationFence,
+        *,
+        action_key: str,
+        tool_name: str,
+        intent: dict[str, Any],
+    ) -> int | None:
+        """Commit a mutating action intent and block on every unresolved predecessor."""
+
+        if not self.endpoint_allowed("mutate"):
+            return None
+        key = self._journal_text(action_key, "action key")
+        tool = self._journal_text(tool_name, "action tool", limit=80)
+        encoded = self._journal_json(intent, "action intent", limit=64 * 1024)
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return None
+            existing = connection.execute(
+                "SELECT * FROM action_intents WHERE invocation_id = ? AND action_key = ?",
+                (fence.invocation_id, key),
+            ).fetchone()
+            if existing is not None:
+                if existing["tool_name"] != tool or existing["intent_json"] != encoded:
+                    raise ValueError("recovery action idempotency key was reused")
+                return int(existing["id"])
+            unresolved = connection.execute(
+                "SELECT 1 FROM action_intents WHERE invocation_id = ? "
+                "AND state IN ('pending', 'unknown') LIMIT 1",
+                (fence.invocation_id,),
+            ).fetchone()
+            if unresolved is not None:
+                return None
+            count = int(
+                connection.execute(
+                    "SELECT count(*) FROM action_intents WHERE invocation_id = ?",
+                    (fence.invocation_id,),
+                ).fetchone()[0]
+            )
+            if count >= self.max_actions_per_invocation:
+                return None
+            cursor = connection.execute(
+                "INSERT INTO action_intents(invocation_id, action_key, tool_name, intent_json, "
+                "state, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (fence.invocation_id, key, tool, encoded, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def record_action_outcome(
+        self,
+        fence: InvocationFence,
+        *,
+        action_key: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> bool:
+        if outcome not in {"succeeded", "failed"}:
+            raise ValueError("recovery action outcome is invalid")
+        key = self._journal_text(action_key, "action key")
+        encoded = self._journal_json(details, "action outcome", limit=64 * 1024)
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return False
+            intent = connection.execute(
+                "SELECT * FROM action_intents WHERE invocation_id = ? AND action_key = ?",
+                (fence.invocation_id, key),
+            ).fetchone()
+            if intent is None:
+                return False
+            existing = connection.execute(
+                "SELECT outcome, outcome_json FROM action_outcomes WHERE action_intent_id = ?",
+                (intent["id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["outcome"] != outcome or existing["outcome_json"] != encoded:
+                    raise ValueError("recovery action outcome conflicts with its first record")
+                return True
+            if intent["state"] != "pending":
+                return False
+            connection.execute(
+                "INSERT INTO action_outcomes(action_intent_id, outcome, outcome_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (intent["id"], outcome, encoded, now),
+            )
+            connection.execute(
+                "UPDATE action_intents SET state = 'completed', updated_at = ? WHERE id = ?",
+                (now, intent["id"]),
+            )
+            return True
+
+    def reconcile_action(
+        self,
+        fence: InvocationFence,
+        *,
+        action_key: str,
+        idempotency_key: str,
+        result: str,
+        details: dict[str, Any],
+    ) -> bool:
+        if not self.endpoint_allowed("reconcile"):
+            return False
+        if result not in {"applied", "not_applied"}:
+            raise ValueError("recovery action reconciliation result is invalid")
+        key = self._journal_text(action_key, "action key")
+        idempotency = self._journal_text(
+            idempotency_key, "action reconciliation idempotency key"
+        )
+        encoded = self._journal_json(details, "action reconciliation", limit=64 * 1024)
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return False
+            intent = connection.execute(
+                "SELECT * FROM action_intents WHERE invocation_id = ? AND action_key = ?",
+                (fence.invocation_id, key),
+            ).fetchone()
+            if intent is None:
+                return False
+            existing = connection.execute(
+                "SELECT idempotency_key, result, details_json FROM action_reconciliations "
+                "WHERE action_intent_id = ?",
+                (intent["id"],),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["idempotency_key"] != idempotency
+                    or existing["result"] != result
+                    or existing["details_json"] != encoded
+                ):
+                    raise ValueError("recovery action reconciliation conflicts with its first record")
+                return True
+            if intent["state"] != "unknown":
+                return False
+            connection.execute(
+                "INSERT INTO action_reconciliations(action_intent_id, idempotency_key, result, "
+                "details_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (intent["id"], idempotency, result, encoded, now),
+            )
+            connection.execute(
+                "UPDATE action_intents SET state = 'reconciled', updated_at = ? WHERE id = ?",
+                (now, intent["id"]),
+            )
+            return True
+
+    def record_completion_claim(
+        self,
+        fence: InvocationFence,
+        *,
+        claim_key: str,
+        claim: dict[str, Any],
+    ) -> int | None:
+        if not self.endpoint_allowed("finish"):
+            return None
+        key = self._journal_text(claim_key, "completion claim key")
+        encoded = self._journal_json(claim, "completion claim")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            if not self._fence_valid(connection, fence, now):
+                return None
+            if connection.execute(
+                "SELECT 1 FROM action_intents WHERE invocation_id = ? "
+                "AND state IN ('pending', 'unknown') LIMIT 1",
+                (fence.invocation_id,),
+            ).fetchone() is not None:
+                return None
+            existing = connection.execute(
+                "SELECT * FROM fixer_claims WHERE invocation_id = ?",
+                (fence.invocation_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["claim_key"] != key or existing["claim_json"] != encoded:
+                    raise ValueError("recovery completion claim conflicts with its first record")
+                return int(existing["id"])
+            cursor = connection.execute(
+                "INSERT INTO fixer_claims(invocation_id, incident_id, generation, evidence_hash, "
+                "policy_revision, claim_key, claim_json, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    fence.invocation_id,
+                    fence.incident_id,
+                    fence.generation,
+                    fence.evidence_hash,
+                    fence.policy_revision,
+                    key,
+                    encoded,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
 
     def finish(self, fence: InvocationFence, outcome: str) -> bool:
         """Accept a future fixer result only while every durable fence still matches."""
@@ -1941,6 +2376,83 @@ class RecoveryVerifier:
                 )
         return True
 
+    @staticmethod
+    def _attempt_documents(
+        result: VerificationResult,
+    ) -> tuple[str, str]:
+        reasons_json = _canonical_json(list(result.reasons))
+        evidence_json = _canonical_json(
+            [
+                {
+                    "fresh_until": item.fresh_until,
+                    "id": item.identifier,
+                    "kind": item.kind,
+                    "observed_at": item.observed_at,
+                    "state": item.state,
+                }
+                for item in result.evidence
+            ]
+        )
+        return reasons_json, evidence_json
+
+    def _record_attempt(
+        self,
+        connection: Any,
+        incident: Any,
+        result: VerificationResult,
+        now: float,
+    ) -> None:
+        status = (
+            "recovered"
+            if result.recovered
+            else "contradicted"
+            if _is_fresh_contradiction(result, now=now)
+            else "deferred"
+        )
+        reasons_json, evidence_json = self._attempt_documents(result)
+        previous = connection.execute(
+            "SELECT result, reasons_json, evidence_json FROM verification_attempts "
+            "WHERE incident_id = ? AND generation = ? ORDER BY attempt DESC LIMIT 1",
+            (incident["id"], incident["generation"]),
+        ).fetchone()
+        if (
+            previous is not None
+            and previous["result"] == status
+            and previous["reasons_json"] == reasons_json
+            and previous["evidence_json"] == evidence_json
+        ):
+            return
+        attempt = int(
+            connection.execute(
+                "SELECT coalesce(max(attempt), 0) + 1 FROM verification_attempts "
+                "WHERE incident_id = ? AND generation = ?",
+                (incident["id"], incident["generation"]),
+            ).fetchone()[0]
+        )
+        invocation = connection.execute(
+            "SELECT id FROM invocations WHERE incident_id = ? AND policy_revision = ? "
+            "ORDER BY generation DESC, id DESC LIMIT 1",
+            (incident["id"], incident["policy_revision"]),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO verification_attempts(incident_id, generation, evidence_hash, "
+            "policy_revision, invocation_id, attempt, result, reasons_json, evidence_json, "
+            "started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                incident["id"],
+                incident["generation"],
+                incident["evidence_hash"],
+                incident["policy_revision"],
+                None if invocation is None else invocation["id"],
+                attempt,
+                status,
+                reasons_json,
+                evidence_json,
+                now,
+                now,
+            ),
+        )
+
     def evaluate(self, incident_id: int) -> VerificationResult:
         if not isinstance(incident_id, int) or incident_id < 1:
             raise ValueError("recovery verification incident is invalid")
@@ -2019,11 +2531,13 @@ class RecoveryVerifier:
             if now - float(incident["updated_at"]) < self.hold_down_seconds:
                 reasons.append("hold_down")
             if reasons:
-                return VerificationResult(
+                result = VerificationResult(
                     False,
                     tuple(sorted(set(reasons))),
                     tuple(evidence),
                 )
+                self._record_attempt(connection, incident, result, now)
+                return result
             connection.execute(
                 "UPDATE incidents SET state = 'recovered', updated_at = ? WHERE id = ?",
                 (now, incident_id),
@@ -2043,7 +2557,9 @@ class RecoveryVerifier:
                     ),
                 ),
             )
-            return VerificationResult(True, (), tuple(evidence))
+            result = VerificationResult(True, (), tuple(evidence))
+            self._record_attempt(connection, incident, result, now)
+            return result
 
     def evaluate_all(self) -> list[tuple[int, VerificationResult]]:
         with self.ledger.transaction() as connection:
@@ -2663,6 +3179,160 @@ class EmergencyNotifier:
                 return
 
 
+class RecoveryReportStore:
+    """Detailed reports and their delivery state, independent of incidents."""
+
+    def __init__(
+        self,
+        ledger: RecoveryLedger,
+        *,
+        max_bytes: int = 256 * 1024,
+        retry_seconds: float = 300.0,
+        clock: Callable[[], float] = time.time,
+    ):
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1_024 <= max_bytes <= 1024 * 1024
+            or isinstance(retry_seconds, bool)
+            or not isinstance(retry_seconds, (int, float))
+            or not math.isfinite(retry_seconds)
+            or not 1 <= retry_seconds <= 86_400
+        ):
+            raise ValueError("recovery report policy is invalid")
+        self.ledger = ledger
+        self.max_bytes = max_bytes
+        self.retry_seconds = float(retry_seconds)
+        self.clock = clock
+
+    def queue(
+        self,
+        *,
+        report_key: str,
+        incident_id: int,
+        generation: int,
+        body: dict[str, Any],
+        invocation_id: int | None = None,
+    ) -> int:
+        if (
+            not isinstance(report_key, str)
+            or safe_field(report_key, default="") != report_key
+            or isinstance(incident_id, bool)
+            or not isinstance(incident_id, int)
+            or incident_id < 1
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or (
+                invocation_id is not None
+                and (
+                    isinstance(invocation_id, bool)
+                    or not isinstance(invocation_id, int)
+                    or invocation_id < 1
+                )
+            )
+            or not isinstance(body, dict)
+        ):
+            raise ValueError("recovery report is invalid")
+        try:
+            body_json = _canonical_json(body)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("recovery report is invalid") from exc
+        if len(body_json.encode("utf-8")) > self.max_bytes:
+            raise ValueError("recovery report is too large")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            incident = connection.execute(
+                "SELECT generation FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            if incident is None or int(incident["generation"]) != generation:
+                raise ValueError("recovery report fence is stale")
+            if invocation_id is not None:
+                invocation = connection.execute(
+                    "SELECT 1 FROM invocations WHERE id = ? AND incident_id = ?",
+                    (invocation_id, incident_id),
+                ).fetchone()
+                if invocation is None:
+                    raise ValueError("recovery report invocation is invalid")
+            existing = connection.execute(
+                "SELECT * FROM incident_reports WHERE report_key = ?",
+                (report_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["incident_id"] != incident_id
+                    or existing["generation"] != generation
+                    or existing["invocation_id"] != invocation_id
+                    or existing["body_json"] != body_json
+                ):
+                    raise ValueError("recovery report key was reused")
+                return int(existing["id"])
+            conflicting = connection.execute(
+                "SELECT 1 FROM incident_reports WHERE incident_id = ? AND generation = ?",
+                (incident_id, generation),
+            ).fetchone()
+            if conflicting is not None:
+                raise ValueError("recovery incident generation already has a report")
+            cursor = connection.execute(
+                "INSERT INTO incident_reports(report_key, incident_id, generation, invocation_id, "
+                "body_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (report_key, incident_id, generation, invocation_id, body_json, now),
+            )
+            report_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO report_outbox(report_id, state, created_at, available_at) "
+                "VALUES (?, ?, ?, ?)",
+                (report_id, REPORT_PENDING, now, now),
+            )
+            return report_id
+
+    def state(self, report_key: str) -> str | None:
+        if not isinstance(report_key, str) or safe_field(report_key, default="") != report_key:
+            raise ValueError("recovery report key is invalid")
+        row = self.ledger.connection.execute(
+            "SELECT report_outbox.state FROM report_outbox "
+            "JOIN incident_reports ON incident_reports.id = report_outbox.report_id "
+            "WHERE incident_reports.report_key = ?",
+            (report_key,),
+        ).fetchone()
+        return None if row is None else str(row["state"])
+
+    def mark_reported(self, report_key: str) -> bool:
+        if not isinstance(report_key, str) or safe_field(report_key, default="") != report_key:
+            raise ValueError("recovery report key is invalid")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            row = connection.execute(
+                "SELECT report_outbox.id, report_outbox.state FROM report_outbox "
+                "JOIN incident_reports ON incident_reports.id = report_outbox.report_id "
+                "WHERE incident_reports.report_key = ?",
+                (report_key,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == REPORTED:
+                return True
+            connection.execute(
+                "UPDATE report_outbox SET state = ?, delivered_at = ?, attempts = attempts + 1 "
+                "WHERE id = ? AND state = ?",
+                (REPORTED, now, row["id"], REPORT_PENDING),
+            )
+            return True
+
+    def defer(self, report_key: str) -> bool:
+        if not isinstance(report_key, str) or safe_field(report_key, default="") != report_key:
+            raise ValueError("recovery report key is invalid")
+        now = self.clock()
+        with self.ledger.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE report_outbox SET attempts = attempts + 1, available_at = ? "
+                "WHERE state = ? AND report_id = ("
+                "SELECT id FROM incident_reports WHERE report_key = ?)",
+                (now + self.retry_seconds, REPORT_PENDING, report_key),
+            )
+            return cursor.rowcount == 1
+
+
 class RecoveryNotificationOutbox:
     """Durable immediate escalation handoff to the native notifier."""
 
@@ -3208,12 +3878,19 @@ def _build_recovery_service(
     )
     coordinator = IncidentCoordinator(
         ledger,
-        RecoveryPolicy(revision=revision, rules=configured_rules),
+        RecoveryPolicy(
+            revision=revision,
+            rules=configured_rules,
+            lease_seconds=configured.fixer_lease_seconds,
+        ),
         owner=f"supervisor-{os.getpid()}",
         controls=controls,
         immediate_escalation=notifications.immediate_escalation,
         mode=configured.mode,
         static_policy=static_policy,
+        max_actions_per_invocation=int(
+            configured.action_policy["maxActionsPerInvocation"]
+        ),
     )
     verifier = RecoveryVerifier(
         ledger,
@@ -3281,7 +3958,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ledger: RecoveryLedger | None
     try:
-        ledger = RecoveryLedger(configured.database, busy_timeout_ms=args.busy_timeout_ms)
+        ledger = RecoveryLedger(
+            configured.database, busy_timeout_ms=args.busy_timeout_ms
+        )
     except LedgerCorrupt:
         emergency.emit("ledger_corrupt")
         try:
@@ -3331,6 +4010,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if ledger is not None:
         try:
+            ledger.recover_unfinished_actions()
             service = _build_recovery_service(
                 ledger,
                 event_spool,
@@ -3376,7 +4056,9 @@ def main(argv: list[str] | None = None) -> int:
                 recovered_ledger: RecoveryLedger | None = None
                 try:
                     recovered_ledger = RecoveryLedger(
-                        configured.database, busy_timeout_ms=args.busy_timeout_ms
+                        configured.database,
+                        busy_timeout_ms=args.busy_timeout_ms,
+                        recover_unfinished_actions=True,
                     )
                     recovered_service = _build_recovery_service(
                         recovered_ledger,

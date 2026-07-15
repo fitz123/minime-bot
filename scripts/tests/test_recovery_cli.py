@@ -21,11 +21,12 @@ import recovery_supervisor
 
 def config_document(mode: str = "observe") -> dict[str, object]:
     return {
-        "version": 1,
+        "version": 2,
         "mode": mode,
         "database": "var/recovery/ledger.sqlite3",
         "spoolDirectory": "var/recovery/spool",
         "authTokenFile": "config/recovery-auth-token",
+        "fixerAuthTokenFile": "config/recovery-fixer-auth-token",
         "host": "127.0.0.1",
         "port": 9877,
         "correlationRules": [
@@ -41,6 +42,40 @@ def config_document(mode: str = "observe") -> dict[str, object]:
         "runtimeDoctorCadenceSeconds": 300,
         "verificationFreshnessSeconds": 660,
         "verificationHoldDownSeconds": 60,
+        "internalAgentId": "recovery-fixer",
+        "sessionPolicy": {
+            "directory": "var/recovery/sessions",
+            "startupTimeoutSeconds": 30,
+            "resumeTimeoutSeconds": 30,
+            "maxReplacementsPerGeneration": 1,
+            "journalDigestMaxBytes": 32_768,
+        },
+        "actionPolicy": {
+            "maxActionsPerInvocation": 128,
+            "preimageMaxBytes": 1024 * 1024,
+            "reconciliationTimeoutSeconds": 300,
+        },
+        "quarantinePolicy": {
+            "directory": "var/recovery/quarantine",
+            "allowedRoots": [],
+            "maxItemsPerIncident": 64,
+            "maxItemBytes": 10 * 1024 * 1024,
+            "maxIncidentBytes": 50 * 1024 * 1024,
+        },
+        "reportPolicy": {
+            "maxBytes": 256 * 1024,
+            "maxTimelineEntries": 256,
+            "retrySeconds": 300,
+        },
+        "slotPolicy": {
+            "stateDirectory": "var/recovery/slots",
+            "capsuleRoot": "var/recovery/capsule",
+            "botReleaseRoot": "var/releases",
+            "startupHealthTimeoutSeconds": 60,
+        },
+        "reviewedOperations": [],
+        "fixerLeaseSeconds": 120,
+        "fixerRenewSeconds": 30,
     }
 
 
@@ -59,7 +94,7 @@ def call_cli(root: Path, *args: str) -> tuple[int, str, str]:
 
 
 class RecoveryConfigTests(unittest.TestCase):
-    def test_foundation_config_accepts_only_observe_and_validated_probes(self) -> None:
+    def test_version_two_config_accepts_exact_modes_and_static_fixer_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             document = config_document()
@@ -97,20 +132,57 @@ class RecoveryConfigTests(unittest.TestCase):
                     "runtimeDoctorCadenceSeconds",
                     "verificationFreshnessSeconds",
                     "verificationHoldDownSeconds",
+                    "internalAgentId",
+                    "sessionPolicy",
+                    "actionPolicy",
+                    "quarantinePolicy",
+                    "reportPolicy",
+                    "slotPolicy",
+                    "reviewedOperations",
+                    "fixerLeaseSeconds",
+                    "fixerRenewSeconds",
                 },
             )
 
-            for legacy_mode in ("plan", "enabled"):
-                invalid = config_document(legacy_mode)
+            for mode in ("diagnose", "enabled"):
+                valid = config_document(mode)
+                (root / "recovery.json").write_text(
+                    json.dumps(valid), encoding="utf-8"
+                )
+                self.assertEqual(
+                    recovery_config.load_recovery_config(
+                        root / "recovery.json", root
+                    ).mode,
+                    mode,
+                )
+
+            for invalid_mode in ("plan", "disabled", "OBSERVE"):
+                invalid = config_document(invalid_mode)
                 (root / "recovery.json").write_text(
                     json.dumps(invalid), encoding="utf-8"
                 )
-                with self.subTest(mode=legacy_mode), self.assertRaises(
+                with self.subTest(mode=invalid_mode), self.assertRaises(
                     recovery_config.RecoveryConfigError
                 ):
                     recovery_config.load_recovery_config(
                         root / "recovery.json", root
                     )
+
+            old_version = config_document()
+            old_version["version"] = 1
+            (root / "recovery.json").write_text(json.dumps(old_version), encoding="utf-8")
+            with self.assertRaises(recovery_config.RecoveryConfigError):
+                recovery_config.load_recovery_config(root / "recovery.json", root)
+
+    def test_mode_endpoint_authorization_matrix_is_closed(self) -> None:
+        for operation in ("inspect", "reconcile", "blocked", "finish"):
+            self.assertFalse(recovery_config.recovery_endpoint_allowed("observe", operation))
+            self.assertTrue(recovery_config.recovery_endpoint_allowed("diagnose", operation))
+            self.assertTrue(recovery_config.recovery_endpoint_allowed("enabled", operation))
+        self.assertFalse(recovery_config.recovery_endpoint_allowed("diagnose", "mutate"))
+        self.assertTrue(recovery_config.recovery_endpoint_allowed("enabled", "mutate"))
+        with self.assertRaises(ValueError):
+            recovery_config.recovery_endpoint_allowed("enabled", "arbitrary")
 
     def test_closed_config_rejects_actuator_fields_and_unsafe_probe_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -202,6 +274,80 @@ class RecoveryConfigTests(unittest.TestCase):
                     recovery_config.load_recovery_config(
                         root / "recovery.json", root
                     )
+
+    def test_closed_fixer_policy_rejects_unknown_adaptive_paths_and_shell_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_documents: list[tuple[str, dict[str, object]]] = []
+
+            adaptive = config_document()
+            adaptive["adaptivePolicy"] = {"enabled": True}
+            invalid_documents.append(("adaptive-root", adaptive))
+
+            unknown_nested = config_document()
+            assert isinstance(unknown_nested["sessionPolicy"], dict)
+            unknown_nested["sessionPolicy"]["adaptiveTimeout"] = 1
+            invalid_documents.append(("unknown-nested", unknown_nested))
+
+            unsafe_root = config_document()
+            assert isinstance(unsafe_root["quarantinePolicy"], dict)
+            unsafe_root["quarantinePolicy"]["allowedRoots"] = ["../private"]
+            invalid_documents.append(("unsafe-root", unsafe_root))
+
+            same_token = config_document()
+            same_token["fixerAuthTokenFile"] = same_token["authTokenFile"]
+            invalid_documents.append(("shared-credential", same_token))
+
+            bad_renew = config_document()
+            bad_renew["fixerRenewSeconds"] = 60
+            invalid_documents.append(("unsafe-renew", bad_renew))
+
+            shell_operation = config_document()
+            shell_operation["reviewedOperations"] = [
+                {
+                    "id": "restart",
+                    "kind": "restart",
+                    "executable": "/bin/sh",
+                    "argv": ["-c", "service restart; echo secret"],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            invalid_documents.append(("shell-operation", shell_operation))
+
+            malformed_operation = config_document()
+            malformed_operation["reviewedOperations"] = [
+                {
+                    "id": "restart",
+                    "kind": [],
+                    "executable": "/bin/launchctl",
+                    "argv": ["kickstart", "-k", "gui/501/ai.minime.bot"],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            invalid_documents.append(("malformed-operation", malformed_operation))
+
+            valid_operation = config_document("enabled")
+            valid_operation["reviewedOperations"] = [
+                {
+                    "id": "restart-bot",
+                    "kind": "restart",
+                    "executable": "/bin/launchctl",
+                    "argv": ["kickstart", "-k", "gui/501/ai.minime.bot"],
+                    "timeoutSeconds": 30,
+                }
+            ]
+            (root / "recovery.json").write_text(
+                json.dumps(valid_operation), encoding="utf-8"
+            )
+            loaded = recovery_config.load_recovery_config(root / "recovery.json", root)
+            self.assertEqual(loaded.reviewed_operations[0]["id"], "restart-bot")
+
+            for name, document in invalid_documents:
+                (root / "recovery.json").write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(case=name), self.assertRaises(
+                    recovery_config.RecoveryConfigError
+                ):
+                    recovery_config.load_recovery_config(root / "recovery.json", root)
 
     def test_config_rejects_zero_port_and_excessive_total_probe_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -397,6 +543,8 @@ class RecoveryCliTests(unittest.TestCase):
                 status_result["foundation"],
                 {
                     "fixerAvailable": False,
+                    "fixerDispatchAllowed": False,
+                    "mutationAllowed": False,
                     "nativeVerification": True,
                     "observeOnly": True,
                     "remediationActionsAvailable": False,
