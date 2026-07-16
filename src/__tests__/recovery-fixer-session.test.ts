@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn as spawnChildProcess, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import {
@@ -18,7 +19,6 @@ import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
-import type { ChildProcess } from "node:child_process";
 import {
   SessionManager as PiSessionManager,
   type ExtensionAPI,
@@ -26,12 +26,18 @@ import {
   type ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+  NewlineOnlyJsonlSplitter,
   PI_EXTENSION_WRAPPER_RELPATHS,
   PI_RECOVERY_WRAPPER_RELPATHS,
   buildPiSpawnArgs,
   buildPiSpawnEnv,
+  sendPiGetState,
   type PiStartupDiagnostics,
 } from "../pi-rpc-protocol.js";
+import {
+  EXPECTED_PI_PACKAGE_VERSION,
+  resolvePackageOwnedPiInvocation,
+} from "../pi-runtime.js";
 import {
   RecoveryProtocolClient,
   RecoveryToolJournal,
@@ -54,6 +60,7 @@ import {
   recoveryStartsNewPiProcessGroup,
   terminateRecoveryProcessGroup,
 } from "../recovery/fixer-session.js";
+import { waitForSpawn } from "../session-manager.js";
 
 const temporary: string[] = [];
 
@@ -154,6 +161,83 @@ function fakeChild(): ChildProcess {
     kill: () => true,
   });
   return child;
+}
+
+interface PinnedPiSessionState {
+  sessionId: string;
+  sessionFile: string;
+  messageCount: number;
+  pendingMessageCount: number;
+}
+
+async function requestPinnedPiSessionState(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<PinnedPiSessionState> {
+  await waitForSpawn(child, timeoutMs);
+  const stdout = child.stdout;
+  if (!stdout) throw new Error("Pinned Pi smoke stdout is unavailable");
+  const responseId = "recovery-preseed-smoke";
+  const splitter = new NewlineOnlyJsonlSplitter();
+
+  return await new Promise<PinnedPiSessionState>((resolveState, rejectState) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      stdout.removeListener("data", onData);
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onError);
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      rejectState(error);
+    };
+    const onExit = () => fail(new Error("Pinned Pi smoke exited before get_state"));
+    const onError = (error: Error) => fail(error);
+    const onData = (chunk: Buffer) => {
+      for (const line of splitter.push(chunk)) {
+        let record: unknown;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (
+          typeof record !== "object"
+          || record === null
+          || (record as Record<string, unknown>).type !== "response"
+          || (record as Record<string, unknown>).id !== responseId
+          || (record as Record<string, unknown>).command !== "get_state"
+        ) {
+          continue;
+        }
+        const response = record as Record<string, unknown>;
+        const data = response.data;
+        if (
+          response.success !== true
+          || typeof data !== "object"
+          || data === null
+          || typeof (data as Record<string, unknown>).sessionId !== "string"
+          || typeof (data as Record<string, unknown>).sessionFile !== "string"
+          || typeof (data as Record<string, unknown>).messageCount !== "number"
+          || typeof (data as Record<string, unknown>).pendingMessageCount !== "number"
+        ) {
+          fail(new Error("Pinned Pi smoke returned an invalid get_state response"));
+          return;
+        }
+        cleanup();
+        resolveState(data as unknown as PinnedPiSessionState);
+        return;
+      }
+    };
+    const timer = setTimeout(
+      () => fail(new Error("Pinned Pi smoke timed out waiting for get_state")),
+      timeoutMs,
+    );
+    stdout.on("data", onData);
+    child.once("exit", onExit);
+    child.once("error", onError);
+    sendPiGetState(child, responseId);
+  });
 }
 
 describe("exact-session recovery fixer", () => {
@@ -379,6 +463,121 @@ describe("exact-session recovery fixer", () => {
     );
   });
 
+  it("resumes the pre-seeded session through pinned offline Pi RPC without a provider turn", {
+    timeout: 15_000,
+  }, async () => {
+    const createdRoot = mkdtempSync(join(tmpdir(), "minime-recovery-pi-smoke-"));
+    temporary.push(createdRoot);
+    chmodSync(createdRoot, 0o700);
+    const root = realpathSync(createdRoot);
+    const sessionDirectory = join(root, "sessions");
+    const agentWorkspace = join(root, "agent");
+    const piAgentDirectory = join(root, "pi-agent");
+    const xdgConfigDirectory = join(root, "xdg-config");
+    const xdgCacheDirectory = join(root, "xdg-cache");
+    const xdgDataDirectory = join(root, "xdg-data");
+    for (const directory of [
+      sessionDirectory,
+      agentWorkspace,
+      piAgentDirectory,
+      xdgConfigDirectory,
+      xdgCacheDirectory,
+      xdgDataDirectory,
+    ]) {
+      mkdirSync(directory, { mode: 0o700 });
+      chmodSync(directory, 0o700);
+    }
+
+    let child: ChildProcess | undefined;
+    let state: PinnedPiSessionState | undefined;
+    let seeded: ReturnType<typeof preseedCanonicalRecoverySession> | undefined;
+    let transcriptHeaderBefore: Record<string, unknown> | undefined;
+    let transcriptEntriesAfter: Array<Record<string, unknown>> = [];
+    let transcriptDetails: ReturnType<typeof lstatSync> | undefined;
+    let discoveredPath = "";
+    let reportedPath = "";
+    let stderr = "";
+    let runtimeVersion = "";
+    try {
+      seeded = preseedCanonicalRecoverySession(
+        realpathSync(sessionDirectory),
+        realpathSync(agentWorkspace),
+      );
+      transcriptHeaderBefore = JSON.parse(
+        readFileSync(seeded.transcriptPath, "utf8").trim(),
+      ) as Record<string, unknown>;
+      const invocation = resolvePackageOwnedPiInvocation("rpc", [
+        "--mode", "rpc",
+        "--provider", "openai-codex",
+        "--model", "gpt-5.5",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--no-tools",
+        "--offline",
+        "--session", seeded.sessionId,
+      ]);
+      runtimeVersion = invocation.diagnostic.detectedVersion;
+      child = spawnChildProcess(invocation.command, invocation.args, {
+        cwd: realpathSync(agentWorkspace),
+        env: {
+          HOME: root,
+          NO_COLOR: "1",
+          PATH: process.env.PATH ?? "",
+          PI_CODING_AGENT_DIR: realpathSync(piAgentDirectory),
+          PI_CODING_AGENT_SESSION_DIR: realpathSync(sessionDirectory),
+          PI_OFFLINE: "1",
+          PI_SKIP_VERSION_CHECK: "1",
+          PI_TELEMETRY: "0",
+          TMPDIR: root,
+          XDG_CACHE_HOME: realpathSync(xdgCacheDirectory),
+          XDG_CONFIG_HOME: realpathSync(xdgConfigDirectory),
+          XDG_DATA_HOME: realpathSync(xdgDataDirectory),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        stderr += chunk.toString();
+      });
+      state = await requestPinnedPiSessionState(child, 5_000);
+      reportedPath = realpathSync(state.sessionFile);
+      discoveredPath = await discoverCanonicalRecoveryTranscript(
+        realpathSync(sessionDirectory),
+        seeded.sessionId,
+        500,
+      );
+      transcriptEntriesAfter = readFileSync(seeded.transcriptPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      transcriptDetails = lstatSync(seeded.transcriptPath);
+    } finally {
+      if (child) await terminateRecoveryProcessGroup(child, undefined, false);
+      rmSync(createdRoot, { recursive: true, force: true });
+    }
+
+    assert.ok(seeded);
+    assert.ok(state);
+    assert.ok(transcriptDetails);
+    assert.equal(runtimeVersion, EXPECTED_PI_PACKAGE_VERSION);
+    assert.equal(state.sessionId, seeded.sessionId);
+    assert.equal(reportedPath, seeded.transcriptPath);
+    assert.equal(discoveredPath, seeded.transcriptPath);
+    assert.equal(state.messageCount, 0);
+    assert.equal(state.pendingMessageCount, 0);
+    assert.equal(transcriptDetails.isFile(), true);
+    assert.equal(transcriptDetails.isSymbolicLink(), false);
+    assert.equal(transcriptDetails.mode & 0o777, 0o600);
+    if (typeof process.getuid === "function") assert.equal(transcriptDetails.uid, process.getuid());
+    assert.deepEqual(transcriptEntriesAfter[0], transcriptHeaderBefore);
+    assert.equal(transcriptEntriesAfter.some((entry) => entry.type === "message"), false);
+    assert.equal(stderr, "");
+    assert.equal(child?.exitCode !== null || child?.signalCode !== null, true);
+    assert.equal(existsSync(createdRoot), false);
+  });
+
   it("uses exclusive creation and refuses a colliding canonical transcript", () => {
     const root = mkdtempSync(join(tmpdir(), "minime-recovery-preseed-collision-"));
     temporary.push(root);
@@ -548,9 +747,34 @@ describe("exact-session recovery fixer", () => {
       resolve("node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-mode.js"),
       "utf8",
     );
+    const vendorSessionManager = readFileSync(
+      resolve("node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.js"),
+      "utf8",
+    );
     assert.match(vendorMain, /PI_CODING_AGENT_SESSION_DIR|ENV_SESSION_DIR/);
     assert.match(vendorMain, /No session found matching/);
     assert.match(vendorRpc, /sessionId: session\.sessionId/);
+    assert.match(vendorRpc, /sessionFile: session\.sessionFile/);
+    assert.match(
+      vendorSessionManager,
+      /if \(this\.fileEntries\.length === 0\)[\s\S]{0,750}this\._rewriteFile\(\)/,
+    );
+    assert.match(
+      vendorSessionManager,
+      /const hasAssistant = this\.fileEntries\.some[\s\S]{0,500}if \(!hasAssistant\)/,
+    );
+
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-pi-lazy-session-"));
+    temporary.push(root);
+    const sessionDirectory = join(root, "sessions");
+    const agentWorkspace = join(root, "agent");
+    mkdirSync(sessionDirectory, { mode: 0o700 });
+    mkdirSync(agentWorkspace, { mode: 0o700 });
+    chmodSync(sessionDirectory, 0o700);
+    const lazySession = PiSessionManager.create(agentWorkspace, sessionDirectory);
+    const lazyTranscriptPath = lazySession.getSessionFile();
+    assert.equal(typeof lazyTranscriptPath, "string");
+    assert.equal(existsSync(lazyTranscriptPath as string), false);
   });
 
   it("validates private credentials and every fenced protocol route over loopback HTTP", async () => {

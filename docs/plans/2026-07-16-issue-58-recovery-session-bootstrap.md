@@ -8,7 +8,7 @@ Preserve ADR-086: one exact owner-only resumable Pi session per incident generat
 
 ## Evidence and constraints
 
-- Production evidence: `/tmp/full-cycle-recovery-fixer/live-diagnose-session-bootstrap-root-cause.md` (local operator evidence; do not copy private paths or payloads into public docs/PR text).
+- Production evidence was reviewed from a local operator artifact; its private path and payload are intentionally omitted from public docs and PR text.
 - Relevant code: `src/recovery/fixer-session.ts`, `src/pi-rpc-protocol.ts`, `src/__tests__/recovery-fixer-session.test.ts`.
 - Pi 0.80.6 source confirms lazy persistence: `SessionManager` exposes an ID/path immediately but does not write a new file until persistence conditions are met.
 - A securely created empty `0600` JSONL opened through Pi's exported `SessionManager.open(path, sessionDir, cwdOverride)` is rewritten as a valid v3 header. Starting Pi with `--session <id>` then reports that exact ID/path without a provider request.
@@ -38,12 +38,12 @@ git diff --stat main...HEAD
 - [x] Run the focused recovery fixer tests and typecheck/build before Task 2.
 
 ### Task 2: Prove the real Pi 0.80.6 persistence contract without a provider call
-- [ ] Add a bounded provider-free integration smoke using the pinned Pi CLI/RPC and a temporary private directory: pre-seed through the production helper, start with the exact session, issue only `get_state`, and prove exact ID/path plus a regular owner-only `0600` transcript.
-- [ ] Make the smoke deterministic and offline: no model prompt/provider request, no global session mutation, no production workspace/runtime path, and complete child/process cleanup on success or failure.
-- [ ] Preserve and extend the pinned-vendor mechanics test so future Pi upgrades cannot silently reintroduce the lazy-transcript deadlock.
-- [ ] Run the focused tests repeatedly and verify no temporary child/session leakage.
-- [ ] Run `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, and `git diff --check`.
-- [ ] Inspect `git diff --stat main...HEAD` and ensure the diff is limited to the recovery session bootstrap, tests, and this completed plan; no private identifiers or paths may enter the public diff.
+- [x] Add a bounded provider-free integration smoke using the pinned Pi CLI/RPC and a temporary private directory: pre-seed through the production helper, start with the exact session, issue only `get_state`, and prove exact ID/path plus a regular owner-only `0600` transcript.
+- [x] Make the smoke deterministic and offline: no model prompt/provider request, no global session mutation, no production workspace/runtime path, and complete child/process cleanup on success or failure.
+- [x] Preserve and extend the pinned-vendor mechanics test so future Pi upgrades cannot silently reintroduce the lazy-transcript deadlock.
+- [x] Run the focused tests repeatedly and verify no temporary child/session leakage.
+- [x] Run `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, and `git diff --check`.
+- [x] Inspect `git diff --stat main...HEAD` and ensure the diff is limited to the recovery session bootstrap, tests, and this completed plan; no private identifiers or paths may enter the public diff.
 
 ## Post-completion
 
