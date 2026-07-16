@@ -38,13 +38,13 @@ Fix issue #66 by removing the package-level cron model pin and making every LLM 
 - [x] Run the focused cron-runner and configuration tests; fix all failures before Task 2.
 
 ### Task 2: Verify issue #66 acceptance criteria and package integrity
-- [ ] Verify changing one agent model changes only cron runs selecting that agent.
-- [ ] Verify context assembly and Pi spawn receive the same resolved model.
-- [ ] Verify no unconditional cron model constant or stale documentation remains.
-- [ ] Run the full unit test suite.
-- [ ] Run build and typecheck/lint validation.
-- [ ] Run `npm pack --dry-run` and inspect the result.
-- [ ] Review `git diff --stat main...HEAD` and confirm the diff is limited to issue #66.
+- [x] Verify changing one agent model changes only cron runs selecting that agent.
+- [x] Verify context assembly and Pi spawn receive the same resolved model.
+- [x] Verify no unconditional cron model constant or stale documentation remains.
+- [x] Run the full unit test suite.
+- [x] Run build and typecheck/lint validation.
+- [x] Run `npm pack --dry-run` and inspect the result.
+- [x] Review `git diff --stat main...HEAD` and confirm the diff is limited to issue #66.
 
 ## Technical Details
 
