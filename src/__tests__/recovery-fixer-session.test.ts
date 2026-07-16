@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -18,7 +19,12 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import type { ChildProcess } from "node:child_process";
-import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager as PiSessionManager,
+  type ExtensionAPI,
+  type ToolCallEvent,
+  type ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 import {
   PI_EXTENSION_WRAPPER_RELPATHS,
   PI_RECOVERY_WRAPPER_RELPATHS,
@@ -42,6 +48,7 @@ import {
   discoverCanonicalRecoveryTranscript,
   hasNoSessionFoundClassifier,
   inspectRecoveryTranscript,
+  preseedCanonicalRecoverySession,
   resolveRecoveryAgent,
   runRecoveryFixer,
   recoveryStartsNewPiProcessGroup,
@@ -70,6 +77,52 @@ function runtimeEnv(
     MINIME_RECOVERY_LEASE_TOKEN: "b".repeat(48),
     MINIME_RECOVERY_PREIMAGE_DIRECTORY: "/private/preimages",
     MINIME_RECOVERY_PREIMAGE_MAX_BYTES: "1048576",
+  };
+}
+
+function recoveryRunnerFixture(prefix = "minime-recovery-runner-"): {
+  env: NodeJS.ProcessEnv;
+  root: string;
+} {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  temporary.push(root);
+  const agentWorkspace = join(root, "agent");
+  const sessionRoot = join(root, "sessions");
+  mkdirSync(agentWorkspace, { recursive: true });
+  mkdirSync(sessionRoot, { recursive: true, mode: 0o700 });
+  chmodSync(sessionRoot, 0o700);
+  const configPath = join(root, "config.yaml");
+  writeFileSync(configPath, [
+    "agents:",
+    "  recovery-fixer:",
+    `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
+    "    model: gpt-5.5",
+    "  chat-agent:",
+    `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
+    "    model: gpt-5.5",
+    "telegramTokenEnv: MINIME_TEST_RECOVERY_TELEGRAM_TOKEN",
+    "bindings:",
+    "  - chatId: 111",
+    "    agentId: chat-agent",
+    "    kind: dm",
+    "",
+  ].join("\n"));
+  return {
+    root,
+    env: {
+      ...runtimeEnv("enabled"),
+      MINIME_CONFIG_PATH: configPath,
+      MINIME_CONTROL_WORKSPACE_ROOT: root,
+      MINIME_RECOVERY_AGENT_ID: "recovery-fixer",
+      MINIME_RECOVERY_SESSION_ROOT: sessionRoot,
+      MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS: "1",
+      MINIME_RECOVERY_RESUME_TIMEOUT_SECONDS: "2",
+      MINIME_RECOVERY_RENEW_SECONDS: "10",
+      MINIME_RECOVERY_RUN_TIMEOUT_SECONDS: "10",
+      MINIME_RECOVERY_PI_EXECUTABLE: "/usr/local/bin/pi",
+      MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP: "1",
+      MINIME_RECOVERY_PREIMAGE_DIRECTORY: join(root, "preimages"),
+    },
   };
 }
 
@@ -301,6 +354,104 @@ describe("exact-session recovery fixer", () => {
     assert.equal(inspectRecoveryTranscript(root, path, "different").readable, false);
   });
 
+  it("securely pre-seeds one Pi-generated owner-only session for the recovery workspace", async () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-preseed-"));
+    temporary.push(root);
+    const sessionDirectory = join(root, "sessions");
+    const agentWorkspace = join(root, "agent");
+    mkdirSync(sessionDirectory, { mode: 0o700 });
+    mkdirSync(agentWorkspace);
+    chmodSync(sessionDirectory, 0o700);
+
+    const seeded = preseedCanonicalRecoverySession(sessionDirectory, agentWorkspace);
+    const details = lstatSync(seeded.transcriptPath);
+    const header = JSON.parse(readFileSync(seeded.transcriptPath, "utf8").trim()) as Record<string, unknown>;
+    assert.equal(details.isFile(), true);
+    assert.equal(details.mode & 0o777, 0o600);
+    if (typeof process.getuid === "function") assert.equal(details.uid, process.getuid());
+    assert.equal(header.type, "session");
+    assert.equal(header.version, 3);
+    assert.equal(header.id, seeded.sessionId);
+    assert.equal(header.cwd, resolve(agentWorkspace));
+    assert.equal(
+      await discoverCanonicalRecoveryTranscript(sessionDirectory, seeded.sessionId, 100),
+      seeded.transcriptPath,
+    );
+  });
+
+  it("uses exclusive creation and refuses a colliding canonical transcript", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-preseed-collision-"));
+    temporary.push(root);
+    const sessionDirectory = join(root, "sessions");
+    const agentWorkspace = join(root, "agent");
+    mkdirSync(sessionDirectory, { mode: 0o700 });
+    mkdirSync(agentWorkspace);
+    chmodSync(sessionDirectory, 0o700);
+    const collision = join(sessionDirectory, "recovery-session.jsonl");
+    writeFileSync(collision, "collision-must-survive\n", { mode: 0o600 });
+
+    assert.throws(
+      () => preseedCanonicalRecoverySession(sessionDirectory, agentWorkspace),
+      /EEXIST|file already exists/,
+    );
+    assert.equal(readFileSync(collision, "utf8"), "collision-must-survive\n");
+  });
+
+  it("rejects unsafe mode, invalid header, and escaped transcript state", () => {
+    const cases: Array<{
+      name: string;
+      mutate: (
+        transcriptPath: string,
+        sessionDirectory: string,
+        workspaceCwd: string,
+        root: string,
+      ) => Pick<PiSessionManager, "getSessionId" | "getSessionFile">;
+    }> = [
+      {
+        name: "unsafe mode",
+        mutate: (path, sessionDir, cwd) => {
+          const session = PiSessionManager.open(path, sessionDir, cwd);
+          chmodSync(path, 0o644);
+          return session;
+        },
+      },
+      {
+        name: "invalid header",
+        mutate: (path, sessionDir, cwd) => {
+          const session = PiSessionManager.open(path, sessionDir, cwd);
+          writeFileSync(path, "not-json\n");
+          return session;
+        },
+      },
+      {
+        name: "escaped path",
+        mutate: (path, sessionDir, cwd, root) => {
+          PiSessionManager.open(path, sessionDir, cwd);
+          const escapedPath = join(root, "escaped.jsonl");
+          writeFileSync(escapedPath, "", { mode: 0o600 });
+          return PiSessionManager.open(escapedPath, root, cwd);
+        },
+      },
+    ];
+
+    for (const edgeCase of cases) {
+      const root = mkdtempSync(join(tmpdir(), "minime-recovery-preseed-invalid-"));
+      temporary.push(root);
+      const sessionDirectory = join(root, "sessions");
+      const agentWorkspace = join(root, "agent");
+      mkdirSync(sessionDirectory, { mode: 0o700 });
+      mkdirSync(agentWorkspace);
+      chmodSync(sessionDirectory, 0o700);
+      assert.throws(
+        () => preseedCanonicalRecoverySession(sessionDirectory, agentWorkspace, {
+          openSession: (path, sessionDir, cwd) => edgeCase.mutate(path, sessionDir, cwd, root),
+        }),
+        /invalid|unsafe/,
+        edgeCase.name,
+      );
+    }
+  });
+
   it("degrades missing, unsafe, and invalid transcripts instead of silently replacing them", () => {
     const root = mkdtempSync(join(tmpdir(), "minime-recovery-unreadable-"));
     temporary.push(root);
@@ -503,51 +654,24 @@ describe("exact-session recovery fixer", () => {
   });
 
   it("runs the bind-before-prompt fixer flow with the recovery-only wrapper set", async () => {
-    const root = mkdtempSync(join(tmpdir(), "minime-recovery-runner-"));
-    temporary.push(root);
-    const agentWorkspace = join(root, "agent");
-    const sessionRoot = join(root, "sessions");
-    mkdirSync(agentWorkspace, { recursive: true });
-    mkdirSync(sessionRoot, { recursive: true, mode: 0o700 });
-    chmodSync(sessionRoot, 0o700);
-    const configPath = join(root, "config.yaml");
-    writeFileSync(configPath, [
-      "agents:",
-      "  recovery-fixer:",
-      `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
-      "    model: gpt-5.5",
-      "  chat-agent:",
-      `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
-      "    model: gpt-5.5",
-      "telegramTokenEnv: MINIME_TEST_RECOVERY_TELEGRAM_TOKEN",
-      "bindings:",
-      "  - chatId: 111",
-      "    agentId: chat-agent",
-      "    kind: dm",
-      "",
-    ].join("\n"));
-    const env: NodeJS.ProcessEnv = {
-      ...runtimeEnv("enabled"),
-      MINIME_CONFIG_PATH: configPath,
-      MINIME_CONTROL_WORKSPACE_ROOT: root,
-      MINIME_RECOVERY_AGENT_ID: "recovery-fixer",
-      MINIME_RECOVERY_SESSION_ROOT: sessionRoot,
-      MINIME_RECOVERY_STARTUP_TIMEOUT_SECONDS: "1",
-      MINIME_RECOVERY_RESUME_TIMEOUT_SECONDS: "2",
-      MINIME_RECOVERY_RENEW_SECONDS: "10",
-      MINIME_RECOVERY_RUN_TIMEOUT_SECONDS: "10",
-      MINIME_RECOVERY_PI_EXECUTABLE: "/usr/local/bin/pi",
-      MINIME_RECOVERY_SUPERVISOR_PROCESS_GROUP: "1",
-      MINIME_RECOVERY_PREIMAGE_DIRECTORY: join(root, "preimages"),
-    };
+    const { env } = recoveryRunnerFixture();
     const order: string[] = [];
     let heartbeatCount = 0;
     let boundRuntime: Record<string, unknown> | undefined;
     const client = {
       contract: readRecoveryRuntimeContract(env),
       state: async () => ({ mode: "enabled", evidence: [], unknownActions: [], journalDigest: "" }),
-      bindSession: async (binding: { runtime: Record<string, unknown> }) => {
+      bindSession: async (binding: {
+        sessionId: string;
+        transcriptPath: string;
+        runtime: Record<string, unknown>;
+      }) => {
         order.push("bind");
+        assert.equal(inspectRecoveryTranscript(
+          resolve(binding.transcriptPath, ".."),
+          binding.transcriptPath,
+          binding.sessionId,
+        ).readable, true);
         boundRuntime = binding.runtime;
         return 11;
       },
@@ -556,13 +680,22 @@ describe("exact-session recovery fixer", () => {
         return true;
       },
     } as unknown as RecoveryProtocolClient;
-    const spawn = ((_agent: unknown, _session: unknown, extensions: { relpaths?: readonly string[] }, runtime: {
+    const spawn = ((_agent: unknown, session: unknown, extensions: { relpaths?: readonly string[] }, runtime: {
       recovery?: { sessionDirectory: string; piExecutable: string };
       startNewProcessGroup?: boolean;
     }) => {
       assert.deepEqual(extensions.relpaths, PI_RECOVERY_WRAPPER_RELPATHS);
       assert.equal(runtime.recovery?.piExecutable, "/usr/local/bin/pi");
       assert.equal(runtime.startNewProcessGroup, false);
+      assert.equal(typeof session, "string");
+      const sessionId = String(session);
+      const sessionDirectory = runtime.recovery?.sessionDirectory ?? "";
+      const seededFiles = readdirSync(sessionDirectory).filter((name) => name.endsWith(".jsonl"));
+      assert.deepEqual(seededFiles, ["recovery-session.jsonl"]);
+      const seededPath = join(sessionDirectory, seededFiles[0]);
+      assert.equal(inspectRecoveryTranscript(sessionDirectory, seededPath, sessionId).readable, true);
+      assert.equal(lstatSync(seededPath).mode & 0o777, 0o600);
+      order.push("preseed");
       const child = fakeChild();
       child.kill = ((signal?: NodeJS.Signals) => {
         Object.defineProperty(child, "signalCode", { value: signal ?? "SIGTERM", configurable: true });
@@ -574,9 +707,7 @@ describe("exact-session recovery fixer", () => {
         if (command.type === "get_state") {
           if (command.id !== "recovery-session-binding") return;
           order.push("get_state");
-          const sessionId = "bound-session";
           setTimeout(() => {
-            transcript(runtime.recovery?.sessionDirectory ?? "", sessionId);
             child.stdout?.push(`${JSON.stringify({
               type: "response",
               id: command.id,
@@ -621,10 +752,78 @@ describe("exact-session recovery fixer", () => {
       }
     })();
     assert.equal(result.status, "settled");
-    assert.deepEqual(order, ["get_state", "bind", "prompt"]);
+    assert.deepEqual(order, ["preseed", "get_state", "bind", "prompt"]);
     assert.ok(heartbeatCount > 0, "the lease must renew while session binding is pending");
     assert.equal(boundRuntime?.model, "openai-codex/gpt-5.5");
     assert.equal(boundRuntime?.pi, "0.80.6");
+  });
+
+  it("cleans up the Pi process group on child-id mismatch and durable-bind failure", async () => {
+    for (const failure of ["child_id_mismatch", "bind_failure"] as const) {
+      const { env } = recoveryRunnerFixture(`minime-recovery-${failure}-`);
+      const killSignals: NodeJS.Signals[] = [];
+      let heartbeatCount = 0;
+      let bindCount = 0;
+      let promptCount = 0;
+      const client = {
+        contract: readRecoveryRuntimeContract(env),
+        state: async () => ({ mode: "enabled", evidence: [], unknownActions: [], journalDigest: "" }),
+        bindSession: async () => {
+          bindCount += 1;
+          if (failure === "bind_failure") throw new Error("durable bind failed");
+          return 11;
+        },
+        heartbeat: async () => {
+          heartbeatCount += 1;
+          return true;
+        },
+      } as unknown as RecoveryProtocolClient;
+      const spawn = ((_agent: unknown, session: unknown, _extensions: unknown, runtime: {
+        recovery?: { sessionDirectory: string };
+      }) => {
+        assert.equal(typeof session, "string");
+        const seededId = String(session);
+        const sessionDirectory = runtime.recovery?.sessionDirectory ?? "";
+        const seededPath = join(sessionDirectory, "recovery-session.jsonl");
+        assert.equal(inspectRecoveryTranscript(sessionDirectory, seededPath, seededId).readable, true);
+        const child = fakeChild();
+        child.kill = ((signal?: NodeJS.Signals) => {
+          const actualSignal = signal ?? "SIGTERM";
+          killSignals.push(actualSignal);
+          Object.defineProperty(child, "signalCode", { value: actualSignal, configurable: true });
+          setImmediate(() => child.emit("exit", null, actualSignal));
+          return true;
+        }) as ChildProcess["kill"];
+        child.stdin?.on("data", (chunk) => {
+          const command = JSON.parse(chunk.toString()) as { type: string; id?: string };
+          if (command.type === "prompt") {
+            promptCount += 1;
+            return;
+          }
+          if (command.type !== "get_state") return;
+          setTimeout(() => child.stdout?.push(`${JSON.stringify({
+            type: "response",
+            id: command.id,
+            command: "get_state",
+            success: true,
+            data: {
+              sessionId: failure === "child_id_mismatch" ? "different-session" : seededId,
+            },
+          })}\n`), 20);
+        });
+        setImmediate(() => child.emit("spawn"));
+        return child;
+      }) as never;
+
+      await assert.rejects(
+        runRecoveryFixer({ env, client, spawn, startupTimeoutMs: 1_000, renewMs: 5 }),
+        failure === "child_id_mismatch" ? /different pre-seeded session id/ : /durable bind failed/,
+      );
+      assert.ok(heartbeatCount > 0, `${failure}: lease did not renew during bootstrap`);
+      assert.equal(bindCount, failure === "bind_failure" ? 1 : 0);
+      assert.equal(promptCount, 0);
+      assert.deepEqual(killSignals, ["SIGTERM"]);
+    }
   });
 });
 

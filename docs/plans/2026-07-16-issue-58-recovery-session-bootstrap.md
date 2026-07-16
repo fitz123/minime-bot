@@ -29,13 +29,13 @@ git diff --stat main...HEAD
 ## Tasks
 
 ### Task 1: Pre-seed and verify the fresh canonical Pi session
-- [ ] Add a small testable helper in `src/recovery/fixer-session.ts` that creates exactly one owner-only `.jsonl` inside the already-private fresh generation directory using an exclusive `0600` file and Pi's exported `SessionManager`, with the recovery agent workspace as the session cwd.
-- [ ] Return the Pi-generated session ID and canonical transcript path only after existing owner/type/path/header validation succeeds; fail closed on collision, unsafe mode/owner, invalid header, or escaped path.
-- [ ] Start fresh Pi with that exact session ID, require RPC `get_state` to report the same ID, require discovery to resolve the same pre-seeded canonical path, and durably bind before sending the incident prompt.
-- [ ] Keep the existing prior-session resume/replacement path unchanged and preserve full process-group cleanup and lease behavior on every bootstrap failure.
-- [ ] Update focused unit tests so `get_state` no longer fabricates a transcript, and assert strict order: secure pre-seed → exact Pi resume/ID verification → durable bind → prompt.
-- [ ] Add edge tests for owner-only mode, exclusive creation/collision, invalid/escaped transcript state, child ID mismatch, and bootstrap failure cleanup.
-- [ ] Run the focused recovery fixer tests and typecheck/build before Task 2.
+- [x] Add a small testable helper in `src/recovery/fixer-session.ts` that creates exactly one owner-only `.jsonl` inside the already-private fresh generation directory using an exclusive `0600` file and Pi's exported `SessionManager`, with the recovery agent workspace as the session cwd.
+- [x] Return the Pi-generated session ID and canonical transcript path only after existing owner/type/path/header validation succeeds; fail closed on collision, unsafe mode/owner, invalid header, or escaped path.
+- [x] Start fresh Pi with that exact session ID, require RPC `get_state` to report the same ID, require discovery to resolve the same pre-seeded canonical path, and durably bind before sending the incident prompt.
+- [x] Keep the existing prior-session resume/replacement path unchanged and preserve full process-group cleanup and lease behavior on every bootstrap failure.
+- [x] Update focused unit tests so `get_state` no longer fabricates a transcript, and assert strict order: secure pre-seed → exact Pi resume/ID verification → durable bind → prompt.
+- [x] Add edge tests for owner-only mode, exclusive creation/collision, invalid/escaped transcript state, child ID mismatch, and bootstrap failure cleanup.
+- [x] Run the focused recovery fixer tests and typecheck/build before Task 2.
 
 ### Task 2: Prove the real Pi 0.80.6 persistence contract without a provider call
 - [ ] Add a bounded provider-free integration smoke using the pinned Pi CLI/RPC and a temporary private directory: pre-seed through the production helper, start with the exact session, issue only `get_state`, and prove exact ID/path plus a regular owner-only `0600` transcript.
