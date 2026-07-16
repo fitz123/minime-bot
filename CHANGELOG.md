@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.10
+
+- Pre-seed a canonical owner-only Pi transcript before launching a fresh recovery session, avoiding Pi lazy-transcript startup deadlock before the first assistant turn.
+- Verify the exact session ID and path through RPC before binding the incident generation while preserving exact resume, replacement, fencing, workspace-alias, and process-cleanup behavior.
+
 ## 2026.7.9
 
 - Decouple internal recovery-agent lookup from unrelated transport secret materialization so the host-native recovery runner can bind its dedicated agent in a restricted environment.
