@@ -145,6 +145,7 @@ export type TavilyNotificationKind =
   | "threshold_critical"
   | "incident"
   | "reminder"
+  | "recheck_failure"
   | "recovery";
 
 export type TavilyNotificationFailure =
@@ -173,6 +174,7 @@ export interface TavilyIncident {
   observedTools: Array<"web_search" | "web_fetch">;
   nextReminderAt: string;
   lastUsageRecoverable: boolean;
+  deliveryTerminalAt?: string;
   acknowledgedAt?: string;
   resolvedAt?: string;
 }
@@ -215,7 +217,6 @@ export interface TavilyMonitorState {
     observedAt: string;
     httpStatus?: number;
   };
-  thresholdNotificationKeys: string[];
   notificationKeys: string[];
   processedEventKeys: string[];
   outbox: TavilyNotification[];
@@ -264,7 +265,6 @@ export interface TavilyMonitorOptions {
   now?: () => Date;
   usageTimeoutMs?: number;
   probeTimeoutMs?: number;
-  eventPollIntervalMs?: number;
   reminderIntervalMs?: number;
   statusStaleMs?: number;
   onStateChange?: TavilyStateObserver;
@@ -521,10 +521,12 @@ export async function requestTavilyUsage(
   }
 }
 
-/** True when at least one provider credit path can currently serve requests. */
+/** True when the API key and at least one account credit path can serve requests. */
 export function isTavilyUsageRecoverable(sample: TavilyUsageSample): boolean {
-  return sample.account.plan.usage < sample.account.plan.limit ||
+  const keyHasCapacity = sample.key.usage < sample.key.limit;
+  const accountHasCapacity = sample.account.plan.usage < sample.account.plan.limit ||
     (sample.account.paygo.limit > 0 && sample.account.paygo.usage < sample.account.paygo.limit);
+  return keyHasCapacity && accountHasCapacity;
 }
 
 interface ProbeResult {
@@ -696,7 +698,6 @@ function freshState(now: () => Date): TavilyMonitorState {
     version: TAVILY_STATE_VERSION,
     updatedAt: isoNow(now),
     incidentSequence: 0,
-    thresholdNotificationKeys: [],
     notificationKeys: [],
     processedEventKeys: [],
     outbox: [],
@@ -816,6 +817,7 @@ function validIncident(value: unknown): value is TavilyIncident {
         "observedTools",
         "nextReminderAt",
         "lastUsageRecoverable",
+        "deliveryTerminalAt",
         "acknowledgedAt",
         "resolvedAt",
       ]) ||
@@ -830,6 +832,7 @@ function validIncident(value: unknown): value is TavilyIncident {
       new Set(value.observedTools).size !== value.observedTools.length ||
       !isCanonicalIsoTimestamp(value.nextReminderAt) ||
       typeof value.lastUsageRecoverable !== "boolean" ||
+      (value.deliveryTerminalAt !== undefined && !isCanonicalIsoTimestamp(value.deliveryTerminalAt)) ||
       (value.acknowledgedAt !== undefined && !isCanonicalIsoTimestamp(value.acknowledgedAt)) ||
       (value.resolvedAt !== undefined && !isCanonicalIsoTimestamp(value.resolvedAt))) {
     return false;
@@ -851,7 +854,7 @@ function validNotification(value: unknown): value is TavilyNotification {
         "lastFailure",
       ]) ||
       !boundedString(value.key, 256) ||
-      !["threshold_warning", "threshold_critical", "incident", "reminder", "recovery"].includes(
+      !["threshold_warning", "threshold_critical", "incident", "reminder", "recheck_failure", "recovery"].includes(
         value.kind as string,
       ) ||
       !boundedString(value.message) ||
@@ -879,7 +882,6 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
     "latestSampleStatus",
     "lastFailure",
     "lastVerification",
-    "thresholdNotificationKeys",
     "notificationKeys",
     "processedEventKeys",
     "outbox",
@@ -920,9 +922,6 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
           validMonitorClassification(lastVerification.classification)) &&
         isCanonicalIsoTimestamp(lastVerification.observedAt) &&
         (lastVerification.httpStatus === undefined || validHttpStatus(lastVerification.httpStatus)))) &&
-    Array.isArray(value.thresholdNotificationKeys) &&
-    value.thresholdNotificationKeys.every((key) => boundedString(key, 256)) &&
-    new Set(value.thresholdNotificationKeys).size === value.thresholdNotificationKeys.length &&
     Array.isArray(value.notificationKeys) &&
     value.notificationKeys.every((key) => boundedString(key, 256)) &&
     new Set(value.notificationKeys).size === value.notificationKeys.length &&
@@ -947,19 +946,6 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
         isCanonicalIsoTimestamp(pending.usageObservedAt)));
 }
 
-function withTelemetryStats(value: unknown): unknown {
-  if (!isRecord(value) || value.version !== TAVILY_STATE_VERSION || value.telemetryStats !== undefined) {
-    return value;
-  }
-  return {
-    ...value,
-    telemetryStats: {
-      usageSamples: { success: 0, failure: 0 },
-      failures: [],
-    },
-  };
-}
-
 /** Owner-only atomic persistence for the single consolidated Tavily state document. */
 export class TavilyStateStore {
   readonly path: string;
@@ -975,7 +961,7 @@ export class TavilyStateStore {
   load(): TavilyMonitorState {
     try {
       assertPrivateFile(this.path);
-      const parsed = withTelemetryStats(JSON.parse(readFileSync(this.path, "utf8")));
+      const parsed: unknown = JSON.parse(readFileSync(this.path, "utf8"));
       if (!validMonitorState(parsed)) throw new Error("Tavily monitor state is invalid");
       return structuredClone(parsed);
     } catch (error) {
@@ -1013,7 +999,6 @@ export class TavilyStateStore {
         mode: 0o600,
       });
       renameSync(temporaryPath, this.path);
-      chmodSync(this.path, 0o600);
     } catch (error) {
       try { unlinkSync(temporaryPath); } catch { /* best-effort staging cleanup */ }
       throw error;
@@ -1086,8 +1071,6 @@ function addThresholdNotifications(state: TavilyMonitorState, sample: TavilyUsag
     for (const threshold of [80, 95] as const) {
       if (percentage < threshold) continue;
       const key = thresholdKey(sample, scope, threshold);
-      if (state.thresholdNotificationKeys.includes(key)) continue;
-      state.thresholdNotificationKeys.push(key);
       addNotification(state, {
         key,
         kind: threshold === 80 ? "threshold_warning" : "threshold_critical",
@@ -1146,15 +1129,12 @@ export class TavilyMonitor {
   private readonly now: () => Date;
   private readonly usageTimeoutMs: number;
   private readonly probeTimeoutMs: number;
-  private readonly eventPollIntervalMs: number;
   private readonly reminderIntervalMs: number;
   private readonly statusStaleMs: number;
   private readonly onStateChange: TavilyStateObserver | undefined;
   private readonly eventDirectory: string;
   private readonly store: TavilyStateStore;
   private state: TavilyMonitorState;
-  private eventTimer: ReturnType<typeof setInterval> | undefined;
-  private readonly verificationFlights = new Map<string, Promise<TavilyRecoveryResult>>();
 
   constructor(options: TavilyMonitorOptions) {
     this.apiKey = options.apiKey;
@@ -1162,7 +1142,6 @@ export class TavilyMonitor {
     this.now = options.now ?? (() => new Date());
     this.usageTimeoutMs = options.usageTimeoutMs ?? TAVILY_USAGE_TIMEOUT_MS;
     this.probeTimeoutMs = options.probeTimeoutMs ?? TAVILY_RECOVERY_PROBE_TIMEOUT_MS;
-    this.eventPollIntervalMs = options.eventPollIntervalMs ?? TAVILY_EVENT_POLL_INTERVAL_MS;
     this.reminderIntervalMs = options.reminderIntervalMs ?? TAVILY_REMINDER_INTERVAL_MS;
     this.statusStaleMs = options.statusStaleMs ?? TAVILY_STATUS_STALE_MS;
     if (!Number.isFinite(this.statusStaleMs) || this.statusStaleMs <= 0) {
@@ -1219,9 +1198,11 @@ export class TavilyMonitor {
 
   private commit(change: (state: TavilyMonitorState, now: string) => void): void {
     const now = isoNow(this.now);
-    change(this.state, now);
-    this.state.updatedAt = now;
-    this.store.save(this.state);
+    const candidate = structuredClone(this.state);
+    change(candidate, now);
+    candidate.updatedAt = now;
+    this.store.save(candidate);
+    this.state = candidate;
     this.refreshDiagnostics(new Date(now));
   }
 
@@ -1375,32 +1356,18 @@ export class TavilyMonitor {
     return processed;
   }
 
-  /** Startup drain followed by the package's short, unref'ed polling pattern. */
-  startChildEventPolling(): void {
-    if (this.eventTimer) return;
-    this.drainChildEvents();
-    this.eventTimer = setInterval(() => this.drainChildEvents(), this.eventPollIntervalMs);
-    this.eventTimer.unref();
-  }
-
-  stopChildEventPolling(): void {
-    if (!this.eventTimer) return;
-    clearInterval(this.eventTimer);
-    this.eventTimer = undefined;
-  }
-
   /** Queue at most one due reminder and advance its stable six-hour cadence. */
   queueDueReminder(): boolean {
     const incident = this.state.incident;
     const nowDate = validDate(this.now());
-    if (!incident || incident.resolvedAt || incident.acknowledgedAt ||
+    if (!incident || incident.resolvedAt || incident.acknowledgedAt || incident.deliveryTerminalAt ||
         nowDate.getTime() < new Date(incident.nextReminderAt).getTime()) {
       return false;
     }
     let queued = false;
     this.commit((state, now) => {
       const current = state.incident;
-      if (!current || current.resolvedAt || current.acknowledgedAt) return;
+      if (!current || current.resolvedAt || current.acknowledgedAt || current.deliveryTerminalAt) return;
       const scheduledAt = current.nextReminderAt;
       queued = addNotification(state, {
         key: `incident:${current.generation}:reminder:${scheduledAt}`,
@@ -1422,6 +1389,21 @@ export class TavilyMonitor {
     return queued;
   }
 
+  /** Retry one active incident after an operator explicitly restarts with a usable destination. */
+  resumeIncidentDelivery(): boolean {
+    const incident = this.state.incident;
+    if (!incident || incident.resolvedAt || incident.acknowledgedAt || !incident.deliveryTerminalAt) {
+      return false;
+    }
+    this.commit((state, now) => {
+      const current = state.incident;
+      if (!current || current.resolvedAt || current.acknowledgedAt || !current.deliveryTerminalAt) return;
+      delete current.deliveryTerminalAt;
+      current.nextReminderAt = now;
+    });
+    return true;
+  }
+
   acknowledgeIncident(generation: string): boolean {
     const incident = this.state.incident;
     if (!incident || incident.generation !== generation || incident.resolvedAt) return false;
@@ -1434,11 +1416,17 @@ export class TavilyMonitor {
     return true;
   }
 
+  isIncidentActive(generation: string): boolean {
+    const incident = this.state.incident;
+    return incident?.generation === generation && incident.resolvedAt === undefined;
+  }
+
   private verificationFailure(
     generation: string,
     stage: TavilyRecoveryStage,
     classification: TavilyMonitorFailureClassification,
     httpStatus?: number,
+    notifyOperator = false,
   ): TavilyRecoveryResult {
     this.commit((state, now) => {
       state.lastVerification = {
@@ -1468,6 +1456,17 @@ export class TavilyMonitor {
       if (state.pendingAutomaticVerification?.generation === generation) {
         delete state.pendingAutomaticVerification;
       }
+      if (notifyOperator) {
+        const failureSequence = state.notificationKeys.length + 1;
+        addNotification(state, {
+          key: `incident:${generation}:recheck-failure:${now}:${failureSequence}`,
+          kind: "recheck_failure",
+          createdAt: now,
+          incidentGeneration: generation,
+          message: `Tavily recovery check failed at ${stage} (${classification}). ` +
+            "The incident remains active.",
+        });
+      }
     });
     return {
       ok: false,
@@ -1478,83 +1477,93 @@ export class TavilyMonitor {
     };
   }
 
-  private runVerification(
+  private async runVerification(
     generation: string,
     usageSample?: TavilyUsageSample,
+    notifyOperator = false,
   ): Promise<TavilyRecoveryResult> {
-    const existingFlight = this.verificationFlights.get(generation);
-    if (existingFlight) return existingFlight;
+    this.drainChildEvents();
     const incident = this.state.incident;
     if (!incident || incident.generation !== generation || incident.resolvedAt) {
-      return Promise.resolve({
+      return {
         ok: false,
         generation,
         stage: "incident",
         classification: "stale_incident",
-      });
+      };
     }
+    const lastObservedBeforeVerification = incident.lastObservedAt;
 
-    const flight = (async (): Promise<TavilyRecoveryResult> => {
-      const result = await verifyTavilyRecovery({
-        apiKey: this.apiKey,
-        fetchImpl: this.fetchImpl,
-        now: this.now,
-        timeoutMs: this.usageTimeoutMs,
-        probeTimeoutMs: this.probeTimeoutMs,
-        ...(usageSample === undefined ? {} : { usageSample }),
-      });
-      if (!result.ok) {
-        if (result.sample) {
-          this.recordUsageResult(
-            { ok: true, sample: result.sample },
-            false,
-            usageSample === undefined,
-          );
-        }
-        return this.verificationFailure(
-          generation,
-          result.stage,
-          result.classification as TavilyMonitorFailureClassification,
-          result.httpStatus,
+    const result = await verifyTavilyRecovery({
+      apiKey: this.apiKey,
+      fetchImpl: this.fetchImpl,
+      now: this.now,
+      timeoutMs: this.usageTimeoutMs,
+      probeTimeoutMs: this.probeTimeoutMs,
+      ...(usageSample === undefined ? {} : { usageSample }),
+    });
+    if (!result.ok) {
+      if (result.sample) {
+        this.recordUsageResult(
+          { ok: true, sample: result.sample },
+          false,
+          usageSample === undefined,
         );
       }
-      this.recordUsageResult(
-        { ok: true, sample: result.sample },
-        false,
-        usageSample === undefined,
+      return this.verificationFailure(
+        generation,
+        result.stage,
+        result.classification as TavilyMonitorFailureClassification,
+        result.httpStatus,
+        notifyOperator,
       );
-      this.commit((state, now) => {
-        const current = state.incident;
-        if (!current || current.generation !== generation || current.resolvedAt) return;
-        current.resolvedAt = now;
-        delete state.pendingAutomaticVerification;
-        state.lastVerification = {
-          generation,
-          ok: true,
-          stage: "extract_probe",
-          observedAt: now,
-        };
-        addNotification(state, {
-          key: `incident:${generation}:recovery`,
-          kind: "recovery",
-          createdAt: now,
-          incidentGeneration: generation,
-          message: `Tavily recovered. Provider: Tavily. Incident generation: ${generation}. ` +
-            "Verified tools: web_search, web_fetch.",
-        });
-      });
-      return { ok: true, generation, sample: result.sample };
-    })();
-    this.verificationFlights.set(generation, flight);
-    void flight.then(
-      () => this.verificationFlights.delete(generation),
-      () => this.verificationFlights.delete(generation),
+    }
+    this.recordUsageResult(
+      { ok: true, sample: result.sample },
+      false,
+      usageSample === undefined,
     );
-    return flight;
+    this.drainChildEvents();
+    const current = this.state.incident;
+    const exhaustionAfterUsage = current?.lastObservedAt !== undefined &&
+      (current.lastObservedAt > result.sample.observedAt ||
+        (current.lastObservedAt === result.sample.observedAt &&
+          current.lastObservedAt !== lastObservedBeforeVerification));
+    if (current?.generation === generation && !current.resolvedAt &&
+        exhaustionAfterUsage) {
+      return this.verificationFailure(
+        generation,
+        "usage_state",
+        "usage_exhausted",
+        undefined,
+        notifyOperator,
+      );
+    }
+    this.commit((state, now) => {
+      const active = state.incident;
+      if (!active || active.generation !== generation || active.resolvedAt) return;
+      active.resolvedAt = now;
+      delete state.pendingAutomaticVerification;
+      state.lastVerification = {
+        generation,
+        ok: true,
+        stage: "extract_probe",
+        observedAt: now,
+      };
+      addNotification(state, {
+        key: `incident:${generation}:recovery`,
+        kind: "recovery",
+        createdAt: now,
+        incidentGeneration: generation,
+        message: `Tavily recovered. Provider: Tavily. Incident generation: ${generation}. ` +
+          "Verified tools: web_search, web_fetch.",
+      });
+    });
+    return { ok: true, generation, sample: result.sample };
   }
 
   recheckIncident(generation: string): Promise<TavilyRecoveryResult> {
-    return this.runVerification(generation);
+    return this.runVerification(generation, undefined, true);
   }
 
   /** Resume a crash-interrupted automatic verification using a fresh usage read. */
@@ -1603,13 +1612,17 @@ export class TavilyMonitor {
 
   recordNotificationTerminal(key: string): boolean {
     if (!this.state.outbox.some((entry) => entry.key === key && entry.status === "pending")) return false;
-    this.commit((state) => {
+    this.commit((state, now) => {
       const entry = state.outbox.find((candidate) => candidate.key === key && candidate.status === "pending");
       if (!entry) return;
       entry.attempts += 1;
       entry.status = "terminal";
       entry.lastFailure = "destination_invalid";
       state.notificationStats.terminal += 1;
+      const incident = state.incident;
+      if (incident && !incident.resolvedAt && entry.incidentGeneration === incident.generation) {
+        incident.deliveryTerminalAt = now;
+      }
     });
     return true;
   }

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import client from "prom-client";
-import { TavilyMonitor } from "../tavily-monitor.js";
+import { TAVILY_STATE_RELPATH, TavilyMonitor } from "../tavily-monitor.js";
 import {
   recordTavilyMonitorMetrics,
   tavilyFailures,
@@ -173,6 +173,50 @@ describe("Tavily monitor lifecycle", () => {
     assert.deepEqual(cleared, installed);
   });
 
+  it("resumes one crash-interrupted automatic verification on startup", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:05:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "pending-recovery");
+    const initial = new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key", now: clock.now });
+    initial.drainChildEvents();
+    const statePath = join(workspace, TAVILY_STATE_RELPATH);
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, any>;
+    persisted.incident.lastUsageRecoverable = true;
+    persisted.pendingAutomaticVerification = {
+      generation: persisted.incident.generation,
+      usageObservedAt: "2026-07-16T12:04:59.000Z",
+    };
+    writeFileSync(statePath, `${JSON.stringify(persisted)}\n`, "utf8");
+
+    let calls = 0;
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1 || calls === 4) return jsonResponse(usageResponse(100));
+        if (calls === 2) return jsonResponse(successfulSearchResponse());
+        if (calls === 3) return jsonResponse(successfulExtractResponse());
+        throw new Error("unexpected startup recovery request");
+      }) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const runtime = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+
+    await runtime.start();
+    await runtime.stop();
+    assert.equal(calls, 4, "pending verification plus the normal startup sample run once each");
+    assert.ok(restored.getState().incident?.resolvedAt);
+    assert.equal(restored.getState().pendingAutomaticVerification, undefined);
+    assert.equal(deliveries.filter((delivery) => delivery.text.startsWith("Tavily recovered.")).length, 1);
+  });
+
   it("restores and refreshes metrics and safe status after serialized transitions", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -180,7 +224,7 @@ describe("Tavily monitor lifecycle", () => {
     let observations = 0;
     const observe = (state: Parameters<typeof recordTavilyMonitorMetrics>[0], at: Date) => {
       observations += 1;
-      recordTavilyMonitorMetrics(state, at);
+      recordTavilyMonitorMetrics(state, at, clock.now);
     };
     const monitor = new TavilyMonitor({
       controlWorkspaceRoot: workspace,
@@ -222,7 +266,7 @@ describe("Tavily monitor lifecycle", () => {
       apiKey: privateKey,
       now: clock.now,
       fetchImpl: (async () => assert.fail("startup restoration must not fetch")) as typeof fetch,
-      onStateChange: recordTavilyMonitorMetrics,
+      onStateChange: (state, at) => recordTavilyMonitorMetrics(state, at, clock.now),
     });
     assert.equal(restored.getStatus().sampleState, "stale");
     assert.deepEqual(restored.getStatus(), {
@@ -315,6 +359,107 @@ describe("Tavily durable notification delivery", () => {
     }
   });
 
+  it("stops terminal incident reminders and resumes once after a configured restart", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "terminal-incident");
+    const monitor = new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key", now: clock.now });
+    const missingDestination = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    await missingDestination.processNow();
+    assert.equal(monitor.getState().incident?.deliveryTerminalAt, "2026-07-16T12:00:00.000Z");
+
+    clock.set("2026-07-17T00:00:00.000Z");
+    await missingDestination.processNow();
+    assert.equal(
+      monitor.getState().outbox.filter((entry) => entry.kind === "reminder").length,
+      0,
+      "a terminal destination does not create endless reminder entries",
+    );
+
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(1_000, 1_250))) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const configured = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await configured.start();
+    await configured.stop();
+    assert.equal(restored.getState().incident?.deliveryTerminalAt, undefined);
+    assert.equal(deliveries.filter((delivery) => /exhaustion reminder/.test(delivery.text)).length, 1);
+  });
+
+  it("bounds delivery attempts and aborts them during shutdown", async () => {
+    const workspace = temporaryWorkspace();
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+    });
+    await monitor.sampleUsage();
+    let deliveryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    let observedSignal: AbortSignal | undefined;
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliveryTimeoutMs: 60_000,
+      deliver: async (_payload, signal) => {
+        observedSignal = signal;
+        deliveryStarted();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+    });
+
+    const processing = runtime.processNow();
+    await started;
+    const stopping = runtime.stop();
+    await Promise.all([processing, stopping]);
+    assert.equal(observedSignal?.aborted, true);
+    assert.equal(monitor.getState().outbox[0].lastFailure, "transport");
+    await assert.rejects(runtime.processNow(), /runtime is stopped/);
+    await assert.rejects(runtime.acknowledgeIncident("2026-07-1"), /runtime is stopped/);
+  });
+
+  it("classifies a delivery timeout as a durable transport retry", async () => {
+    const workspace = temporaryWorkspace();
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+    });
+    await monitor.sampleUsage();
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliveryTimeoutMs: 5,
+      retryBaseMs: 10,
+      retryMaxMs: 10,
+      deliver: async (_payload, signal) => {
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("timed out")), { once: true });
+        });
+      },
+    });
+
+    await runtime.processNow();
+    assert.equal(monitor.getState().outbox[0].lastFailure, "transport");
+    assert.equal(monitor.getState().notificationStats.retried, 1);
+  });
+
   it("retains notification deduplication after delivery and restart", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -349,6 +494,41 @@ describe("Tavily durable notification delivery", () => {
 });
 
 describe("Tavily operator transition runtime", () => {
+  it("delivers failed explicit rechecks through the durable outbox", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "failed-recheck");
+    let calls = 0;
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        calls += 1;
+        return calls === 1
+          ? jsonResponse(usageResponse(100))
+          : jsonResponse({ results: [] });
+      }) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await runtime.processNow();
+    deliveries.splice(0);
+    const generation = monitor.getState().incident?.generation as string;
+
+    const result = await runtime.recheckIncident(generation);
+    assert.equal(result.ok, false);
+    assert.equal(deliveries.length, 1);
+    assert.match(deliveries[0].text, /failed at search_probe \(probe_failed\).*remains active/);
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recheck_failure"), false);
+    assert.equal(monitor.getState().notificationStats.delivered, 2);
+  });
+
   it("coalesces concurrent rechecks into one bounded usage/Search/Extract flight", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -374,10 +554,11 @@ describe("Tavily operator transition runtime", () => {
     });
     monitor.drainChildEvents();
     const generation = monitor.getState().incident?.generation as string;
+    const deliveries: TavilyDeliveryPayload[] = [];
     const runtime = new TavilyMonitorRuntime({
       monitor,
       destination: { chatId: 71 },
-      deliver: async () => {},
+      deliver: async (payload) => { deliveries.push(payload); },
       now: clock.now,
     });
 
@@ -390,6 +571,7 @@ describe("Tavily operator transition runtime", () => {
     assert.deepEqual(secondResult, firstResult);
     assert.equal(calls, 3);
     assert.ok(monitor.getState().incident?.resolvedAt);
+    assert.equal(deliveries.filter((delivery) => delivery.text.startsWith("Tavily recovered.")).length, 1);
   });
 
   it("uses bounded destinations, callback data, and delivery error classes", () => {

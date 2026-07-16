@@ -40,7 +40,7 @@ import {
   type TavilyDeliveryDestination,
   type TavilyOperatorActions,
 } from "./tavily-monitor-runtime.js";
-import type { TavilyRecoveryResult, TavilyStatusSnapshot } from "./tavily-monitor.js";
+import type { TavilyStatusSnapshot } from "./tavily-monitor.js";
 
 
 // Re-export for backward compatibility (tests import from here)
@@ -70,15 +70,6 @@ export function isTavilyCallbackDestination(
 ): boolean {
   if (!message || !destination || message.chat.id !== destination.chatId) return false;
   return message.message_thread_id === destination.threadId;
-}
-
-export function formatTavilyRecheckResult(result: TavilyRecoveryResult): string {
-  if (result.ok) return "Tavily recovery verified. The incident is resolved.";
-  if (result.classification === "stale_incident") {
-    return "This Tavily incident action is stale.";
-  }
-  return `Tavily recovery check failed at ${result.stage} (${result.classification}). ` +
-    "The incident remains active.";
 }
 
 /**
@@ -873,32 +864,16 @@ export function createTelegramBot(
         return;
       }
 
-      await ctx.answerCallbackQuery({ text: "Rechecking Tavily credits…" }).catch(() => {});
-      let result: TavilyRecoveryResult;
-      try {
-        result = await tavilyActions.recheckIncident(action.generation);
-      } catch {
-        result = {
-          ok: false,
-          generation: action.generation,
-          stage: "usage",
-          classification: "provider_unavailable",
-        };
+      if (!tavilyActions.isIncidentActive(action.generation)) {
+        await ctx.answerCallbackQuery({ text: "This Tavily incident action is stale." }).catch(() => {});
+        return;
       }
-      if (!destination) return;
-      const reportOptions = {
-        ...(destination.threadId === undefined ? {} : { message_thread_id: destination.threadId }),
-        [TAVILY_DURABLE_DELIVERY]: true,
-      } as Parameters<typeof ctx.api.sendMessage>[2] & {
-        [TAVILY_DURABLE_DELIVERY]: true;
-      };
-      await ctx.api.sendMessage(
-        destination.chatId,
-        formatTavilyRecheckResult(result),
-        reportOptions,
-      ).catch(() => {
-        log.warn("telegram-bot", "Failed to report a Tavily recovery check result");
-      });
+      await ctx.answerCallbackQuery({ text: "Rechecking Tavily credits…" }).catch(() => {});
+      try {
+        await tavilyActions.recheckIncident(action.generation);
+      } catch {
+        log.warn("telegram-bot", "Failed to queue a durable Tavily recovery check result");
+      }
     });
   }
 

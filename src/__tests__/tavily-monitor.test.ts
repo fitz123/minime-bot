@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
   lstatSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -340,6 +342,57 @@ describe("Tavily fixed recovery verification", () => {
     }
     assert.equal(emptyProbe.calls.length, 1, "a failed Search probe does not spend an Extract probe");
   });
+
+  it("rejects empty, malformed, HTTP-failed, and timed-out Extract probes", async () => {
+    const recoverable = parseTavilyUsageResponse(
+      usageResponse({ planUsage: 100 }),
+      new Date("2026-07-16T11:00:00.000Z"),
+    );
+    const cases = [
+      { response: jsonResponse({ results: [] }), classification: "probe_failed", httpStatus: undefined },
+      {
+        response: new Response("{", { status: 200, headers: { "Content-Type": "application/json" } }),
+        classification: "probe_failed",
+        httpStatus: undefined,
+      },
+      { response: jsonResponse({}, 503), classification: "provider_unavailable", httpStatus: 503 },
+    ] as const;
+    for (const testCase of cases) {
+      const fetches = sequenceFetch([jsonResponse(successfulSearchResponse()), testCase.response]);
+      const result = await verifyTavilyRecovery({
+        apiKey: "fixture-key",
+        usageSample: recoverable,
+        fetchImpl: fetches.fetchImpl,
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.stage, "extract_probe");
+        assert.equal(result.classification, testCase.classification);
+        assert.equal(result.httpStatus, testCase.httpStatus);
+      }
+      assert.equal(fetches.calls.length, 2);
+    }
+
+    let calls = 0;
+    const timedOut = await verifyTavilyRecovery({
+      apiKey: "fixture-key",
+      usageSample: recoverable,
+      probeTimeoutMs: 5,
+      fetchImpl: ((_: string | URL | Request, init?: RequestInit) => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve(jsonResponse(successfulSearchResponse()));
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }) as typeof fetch,
+    });
+    assert.equal(timedOut.ok, false);
+    if (!timedOut.ok) {
+      assert.equal(timedOut.stage, "extract_probe");
+      assert.equal(timedOut.classification, "provider_unavailable");
+    }
+    assert.equal(calls, 2);
+  });
 });
 
 describe("Tavily threshold and durable incident state", () => {
@@ -376,7 +429,7 @@ describe("Tavily threshold and durable incident state", () => {
     await monitor.sampleUsage();
     const state = monitor.getState();
     assert.equal(state.outbox.length, 5);
-    assert.ok(state.thresholdNotificationKeys.includes("threshold:2026-08:plan:80"));
+    assert.ok(state.notificationKeys.includes("threshold:2026-08:plan:80"));
     for (const notification of state.outbox) {
       assert.match(notification.message, /Provider: Tavily/);
       assert.match(notification.message, /Usage:/);
@@ -434,7 +487,7 @@ describe("Tavily threshold and durable incident state", () => {
     assert.equal(state.telemetryStats.failures.reduce((total, entry) => total + entry.count, 0), 2);
   });
 
-  it("startup-drains, reminds every six hours, and stops reminders on acknowledgement", () => {
+  it("drains, reminds every six hours, and stops reminders on acknowledgement", () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
     writeExhaustionEvent(
@@ -448,10 +501,8 @@ describe("Tavily threshold and durable incident state", () => {
       controlWorkspaceRoot: workspace,
       apiKey: "fixture-key",
       now: clock.now,
-      eventPollIntervalMs: 20,
     });
-    monitor.startChildEventPolling();
-    monitor.stopChildEventPolling();
+    monitor.drainChildEvents();
     const generation = monitor.getState().incident?.generation as string;
     assert.ok(generation);
 
@@ -504,6 +555,11 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     if (!failed.ok) assert.equal(failed.stage, "search_probe");
     assert.equal(monitor.getState().incident?.resolvedAt, undefined);
     assert.equal(monitor.getState().lastVerification?.ok, false);
+    assert.equal(monitor.getState().outbox.filter((entry) => entry.kind === "recheck_failure").length, 1);
+    assert.match(
+      monitor.getState().outbox.find((entry) => entry.kind === "recheck_failure")?.message ?? "",
+      /failed at search_probe \(probe_failed\).*remains active/,
+    );
 
     clock.set("2026-07-16T12:05:00.000Z");
     const recovered = await monitor.recheckIncident(generation);
@@ -589,6 +645,84 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     await monitor.sampleUsage();
     assert.equal(fetches.calls.length, 7, "a new recoverable transition runs both probes once");
     assert.ok(monitor.getState().incident?.resolvedAt);
+  });
+
+  it("waits for key-level capacity before automatic recovery", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(
+      workspace,
+      "web_search",
+      "base_plan_exhausted",
+      "2026-07-16T12:00:00.000Z",
+      "key-capacity",
+    );
+    const fetches = sequenceFetch([
+      jsonResponse(usageResponse({ planUsage: 100, keyUsage: 1_000, keyLimit: 1_000 })),
+      jsonResponse(usageResponse({ planUsage: 100, keyUsage: 999, keyLimit: 1_000 })),
+      jsonResponse(successfulSearchResponse()),
+      jsonResponse(successfulExtractResponse()),
+    ]);
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: fetches.fetchImpl,
+    });
+    monitor.drainChildEvents();
+
+    await monitor.sampleUsage();
+    assert.equal(fetches.calls.length, 1, "account capacity cannot override an exhausted key");
+    assert.equal(monitor.getState().incident?.lastUsageRecoverable, false);
+
+    clock.set("2026-07-16T12:05:00.000Z");
+    await monitor.sampleUsage();
+    assert.equal(fetches.calls.length, 4);
+    assert.ok(monitor.getState().incident?.resolvedAt);
+  });
+
+  it("keeps an incident active when exhaustion arrives during recovery probes", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:05:00.000Z");
+    writeExhaustionEvent(
+      workspace,
+      "web_search",
+      "base_plan_exhausted",
+      "2026-07-16T12:00:00.000Z",
+      "verification-start",
+    );
+    let calls = 0;
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1) return jsonResponse(usageResponse({ planUsage: 100 }));
+        if (calls === 2) return jsonResponse(successfulSearchResponse());
+        clock.set("2026-07-16T12:06:00.000Z");
+        writeExhaustionEvent(
+          workspace,
+          "web_fetch",
+          "paygo_exhausted",
+          "2026-07-16T12:06:00.000Z",
+          "during-verification",
+        );
+        return jsonResponse(successfulExtractResponse());
+      }) as typeof fetch,
+    });
+    monitor.drainChildEvents();
+    const generation = monitor.getState().incident?.generation as string;
+
+    const result = await monitor.recheckIncident(generation);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, "usage_state");
+      assert.equal(result.classification, "usage_exhausted");
+    }
+    assert.equal(monitor.getState().incident?.resolvedAt, undefined);
+    assert.equal(monitor.getState().incident?.lastObservedAt, "2026-07-16T12:06:00.000Z");
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
   });
 
   it("creates a later generation only for post-resolution exhaustion", async () => {
@@ -693,5 +827,64 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.equal(restored.recordNotificationDelivered(firstKey), true);
     assert.equal(restored.getState().notificationStats.delivered, 1);
     assert.equal(restored.getState().notificationKeys.includes(firstKey), true, "delivery dedupe key survives removal");
+  });
+
+  it("does not mutate live state or delete a child event when persistence fails", () => {
+    const workspace = temporaryWorkspace();
+    const eventPath = writeExhaustionEvent(
+      workspace,
+      "web_search",
+      "base_plan_exhausted",
+      "2026-07-16T12:00:00.000Z",
+      "save-failure",
+    );
+    const monitor = new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" });
+    const before = monitor.getState();
+    const temporaryStatePath = join(workspace, "data", "tavily", ".state.json.tmp");
+    mkdirSync(temporaryStatePath);
+
+    assert.throws(() => monitor.drainChildEvents(), /temporary state is not a file/);
+    assert.deepEqual(monitor.getState(), before);
+    assert.equal(lstatSync(eventPath).isFile(), true, "uncommitted spool event remains available");
+
+    rmSync(temporaryStatePath, { recursive: true });
+    assert.equal(monitor.drainChildEvents(), 1);
+    assert.ok(monitor.getState().incident);
+    const restored = new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" });
+    assert.deepEqual(restored.getState(), monitor.getState());
+  });
+
+  it("rejects malformed, legacy, duplicate, private, and symlinked state documents", async () => {
+    const workspace = temporaryWorkspace();
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      fetchImpl: (async () => jsonResponse(usageResponse())) as typeof fetch,
+    });
+    await monitor.sampleUsage();
+    const statePath = join(workspace, TAVILY_STATE_RELPATH);
+    const valid = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+    const invalidDocuments: unknown[] = [
+      "{",
+      { ...valid, privateQuery: "must-not-be-accepted" },
+      { ...valid, telemetryStats: undefined },
+      { ...valid, notificationKeys: ["duplicate", "duplicate"] },
+    ];
+    for (const document of invalidDocuments) {
+      writeFileSync(statePath, typeof document === "string" ? document : JSON.stringify(document), "utf8");
+      assert.throws(
+        () => new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+        /state is invalid/,
+      );
+    }
+
+    const outside = join(workspace, "outside-state.json");
+    writeFileSync(outside, JSON.stringify(valid), { mode: 0o600 });
+    rmSync(statePath);
+    symlinkSync(outside, statePath);
+    assert.throws(
+      () => new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+      /state is not a plain file/,
+    );
   });
 });

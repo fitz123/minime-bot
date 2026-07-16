@@ -38,9 +38,13 @@ and saves a successful notification delivery before removing the outbox entry.
 Transient Telegram transport, rate-limit, and server failures retry from the
 durable outbox with backoff from 30 seconds up to one hour. A missing configured
 destination or deterministic Telegram 4xx response is recorded as a terminal
-delivery diagnostic rather than retried indefinitely. Delivery uses
-`adminChatId` when configured, otherwise `defaultDeliveryChatId` and its
-optional `defaultDeliveryThreadId`.
+delivery diagnostic and suppresses further reminders for that incident. After
+the destination is corrected, an explicit process restart permits one fresh
+delivery attempt. Delivery uses `adminChatId` when configured, otherwise
+`defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`. When a
+Telegram token source and owner destination are configured, this owner-only
+transport also runs in Discord-backed deployments with no Telegram agent
+bindings.
 
 Incident messages expose `acknowledge degraded mode` and
 `credits fixed — recheck`. Actions are accepted only at the exact configured
@@ -50,7 +54,8 @@ bounded: current `/usage`, a fixed one-result Search probe, and a fixed Extract
 probe must all return validated non-empty results. The monitor uses the same
 verification once when an active incident's usage first becomes recoverable.
 Failed verification leaves the incident open, and provider calls are never
-automatically retried.
+automatically retried. Explicit recheck failures are delivered through the same
+durable outbox as incident and recovery notices.
 
 `/status` reports only sample freshness, plan/PAYGO used and limit values, the
 latest bounded failure class, and incident/acknowledgement state. Prometheus

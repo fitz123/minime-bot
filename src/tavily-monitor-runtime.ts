@@ -10,6 +10,7 @@ import {
 export const TAVILY_USAGE_SAMPLE_INTERVAL_MS = 5 * 60 * 1_000;
 export const TAVILY_DELIVERY_RETRY_BASE_MS = 30_000;
 export const TAVILY_DELIVERY_RETRY_MAX_MS = 60 * 60 * 1_000;
+export const TAVILY_DELIVERY_TIMEOUT_MS = 10_000;
 export const TAVILY_ACK_CALLBACK_PREFIX = "tavily:ack:";
 export const TAVILY_RECHECK_CALLBACK_PREFIX = "tavily:recheck:";
 
@@ -27,10 +28,14 @@ export interface TavilyDeliveryPayload extends TavilyDeliveryDestination {
   replyMarkup?: TavilyInlineKeyboard;
 }
 
-export type TavilyNotificationDelivery = (payload: TavilyDeliveryPayload) => Promise<void>;
+export type TavilyNotificationDelivery = (
+  payload: TavilyDeliveryPayload,
+  signal: AbortSignal,
+) => Promise<void>;
 
 export interface TavilyOperatorActions {
   getDeliveryDestination(): TavilyDeliveryDestination | undefined;
+  isIncidentActive(generation: string): boolean;
   acknowledgeIncident(generation: string): Promise<boolean>;
   recheckIncident(generation: string): Promise<TavilyRecoveryResult>;
 }
@@ -48,6 +53,7 @@ export interface TavilyMonitorRuntimeOptions {
   processIntervalMs?: number;
   retryBaseMs?: number;
   retryMaxMs?: number;
+  deliveryTimeoutMs?: number;
   setIntervalImpl?: (callback: () => void, intervalMs: number) => unknown;
   clearIntervalImpl?: (handle: unknown) => void;
   onError?: (error: unknown) => void;
@@ -172,15 +178,18 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
   private readonly processIntervalMs: number;
   private readonly retryBaseMs: number;
   private readonly retryMaxMs: number;
+  private readonly deliveryTimeoutMs: number;
   private readonly setIntervalImpl: (callback: () => void, intervalMs: number) => unknown;
   private readonly clearIntervalImpl: (handle: unknown) => void;
   private readonly onError: (error: unknown) => void;
   private transitionTail: Promise<void> = Promise.resolve();
+  private acceptingTransitions = true;
   private usageTimer: unknown;
   private processTimer: unknown;
   private running = false;
   private startup: Promise<void> | undefined;
   private readonly recheckFlights = new Map<string, Promise<TavilyRecoveryResult>>();
+  private readonly activeDeliveryControllers = new Set<AbortController>();
 
   constructor(options: TavilyMonitorRuntimeOptions) {
     this.monitor = options.monitor;
@@ -206,6 +215,10 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
     if (this.retryBaseMs > this.retryMaxMs) {
       throw new Error("Tavily delivery retry base exceeds maximum");
     }
+    this.deliveryTimeoutMs = positiveInterval(
+      options.deliveryTimeoutMs ?? TAVILY_DELIVERY_TIMEOUT_MS,
+      "Tavily delivery timeout",
+    );
     this.setIntervalImpl = options.setIntervalImpl ?? ((callback, intervalMs) =>
       setInterval(callback, intervalMs));
     this.clearIntervalImpl = options.clearIntervalImpl ?? ((handle) =>
@@ -221,7 +234,14 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
     return this.running;
   }
 
+  isIncidentActive(generation: string): boolean {
+    return this.monitor.isIncidentActive(generation);
+  }
+
   private enqueue<T>(transition: () => Promise<T> | T): Promise<T> {
+    if (!this.acceptingTransitions) {
+      return Promise.reject(new Error("Tavily monitor runtime is stopped"));
+    }
     const result = this.transitionTail.then(async () => {
       try {
         return await transition();
@@ -248,6 +268,19 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
     return Math.min(this.retryMaxMs, Math.max(backoff, retryAfterMs ?? 0));
   }
 
+  private async deliverOnce(payload: TavilyDeliveryPayload): Promise<void> {
+    const controller = new AbortController();
+    this.activeDeliveryControllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), this.deliveryTimeoutMs);
+    timer.unref();
+    try {
+      await this.deliver(payload, controller.signal);
+    } finally {
+      clearTimeout(timer);
+      this.activeDeliveryControllers.delete(controller);
+    }
+  }
+
   private async deliverDueNotifications(): Promise<void> {
     for (const notification of this.monitor.dueNotifications(this.now())) {
       if (!this.destination) {
@@ -256,7 +289,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       }
       try {
         const replyMarkup = tavilyIncidentReplyMarkup(notification);
-        await this.deliver({
+        await this.deliverOnce({
           ...this.destination,
           text: notification.message,
           ...(replyMarkup === undefined ? {} : { replyMarkup }),
@@ -295,6 +328,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
   /** Restore is performed by the core constructor; start drains and samples before returning. */
   start(): Promise<void> {
     if (this.running) return this.startup ?? Promise.resolve();
+    this.acceptingTransitions = true;
     this.running = true;
     this.processTimer = this.installTimer(() => {
       if (!this.running) return;
@@ -305,6 +339,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       void this.enqueue(() => this.sampleTransition());
     }, this.usageSampleIntervalMs);
     this.startup = this.enqueue(async () => {
+      if (this.destination) this.monitor.resumeIncidentDelivery();
       this.monitor.drainChildEvents();
       await this.monitor.runPendingAutomaticRecovery();
       await this.sampleTransition();
@@ -313,6 +348,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
   }
 
   async stop(): Promise<void> {
+    this.acceptingTransitions = false;
     if (this.running) {
       this.running = false;
       if (this.processTimer !== undefined) this.clearIntervalImpl(this.processTimer);
@@ -321,7 +357,9 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       this.usageTimer = undefined;
       this.startup = undefined;
     }
-    await this.transitionTail;
+    const finalTail = this.transitionTail;
+    for (const controller of this.activeDeliveryControllers) controller.abort();
+    await finalTail;
   }
 
   processNow(): Promise<void> {

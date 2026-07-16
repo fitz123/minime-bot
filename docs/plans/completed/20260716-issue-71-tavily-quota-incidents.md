@@ -1,5 +1,7 @@
 # Issue #71: Durable Tavily quota monitoring and incidents
 
+Status: implementation complete and validated on 2026-07-17.
+
 ## Overview
 
 Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch` contracts, while making account usage, exhaustion, acknowledgement, and verified recovery durable and observable. Use the existing single `tavily.api_key` SOPS contract; do not add alternate providers, fallback, key rotation, billing mutation, or a generic incident framework.

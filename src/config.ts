@@ -623,8 +623,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
   }
 
-  // Resolve Telegram token from configured non-interactive secret sources.
-  // Optional — not needed for Discord-only setups.
+  // Resolve Telegram transport for normal bindings or an owner-only Tavily
+  // destination. A Discord-backed deployment may still need Telegram alerts.
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
   if (legacyTelegramKey) {
     throw new Error(
@@ -636,8 +636,11 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   validateConfiguredSopsSource(sopsFile, telegramTokenSopsKey, "telegramTokenSopsKey");
   const rawTelegramBindings = Array.isArray(raw.bindings) ? raw.bindings : [];
   const hasTelegramBindings = rawTelegramBindings.length > 0;
+  const hasOwnerDeliveryDestination = raw.adminChatId !== undefined ||
+    raw.defaultDeliveryChatId !== undefined;
   let telegramToken: string | undefined;
-  if (hasTelegramBindings && (telegramTokenSopsKey || telegramTokenEnv)) {
+  if ((hasTelegramBindings || hasOwnerDeliveryDestination) &&
+      (telegramTokenSopsKey || telegramTokenEnv)) {
     telegramToken = resolveSecrets
       ? resolveSecret({
         sopsFile,

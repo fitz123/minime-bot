@@ -50,6 +50,7 @@ import {
 } from "../pi-extensions/tavily-secret.js";
 import type { ExecFileSyncLike } from "../secrets.js";
 import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import { TavilyMonitor } from "../tavily-monitor.js";
 
 const KEY = "tvly-test-key";
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1067,7 +1068,7 @@ describe("web-tools Pi wrapper", () => {
     return mod.default;
   }
 
-  it("imports the wrapper, registers both tools, and stays graceful when the SOPS file is missing", async () => {
+  it("persists non-quota failures and stays graceful when event persistence fails", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-missing-"));
     const oldCwd = process.cwd();
     const oldWarn = console.warn;
@@ -1077,7 +1078,7 @@ describe("web-tools Pi wrapper", () => {
 
     try {
       process.chdir(tmpDir);
-      delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = tmpDir;
       console.warn = (message?: unknown) => {
         warnings.push(String(message));
       };
@@ -1093,6 +1094,21 @@ describe("web-tools Pi wrapper", () => {
       assert.equal(result.details.ok, false);
       assert.match(result.content[0].text, /web_search is unavailable/);
       assert.match(result.content[0].text, /SOPS key tavily\.api_key in config\/secrets\.sops\.yaml/);
+
+      const monitor = new TavilyMonitor({ controlWorkspaceRoot: tmpDir, apiKey: undefined });
+      assert.equal(monitor.drainChildEvents(), 1);
+      assert.equal(monitor.getState().lastFailure?.classification, "credential_missing");
+      assert.equal(monitor.getState().lastFailure?.source, "web_search");
+      assert.equal(monitor.getState().incident, undefined);
+
+      const spool = tavilyEventSpoolDirectory(tmpDir);
+      rmSync(spool, { recursive: true });
+      symlinkSync(tmpDir, spool, "dir");
+      const fetchResult = await registered[1].execute("call-2", { url: "https://example.com" });
+      assert.equal(fetchResult.details.ok, false);
+      assert.match(fetchResult.content[0].text, /web_fetch is unavailable/);
+      assert.ok(warnings.some((warning) =>
+        warning === "[web-tools] tool=web_fetch reason=event-write-failed classification=credential_missing"));
     } finally {
       console.warn = oldWarn;
       if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];

@@ -414,7 +414,6 @@ describe("Tavily durable metrics", () => {
       version: 1,
       updatedAt: "2026-07-16T12:00:00.000Z",
       incidentSequence: 0,
-      thresholdNotificationKeys: [],
       notificationKeys: [],
       processedEventKeys: [],
       outbox: [],
@@ -429,6 +428,7 @@ describe("Tavily durable metrics", () => {
 
   it("registers exact low-cardinality names and restores gauges and durable counters", async () => {
     const sampledAt = "2026-07-16T11:58:00.000Z";
+    let collectedAt = new Date("2026-07-16T12:00:00.000Z");
     const state = baseTavilyState({
       incidentSequence: 7,
       latestSample: {
@@ -477,7 +477,11 @@ describe("Tavily durable metrics", () => {
       }],
     });
 
-    recordTavilyMonitorMetrics(state, new Date("2026-07-16T12:00:00.000Z"));
+    recordTavilyMonitorMetrics(
+      state,
+      new Date("2026-07-16T12:00:00.000Z"),
+      () => new Date(collectedAt),
+    );
 
     const names = new Set(client.register.getMetricsAsArray().map((metric) => metric.name));
     for (const name of [
@@ -497,6 +501,12 @@ describe("Tavily durable metrics", () => {
 
     assert.equal((await tavilyUsageSamplePresent.get()).values[0].value, 1);
     assert.equal((await tavilyUsageSampleAge.get()).values[0].value, 120);
+    collectedAt = new Date("2026-07-16T12:03:00.000Z");
+    assert.equal(
+      (await tavilyUsageSampleAge.get()).values[0].value,
+      300,
+      "sample age advances at collection time without another state transition",
+    );
     assert.equal((await tavilyUsageSampleSuccess.get()).values[0].value, 1);
     assert.equal((await tavilyPlanUsage.get()).values[0].value, 950);
     assert.equal((await tavilyPlanLimit.get()).values[0].value, 1_000);
@@ -534,7 +544,8 @@ describe("Tavily durable metrics", () => {
   });
 
   it("represents missing and failed samples without private or unbounded labels", async () => {
-    recordTavilyMonitorMetrics(baseTavilyState(), new Date("2026-07-16T12:00:00.000Z"));
+    const collectNow = () => new Date("2026-07-16T12:00:00.000Z");
+    recordTavilyMonitorMetrics(baseTavilyState(), collectNow(), collectNow);
     assert.equal((await tavilyUsageSamplePresent.get()).values[0].value, 0);
     assert.equal((await tavilyUsageSampleAge.get()).values[0].value, 0);
     assert.equal((await tavilyUsageSampleSuccess.get()).values[0].value, 0);
@@ -555,7 +566,7 @@ describe("Tavily durable metrics", () => {
         usageSamples: { success: 0, failure: 1 },
         failures: [{ classification: "credential_invalid", tool: "usage", count: 1 }],
       },
-    }), new Date("2026-07-16T12:00:00.000Z"));
+    }), collectNow(), collectNow);
     assert.equal((await tavilyUsageSamplePresent.get()).values[0].value, 0);
     assert.equal((await tavilyUsageSampleSuccess.get()).values[0].value, 0);
     const failures = await tavilyFailures.get();

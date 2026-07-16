@@ -216,6 +216,9 @@ export const finalDeliveryFailures = new client.Counter({
 
 // --- Tavily quota and incident monitoring ---
 
+let tavilySampleObservedAtMs: number | undefined;
+let tavilyMetricsClock: () => Date = () => new Date();
+
 export const tavilyUsageSamplePresent = new client.Gauge({
   name: "bot_tavily_usage_sample_present",
   help: "Whether a successful Tavily usage sample is available",
@@ -224,6 +227,12 @@ export const tavilyUsageSamplePresent = new client.Gauge({
 export const tavilyUsageSampleAge = new client.Gauge({
   name: "bot_tavily_usage_sample_age_seconds",
   help: "Age in seconds of the latest successful Tavily usage sample, or zero when missing",
+  collect() {
+    const nowMs = tavilyMetricsClock().getTime();
+    this.set(tavilySampleObservedAtMs === undefined || !Number.isFinite(nowMs)
+      ? 0
+      : Math.max(0, nowMs - tavilySampleObservedAtMs) / 1_000);
+  },
 });
 
 export const tavilyUsageSampleSuccess = new client.Gauge({
@@ -451,9 +460,12 @@ export function recordFinalDeliveryFailure(): void {
 export function recordTavilyMonitorMetrics(
   state: TavilyMonitorState,
   observedAt: Date = new Date(),
+  collectNow: () => Date = () => new Date(),
 ): void {
   const sample = state.latestSample;
   const sampleObservedAt = sample === undefined ? undefined : new Date(sample.observedAt).getTime();
+  tavilySampleObservedAtMs = sampleObservedAt;
+  tavilyMetricsClock = collectNow;
   tavilyUsageSamplePresent.set(sample === undefined ? 0 : 1);
   tavilyUsageSampleAge.set(sampleObservedAt === undefined
     ? 0

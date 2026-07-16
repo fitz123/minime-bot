@@ -19,6 +19,7 @@ describe("config secret resolution: SOPS and env sources", () => {
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.TEST_TELEGRAM_TOKEN_ENV;
+    delete process.env.TEST_OWNER_TELEGRAM_TOKEN_ENV;
     delete process.env.TEST_DISCORD_TOKEN_ENV;
     delete process.env[MINIME_CONFIG_PATH_ENV];
     delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
@@ -282,6 +283,34 @@ discord:
     assert.equal(config.telegramToken, undefined);
     assert.equal(config.bindings.length, 0);
     assert.equal(config.discord!.token, "dc-token-from-env");
+  });
+
+  it("resolves an owner-only Telegram transport for a Discord-backed deployment", () => {
+    process.env.TEST_DISCORD_TOKEN_ENV = "dc-token-from-env";
+    process.env.TEST_OWNER_TELEGRAM_TOKEN_ENV = "owner-telegram-token";
+    writeFileSync(
+      configPath,
+      minimalAgentsYaml +
+        `
+telegramTokenEnv: TEST_OWNER_TELEGRAM_TOKEN_ENV
+bindings: []
+defaultDeliveryChatId: -1007100
+defaultDeliveryThreadId: 17
+discord:
+  tokenEnv: TEST_DISCORD_TOKEN_ENV
+  bindings:
+    - guildId: "999"
+      agentId: main
+      kind: channel
+`,
+    );
+
+    const config = loadConfig(configPath);
+
+    assert.equal(config.telegramToken, "owner-telegram-token");
+    assert.equal(config.bindings.length, 0);
+    assert.equal(config.defaultDeliveryChatId, -1007100);
+    assert.equal(config.defaultDeliveryThreadId, 17);
   });
 
   it("validates telegramTokenEnv type (must be string)", () => {

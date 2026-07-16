@@ -9,11 +9,9 @@ import type { SessionManager } from "../session-manager.js";
 import {
   TAVILY_DURABLE_DELIVERY,
   TELEGRAM_ALLOWED_UPDATES,
-  formatTavilyRecheckResult,
   isTavilyCallbackDestination,
 } from "../telegram-bot.js";
 import type { TavilyOperatorActions } from "../tavily-monitor-runtime.js";
-import type { TavilyRecoveryResult } from "../tavily-monitor.js";
 
 const testBindings: TelegramBinding[] = [
   { chatId: 111111111, agentId: "main", kind: "dm", label: "User1 DM" },
@@ -1666,6 +1664,7 @@ describe("Tavily Telegram incident actions", () => {
     const acknowledged: string[] = [];
     const actions: TavilyOperatorActions = {
       getDeliveryDestination: () => destination,
+      isIncidentActive: () => true,
       acknowledgeIncident: async (generation) => {
         acknowledged.push(generation);
         return true;
@@ -1703,6 +1702,7 @@ describe("Tavily Telegram incident actions", () => {
     let acknowledgements = 0;
     const actions: TavilyOperatorActions = {
       getDeliveryDestination: () => destination,
+      isIncidentActive: () => true,
       acknowledgeIncident: async () => {
         acknowledgements++;
         return false;
@@ -1719,16 +1719,17 @@ describe("Tavily Telegram incident actions", () => {
     );
   });
 
-  it("reports a failed bounded recheck without claiming resolution", async () => {
+  it("delegates recheck reporting to the durable runtime without a direct send", async () => {
     let rechecks = 0;
-    const failure: TavilyRecoveryResult = {
+    const failure = {
       ok: false,
       generation: "2026-07-1",
-      stage: "search_probe",
-      classification: "probe_failed",
-    };
+      stage: "search_probe" as const,
+      classification: "probe_failed" as const,
+    } as const;
     const actions: TavilyOperatorActions = {
       getDeliveryDestination: () => destination,
+      isIncidentActive: () => true,
       acknowledgeIncident: async () => assert.fail("acknowledgement was not expected"),
       recheckIncident: async () => {
         rechecks++;
@@ -1743,14 +1744,88 @@ describe("Tavily Telegram incident actions", () => {
       String(apiCalls.find((call) => call.method === "answerCallbackQuery")?.payload.text),
       /Rechecking/,
     );
-    const report = apiCalls.find((call) => call.method === "sendMessage");
-    assert.ok(report);
-    assert.equal(report.payload.chat_id, destination.chatId);
-    assert.equal(report.payload.message_thread_id, destination.threadId);
-    assert.match(String(report.payload.text), /failed at search_probe \(probe_failed\)/);
-    assert.match(String(report.payload.text), /remains active/);
-    assert.doesNotMatch(String(report.payload.text), /resolved/);
-    assert.equal(formatTavilyRecheckResult(failure), report.payload.text);
+    assert.equal(apiCalls.some((call) => call.method === "sendMessage"), false);
+  });
+
+  it("avoids duplicate success sends and rejects stale rechecks before execution", async () => {
+    for (const result of [
+      {
+        ok: true as const,
+        generation: "2026-07-1",
+        sample: {
+          observedAt: "2026-07-16T12:00:00.000Z",
+          cycleGeneration: "2026-07",
+          key: { usage: 1, limit: 10, remaining: 9 },
+          account: {
+            currentPlan: "Researcher",
+            plan: { usage: 1, limit: 10, remaining: 9 },
+            paygo: { usage: 0, limit: 0, remaining: 0 },
+          },
+        },
+      },
+      {
+        ok: false as const,
+        generation: "2026-07-1",
+        stage: "incident" as const,
+        classification: "stale_incident" as const,
+      },
+    ]) {
+      const actions: TavilyOperatorActions = {
+        getDeliveryDestination: () => destination,
+        isIncidentActive: () => result.ok,
+        acknowledgeIncident: async () => assert.fail("acknowledgement was not expected"),
+        recheckIncident: async () => {
+          if (!result.ok) assert.fail("stale recheck must be rejected before execution");
+          return result;
+        },
+      };
+      const { bot, apiCalls } = initActionsBot(actions);
+      await bot.handleUpdate(callbackUpdate("tavily:recheck:2026-07-1", result.ok ? 6 : 7));
+      assert.equal(apiCalls.filter((call) => call.method === "answerCallbackQuery").length, 1);
+      assert.match(
+        String(apiCalls.find((call) => call.method === "answerCallbackQuery")?.payload.text),
+        result.ok ? /Rechecking/ : /stale/,
+      );
+      assert.equal(apiCalls.some((call) => call.method === "sendMessage"), false);
+    }
+  });
+
+  it("handles owner callbacks even when there are no normal Telegram bindings", async () => {
+    let acknowledgements = 0;
+    const actions: TavilyOperatorActions = {
+      getDeliveryDestination: () => destination,
+      isIncidentActive: () => true,
+      acknowledgeIncident: async () => {
+        acknowledgements += 1;
+        return true;
+      },
+      recheckIncident: async () => assert.fail("recheck was not expected"),
+    };
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot } = createTelegramBot({ ...config, bindings: [] }, sessionManager(), { tavilyActions: actions });
+    bot.api.config.use(async (_prev, method, payload) => {
+      apiCalls.push({ method, payload });
+      return { ok: true, result: true } as any;
+    });
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "TestBot",
+      username: "test_bot",
+      can_join_groups: true,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+      can_manage_bots: false,
+      supports_join_request_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+      has_topics_enabled: false,
+      allows_users_to_create_topics: false,
+    };
+
+    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-1", 8));
+    assert.equal(acknowledgements, 1);
+    assert.match(String(apiCalls[0]?.payload.text), /acknowledged/);
   });
 });
 

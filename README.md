@@ -142,15 +142,19 @@ cycle. Tavily HTTP 432 or 433 responses from either web tool open one shared
 critical incident. Notifications go to `adminChatId` when set; otherwise they
 use `defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`.
 Transient delivery failures use the durable outbox with bounded backoff;
-missing destinations and deterministic Telegram 4xx failures remain visible
-terminal diagnostics instead of retrying forever.
+the owner-only Telegram transport also starts in Discord-backed deployments
+without normal Telegram agent bindings. Missing destinations and deterministic
+Telegram 4xx failures remain visible terminal diagnostics and suppress further
+incident reminders. After correcting the destination, an explicit process
+restart permits one fresh delivery attempt instead of retrying forever.
 
 Incident messages provide generation-bound Telegram actions:
 `acknowledge degraded mode` stops reminders, while `credits fixed — recheck`
 runs one bounded verification. Recheck succeeds only when current `/usage` is
 recoverable and fixed Search and Extract probes both return validated non-empty
-results. The sampler uses the same verification once when active usage first
-becomes recoverable; neither path retries provider requests automatically.
+results. Failed explicit rechecks are reported through the same durable outbox.
+The sampler uses the same verification once when active usage first becomes
+recoverable; neither path retries provider requests automatically.
 
 `/status` includes sample freshness, base-plan and PAYGO counters, the latest
 bounded failure class, and incident/acknowledgement state. Prometheus exports

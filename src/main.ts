@@ -128,11 +128,11 @@ async function main(): Promise<void> {
     apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
     onStateChange: recordTavilyMonitorMetrics,
   });
-  const telegramConfigured = Boolean(config.telegramToken && config.bindings.length > 0);
+  const telegramConfigured = Boolean(config.telegramToken);
   tavilyRuntime = new TavilyMonitorRuntime({
     monitor: tavilyMonitor,
     destination: telegramConfigured ? resolveTavilyDeliveryDestination(config) : undefined,
-    deliver: async (payload) => {
+    deliver: async (payload, signal) => {
       if (!telegramBot) {
         throw { error_code: 400 };
       }
@@ -143,13 +143,18 @@ async function main(): Promise<void> {
       } as Parameters<typeof telegramBot.api.sendMessage>[2] & {
         [TAVILY_DURABLE_DELIVERY]: true;
       };
-      await telegramBot.api.sendMessage(payload.chatId, payload.text, sendOptions);
+      await telegramBot.api.sendMessage(
+        payload.chatId,
+        payload.text,
+        sendOptions,
+        signal as Parameters<typeof telegramBot.api.sendMessage>[3],
+      );
     },
     onError: () => log.error("main", "Tavily monitor transition failed"),
   });
 
   // Start Telegram bot if configured
-  if (config.telegramToken && config.bindings.length > 0) {
+  if (config.telegramToken) {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
