@@ -29,13 +29,13 @@ Fix issue #66 by removing the package-level cron model pin and making every LLM 
 ## Implementation Steps
 
 ### Task 1: Propagate the selected agent model through cron execution
-- [ ] Extend cron agent data to carry the selected agent's required effective model.
-- [ ] Normalize the configured Pi model with the shared runtime helper and remove `PI_CRON_MODEL`.
-- [ ] Use the resolved cron agent model consistently for context assembly and Pi spawn arguments.
-- [ ] Reject blank agent model strings through shared configuration validation.
-- [ ] Update focused config/cron-runner tests for model propagation, normalization, spawn consistency, and blank-model rejection.
-- [ ] Add a concise documentation note that LLM crons inherit their selected agent's model and have no implicit package pin.
-- [ ] Run the focused cron-runner and configuration tests; fix all failures before Task 2.
+- [x] Extend cron agent data to carry the selected agent's required effective model.
+- [x] Normalize the configured Pi model with the shared runtime helper and remove `PI_CRON_MODEL`.
+- [x] Use the resolved cron agent model consistently for context assembly and Pi spawn arguments.
+- [x] Reject blank agent model strings through shared configuration validation.
+- [x] Update focused config/cron-runner tests for model propagation, normalization, spawn consistency, and blank-model rejection.
+- [x] Add a concise documentation note that LLM crons inherit their selected agent's model and have no implicit package pin.
+- [x] Run the focused cron-runner and configuration tests; fix all failures before Task 2.
 
 ### Task 2: Verify issue #66 acceptance criteria and package integrity
 - [ ] Verify changing one agent model changes only cron runs selecting that agent.

@@ -285,6 +285,15 @@ describe("validateAgent model validation", () => {
     );
   });
 
+  it("throws when agent model is blank", () => {
+    for (const model of ["", "   ", "\t\n"]) {
+      assert.throws(
+        () => validateAgent({ workspaceCwd: "/tmp/x", model }, "main"),
+        /Agent "main" has invalid model \(must be a non-empty string\)/,
+      );
+    }
+  });
+
   it("throws when agent fallbackModel is present", () => {
     assert.throws(
       () => validateAgent(

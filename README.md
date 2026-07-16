@@ -329,6 +329,8 @@ label for stale-registration cleanup instead of custom lock files.
 Cron schedule deployment is separate from bot restart. Cron prompt and timeout
 changes are read by the cron runner from the merged workspace cron files at
 each execution, so they do not require restarting `ai.minime.telegram-bot`.
+Each LLM cron inherits the model configured for its selected agent; there is no
+per-cron model override or implicit package-level cron model pin.
 Schedule changes that affect launchd plists are synced with:
 
 ```bash

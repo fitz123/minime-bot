@@ -236,6 +236,9 @@ export function validateAgent(
   if (obj.model !== undefined && typeof obj.model !== "string") {
     throw new Error(`Agent "${id}" has invalid model (must be a string)`);
   }
+  if (typeof obj.model === "string" && obj.model.trim() === "") {
+    throw new Error(`Agent "${id}" has invalid model (must be a non-empty string)`);
+  }
   if (obj.provider === "claude") {
     throw new Error(
       `Agent "${id}" uses provider "claude", but the Claude runtime has been removed; remove provider or set provider: "pi"`,
