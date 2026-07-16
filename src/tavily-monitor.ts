@@ -1417,6 +1417,10 @@ export class TavilyMonitor {
       existing.lastObservedAt = laterTimestamp(existing.lastObservedAt, event.observedAt);
       if (event.observedAt >= existing.lastObservedAt) existing.lastClassification = event.classification;
       if (!existing.observedTools.includes(event.tool)) existing.observedTools.push(event.tool);
+      existing.lastUsageRecoverable = false;
+      if (state.pendingAutomaticVerification?.generation === existing.generation) {
+        delete state.pendingAutomaticVerification;
+      }
       return;
     }
     if (existing?.resolvedAt) {

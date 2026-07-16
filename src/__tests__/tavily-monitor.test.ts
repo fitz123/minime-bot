@@ -769,16 +769,20 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
       now: clock.now,
       fetchImpl: (async () => {
         calls += 1;
-        if (calls === 1) return jsonResponse(usageResponse({ planUsage: 100 }));
-        if (calls === 2) return jsonResponse(successfulSearchResponse());
-        clock.set("2026-07-16T12:06:00.000Z");
-        writeExhaustionEvent(
-          workspace,
-          "web_fetch",
-          "paygo_exhausted",
-          "2026-07-16T12:06:00.000Z",
-          "during-verification",
-        );
+        if (calls === 1 || calls === 4) {
+          return jsonResponse(usageResponse({ planUsage: 100 }));
+        }
+        if (calls === 2 || calls === 5) return jsonResponse(successfulSearchResponse());
+        if (calls === 3) {
+          clock.set("2026-07-16T12:06:00.000Z");
+          writeExhaustionEvent(
+            workspace,
+            "web_fetch",
+            "paygo_exhausted",
+            "2026-07-16T12:06:00.000Z",
+            "during-verification",
+          );
+        }
         return jsonResponse(successfulExtractResponse());
       }) as typeof fetch,
     });
@@ -794,6 +798,11 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.equal(monitor.getState().incident?.resolvedAt, undefined);
     assert.equal(monitor.getState().incident?.lastObservedAt, "2026-07-16T12:06:00.000Z");
     assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
+
+    clock.set("2026-07-16T12:10:00.000Z");
+    await monitor.sampleUsage();
+    assert.equal(calls, 6, "a later recoverable transition reruns both probes");
+    assert.ok(monitor.getState().incident?.resolvedAt);
   });
 
   it("waits for an already-started cross-process event publication before resolving", async () => {
