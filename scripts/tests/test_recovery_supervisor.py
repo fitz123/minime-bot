@@ -159,7 +159,10 @@ def fixer_config_fields(root: Path) -> dict[str, object]:
 
 
 def supervisor_config_document(*, port: int = 9877) -> dict[str, object]:
-    from test_recovery_cli import config_document
+    if __package__:
+        from .test_recovery_cli import config_document
+    else:
+        from test_recovery_cli import config_document
 
     document = config_document()
     document.update(

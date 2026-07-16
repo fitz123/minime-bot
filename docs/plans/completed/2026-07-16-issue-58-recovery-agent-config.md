@@ -1,5 +1,7 @@
 # Issue #58 recovery agent config isolation hotfix
 
+Status: implementation complete and validated on 2026-07-16.
+
 ## Goal
 
 Allow the recovery fixer runner to resolve its configured internal agent from a secret-backed bot configuration without materializing unrelated transport credentials. Preserve full agent/config validation, the sanitized runner environment, and the existing recovery safety boundary.
