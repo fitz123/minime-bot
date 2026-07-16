@@ -30,12 +30,12 @@ Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch
 ## Implementation Steps
 
 ### Task 1: Classify Tavily requests and emit sanitized child events
-- [ ] In `src/pi-extensions/tavily.ts`, add a typed Tavily failure classifier for missing/invalid credential or HTTP 401, HTTP 429, base-plan exhaustion 432, PAYGO exhaustion 433, transport/5xx outage, and extraction failure; never retain provider bodies, queries, URLs, or keys in returned diagnostics/events.
-- [ ] Preserve `WEB_SEARCH_TOOL` and `WEB_FETCH_TOOL` schemas and successful formatting; make failure text explicitly distinguish the bounded classes and treat an empty/failed Extract response as extraction failure while retaining useful partial Extract results.
-- [ ] Add a small owner-only unique-event writer under the resolved control-workspace data path and have `extensions/pi/web-tools.ts` emit only `{version, tool, classification, httpStatus, observedAt}`; 432/433 event persistence must happen before the tool returns.
-- [ ] Keep the existing SOPS lookup and all query/URL/DNS egress guards unchanged, and pass the Pi cancellation signal through bounded requests without adding retries.
-- [ ] Extend `src/__tests__/tavily.test.ts` with all classifications, Search/Extract 432/433 events, extraction failure, missing secret, transport/5xx, redaction, event-file safety, unchanged schemas/success output, and complete existing egress regressions.
-- [ ] Run the focused Tavily tests and typecheck before Task 2.
+- [x] In `src/pi-extensions/tavily.ts`, add a typed Tavily failure classifier for missing/invalid credential or HTTP 401, HTTP 429, base-plan exhaustion 432, PAYGO exhaustion 433, transport/5xx outage, and extraction failure; never retain provider bodies, queries, URLs, or keys in returned diagnostics/events.
+- [x] Preserve `WEB_SEARCH_TOOL` and `WEB_FETCH_TOOL` schemas and successful formatting; make failure text explicitly distinguish the bounded classes and treat an empty/failed Extract response as extraction failure while retaining useful partial Extract results.
+- [x] Add a small owner-only unique-event writer under the resolved control-workspace data path and have `extensions/pi/web-tools.ts` emit only `{version, tool, classification, httpStatus, observedAt}`; 432/433 event persistence must happen before the tool returns.
+- [x] Keep the existing SOPS lookup and all query/URL/DNS egress guards unchanged, and pass the Pi cancellation signal through bounded requests without adding retries.
+- [x] Extend `src/__tests__/tavily.test.ts` with all classifications, Search/Extract 432/433 events, extraction failure, missing secret, transport/5xx, redaction, event-file safety, unchanged schemas/success output, and complete existing egress regressions.
+- [x] Run the focused Tavily tests and typecheck before Task 2.
 
 ### Task 2: Implement the durable usage/incident state machine
 - [ ] Add a Tavily-specific module that builds/parses authenticated `GET /usage`, validates key/account/base-plan/PAYGO counters, derives the monthly billing-cycle generation, and exposes fixed sanitized Search and Extract recovery probes with explicit timeouts and no retries.

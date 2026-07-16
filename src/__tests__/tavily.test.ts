@@ -1,12 +1,23 @@
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   buildExtractRequest,
   buildSearchRequest,
+  classifyTavilyFailure,
   DEFAULT_SEARCH_MAX_RESULTS,
   executeWebFetch,
   executeWebSearch,
@@ -21,8 +32,15 @@ import {
   WEB_FETCH_TOOL,
   WEB_SEARCH_TOOL,
   type RunToolDeps,
+  type TavilyFailure,
   type TavilyWarn,
 } from "../pi-extensions/tavily.js";
+import {
+  TAVILY_CHILD_EVENT_VERSION,
+  TAVILY_EVENT_SPOOL_RELPATH,
+  tavilyEventSpoolDirectory,
+  writeTavilyChildEvent,
+} from "../pi-extensions/tavily-events.js";
 import {
   readTavilyApiKeyFromSops,
   tavilyControlWorkspaceRoot,
@@ -56,7 +74,11 @@ interface WrapperToolResult {
 
 interface RegisteredTool {
   name: string;
-  execute: (toolCallId: string, params: Record<string, unknown>) => Promise<WrapperToolResult>;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => Promise<WrapperToolResult>;
 }
 
 /** A minimal Response-like object for the success / HTTP-error paths. */
@@ -90,6 +112,122 @@ function makeDeps(overrides: Partial<RunToolDeps> = {}): { deps: RunToolDeps; wa
   };
   return { deps, warns };
 }
+
+describe("tavily: bounded failure classification", () => {
+  it("classifies credentials, quota responses, outages, and extraction failures", () => {
+    assert.deepEqual(classifyTavilyFailure({ kind: "missing-credential" }), {
+      classification: "credential_missing",
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 401 }), {
+      classification: "credential_invalid",
+      httpStatus: 401,
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 429 }), {
+      classification: "rate_limited",
+      httpStatus: 429,
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 432 }), {
+      classification: "base_plan_exhausted",
+      httpStatus: 432,
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 433 }), {
+      classification: "paygo_exhausted",
+      httpStatus: 433,
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 503 }), {
+      classification: "provider_unavailable",
+      httpStatus: 503,
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "transport" }), {
+      classification: "provider_unavailable",
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "extraction" }), {
+      classification: "extraction_failed",
+    });
+    assert.deepEqual(classifyTavilyFailure({ kind: "http", httpStatus: 400 }), {
+      classification: "request_failed",
+      httpStatus: 400,
+    });
+  });
+});
+
+describe("tavily: child failure event writer", () => {
+  it("atomically creates unique minimal owner-only event files under control data", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-writer-"));
+    const observedAt = new Date("2026-07-16T10:20:30.000Z");
+    const firstFailure: TavilyFailure = { classification: "base_plan_exhausted", httpStatus: 432 };
+    const secondFailure: TavilyFailure = { classification: "paygo_exhausted", httpStatus: 433 };
+
+    try {
+      const firstPath = writeTavilyChildEvent(controlWorkspace, "web_search", firstFailure, {
+        now: () => observedAt,
+        uniqueId: () => "event-one",
+        pid: 77,
+      });
+      const secondPath = writeTavilyChildEvent(controlWorkspace, "web_fetch", secondFailure, {
+        now: () => observedAt,
+        uniqueId: () => "event-two",
+        pid: 77,
+      });
+      const spool = tavilyEventSpoolDirectory(controlWorkspace);
+
+      assert.equal(TAVILY_EVENT_SPOOL_RELPATH, "data/tavily/events");
+      assert.equal(dirname(firstPath), spool);
+      assert.equal(dirname(secondPath), spool);
+      assert.notEqual(firstPath, secondPath);
+      assert.deepEqual(readdirSync(spool).sort(), [
+        "1784197230000-77-event-one.json",
+        "1784197230000-77-event-two.json",
+      ]);
+      assert.deepEqual(JSON.parse(readFileSync(firstPath, "utf8")), {
+        version: TAVILY_CHILD_EVENT_VERSION,
+        tool: "web_search",
+        classification: "base_plan_exhausted",
+        httpStatus: 432,
+        observedAt: "2026-07-16T10:20:30.000Z",
+      });
+      assert.deepEqual(Object.keys(JSON.parse(readFileSync(secondPath, "utf8"))).sort(), [
+        "classification",
+        "httpStatus",
+        "observedAt",
+        "tool",
+        "version",
+      ]);
+      assert.equal(lstatSync(join(controlWorkspace, "data")).mode & 0o777, 0o700);
+      assert.equal(lstatSync(join(controlWorkspace, "data", "tavily")).mode & 0o777, 0o700);
+      assert.equal(lstatSync(spool).mode & 0o777, 0o700);
+      assert.equal(lstatSync(firstPath).mode & 0o777, 0o600);
+      assert.doesNotMatch(
+        readFileSync(firstPath, "utf8"),
+        /private query|https:\/\/private\.example|tvly-private|\/Users\/private/,
+      );
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked spool component", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-symlink-control-"));
+    const outside = mkdtempSync(join(tmpdir(), "tavily-event-symlink-outside-"));
+
+    try {
+      mkdirSync(join(controlWorkspace, "data"), { mode: 0o700 });
+      symlinkSync(outside, join(controlWorkspace, "data", "tavily"));
+      assert.throws(
+        () => writeTavilyChildEvent(
+          controlWorkspace,
+          "web_search",
+          { classification: "provider_unavailable" },
+        ),
+        /not a plain directory/,
+      );
+      assert.deepEqual(readdirSync(outside), []);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("tavily: buildSearchRequest", () => {
   it("targets the Tavily /search endpoint via POST with a Bearer header", () => {
@@ -247,7 +385,13 @@ describe("tavily: executeWebSearch", () => {
     assert.match(res.text, /SOPS key tavily\.api_key in config\/secrets\.sops\.yaml/);
     assert.doesNotMatch(res.text, /keychain|Keychain|tavily-api-key|minime/);
     assert.equal(mock.calls.length, 0);
-    assert.deepEqual(warns, [{ tool: "web_search", reason: "missing-key" }]);
+    assert.deepEqual(res.failure, { classification: "credential_missing" });
+    assert.deepEqual(warns, [{
+      tool: "web_search",
+      reason: "missing-key",
+      classification: "credential_missing",
+      httpStatus: undefined,
+    }]);
   });
 
   it("rejects an empty query gracefully (bad-args, no fetch)", async () => {
@@ -316,26 +460,74 @@ describe("tavily: executeWebSearch", () => {
     ]);
   });
 
-  it("maps a non-2xx response to a graceful http-error result", async () => {
-    const mock = mockFetch(async () => jsonResponse("rate limited", 429));
-    const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
-    const res = await executeWebSearch({ query: "q" }, deps);
-    assert.equal(res.ok, false);
-    assert.match(res.text, /web_search failed/);
-    assert.match(res.text, /HTTP 429/);
-    assert.equal(warns[0].tool, "web_search");
-    assert.equal(warns[0].reason, "http-error");
+  it("maps HTTP failures to distinct sanitized diagnostics without reading provider bodies", async () => {
+    const cases = [
+      { status: 401, classification: "credential_invalid", text: /credential is invalid/ },
+      { status: 429, classification: "rate_limited", text: /rate limit reached/ },
+      { status: 432, classification: "base_plan_exhausted", text: /base-plan credits are exhausted/ },
+      { status: 433, classification: "paygo_exhausted", text: /PAYGO credits are exhausted/ },
+      { status: 503, classification: "provider_unavailable", text: /temporarily unavailable/ },
+    ] as const;
+
+    for (const testCase of cases) {
+      const privateBody = "tvly-private-key private query https://private.example /Users/private/file";
+      let bodyRead = false;
+      const mock = mockFetch(async () => ({
+        ok: false,
+        status: testCase.status,
+        text: async () => {
+          bodyRead = true;
+          return privateBody;
+        },
+      }) as Response);
+      const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
+      const res = await executeWebSearch({ query: "q" }, deps);
+
+      assert.equal(res.ok, false);
+      assert.match(res.text, testCase.text);
+      assert.match(res.text, new RegExp(`HTTP ${testCase.status}`));
+      assert.deepEqual(res.failure, {
+        classification: testCase.classification,
+        httpStatus: testCase.status,
+      });
+      assert.deepEqual(warns, [{
+        tool: "web_search",
+        reason: "tavily-failure",
+        classification: testCase.classification,
+        httpStatus: testCase.status,
+      }]);
+      assert.equal(bodyRead, false);
+      assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /tvly-private|private query|private\.example|\/Users\/private/);
+    }
   });
 
-  it("maps a transport error to a graceful request-failed result", async () => {
+  it("maps a transport error to a fixed provider-unavailable result", async () => {
     const mock = mockFetch(async () => {
-      throw new Error("ECONNREFUSED");
+      throw new Error("ECONNREFUSED tvly-private https://private.example /Users/private/file");
     });
     const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
     const res = await executeWebSearch({ query: "q" }, deps);
     assert.equal(res.ok, false);
-    assert.match(res.text, /web_search failed: ECONNREFUSED/);
-    assert.equal(warns[0].reason, "request-failed");
+    assert.equal(res.text, "web_search failed: Tavily is temporarily unavailable.");
+    assert.deepEqual(res.failure, { classification: "provider_unavailable" });
+    assert.deepEqual(warns, [{
+      tool: "web_search",
+      reason: "tavily-failure",
+      classification: "provider_unavailable",
+      httpStatus: undefined,
+    }]);
+    assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /ECONNREFUSED|tvly-private|private\.example|\/Users\/private/);
+  });
+
+  it("passes the Pi cancellation signal through the Tavily request", async () => {
+    const request = mockFetch(async () => jsonResponse({ results: [] }));
+    const { deps } = makeDeps({ fetchImpl: request.fn });
+    const controller = new AbortController();
+
+    const res = await executeWebSearch({ query: "q" }, deps, controller.signal);
+
+    assert.equal(res.ok, true);
+    assert.equal(request.calls[0].init?.signal, controller.signal);
   });
 });
 
@@ -359,7 +551,13 @@ describe("tavily: executeWebFetch", () => {
     assert.match(res.text, /SOPS key tavily\.api_key in config\/secrets\.sops\.yaml/);
     assert.doesNotMatch(res.text, /keychain|Keychain|tavily-api-key|minime/);
     assert.equal(mock.calls.length, 0);
-    assert.deepEqual(warns, [{ tool: "web_fetch", reason: "missing-key" }]);
+    assert.deepEqual(res.failure, { classification: "credential_missing" });
+    assert.deepEqual(warns, [{
+      tool: "web_fetch",
+      reason: "missing-key",
+      classification: "credential_missing",
+      httpStatus: undefined,
+    }]);
   });
 
   it("rejects an empty url gracefully (bad-args)", async () => {
@@ -552,14 +750,60 @@ describe("tavily: executeWebFetch", () => {
     assert.equal(warns.length, 0);
   });
 
-  it("maps a non-2xx response to a graceful http-error result", async () => {
-    const mock = mockFetch(async () => jsonResponse("boom", 500));
+  it("classifies empty and wholly failed Extract responses without returning private URLs", async () => {
+    const privateUrl = "https://private.example/path?secret=tvly-private";
+    for (const body of [
+      { results: [] },
+      { results: [], failed_results: [{ url: privateUrl }] },
+      { results: [{ url: privateUrl, raw_content: "   " }] },
+    ]) {
+      const mock = mockFetch(async () => jsonResponse(body));
+      const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
+      const res = await executeWebFetch({ url: "https://example.com" }, deps);
+
+      assert.equal(res.ok, false);
+      assert.equal(res.text, "web_fetch failed: Tavily returned no usable extracted content.");
+      assert.deepEqual(res.failure, { classification: "extraction_failed" });
+      assert.deepEqual(warns, [{
+        tool: "web_fetch",
+        reason: "tavily-failure",
+        classification: "extraction_failed",
+        httpStatus: undefined,
+      }]);
+      assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /private\.example|tvly-private/);
+    }
+  });
+
+  it("retains useful partial Extract results", async () => {
+    const mock = mockFetch(async () => jsonResponse({
+      results: [{ url: "https://example.com/good", raw_content: "useful page body" }],
+      failed_results: [{ url: "https://example.com/failed" }],
+    }));
+    const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
+
+    const res = await executeWebFetch({ url: "https://example.com" }, deps);
+
+    assert.equal(res.ok, true);
+    assert.match(res.text, /useful page body/);
+    assert.match(res.text, /Failed to extract: https:\/\/example\.com\/failed/);
+    assert.equal(res.failure, undefined);
+    assert.deepEqual(warns, []);
+  });
+
+  it("maps a 5xx response to a sanitized provider-unavailable result", async () => {
+    const mock = mockFetch(async () => jsonResponse("tvly-private provider body", 500));
     const { deps, warns } = makeDeps({ fetchImpl: mock.fn });
     const res = await executeWebFetch({ url: "https://example.com" }, deps);
     assert.equal(res.ok, false);
-    assert.match(res.text, /web_fetch failed/);
-    assert.match(res.text, /HTTP 500/);
-    assert.equal(warns[0].reason, "http-error");
+    assert.equal(res.text, "web_fetch failed: Tavily is temporarily unavailable (HTTP 500).");
+    assert.deepEqual(res.failure, { classification: "provider_unavailable", httpStatus: 500 });
+    assert.deepEqual(warns, [{
+      tool: "web_fetch",
+      reason: "tavily-failure",
+      classification: "provider_unavailable",
+      httpStatus: 500,
+    }]);
+    assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /tvly-private|provider body/);
   });
 });
 
@@ -739,8 +983,13 @@ describe("tavily: SOPS API key lookup", () => {
 describe("tavily: warn + tool descriptors", () => {
   it("formats a structured warn line", () => {
     assert.equal(
-      formatTavilyWarn({ tool: "web_search", reason: "http-error", detail: "HTTP 429" }),
-      "[web-tools] tool=web_search reason=http-error detail=HTTP 429",
+      formatTavilyWarn({
+        tool: "web_search",
+        reason: "tavily-failure",
+        classification: "rate_limited",
+        httpStatus: 429,
+      }),
+      "[web-tools] tool=web_search reason=tavily-failure classification=rate_limited httpStatus=429",
     );
     assert.equal(
       formatTavilyWarn({ tool: "web_fetch", reason: "missing-key" }),
@@ -836,7 +1085,9 @@ describe("web-tools Pi wrapper", () => {
       registerWebTools({ registerTool: (tool) => registered.push(tool) });
 
       assert.deepEqual(registered.map((tool) => tool.name), ["web_search", "web_fetch"]);
-      assert.deepEqual(warnings, ["[web-tools] tool=web_search reason=missing-key"]);
+      assert.deepEqual(warnings, [
+        "[web-tools] tool=web_search reason=missing-key classification=credential_missing",
+      ]);
 
       const result = await registered[0].execute("call-1", { query: "docs" });
       assert.equal(result.details.ok, false);
@@ -844,6 +1095,107 @@ describe("web-tools Pi wrapper", () => {
       assert.match(result.content[0].text, /SOPS key tavily\.api_key in config\/secrets\.sops\.yaml/);
     } finally {
       console.warn = oldWarn;
+      if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      else process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
+      process.chdir(oldCwd);
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists minimal Search and Extract 432/433 events before each tool returns", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-events-"));
+    const controlWorkspace = join(tmpDir, "control-workspace");
+    const childWorkspace = join(tmpDir, "child-workspace");
+    const binDir = join(tmpDir, "bin");
+    const oldCwd = process.cwd();
+    const oldPath = process.env.PATH;
+    const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldFetch = globalThis.fetch;
+    const oldWarn = console.warn;
+    const registered: RegisteredTool[] = [];
+    const warnings: string[] = [];
+    const statuses = [432, 433, 432, 433];
+    const signals: Array<AbortSignal | null | undefined> = [];
+
+    try {
+      mkdirSync(join(controlWorkspace, "config"), { recursive: true });
+      mkdirSync(childWorkspace, { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(join(controlWorkspace, TAVILY_SOPS_FILE_RELPATH), "placeholder: true\n", "utf8");
+      writeFileSync(join(binDir, "sops"), "#!/bin/sh\nprintf 'tvly-wrapper-event-test-key\\n'\n", "utf8");
+      chmodSync(join(binDir, "sops"), 0o755);
+      process.env.PATH = `${binDir}:${oldPath ?? ""}`;
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
+      process.chdir(childWorkspace);
+      console.warn = (message?: unknown) => warnings.push(String(message));
+      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+        signals.push(init?.signal);
+        const status = statuses.shift();
+        assert.ok(status);
+        return jsonResponse(
+          "tvly-private-response https://private.example /Users/private provider query",
+          status,
+        );
+      }) as typeof fetch;
+
+      const registerWebTools = await importWrapper();
+      registerWebTools({ registerTool: (tool) => registered.push(tool) });
+      const search = registered.find((tool) => tool.name === "web_search");
+      const fetchTool = registered.find((tool) => tool.name === "web_fetch");
+      assert.ok(search);
+      assert.ok(fetchTool);
+      const controller = new AbortController();
+      const calls = [
+        () => search.execute("search-432", { query: "Tavily documentation" }, controller.signal),
+        () => search.execute("search-433", { query: "Tavily documentation" }, controller.signal),
+        () => fetchTool.execute("fetch-432", { url: "https://1.1.1.1/" }, controller.signal),
+        () => fetchTool.execute("fetch-433", { url: "https://1.1.1.1/" }, controller.signal),
+      ];
+      const expectedText = [/base-plan/, /PAYGO/, /base-plan/, /PAYGO/];
+      const spool = tavilyEventSpoolDirectory(controlWorkspace);
+
+      for (const [index, run] of calls.entries()) {
+        const result = await run();
+        assert.equal(result.details.ok, false);
+        assert.match(result.content[0].text, expectedText[index]);
+        assert.equal(readdirSync(spool).filter((name) => name.endsWith(".json")).length, index + 1);
+      }
+
+      assert.deepEqual(signals, [controller.signal, controller.signal, controller.signal, controller.signal]);
+      const events = readdirSync(spool)
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(spool, name), "utf8")) as Record<string, unknown>)
+        .sort((a, b) => `${a.tool}-${a.httpStatus}`.localeCompare(`${b.tool}-${b.httpStatus}`));
+      assert.deepEqual(events.map((event) => [event.tool, event.classification, event.httpStatus]), [
+        ["web_fetch", "base_plan_exhausted", 432],
+        ["web_fetch", "paygo_exhausted", 433],
+        ["web_search", "base_plan_exhausted", 432],
+        ["web_search", "paygo_exhausted", 433],
+      ]);
+      for (const event of events) {
+        assert.deepEqual(Object.keys(event).sort(), [
+          "classification",
+          "httpStatus",
+          "observedAt",
+          "tool",
+          "version",
+        ]);
+        assert.equal(event.version, TAVILY_CHILD_EVENT_VERSION);
+        assert.equal(typeof event.observedAt, "string");
+        assert.ok(Number.isFinite(Date.parse(String(event.observedAt))));
+      }
+      const durableOutput = readdirSync(spool)
+        .map((name) => readFileSync(join(spool, name), "utf8"))
+        .join("\n");
+      assert.doesNotMatch(
+        `${durableOutput}\n${warnings.join("\n")}`,
+        /tvly-wrapper|tvly-private|private\.example|\/Users\/private|provider query|Tavily documentation|1\.1\.1\.1/,
+      );
+    } finally {
+      globalThis.fetch = oldFetch;
+      console.warn = oldWarn;
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
       if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
       else process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldWorkspace;
       process.chdir(oldCwd);

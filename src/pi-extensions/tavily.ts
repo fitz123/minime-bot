@@ -90,11 +90,37 @@ export interface ParsedExtract {
 export interface WebToolResult {
   ok: boolean;
   text: string;
+  /** Sanitized provider failure metadata for the thin Pi wrapper/monitor spool. */
+  failure?: TavilyFailure;
 }
+
+/** Bounded values safe for tool diagnostics, durable state, and metric labels. */
+export type TavilyFailureClassification =
+  | "credential_missing"
+  | "credential_invalid"
+  | "rate_limited"
+  | "base_plan_exhausted"
+  | "paygo_exhausted"
+  | "provider_unavailable"
+  | "extraction_failed"
+  | "request_failed";
+
+export interface TavilyFailure {
+  classification: TavilyFailureClassification;
+  httpStatus?: number;
+}
+
+export type TavilyFailureInput =
+  | { kind: "missing-credential" }
+  | { kind: "http"; httpStatus: number }
+  | { kind: "transport" }
+  | { kind: "extraction" };
 
 export interface TavilyWarn {
   tool: "web_search" | "web_fetch";
-  reason: "missing-key" | "bad-args" | "blocked-egress" | "http-error" | "request-failed";
+  reason: "missing-key" | "bad-args" | "blocked-egress" | "tavily-failure" | "event-write-failed";
+  classification?: TavilyFailureClassification;
+  httpStatus?: number;
   detail?: string;
 }
 
@@ -113,7 +139,42 @@ export interface RunToolDeps {
 
 /** Format a {@link TavilyWarn} into a single structured log line. */
 export function formatTavilyWarn(w: TavilyWarn): string {
-  return `[web-tools] tool=${w.tool} reason=${w.reason}${w.detail ? ` detail=${w.detail}` : ""}`;
+  return `[web-tools] tool=${w.tool} reason=${w.reason}` +
+    `${w.classification ? ` classification=${w.classification}` : ""}` +
+    `${w.httpStatus !== undefined ? ` httpStatus=${w.httpStatus}` : ""}` +
+    `${w.detail ? ` detail=${w.detail}` : ""}`;
+}
+
+/** Map all provider-facing failures to a small, secret-safe classification set. */
+export function classifyTavilyFailure(input: TavilyFailureInput): TavilyFailure {
+  if (input.kind === "missing-credential") {
+    return { classification: "credential_missing" };
+  }
+  if (input.kind === "transport") {
+    return { classification: "provider_unavailable" };
+  }
+  if (input.kind === "extraction") {
+    return { classification: "extraction_failed" };
+  }
+
+  const httpStatus = input.httpStatus;
+  switch (httpStatus) {
+    case 401:
+      return { classification: "credential_invalid", httpStatus };
+    case 429:
+      return { classification: "rate_limited", httpStatus };
+    case 432:
+      return { classification: "base_plan_exhausted", httpStatus };
+    case 433:
+      return { classification: "paygo_exhausted", httpStatus };
+    default:
+      return {
+        classification: httpStatus >= 500 && httpStatus <= 599
+          ? "provider_unavailable"
+          : "request_failed",
+        httpStatus,
+      };
+  }
 }
 
 function authHeaders(apiKey: string): Record<string, string> {
@@ -593,6 +654,49 @@ function errResult(text: string): WebToolResult {
   return { ok: false, text };
 }
 
+function failureText(tool: "web_search" | "web_fetch", failure: TavilyFailure): string {
+  switch (failure.classification) {
+    case "credential_missing":
+      return missingKeyText(tool);
+    case "credential_invalid":
+      return `${tool} failed: the Tavily credential is invalid (HTTP 401).`;
+    case "rate_limited":
+      return `${tool} failed: Tavily request rate limit reached (HTTP 429).`;
+    case "base_plan_exhausted":
+      return `${tool} failed: Tavily base-plan credits are exhausted (HTTP 432).`;
+    case "paygo_exhausted":
+      return `${tool} failed: Tavily PAYGO credits are exhausted (HTTP 433).`;
+    case "provider_unavailable":
+      return `${tool} failed: Tavily is temporarily unavailable` +
+        `${failure.httpStatus === undefined ? "." : ` (HTTP ${failure.httpStatus}).`}`;
+    case "extraction_failed":
+      return `${tool} failed: Tavily returned no usable extracted content.`;
+    case "request_failed":
+      return `${tool} failed: Tavily rejected the request` +
+        `${failure.httpStatus === undefined ? "." : ` (HTTP ${failure.httpStatus}).`}`;
+  }
+}
+
+function classifiedFailureResult(
+  tool: "web_search" | "web_fetch",
+  failure: TavilyFailure,
+): WebToolResult {
+  return { ok: false, text: failureText(tool, failure), failure };
+}
+
+function warnFailure(
+  deps: RunToolDeps,
+  tool: "web_search" | "web_fetch",
+  failure: TavilyFailure,
+): void {
+  deps.warn?.({
+    tool,
+    reason: failure.classification === "credential_missing" ? "missing-key" : "tavily-failure",
+    classification: failure.classification,
+    httpStatus: failure.httpStatus,
+  });
+}
+
 function missingKeyText(tool: "web_search" | "web_fetch"): string {
   return `${tool} is unavailable: Tavily API key not configured (SOPS key ` +
     `${TAVILY_SOPS_KEY} in ${TAVILY_SOPS_FILE_RELPATH}). Add the private ` +
@@ -601,23 +705,22 @@ function missingKeyText(tool: "web_search" | "web_fetch"): string {
 
 /**
  * Run a built Tavily request through `fetchImpl`, returning the parsed JSON body
- * on a 2xx response. Throws on non-2xx (caller maps to a graceful result) and on
- * any transport error (propagated from `fetchImpl`).
+ * on a 2xx response. Throws only bounded status metadata on non-2xx; provider
+ * bodies are deliberately never read, logged, returned, or persisted.
  */
-async function fetchTavilyJson(req: TavilyHttpRequest, fetchImpl: typeof fetch): Promise<unknown> {
+async function fetchTavilyJson(
+  req: TavilyHttpRequest,
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const res = await fetchImpl(req.url, {
     method: req.method,
     headers: req.headers,
     body: req.body,
+    signal,
   });
   if (!res.ok) {
-    let detail = "";
-    try {
-      detail = (await res.text()).slice(0, 300);
-    } catch {
-      detail = "";
-    }
-    const err = new Error(`HTTP ${res.status}${detail ? ` ${detail}` : ""}`);
+    const err = new Error("Tavily HTTP request failed");
     (err as { httpStatus?: number }).httpStatus = res.status;
     throw err;
   }
@@ -625,10 +728,15 @@ async function fetchTavilyJson(req: TavilyHttpRequest, fetchImpl: typeof fetch):
 }
 
 /** Execute a `web_search` tool call. Never throws (criterion 3 — graceful). */
-export async function executeWebSearch(args: WebSearchArgs, deps: RunToolDeps): Promise<WebToolResult> {
+export async function executeWebSearch(
+  args: WebSearchArgs,
+  deps: RunToolDeps,
+  signal?: AbortSignal,
+): Promise<WebToolResult> {
   if (!deps.apiKey) {
-    deps.warn?.({ tool: "web_search", reason: "missing-key" });
-    return errResult(missingKeyText("web_search"));
+    const failure = classifyTavilyFailure({ kind: "missing-credential" });
+    warnFailure(deps, "web_search", failure);
+    return classifiedFailureResult("web_search", failure);
   }
 
   const query = typeof args.query === "string" ? args.query.trim() : "";
@@ -645,25 +753,28 @@ export async function executeWebSearch(args: WebSearchArgs, deps: RunToolDeps): 
 
   const req = buildSearchRequest(deps.apiKey, { ...args, query });
   try {
-    const json = await fetchTavilyJson(req, deps.fetchImpl);
+    const json = await fetchTavilyJson(req, deps.fetchImpl, signal);
     return { ok: true, text: formatSearchResult(query, parseSearchResponse(json)) };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const isHttp = typeof (err as { httpStatus?: number }).httpStatus === "number";
-    deps.warn?.({
-      tool: "web_search",
-      reason: isHttp ? "http-error" : "request-failed",
-      detail: message,
-    });
-    return errResult(`web_search failed: ${message}`);
+    const httpStatus = (err as { httpStatus?: unknown }).httpStatus;
+    const failure = typeof httpStatus === "number"
+      ? classifyTavilyFailure({ kind: "http", httpStatus })
+      : classifyTavilyFailure({ kind: "transport" });
+    warnFailure(deps, "web_search", failure);
+    return classifiedFailureResult("web_search", failure);
   }
 }
 
 /** Execute a `web_fetch` tool call. Never throws (criterion 3 — graceful). */
-export async function executeWebFetch(args: WebFetchArgs, deps: RunToolDeps): Promise<WebToolResult> {
+export async function executeWebFetch(
+  args: WebFetchArgs,
+  deps: RunToolDeps,
+  signal?: AbortSignal,
+): Promise<WebToolResult> {
   if (!deps.apiKey) {
-    deps.warn?.({ tool: "web_fetch", reason: "missing-key" });
-    return errResult(missingKeyText("web_fetch"));
+    const failure = classifyTavilyFailure({ kind: "missing-credential" });
+    warnFailure(deps, "web_fetch", failure);
+    return classifiedFailureResult("web_fetch", failure);
   }
 
   const url = typeof args.url === "string" ? args.url.trim() : "";
@@ -680,17 +791,21 @@ export async function executeWebFetch(args: WebFetchArgs, deps: RunToolDeps): Pr
 
   const req = buildExtractRequest(deps.apiKey, { url: egress.safeUrl ?? url });
   try {
-    const json = await fetchTavilyJson(req, deps.fetchImpl);
-    return { ok: true, text: formatExtractResult(parseExtractResponse(json)) };
+    const json = await fetchTavilyJson(req, deps.fetchImpl, signal);
+    const parsed = parseExtractResponse(json);
+    if (!parsed.results.some((result) => result.content.trim().length > 0)) {
+      const failure = classifyTavilyFailure({ kind: "extraction" });
+      warnFailure(deps, "web_fetch", failure);
+      return classifiedFailureResult("web_fetch", failure);
+    }
+    return { ok: true, text: formatExtractResult(parsed) };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const isHttp = typeof (err as { httpStatus?: number }).httpStatus === "number";
-    deps.warn?.({
-      tool: "web_fetch",
-      reason: isHttp ? "http-error" : "request-failed",
-      detail: message,
-    });
-    return errResult(`web_fetch failed: ${message}`);
+    const httpStatus = (err as { httpStatus?: unknown }).httpStatus;
+    const failure = typeof httpStatus === "number"
+      ? classifyTavilyFailure({ kind: "http", httpStatus })
+      : classifyTavilyFailure({ kind: "transport" });
+    warnFailure(deps, "web_fetch", failure);
+    return classifiedFailureResult("web_fetch", failure);
   }
 }
 
