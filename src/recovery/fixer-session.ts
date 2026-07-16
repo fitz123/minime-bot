@@ -328,7 +328,7 @@ export async function terminateRecoveryProcessGroup(
 }
 
 export function resolveRecoveryAgent(agentId: string, configPath?: string): AgentConfig {
-  const config = loadConfig(configPath);
+  const config = loadConfig(configPath, { resolveSecrets: false });
   const agent = config.agents[agentId];
   if (!agent) throw new Error("Configured recovery agent is unavailable");
   return agent;
