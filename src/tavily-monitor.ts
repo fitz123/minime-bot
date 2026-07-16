@@ -1456,7 +1456,7 @@ export class TavilyMonitor {
 
   /** Drain all committed child events; each state transition is saved before unlink. */
   drainChildEvents(): number {
-    ensureMonitorDirectories(dirname(dirname(dirname(this.eventDirectory))));
+    ensureMonitorDirectories(this.controlWorkspaceRoot);
     ensurePrivateDirectory(this.eventDirectory);
     let files: string[];
     try {
@@ -1786,6 +1786,7 @@ export class TavilyMonitor {
       const incident = state.incident;
       if (incident && !incident.resolvedAt && entry.incidentGeneration === incident.generation) {
         incident.deliveryTerminalAt = now;
+        cancelPendingNotifications(state, incident.generation, ["reminder"]);
       }
     });
     return true;

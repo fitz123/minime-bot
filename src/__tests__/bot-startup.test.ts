@@ -8,6 +8,7 @@ import {
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
+  stopTelegramBot,
   stopTelegramBotInBackground,
 } from "../bot-startup.js";
 
@@ -167,6 +168,30 @@ describe("stopTelegramBotInBackground", () => {
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(reported, expected);
+  });
+
+  it("allows restart scheduling only after grammY cleanup settles", async () => {
+    let finishStop!: () => void;
+    const stopPending = new Promise<void>((resolve) => { finishStop = resolve; });
+    const pendingTimers: Array<{ callback: () => void; delayMs: number }> = [];
+    const scheduler = createTelegramPollingRestartScheduler({
+      baseDelayMs: 5,
+      setTimeoutFn: (callback, delayMs) => {
+        pendingTimers.push({ callback, delayMs });
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+    });
+
+    const cleanup = stopTelegramBot(
+      { stop: () => stopPending },
+      () => assert.fail("cleanup unexpectedly failed"),
+    ).then(() => scheduler.schedule(() => {}));
+
+    await Promise.resolve();
+    assert.equal(pendingTimers.length, 0, "a new polling generation cannot overlap cleanup");
+    finishStop();
+    assert.equal(await cleanup, 5);
+    assert.equal(pendingTimers.length, 1);
   });
 });
 

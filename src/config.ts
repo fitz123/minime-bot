@@ -712,8 +712,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // adminChatId (optional — used by cron-runner for delivery failure notifications)
   let adminChatId: number | undefined;
   if (raw.adminChatId !== undefined) {
-    if (!Number.isInteger(raw.adminChatId) || raw.adminChatId === 0) {
-      throw new Error(`Invalid adminChatId: ${raw.adminChatId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.adminChatId) || raw.adminChatId === 0) {
+      throw new Error(`Invalid adminChatId: ${raw.adminChatId} (must be a non-zero safe integer)`);
     }
     adminChatId = raw.adminChatId;
   }
@@ -721,8 +721,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // defaultDeliveryChatId (optional — used by cron-runner as fallback delivery target)
   let defaultDeliveryChatId: number | undefined;
   if (raw.defaultDeliveryChatId !== undefined) {
-    if (!Number.isInteger(raw.defaultDeliveryChatId) || raw.defaultDeliveryChatId === 0) {
-      throw new Error(`Invalid defaultDeliveryChatId: ${raw.defaultDeliveryChatId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.defaultDeliveryChatId) || raw.defaultDeliveryChatId === 0) {
+      throw new Error(`Invalid defaultDeliveryChatId: ${raw.defaultDeliveryChatId} (must be a non-zero safe integer)`);
     }
     defaultDeliveryChatId = raw.defaultDeliveryChatId;
   }
@@ -730,8 +730,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // defaultDeliveryThreadId (optional — used with defaultDeliveryChatId)
   let defaultDeliveryThreadId: number | undefined;
   if (raw.defaultDeliveryThreadId !== undefined) {
-    if (!Number.isInteger(raw.defaultDeliveryThreadId) || raw.defaultDeliveryThreadId === 0) {
-      throw new Error(`Invalid defaultDeliveryThreadId: ${raw.defaultDeliveryThreadId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.defaultDeliveryThreadId) || raw.defaultDeliveryThreadId <= 0) {
+      throw new Error(`Invalid defaultDeliveryThreadId: ${raw.defaultDeliveryThreadId} (must be a positive safe integer)`);
     }
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }

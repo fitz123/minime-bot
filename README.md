@@ -143,10 +143,28 @@ critical incident. Notifications go to `adminChatId` when set; otherwise they
 use `defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`.
 Transient delivery failures use the durable outbox with bounded backoff;
 the owner-only Telegram transport also starts in Discord-backed deployments
-without normal Telegram agent bindings. Missing destinations and deterministic
-Telegram 4xx failures remain visible terminal diagnostics and suppress further
-incident reminders. After correcting the destination, an explicit process
-restart permits one fresh delivery attempt instead of retrying forever.
+without normal Telegram agent bindings when both a Telegram token source and an
+owner destination are configured. Use `telegramTokenSopsKey` together with
+`secrets.sopsFile`, or use `telegramTokenEnv`; configure `adminChatId`, or fall
+back to `defaultDeliveryChatId` plus an optional positive
+`defaultDeliveryThreadId`. `adminChatId` takes precedence and never uses the
+fallback thread. For example, replace the placeholders in this fragment:
+
+```yaml
+secrets:
+  sopsFile: config/secrets.sops.yaml
+telegramTokenSopsKey: telegram.bot_token
+# Or use: telegramTokenEnv: MINIME_TELEGRAM_TOKEN
+adminChatId: <owner-chat-id>
+# Or omit adminChatId and use:
+# defaultDeliveryChatId: <fallback-chat-id>
+# defaultDeliveryThreadId: <positive-topic-id>
+```
+
+Missing destinations and deterministic Telegram 4xx failures remain visible
+terminal diagnostics and suppress further incident reminders. After correcting
+the destination, an explicit process restart permits one fresh delivery attempt
+instead of retrying forever.
 
 Incident messages provide generation-bound Telegram actions:
 `acknowledge degraded mode` stops reminders, while `credits fixed — recheck`
@@ -342,6 +360,14 @@ Discord stale-message cutoff. The low-cardinality metrics are
 Because grammY pauses simple polling while middleware runs, bounded media
 preprocessing is tracked separately and allowed up to ten minutes before it is
 treated as a stalled handler.
+
+Polling failure recovery depends on the active conversational platforms. A
+Telegram-only deployment with Telegram agent bindings exits for supervisor
+restart. When Discord has live agent bindings, the process keeps Discord online,
+waits for grammY's final Telegram polling cleanup to settle, and retries Telegram
+after exponential delays from five seconds up to one minute; a successful
+polling-loop request resets that delay. An owner-only Telegram alert transport
+does not count as a conversational platform.
 
 ## Launchd Operations
 

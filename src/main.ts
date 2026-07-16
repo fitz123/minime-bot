@@ -16,6 +16,7 @@ import {
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
+  stopTelegramBot,
   stopTelegramBotInBackground,
   type TelegramPollingRestartScheduler,
 } from "./bot-startup.js";
@@ -195,20 +196,24 @@ async function main(): Promise<void> {
   // Start Telegram bot if configured
   if (config.telegramToken) {
     telegramPollingRestart = createTelegramPollingRestartScheduler();
+    let telegramPollingGeneration = 0;
+    let telegramFailureHandled = true;
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
-      onSuccessfulPoll: () => telegramPollingRestart?.reset(),
+      // A failed generation disables this before grammY's final offset
+      // confirmation, so cleanup cannot collapse the restart backoff.
+      onSuccessfulPoll: () => {
+        if (!telegramFailureHandled && !shuttingDown) telegramPollingRestart?.reset();
+      },
       tavilyActions: tavilySupervisor,
       getTavilyStatus: () => tavilySupervisor?.getStatus(),
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
 
-    let telegramPollingGeneration = 0;
-    let telegramFailureHandled = false;
     function handleTelegramPollingFailure(
       generation: number,
       reason: "startup_timeout" | "polling_failed" | "watchdog_restart",
@@ -224,7 +229,7 @@ async function main(): Promise<void> {
       watchdog = undefined;
       onUpdateFn = undefined;
 
-      void agentPlatformStartup.then(() => {
+      void agentPlatformStartup.then(async () => {
         if (shuttingDown) return;
         const restartRequired = shouldRestartForTelegramFailure({
           telegramBindingCount: config.bindings.length,
@@ -242,9 +247,10 @@ async function main(): Promise<void> {
           `Telegram polling unavailable (${reason}); keeping the active conversational platform online`,
           error,
         );
-        stopTelegramBotInBackground(bot, () => {
+        await stopTelegramBot(bot, () => {
           log.warn("main", "Telegram polling cleanup could not confirm the final update offset");
         });
+        if (shuttingDown) return;
         const delayMs = telegramPollingRestart?.schedule(startTelegramPolling);
         if (delayMs !== undefined) {
           log.warn("main", `Retrying Telegram polling in ${delayMs}ms`);

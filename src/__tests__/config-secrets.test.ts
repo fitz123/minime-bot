@@ -313,6 +313,30 @@ discord:
     assert.equal(config.defaultDeliveryThreadId, 17);
   });
 
+  it("rejects owner delivery identifiers that cannot be represented safely", () => {
+    const invalidFields = [
+      ["adminChatId", Number.MAX_SAFE_INTEGER + 1, /Invalid adminChatId: .*non-zero safe integer/],
+      ["defaultDeliveryChatId", Number.MAX_SAFE_INTEGER + 1, /Invalid defaultDeliveryChatId: .*non-zero safe integer/],
+      ["defaultDeliveryThreadId", -1, /Invalid defaultDeliveryThreadId: .*positive safe integer/],
+    ] as const;
+
+    for (const [field, value, expected] of invalidFields) {
+      writeFileSync(
+        configPath,
+        minimalAgentsYaml +
+          `
+telegramTokenEnv: TEST_TELEGRAM_TOKEN_ENV
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+${field}: ${value}
+`,
+      );
+      assert.throws(() => loadConfig(configPath, { resolveSecrets: false }), expected);
+    }
+  });
+
   it("validates telegramTokenEnv type (must be string)", () => {
     writeFileSync(
       configPath,

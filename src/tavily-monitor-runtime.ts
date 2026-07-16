@@ -122,17 +122,23 @@ export function classifyTavilyDeliveryError(error: unknown): DeliveryFailure {
 export function resolveTavilyDeliveryDestination(
   config: Pick<BotConfig, "adminChatId" | "defaultDeliveryChatId" | "defaultDeliveryThreadId">,
 ): TavilyDeliveryDestination | undefined {
-  if (Number.isSafeInteger(config.adminChatId) && config.adminChatId !== 0) {
-    return { chatId: config.adminChatId as number };
+  if (config.adminChatId !== undefined) {
+    return Number.isSafeInteger(config.adminChatId) && config.adminChatId !== 0
+      ? { chatId: config.adminChatId }
+      : undefined;
   }
   if (!Number.isSafeInteger(config.defaultDeliveryChatId) || config.defaultDeliveryChatId === 0) {
     return undefined;
   }
+  if (config.defaultDeliveryThreadId !== undefined &&
+      (!Number.isSafeInteger(config.defaultDeliveryThreadId) || config.defaultDeliveryThreadId <= 0)) {
+    return undefined;
+  }
   return {
     chatId: config.defaultDeliveryChatId as number,
-    ...(Number.isSafeInteger(config.defaultDeliveryThreadId) && config.defaultDeliveryThreadId !== 0
-      ? { threadId: config.defaultDeliveryThreadId as number }
-      : {}),
+    ...(config.defaultDeliveryThreadId === undefined
+      ? {}
+      : { threadId: config.defaultDeliveryThreadId }),
   };
 }
 
@@ -190,7 +196,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
   private running = false;
   private startup: Promise<void> | undefined;
   private readonly recheckFlights = new Map<string, Promise<TavilyRecoveryResult>>();
-  private readonly activeDeliveryControllers = new Set<AbortController>();
+  private activeDeliveryController: AbortController | undefined;
 
   constructor(options: TavilyMonitorRuntimeOptions) {
     this.monitor = options.monitor;
@@ -271,19 +277,23 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
 
   private async deliverOnce(payload: TavilyDeliveryPayload): Promise<void> {
     const controller = new AbortController();
-    this.activeDeliveryControllers.add(controller);
+    this.activeDeliveryController = controller;
     const timer = setTimeout(() => controller.abort(), this.deliveryTimeoutMs);
     timer.unref();
     try {
       await this.deliver(payload, controller.signal);
     } finally {
       clearTimeout(timer);
-      this.activeDeliveryControllers.delete(controller);
+      if (this.activeDeliveryController === controller) {
+        this.activeDeliveryController = undefined;
+      }
     }
   }
 
   private async deliverDueNotifications(): Promise<void> {
-    for (const notification of this.monitor.dueNotifications(this.now())) {
+    while (true) {
+      const notification = this.monitor.dueNotifications(this.now())[0];
+      if (!notification) return;
       if (!this.acceptingTransitions) return;
       if (!this.destination) {
         this.monitor.recordNotificationTerminal(notification.key);
@@ -363,16 +373,12 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       this.startup = undefined;
     }
     const finalTail = this.transitionTail;
-    for (const controller of this.activeDeliveryControllers) controller.abort();
+    this.activeDeliveryController?.abort();
     await finalTail;
   }
 
   processNow(): Promise<void> {
     return this.enqueue(() => this.processTransition());
-  }
-
-  sampleNow(): Promise<void> {
-    return this.enqueue(() => this.sampleTransition());
   }
 
   acknowledgeIncident(generation: string): Promise<boolean> {
@@ -549,19 +555,16 @@ export class TavilyMonitorSupervisor implements TavilyOperatorActions {
 
     let startup: Promise<void>;
     try {
-      startup = owner.runtime.start();
+      startup = Promise.resolve(owner.runtime.start());
     } catch (error) {
-      this.onError(error);
-      this.releaseOwner(owner);
-      this.scheduleRetry();
-      return;
+      startup = Promise.reject(error);
     }
+    let failed = false;
     let activation!: Promise<void>;
     activation = startup.then(
-      () => {
-        if (this.activation === activation) this.activation = undefined;
-      },
+      () => undefined,
       async (error) => {
+        failed = true;
         this.onError(error);
         try {
           await owner.runtime.stop();
@@ -569,10 +572,11 @@ export class TavilyMonitorSupervisor implements TavilyOperatorActions {
           this.onError(stopError);
         }
         this.releaseOwner(owner);
-        if (this.activation === activation) this.activation = undefined;
-        this.scheduleRetry();
       },
-    );
+    ).finally(() => {
+      if (this.activation === activation) this.activation = undefined;
+      if (failed) this.scheduleRetry();
+    });
     this.activation = activation;
     void activation;
   }

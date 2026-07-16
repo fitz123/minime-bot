@@ -52,6 +52,15 @@ A recovery is persisted only after current usage plus fixed Search and Extract
 probes all validate. PAYGO activation and limit changes remain manual Tavily
 Billing work; no package code mutates billing.
 
+Ownership is enforced by the nonblocking single-writer lease at
+`data/tavily/writer.lock`; a replacement waits asynchronously, and a stale lease
+whose owning process is no longer alive can be recovered before constructing a
+fresh monitor. Child publication and recovery commits also share the
+process-reentrant `data/tavily/events/.publish.lock`. A child writer takes that
+lock before timestamping or staging an event, while recovery takes it before its
+final drain and resolution commit, preventing an already-started exhaustion
+publication from racing behind a false recovery.
+
 `PI_EXTENSIONS_DISABLED=1` stops new child events because it disables the web
 tools themselves; it does not delete existing monitor state. For a package
 rollback, retain `data/tavily/` so a later return to this version preserves

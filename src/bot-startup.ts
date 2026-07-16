@@ -144,8 +144,16 @@ export function stopTelegramBotInBackground(
   bot: { stop: () => Promise<void> },
   onError: (error: unknown) => void,
 ): void {
+  void stopTelegramBot(bot, onError);
+}
+
+/** Wait until grammY has finished its final update-offset confirmation. */
+export async function stopTelegramBot(
+  bot: { stop: () => Promise<void> },
+  onError: (error: unknown) => void,
+): Promise<void> {
   try {
-    void bot.stop().catch(onError);
+    await bot.stop();
   } catch (error) {
     onError(error);
   }

@@ -46,6 +46,22 @@ Telegram token source and owner destination are configured, this owner-only
 transport also runs in Discord-backed deployments with no Telegram agent
 bindings.
 
+The token source is either `telegramTokenSopsKey` together with
+`secrets.sopsFile`, or `telegramTokenEnv`. Both it and one destination are
+required. `adminChatId` takes precedence; `defaultDeliveryThreadId` is a
+positive topic ID used only with the fallback `defaultDeliveryChatId`:
+
+```yaml
+secrets:
+  sopsFile: config/secrets.sops.yaml
+telegramTokenSopsKey: telegram.bot_token
+# Or use: telegramTokenEnv: MINIME_TELEGRAM_TOKEN
+adminChatId: <owner-chat-id>
+# Fallback instead of adminChatId:
+# defaultDeliveryChatId: <fallback-chat-id>
+# defaultDeliveryThreadId: <positive-topic-id>
+```
+
 Incident messages expose `acknowledge degraded mode` and
 `credits fixed — recheck`. Actions are accepted only at the exact configured
 chat/thread and for the current incident generation. Acknowledgement stops

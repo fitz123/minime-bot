@@ -182,6 +182,114 @@ describe("Tavily monitor ownership supervisor", () => {
     await supervisor.stop();
     assert.equal(events.at(-1), "lease-release");
   });
+
+  it("retries after lease acquisition and runtime construction failures", async () => {
+    const workspace = temporaryWorkspace();
+    const acquisitionError = new Error("synthetic lease failure");
+    const constructionError = new Error("synthetic runtime construction failure");
+    const errors: unknown[] = [];
+    const retries: Array<() => void> = [];
+    let attempt = 0;
+    let releases = 0;
+    const supervisor = new TavilyMonitorSupervisor({
+      destination: undefined,
+      tryAcquireLease: () => {
+        attempt += 1;
+        if (attempt === 1) throw acquisitionError;
+        return { release: () => { releases += 1; } };
+      },
+      createRuntime: () => {
+        if (attempt === 2) throw constructionError;
+        return {
+          monitor: new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+          runtime: stubOwnedRuntime([]),
+        };
+      },
+      setTimeoutImpl: (callback) => {
+        retries.push(callback);
+        return { unref() {} };
+      },
+      clearTimeoutImpl: () => {},
+      onError: (error) => { errors.push(error); },
+    });
+
+    supervisor.start();
+    assert.equal(retries.length, 1);
+    retries.shift()?.();
+    assert.equal(releases, 1, "a failed construction releases its lease");
+    assert.equal(retries.length, 1);
+    retries.shift()?.();
+    await Promise.resolve();
+    assert.deepEqual(errors, [acquisitionError, constructionError]);
+    await supervisor.stop();
+    assert.equal(releases, 2, "the successfully activated owner also releases on stop");
+  });
+
+  it("stops failed runtimes and releases their leases before retrying", async () => {
+    const workspace = temporaryWorkspace();
+    const synchronousStartError = new Error("synthetic synchronous start failure");
+    const asynchronousStartError = new Error("synthetic asynchronous start failure");
+    const cleanupError = new Error("synthetic cleanup failure");
+    const errors: unknown[] = [];
+    const events: string[] = [];
+    const retries: Array<() => void> = [];
+    let runtimeNumber = 0;
+    let leaseNumber = 0;
+    const supervisor = new TavilyMonitorSupervisor({
+      destination: undefined,
+      tryAcquireLease: () => {
+        const current = ++leaseNumber;
+        return { release: () => { events.push(`release-${current}`); } };
+      },
+      createRuntime: () => {
+        const current = ++runtimeNumber;
+        const runtime = stubOwnedRuntime(events);
+        if (current === 1) {
+          runtime.start = () => {
+            events.push("start-1");
+            throw synchronousStartError;
+          };
+          runtime.stop = async () => { events.push("stop-1"); };
+        } else if (current === 2) {
+          runtime.start = async () => {
+            events.push("start-2");
+            throw asynchronousStartError;
+          };
+          runtime.stop = async () => {
+            events.push("stop-2");
+            throw cleanupError;
+          };
+        }
+        return {
+          monitor: new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+          runtime,
+        };
+      },
+      setTimeoutImpl: (callback) => {
+        retries.push(callback);
+        return { unref() {} };
+      },
+      clearTimeoutImpl: () => {},
+      onError: (error) => { errors.push(error); },
+    });
+
+    supervisor.start();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(events.slice(0, 3), ["start-1", "stop-1", "release-1"]);
+    assert.equal(retries.length, 1);
+
+    retries.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(events.slice(3, 6), ["start-2", "stop-2", "release-2"]);
+    assert.equal(retries.length, 1);
+
+    retries.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(runtimeNumber, 3);
+    assert.deepEqual(errors, [synchronousStartError, asynchronousStartError, cleanupError]);
+    await supervisor.stop();
+    assert.equal(events.at(-1), "release-3");
+  });
 });
 
 describe("Tavily monitor lifecycle", () => {
@@ -258,6 +366,57 @@ describe("Tavily monitor lifecycle", () => {
     await runtime.stop();
     assert.equal(runtime.isRunning(), false);
     assert.deepEqual(cleared, installed);
+  });
+
+  it("serializes startup sampling, spool processing, and operator actions", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "serialized-runtime");
+    let releaseUsage!: () => void;
+    const usageGate = new Promise<void>((resolve) => { releaseUsage = resolve; });
+    let usageStarted!: () => void;
+    const started = new Promise<void>((resolve) => { usageStarted = resolve; });
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        usageStarted();
+        await usageGate;
+        return jsonResponse(usageResponse(1_000));
+      }) as typeof fetch,
+    });
+    const timerCallbacks: Array<() => void> = [];
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+      setIntervalImpl: (callback) => {
+        timerCallbacks.push(callback);
+        return { unref() {} };
+      },
+      clearIntervalImpl: () => {},
+    });
+
+    const startup = runtime.start();
+    await started;
+    const generation = monitor.getState().incident?.generation as string;
+    timerCallbacks[0]?.();
+    const acknowledgement = runtime.acknowledgeIncident(generation);
+    await Promise.resolve();
+    assert.equal(deliveries.length, 0, "queued transitions cannot overtake the blocked sampler");
+
+    releaseUsage();
+    await Promise.all([startup, acknowledgement]);
+    assert.equal(monitor.getState().incident?.acknowledgedAt !== undefined, true);
+    assert.equal(
+      deliveries.filter((delivery) => /exhaustion incident/.test(delivery.text)).length,
+      1,
+      "overlapping triggers do not duplicate the incident delivery",
+    );
+    await runtime.stop();
   });
 
   it("resumes one crash-interrupted automatic verification on startup", async () => {
@@ -528,6 +687,64 @@ describe("Tavily durable notification delivery", () => {
     }
   });
 
+  it("suppresses a due reminder invalidated by terminalizing the opening delivery", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T18:00:01.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "old-terminal-incident");
+    const monitor = new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key", now: clock.now });
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+
+    await runtime.processNow();
+    const state = monitor.getState();
+    assert.equal(state.notificationStats.terminal, 1);
+    assert.equal(state.outbox.filter((entry) => entry.kind === "incident" && entry.status === "terminal").length, 1);
+    assert.equal(state.outbox.some((entry) => entry.kind === "reminder"), false);
+  });
+
+  it("cancels a backed-off reminder when another incident notification becomes terminal", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "terminal-after-reminder");
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => new Response("unavailable", { status: 503 })) as typeof fetch,
+    });
+    let deliveryMode: "success" | "retry-reminder" | "terminal" = "success";
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliver: async (payload) => {
+        if (deliveryMode === "retry-reminder" && /exhaustion reminder/.test(payload.text)) {
+          throw new Error("synthetic transient reminder failure");
+        }
+        if (deliveryMode === "terminal") throw { error_code: 400 };
+      },
+      now: clock.now,
+      retryBaseMs: 60_000,
+      retryMaxMs: 60_000,
+    });
+    await runtime.processNow();
+    const generation = monitor.getState().incident?.generation as string;
+
+    clock.set("2026-07-16T18:00:00.000Z");
+    deliveryMode = "retry-reminder";
+    await runtime.processNow();
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "reminder"), true);
+
+    deliveryMode = "terminal";
+    await runtime.recheckIncident(generation);
+    const state = monitor.getState();
+    assert.equal(state.incident?.deliveryTerminalAt, "2026-07-16T18:00:00.000Z");
+    assert.equal(state.outbox.some((entry) => entry.kind === "reminder"), false);
+  });
+
   it("stops terminal incident reminders and resumes once after a configured restart", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -757,6 +974,14 @@ describe("Tavily operator transition runtime", () => {
       defaultDeliveryChatId: -10071,
       defaultDeliveryThreadId: 17,
     }), { chatId: -10071, threadId: 17 });
+    assert.equal(resolveTavilyDeliveryDestination({
+      defaultDeliveryChatId: -10071,
+      defaultDeliveryThreadId: -1,
+    }), undefined);
+    assert.equal(resolveTavilyDeliveryDestination({
+      adminChatId: Number.MAX_SAFE_INTEGER + 1,
+      defaultDeliveryChatId: 72,
+    }), undefined);
     assert.equal(resolveTavilyDeliveryDestination({}), undefined);
     assert.deepEqual(parseTavilyCallbackData("tavily:ack:2026-07-1"), {
       action: "acknowledge",
