@@ -26,6 +26,31 @@ function immediateTimeout(callback: () => void): ReturnType<typeof setTimeout> {
 beforeEach(() => client.register.resetMetrics());
 
 describe("polling-watchdog", () => {
+  it("gives a restarted poller a fresh liveness window", async () => {
+    let clock = 100_000;
+    let exits = 0;
+    let heartbeats = 0;
+    const oldProgress = snapshot({
+      lastPollStartedAtMs: 10_000,
+      lastPollSucceededAtMs: 10_000,
+      successfulPollCount: 1,
+      inFlight: true,
+    });
+    const wd = createWatchdog({
+      pollProgress: () => oldProgress,
+      heartbeat: async () => { heartbeats++; return true; },
+      exit: () => { exits++; },
+      now: () => clock,
+      thresholdMs: 90_000,
+    });
+
+    clock = 130_000;
+    await wd.check();
+
+    assert.equal(exits, 0);
+    assert.equal(heartbeats, 0);
+  });
+
   it("keeps at least 60 minutes of successful empty polling healthy", async () => {
     let clock = 0;
     let progress = snapshot();

@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { GrammyError } from "grammy";
 import {
+  createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
   is409ConflictError,
   runTelegramSetupInBackground,
@@ -9,6 +10,44 @@ import {
   startBotWithRetry,
   stopTelegramBotInBackground,
 } from "../bot-startup.js";
+
+describe("createTelegramPollingRestartScheduler", () => {
+  it("deduplicates restarts, bounds backoff, and resets after recovery", () => {
+    const pending: Array<{ callback: () => void; delayMs: number; cancelled: boolean }> = [];
+    const scheduler = createTelegramPollingRestartScheduler({
+      baseDelayMs: 5,
+      maxDelayMs: 10,
+      setTimeoutFn: (callback, delayMs) => {
+        const entry = { callback, delayMs, cancelled: false };
+        pending.push(entry);
+        return { unref() {} } as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutFn: () => {
+        const entry = pending.at(-1);
+        if (entry) entry.cancelled = true;
+      },
+    });
+    let restarts = 0;
+
+    assert.equal(scheduler.schedule(() => { restarts++; }), 5);
+    assert.equal(scheduler.schedule(() => assert.fail("duplicate restart ran")), undefined);
+    assert.equal(pending[0]?.delayMs, 5);
+    pending[0]?.callback();
+    assert.equal(restarts, 1);
+
+    assert.equal(scheduler.schedule(() => { restarts++; }), 10);
+    pending[1]?.callback();
+    assert.equal(scheduler.schedule(() => { restarts++; }), 10);
+    pending[2]?.callback();
+    assert.equal(restarts, 3);
+
+    scheduler.reset();
+    assert.equal(scheduler.schedule(() => { restarts++; }), 5);
+    scheduler.cancel();
+    assert.equal(pending[3]?.cancelled, true);
+    assert.equal(restarts, 3);
+  });
+});
 
 describe("hasActiveAgentPlatform", () => {
   it("does not count an owner-only Telegram alert transport after Discord startup fails", () => {

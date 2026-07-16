@@ -32,6 +32,61 @@ export interface RetryOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+type TimeoutHandle = ReturnType<typeof setTimeout>;
+
+export interface TelegramPollingRestartSchedulerOptions {
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  setTimeoutFn?: (callback: () => void, ms: number) => TimeoutHandle;
+  clearTimeoutFn?: (handle: TimeoutHandle) => void;
+}
+
+export interface TelegramPollingRestartScheduler {
+  /** Queue one restart and return its delay, or undefined when one is already queued. */
+  schedule(restart: () => void): number | undefined;
+  /** Reset exponential backoff after a getUpdates call succeeds. */
+  reset(): void;
+  /** Cancel a pending restart during shutdown. */
+  cancel(): void;
+}
+
+/** Keep Telegram polling recoverable without taking down a healthy Discord bot. */
+export function createTelegramPollingRestartScheduler(
+  options: TelegramPollingRestartSchedulerOptions = {},
+): TelegramPollingRestartScheduler {
+  const baseDelayMs = Math.max(1, options.baseDelayMs ?? 5_000);
+  const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 60_000);
+  const setTimeoutFn: (callback: () => void, ms: number) => TimeoutHandle =
+    options.setTimeoutFn ?? ((callback, ms) => setTimeout(callback, ms));
+  const clearTimeoutFn: (handle: TimeoutHandle) => void =
+    options.clearTimeoutFn ?? ((handle) => clearTimeout(handle));
+  let attempt = 0;
+  let timer: TimeoutHandle | undefined;
+
+  return {
+    schedule(restart) {
+      if (timer !== undefined) return undefined;
+      const delayMs = Math.min(baseDelayMs * 2 ** Math.min(attempt, 30), maxDelayMs);
+      attempt += 1;
+      const handle = setTimeoutFn(() => {
+        timer = undefined;
+        restart();
+      }, delayMs);
+      timer = handle;
+      handle.unref?.();
+      return delayMs;
+    },
+    reset() {
+      attempt = 0;
+    },
+    cancel() {
+      if (timer === undefined) return;
+      clearTimeoutFn(timer);
+      timer = undefined;
+    },
+  };
+}
+
 export interface ActiveAgentPlatformState {
   telegramStarted: boolean;
   telegramBindingCount: number;

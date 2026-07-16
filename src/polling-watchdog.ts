@@ -56,8 +56,10 @@ export function pollProgressAgeMs(
   nowMs: number,
   monitoringStartedAtMs = snapshot.initializedAtMs,
 ): number {
-  const progressAt = snapshot.lastPollSucceededAtMs
-    ?? Math.max(snapshot.initializedAtMs, monitoringStartedAtMs);
+  const progressAt = Math.max(
+    snapshot.lastPollSucceededAtMs ?? snapshot.initializedAtMs,
+    monitoringStartedAtMs,
+  );
   return Math.max(0, nowMs - progressAt);
 }
 
