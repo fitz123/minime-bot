@@ -259,10 +259,11 @@ export function preseedCanonicalRecoverySession(
   options: RecoverySessionSeedOptions = {},
 ): PreseededRecoverySession {
   const directory = privateDirectory(normalize(resolve(sessionDirectory)), false);
-  const workspaceCwd = normalize(resolve(agentWorkspaceCwd));
-  if (!statSync(workspaceCwd).isDirectory()) {
+  const resolvedWorkspaceCwd = normalize(resolve(agentWorkspaceCwd));
+  if (!statSync(resolvedWorkspaceCwd).isDirectory()) {
     throw new Error("Recovery agent workspace is not a directory");
   }
+  const workspaceCwd = realpathSync(resolvedWorkspaceCwd);
 
   const transcriptPath = join(directory, "recovery-session.jsonl");
   const descriptor = openSync(transcriptPath, "wx", 0o600);

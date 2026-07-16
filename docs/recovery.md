@@ -266,13 +266,15 @@ creates another fenced generation and resumes the same Pi session.
 The fixer uses normal Pi context and tools plus the non-default
 `dist/extensions/pi/recovery.js` wrapper. Recovery fails closed if that wrapper
 cannot load or `PI_EXTENSIONS_DISABLED=1`; normal bot, cron, subagent, and
-ask-agent invocations never load it by default. The runner uses the pinned Pi
-mechanics: an owner-only `PI_CODING_AGENT_SESSION_DIR`, RPC `get_state` to obtain
-`data.sessionId`, and exactly one canonical owner-only JSONL transcript. The
-supervisor commits that binding before the incident prompt. A retry uses
-`--session ID` and the same directory, never `--no-session`. Replacement is
-allowed only after host inspection proves the transcript unreadable and Pi
-returns its explicit no-session startup classifier.
+ask-agent invocations never load it by default. For a fresh generation, the
+runner exclusively creates one owner-only `0600` JSONL inside an owner-only
+`PI_CODING_AGENT_SESSION_DIR` and opens it through Pi's exported
+`SessionManager` to produce the canonical v3 header and session ID. It launches
+Pi with that exact `--session ID`, requires RPC `get_state` and transcript
+discovery to confirm the same ID/path, and commits the binding before the
+incident prompt. A retry uses the same ID and directory, never `--no-session`.
+Replacement is allowed only after host inspection proves the transcript
+unreadable and Pi returns its explicit no-session startup classifier.
 
 Before every mutating `bash`, `edit`, `write`, Knowledge update, recovery tool,
 or other mutating tool, the extension commits an intent. It commits an outcome

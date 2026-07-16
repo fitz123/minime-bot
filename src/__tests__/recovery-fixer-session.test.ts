@@ -11,7 +11,9 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -456,7 +458,7 @@ describe("exact-session recovery fixer", () => {
     assert.equal(header.type, "session");
     assert.equal(header.version, 3);
     assert.equal(header.id, seeded.sessionId);
-    assert.equal(header.cwd, resolve(agentWorkspace));
+    assert.equal(header.cwd, realpathSync(agentWorkspace));
     assert.equal(
       await discoverCanonicalRecoveryTranscript(sessionDirectory, seeded.sessionId, 100),
       seeded.transcriptPath,
@@ -472,13 +474,14 @@ describe("exact-session recovery fixer", () => {
     const root = realpathSync(createdRoot);
     const sessionDirectory = join(root, "sessions");
     const agentWorkspace = join(root, "agent");
+    const agentWorkspaceTarget = join(root, "agent-target");
     const piAgentDirectory = join(root, "pi-agent");
     const xdgConfigDirectory = join(root, "xdg-config");
     const xdgCacheDirectory = join(root, "xdg-cache");
     const xdgDataDirectory = join(root, "xdg-data");
     for (const directory of [
       sessionDirectory,
-      agentWorkspace,
+      agentWorkspaceTarget,
       piAgentDirectory,
       xdgConfigDirectory,
       xdgCacheDirectory,
@@ -487,6 +490,12 @@ describe("exact-session recovery fixer", () => {
       mkdirSync(directory, { mode: 0o700 });
       chmodSync(directory, 0o700);
     }
+    symlinkSync(
+      agentWorkspaceTarget,
+      agentWorkspace,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const canonicalAgentWorkspace = realpathSync(agentWorkspace);
 
     let child: ChildProcess | undefined;
     let state: PinnedPiSessionState | undefined;
@@ -501,7 +510,7 @@ describe("exact-session recovery fixer", () => {
     try {
       seeded = preseedCanonicalRecoverySession(
         realpathSync(sessionDirectory),
-        realpathSync(agentWorkspace),
+        agentWorkspace,
       );
       transcriptHeaderBefore = JSON.parse(
         readFileSync(seeded.transcriptPath, "utf8").trim(),
@@ -521,7 +530,7 @@ describe("exact-session recovery fixer", () => {
       ]);
       runtimeVersion = invocation.diagnostic.detectedVersion;
       child = spawnChildProcess(invocation.command, invocation.args, {
-        cwd: realpathSync(agentWorkspace),
+        cwd: agentWorkspace,
         env: {
           HOME: root,
           NO_COLOR: "1",
@@ -562,6 +571,7 @@ describe("exact-session recovery fixer", () => {
     assert.ok(state);
     assert.ok(transcriptDetails);
     assert.equal(runtimeVersion, EXPECTED_PI_PACKAGE_VERSION);
+    assert.equal(transcriptHeaderBefore?.cwd, canonicalAgentWorkspace);
     assert.equal(state.sessionId, seeded.sessionId);
     assert.equal(reportedPath, seeded.transcriptPath);
     assert.equal(discoveredPath, seeded.transcriptPath);
@@ -619,6 +629,24 @@ describe("exact-session recovery fixer", () => {
         mutate: (path, sessionDir, cwd) => {
           const session = PiSessionManager.open(path, sessionDir, cwd);
           writeFileSync(path, "not-json\n");
+          return session;
+        },
+      },
+      {
+        name: "wrong header version",
+        mutate: (path, sessionDir, cwd) => {
+          const session = PiSessionManager.open(path, sessionDir, cwd);
+          const header = JSON.parse(readFileSync(path, "utf8").trim()) as Record<string, unknown>;
+          writeFileSync(path, `${JSON.stringify({ ...header, version: -1 })}\n`);
+          return session;
+        },
+      },
+      {
+        name: "wrong header cwd",
+        mutate: (path, sessionDir, cwd, root) => {
+          const session = PiSessionManager.open(path, sessionDir, cwd);
+          const header = JSON.parse(readFileSync(path, "utf8").trim()) as Record<string, unknown>;
+          writeFileSync(path, `${JSON.stringify({ ...header, cwd: join(root, "different-agent") })}\n`);
           return session;
         },
       },
@@ -982,8 +1010,155 @@ describe("exact-session recovery fixer", () => {
     assert.equal(boundRuntime?.pi, "0.80.6");
   });
 
-  it("cleans up the Pi process group on child-id mismatch and durable-bind failure", async () => {
-    for (const failure of ["child_id_mismatch", "bind_failure"] as const) {
+  it("replaces an unreadable prior session before prompting after Pi's no-session classifier", async () => {
+    const { env, root } = recoveryRunnerFixture("minime-recovery-replacement-");
+    const priorDirectory = join(root, "prior-session");
+    mkdirSync(priorDirectory, { mode: 0o700 });
+    chmodSync(priorDirectory, 0o700);
+    const priorTranscriptPath = join(priorDirectory, "missing-session.jsonl");
+    const order: string[] = [];
+    const killSignals: string[] = [];
+    let spawnCount = 0;
+    let heartbeatCount = 0;
+    let promptCount = 0;
+    const client = {
+      contract: readRecoveryRuntimeContract(env),
+      state: async () => ({
+        mode: "enabled",
+        evidence: [],
+        unknownActions: [],
+        resumeSession: {
+          bindingId: 7,
+          sessionId: "missing-session",
+          sessionDirectory: priorDirectory,
+          transcriptPath: priorTranscriptPath,
+          generation: 2,
+        },
+        journalDigest: "bounded prior digest",
+      }),
+      bindSession: async () => {
+        throw new Error("replacement must not create an independent binding");
+      },
+      markSessionResumed: async () => {
+        throw new Error("unreadable prior session must not be marked resumed");
+      },
+      replaceSession: async (replacement: {
+        previousBindingId: number;
+        sessionId: string;
+        sessionDirectory: string;
+        transcriptPath: string;
+        startupClassifier: string;
+        journalDigest: string;
+      }) => {
+        order.push("replace");
+        assert.equal(replacement.previousBindingId, 7);
+        assert.equal(replacement.startupClassifier, "no_session_found");
+        assert.equal(replacement.journalDigest, "bounded prior digest");
+        assert.notEqual(replacement.sessionDirectory, priorDirectory);
+        assert.equal(inspectRecoveryTranscript(
+          replacement.sessionDirectory,
+          replacement.transcriptPath,
+          replacement.sessionId,
+        ).readable, true);
+        return 12;
+      },
+      heartbeat: async () => {
+        heartbeatCount += 1;
+        return true;
+      },
+    } as unknown as RecoveryProtocolClient;
+    const spawn = ((_agent: unknown, session: unknown, _extensions: unknown, runtime: {
+      recovery?: { sessionDirectory: string };
+    }) => {
+      const attempt = spawnCount++;
+      const child = fakeChild();
+      child.kill = ((signal?: NodeJS.Signals) => {
+        const actualSignal = signal ?? "SIGTERM";
+        killSignals.push(`${attempt === 0 ? "prior" : "replacement"}:${actualSignal}`);
+        Object.defineProperty(child, "signalCode", { value: actualSignal, configurable: true });
+        if (attempt === 0) order.push("resume_cleanup");
+        setImmediate(() => child.emit("exit", null, actualSignal));
+        return true;
+      }) as ChildProcess["kill"];
+
+      if (attempt === 0) {
+        assert.equal(session, "missing-session");
+        assert.equal(runtime.recovery?.sessionDirectory, priorDirectory);
+        order.push("resume_spawn");
+        (child as unknown as PiStartupDiagnostics).piStartupStderr = () =>
+          "No session found matching 'missing-session'";
+        child.stdin?.on("data", (chunk) => {
+          const command = JSON.parse(chunk.toString()) as { type: string };
+          if (command.type === "prompt") promptCount += 1;
+          if (command.type === "get_state") setImmediate(() => child.emit("exit", 1, null));
+        });
+      } else {
+        assert.equal(attempt, 1);
+        assert.equal(typeof session, "string");
+        const sessionId = String(session);
+        const sessionDirectory = runtime.recovery?.sessionDirectory ?? "";
+        const seededPath = join(sessionDirectory, "recovery-session.jsonl");
+        assert.equal(inspectRecoveryTranscript(sessionDirectory, seededPath, sessionId).readable, true);
+        order.push("preseed");
+        child.stdin?.on("data", (chunk) => {
+          const command = JSON.parse(chunk.toString()) as { type: string; id?: string };
+          if (command.type === "get_state") {
+            if (command.id === "recovery-session-binding") order.push("get_state");
+            setTimeout(() => child.stdout?.push(`${JSON.stringify({
+              type: "response",
+              id: command.id,
+              command: "get_state",
+              success: true,
+              data: { sessionId },
+            })}\n`), 20);
+          } else if (command.type === "prompt") {
+            promptCount += 1;
+            order.push("prompt");
+            child.stdout?.push(`${JSON.stringify({
+              type: "response",
+              command: "prompt",
+              success: true,
+              id: command.id,
+            })}\n`);
+            child.stdout?.push(`${JSON.stringify({ type: "agent_start" })}\n`);
+            child.stdout?.push(`${JSON.stringify({
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+            })}\n`);
+            child.stdout?.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
+          }
+        });
+      }
+      setImmediate(() => child.emit("spawn"));
+      return child;
+    }) as never;
+
+    const result = await runRecoveryFixer({
+      env,
+      client,
+      spawn,
+      startupTimeoutMs: 1_000,
+      renewMs: 5,
+    });
+    assert.equal(result.status, "settled");
+    assert.equal(result.session.bindingId, 12);
+    assert.equal(result.session.replaced, true);
+    assert.equal(spawnCount, 2);
+    assert.equal(promptCount, 1);
+    assert.ok(heartbeatCount > 0, "the lease must renew during replacement bootstrap");
+    assert.deepEqual(order, [
+      "resume_spawn",
+      "resume_cleanup",
+      "preseed",
+      "get_state",
+      "replace",
+      "prompt",
+    ]);
+    assert.deepEqual(killSignals, ["prior:SIGTERM", "replacement:SIGTERM"]);
+  });
+
+  it("cleans up the Pi process group on fresh bootstrap verification and binding failures", async () => {
+    for (const failure of ["child_id_mismatch", "transcript_path_mismatch", "bind_failure"] as const) {
       const { env } = recoveryRunnerFixture(`minime-recovery-${failure}-`);
       const killSignals: NodeJS.Signals[] = [];
       let heartbeatCount = 0;
@@ -1010,6 +1185,9 @@ describe("exact-session recovery fixer", () => {
         const sessionDirectory = runtime.recovery?.sessionDirectory ?? "";
         const seededPath = join(sessionDirectory, "recovery-session.jsonl");
         assert.equal(inspectRecoveryTranscript(sessionDirectory, seededPath, seededId).readable, true);
+        if (failure === "transcript_path_mismatch") {
+          renameSync(seededPath, join(sessionDirectory, "different-session-path.jsonl"));
+        }
         const child = fakeChild();
         child.kill = ((signal?: NodeJS.Signals) => {
           const actualSignal = signal ?? "SIGTERM";
@@ -1041,7 +1219,11 @@ describe("exact-session recovery fixer", () => {
 
       await assert.rejects(
         runRecoveryFixer({ env, client, spawn, startupTimeoutMs: 1_000, renewMs: 5 }),
-        failure === "child_id_mismatch" ? /different pre-seeded session id/ : /durable bind failed/,
+        failure === "child_id_mismatch"
+          ? /different pre-seeded session id/
+          : failure === "transcript_path_mismatch"
+            ? /different pre-seeded transcript path/
+            : /durable bind failed/,
       );
       assert.ok(heartbeatCount > 0, `${failure}: lease did not renew during bootstrap`);
       assert.equal(bindCount, failure === "bind_failure" ? 1 : 0);

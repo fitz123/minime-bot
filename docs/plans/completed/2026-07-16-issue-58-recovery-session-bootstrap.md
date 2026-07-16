@@ -1,5 +1,7 @@
 # Issue #58 recovery exact-session bootstrap fix
 
+Status: implementation complete and validated on 2026-07-16.
+
 ## Goal
 
 Fix the production diagnosis gate exposed by `v2026.7.9`: a fresh recovery Pi process reports an ID/path through RPC `get_state`, but Pi 0.80.6 does not create its JSONL transcript before the first persisted assistant turn. The recovery runner currently waits for that file before sending the first prompt, so both retries expire after the 30-second startup timeout with no durable session binding.
