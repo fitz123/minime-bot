@@ -35,6 +35,7 @@ export const TAVILY_EVENT_POLL_INTERVAL_MS = 2_000;
 export const TAVILY_USAGE_TIMEOUT_MS = 10_000;
 export const TAVILY_RECOVERY_PROBE_TIMEOUT_MS = 10_000;
 export const TAVILY_REMINDER_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+export const TAVILY_STATUS_STALE_MS = 10 * 60 * 1_000;
 
 const MAX_PROCESSED_EVENT_KEYS = 2_048;
 const TAVILY_FAILURE_CLASSIFICATIONS = new Set<TavilyFailureClassification>([
@@ -181,6 +182,20 @@ export interface TavilyPendingAutomaticVerification {
   usageObservedAt: string;
 }
 
+export interface TavilyFailureStat {
+  classification: TavilyMonitorFailureClassification;
+  tool: TavilyDiagnosticSource;
+  count: number;
+}
+
+export interface TavilyTelemetryStats {
+  usageSamples: {
+    success: number;
+    failure: number;
+  };
+  failures: TavilyFailureStat[];
+}
+
 export interface TavilyMonitorState {
   version: typeof TAVILY_STATE_VERSION;
   updatedAt: string;
@@ -209,9 +224,26 @@ export interface TavilyMonitorState {
     retried: number;
     terminal: number;
   };
+  telemetryStats: TavilyTelemetryStats;
   incident?: TavilyIncident;
   pendingAutomaticVerification?: TavilyPendingAutomaticVerification;
 }
+
+export type TavilyStatusSampleState = "fresh" | "stale" | "missing" | "error";
+
+/** Privacy-safe projection used by /status; it intentionally omits durable identifiers and paths. */
+export interface TavilyStatusSnapshot {
+  sampleState: TavilyStatusSampleState;
+  sampledAt?: string;
+  latestAttemptAt?: string;
+  plan?: TavilyQuotaCounter;
+  paygo?: TavilyQuotaCounter;
+  lastFailure?: TavilyMonitorDiagnostic;
+  incident: "none" | "active" | "resolved";
+  acknowledged: boolean;
+}
+
+export type TavilyStateObserver = (state: TavilyMonitorState, observedAt: Date) => void;
 
 export interface TavilyUsageRequestOptions {
   apiKey: string | undefined;
@@ -234,6 +266,8 @@ export interface TavilyMonitorOptions {
   probeTimeoutMs?: number;
   eventPollIntervalMs?: number;
   reminderIntervalMs?: number;
+  statusStaleMs?: number;
+  onStateChange?: TavilyStateObserver;
 }
 
 function isMissing(error: unknown): boolean {
@@ -667,6 +701,10 @@ function freshState(now: () => Date): TavilyMonitorState {
     processedEventKeys: [],
     outbox: [],
     notificationStats: { delivered: 0, retried: 0, terminal: 0 },
+    telemetryStats: {
+      usageSamples: { success: 0, failure: 0 },
+      failures: [],
+    },
   };
 }
 
@@ -737,6 +775,33 @@ function validDiagnostic(value: unknown): value is TavilyMonitorDiagnostic {
       !isCanonicalIsoTimestamp(value.observedAt) ||
       (value.httpStatus !== undefined && !validHttpStatus(value.httpStatus))) {
     return false;
+  }
+  return true;
+}
+
+function validTelemetryStats(value: unknown): value is TavilyTelemetryStats {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["usageSamples", "failures"]) ||
+      !isRecord(value.usageSamples) ||
+      !hasOnlyKeys(value.usageSamples, ["success", "failure"]) ||
+      !Number.isSafeInteger(value.usageSamples.success) || (value.usageSamples.success as number) < 0 ||
+      !Number.isSafeInteger(value.usageSamples.failure) || (value.usageSamples.failure as number) < 0 ||
+      !Array.isArray(value.failures) || value.failures.length > 64) {
+    return false;
+  }
+  const keys = new Set<string>();
+  for (const failure of value.failures) {
+    if (!isRecord(failure) ||
+        !hasOnlyKeys(failure, ["classification", "tool", "count"]) ||
+        !validMonitorClassification(failure.classification) ||
+        !["usage", "web_search", "web_fetch", "recovery_search", "recovery_extract"].includes(
+          failure.tool as string,
+        ) ||
+        !Number.isSafeInteger(failure.count) || (failure.count as number) < 1) {
+      return false;
+    }
+    const key = `${failure.classification}:${failure.tool}`;
+    if (keys.has(key)) return false;
+    keys.add(key);
   }
   return true;
 }
@@ -819,6 +884,7 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
     "processedEventKeys",
     "outbox",
     "notificationStats",
+    "telemetryStats",
     "incident",
     "pendingAutomaticVerification",
   ])) return false;
@@ -826,6 +892,7 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
   const lastVerification = value.lastVerification;
   const pending = value.pendingAutomaticVerification;
   const stats = value.notificationStats;
+  const telemetryStats = value.telemetryStats;
   return value.version === TAVILY_STATE_VERSION &&
     isCanonicalIsoTimestamp(value.updatedAt) &&
     Number.isSafeInteger(value.incidentSequence) &&
@@ -871,12 +938,26 @@ function validMonitorState(value: unknown): value is TavilyMonitorState {
     Number.isSafeInteger(stats.delivered) && (stats.delivered as number) >= 0 &&
     Number.isSafeInteger(stats.retried) && (stats.retried as number) >= 0 &&
     Number.isSafeInteger(stats.terminal) && (stats.terminal as number) >= 0 &&
+    validTelemetryStats(telemetryStats) &&
     (value.incident === undefined || validIncident(value.incident)) &&
     (pending === undefined ||
       (isRecord(pending) &&
         hasOnlyKeys(pending, ["generation", "usageObservedAt"]) &&
         boundedString(pending.generation, 80) &&
         isCanonicalIsoTimestamp(pending.usageObservedAt)));
+}
+
+function withTelemetryStats(value: unknown): unknown {
+  if (!isRecord(value) || value.version !== TAVILY_STATE_VERSION || value.telemetryStats !== undefined) {
+    return value;
+  }
+  return {
+    ...value,
+    telemetryStats: {
+      usageSamples: { success: 0, failure: 0 },
+      failures: [],
+    },
+  };
 }
 
 /** Owner-only atomic persistence for the single consolidated Tavily state document. */
@@ -894,7 +975,7 @@ export class TavilyStateStore {
   load(): TavilyMonitorState {
     try {
       assertPrivateFile(this.path);
-      const parsed: unknown = JSON.parse(readFileSync(this.path, "utf8"));
+      const parsed = withTelemetryStats(JSON.parse(readFileSync(this.path, "utf8")));
       if (!validMonitorState(parsed)) throw new Error("Tavily monitor state is invalid");
       return structuredClone(parsed);
     } catch (error) {
@@ -974,6 +1055,29 @@ function addNotification(
   return true;
 }
 
+function recordUsageSampleStat(state: TavilyMonitorState, outcome: "success" | "failure"): void {
+  state.telemetryStats.usageSamples[outcome] += 1;
+}
+
+function recordFailureStat(
+  state: TavilyMonitorState,
+  diagnostic: Pick<TavilyMonitorDiagnostic, "classification" | "source">,
+): void {
+  const existing = state.telemetryStats.failures.find((entry) =>
+    entry.classification === diagnostic.classification && entry.tool === diagnostic.source);
+  if (existing) {
+    existing.count += 1;
+    return;
+  }
+  state.telemetryStats.failures.push({
+    classification: diagnostic.classification,
+    tool: diagnostic.source,
+    count: 1,
+  });
+  state.telemetryStats.failures.sort((left, right) =>
+    `${left.classification}:${left.tool}`.localeCompare(`${right.classification}:${right.tool}`));
+}
+
 function addThresholdNotifications(state: TavilyMonitorState, sample: TavilyUsageSample, now: string): void {
   for (const scope of ["plan", "paygo"] as const) {
     const quota = sample.account[scope];
@@ -1044,6 +1148,8 @@ export class TavilyMonitor {
   private readonly probeTimeoutMs: number;
   private readonly eventPollIntervalMs: number;
   private readonly reminderIntervalMs: number;
+  private readonly statusStaleMs: number;
+  private readonly onStateChange: TavilyStateObserver | undefined;
   private readonly eventDirectory: string;
   private readonly store: TavilyStateStore;
   private state: TavilyMonitorState;
@@ -1058,13 +1164,57 @@ export class TavilyMonitor {
     this.probeTimeoutMs = options.probeTimeoutMs ?? TAVILY_RECOVERY_PROBE_TIMEOUT_MS;
     this.eventPollIntervalMs = options.eventPollIntervalMs ?? TAVILY_EVENT_POLL_INTERVAL_MS;
     this.reminderIntervalMs = options.reminderIntervalMs ?? TAVILY_REMINDER_INTERVAL_MS;
+    this.statusStaleMs = options.statusStaleMs ?? TAVILY_STATUS_STALE_MS;
+    if (!Number.isFinite(this.statusStaleMs) || this.statusStaleMs <= 0) {
+      throw new Error("Tavily status stale interval must be positive");
+    }
+    this.onStateChange = options.onStateChange;
     this.eventDirectory = tavilyEventSpoolDirectory(options.controlWorkspaceRoot);
     this.store = new TavilyStateStore(options.controlWorkspaceRoot, this.now);
     this.state = this.store.load();
+    this.refreshDiagnostics();
   }
 
   getState(): TavilyMonitorState {
     return structuredClone(this.state);
+  }
+
+  getStatus(at: Date = this.now()): TavilyStatusSnapshot {
+    const now = validDate(at);
+    const sample = this.state.latestSample;
+    const latestStatus = this.state.latestSampleStatus;
+    let sampleState: TavilyStatusSampleState;
+    if (latestStatus && latestStatus.classification !== "ok") {
+      sampleState = "error";
+    } else if (!sample) {
+      sampleState = "missing";
+    } else {
+      const ageMs = Math.max(0, now.getTime() - new Date(sample.observedAt).getTime());
+      sampleState = ageMs > this.statusStaleMs ? "stale" : "fresh";
+    }
+    const incident = this.state.incident;
+    return {
+      sampleState,
+      ...(sample === undefined
+        ? {}
+        : {
+          sampledAt: sample.observedAt,
+          plan: structuredClone(sample.account.plan),
+          paygo: structuredClone(sample.account.paygo),
+        }),
+      ...(latestStatus === undefined ? {} : { latestAttemptAt: latestStatus.observedAt }),
+      ...(this.state.lastFailure === undefined
+        ? {}
+        : { lastFailure: structuredClone(this.state.lastFailure) }),
+      incident: !incident ? "none" : incident.resolvedAt ? "resolved" : "active",
+      acknowledged: Boolean(incident?.acknowledgedAt),
+    };
+  }
+
+  /** Re-publish the restored/current durable state without exposing mutable state to observers. */
+  refreshDiagnostics(at: Date = this.now()): void {
+    if (!this.onStateChange) return;
+    this.onStateChange(structuredClone(this.state), validDate(at));
   }
 
   private commit(change: (state: TavilyMonitorState, now: string) => void): void {
@@ -1072,10 +1222,16 @@ export class TavilyMonitor {
     change(this.state, now);
     this.state.updatedAt = now;
     this.store.save(this.state);
+    this.refreshDiagnostics(new Date(now));
   }
 
-  private recordUsageResult(result: TavilyUsageRequestResult, scheduleAutomatic: boolean): void {
+  private recordUsageResult(
+    result: TavilyUsageRequestResult,
+    scheduleAutomatic: boolean,
+    countSample = true,
+  ): void {
     this.commit((state, now) => {
+      if (countSample) recordUsageSampleStat(state, result.ok ? "success" : "failure");
       if (!result.ok) {
         state.latestSampleStatus = {
           classification: result.diagnostic.classification,
@@ -1085,6 +1241,7 @@ export class TavilyMonitor {
             : { httpStatus: result.diagnostic.httpStatus }),
         };
         state.lastFailure = result.diagnostic;
+        recordFailureStat(state, result.diagnostic);
         return;
       }
       state.latestSample = result.sample;
@@ -1131,6 +1288,7 @@ export class TavilyMonitor {
       event.observedAt,
       event.httpStatus,
     );
+    recordFailureStat(state, state.lastFailure);
     if (event.classification !== "base_plan_exhausted" && event.classification !== "paygo_exhausted") {
       return;
     }
@@ -1298,7 +1456,9 @@ export class TavilyMonitor {
         now,
         httpStatus,
       );
+      recordFailureStat(state, state.lastFailure);
       if (stage === "usage") {
+        recordUsageSampleStat(state, "failure");
         state.latestSampleStatus = {
           classification,
           observedAt: now,
@@ -1345,7 +1505,11 @@ export class TavilyMonitor {
       });
       if (!result.ok) {
         if (result.sample) {
-          this.recordUsageResult({ ok: true, sample: result.sample }, false);
+          this.recordUsageResult(
+            { ok: true, sample: result.sample },
+            false,
+            usageSample === undefined,
+          );
         }
         return this.verificationFailure(
           generation,
@@ -1354,7 +1518,11 @@ export class TavilyMonitor {
           result.httpStatus,
         );
       }
-      this.recordUsageResult({ ok: true, sample: result.sample }, false);
+      this.recordUsageResult(
+        { ok: true, sample: result.sample },
+        false,
+        usageSample === undefined,
+      );
       this.commit((state, now) => {
         const current = state.incident;
         if (!current || current.generation !== generation || current.resolvedAt) return;

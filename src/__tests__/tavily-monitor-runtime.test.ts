@@ -3,7 +3,19 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import client from "prom-client";
 import { TavilyMonitor } from "../tavily-monitor.js";
+import {
+  recordTavilyMonitorMetrics,
+  tavilyFailures,
+  tavilyIncidentAcknowledged,
+  tavilyIncidentActive,
+  tavilyNotifications,
+  tavilyUsageSampleAge,
+  tavilyUsageSamplePresent,
+  tavilyUsageSampleSuccess,
+  tavilyUsageSamples,
+} from "../metrics.js";
 import {
   TAVILY_USAGE_SAMPLE_INTERVAL_MS,
   TavilyMonitorRuntime,
@@ -159,6 +171,80 @@ describe("Tavily monitor lifecycle", () => {
     await runtime.stop();
     assert.equal(runtime.isRunning(), false);
     assert.deepEqual(cleared, installed);
+  });
+
+  it("restores and refreshes metrics and safe status after serialized transitions", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    const privateKey = "tvly-private-runtime-key";
+    let observations = 0;
+    const observe = (state: Parameters<typeof recordTavilyMonitorMetrics>[0], at: Date) => {
+      observations += 1;
+      recordTavilyMonitorMetrics(state, at);
+    };
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: privateKey,
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(100))) as typeof fetch,
+      onStateChange: observe,
+    });
+    assert.equal((await tavilyUsageSamplePresent.get()).values[0].value, 0);
+
+    await monitor.sampleUsage();
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:01.000Z", "metrics");
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    const beforeProcess = observations;
+    await runtime.processNow();
+    assert.ok(observations > beforeProcess, "serialized transitions refresh diagnostics");
+    const generation = monitor.getState().incident?.generation as string;
+    assert.equal(await runtime.acknowledgeIncident(generation), true);
+
+    assert.equal((await tavilyUsageSamplePresent.get()).values[0].value, 1);
+    assert.equal((await tavilyUsageSampleSuccess.get()).values[0].value, 1);
+    assert.equal((await tavilyUsageSamples.get()).values.find((value) =>
+      value.labels.outcome === "success")?.value, 1);
+    assert.equal((await tavilyFailures.get()).values.find((value) =>
+      value.labels.classification === "base_plan_exhausted" && value.labels.tool === "web_search")?.value, 1);
+    assert.equal((await tavilyNotifications.get()).values.find((value) =>
+      value.labels.outcome === "terminal")?.value, 1);
+    assert.equal((await tavilyIncidentActive.get()).values[0].value, 1);
+    assert.equal((await tavilyIncidentAcknowledged.get()).values[0].value, 1);
+
+    clock.set("2026-07-16T12:11:00.000Z");
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: privateKey,
+      now: clock.now,
+      fetchImpl: (async () => assert.fail("startup restoration must not fetch")) as typeof fetch,
+      onStateChange: recordTavilyMonitorMetrics,
+    });
+    assert.equal(restored.getStatus().sampleState, "stale");
+    assert.deepEqual(restored.getStatus(), {
+      sampleState: "stale",
+      sampledAt: "2026-07-16T12:00:00.000Z",
+      latestAttemptAt: "2026-07-16T12:00:00.000Z",
+      plan: { usage: 100, limit: 1_000, remaining: 900 },
+      paygo: { usage: 0, limit: 1_250, remaining: 1_250 },
+      lastFailure: {
+        classification: "base_plan_exhausted",
+        source: "web_search",
+        observedAt: "2026-07-16T12:00:01.000Z",
+        httpStatus: 432,
+      },
+      incident: "active",
+      acknowledged: true,
+    });
+    assert.equal((await tavilyUsageSampleAge.get()).values[0].value, 660);
+    assert.equal((await tavilyNotifications.get()).values.find((value) =>
+      value.labels.outcome === "terminal")?.value, 1, "durable outcome restores without replay");
+    const scrape = await client.register.metrics();
+    assert.doesNotMatch(scrape, /tvly-private-runtime-key|private-generation|\/Users\/|state\.json/);
   });
 });
 

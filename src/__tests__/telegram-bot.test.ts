@@ -1389,8 +1389,12 @@ describe("command handler wiring", () => {
     };
   }
 
-  function initBot(mockSM: SessionManager, apiCalls: Array<{ method: string; payload: any }> = []) {
-    const result = createTelegramBot(handlerConfig, mockSM);
+  function initBot(
+    mockSM: SessionManager,
+    apiCalls: Array<{ method: string; payload: any }> = [],
+    opts?: Parameters<typeof createTelegramBot>[2],
+  ) {
+    const result = createTelegramBot(handlerConfig, mockSM, opts);
     const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
@@ -1489,6 +1493,32 @@ describe("command handler wiring", () => {
     assert.ok(mockSM.calls.includes("getSessionHealth:111111111"));
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+
+  it("/status includes the current privacy-safe Tavily diagnostics", async () => {
+    const mockSM = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot } = initBot(mockSM, apiCalls, {
+      getTavilyStatus: () => ({
+        sampleState: "error",
+        latestAttemptAt: new Date(Date.now() - 60_000).toISOString(),
+        lastFailure: {
+          classification: "rate_limited",
+          source: "web_fetch",
+          observedAt: new Date(Date.now() - 60_000).toISOString(),
+          httpStatus: 429,
+        },
+        incident: "active",
+        acknowledged: false,
+      }),
+    });
+
+    await bot.handleUpdate(makeCommandUpdate("status", 31));
+    const text = String(apiCalls.find((call) => call.method === "sendMessage")?.payload.text);
+    assert.match(text, /Tavily: error \(attempt 1m ago\)/);
+    assert.match(text, /Last failure: rate_limited \(web_fetch, 1m ago\)/);
+    assert.match(text, /Incident: active \(unacknowledged\)/);
+    assert.doesNotMatch(text, /HTTP 429|chat_id|generation|state\.json/);
   });
 
   it("handles delayed command and text updates through their normal paths", async () => {

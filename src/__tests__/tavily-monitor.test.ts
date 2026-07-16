@@ -420,6 +420,10 @@ describe("Tavily threshold and durable incident state", () => {
     assert.equal(state.incident?.lastClassification, "paygo_exhausted");
     assert.deepEqual(state.incident?.observedTools, ["web_search", "web_fetch"]);
     assert.equal(state.outbox.filter((entry) => entry.kind === "incident").length, 1);
+    assert.deepEqual(state.telemetryStats.failures, [
+      { classification: "base_plan_exhausted", tool: "web_search", count: 1 },
+      { classification: "paygo_exhausted", tool: "web_fetch", count: 1 },
+    ]);
     assert.deepEqual(readdirSync(tavilyEventSpoolDirectory(workspace)), []);
 
     writeFileSync(join(tavilyEventSpoolDirectory(workspace), firstName), firstRaw, { mode: 0o600 });
@@ -427,6 +431,7 @@ describe("Tavily threshold and durable incident state", () => {
     state = monitor.getState();
     assert.equal(state.incidentSequence, 1);
     assert.equal(state.outbox.filter((entry) => entry.kind === "incident").length, 1);
+    assert.equal(state.telemetryStats.failures.reduce((total, entry) => total + entry.count, 0), 2);
   });
 
   it("startup-drains, reminds every six hours, and stops reminders on acknowledgement", () => {

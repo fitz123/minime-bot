@@ -40,7 +40,7 @@ import {
   type TavilyDeliveryDestination,
   type TavilyOperatorActions,
 } from "./tavily-monitor-runtime.js";
-import type { TavilyRecoveryResult } from "./tavily-monitor.js";
+import type { TavilyRecoveryResult, TavilyStatusSnapshot } from "./tavily-monitor.js";
 
 
 // Re-export for backward compatibility (tests import from here)
@@ -783,7 +783,11 @@ export const createDraftSkipAutoRetryTransformer = createTelegramAutoRetryTransf
 export function createTelegramBot(
   config: BotConfig,
   sessionManager: SessionManager,
-  opts?: { onUpdate?: () => void; tavilyActions?: TavilyOperatorActions },
+  opts?: {
+    onUpdate?: () => void;
+    tavilyActions?: TavilyOperatorActions;
+    getTavilyStatus?: () => TavilyStatusSnapshot;
+  },
 ): TelegramBotResult {
   if (!config.telegramToken) {
     throw new Error("telegramToken is required for Telegram bot");
@@ -968,6 +972,7 @@ export function createTelegramBot(
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth: sessionManager.getSessionHealth(key),
       quotaStatus: readQuotaStatus(),
+      tavilyStatus: opts?.getTavilyStatus?.(),
     }));
   });
 

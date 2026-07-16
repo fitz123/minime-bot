@@ -222,7 +222,13 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
   }
 
   private enqueue<T>(transition: () => Promise<T> | T): Promise<T> {
-    const result = this.transitionTail.then(transition);
+    const result = this.transitionTail.then(async () => {
+      try {
+        return await transition();
+      } finally {
+        this.monitor.refreshDiagnostics(this.now());
+      }
+    });
     this.transitionTail = result.then(
       () => undefined,
       (error) => { this.onError(error); },

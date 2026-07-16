@@ -56,11 +56,11 @@ Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch
 - [x] Run focused lifecycle/Telegram tests and typecheck before Task 4.
 
 ### Task 4: Expose safe diagnostics and Prometheus metrics
-- [ ] Extend `src/metrics.ts` with low-cardinality Tavily gauges/counters for sample freshness/success, plan and PAYGO usage/limits, active/acknowledged incident state, bounded failure classes/tools, and notification outcomes; never label by key, query, URL, destination, generation, or host path.
-- [ ] Extend `/status` through `src/status-report.ts` and `src/telegram-bot.ts` with a compact Tavily block showing sample freshness, plan/PAYGO usage, last bounded failure class, and incident/acknowledgement state without private values.
-- [ ] Restore metrics and diagnostics from durable state on startup and update them after every serialized transition.
-- [ ] Add `src/__tests__/metrics.test.ts`, `src/__tests__/status-report.test.ts`, and monitor integration assertions for exact metric names, bounded labels, stale/missing/error states, and secret/private-data absence.
-- [ ] Run focused metrics/status tests and typecheck before Task 5.
+- [x] Extend `src/metrics.ts` with low-cardinality Tavily gauges/counters for sample freshness/success, plan and PAYGO usage/limits, active/acknowledged incident state, bounded failure classes/tools, and notification outcomes; never label by key, query, URL, destination, generation, or host path.
+- [x] Extend `/status` through `src/status-report.ts` and `src/telegram-bot.ts` with a compact Tavily block showing sample freshness, plan/PAYGO usage, last bounded failure class, and incident/acknowledgement state without private values.
+- [x] Restore metrics and diagnostics from durable state on startup and update them after every serialized transition.
+- [x] Add `src/__tests__/metrics.test.ts`, `src/__tests__/status-report.test.ts`, and monitor integration assertions for exact metric names, bounded labels, stale/missing/error states, and secret/private-data absence.
+- [x] Run focused metrics/status tests and typecheck before Task 5.
 
 ### Task 5: Package, document, and validate the complete contract
 - [ ] Update `README.md`, `src/pi-extensions/README.md`, and `docs/monitoring.md` with the single-key Tavily contract, default cadences, durable state/incident behavior, operator actions, diagnostics/metrics, manual PAYGO requirement, and rollback behavior; do not publish deployment identifiers or local paths.

@@ -9,7 +9,7 @@ import {
 } from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
-import { startMetricsServer, stopMetricsServer } from "./metrics.js";
+import { recordTavilyMonitorMetrics, startMetricsServer, stopMetricsServer } from "./metrics.js";
 import {
   runTelegramSetupInBackground,
   startBotWithRetry,
@@ -126,6 +126,7 @@ async function main(): Promise<void> {
   const tavilyMonitor = new TavilyMonitor({
     controlWorkspaceRoot,
     apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
+    onStateChange: recordTavilyMonitorMetrics,
   });
   const telegramConfigured = Boolean(config.telegramToken && config.bindings.length > 0);
   tavilyRuntime = new TavilyMonitorRuntime({
@@ -155,6 +156,7 @@ async function main(): Promise<void> {
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
       tavilyActions: tavilyRuntime,
+      getTavilyStatus: () => tavilyMonitor.getStatus(),
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
