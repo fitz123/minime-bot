@@ -38,14 +38,14 @@ Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch
 - [x] Run the focused Tavily tests and typecheck before Task 2.
 
 ### Task 2: Implement the durable usage/incident state machine
-- [ ] Add a Tavily-specific module that builds/parses authenticated `GET /usage`, validates key/account/base-plan/PAYGO counters, derives the monthly billing-cycle generation, and exposes fixed sanitized Search and Extract recovery probes with explicit timeouts and no retries.
-- [ ] Implement one versioned owner-only state document under the control-workspace data directory with atomic same-directory replacement: latest sample/classification, bounded diagnostics, threshold-delivery keys, one active exhaustion incident generation, generation-scoped acknowledgement/resolution, and a durable notification outbox.
-- [ ] Deduplicate plan and PAYGO 80% warnings and 95% critical warnings by billing-cycle/scope/threshold generation; include only provider, usage, limit, remaining credits, reset when known, affected tools, and the fixed Tavily Billing URL.
-- [ ] Ingest the child-event spool with startup drain plus the existing short polling pattern. A 432/433 from either tool opens or refreshes the same active critical generation and durably queues its immediate notification; only a later post-resolution exhaustion creates a new generation.
-- [ ] Queue one six-hour reminder cadence for an active unacknowledged generation, stop reminders on acknowledgement or resolution, and keep notification keys idempotent across process restarts.
-- [ ] Implement one shared verification path for explicit recheck and automatic recovery: current `/usage` plus both fixed probes must succeed before persisting resolution and queuing exactly one recovery notice; dedupe automatic probes by the observed recoverable usage transition.
-- [ ] Add focused state-machine/filesystem tests for malformed usage, 80/95 transitions, cycle rollover, concurrent child events, 432/433 refresh, acknowledgement, later generations, six-hour cadence, failed/successful recheck, automatic recovery, atomic restart persistence, and no private fields.
-- [ ] Run the focused quota-state tests and typecheck before Task 3.
+- [x] Add a Tavily-specific module that builds/parses authenticated `GET /usage`, validates key/account/base-plan/PAYGO counters, derives the monthly billing-cycle generation, and exposes fixed sanitized Search and Extract recovery probes with explicit timeouts and no retries.
+- [x] Implement one versioned owner-only state document under the control-workspace data directory with atomic same-directory replacement: latest sample/classification, bounded diagnostics, threshold-delivery keys, one active exhaustion incident generation, generation-scoped acknowledgement/resolution, and a durable notification outbox.
+- [x] Deduplicate plan and PAYGO 80% warnings and 95% critical warnings by billing-cycle/scope/threshold generation; include only provider, usage, limit, remaining credits, reset when known, affected tools, and the fixed Tavily Billing URL.
+- [x] Ingest the child-event spool with startup drain plus the existing short polling pattern. A 432/433 from either tool opens or refreshes the same active critical generation and durably queues its immediate notification; only a later post-resolution exhaustion creates a new generation.
+- [x] Queue one six-hour reminder cadence for an active unacknowledged generation, stop reminders on acknowledgement or resolution, and keep notification keys idempotent across process restarts.
+- [x] Implement one shared verification path for explicit recheck and automatic recovery: current `/usage` plus both fixed probes must succeed before persisting resolution and queuing exactly one recovery notice; dedupe automatic probes by the observed recoverable usage transition.
+- [x] Add focused state-machine/filesystem tests for malformed usage, 80/95 transitions, cycle rollover, concurrent child events, 432/433 refresh, acknowledgement, later generations, six-hour cadence, failed/successful recheck, automatic recovery, atomic restart persistence, and no private fields.
+- [x] Run the focused quota-state tests and typecheck before Task 3.
 
 ### Task 3: Wire lifecycle, durable delivery, and Telegram actions
 - [ ] Add a lifecycle-managed Tavily monitor to `src/main.ts`: restore/drain state, sample immediately and every five minutes, process due child events/outbox entries, and stop all timers cleanly during shutdown.
