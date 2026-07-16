@@ -48,12 +48,12 @@ Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch
 - [x] Run the focused quota-state tests and typecheck before Task 3.
 
 ### Task 3: Wire lifecycle, durable delivery, and Telegram actions
-- [ ] Add a lifecycle-managed Tavily monitor to `src/main.ts`: restore/drain state, sample immediately and every five minutes, process due child events/outbox entries, and stop all timers cleanly during shutdown.
-- [ ] Deliver through the existing grammY bot API and configured owner/admin destination. Persist success before removing work; retry transient transport/429/5xx delivery with bounded backoff, while recording deterministic destination/4xx errors as visible terminal outbox diagnostics rather than retrying forever.
-- [ ] Add generation-bound inline actions for “acknowledge degraded mode” and “credits fixed — recheck” in `src/telegram-bot.ts`; accept them only from the configured destination/thread and only for the current active generation, answer stale/unauthorized callbacks safely, and include `callback_query` in polling updates.
-- [ ] Keep recheck single-flight and bounded; report failure without resolving, and use the same successful resolution path as sampler recovery.
-- [ ] Add lifecycle and Telegram tests for startup drain, timer idempotence/shutdown, transient delivery retry, deterministic delivery failure, restart deduplication, exact destination authorization, stale generation actions, acknowledgement, single-flight recheck, and callback updates.
-- [ ] Run focused lifecycle/Telegram tests and typecheck before Task 4.
+- [x] Add a lifecycle-managed Tavily monitor to `src/main.ts`: restore/drain state, sample immediately and every five minutes, process due child events/outbox entries, and stop all timers cleanly during shutdown.
+- [x] Deliver through the existing grammY bot API and configured owner/admin destination. Persist success before removing work; retry transient transport/429/5xx delivery with bounded backoff, while recording deterministic destination/4xx errors as visible terminal outbox diagnostics rather than retrying forever.
+- [x] Add generation-bound inline actions for “acknowledge degraded mode” and “credits fixed — recheck” in `src/telegram-bot.ts`; accept them only from the configured destination/thread and only for the current active generation, answer stale/unauthorized callbacks safely, and include `callback_query` in polling updates.
+- [x] Keep recheck single-flight and bounded; report failure without resolving, and use the same successful resolution path as sampler recovery.
+- [x] Add lifecycle and Telegram tests for startup drain, timer idempotence/shutdown, transient delivery retry, deterministic delivery failure, restart deduplication, exact destination authorization, stale generation actions, acknowledgement, single-flight recheck, and callback updates.
+- [x] Run focused lifecycle/Telegram tests and typecheck before Task 4.
 
 ### Task 4: Expose safe diagnostics and Prometheus metrics
 - [ ] Extend `src/metrics.ts` with low-cardinality Tavily gauges/counters for sample freshness/success, plan and PAYGO usage/limits, active/acknowledged incident state, bounded failure classes/tools, and notification outcomes; never label by key, query, URL, destination, generation, or host path.

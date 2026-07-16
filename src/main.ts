@@ -1,6 +1,12 @@
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
-import { createTelegramBot, BOT_COMMANDS, type TelegramBotResult } from "./telegram-bot.js";
+import {
+  createTelegramBot,
+  BOT_COMMANDS,
+  TAVILY_DURABLE_DELIVERY,
+  TELEGRAM_ALLOWED_UPDATES,
+  type TelegramBotResult,
+} from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
 import { startMetricsServer, stopMetricsServer } from "./metrics.js";
@@ -18,6 +24,13 @@ import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
 import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
+import { readTavilyApiKeyFromSops } from "./pi-extensions/tavily-secret.js";
+import { TavilyMonitor } from "./tavily-monitor.js";
+import {
+  resolveTavilyDeliveryDestination,
+  TavilyMonitorRuntime,
+} from "./tavily-monitor-runtime.js";
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -46,6 +59,7 @@ async function main(): Promise<void> {
   let echoWatcher: EchoWatcher | undefined;
   let discordClient: Client | undefined;
   let watchdog: Watchdog | undefined;
+  let tavilyRuntime: TavilyMonitorRuntime | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -60,6 +74,7 @@ async function main(): Promise<void> {
     log.info("main", `Received ${signal}, shutting down...`);
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
+    const tavilyStop = tavilyRuntime?.stop();
     if (telegramBot) {
       stopTelegramBotInBackground(telegramBot, () => {
         log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
@@ -70,6 +85,7 @@ async function main(): Promise<void> {
     // updates, but already-scheduled debounce timers could still fire and start
     // new flush() work during the graceful shutdown wait window.
     for (const mq of messageQueues) mq.cancelAllDebounceTimers();
+    await tavilyStop;
     // Wait for busy sessions to finish their current turns BEFORE clearing
     // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
     // that would break in-flight sessions still reading those files.
@@ -106,6 +122,31 @@ async function main(): Promise<void> {
     requestShutdown("unhandledRejection", 1);
   });
 
+  const controlWorkspaceRoot = resolveWorkspaceContract().paths.controlWorkspaceRoot;
+  const tavilyMonitor = new TavilyMonitor({
+    controlWorkspaceRoot,
+    apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
+  });
+  const telegramConfigured = Boolean(config.telegramToken && config.bindings.length > 0);
+  tavilyRuntime = new TavilyMonitorRuntime({
+    monitor: tavilyMonitor,
+    destination: telegramConfigured ? resolveTavilyDeliveryDestination(config) : undefined,
+    deliver: async (payload) => {
+      if (!telegramBot) {
+        throw { error_code: 400 };
+      }
+      const sendOptions = {
+        ...(payload.threadId === undefined ? {} : { message_thread_id: payload.threadId }),
+        ...(payload.replyMarkup === undefined ? {} : { reply_markup: payload.replyMarkup }),
+        [TAVILY_DURABLE_DELIVERY]: true,
+      } as Parameters<typeof telegramBot.api.sendMessage>[2] & {
+        [TAVILY_DURABLE_DELIVERY]: true;
+      };
+      await telegramBot.api.sendMessage(payload.chatId, payload.text, sendOptions);
+    },
+    onError: () => log.error("main", "Tavily monitor transition failed"),
+  });
+
   // Start Telegram bot if configured
   if (config.telegramToken && config.bindings.length > 0) {
     // Mutable reference so onUpdate callback can reach the watchdog
@@ -113,6 +154,7 @@ async function main(): Promise<void> {
     let onUpdateFn: (() => void) | undefined;
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
+      tavilyActions: tavilyRuntime,
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
@@ -157,7 +199,7 @@ async function main(): Promise<void> {
       () =>
         bot.start({
           timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
-          allowed_updates: ["message", "message_reaction"],
+          allowed_updates: TELEGRAM_ALLOWED_UPDATES,
           onStart: (botInfo) => {
             startedSuccessfully = true;
             clearTimeout(startupTimeout);
@@ -203,6 +245,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  void tavilyRuntime.start().catch(() => {
+    log.error("main", "Tavily monitor startup failed");
+  });
 }
 
 main().catch((err) => {
