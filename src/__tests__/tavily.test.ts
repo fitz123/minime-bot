@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -177,6 +178,38 @@ describe("tavily: child failure event writer", () => {
 
       outer.release();
       assert.equal(readdirSync(tavilyEventSpoolDirectory(controlWorkspace)).includes(".publish.lock"), false);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a crashed publication lock after its PID is reused", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-reused-pid-"));
+    try {
+      const lockPath = join(controlWorkspace, TAVILY_EVENT_PUBLICATION_LOCK_RELPATH);
+      mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+      writeFileSync(lockPath, `${JSON.stringify({
+        version: 1,
+        pid: 71,
+        token: "stale-owner",
+      })}\n`, { mode: 0o600 });
+      const acquiredAt = new Date("2026-07-16T10:20:30.000Z");
+      utimesSync(lockPath, acquiredAt, acquiredAt);
+
+      const replacement = acquireTavilyEventPublicationLock(controlWorkspace, {
+        pid: 72,
+        uniqueId: () => "replacement",
+        isProcessAlive: () => true,
+        getProcessIdentity: () => undefined,
+        getProcessStartedAt: (pid) => pid === 71
+          ? new Date("2026-07-16T10:21:00.000Z").getTime()
+          : new Date("2026-07-16T10:20:00.000Z").getTime(),
+        now: () => new Date("2026-07-16T10:21:30.000Z"),
+        waitTimeoutMs: 0,
+      });
+      assert.equal(replacement.path, lockPath);
+      replacement.release();
+      assert.equal(readdirSync(dirname(lockPath)).includes(".publish.lock"), false);
     } finally {
       rmSync(controlWorkspace, { recursive: true, force: true });
     }

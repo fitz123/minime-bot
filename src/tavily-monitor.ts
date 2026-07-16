@@ -23,6 +23,9 @@ import {
 } from "./pi-extensions/tavily.js";
 import {
   TAVILY_CHILD_EVENT_VERSION,
+  TAVILY_LOCK_PROCESS_START_CLOCK_SKEW_MS,
+  tavilyProcessIdentity,
+  tavilyProcessStartedAt,
   tavilyEventSpoolDirectory,
   withTavilyEventPublicationLock,
   type TavilyChildEvent,
@@ -194,6 +197,8 @@ export interface TavilyWriterLeaseOptions {
   uniqueId?: () => string;
   now?: () => Date;
   isProcessAlive?: (pid: number) => boolean;
+  getProcessIdentity?: (pid: number) => string | undefined;
+  getProcessStartedAt?: (pid: number) => number | undefined;
 }
 
 export interface TavilyPendingAutomaticVerification {
@@ -705,6 +710,7 @@ interface TavilyWriterLeaseRecord {
   pid: number;
   token: string;
   acquiredAt: string;
+  processIdentity?: string;
 }
 
 function defaultProcessIsAlive(pid: number): boolean {
@@ -720,11 +726,14 @@ function readWriterLease(path: string): TavilyWriterLeaseRecord {
   assertPrivateFile(path);
   const value: unknown = JSON.parse(readFileSync(path, "utf8"));
   if (!isRecord(value) ||
-      !hasOnlyKeys(value, ["version", "pid", "token", "acquiredAt"]) ||
+      !hasOnlyKeys(value, ["version", "pid", "token", "acquiredAt", "processIdentity"]) ||
       value.version !== 1 ||
       !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 ||
       typeof value.token !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(value.token) ||
-      !isCanonicalIsoTimestamp(value.acquiredAt)) {
+      !isCanonicalIsoTimestamp(value.acquiredAt) ||
+      (value.processIdentity !== undefined &&
+        (typeof value.processIdentity !== "string" ||
+          !/^[A-Za-z0-9_-]{1,80}$/.test(value.processIdentity)))) {
     throw new Error("Tavily monitor writer lease is invalid");
   }
   return value as unknown as TavilyWriterLeaseRecord;
@@ -741,17 +750,24 @@ export function tryAcquireTavilyWriterLease(
   const pid = options.pid ?? process.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Tavily monitor writer lease PID is invalid");
   const isProcessAlive = options.isProcessAlive ?? defaultProcessIsAlive;
+  const getProcessIdentity = options.getProcessIdentity ?? tavilyProcessIdentity;
+  const getProcessStartedAt = options.getProcessStartedAt ?? tavilyProcessStartedAt;
   const now = options.now ?? (() => new Date());
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const token = (options.uniqueId?.() ?? randomUUID()).replaceAll(/[^A-Za-z0-9-]/g, "");
     if (!token) throw new Error("Tavily monitor writer lease token is invalid");
     const candidatePath = join(directory, `.writer-${pid}-${token}.tmp`);
+    const processIdentity = getProcessIdentity(pid);
+    if (processIdentity !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(processIdentity)) {
+      throw new Error("Tavily monitor writer lease process identity is invalid");
+    }
     const record: TavilyWriterLeaseRecord = {
       version: 1,
       pid,
       token,
       acquiredAt: isoNow(now),
+      ...(processIdentity === undefined ? {} : { processIdentity }),
     };
     writeFileSync(candidatePath, `${JSON.stringify(record)}\n`, {
       encoding: "utf8",
@@ -790,10 +806,26 @@ export function tryAcquireTavilyWriterLease(
       if (isMissing(error)) continue;
       throw error;
     }
-    if (isProcessAlive(owner.pid)) return undefined;
+    if (isProcessAlive(owner.pid)) {
+      if (owner.processIdentity !== undefined) {
+        const currentIdentity = getProcessIdentity(owner.pid);
+        if (currentIdentity === undefined || currentIdentity === owner.processIdentity) {
+          return undefined;
+        }
+      } else {
+        const currentStartedAt = getProcessStartedAt(owner.pid);
+        if (currentStartedAt === undefined ||
+            currentStartedAt <= new Date(owner.acquiredAt).getTime() +
+              TAVILY_LOCK_PROCESS_START_CLOCK_SKEW_MS) {
+          return undefined;
+        }
+      }
+    }
     try {
       const current = readWriterLease(path);
-      if (current.token !== owner.token) return undefined;
+      if (current.token !== owner.token || current.processIdentity !== owner.processIdentity) {
+        return undefined;
+      }
       unlinkSync(path);
     } catch (error) {
       if (!isMissing(error)) throw error;

@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   linkSync,
@@ -23,6 +24,7 @@ const publicationLocksHeldByThisProcess = new Map<string, {
   token: string;
 }>();
 const publicationWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
+export const TAVILY_LOCK_PROCESS_START_CLOCK_SKEW_MS = 5_000;
 
 export interface TavilyChildEvent {
   version: typeof TAVILY_CHILD_EVENT_VERSION;
@@ -42,6 +44,9 @@ export interface TavilyEventPublicationLockOptions {
   uniqueId?: () => string;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
+  getProcessIdentity?: (pid: number) => string | undefined;
+  getProcessStartedAt?: (pid: number) => number | undefined;
+  now?: () => Date;
   waitTimeoutMs?: number;
   waitIntervalMs?: number;
 }
@@ -55,6 +60,8 @@ interface TavilyEventPublicationLockRecord {
   version: 1;
   pid: number;
   token: string;
+  processIdentity?: string;
+  acquiredAt: string;
 }
 
 function isMissing(error: unknown): boolean {
@@ -126,6 +133,79 @@ function defaultProcessIsAlive(pid: number): boolean {
   }
 }
 
+function hashProcessIdentity(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+function queryPosixProcessStart(pid: number): string | undefined {
+  try {
+    return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        LC_ALL: "C",
+        TZ: "UTC",
+      },
+    }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Return the process start epoch used to recover pre-fingerprint lock files. */
+export function tavilyProcessStartedAt(pid: number): number | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const value = queryPosixProcessStart(pid);
+  if (!value) return undefined;
+  const milliseconds = Date.parse(`${value} UTC`);
+  return Number.isFinite(milliseconds) ? milliseconds : undefined;
+}
+
+/**
+ * Return a bounded fingerprint for one OS process instance. PIDs alone can be
+ * reused after a crash or reboot, so lock recovery also compares the process
+ * start identity. Raw boot IDs and process metadata never reach the lock file.
+ */
+export function tavilyProcessIdentity(pid: number): string | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      if (commandEnd < 0) return undefined;
+      const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+      const startTicks = fields[19];
+      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      if (!startTicks || !/^\d+$/.test(startTicks) || !bootId) return undefined;
+      return hashProcessIdentity(`linux:${bootId}:${startTicks}`);
+    } catch {
+      // Fall through to the portable POSIX process-start query.
+    }
+  }
+  const startedAt = queryPosixProcessStart(pid);
+  return startedAt ? hashProcessIdentity(`${process.platform}:${startedAt}`) : undefined;
+}
+
+function validProcessIdentity(value: string | undefined): value is string {
+  return value !== undefined && /^[A-Za-z0-9_-]{1,80}$/.test(value);
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    new Date(value).toISOString() === value;
+}
+
+function isoNow(now: () => Date): string {
+  const value = now();
+  if (!Number.isFinite(value.getTime())) {
+    throw new Error("Tavily event publication lock time is invalid");
+  }
+  return value.toISOString();
+}
+
 function readPublicationLock(path: string): TavilyEventPublicationLockRecord {
   assertPrivateFile(path);
   const value: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -134,14 +214,35 @@ function readPublicationLock(path: string): TavilyEventPublicationLockRecord {
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
-  if (keys.length !== 3 ||
-      !keys.every((key) => key === "version" || key === "pid" || key === "token") ||
+  if (!keys.every((key) =>
+    key === "version" || key === "pid" || key === "token" ||
+    key === "processIdentity" || key === "acquiredAt") ||
       record.version !== 1 ||
       !Number.isSafeInteger(record.pid) || (record.pid as number) <= 0 ||
-      typeof record.token !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(record.token)) {
+      typeof record.token !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(record.token) ||
+      (record.processIdentity !== undefined &&
+        (typeof record.processIdentity !== "string" || !validProcessIdentity(record.processIdentity))) ||
+      (record.acquiredAt !== undefined && !isCanonicalIsoTimestamp(record.acquiredAt))) {
     throw new Error("Tavily event publication lock is invalid");
   }
-  return record as unknown as TavilyEventPublicationLockRecord;
+  const acquiredAt = record.acquiredAt ?? lstatSync(path).mtime.toISOString();
+  return { ...record, acquiredAt } as unknown as TavilyEventPublicationLockRecord;
+}
+
+function lockOwnerMatchesLiveProcess(
+  owner: TavilyEventPublicationLockRecord,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
+  getProcessStartedAt: (pid: number) => number | undefined,
+): boolean {
+  if (!isProcessAlive(owner.pid)) return false;
+  if (owner.processIdentity !== undefined) {
+    const currentIdentity = getProcessIdentity(owner.pid);
+    return currentIdentity === undefined || currentIdentity === owner.processIdentity;
+  }
+  const currentStartedAt = getProcessStartedAt(owner.pid);
+  return currentStartedAt === undefined ||
+    currentStartedAt <= new Date(owner.acquiredAt).getTime() + TAVILY_LOCK_PROCESS_START_CLOCK_SKEW_MS;
 }
 
 function publicationLockHandle(
@@ -197,13 +298,26 @@ export function acquireTavilyEventPublicationLock(
     throw new Error("Tavily event publication lock wait is invalid");
   }
   const isProcessAlive = options.isProcessAlive ?? defaultProcessIsAlive;
+  const getProcessIdentity = options.getProcessIdentity ?? tavilyProcessIdentity;
+  const getProcessStartedAt = options.getProcessStartedAt ?? tavilyProcessStartedAt;
+  const now = options.now ?? (() => new Date());
   const deadline = Date.now() + waitTimeoutMs;
 
   for (;;) {
     const token = (options.uniqueId?.() ?? randomUUID()).replaceAll(/[^A-Za-z0-9-]/g, "");
     if (!token) throw new Error("Tavily event publication lock token is invalid");
     const candidatePath = join(directory, `.publish-${pid}-${token}.tmp`);
-    const record: TavilyEventPublicationLockRecord = { version: 1, pid, token };
+    const processIdentity = getProcessIdentity(pid);
+    if (processIdentity !== undefined && !validProcessIdentity(processIdentity)) {
+      throw new Error("Tavily event publication lock process identity is invalid");
+    }
+    const record: TavilyEventPublicationLockRecord = {
+      version: 1,
+      pid,
+      token,
+      ...(processIdentity === undefined ? {} : { processIdentity }),
+      acquiredAt: isoNow(now),
+    };
     writeFileSync(candidatePath, `${JSON.stringify(record)}\n`, {
       encoding: "utf8",
       flag: "wx",
@@ -231,9 +345,18 @@ export function acquireTavilyEventPublicationLock(
       if (isMissing(error)) continue;
       throw error;
     }
-    if (!isProcessAlive(owner.pid)) {
+    const sameProcessInstance = lockOwnerMatchesLiveProcess(
+      owner,
+      isProcessAlive,
+      getProcessIdentity,
+      getProcessStartedAt,
+    );
+    if (!sameProcessInstance) {
       try {
-        if (readPublicationLock(path).token === owner.token) unlinkSync(path);
+        const current = readPublicationLock(path);
+        if (current.token === owner.token && current.processIdentity === owner.processIdentity) {
+          unlinkSync(path);
+        }
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
@@ -309,5 +432,5 @@ export function writeTavilyChildEvent(
       }
       throw error;
     }
-  }, { pid: options.pid });
+  }, { pid: options.pid, now: options.now });
 }

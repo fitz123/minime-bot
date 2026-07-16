@@ -463,6 +463,57 @@ describe("Tavily production writer lease", () => {
     replacement.release();
     assert.equal(readdirSync(join(workspace, "data", "tavily")).includes("writer.lock"), false);
   });
+
+  it("recovers a crashed writer lease after its PID is reused", () => {
+    const workspace = temporaryWorkspace();
+    const first = tryAcquireTavilyWriterLease(workspace, {
+      pid: 101,
+      uniqueId: () => "first-instance",
+      getProcessIdentity: () => "old-process-instance",
+      now: () => new Date("2026-07-16T11:00:00.000Z"),
+    });
+    assert.ok(first);
+
+    const replacement = tryAcquireTavilyWriterLease(workspace, {
+      pid: 102,
+      uniqueId: () => "replacement-instance",
+      isProcessAlive: () => true,
+      getProcessIdentity: (pid) => pid === 101
+        ? "reused-process-instance"
+        : "replacement-process-instance",
+      now: () => new Date("2026-07-16T11:01:00.000Z"),
+    });
+    assert.ok(replacement, "a different process instance must not inherit the stale lease");
+    first.release();
+    assert.equal(lstatSync(replacement.path).isFile(), true, "the stale release preserves its replacement");
+    replacement.release();
+  });
+
+  it("uses acquisition time to recover a pre-fingerprint writer lease after PID reuse", () => {
+    const workspace = temporaryWorkspace();
+    const first = tryAcquireTavilyWriterLease(workspace, {
+      pid: 101,
+      uniqueId: () => "legacy-owner",
+      getProcessIdentity: () => undefined,
+      now: () => new Date("2026-07-16T11:00:00.000Z"),
+    });
+    assert.ok(first);
+
+    const replacement = tryAcquireTavilyWriterLease(workspace, {
+      pid: 102,
+      uniqueId: () => "legacy-replacement",
+      isProcessAlive: () => true,
+      getProcessIdentity: () => undefined,
+      getProcessStartedAt: (pid) => pid === 101
+        ? new Date("2026-07-16T11:01:00.000Z").getTime()
+        : new Date("2026-07-16T11:00:30.000Z").getTime(),
+      now: () => new Date("2026-07-16T11:02:00.000Z"),
+    });
+    assert.ok(replacement);
+    first.release();
+    assert.equal(lstatSync(replacement.path).isFile(), true);
+    replacement.release();
+  });
 });
 
 describe("Tavily threshold and durable incident state", () => {
