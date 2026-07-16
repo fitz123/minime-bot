@@ -21,10 +21,10 @@ python3 -B scripts/tests/test_recovery_supervisor.py
 ## Tasks
 
 ### Task 1: Decouple recovery-agent lookup from transport secret materialization
-- [ ] Update `src/recovery/fixer-session.ts` so recovery-agent lookup validates merged configuration and the selected agent without resolving configured transport credentials.
-- [ ] Preserve rejection of missing/invalid agents, models, workspaces, bindings, and other configuration errors; do not pass secret-resolution environment variables into the runner.
-- [ ] Add focused tests proving a secret-backed config resolves the internal recovery agent when credential material is unavailable and never invokes the secret resolver.
-- [ ] Run focused recovery fixer/session tests and fix all failures before continuing.
+- [x] Update `src/recovery/fixer-session.ts` so recovery-agent lookup validates merged configuration and the selected agent without resolving configured transport credentials.
+- [x] Preserve rejection of missing/invalid agents, models, workspaces, bindings, and other configuration errors; do not pass secret-resolution environment variables into the runner.
+- [x] Add focused tests proving a secret-backed config resolves the internal recovery agent when credential material is unavailable and never invokes the secret resolver.
+- [x] Run focused recovery fixer/session tests and fix all failures before continuing.
 
 ### Task 2: Verify packaged and host-native recovery compatibility
 - [ ] Run the TypeScript test suite, lint, and build.

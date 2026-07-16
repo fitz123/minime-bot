@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -41,6 +42,7 @@ import {
   discoverCanonicalRecoveryTranscript,
   hasNoSessionFoundClassifier,
   inspectRecoveryTranscript,
+  resolveRecoveryAgent,
   runRecoveryFixer,
   recoveryStartsNewPiProcessGroup,
   terminateRecoveryProcessGroup,
@@ -102,6 +104,148 @@ function fakeChild(): ChildProcess {
 }
 
 describe("exact-session recovery fixer", () => {
+  it("resolves the recovery agent without invoking the unavailable transport secret resolver", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-agent-config-"));
+    temporary.push(root);
+    const agentWorkspace = join(root, "agent");
+    const binDirectory = join(root, "bin");
+    const sopsFile = join(root, "secrets.sops.yaml");
+    const resolverMarker = join(root, "secret-resolver-invoked");
+    mkdirSync(agentWorkspace);
+    mkdirSync(binDirectory);
+    writeFileSync(sopsFile, "telegram:\n  bot_token: unavailable\n");
+    writeFileSync(join(binDirectory, "sops"), [
+      "#!/bin/sh",
+      `: > ${JSON.stringify(resolverMarker)}`,
+      "exit 23",
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const configPath = join(root, "config.yaml");
+    writeFileSync(configPath, [
+      "secrets:",
+      "  sopsFile: secrets.sops.yaml",
+      "telegramTokenSopsKey: telegram.bot_token",
+      "agents:",
+      "  recovery-fixer:",
+      `    workspaceCwd: ${JSON.stringify(agentWorkspace)}`,
+      "    model: gpt-5.5",
+      "bindings:",
+      "  - chatId: 111",
+      "    agentId: recovery-fixer",
+      "    kind: dm",
+      "",
+    ].join("\n"));
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDirectory}:${previousPath ?? ""}`;
+    let agent: ReturnType<typeof resolveRecoveryAgent>;
+    try {
+      agent = resolveRecoveryAgent("recovery-fixer", configPath);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    assert.equal(agent.id, "recovery-fixer");
+    assert.equal(agent.model, "gpt-5.5");
+    assert.equal(agent.workspaceCwd, agentWorkspace);
+    assert.equal(existsSync(resolverMarker), false);
+  });
+
+  it("preserves full config and selected-agent validation during recovery lookup", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-recovery-agent-validation-"));
+    temporary.push(root);
+    const configPath = join(root, "config.yaml");
+    const localConfigPath = join(root, "config.local.yaml");
+    const validAgent = [
+      "agents:",
+      "  recovery-fixer:",
+      "    workspaceCwd: agent",
+      "    model: gpt-5.5",
+    ];
+    const transport = [
+      "telegramTokenEnv: MINIME_TEST_UNAVAILABLE_TRANSPORT_TOKEN",
+      "bindings:",
+      "  - chatId: 111",
+      "    agentId: recovery-fixer",
+      "    kind: dm",
+      "",
+    ];
+    const invalidCases: Array<{
+      name: string;
+      agentId?: string;
+      lines: string[];
+      localLines?: string[];
+      error: RegExp;
+    }> = [
+      {
+        name: "missing selected agent",
+        agentId: "missing-agent",
+        lines: [...validAgent, ...transport],
+        error: /Configured recovery agent is unavailable/,
+      },
+      {
+        name: "invalid agent",
+        lines: ["agents:", "  recovery-fixer: true", ...transport],
+        error: /Agent "recovery-fixer" must be an object/,
+      },
+      {
+        name: "invalid model",
+        lines: [
+          "agents:",
+          "  recovery-fixer:",
+          "    workspaceCwd: agent",
+          "    model: 55",
+          ...transport,
+        ],
+        error: /Agent "recovery-fixer" has invalid model/,
+      },
+      {
+        name: "invalid workspace",
+        lines: [
+          "agents:",
+          "  recovery-fixer:",
+          "    workspaceCwd: 55",
+          "    model: gpt-5.5",
+          ...transport,
+        ],
+        error: /Agent "recovery-fixer" missing workspaceCwd/,
+      },
+      {
+        name: "invalid binding",
+        lines: [
+          ...validAgent,
+          "telegramTokenEnv: MINIME_TEST_UNAVAILABLE_TRANSPORT_TOKEN",
+          "bindings:",
+          "  - chatId: 111",
+          "    agentId: missing-agent",
+          "    kind: dm",
+          "",
+        ],
+        error: /Binding\[0\] references unknown agent "missing-agent"/,
+      },
+      {
+        name: "other merged config error",
+        lines: [...validAgent, ...transport],
+        localLines: ["metricsPort: 70000", ""],
+        error: /Invalid metricsPort/,
+      },
+    ];
+
+    for (const invalidCase of invalidCases) {
+      writeFileSync(configPath, invalidCase.lines.join("\n"));
+      rmSync(localConfigPath, { force: true });
+      if (invalidCase.localLines) {
+        writeFileSync(localConfigPath, invalidCase.localLines.join("\n"));
+      }
+      assert.throws(
+        () => resolveRecoveryAgent(invalidCase.agentId ?? "recovery-fixer", configPath),
+        invalidCase.error,
+        invalidCase.name,
+      );
+    }
+  });
+
   it("joins the supervisor-owned process group while preserving standalone fencing", () => {
     assert.equal(recoveryStartsNewPiProcessGroup({}), true);
     assert.equal(recoveryStartsNewPiProcessGroup({
@@ -461,7 +605,7 @@ describe("exact-session recovery fixer", () => {
       return child;
     }) as never;
     const previousToken = process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN;
-    process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN = "synthetic-test-token";
+    delete process.env.MINIME_TEST_RECOVERY_TELEGRAM_TOKEN;
     const result = await (async () => {
       try {
         return await runRecoveryFixer({
