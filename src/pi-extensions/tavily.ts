@@ -39,6 +39,8 @@ export const MAX_SEARCH_MAX_RESULTS = 20;
 export const MAX_SEARCH_QUERY_CHARS = 300;
 /** Hard cap for fetch URLs before they are sent to Tavily. */
 export const MAX_FETCH_URL_CHARS = 2048;
+/** Bound model-facing Tavily requests even when Pi does not cancel the tool call. */
+export const TAVILY_TOOL_REQUEST_TIMEOUT_MS = 30_000;
 const DNS_RESOLVE_TIMEOUT_MS = 1500;
 
 /** A fully-described HTTP request (so tests can assert shape without a network). */
@@ -133,6 +135,8 @@ export interface RunToolDeps {
   fetchImpl: typeof fetch;
   /** Optional DNS resolver for hostname egress checks (mocked in tests). */
   resolveHost?: ResolveHost;
+  /** Test-only override for the fixed model-facing request timeout. */
+  requestTimeoutMs?: number;
   /** Structured warn sink. */
   warn?: (event: TavilyWarn) => void;
 }
@@ -703,6 +707,40 @@ function missingKeyText(tool: "web_search" | "web_fetch"): string {
     "control-workspace Tavily SOPS file and restart the bot.";
 }
 
+function boundedRequestSignal(
+  parent: AbortSignal | undefined,
+  timeoutMs: number,
+): { signal: AbortSignal; cancel: () => void } {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Tavily tool request timeout must be positive");
+  }
+  const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(parent?.reason);
+  if (parent?.aborted) {
+    abortFromParent();
+  } else {
+    parent?.addEventListener("abort", abortFromParent, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref();
+  return {
+    signal: controller.signal,
+    cancel: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+/** Release a non-2xx Undici response without consuming provider diagnostics. */
+export async function cancelTavilyResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Failure classification must not be replaced by a cleanup error.
+  }
+}
+
 /**
  * Run a built Tavily request through `fetchImpl`, returning the parsed JSON body
  * on a 2xx response. Throws only bounded status metadata on non-2xx; provider
@@ -712,19 +750,27 @@ async function fetchTavilyJson(
   req: TavilyHttpRequest,
   fetchImpl: typeof fetch,
   signal?: AbortSignal,
+  timeoutMs = TAVILY_TOOL_REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
-  const res = await fetchImpl(req.url, {
-    method: req.method,
-    headers: req.headers,
-    body: req.body,
-    signal,
-  });
-  if (!res.ok) {
-    const err = new Error("Tavily HTTP request failed");
-    (err as { httpStatus?: number }).httpStatus = res.status;
-    throw err;
+  const bounded = boundedRequestSignal(signal, timeoutMs);
+  try {
+    const res = await fetchImpl(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+      signal: bounded.signal,
+    });
+    if (!res.ok) {
+      const httpStatus = res.status;
+      await cancelTavilyResponseBody(res);
+      const err = new Error("Tavily HTTP request failed");
+      (err as { httpStatus?: number }).httpStatus = httpStatus;
+      throw err;
+    }
+    return await res.json();
+  } finally {
+    bounded.cancel();
   }
-  return res.json();
 }
 
 /** Execute a `web_search` tool call. Never throws (criterion 3 — graceful). */
@@ -753,7 +799,7 @@ export async function executeWebSearch(
 
   const req = buildSearchRequest(deps.apiKey, { ...args, query });
   try {
-    const json = await fetchTavilyJson(req, deps.fetchImpl, signal);
+    const json = await fetchTavilyJson(req, deps.fetchImpl, signal, deps.requestTimeoutMs);
     return { ok: true, text: formatSearchResult(query, parseSearchResponse(json)) };
   } catch (err) {
     const httpStatus = (err as { httpStatus?: unknown }).httpStatus;
@@ -791,7 +837,7 @@ export async function executeWebFetch(
 
   const req = buildExtractRequest(deps.apiKey, { url: egress.safeUrl ?? url });
   try {
-    const json = await fetchTavilyJson(req, deps.fetchImpl, signal);
+    const json = await fetchTavilyJson(req, deps.fetchImpl, signal, deps.requestTimeoutMs);
     const parsed = parseExtractResponse(json);
     if (!parsed.results.some((result) => result.content.trim().length > 0)) {
       const failure = classifyTavilyFailure({ kind: "extraction" });

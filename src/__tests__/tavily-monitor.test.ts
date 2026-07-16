@@ -18,12 +18,14 @@ import {
   TAVILY_RECOVERY_SEARCH_QUERY,
   TAVILY_STATE_RELPATH,
   TAVILY_USAGE_URL,
+  TAVILY_WRITER_LEASE_RELPATH,
   TavilyMonitor,
   buildTavilyUsageRequest,
   isTavilyUsageRecoverable,
   parseTavilyUsageResponse,
   requestTavilyUsage,
   tavilyBillingCycleGeneration,
+  tryAcquireTavilyWriterLease,
   verifyTavilyRecovery,
 } from "../tavily-monitor.js";
 import {
@@ -228,12 +230,14 @@ describe("Tavily usage parsing and bounded requests", () => {
     });
 
     let bodyRead = false;
+    let bodyCanceled = false;
     const serverFailure = await requestTavilyUsage({
       apiKey: "fixture-key",
       now: clock,
       fetchImpl: (async () => ({
         ok: false,
         status: 503,
+        body: { cancel: async () => { bodyCanceled = true; } },
         json: async () => { bodyRead = true; return { secret: "provider-body" }; },
       }) as unknown as Response) as typeof fetch,
     });
@@ -243,6 +247,7 @@ describe("Tavily usage parsing and bounded requests", () => {
       assert.equal(serverFailure.diagnostic.httpStatus, 503);
     }
     assert.equal(bodyRead, false, "non-2xx provider bodies are never read");
+    assert.equal(bodyCanceled, true, "non-2xx provider bodies are cancelled");
 
     const malformed = await requestTavilyUsage({
       apiKey: "fixture-key",
@@ -393,6 +398,69 @@ describe("Tavily fixed recovery verification", () => {
     }
     assert.equal(calls, 2);
   });
+
+  it("cancels non-2xx recovery-probe bodies without replacing their classification", async () => {
+    const recoverable = parseTavilyUsageResponse(
+      usageResponse({ planUsage: 100 }),
+      new Date("2026-07-16T11:00:00.000Z"),
+    );
+    let bodyCanceled = false;
+    const fetches = sequenceFetch([
+      jsonResponse(successfulSearchResponse()),
+      {
+        ok: false,
+        status: 503,
+        body: { cancel: async () => { bodyCanceled = true; } },
+      } as unknown as Response,
+    ]);
+
+    const result = await verifyTavilyRecovery({
+      apiKey: "fixture-key",
+      usageSample: recoverable,
+      fetchImpl: fetches.fetchImpl,
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, "extract_probe");
+      assert.equal(result.classification, "provider_unavailable");
+      assert.equal(result.httpStatus, 503);
+    }
+    assert.equal(bodyCanceled, true);
+  });
+});
+
+describe("Tavily production writer lease", () => {
+  it("permits one writer, recovers a dead owner, and protects a replacement from stale release", () => {
+    const workspace = temporaryWorkspace();
+    const first = tryAcquireTavilyWriterLease(workspace, {
+      pid: 101,
+      uniqueId: () => "first",
+      now: () => new Date("2026-07-16T11:00:00.000Z"),
+    });
+    assert.ok(first);
+    assert.equal(first.path, join(workspace, TAVILY_WRITER_LEASE_RELPATH));
+    assert.equal(lstatSync(first.path).mode & 0o777, 0o600);
+
+    const blocked = tryAcquireTavilyWriterLease(workspace, {
+      pid: 102,
+      uniqueId: () => "blocked",
+      isProcessAlive: (pid) => pid === 101,
+    });
+    assert.equal(blocked, undefined);
+
+    const replacement = tryAcquireTavilyWriterLease(workspace, {
+      pid: 102,
+      uniqueId: () => "replacement",
+      now: () => new Date("2026-07-16T11:01:00.000Z"),
+      isProcessAlive: () => false,
+    });
+    assert.ok(replacement);
+    first.release();
+    assert.equal(lstatSync(replacement.path).isFile(), true, "the stale owner cannot unlink its replacement");
+    replacement.release();
+    assert.equal(readdirSync(join(workspace, "data", "tavily")).includes("writer.lock"), false);
+  });
 });
 
 describe("Tavily threshold and durable incident state", () => {
@@ -518,6 +586,7 @@ describe("Tavily threshold and durable incident state", () => {
     const acknowledgedAt = monitor.getState().incident?.acknowledgedAt;
     assert.equal(monitor.acknowledgeIncident(generation), true, "acknowledgement is idempotent");
     assert.equal(monitor.getState().incident?.acknowledgedAt, acknowledgedAt);
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "reminder"), false);
     clock.set("2026-07-17T12:00:00.000Z");
     assert.equal(monitor.queueDueReminder(), false);
   });
@@ -565,7 +634,7 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     const recovered = await monitor.recheckIncident(generation);
     assert.equal(recovered.ok, true);
     assert.equal(monitor.getState().incident?.resolvedAt, "2026-07-16T12:05:00.000Z");
-    assert.equal(monitor.getState().outbox.filter((entry) => entry.kind === "recovery").length, 1);
+    assert.deepEqual(monitor.getState().outbox.map((entry) => entry.kind), ["recovery"]);
 
     const callsBeforeStale = fetches.calls.length;
     const stale = await monitor.recheckIncident(generation);
@@ -725,6 +794,59 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
   });
 
+  it("reopens for an event published after the final drain but before resolution commits", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:05:00.000Z");
+    writeExhaustionEvent(
+      workspace,
+      "web_search",
+      "base_plan_exhausted",
+      "2026-07-16T12:00:00.000Z",
+      "verification-start",
+    );
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: sequenceFetch([
+        jsonResponse(usageResponse({ planUsage: 100 })),
+        jsonResponse(successfulSearchResponse()),
+        jsonResponse(successfulExtractResponse()),
+      ]).fetchImpl,
+    });
+    monitor.drainChildEvents();
+    const firstGeneration = monitor.getState().incident?.generation as string;
+    const originalDrain = monitor.drainChildEvents.bind(monitor);
+    let verificationDrains = 0;
+    monitor.drainChildEvents = () => {
+      verificationDrains += 1;
+      const processed = originalDrain();
+      if (verificationDrains === 2) {
+        clock.set("2026-07-16T12:06:00.000Z");
+        writeExhaustionEvent(
+          workspace,
+          "web_fetch",
+          "paygo_exhausted",
+          "2026-07-16T12:06:00.000Z",
+          "after-final-listing",
+        );
+      }
+      return processed;
+    };
+
+    const result = await monitor.recheckIncident(firstGeneration);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, "usage_state");
+      assert.equal(result.classification, "usage_exhausted");
+    }
+    const state = monitor.getState();
+    assert.equal(state.incident?.generation, "2026-07-2");
+    assert.equal(state.incident?.resolvedAt, undefined);
+    assert.equal(state.outbox.some((entry) => entry.kind === "recovery"), false);
+    assert.equal(state.outbox.filter((entry) => entry.kind === "incident").length, 1);
+  });
+
   it("creates a later generation only for post-resolution exhaustion", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -775,7 +897,8 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.equal(state.incident?.generation, "2026-07-2");
     assert.equal(state.incident?.acknowledgedAt, undefined);
     assert.equal(state.incident?.resolvedAt, undefined);
-    assert.equal(state.outbox.filter((entry) => entry.kind === "incident").length, 2);
+    assert.equal(state.outbox.filter((entry) => entry.kind === "incident").length, 1);
+    assert.equal(state.outbox.some((entry) => entry.kind === "recovery"), false);
   });
 
   it("atomically restores owner-only state without persisting private fields", async () => {

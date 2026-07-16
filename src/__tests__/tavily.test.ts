@@ -473,9 +473,11 @@ describe("tavily: executeWebSearch", () => {
     for (const testCase of cases) {
       const privateBody = "tvly-private-key private query https://private.example /Users/private/file";
       let bodyRead = false;
+      let bodyCanceled = false;
       const mock = mockFetch(async () => ({
         ok: false,
         status: testCase.status,
+        body: { cancel: async () => { bodyCanceled = true; } },
         text: async () => {
           bodyRead = true;
           return privateBody;
@@ -498,6 +500,7 @@ describe("tavily: executeWebSearch", () => {
         httpStatus: testCase.status,
       }]);
       assert.equal(bodyRead, false);
+      assert.equal(bodyCanceled, true);
       assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /tvly-private|private query|private\.example|\/Users\/private/);
     }
   });
@@ -520,15 +523,49 @@ describe("tavily: executeWebSearch", () => {
     assert.doesNotMatch(`${res.text}\n${JSON.stringify(warns)}`, /ECONNREFUSED|tvly-private|private\.example|\/Users\/private/);
   });
 
-  it("passes the Pi cancellation signal through the Tavily request", async () => {
-    const request = mockFetch(async () => jsonResponse({ results: [] }));
+  it("combines the Pi cancellation signal with the internal request bound", async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const request = mockFetch(async (_url, init) => {
+      requestSignal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    });
     const { deps } = makeDeps({ fetchImpl: request.fn });
     const controller = new AbortController();
 
-    const res = await executeWebSearch({ query: "q" }, deps, controller.signal);
+    const pending = executeWebSearch({ query: "q" }, deps, controller.signal);
+    controller.abort();
+    const res = await pending;
 
-    assert.equal(res.ok, true);
-    assert.equal(request.calls[0].init?.signal, controller.signal);
+    assert.equal(res.ok, false);
+    assert.deepEqual(res.failure, { classification: "provider_unavailable" });
+    assert.ok(requestSignal instanceof AbortSignal);
+    assert.notEqual(requestSignal, controller.signal);
+    assert.equal(requestSignal.aborted, true);
+  });
+
+  it("times out a stalled Tavily request once and returns a bounded monitor event", async () => {
+    let attempts = 0;
+    const request = mockFetch(async (_url, init) => {
+      attempts += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("timed out")), { once: true });
+      });
+    });
+    const { deps, warns } = makeDeps({ fetchImpl: request.fn, requestTimeoutMs: 5 });
+
+    const res = await executeWebSearch({ query: "q" }, deps);
+
+    assert.equal(res.ok, false);
+    assert.deepEqual(res.failure, { classification: "provider_unavailable" });
+    assert.equal(attempts, 1);
+    assert.deepEqual(warns, [{
+      tool: "web_search",
+      reason: "tavily-failure",
+      classification: "provider_unavailable",
+      httpStatus: undefined,
+    }]);
   });
 });
 
@@ -1177,7 +1214,9 @@ describe("web-tools Pi wrapper", () => {
         assert.equal(readdirSync(spool).filter((name) => name.endsWith(".json")).length, index + 1);
       }
 
-      assert.deepEqual(signals, [controller.signal, controller.signal, controller.signal, controller.signal]);
+      assert.equal(signals.length, 4);
+      assert.ok(signals.every((signal) => signal instanceof AbortSignal));
+      assert.ok(signals.every((signal) => signal !== controller.signal));
       const events = readdirSync(spool)
         .filter((name) => name.endsWith(".json"))
         .map((name) => JSON.parse(readFileSync(join(spool, name), "utf8")) as Record<string, unknown>)

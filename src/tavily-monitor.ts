@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -14,6 +15,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   TAVILY_EXTRACT_URL,
   TAVILY_SEARCH_URL,
+  cancelTavilyResponseBody,
   classifyTavilyFailure,
   parseExtractResponse,
   parseSearchResponse,
@@ -31,6 +33,7 @@ export const TAVILY_RECOVERY_SEARCH_QUERY = "Tavily API documentation";
 export const TAVILY_RECOVERY_EXTRACT_URL = "https://example.com/";
 export const TAVILY_STATE_VERSION = 1 as const;
 export const TAVILY_STATE_RELPATH = "data/tavily/state.json";
+export const TAVILY_WRITER_LEASE_RELPATH = "data/tavily/writer.lock";
 export const TAVILY_EVENT_POLL_INTERVAL_MS = 2_000;
 export const TAVILY_USAGE_TIMEOUT_MS = 10_000;
 export const TAVILY_RECOVERY_PROBE_TIMEOUT_MS = 10_000;
@@ -177,6 +180,19 @@ export interface TavilyIncident {
   deliveryTerminalAt?: string;
   acknowledgedAt?: string;
   resolvedAt?: string;
+  recoveryUsageObservedAt?: string;
+}
+
+export interface TavilyWriterLease {
+  path: string;
+  release: () => void;
+}
+
+export interface TavilyWriterLeaseOptions {
+  pid?: number;
+  uniqueId?: () => string;
+  now?: () => Date;
+  isProcessAlive?: (pid: number) => boolean;
 }
 
 export interface TavilyPendingAutomaticVerification {
@@ -483,8 +499,9 @@ export async function requestTavilyUsage(
     };
   }
   if (!response.ok) {
-    timeout.cancel();
     const failure = classifyTavilyFailure({ kind: "http", httpStatus: response.status });
+    await cancelTavilyResponseBody(response);
+    timeout.cancel();
     return {
       ok: false,
       diagnostic: monitorDiagnostic(
@@ -560,8 +577,9 @@ async function runRecoveryProbe(
   }
 
   if (!response.ok) {
-    timeout.cancel();
     const failure = classifyTavilyFailure({ kind: "http", httpStatus: response.status });
+    await cancelTavilyResponseBody(response);
+    timeout.cancel();
     return {
       ok: false,
       classification: failure.classification,
@@ -679,6 +697,108 @@ function ensureMonitorDirectories(controlWorkspaceRoot: string): string {
   ensurePrivateDirectory(dataDirectory);
   ensurePrivateDirectory(tavilyDirectory);
   return tavilyDirectory;
+}
+
+interface TavilyWriterLeaseRecord {
+  version: 1;
+  pid: number;
+  token: string;
+  acquiredAt: string;
+}
+
+function defaultProcessIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function readWriterLease(path: string): TavilyWriterLeaseRecord {
+  assertPrivateFile(path);
+  const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (!isRecord(value) ||
+      !hasOnlyKeys(value, ["version", "pid", "token", "acquiredAt"]) ||
+      value.version !== 1 ||
+      !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 ||
+      typeof value.token !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(value.token) ||
+      !isCanonicalIsoTimestamp(value.acquiredAt)) {
+    throw new Error("Tavily monitor writer lease is invalid");
+  }
+  return value as unknown as TavilyWriterLeaseRecord;
+}
+
+/** Acquire the one production writer lease, recovering a lock left by a dead process. */
+export function tryAcquireTavilyWriterLease(
+  controlWorkspaceRoot: string,
+  options: TavilyWriterLeaseOptions = {},
+): TavilyWriterLease | undefined {
+  const directory = ensureMonitorDirectories(controlWorkspaceRoot);
+  const path = resolve(controlWorkspaceRoot, TAVILY_WRITER_LEASE_RELPATH);
+  if (dirname(path) !== directory) throw new Error("Tavily monitor writer lease path is invalid");
+  const pid = options.pid ?? process.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Tavily monitor writer lease PID is invalid");
+  const isProcessAlive = options.isProcessAlive ?? defaultProcessIsAlive;
+  const now = options.now ?? (() => new Date());
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const token = (options.uniqueId?.() ?? randomUUID()).replaceAll(/[^A-Za-z0-9-]/g, "");
+    if (!token) throw new Error("Tavily monitor writer lease token is invalid");
+    const candidatePath = join(directory, `.writer-${pid}-${token}.tmp`);
+    const record: TavilyWriterLeaseRecord = {
+      version: 1,
+      pid,
+      token,
+      acquiredAt: isoNow(now),
+    };
+    writeFileSync(candidatePath, `${JSON.stringify(record)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    let acquired = false;
+    try {
+      linkSync(candidatePath, path);
+      acquired = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } finally {
+      try { unlinkSync(candidatePath); } catch { /* best-effort candidate cleanup */ }
+    }
+    if (acquired) {
+      let released = false;
+      return {
+        path,
+        release: () => {
+          if (released) return;
+          released = true;
+          try {
+            if (readWriterLease(path).token === token) unlinkSync(path);
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+        },
+      };
+    }
+
+    let owner: TavilyWriterLeaseRecord;
+    try {
+      owner = readWriterLease(path);
+    } catch (error) {
+      if (isMissing(error)) continue;
+      throw error;
+    }
+    if (isProcessAlive(owner.pid)) return undefined;
+    try {
+      const current = readWriterLease(path);
+      if (current.token !== owner.token) return undefined;
+      unlinkSync(path);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+  }
+  return undefined;
 }
 
 function assertPrivateFile(path: string): void {
@@ -820,6 +940,7 @@ function validIncident(value: unknown): value is TavilyIncident {
         "deliveryTerminalAt",
         "acknowledgedAt",
         "resolvedAt",
+        "recoveryUsageObservedAt",
       ]) ||
       !boundedString(value.generation, 80) ||
       !isCanonicalIsoTimestamp(value.openedAt) ||
@@ -834,7 +955,9 @@ function validIncident(value: unknown): value is TavilyIncident {
       typeof value.lastUsageRecoverable !== "boolean" ||
       (value.deliveryTerminalAt !== undefined && !isCanonicalIsoTimestamp(value.deliveryTerminalAt)) ||
       (value.acknowledgedAt !== undefined && !isCanonicalIsoTimestamp(value.acknowledgedAt)) ||
-      (value.resolvedAt !== undefined && !isCanonicalIsoTimestamp(value.resolvedAt))) {
+      (value.resolvedAt !== undefined && !isCanonicalIsoTimestamp(value.resolvedAt)) ||
+      (value.recoveryUsageObservedAt !== undefined &&
+        (!isCanonicalIsoTimestamp(value.recoveryUsageObservedAt) || value.resolvedAt === undefined))) {
     return false;
   }
   return true;
@@ -1038,6 +1161,18 @@ function addNotification(
     nextAttemptAt: notification.createdAt,
   });
   return true;
+}
+
+function cancelPendingNotifications(
+  state: TavilyMonitorState,
+  generation: string,
+  kinds: readonly TavilyNotificationKind[],
+): void {
+  const canceledKinds = new Set<TavilyNotificationKind>(kinds);
+  state.outbox = state.outbox.filter((entry) =>
+    entry.status !== "pending" ||
+    entry.incidentGeneration !== generation ||
+    !canceledKinds.has(entry.kind));
 }
 
 function recordUsageSampleStat(state: TavilyMonitorState, outcome: "success" | "failure"): void {
@@ -1281,8 +1416,10 @@ export class TavilyMonitor {
       if (!existing.observedTools.includes(event.tool)) existing.observedTools.push(event.tool);
       return;
     }
-    if (existing?.resolvedAt && new Date(event.observedAt).getTime() <= new Date(existing.resolvedAt).getTime()) {
-      return;
+    if (existing?.resolvedAt) {
+      const recoveryCutoff = existing.recoveryUsageObservedAt ?? existing.resolvedAt;
+      if (new Date(event.observedAt).getTime() <= new Date(recoveryCutoff).getTime()) return;
+      cancelPendingNotifications(state, existing.generation, ["recovery"]);
     }
 
     const generation = incidentGeneration(state, event.observedAt);
@@ -1411,6 +1548,7 @@ export class TavilyMonitor {
     this.commit((state, now) => {
       if (state.incident?.generation === generation && !state.incident.resolvedAt) {
         state.incident.acknowledgedAt = now;
+        cancelPendingNotifications(state, generation, ["reminder"]);
       }
     });
     return true;
@@ -1543,6 +1681,7 @@ export class TavilyMonitor {
       const active = state.incident;
       if (!active || active.generation !== generation || active.resolvedAt) return;
       active.resolvedAt = now;
+      active.recoveryUsageObservedAt = result.sample.observedAt;
       delete state.pendingAutomaticVerification;
       state.lastVerification = {
         generation,
@@ -1550,6 +1689,7 @@ export class TavilyMonitor {
         stage: "extract_probe",
         observedAt: now,
       };
+      cancelPendingNotifications(state, generation, ["incident", "reminder", "recheck_failure"]);
       addNotification(state, {
         key: `incident:${generation}:recovery`,
         kind: "recovery",
@@ -1559,6 +1699,18 @@ export class TavilyMonitor {
           "Verified tools: web_search, web_fetch.",
       });
     });
+    // Close the listing-to-commit window: a child event published after the
+    // pre-commit drain is authoritative and cancels the still-pending recovery.
+    this.drainChildEvents();
+    const afterResolution = this.state.incident;
+    if (afterResolution && afterResolution.generation !== generation && !afterResolution.resolvedAt) {
+      return {
+        ok: false,
+        generation,
+        stage: "usage_state",
+        classification: "usage_exhausted",
+      };
+    }
     return { ok: true, generation, sample: result.sample };
   }
 

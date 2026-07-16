@@ -41,7 +41,10 @@ export interface UpdateProcessingProbe {
  * Observe grammY's internal getUpdates calls without retaining their payloads
  * or responses. Empty successful responses count as healthy poll progress.
  */
-export function createPollProgressProbe(now: () => number = Date.now): PollProgressProbe {
+export function createPollProgressProbe(
+  now: () => number = Date.now,
+  onSuccessfulPoll?: () => void,
+): PollProgressProbe {
   const initializedAtMs = now();
   let lastPollStartedAtMs: number | null = null;
   let lastPollSucceededAtMs: number | null = null;
@@ -63,6 +66,7 @@ export function createPollProgressProbe(now: () => number = Date.now): PollProgr
         lastPollSucceededAtMs = now();
         lastPollFailedAtMs = null;
         successfulPollCount++;
+        try { onSuccessfulPoll?.(); } catch { /* observation must not fail polling */ }
       } else {
         lastPollFailedAtMs = now();
         failedPollCount++;

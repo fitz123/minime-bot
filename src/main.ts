@@ -26,7 +26,11 @@ import type { EchoWatcher } from "./echo-watcher.js";
 import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
 import { resolveWorkspaceContract } from "./workspace-contract.js";
 import { readTavilyApiKeyFromSops } from "./pi-extensions/tavily-secret.js";
-import { TavilyMonitor } from "./tavily-monitor.js";
+import {
+  TavilyMonitor,
+  tryAcquireTavilyWriterLease,
+  type TavilyWriterLease,
+} from "./tavily-monitor.js";
 import {
   resolveTavilyDeliveryDestination,
   TavilyMonitorRuntime,
@@ -60,6 +64,7 @@ async function main(): Promise<void> {
   let discordClient: Client | undefined;
   let watchdog: Watchdog | undefined;
   let tavilyRuntime: TavilyMonitorRuntime | undefined;
+  let tavilyWriterLease: TavilyWriterLease | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -85,7 +90,12 @@ async function main(): Promise<void> {
     // updates, but already-scheduled debounce timers could still fire and start
     // new flush() work during the graceful shutdown wait window.
     for (const mq of messageQueues) mq.cancelAllDebounceTimers();
-    await tavilyStop;
+    try {
+      await tavilyStop;
+    } finally {
+      tavilyWriterLease?.release();
+      tavilyWriterLease = undefined;
+    }
     // Wait for busy sessions to finish their current turns BEFORE clearing
     // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
     // that would break in-flight sessions still reading those files.
@@ -123,6 +133,17 @@ async function main(): Promise<void> {
   });
 
   const controlWorkspaceRoot = resolveWorkspaceContract().paths.controlWorkspaceRoot;
+  let loggedWriterWait = false;
+  while (!tavilyWriterLease) {
+    tavilyWriterLease = tryAcquireTavilyWriterLease(controlWorkspaceRoot);
+    if (tavilyWriterLease) break;
+    if (!loggedWriterWait) {
+      loggedWriterWait = true;
+      log.warn("main", "Another process owns the Tavily monitor writer lease; waiting");
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+  }
+  if (loggedWriterWait) log.info("main", "Tavily monitor writer lease acquired");
   const tavilyMonitor = new TavilyMonitor({
     controlWorkspaceRoot,
     apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
@@ -152,6 +173,14 @@ async function main(): Promise<void> {
     },
     onError: () => log.error("main", "Tavily monitor transition failed"),
   });
+  let tavilyStartRequested = false;
+  const startTavilyRuntime = (): void => {
+    if (shuttingDown || tavilyStartRequested) return;
+    tavilyStartRequested = true;
+    void tavilyRuntime!.start().catch(() => {
+      log.error("main", "Tavily monitor startup failed");
+    });
+  };
 
   // Start Telegram bot if configured
   if (config.telegramToken) {
@@ -160,6 +189,9 @@ async function main(): Promise<void> {
     let onUpdateFn: (() => void) | undefined;
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
+      // A successful getUpdates proves this process owns polling. This also
+      // protects the first rollout where the replaced binary has no writer lease.
+      onSuccessfulPoll: startTavilyRuntime,
       tavilyActions: tavilyRuntime,
       getTavilyStatus: () => tavilyMonitor.getStatus(),
     });
@@ -252,9 +284,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  void tavilyRuntime.start().catch(() => {
-    log.error("main", "Tavily monitor startup failed");
-  });
+  if (!telegramConfigured) startTavilyRuntime();
 }
 
 main().catch((err) => {

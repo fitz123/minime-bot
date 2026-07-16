@@ -8,6 +8,24 @@ import {
 } from "../poll-progress.js";
 
 describe("poll-progress probe", () => {
+  it("signals polling ownership without allowing observer failures to break successful polls", async () => {
+    let successes = 0;
+    const probe = createPollProgressProbe(
+      () => 5,
+      () => {
+        successes += 1;
+        if (successes === 1) throw new Error("observer failure");
+      },
+    );
+    const poll = (async () => ({ ok: true, result: [] })) as never;
+
+    await probe.transformer(poll, "getUpdates", {});
+    await probe.transformer(poll, "getUpdates", {});
+
+    assert.equal(successes, 2);
+    assert.equal(probe.snapshot().successfulPollCount, 2);
+  });
+
   it("derives a conservative stall threshold from the explicit poll timeout", () => {
     assert.ok(DEFAULT_POLL_STALL_THRESHOLD_MS > TELEGRAM_LONG_POLL_TIMEOUT_SECONDS * 1000);
     assert.equal(DEFAULT_POLL_STALL_THRESHOLD_MS, TELEGRAM_LONG_POLL_TIMEOUT_SECONDS * 3 * 1000);

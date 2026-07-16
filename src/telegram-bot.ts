@@ -776,6 +776,7 @@ export function createTelegramBot(
   sessionManager: SessionManager,
   opts?: {
     onUpdate?: () => void;
+    onSuccessfulPoll?: () => void;
     tavilyActions?: TavilyOperatorActions;
     getTavilyStatus?: () => TavilyStatusSnapshot;
   },
@@ -798,7 +799,7 @@ export function createTelegramBot(
 
   // Outermost transformer: observe completion of each logical getUpdates call,
   // including grammY polling calls, without retaining request/response data.
-  const pollProgress = createPollProgressProbe();
+  const pollProgress = createPollProgressProbe(Date.now, opts?.onSuccessfulPoll);
   bot.api.config.use(pollProgress.transformer);
 
   // Simple long polling waits for update middleware before the next poll.
