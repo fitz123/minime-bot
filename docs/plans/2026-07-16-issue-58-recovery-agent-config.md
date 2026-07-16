@@ -27,10 +27,10 @@ python3 -B scripts/tests/test_recovery_supervisor.py
 - [x] Run focused recovery fixer/session tests and fix all failures before continuing.
 
 ### Task 2: Verify packaged and host-native recovery compatibility
-- [ ] Run the TypeScript test suite, lint, and build.
-- [ ] Run Python recovery-supervisor tests.
-- [ ] Run package dry-run/install validation so the built fixer-session artifact contains the fix.
-- [ ] Confirm the diff contains no private paths, identifiers, destinations, credentials, or production payloads.
+- [x] Run the TypeScript test suite, lint, and build.
+- [x] Run Python recovery-supervisor tests.
+- [x] Run package dry-run/install validation so the built fixer-session artifact contains the fix.
+- [x] Confirm the diff contains no private paths, identifiers, destinations, credentials, or production payloads.
 
 ## Post-Completion
 
