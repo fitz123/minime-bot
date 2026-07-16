@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.11
+
+- Make LLM cron jobs inherit the selected agent's normalized model for both context assembly and Pi execution instead of using a stale package-level pin.
+- Reject blank agent model configuration and add regression coverage for agent-specific cron model isolation and spawn consistency.
+
 ## 2026.7.10
 
 - Pre-seed a canonical owner-only Pi transcript before launching a fresh recovery session, avoiding Pi lazy-transcript startup deadlock before the first assistant turn.
