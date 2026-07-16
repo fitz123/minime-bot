@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.9
+
+- Decouple internal recovery-agent lookup from unrelated transport secret materialization so the host-native recovery runner can bind its dedicated agent in a restricted environment.
+- Preserve merged configuration and selected-agent validation without weakening recovery runner secret isolation.
+
 ## 2026.7.8
 
 - Add the host-native recovery supervisor foundation with durable authenticated intake, incident correlation and fencing, deterministic verification, static controls, outboxes, automatic native fallback, bounded event retention, and stale-telemetry deferral.
