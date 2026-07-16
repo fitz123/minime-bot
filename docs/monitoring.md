@@ -14,6 +14,70 @@ Copy them outside the package and replace every placeholder. Keep the package
 checkout, installed package, control workspace, and runtime state in distinct
 locations.
 
+## In-process Tavily quota monitoring
+
+The Node runtime includes a specialized Tavily monitor in addition to the
+host-native alert path documented below. Tavily remains the only provider for
+`web_search` and `web_fetch`. The tools and monitor share the single
+`tavily.api_key` SOPS entry in the control workspace's
+`config/secrets.sops.yaml`; there is no plaintext environment fallback,
+alternate provider, multi-key rotation, or billing mutation.
+
+On startup, the monitor restores its owner-only atomic state, drains pending Pi
+child events, and samples Tavily `/usage`. It samples again every five minutes
+and polls child events every two seconds. Base-plan and PAYGO scopes each emit
+deduplicated 80% warnings and 95% critical notices per monthly billing-cycle
+generation. A tool HTTP 432 or 433 opens or refreshes one shared exhaustion
+incident, and an active unacknowledged generation produces one reminder every
+six hours.
+
+State, incident acknowledgement and resolution, notification deduplication, and
+the delivery outbox persist below the control workspace's `data/tavily/`
+directory. The monitor saves an event transition before deleting its spool file
+and saves a successful notification delivery before removing the outbox entry.
+Transient Telegram transport, rate-limit, and server failures retry from the
+durable outbox with backoff from 30 seconds up to one hour. A missing configured
+destination or deterministic Telegram 4xx response is recorded as a terminal
+delivery diagnostic rather than retried indefinitely. Delivery uses
+`adminChatId` when configured, otherwise `defaultDeliveryChatId` and its
+optional `defaultDeliveryThreadId`.
+
+Incident messages expose `acknowledge degraded mode` and
+`credits fixed — recheck`. Actions are accepted only at the exact configured
+chat/thread and for the current incident generation. Acknowledgement stops
+reminders but does not resolve the incident. Recheck is single-flight and
+bounded: current `/usage`, a fixed one-result Search probe, and a fixed Extract
+probe must all return validated non-empty results. The monitor uses the same
+verification once when an active incident's usage first becomes recoverable.
+Failed verification leaves the incident open, and provider calls are never
+automatically retried.
+
+`/status` reports only sample freshness, plan/PAYGO used and limit values, the
+latest bounded failure class, and incident/acknowledgement state. Prometheus
+exports these low-cardinality series:
+
+- `bot_tavily_usage_sample_present`
+- `bot_tavily_usage_sample_age_seconds`
+- `bot_tavily_usage_sample_success`
+- `bot_tavily_plan_usage` and `bot_tavily_plan_limit`
+- `bot_tavily_paygo_usage` and `bot_tavily_paygo_limit`
+- `bot_tavily_incident_active` and `bot_tavily_incident_acknowledged`
+- `bot_tavily_usage_samples_total{outcome}`
+- `bot_tavily_failures_total{classification,tool}`
+- `bot_tavily_notifications_total{outcome}`
+
+Labels are bounded and never contain a key, query, requested URL, destination,
+incident generation, provider body, or host path. A missing sample sets the
+presence gauge to zero; stale and failed attempts remain visible through
+freshness, success, `/status`, and the bounded failure counters.
+
+Enable PAYGO and set or raise its credit limit manually in Tavily Billing. The
+monitor observes those changes but cannot make them. To roll back this monitor,
+install and restart the prior package release and retain `data/tavily/`; the
+prior runtime ignores the files, while retaining them preserves deduplication
+and pending delivery if this release is restored. Delete that state only after
+reviewing and intentionally abandoning its incident history and outbox.
+
 ## Prerequisites
 
 The native helpers require Python 3.9 or newer. The encrypted-secret path also

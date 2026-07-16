@@ -63,10 +63,10 @@ Keep Tavily as the sole provider behind the existing `web_search` and `web_fetch
 - [x] Run focused metrics/status tests and typecheck before Task 5.
 
 ### Task 5: Package, document, and validate the complete contract
-- [ ] Update `README.md`, `src/pi-extensions/README.md`, and `docs/monitoring.md` with the single-key Tavily contract, default cadences, durable state/incident behavior, operator actions, diagnostics/metrics, manual PAYGO requirement, and rollback behavior; do not publish deployment identifiers or local paths.
-- [ ] Update `src/__tests__/package-install.test.ts` and package-artifact assertions so the installed package includes and exercises the monitor/core and generated web-tools wrapper from an arbitrary control workspace.
-- [ ] Run all focused Tavily/Telegram/lifecycle/metrics/status/package tests, then `npm test`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `git diff --check`, and a public-data scan.
-- [ ] Verify `git diff --stat main...HEAD` contains only issue #71 implementation, tests, docs, and this completed plan, with no Brave/fallback/multi-key/provider abstraction or billing automation.
+- [x] Update `README.md`, `src/pi-extensions/README.md`, and `docs/monitoring.md` with the single-key Tavily contract, default cadences, durable state/incident behavior, operator actions, diagnostics/metrics, manual PAYGO requirement, and rollback behavior; do not publish deployment identifiers or local paths.
+- [x] Update `src/__tests__/package-install.test.ts` and package-artifact assertions so the installed package includes and exercises the monitor/core and generated web-tools wrapper from an arbitrary control workspace.
+- [x] Run all focused Tavily/Telegram/lifecycle/metrics/status/package tests, then `npm test`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `git diff --check`, and a public-data scan.
+- [x] Verify `git diff --stat main...HEAD` contains only issue #71 implementation, tests, docs, and this completed plan, with no Brave/fallback/multi-key/provider abstraction or billing automation.
 
 ## Technical Details
 
