@@ -92,9 +92,10 @@ silently vanish under Pi. The assembler reads the agent's LIVE workspace files
 `buildPiSpawnArgs` in
 `bot/src/pi-rpc-protocol.ts` for all live Pi RPC sessions, and `cron-runner.ts`
 also calls it directly for LLM print-mode crons where `engine` may be omitted
-or set to `pi`. For crons, the runner
-builds a minimal Pi agent from `agentId`, `workspaceCwd`, optional
-`systemPrompt`, and `thinking`, then injects CLAUDE/MEMORY/rules context via files.
+or set to `pi`. For crons, the runner builds a minimal Pi agent from the
+selected agent's `id`, `workspaceCwd`, normalized required `model`, and optional
+`systemPrompt` and `thinking`. That same model reaches context assembly and Pi's
+`--model` argument, while CLAUDE/MEMORY/rules context is injected via files.
 
 ### Layer mapping
 
