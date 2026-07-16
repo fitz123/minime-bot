@@ -238,6 +238,25 @@ describe("cron-runner runPi", () => {
     }
   });
 
+  it("uses the same resolved model for context assembly and Pi spawn", () => {
+    const ws = makeWorkspace();
+    const captures: SpawnCapture[] = [];
+    const resolvedModel = "openai-codex/gpt-5.5-mini";
+    let contextModel: string | undefined;
+    const deps = makeDeps(captures, {
+      buildAgentConfig: (_cron, cwd) => makeAgent(cwd, { model: resolvedModel }),
+      assembleContext: (agent) => {
+        contextModel = agent.model;
+        return null;
+      },
+    });
+
+    runPi(makeCron(), ws, deps);
+
+    assert.strictEqual(contextModel, resolvedModel);
+    assert.strictEqual(flagValue(captures[0].args, "--model"), resolvedModel);
+  });
+
   it("passes context artifact args before the fixed cron instruction", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
@@ -296,6 +315,7 @@ describe("cron-runner runPi", () => {
     const agentData = {
       id: "main",
       workspaceCwd: ws,
+      model: "openai-codex/gpt-5.5-mini",
       systemPrompt: "PERSONA_TOKEN",
       thinking: "low" as const,
     };
@@ -303,13 +323,14 @@ describe("cron-runner runPi", () => {
     const deps = makeDeps(captures, {
       buildAgentConfig: (_cron, cwd, data) => {
         seenAgentData = data as typeof agentData;
-        return makeAgent(cwd, { systemPrompt: data?.systemPrompt, thinking: data?.thinking });
+        return makeAgent(cwd, { model: data?.model, systemPrompt: data?.systemPrompt, thinking: data?.thinking });
       },
     });
 
     runPi(makeCron(), ws, deps, agentData);
 
     assert.deepStrictEqual(seenAgentData, agentData);
+    assert.strictEqual(flagValue(captures[0].args, "--model"), agentData.model);
     assert.strictEqual(flagValue(captures[0].args, "--thinking"), "low");
   });
 

@@ -824,6 +824,26 @@ bindings: []
       });
     });
 
+    it("propagates and normalizes the selected agent model", () => {
+      writeFileSync(CONFIG_FILE, `agents:
+  main:
+    workspaceCwd: /tmp/main-workspace
+    model: "  gpt-5.5  "
+  worker:
+    workspaceCwd: /tmp/worker-workspace
+    model: "  custom-provider/custom-model  "
+bindings: []
+`);
+
+      const mainAgent = buildPiCronAgentConfig("main", CONFIG_FILE);
+      const workerAgent = buildPiCronAgentConfig("worker", CONFIG_FILE);
+
+      assert.strictEqual(mainAgent.model, "openai-codex/gpt-5.5");
+      assert.strictEqual(workerAgent.model, "custom-provider/custom-model");
+      assert.strictEqual(mainAgent.workspaceCwd, "/tmp/main-workspace");
+      assert.strictEqual(workerAgent.workspaceCwd, "/tmp/worker-workspace");
+    });
+
     it("validates askAgent references on the cron agent config path", () => {
       writeFileSync(CONFIG_FILE, `agents:
   main:
@@ -953,6 +973,7 @@ bindings: []
       assert.deepStrictEqual(resolveCronAgentData("worker", CONFIG_FILE), {
         id: "worker",
         workspaceCwd: "/tmp/worker-workspace",
+        model: "openai-codex/gpt-5.5",
       });
     });
 
@@ -972,6 +993,7 @@ bindings: []
       assert.deepStrictEqual(resolveCronAgentData("main", configFile), {
         id: "main",
         workspaceCwd: agentWorkspace,
+        model: "openai-codex/gpt-5.5",
       });
     });
 
@@ -1013,6 +1035,20 @@ bindings: []
       assert.throws(
         () => buildPiCronAgentConfig("main", CONFIG_FILE),
         /Agent "main" missing workspaceCwd/,
+      );
+    });
+
+    it("throws before spawn when the selected agent model is blank", () => {
+      writeFileSync(CONFIG_FILE, `agents:
+  main:
+    workspaceCwd: /tmp/main-workspace
+    model: "   "
+bindings: []
+`);
+
+      assert.throws(
+        () => buildPiCronAgentConfig("main", CONFIG_FILE),
+        /Agent "main" has invalid model \(must be a non-empty string\)/,
       );
     });
   });
@@ -1207,7 +1243,13 @@ bindings: []
         },
         resolveCronAgentData: (agentId: string) => {
           calls.workspaces.push(agentId);
-          return { id: agentId, workspaceCwd: "/tmp/main-workspace", systemPrompt: "persona", thinking: "high" };
+          return {
+            id: agentId,
+            workspaceCwd: "/tmp/main-workspace",
+            model: "openai-codex/gpt-5.5",
+            systemPrompt: "persona",
+            thinking: "high",
+          };
         },
         runScript: (scriptCron: CronJob) => {
           calls.scripts.push(scriptCron.name);
@@ -1330,7 +1372,13 @@ bindings: []
           cronName: cron.name,
           workspaceCwd: "/tmp/main-workspace",
           engine: "pi",
-          agentData: { id: "main", workspaceCwd: "/tmp/main-workspace", systemPrompt: "persona", thinking: "high" },
+          agentData: {
+            id: "main",
+            workspaceCwd: "/tmp/main-workspace",
+            model: "openai-codex/gpt-5.5",
+            systemPrompt: "persona",
+            thinking: "high",
+          },
         },
       ]);
       assert.deepStrictEqual(calls.deliveries, [

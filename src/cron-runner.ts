@@ -25,6 +25,7 @@ import { shouldSuppressNoReply } from "./no-reply.js";
 import {
   buildPiSpawnEnv,
   PI_CRON_WRAPPER_RELPATHS,
+  normalizePiModel,
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   shouldIncludePiChildEnvKey,
@@ -45,7 +46,6 @@ const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
 const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
-const PI_CRON_MODEL = "openai-codex/gpt-5.5";
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
@@ -70,6 +70,7 @@ const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "m
 export interface CronAgentData {
   id: string;
   workspaceCwd: string;
+  model: string;
   systemPrompt?: string;
   thinking?: AgentConfig["thinking"];
 }
@@ -349,6 +350,7 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
   const result: CronAgentData = {
     id: agentId,
     workspaceCwd: agent.workspaceCwd,
+    model: normalizePiModel(agent.model),
   };
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
@@ -368,7 +370,7 @@ function buildPiCronAgentConfigFromData(agent: CronAgentData): AgentConfig {
     id: agent.id,
     workspaceCwd: agent.workspaceCwd,
     provider: "pi",
-    model: PI_CRON_MODEL,
+    model: agent.model,
   };
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
@@ -717,7 +719,7 @@ function runPi(
     "--no-session",
     "--no-extensions",
     "--model",
-    PI_CRON_MODEL,
+    agent.model,
     "--thinking",
     thinking,
   ];
