@@ -5,6 +5,7 @@ import {
   hasActiveAgentPlatform,
   is409ConflictError,
   runTelegramSetupInBackground,
+  shouldRestartForTelegramFailure,
   startBotWithRetry,
   stopTelegramBotInBackground,
 } from "../bot-startup.js";
@@ -38,6 +39,37 @@ describe("hasActiveAgentPlatform", () => {
       discordStarted: true,
       discordBindingCount: 0,
     }), false);
+  });
+});
+
+describe("shouldRestartForTelegramFailure", () => {
+  it("keeps a Discord deployment alive when alert-only Telegram polling fails", () => {
+    assert.equal(shouldRestartForTelegramFailure({
+      telegramBindingCount: 0,
+      discordStarted: true,
+      discordBindingCount: 1,
+    }), false);
+  });
+
+  it("keeps a live Discord platform alive when a bound Telegram platform fails", () => {
+    assert.equal(shouldRestartForTelegramFailure({
+      telegramBindingCount: 1,
+      discordStarted: true,
+      discordBindingCount: 1,
+    }), false);
+  });
+
+  it("restarts when failed Telegram polling was the only conversational platform", () => {
+    assert.equal(shouldRestartForTelegramFailure({
+      telegramBindingCount: 1,
+      discordStarted: false,
+      discordBindingCount: 1,
+    }), true);
+    assert.equal(shouldRestartForTelegramFailure({
+      telegramBindingCount: 1,
+      discordStarted: true,
+      discordBindingCount: 0,
+    }), true);
   });
 });
 

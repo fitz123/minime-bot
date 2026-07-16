@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type Server } from "node:http";
 import client from "prom-client";
 import {
   recordResultMetrics,
@@ -724,6 +725,27 @@ describe("Pi metrics registration", () => {
 });
 
 describe("metrics HTTP server", () => {
+  const listen = (server: Server): Promise<void> => new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  const close = (server: Server): Promise<void> => new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    server.close(() => resolve());
+  });
+
+  const waitUntil = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() >= deadline) assert.fail("condition was not met before timeout");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
   afterEach(async () => {
     await stopMetricsServer();
   });
@@ -773,5 +795,35 @@ describe("metrics HTTP server", () => {
     // Verify still reachable on loopback even when bound to 0.0.0.0
     const res = await fetch(`http://127.0.0.1:${addr.port}/metrics`);
     assert.strictEqual(res.status, 200);
+  });
+
+  it("retries EADDRINUSE until an overlapping process releases the port", async () => {
+    const oldServer = createServer();
+    await listen(oldServer);
+    const address = oldServer.address();
+    assert.ok(address && typeof address === "object");
+
+    const server = startMetricsServer(address.port, undefined, { addressInUseRetryMs: 10 });
+    await new Promise<void>((resolve) => server.once("error", () => resolve()));
+    await close(oldServer);
+    await waitUntil(() => server.listening);
+
+    const res = await fetch(`http://127.0.0.1:${address.port}/metrics`);
+    assert.strictEqual(res.status, 200);
+  });
+
+  it("cancels a pending EADDRINUSE retry during shutdown", async () => {
+    const oldServer = createServer();
+    await listen(oldServer);
+    const address = oldServer.address();
+    assert.ok(address && typeof address === "object");
+
+    const server = startMetricsServer(address.port, undefined, { addressInUseRetryMs: 20 });
+    await new Promise<void>((resolve) => server.once("error", () => resolve()));
+    await stopMetricsServer();
+    await close(oldServer);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(server.listening, false);
   });
 });

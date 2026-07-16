@@ -498,14 +498,24 @@ export function recordTavilyMonitorMetrics(
 // --- HTTP server ---
 
 let metricsServer: Server | null = null;
+let metricsListenRetry: ReturnType<typeof setTimeout> | null = null;
+
+export interface MetricsServerOptions {
+  addressInUseRetryMs?: number;
+}
 
 /**
  * Start the Prometheus metrics HTTP server on the given port.
  * Serves /metrics in standard Prometheus text format.
  * Returns the server instance.
  */
-export function startMetricsServer(port: number, host?: string): Server {
+export function startMetricsServer(
+  port: number,
+  host?: string,
+  options: MetricsServerOptions = {},
+): Server {
   const listenHost = host ?? "127.0.0.1";
+  const addressInUseRetryMs = Math.max(1, options.addressInUseRetryMs ?? 1_000);
   const server = createServer(async (req, res) => {
     if (req.url === "/metrics" && req.method === "GET") {
       try {
@@ -523,15 +533,39 @@ export function startMetricsServer(port: number, host?: string): Server {
     }
   });
 
-  server.on("error", (err) => {
-    log.error("metrics", `Metrics server error: ${err.message}`);
-  });
+  const listen = () => {
+    if (metricsServer !== server) return;
+    server.listen(port, listenHost);
+  };
 
-  server.listen(port, listenHost, () => {
+  server.on("listening", () => {
+    if (metricsServer !== server) {
+      server.close();
+      return;
+    }
     log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
   });
 
+  server.on("error", (err) => {
+    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE" && metricsServer === server) {
+      if (metricsListenRetry === null) {
+        log.warn(
+          "metrics",
+          `Metrics address ${listenHost}:${port} is still in use; retrying in ${addressInUseRetryMs}ms`,
+        );
+        metricsListenRetry = setTimeout(() => {
+          metricsListenRetry = null;
+          listen();
+        }, addressInUseRetryMs);
+        metricsListenRetry.unref();
+      }
+      return;
+    }
+    log.error("metrics", `Metrics server error: ${err.message}`);
+  });
+
   metricsServer = server;
+  listen();
   return server;
 }
 
@@ -540,11 +574,19 @@ export function startMetricsServer(port: number, host?: string): Server {
  */
 export function stopMetricsServer(): Promise<void> {
   return new Promise((resolve) => {
-    if (metricsServer) {
-      metricsServer.close(() => resolve());
-      metricsServer = null;
-    } else {
-      resolve();
+    if (metricsListenRetry !== null) {
+      clearTimeout(metricsListenRetry);
+      metricsListenRetry = null;
     }
+    const server = metricsServer;
+    metricsServer = null;
+    if (!server || !server.listening) {
+      resolve();
+      return;
+    }
+    server.close((err) => {
+      if (err) log.error("metrics", `Failed to stop metrics server: ${err.message}`);
+      resolve();
+    });
   });
 }

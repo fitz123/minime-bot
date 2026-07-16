@@ -13,6 +13,7 @@ import { recordTavilyMonitorMetrics, startMetricsServer, stopMetricsServer } fro
 import {
   hasActiveAgentPlatform,
   runTelegramSetupInBackground,
+  shouldRestartForTelegramFailure,
   startBotWithRetry,
   stopTelegramBotInBackground,
 } from "./bot-startup.js";
@@ -65,6 +66,7 @@ async function main(): Promise<void> {
   let discordClient: Client | undefined;
   let watchdog: Watchdog | undefined;
   let tavilySupervisor: TavilyMonitorSupervisor | undefined;
+  let telegramStartupTimeout: ReturnType<typeof setTimeout> | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info("main", `Received ${signal}, shutting down...`);
+    if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
     const tavilyStop = tavilySupervisor?.stop();
@@ -177,6 +180,14 @@ async function main(): Promise<void> {
   // start Discord while it waits for the previous writer to exit.
   tavilySupervisor.start();
 
+  // Telegram starts before Discord has finished connecting. Polling failures
+  // wait for that startup decision so an auxiliary alert transport cannot take
+  // down a healthy conversational platform merely because it failed first.
+  let finishAgentPlatformStartup!: () => void;
+  const agentPlatformStartup = new Promise<void>((resolve) => {
+    finishAgentPlatformStartup = resolve;
+  });
+
   // Start Telegram bot if configured
   if (config.telegramToken) {
     // Mutable reference so onUpdate callback can reach the watchdog
@@ -189,6 +200,40 @@ async function main(): Promise<void> {
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
+
+    let telegramFailureHandled = false;
+    const handleTelegramPollingFailure = (
+      reason: "startup_timeout" | "polling_failed" | "watchdog_restart",
+      error?: unknown,
+    ): void => {
+      if (telegramFailureHandled || shuttingDown) return;
+      telegramFailureHandled = true;
+      if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
+      watchdog?.stop();
+
+      void agentPlatformStartup.then(() => {
+        if (shuttingDown) return;
+        const restartRequired = shouldRestartForTelegramFailure({
+          telegramBindingCount: config.bindings.length,
+          discordStarted: Boolean(discordClient),
+          discordBindingCount: config.discord?.bindings.length ?? 0,
+        });
+        if (restartRequired) {
+          log.error("main", `Telegram polling unavailable (${reason}) — exiting for restart`, error);
+          process.exit(1);
+          return;
+        }
+
+        log.error(
+          "main",
+          `Telegram polling unavailable (${reason}); continuing with the active conversational platform`,
+          error,
+        );
+        stopTelegramBotInBackground(bot, () => {
+          log.warn("main", "Telegram polling cleanup could not confirm the final update offset");
+        });
+      });
+    };
 
     // Echo watcher: drain accumulated files from when bot was down, then start polling
     echoWatcher = ew;
@@ -209,16 +254,17 @@ async function main(): Promise<void> {
           return false;
         }
       },
+      exit: () => handleTelegramPollingFailure("watchdog_restart"),
     });
     onUpdateFn = () => watchdog!.touch();
 
-    // Startup timeout — if onStart doesn't fire, exit for launchd restart.
+    // Startup timeout — if onStart does not fire, apply the same platform-aware
+    // failure policy as a rejected polling loop.
     // Set to 120s to accommodate the 409-retry backoff window (~75s worst case).
     let startedSuccessfully = false;
-    const startupTimeout = setTimeout(() => {
+    telegramStartupTimeout = setTimeout(() => {
       if (!startedSuccessfully) {
-        log.error("main", "Telegram startup timed out after 120s — exiting for launchd restart");
-        process.exit(1);
+        handleTelegramPollingFailure("startup_timeout");
       }
     }, 120_000);
 
@@ -233,7 +279,7 @@ async function main(): Promise<void> {
           allowed_updates: TELEGRAM_ALLOWED_UPDATES,
           onStart: (botInfo) => {
             startedSuccessfully = true;
-            clearTimeout(startupTimeout);
+            if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
             setBotUsername(botInfo.username);
             log.info("main", `Telegram bot @${botInfo.username} is running (id: ${botInfo.id})`);
             // No global media wipe on startup: grammY invokes onStart before the
@@ -252,10 +298,7 @@ async function main(): Promise<void> {
             );
           },
         }),
-    ).catch((err) => {
-      log.error("main", "Telegram bot polling failed — exiting for restart:", err);
-      process.exit(1);
-    });
+    ).catch((err) => handleTelegramPollingFailure("polling_failed", err));
   }
 
   // Start Discord bot if configured
@@ -281,6 +324,7 @@ async function main(): Promise<void> {
     log.error("main", "No bots started — exiting");
     process.exit(1);
   }
+  finishAgentPlatformStartup();
 }
 
 main().catch((err) => {

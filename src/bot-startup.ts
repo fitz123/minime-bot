@@ -45,6 +45,22 @@ export function hasActiveAgentPlatform(state: ActiveAgentPlatformState): boolean
     (state.discordStarted && state.discordBindingCount > 0);
 }
 
+export interface TelegramFailurePlatformState {
+  telegramBindingCount: number;
+  discordStarted: boolean;
+  discordBindingCount: number;
+}
+
+/**
+ * Restart only when failed Telegram polling was the sole conversational
+ * platform. Alert-only Telegram and deployments with a live Discord platform
+ * can keep serving while Telegram polling is unavailable.
+ */
+export function shouldRestartForTelegramFailure(state: TelegramFailurePlatformState): boolean {
+  return state.telegramBindingCount > 0 &&
+    !(state.discordStarted && state.discordBindingCount > 0);
+}
+
 /**
  * Start non-critical Telegram setup without delaying grammY's first getUpdates.
  * Synchronous throws and rejected promises are routed to the same error callback.
