@@ -4,6 +4,7 @@ import { on } from "node:events";
 import {
   chmodSync,
   closeSync,
+  fchmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -17,6 +18,10 @@ import {
 import { basename, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  CURRENT_SESSION_VERSION,
+  SessionManager as PiSessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "../config.js";
 import {
   NewlineOnlyJsonlSplitter,
@@ -26,6 +31,7 @@ import {
   parsePiStartupRecord,
   piExtensionRelpathForDir,
   readPiStream,
+  resolveValidatedPiAgentWorkspaceCwd,
   sendPiGetState,
   sendPiPrompt,
   spawnPiRpcSession,
@@ -75,6 +81,19 @@ export interface RecoverySessionHandle {
   sessionDirectory: string;
   transcriptPath: string;
   replaced: boolean;
+}
+
+export interface PreseededRecoverySession {
+  sessionId: string;
+  transcriptPath: string;
+}
+
+export interface RecoverySessionSeedOptions {
+  openSession?: (
+    transcriptPath: string,
+    sessionDirectory: string,
+    workspaceCwd: string,
+  ) => Pick<PiSessionManager, "getSessionId" | "getSessionFile">;
 }
 
 export interface RecoveryFixerRunResult {
@@ -232,6 +251,60 @@ function jsonlCandidates(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true })
     .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".jsonl"))
     .map((entry) => join(directory, entry.name));
+}
+
+export function preseedCanonicalRecoverySession(
+  sessionDirectory: string,
+  agentWorkspaceCwd: string,
+  options: RecoverySessionSeedOptions = {},
+): PreseededRecoverySession {
+  const directory = privateDirectory(normalize(resolve(sessionDirectory)), false);
+  const resolvedWorkspaceCwd = normalize(resolve(agentWorkspaceCwd));
+  if (!statSync(resolvedWorkspaceCwd).isDirectory()) {
+    throw new Error("Recovery agent workspace is not a directory");
+  }
+  const workspaceCwd = realpathSync(resolvedWorkspaceCwd);
+
+  const transcriptPath = join(directory, "recovery-session.jsonl");
+  const descriptor = openSync(transcriptPath, "wx", 0o600);
+  try {
+    fchmodSync(descriptor, 0o600);
+  } finally {
+    closeSync(descriptor);
+  }
+
+  const openSession = options.openSession
+    ?? ((path: string, sessionDir: string, cwd: string) => PiSessionManager.open(path, sessionDir, cwd));
+  const session = openSession(transcriptPath, directory, workspaceCwd);
+  const sessionId = session.getSessionId();
+  const reportedPath = session.getSessionFile();
+  if (typeof sessionId !== "string" || sessionId.length === 0 || typeof reportedPath !== "string") {
+    throw new Error("Pi did not create a valid recovery session identity");
+  }
+
+  const inspection = inspectRecoveryTranscript(directory, reportedPath, sessionId);
+  const jsonlEntries = readdirSync(directory, { withFileTypes: true })
+    .filter((entry) => entry.name.endsWith(".jsonl"));
+  if (
+    !inspection.readable
+    || !inspection.canonicalPath
+    || inspection.canonicalPath !== realpathSync(transcriptPath)
+    || jsonlEntries.length !== 1
+    || jsonlEntries[0]?.name !== basename(transcriptPath)
+  ) {
+    throw new Error("Pi created an invalid recovery session transcript");
+  }
+
+  const details = lstatSync(inspection.canonicalPath);
+  const header = readTranscriptHeader(inspection.canonicalPath);
+  if (
+    (details.mode & 0o777) !== 0o600
+    || header?.version !== CURRENT_SESSION_VERSION
+    || header.cwd !== workspaceCwd
+  ) {
+    throw new Error("Pi created an unsafe recovery session transcript");
+  }
+  return { sessionId, transcriptPath: inspection.canonicalPath };
 }
 
 export async function discoverCanonicalRecoveryTranscript(
@@ -505,34 +578,51 @@ async function spawnBoundSession(
     protocol.fence.incidentId,
     protocol.fence.generation,
   );
+  const seeded = preseedCanonicalRecoverySession(
+    sessionDirectory,
+    resolveValidatedPiAgentWorkspaceCwd(agent),
+  );
   const child = spawnWithPrivateUmask(
     spawn,
     agent,
-    undefined,
+    seeded.sessionId,
     extensionOptions,
     runtimeEnv(protocol, sessionDirectory, runner.agentId, runner.piExecutable, options.env),
   );
   observeChild(child);
   try {
-    const sessionId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
+    const observedId = await captureRecoverySessionId(child, runner.startupTimeoutMs);
+    if (observedId !== seeded.sessionId) {
+      throw new Error("Recovery Pi resumed a different pre-seeded session id");
+    }
     const transcriptPath = await discoverCanonicalRecoveryTranscript(
       sessionDirectory,
-      sessionId,
+      seeded.sessionId,
       runner.startupTimeoutMs,
       options,
     );
+    if (normalize(transcriptPath) !== normalize(seeded.transcriptPath)) {
+      throw new Error("Recovery Pi resumed a different pre-seeded transcript path");
+    }
     const bindingId = prior
       ? await client.replaceSession({
         previousBindingId: prior.bindingId,
-        sessionId,
+        sessionId: seeded.sessionId,
         sessionDirectory,
         transcriptPath,
         startupClassifier: "no_session_found",
         journalDigest: state.journalDigest,
         runtime,
       })
-      : await client.bindSession({ sessionId, sessionDirectory, transcriptPath, runtime });
-    return { child, bindingId, sessionId, sessionDirectory, transcriptPath, replaced: Boolean(prior) };
+      : await client.bindSession({ sessionId: seeded.sessionId, sessionDirectory, transcriptPath, runtime });
+    return {
+      child,
+      bindingId,
+      sessionId: seeded.sessionId,
+      sessionDirectory,
+      transcriptPath,
+      replaced: Boolean(prior),
+    };
   } catch (error) {
     await terminateRecoveryProcessGroup(
       child,
