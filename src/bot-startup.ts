@@ -32,6 +32,19 @@ export interface RetryOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+export interface ActiveAgentPlatformState {
+  telegramStarted: boolean;
+  telegramBindingCount: number;
+  discordStarted: boolean;
+  discordBindingCount: number;
+}
+
+/** Alert-only transports do not count as a usable conversational platform. */
+export function hasActiveAgentPlatform(state: ActiveAgentPlatformState): boolean {
+  return (state.telegramStarted && state.telegramBindingCount > 0) ||
+    (state.discordStarted && state.discordBindingCount > 0);
+}
+
 /**
  * Start non-critical Telegram setup without delaying grammY's first getUpdates.
  * Synchronous throws and rejected promises are routed to the same error callback.

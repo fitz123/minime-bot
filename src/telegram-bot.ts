@@ -778,7 +778,7 @@ export function createTelegramBot(
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
     tavilyActions?: TavilyOperatorActions;
-    getTavilyStatus?: () => TavilyStatusSnapshot;
+    getTavilyStatus?: () => TavilyStatusSnapshot | undefined;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {

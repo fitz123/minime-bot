@@ -5,6 +5,7 @@ import {
   type TavilyNotification,
   type TavilyNotificationFailure,
   type TavilyRecoveryResult,
+  type TavilyStatusSnapshot,
 } from "./tavily-monitor.js";
 
 export const TAVILY_USAGE_SAMPLE_INTERVAL_MS = 5 * 60 * 1_000;
@@ -283,6 +284,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
 
   private async deliverDueNotifications(): Promise<void> {
     for (const notification of this.monitor.dueNotifications(this.now())) {
+      if (!this.acceptingTransitions) return;
       if (!this.destination) {
         this.monitor.recordNotificationTerminal(notification.key);
         continue;
@@ -296,6 +298,9 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
         });
         this.monitor.recordNotificationDelivered(notification.key);
       } catch (error) {
+        // Shutdown aborts active deliveries. Leave the entry pending for the
+        // next process and never advance to another notification afterward.
+        if (!this.acceptingTransitions) return;
         const classified = classifyTavilyDeliveryError(error);
         if (classified.failure === "destination_invalid") {
           this.monitor.recordNotificationTerminal(notification.key);
@@ -388,5 +393,209 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       () => this.recheckFlights.delete(generation),
     );
     return flight;
+  }
+}
+
+export interface TavilyMonitorSupervisorLease {
+  release: () => void;
+}
+
+export interface TavilyOwnedMonitorRuntime extends TavilyOperatorActions {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export interface TavilyMonitorSupervisorOptions {
+  destination: TavilyDeliveryDestination | undefined;
+  tryAcquireLease: () => TavilyMonitorSupervisorLease | undefined;
+  createRuntime: () => {
+    monitor: Pick<TavilyMonitor, "getStatus">;
+    runtime: TavilyOwnedMonitorRuntime;
+  };
+  retryIntervalMs?: number;
+  setTimeoutImpl?: (callback: () => void, delayMs: number) => unknown;
+  clearTimeoutImpl?: (handle: unknown) => void;
+  onWait?: () => void;
+  onAcquired?: () => void;
+  onError?: (error: unknown) => void;
+}
+
+interface TavilyMonitorOwner {
+  lease: TavilyMonitorSupervisorLease;
+  monitor: Pick<TavilyMonitor, "getStatus">;
+  runtime: TavilyOwnedMonitorRuntime;
+}
+
+/**
+ * Acquire the production writer lease without blocking bot startup. A fresh
+ * monitor is constructed only after ownership is obtained, so a waiting
+ * replacement cannot later overwrite state from the previous writer.
+ */
+export class TavilyMonitorSupervisor implements TavilyOperatorActions {
+  private readonly destination: TavilyDeliveryDestination | undefined;
+  private readonly tryAcquireLease: () => TavilyMonitorSupervisorLease | undefined;
+  private readonly createRuntime: TavilyMonitorSupervisorOptions["createRuntime"];
+  private readonly retryIntervalMs: number;
+  private readonly setTimeoutImpl: (callback: () => void, delayMs: number) => unknown;
+  private readonly clearTimeoutImpl: (handle: unknown) => void;
+  private readonly onWait: () => void;
+  private readonly onAcquired: () => void;
+  private readonly onError: (error: unknown) => void;
+  private owner: TavilyMonitorOwner | undefined;
+  private retryTimer: unknown;
+  private activation: Promise<void> | undefined;
+  private stopPromise: Promise<void> | undefined;
+  private startRequested = false;
+  private stopped = false;
+  private waitingLogged = false;
+
+  constructor(options: TavilyMonitorSupervisorOptions) {
+    this.destination = options.destination;
+    this.tryAcquireLease = options.tryAcquireLease;
+    this.createRuntime = options.createRuntime;
+    this.retryIntervalMs = positiveInterval(
+      options.retryIntervalMs ?? 1_000,
+      "Tavily monitor lease retry interval",
+    );
+    this.setTimeoutImpl = options.setTimeoutImpl ?? ((callback, delayMs) =>
+      setTimeout(callback, delayMs));
+    this.clearTimeoutImpl = options.clearTimeoutImpl ?? ((handle) =>
+      clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.onWait = options.onWait ?? (() => {});
+    this.onAcquired = options.onAcquired ?? (() => {});
+    this.onError = options.onError ?? (() => {});
+  }
+
+  getDeliveryDestination(): TavilyDeliveryDestination | undefined {
+    return this.destination ? { ...this.destination } : undefined;
+  }
+
+  getStatus(): TavilyStatusSnapshot | undefined {
+    return this.owner?.monitor.getStatus();
+  }
+
+  isIncidentActive(generation: string): boolean {
+    return this.owner?.runtime.isIncidentActive(generation) ?? false;
+  }
+
+  acknowledgeIncident(generation: string): Promise<boolean> {
+    if (!this.owner) return Promise.reject(new Error("Tavily monitor writer is unavailable"));
+    return this.owner.runtime.acknowledgeIncident(generation);
+  }
+
+  recheckIncident(generation: string): Promise<TavilyRecoveryResult> {
+    if (!this.owner) return Promise.reject(new Error("Tavily monitor writer is unavailable"));
+    return this.owner.runtime.recheckIncident(generation);
+  }
+
+  start(): void {
+    if (this.stopped) throw new Error("Tavily monitor supervisor is stopped");
+    if (this.startRequested) return;
+    this.startRequested = true;
+    this.tryActivate();
+  }
+
+  private scheduleRetry(): void {
+    if (!this.startRequested || this.stopped || this.retryTimer !== undefined) return;
+    this.retryTimer = this.setTimeoutImpl(() => {
+      this.retryTimer = undefined;
+      this.tryActivate();
+    }, this.retryIntervalMs);
+    (this.retryTimer as TavilyIntervalHandle | undefined)?.unref?.();
+  }
+
+  private releaseOwner(owner: TavilyMonitorOwner): void {
+    if (this.owner !== owner) return;
+    this.owner = undefined;
+    try {
+      owner.lease.release();
+    } catch (error) {
+      this.onError(error);
+    }
+  }
+
+  private tryActivate(): void {
+    if (!this.startRequested || this.stopped || this.owner || this.activation) return;
+    let lease: TavilyMonitorSupervisorLease | undefined;
+    try {
+      lease = this.tryAcquireLease();
+    } catch (error) {
+      this.onError(error);
+      this.scheduleRetry();
+      return;
+    }
+    if (!lease) {
+      if (!this.waitingLogged) {
+        this.waitingLogged = true;
+        this.onWait();
+      }
+      this.scheduleRetry();
+      return;
+    }
+
+    let created: ReturnType<TavilyMonitorSupervisorOptions["createRuntime"]>;
+    try {
+      created = this.createRuntime();
+    } catch (error) {
+      try { lease.release(); } catch (releaseError) { this.onError(releaseError); }
+      this.onError(error);
+      this.scheduleRetry();
+      return;
+    }
+    const owner: TavilyMonitorOwner = { lease, ...created };
+    this.owner = owner;
+    if (this.waitingLogged) this.waitingLogged = false;
+    this.onAcquired();
+
+    let startup: Promise<void>;
+    try {
+      startup = owner.runtime.start();
+    } catch (error) {
+      this.onError(error);
+      this.releaseOwner(owner);
+      this.scheduleRetry();
+      return;
+    }
+    let activation!: Promise<void>;
+    activation = startup.then(
+      () => {
+        if (this.activation === activation) this.activation = undefined;
+      },
+      async (error) => {
+        this.onError(error);
+        try {
+          await owner.runtime.stop();
+        } catch (stopError) {
+          this.onError(stopError);
+        }
+        this.releaseOwner(owner);
+        if (this.activation === activation) this.activation = undefined;
+        this.scheduleRetry();
+      },
+    );
+    this.activation = activation;
+    void activation;
+  }
+
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
+    this.startRequested = false;
+    if (this.retryTimer !== undefined) {
+      this.clearTimeoutImpl(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+    this.stopPromise = (async () => {
+      const owner = this.owner;
+      if (owner) {
+        try {
+          await owner.runtime.stop();
+        } finally {
+          this.releaseOwner(owner);
+        }
+      }
+      await this.activation;
+    })();
+    return this.stopPromise;
   }
 }

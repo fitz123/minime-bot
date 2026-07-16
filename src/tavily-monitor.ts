@@ -24,6 +24,7 @@ import {
 import {
   TAVILY_CHILD_EVENT_VERSION,
   tavilyEventSpoolDirectory,
+  withTavilyEventPublicationLock,
   type TavilyChildEvent,
 } from "./pi-extensions/tavily-events.js";
 
@@ -1259,6 +1260,7 @@ function eventKey(fileName: string, raw: string): string {
 
 /** Stateful quota/incident core used by the main-process lifecycle integration. */
 export class TavilyMonitor {
+  private readonly controlWorkspaceRoot: string;
   private readonly apiKey: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
@@ -1272,6 +1274,7 @@ export class TavilyMonitor {
   private state: TavilyMonitorState;
 
   constructor(options: TavilyMonitorOptions) {
+    this.controlWorkspaceRoot = resolve(options.controlWorkspaceRoot);
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
@@ -1283,8 +1286,8 @@ export class TavilyMonitor {
       throw new Error("Tavily status stale interval must be positive");
     }
     this.onStateChange = options.onStateChange;
-    this.eventDirectory = tavilyEventSpoolDirectory(options.controlWorkspaceRoot);
-    this.store = new TavilyStateStore(options.controlWorkspaceRoot, this.now);
+    this.eventDirectory = tavilyEventSpoolDirectory(this.controlWorkspaceRoot);
+    this.store = new TavilyStateStore(this.controlWorkspaceRoot, this.now);
     this.state = this.store.load();
     this.refreshDiagnostics();
   }
@@ -1661,57 +1664,62 @@ export class TavilyMonitor {
       false,
       usageSample === undefined,
     );
-    this.drainChildEvents();
-    const current = this.state.incident;
-    const exhaustionAfterUsage = current?.lastObservedAt !== undefined &&
-      (current.lastObservedAt > result.sample.observedAt ||
-        (current.lastObservedAt === result.sample.observedAt &&
-          current.lastObservedAt !== lastObservedBeforeVerification));
-    if (current?.generation === generation && !current.resolvedAt &&
-        exhaustionAfterUsage) {
-      return this.verificationFailure(
-        generation,
-        "usage_state",
-        "usage_exhausted",
-        undefined,
-        notifyOperator,
-      );
-    }
-    this.commit((state, now) => {
-      const active = state.incident;
-      if (!active || active.generation !== generation || active.resolvedAt) return;
-      active.resolvedAt = now;
-      active.recoveryUsageObservedAt = result.sample.observedAt;
-      delete state.pendingAutomaticVerification;
-      state.lastVerification = {
-        generation,
-        ok: true,
-        stage: "extract_probe",
-        observedAt: now,
-      };
-      cancelPendingNotifications(state, generation, ["incident", "reminder", "recheck_failure"]);
-      addNotification(state, {
-        key: `incident:${generation}:recovery`,
-        kind: "recovery",
-        createdAt: now,
-        incidentGeneration: generation,
-        message: `Tavily recovered. Provider: Tavily. Incident generation: ${generation}. ` +
-          "Verified tools: web_search, web_fetch.",
+    return withTavilyEventPublicationLock(this.controlWorkspaceRoot, () => {
+      // A writer takes the same lock before it timestamps or stages an event.
+      // Acquiring it here therefore waits for every already-started publication
+      // before recovery can be committed or exposed to the delivery runtime.
+      this.drainChildEvents();
+      const current = this.state.incident;
+      const exhaustionAfterUsage = current?.lastObservedAt !== undefined &&
+        (current.lastObservedAt > result.sample.observedAt ||
+          (current.lastObservedAt === result.sample.observedAt &&
+            current.lastObservedAt !== lastObservedBeforeVerification));
+      if (current?.generation === generation && !current.resolvedAt &&
+          exhaustionAfterUsage) {
+        return this.verificationFailure(
+          generation,
+          "usage_state",
+          "usage_exhausted",
+          undefined,
+          notifyOperator,
+        );
+      }
+      this.commit((state, now) => {
+        const active = state.incident;
+        if (!active || active.generation !== generation || active.resolvedAt) return;
+        active.resolvedAt = now;
+        active.recoveryUsageObservedAt = result.sample.observedAt;
+        delete state.pendingAutomaticVerification;
+        state.lastVerification = {
+          generation,
+          ok: true,
+          stage: "extract_probe",
+          observedAt: now,
+        };
+        cancelPendingNotifications(state, generation, ["incident", "reminder", "recheck_failure"]);
+        addNotification(state, {
+          key: `incident:${generation}:recovery`,
+          kind: "recovery",
+          createdAt: now,
+          incidentGeneration: generation,
+          message: `Tavily recovered. Provider: Tavily. Incident generation: ${generation}. ` +
+            "Verified tools: web_search, web_fetch.",
+        });
       });
+      // Preserve same-process reentrant safety for observers/tests that publish
+      // synchronously from a state transition while the outer lock is held.
+      this.drainChildEvents();
+      const afterResolution = this.state.incident;
+      if (afterResolution && afterResolution.generation !== generation && !afterResolution.resolvedAt) {
+        return {
+          ok: false,
+          generation,
+          stage: "usage_state",
+          classification: "usage_exhausted",
+        };
+      }
+      return { ok: true, generation, sample: result.sample };
     });
-    // Close the listing-to-commit window: a child event published after the
-    // pre-commit drain is authoritative and cancels the still-pending recovery.
-    this.drainChildEvents();
-    const afterResolution = this.state.incident;
-    if (afterResolution && afterResolution.generation !== generation && !afterResolution.resolvedAt) {
-      return {
-        ok: false,
-        generation,
-        stage: "usage_state",
-        classification: "usage_exhausted",
-      };
-    }
-    return { ok: true, generation, sample: result.sample };
   }
 
   recheckIncident(generation: string): Promise<TavilyRecoveryResult> {

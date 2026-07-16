@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import {
   lstatSync,
   mkdirSync,
@@ -9,7 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import { mkdtempSync } from "node:fs";
 import {
@@ -791,6 +793,86 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     }
     assert.equal(monitor.getState().incident?.resolvedAt, undefined);
     assert.equal(monitor.getState().incident?.lastObservedAt, "2026-07-16T12:06:00.000Z");
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
+  });
+
+  it("waits for an already-started cross-process event publication before resolving", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:05:00.000Z");
+    writeExhaustionEvent(
+      workspace,
+      "web_search",
+      "base_plan_exhausted",
+      "2026-07-16T12:00:00.000Z",
+      "verification-start",
+    );
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: sequenceFetch([
+        jsonResponse(usageResponse({ planUsage: 100 })),
+        jsonResponse(successfulSearchResponse()),
+        jsonResponse(successfulExtractResponse()),
+      ]).fetchImpl,
+    });
+    monitor.drainChildEvents();
+    const generation = monitor.getState().incident?.generation as string;
+
+    const eventsModule = pathToFileURL(resolve("src/pi-extensions/tavily-events.ts")).href;
+    const childScript = `
+      import {
+        acquireTavilyEventPublicationLock,
+        writeTavilyChildEvent,
+      } from ${JSON.stringify(eventsModule)};
+      const workspace = process.argv[1];
+      const lock = acquireTavilyEventPublicationLock(workspace);
+      process.stdout.write("locked\\n");
+      setTimeout(() => {
+        writeTavilyChildEvent(
+          workspace,
+          "web_fetch",
+          { classification: "paygo_exhausted", httpStatus: 433 },
+          {
+            now: () => new Date("2026-07-16T12:06:00.000Z"),
+            uniqueId: () => "in-progress",
+          },
+        );
+        lock.release();
+      }, 150);
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript, workspace],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    const exited = new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    await new Promise<void>((resolveLocked, rejectLocked) => {
+      let output = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        output += chunk;
+        if (output.includes("locked\n")) resolveLocked();
+      });
+      child.once("error", rejectLocked);
+      child.once("exit", (code) => {
+        if (!output.includes("locked\n")) {
+          rejectLocked(new Error(`publication child exited early (${code}): ${stderr}`));
+        }
+      });
+    });
+
+    const result = await monitor.recheckIncident(generation);
+    assert.equal(await exited, 0, stderr);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, "usage_state");
+      assert.equal(result.classification, "usage_exhausted");
+    }
+    assert.equal(monitor.getState().incident?.resolvedAt, undefined);
     assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
   });
 

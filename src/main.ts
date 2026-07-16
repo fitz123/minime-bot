@@ -11,6 +11,7 @@ import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
 import { recordTavilyMonitorMetrics, startMetricsServer, stopMetricsServer } from "./metrics.js";
 import {
+  hasActiveAgentPlatform,
   runTelegramSetupInBackground,
   startBotWithRetry,
   stopTelegramBotInBackground,
@@ -29,10 +30,10 @@ import { readTavilyApiKeyFromSops } from "./pi-extensions/tavily-secret.js";
 import {
   TavilyMonitor,
   tryAcquireTavilyWriterLease,
-  type TavilyWriterLease,
 } from "./tavily-monitor.js";
 import {
   resolveTavilyDeliveryDestination,
+  TavilyMonitorSupervisor,
   TavilyMonitorRuntime,
 } from "./tavily-monitor-runtime.js";
 
@@ -63,8 +64,7 @@ async function main(): Promise<void> {
   let echoWatcher: EchoWatcher | undefined;
   let discordClient: Client | undefined;
   let watchdog: Watchdog | undefined;
-  let tavilyRuntime: TavilyMonitorRuntime | undefined;
-  let tavilyWriterLease: TavilyWriterLease | undefined;
+  let tavilySupervisor: TavilyMonitorSupervisor | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
     log.info("main", `Received ${signal}, shutting down...`);
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
-    const tavilyStop = tavilyRuntime?.stop();
+    const tavilyStop = tavilySupervisor?.stop();
     if (telegramBot) {
       stopTelegramBotInBackground(telegramBot, () => {
         log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
@@ -90,12 +90,7 @@ async function main(): Promise<void> {
     // updates, but already-scheduled debounce timers could still fire and start
     // new flush() work during the graceful shutdown wait window.
     for (const mq of messageQueues) mq.cancelAllDebounceTimers();
-    try {
-      await tavilyStop;
-    } finally {
-      tavilyWriterLease?.release();
-      tavilyWriterLease = undefined;
-    }
+    await tavilyStop;
     // Wait for busy sessions to finish their current turns BEFORE clearing
     // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
     // that would break in-flight sessions still reading those files.
@@ -133,54 +128,54 @@ async function main(): Promise<void> {
   });
 
   const controlWorkspaceRoot = resolveWorkspaceContract().paths.controlWorkspaceRoot;
-  let loggedWriterWait = false;
-  while (!tavilyWriterLease) {
-    tavilyWriterLease = tryAcquireTavilyWriterLease(controlWorkspaceRoot);
-    if (tavilyWriterLease) break;
-    if (!loggedWriterWait) {
-      loggedWriterWait = true;
-      log.warn("main", "Another process owns the Tavily monitor writer lease; waiting");
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
-  }
-  if (loggedWriterWait) log.info("main", "Tavily monitor writer lease acquired");
-  const tavilyMonitor = new TavilyMonitor({
-    controlWorkspaceRoot,
-    apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
-    onStateChange: recordTavilyMonitorMetrics,
-  });
   const telegramConfigured = Boolean(config.telegramToken);
-  tavilyRuntime = new TavilyMonitorRuntime({
-    monitor: tavilyMonitor,
-    destination: telegramConfigured ? resolveTavilyDeliveryDestination(config) : undefined,
-    deliver: async (payload, signal) => {
-      if (!telegramBot) {
-        throw { error_code: 400 };
-      }
-      const sendOptions = {
-        ...(payload.threadId === undefined ? {} : { message_thread_id: payload.threadId }),
-        ...(payload.replyMarkup === undefined ? {} : { reply_markup: payload.replyMarkup }),
-        [TAVILY_DURABLE_DELIVERY]: true,
-      } as Parameters<typeof telegramBot.api.sendMessage>[2] & {
-        [TAVILY_DURABLE_DELIVERY]: true;
-      };
-      await telegramBot.api.sendMessage(
-        payload.chatId,
-        payload.text,
-        sendOptions,
-        signal as Parameters<typeof telegramBot.api.sendMessage>[3],
-      );
+  const tavilyDestination = telegramConfigured
+    ? resolveTavilyDeliveryDestination(config)
+    : undefined;
+  tavilySupervisor = new TavilyMonitorSupervisor({
+    destination: tavilyDestination,
+    tryAcquireLease: () => tryAcquireTavilyWriterLease(controlWorkspaceRoot),
+    createRuntime: () => {
+      const monitor = new TavilyMonitor({
+        controlWorkspaceRoot,
+        apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
+        onStateChange: recordTavilyMonitorMetrics,
+      });
+      const runtime = new TavilyMonitorRuntime({
+        monitor,
+        destination: tavilyDestination,
+        deliver: async (payload, signal) => {
+          if (!telegramBot) {
+            // Bot construction/polling must not gate monitoring. Treat its
+            // startup window as transient so the durable outbox retries.
+            throw new Error("Telegram transport is not ready");
+          }
+          const sendOptions = {
+            ...(payload.threadId === undefined ? {} : { message_thread_id: payload.threadId }),
+            ...(payload.replyMarkup === undefined ? {} : { reply_markup: payload.replyMarkup }),
+            [TAVILY_DURABLE_DELIVERY]: true,
+          } as Parameters<typeof telegramBot.api.sendMessage>[2] & {
+            [TAVILY_DURABLE_DELIVERY]: true;
+          };
+          await telegramBot.api.sendMessage(
+            payload.chatId,
+            payload.text,
+            sendOptions,
+            signal as Parameters<typeof telegramBot.api.sendMessage>[3],
+          );
+        },
+        onError: () => log.error("main", "Tavily monitor transition failed"),
+      });
+      return { monitor, runtime };
     },
-    onError: () => log.error("main", "Tavily monitor transition failed"),
+    onWait: () => log.warn("main", "Another process owns the Tavily monitor writer lease; waiting"),
+    onAcquired: () => log.info("main", "Tavily monitor writer lease acquired"),
+    onError: () => log.error("main", "Tavily monitor ownership transition failed"),
   });
-  let tavilyStartRequested = false;
-  const startTavilyRuntime = (): void => {
-    if (shuttingDown || tavilyStartRequested) return;
-    tavilyStartRequested = true;
-    void tavilyRuntime!.start().catch(() => {
-      log.error("main", "Tavily monitor startup failed");
-    });
-  };
+  // Lease acquisition and immediate monitoring run independently of both
+  // transports. A replacement can therefore negotiate Telegram polling or
+  // start Discord while it waits for the previous writer to exit.
+  tavilySupervisor.start();
 
   // Start Telegram bot if configured
   if (config.telegramToken) {
@@ -189,11 +184,8 @@ async function main(): Promise<void> {
     let onUpdateFn: (() => void) | undefined;
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
-      // A successful getUpdates proves this process owns polling. This also
-      // protects the first rollout where the replaced binary has no writer lease.
-      onSuccessfulPoll: startTavilyRuntime,
-      tavilyActions: tavilyRuntime,
-      getTavilyStatus: () => tavilyMonitor.getStatus(),
+      tavilyActions: tavilySupervisor,
+      getTavilyStatus: () => tavilySupervisor?.getStatus(),
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
@@ -278,13 +270,17 @@ async function main(): Promise<void> {
     }
   }
 
-  // Fail fast if no bots are active
-  if (!telegramBot && !discordClient) {
+  // Owner-only Telegram delivery is not an agent platform. Require at least
+  // one started transport with a conversational binding.
+  if (!hasActiveAgentPlatform({
+    telegramStarted: Boolean(telegramBot),
+    telegramBindingCount: config.bindings.length,
+    discordStarted: Boolean(discordClient),
+    discordBindingCount: config.discord?.bindings.length ?? 0,
+  })) {
     log.error("main", "No bots started — exiting");
     process.exit(1);
   }
-
-  if (!telegramConfigured) startTavilyRuntime();
 }
 
 main().catch((err) => {

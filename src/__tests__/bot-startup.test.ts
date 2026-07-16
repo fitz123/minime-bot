@@ -2,11 +2,44 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { GrammyError } from "grammy";
 import {
+  hasActiveAgentPlatform,
   is409ConflictError,
   runTelegramSetupInBackground,
   startBotWithRetry,
   stopTelegramBotInBackground,
 } from "../bot-startup.js";
+
+describe("hasActiveAgentPlatform", () => {
+  it("does not count an owner-only Telegram alert transport after Discord startup fails", () => {
+    assert.equal(hasActiveAgentPlatform({
+      telegramStarted: true,
+      telegramBindingCount: 0,
+      discordStarted: false,
+      discordBindingCount: 1,
+    }), false);
+  });
+
+  it("accepts only started transports with conversational bindings", () => {
+    assert.equal(hasActiveAgentPlatform({
+      telegramStarted: true,
+      telegramBindingCount: 1,
+      discordStarted: false,
+      discordBindingCount: 0,
+    }), true);
+    assert.equal(hasActiveAgentPlatform({
+      telegramStarted: false,
+      telegramBindingCount: 0,
+      discordStarted: true,
+      discordBindingCount: 1,
+    }), true);
+    assert.equal(hasActiveAgentPlatform({
+      telegramStarted: false,
+      telegramBindingCount: 1,
+      discordStarted: true,
+      discordBindingCount: 0,
+    }), false);
+  });
+});
 
 describe("runTelegramSetupInBackground", () => {
   it("returns before a pending setup task completes", async () => {

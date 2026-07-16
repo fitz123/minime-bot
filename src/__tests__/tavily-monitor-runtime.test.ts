@@ -18,11 +18,13 @@ import {
 } from "../metrics.js";
 import {
   TAVILY_USAGE_SAMPLE_INTERVAL_MS,
+  TavilyMonitorSupervisor,
   TavilyMonitorRuntime,
   classifyTavilyDeliveryError,
   parseTavilyCallbackData,
   resolveTavilyDeliveryDestination,
   type TavilyDeliveryPayload,
+  type TavilyOwnedMonitorRuntime,
 } from "../tavily-monitor-runtime.js";
 import {
   tavilyEventSpoolDirectory,
@@ -96,6 +98,91 @@ function writeExhaustionEvent(workspace: string, observedAt: string, id: string)
     { now: () => new Date(observedAt), uniqueId: () => id, pid: 71 },
   );
 }
+
+function stubOwnedRuntime(events: string[]): TavilyOwnedMonitorRuntime {
+  return {
+    getDeliveryDestination: () => undefined,
+    isIncidentActive: () => false,
+    acknowledgeIncident: async () => false,
+    recheckIncident: async (generation) => ({
+      ok: false,
+      generation,
+      stage: "incident",
+      classification: "stale_incident",
+    }),
+    start: async () => { events.push("runtime-start"); },
+    stop: async () => { events.push("runtime-stop"); },
+  };
+}
+
+describe("Tavily monitor ownership supervisor", () => {
+  it("starts monitoring immediately without waiting for a Telegram poll", async () => {
+    const workspace = temporaryWorkspace();
+    const events: string[] = [];
+    const supervisor = new TavilyMonitorSupervisor({
+      destination: { chatId: 71 },
+      tryAcquireLease: () => {
+        events.push("lease-acquire");
+        return { release: () => { events.push("lease-release"); } };
+      },
+      createRuntime: () => {
+        events.push("runtime-create");
+        return {
+          monitor: new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+          runtime: stubOwnedRuntime(events),
+        };
+      },
+    });
+
+    supervisor.start();
+    assert.deepEqual(events.slice(0, 3), ["lease-acquire", "runtime-create", "runtime-start"]);
+    await supervisor.stop();
+    assert.deepEqual(events.slice(-2), ["runtime-stop", "lease-release"]);
+  });
+
+  it("returns while a live writer owns the lease and retries with a fresh runtime later", async () => {
+    const workspace = temporaryWorkspace();
+    const events: string[] = [];
+    const retries: Array<() => void> = [];
+    let leaseAvailable = false;
+    let factoryCalls = 0;
+    const supervisor = new TavilyMonitorSupervisor({
+      destination: undefined,
+      tryAcquireLease: () => {
+        events.push("lease-attempt");
+        return leaseAvailable
+          ? { release: () => { events.push("lease-release"); } }
+          : undefined;
+      },
+      createRuntime: () => {
+        factoryCalls += 1;
+        return {
+          monitor: new TavilyMonitor({ controlWorkspaceRoot: workspace, apiKey: "fixture-key" }),
+          runtime: stubOwnedRuntime(events),
+        };
+      },
+      setTimeoutImpl: (callback) => {
+        retries.push(callback);
+        return { unref() {} };
+      },
+      clearTimeoutImpl: () => {},
+      onWait: () => { events.push("waiting"); },
+    });
+
+    supervisor.start();
+    assert.equal(factoryCalls, 0, "a waiting replacement does not restore stale monitor state");
+    assert.deepEqual(events, ["lease-attempt", "waiting"]);
+    assert.equal(retries.length, 1, "lease waiting is asynchronous and leaves bot startup unblocked");
+
+    leaseAvailable = true;
+    retries.shift()?.();
+    await Promise.resolve();
+    assert.equal(factoryCalls, 1);
+    assert.equal(events.includes("runtime-start"), true);
+    await supervisor.stop();
+    assert.equal(events.at(-1), "lease-release");
+  });
+});
 
 describe("Tavily monitor lifecycle", () => {
   it("startup-drains events, samples immediately, and delivers incident actions", async () => {
@@ -482,22 +569,24 @@ describe("Tavily durable notification delivery", () => {
     assert.equal(deliveries.filter((delivery) => /exhaustion reminder/.test(delivery.text)).length, 1);
   });
 
-  it("bounds delivery attempts and aborts them during shutdown", async () => {
+  it("aborts the active delivery during shutdown without starting the next due notification", async () => {
     const workspace = temporaryWorkspace();
     const monitor = new TavilyMonitor({
       controlWorkspaceRoot: workspace,
       apiKey: "fixture-key",
-      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+      fetchImpl: (async () => jsonResponse(usageResponse(950))) as typeof fetch,
     });
     await monitor.sampleUsage();
     let deliveryStarted!: () => void;
     const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
     let observedSignal: AbortSignal | undefined;
+    let deliveryAttempts = 0;
     const runtime = new TavilyMonitorRuntime({
       monitor,
       destination: { chatId: 71 },
       deliveryTimeoutMs: 60_000,
       deliver: async (_payload, signal) => {
+        deliveryAttempts += 1;
         observedSignal = signal;
         deliveryStarted();
         await new Promise<void>((_resolve, reject) => {
@@ -511,7 +600,9 @@ describe("Tavily durable notification delivery", () => {
     const stopping = runtime.stop();
     await Promise.all([processing, stopping]);
     assert.equal(observedSignal?.aborted, true);
-    assert.equal(monitor.getState().outbox[0].lastFailure, "transport");
+    assert.equal(deliveryAttempts, 1);
+    assert.equal(monitor.getState().outbox.length, 2);
+    assert.equal(monitor.getState().outbox.every((entry) => entry.attempts === 0), true);
     await assert.rejects(runtime.processNow(), /runtime is stopped/);
     await assert.rejects(runtime.acknowledgeIncident("2026-07-1"), /runtime is stopped/);
   });

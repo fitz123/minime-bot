@@ -37,7 +37,9 @@ import {
 } from "../pi-extensions/tavily.js";
 import {
   TAVILY_CHILD_EVENT_VERSION,
+  TAVILY_EVENT_PUBLICATION_LOCK_RELPATH,
   TAVILY_EVENT_SPOOL_RELPATH,
+  acquireTavilyEventPublicationLock,
   tavilyEventSpoolDirectory,
   writeTavilyChildEvent,
 } from "../pi-extensions/tavily-events.js";
@@ -153,6 +155,33 @@ describe("tavily: bounded failure classification", () => {
 });
 
 describe("tavily: child failure event writer", () => {
+  it("publishes under an owner-only process-reentrant lock and cleans the lock", () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-lock-"));
+    try {
+      const outer = acquireTavilyEventPublicationLock(controlWorkspace, {
+        pid: 71,
+        uniqueId: () => "outer",
+      });
+      const lockPath = join(controlWorkspace, TAVILY_EVENT_PUBLICATION_LOCK_RELPATH);
+      assert.equal(outer.path, lockPath);
+      assert.equal(lstatSync(lockPath).mode & 0o777, 0o600);
+
+      const eventPath = writeTavilyChildEvent(
+        controlWorkspace,
+        "web_search",
+        { classification: "base_plan_exhausted", httpStatus: 432 },
+        { pid: 71, uniqueId: () => "nested" },
+      );
+      assert.equal(lstatSync(eventPath).isFile(), true);
+      assert.equal(lstatSync(lockPath).isFile(), true, "nested publication keeps the outer lock");
+
+      outer.release();
+      assert.equal(readdirSync(tavilyEventSpoolDirectory(controlWorkspace)).includes(".publish.lock"), false);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
+  });
+
   it("atomically creates unique minimal owner-only event files under control data", () => {
     const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-writer-"));
     const observedAt = new Date("2026-07-16T10:20:30.000Z");
