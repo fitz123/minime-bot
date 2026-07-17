@@ -837,10 +837,15 @@ export function parseOpsWorkerTask(
   if (state === "RUNNING" && activeRun === null) {
     fail("task.activeRun", "must identify the owned process group while state is RUNNING");
   }
-  if (state !== "RUNNING" && activeRun !== null) {
-    fail("task.activeRun", "must be null unless state is RUNNING");
-  }
   const lastOutcome = parseLastOutcome(task.lastOutcome);
+  const preservesAmbiguousRun = state === "BLOCKED"
+    && lastOutcome?.result === "AMBIGUOUS_ORPHAN";
+  if (state !== "RUNNING" && activeRun !== null && !preservesAmbiguousRun) {
+    fail(
+      "task.activeRun",
+      "must be null unless state is RUNNING or retains an ambiguous blocked process group",
+    );
+  }
   if (
     state === "DONE"
     && (

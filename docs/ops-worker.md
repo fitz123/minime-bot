@@ -49,6 +49,10 @@ live control transport is not part of the PR-1 skeleton. A running task cannot
 be cancelled without its owning supervisor first proving and stopping the
 process group.
 
+An ambiguous process-group identity is a global safety fence: its task retains
+any proven identity evidence, no new Pi attempt is launched, and ordinary retry
+or cancellation is rejected until restart reconciliation proves the group gone.
+
 ## Loopback status
 
 The supervisor binds to `127.0.0.1:9465` by default. Only `127.0.0.1` and `::1`

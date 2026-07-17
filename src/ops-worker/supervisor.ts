@@ -3,6 +3,7 @@ import {
   constants,
   fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -10,6 +11,7 @@ import {
   writeFileSync,
   type Stats,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import {
   OpsWorkerDoneCheckExecutionError,
@@ -44,7 +46,7 @@ const ALLOWED_STATE_TRANSITIONS: Readonly<
   RUNNING: ["CHECKING", "RESUMABLE", "BLOCKED"],
   CHECKING: ["CHECKING", "RESUMABLE", "BLOCKED", "DONE", "CANCELLED"],
   RESUMABLE: ["RUNNING", "CHECKING", "RESUMABLE", "BLOCKED", "CANCELLED"],
-  BLOCKED: ["RESUMABLE", "CANCELLED"],
+  BLOCKED: ["BLOCKED", "RESUMABLE", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -97,6 +99,8 @@ export interface OpsWorkerSupervisorOptions {
   reconcileActiveRun?: (
     task: OpsWorkerTask,
   ) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>;
+  /** Test-only crash-boundary hook. Production callers should leave this unset. */
+  lockFaultInjector?: (point: "after-temp-file-fsync") => void;
 }
 
 export class OpsWorkerSupervisorStateError extends Error {
@@ -247,6 +251,7 @@ class OpsWorkerSingleInstanceGuard {
   private readonly inspectOwner:
     | ((owner: OpsWorkerSupervisorLockRecord) => OpsWorkerLockOwnerStatus)
     | undefined;
+  private readonly faultInjector: ((point: "after-temp-file-fsync") => void) | undefined;
   private acquiredInode: bigint | number | undefined;
 
   constructor(
@@ -255,30 +260,17 @@ class OpsWorkerSingleInstanceGuard {
     inspectOwner:
       | ((owner: OpsWorkerSupervisorLockRecord) => OpsWorkerLockOwnerStatus)
       | undefined,
+    faultInjector: ((point: "after-temp-file-fsync") => void) | undefined,
   ) {
     this.path = join(stateDirectory, SUPERVISOR_LOCK_FILE_NAME);
     this.record = record;
     this.inspectOwner = inspectOwner;
+    this.faultInjector = faultInjector;
   }
 
   acquire(): void {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      let descriptor: number | undefined;
-      try {
-        descriptor = openSync(
-          this.path,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
-          0o600,
-        );
-        writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
-        fsyncSync(descriptor);
-        this.acquiredInode = fstatSync(descriptor).ino;
-        closeSync(descriptor);
-        return;
-      } catch (error) {
-        if (descriptor !== undefined) closeSync(descriptor);
-        if (!isAlreadyExistsError(error)) throw error;
-      }
+      if (this.publishCompleteRecord()) return;
 
       const existing = readSupervisorLock(this.path);
       const existingStats = existing.stats;
@@ -308,6 +300,42 @@ class OpsWorkerSingleInstanceGuard {
     throw new OpsWorkerSupervisorAlreadyRunningError(
       "Could not acquire the supervisor lock",
     );
+  }
+
+  private publishCompleteRecord(): boolean {
+    const nonce = randomBytes(8).toString("hex");
+    const temporaryPath = `${this.path}.${process.pid}.${nonce}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+      writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+      fsyncSync(descriptor);
+      this.faultInjector?.("after-temp-file-fsync");
+      const inode = fstatSync(descriptor).ino;
+      closeSync(descriptor);
+      descriptor = undefined;
+      try {
+        linkSync(temporaryPath, this.path);
+      } catch (error) {
+        if (isAlreadyExistsError(error)) return false;
+        throw error;
+      }
+      this.acquiredInode = inode;
+      return true;
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+      try {
+        unlinkSync(temporaryPath);
+      } catch (error) {
+        if (!isMissingError(error)) {
+          // A leftover private hard link does not affect canonical lock ownership.
+        }
+      }
+    }
   }
 
   release(): void {
@@ -355,6 +383,11 @@ function appendEvidence(
   task.evidence = [...task.evidence, evidence].slice(
     -OPS_WORKER_LIMITS.maxEvidenceEntries,
   );
+}
+
+export function isOpsWorkerUnresolvedOrphan(task: OpsWorkerTask): boolean {
+  return task.state === "BLOCKED"
+    && task.lastOutcome?.result === "AMBIGUOUS_ORPHAN";
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -411,6 +444,7 @@ export class OpsWorkerSupervisor {
         startedAt,
       },
       options.inspectLockOwner,
+      options.lockFaultInjector,
     );
   }
 
@@ -466,9 +500,12 @@ export class OpsWorkerSupervisor {
         `Pi launch slot is already reserved by task ${this.piLaunchReservation}`,
       );
     }
-    if (this.store.list().some((task) => task.state === "RUNNING")) {
+    if (
+      this.store.list().some((task) =>
+        task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
+    ) {
       throw new OpsWorkerSupervisorStateError(
-        "A supervisor may own at most one active process group",
+        "A supervisor may own at most one active or unresolved process group",
       );
     }
     this.piLaunchReservation = taskId;
@@ -512,7 +549,10 @@ export class OpsWorkerSupervisor {
   selectNextTask(): OpsWorkerScheduledTask | undefined {
     this.assertStarted();
     const tasks = this.store.list();
-    if (tasks.some((task) => task.state === "RUNNING")) return undefined;
+    if (
+      tasks.some((task) =>
+        task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
+    ) return undefined;
     const now = this.now().getTime();
     const candidates = tasks.flatMap((task): OpsWorkerScheduledTask[] => {
       if (task.state === "CHECKING") {
@@ -547,10 +587,11 @@ export class OpsWorkerSupervisor {
     }
     if (
       this.store.list().some((task) =>
-        task.id !== taskId && task.state === "RUNNING")
+        task.id !== taskId
+        && (task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)))
     ) {
       throw new OpsWorkerSupervisorStateError(
-        "A supervisor may own at most one active process group",
+        "A supervisor may own at most one active or unresolved process group",
       );
     }
     return this.transition(taskId, "RUNNING", (task) => {
@@ -810,14 +851,18 @@ export class OpsWorkerSupervisor {
     } catch (error) {
       if (!(error instanceof OpsWorkerDoneCheckExecutionError)) throw error;
       this.assertFreshCheckSnapshot(taskId, baseline);
-      const target = this.infrastructureFailureTarget(this.requireTask(taskId));
+      const currentTask = this.requireTask(taskId);
+      const target = currentTask.rounds.consecutiveInfrastructureFailures + 1
+          >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
+        ? "BLOCKED"
+        : "CHECKING";
       return this.transition(taskId, target, (current, at) => {
         current.activeRun = null;
         this.incrementInfrastructureFailures(current);
-        current.schedule.nextCheckAt = null;
-        current.schedule.nextRunAt = new Date(
-          this.now().getTime() + this.infrastructureRetryMs,
-        ).toISOString();
+        current.schedule.nextCheckAt = target === "CHECKING"
+          ? new Date(this.now().getTime() + this.infrastructureRetryMs).toISOString()
+          : null;
+        current.schedule.nextRunAt = null;
         current.lastOutcome = {
           at,
           kind: "DONE_CHECK",
@@ -847,6 +892,11 @@ export class OpsWorkerSupervisor {
         `Operator retry requires BLOCKED, found ${existing.state}`,
       );
     }
+    if (isOpsWorkerUnresolvedOrphan(existing)) {
+      throw new OpsWorkerSupervisorStateError(
+        "Cannot retry a task while its prior process group remains unresolved",
+      );
+    }
     return this.transition(taskId, "RESUMABLE", (task) => {
       task.rounds.remediation = 0;
       task.rounds.consecutiveInfrastructureFailures = 0;
@@ -865,6 +915,11 @@ export class OpsWorkerSupervisor {
     if (existing.state === "RUNNING") {
       throw new OpsWorkerSupervisorStateError(
         "A running task must stop its proven process group before cancellation",
+      );
+    }
+    if (isOpsWorkerUnresolvedOrphan(existing)) {
+      throw new OpsWorkerSupervisorStateError(
+        "Cannot cancel a task while its prior process group remains unresolved",
       );
     }
     return this.transition(taskId, "CANCELLED", (task, at) => {
@@ -913,7 +968,9 @@ export class OpsWorkerSupervisor {
   }
 
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {
-    const running = this.store.list().filter((task) => task.state === "RUNNING");
+    const running = this.store.list().filter((task) =>
+      task.state === "RUNNING"
+      || (isOpsWorkerUnresolvedOrphan(task) && task.activeRun !== null));
     const reconciled: OpsWorkerStartupReconciliation[] = [];
     for (const task of running) {
       let result: OpsWorkerStartupRunResult = { status: "AMBIGUOUS" };
@@ -947,10 +1004,12 @@ export class OpsWorkerSupervisor {
           result: "CRASH",
         });
       } else {
-        this.blockAmbiguousRun(
-          task.id,
-          result.summary ?? "Persisted process-group ownership is ambiguous",
-        );
+        if (task.state === "RUNNING") {
+          this.blockAmbiguousRun(
+            task.id,
+            result.summary ?? "Persisted process-group ownership is ambiguous",
+          );
+        }
         reconciled.push({
           taskId: task.id,
           state: "BLOCKED",
@@ -963,7 +1022,6 @@ export class OpsWorkerSupervisor {
 
   private blockAmbiguousRun(taskId: string, summary: string): OpsWorkerTask {
     return this.transition(taskId, "BLOCKED", (task, at) => {
-      task.activeRun = null;
       task.session.resume = true;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   readFileSync,
   mkdtempSync,
   rmSync,
@@ -480,7 +481,7 @@ describe("ops worker supervisor", () => {
     assert.equal(exhausted.report.state, "PENDING");
   });
 
-  it("schedules DEFER without budget spend and makes check errors resumable", async (t) => {
+  it("schedules DEFER and retries check errors without rerunning Pi", async (t) => {
     let result: unknown = {
       result: "DEFER",
       summary: "The fixture needs a later observation window.",
@@ -500,12 +501,23 @@ describe("ops worker supervisor", () => {
     harness.setNow(LATER);
     assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
     result = { result: "UNKNOWN", summary: "invalid fixture result" };
-    const resumable = await harness.supervisor.runDoneCheck("task-defer");
-    assert.equal(resumable.state, "RESUMABLE");
-    assert.equal(resumable.rounds.remediation, 0);
-    assert.equal(resumable.rounds.consecutiveInfrastructureFailures, 1);
-    assert.equal(resumable.lastOutcome?.result, "ERROR");
-    assert.ok(resumable.schedule.nextRunAt);
+    const retryingCheck = await harness.supervisor.runDoneCheck("task-defer");
+    assert.equal(retryingCheck.state, "CHECKING");
+    assert.equal(retryingCheck.rounds.remediation, 0);
+    assert.equal(retryingCheck.rounds.consecutiveInfrastructureFailures, 1);
+    assert.equal(retryingCheck.lastOutcome?.result, "ERROR");
+    assert.equal(retryingCheck.schedule.nextRunAt, null);
+    assert.ok(retryingCheck.schedule.nextCheckAt);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    const bounded = makeTask("task-check-error-bound");
+    bounded.rounds.consecutiveInfrastructureFailures = 999;
+    harness.store.create(bounded);
+    harness.supervisor.requestDoneCheck(bounded.id);
+    const blocked = await harness.supervisor.runDoneCheck(bounded.id);
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.rounds.consecutiveInfrastructureFailures, 1_000);
+    assert.equal(blocked.schedule.nextRunAt, null);
   });
 
   it("keeps infrastructure failures resumable without spending remediation budget", async (t) => {
@@ -593,7 +605,7 @@ describe("ops worker supervisor", () => {
         "task-active-b",
         { ...activeRun("fixture-supervisor"), attemptId: "attempt-02" },
       ),
-      /at most one active process group/,
+      /at most one active or unresolved process group/,
     );
   });
 
@@ -710,6 +722,25 @@ describe("ops worker supervisor", () => {
       }),
       /process start token contains unsafe characters/,
     );
+
+    const atomic = makeLockHarness("atomic");
+    const interrupted = new OpsWorkerSupervisor({
+      store: atomic.store,
+      doneChecks: atomic.doneChecks,
+      instanceId: "interrupted-owner",
+      processStartToken: "interrupted-owner-start",
+      lockFaultInjector: () => { throw new Error("synthetic lock publication crash"); },
+    });
+    await assert.rejects(interrupted.start(), /synthetic lock publication crash/);
+    assert.equal(existsSync(join(atomic.directory, "supervisor.lock")), false);
+    const afterInterrupted = new OpsWorkerSupervisor({
+      store: atomic.store,
+      doneChecks: atomic.doneChecks,
+      instanceId: "after-interrupted-owner",
+      processStartToken: "after-interrupted-owner-start",
+    });
+    await afterInterrupted.start();
+    afterInterrupted.close();
   });
 
   it("reconciles a prior RUNNING snapshot on restart", async (t) => {
@@ -801,7 +832,18 @@ describe("ops worker supervisor", () => {
     const blocked = restarted.store.get("task-ambiguous");
     assert.equal(blocked?.state, "BLOCKED");
     assert.equal(blocked?.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.deepEqual(blocked?.activeRun, activeRun("first-supervisor"));
     assert.equal(blocked?.report.state, "PENDING");
+    restarted.store.create(makeTask("task-after-ambiguous"));
+    assert.equal(restarted.supervisor.selectNextTask(), undefined);
+    assert.throws(
+      () => restarted.supervisor.retryBlockedTask("task-ambiguous"),
+      /prior process group remains unresolved/,
+    );
+    assert.throws(
+      () => restarted.supervisor.cancelTask("task-ambiguous", "unsafe cancellation"),
+      /prior process group remains unresolved/,
+    );
 
     const attempted = restarted.supervisor.recordReportAttempt(
       "task-ambiguous",

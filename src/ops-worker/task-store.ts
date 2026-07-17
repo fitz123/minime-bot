@@ -4,6 +4,7 @@ import {
   constants,
   fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -16,7 +17,8 @@ import {
   writeSync,
   type Stats,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
@@ -60,6 +62,7 @@ export interface OpsWorkerJournalEntry {
 }
 
 export type OpsWorkerTaskStoreFaultPoint =
+  | "after-mutation-lock-temp-fsync"
   | "after-temp-file-fsync"
   | "after-snapshot-rename"
   | "after-task-directory-fsync"
@@ -197,74 +200,158 @@ function fsyncDirectory(path: string): void {
 
 interface MutationLockRecord {
   pid: number;
+  processStartToken: string;
   nonce: string;
+}
+
+type MutationLockOwnerInspection =
+  | { status: "ACTIVE"; processStartToken: string }
+  | { status: "STALE" }
+  | { status: "AMBIGUOUS" };
+
+const PROCESS_START_TOKEN_PATTERN = /^sha256:[a-f0-9]{64}$/;
+
+function hashProcessStartToken(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function inspectMutationLockOwner(pid: number): MutationLockOwnerInspection {
+  if (process.platform === "linux") {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = raw.lastIndexOf(")");
+      if (closingParen < 0) throw new Error("missing proc stat command boundary");
+      const parsedPid = Number(raw.slice(0, raw.indexOf(" ")));
+      const fields = raw.slice(closingParen + 2).trim().split(/\s+/);
+      const startTicks = fields[19];
+      if (parsedPid !== pid || !startTicks) throw new Error("invalid proc stat identity");
+      return {
+        status: "ACTIVE",
+        processStartToken: hashProcessStartToken(`linux:${startTicks}`),
+      };
+    } catch {
+      // The process probe below distinguishes a stale PID from ambiguous inspection.
+    }
+  } else {
+    const inspected = spawnSync(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf8", timeout: 1_000, maxBuffer: 64 * 1024 },
+    );
+    if (!inspected.error && inspected.status === 0 && inspected.stdout.trim()) {
+      return {
+        status: "ACTIVE",
+        processStartToken: hashProcessStartToken(
+          `${process.platform}:${inspected.stdout.trim()}`,
+        ),
+      };
+    }
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return { status: "STALE" };
+  }
+  return { status: "AMBIGUOUS" };
+}
+
+function parseMutationLockRecord(raw: string): MutationLockRecord {
+  const value = JSON.parse(raw) as Partial<MutationLockRecord>;
+  if (
+    Object.keys(value).length !== 3
+    || !Number.isSafeInteger(value.pid)
+    || (value.pid as number) < 1
+    || typeof value.processStartToken !== "string"
+    || !PROCESS_START_TOKEN_PATTERN.test(value.processStartToken)
+    || typeof value.nonce !== "string"
+    || !/^[a-f0-9]{32}$/.test(value.nonce)
+  ) throw new Error("invalid mutation lock");
+  return {
+    pid: value.pid as number,
+    processStartToken: value.processStartToken,
+    nonce: value.nonce,
+  };
+}
+
+function readMutationLock(path: string): {
+  stats: Stats;
+  raw: string;
+  record: MutationLockRecord;
+} {
+  const beforeOpen = assertRegularFile(path);
+  if (beforeOpen.size > MAX_MUTATION_LOCK_BYTES) {
+    throw new OpsWorkerTaskStoreBusyError();
+  }
+  const descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW);
+  try {
+    const stats = fstatSync(descriptor);
+    if (
+      !stats.isFile()
+      || stats.ino !== beforeOpen.ino
+      || stats.size > MAX_MUTATION_LOCK_BYTES
+      || (typeof process.getuid === "function" && stats.uid !== process.getuid())
+    ) throw new OpsWorkerTaskStoreBusyError();
+    const raw = readFileSync(descriptor, "utf8");
+    return { stats, raw, record: parseMutationLockRecord(raw) };
+  } catch {
+    throw new OpsWorkerTaskStoreBusyError();
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 class OpsWorkerTaskStoreMutationGuard {
   private readonly path: string;
   private readonly record: MutationLockRecord;
+  private readonly faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined;
   private acquiredInode: bigint | number | undefined;
 
-  constructor(stateDirectory: string) {
+  constructor(
+    stateDirectory: string,
+    faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined,
+  ) {
     this.path = join(stateDirectory, MUTATION_LOCK_FILE_NAME);
+    const owner = inspectMutationLockOwner(process.pid);
+    if (owner.status !== "ACTIVE") {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Cannot prove the task-store mutation lock process identity",
+      );
+    }
     this.record = {
       pid: process.pid,
+      processStartToken: owner.processStartToken,
       nonce: randomBytes(16).toString("hex"),
     };
+    this.faultInjector = faultInjector;
   }
 
   acquire(): void {
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
-      let descriptor: number | undefined;
+      if (this.publishCompleteRecord()) return;
+      let existing: ReturnType<typeof readMutationLock>;
       try {
-        descriptor = openSync(
-          this.path,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
-          0o600,
-        );
-        writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
-        this.acquiredInode = fstatSync(descriptor).ino;
-        closeSync(descriptor);
-        return;
-      } catch (error) {
-        if (descriptor !== undefined) closeSync(descriptor);
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-
-      const stats = assertRegularFile(this.path);
-      if (stats.size > MAX_MUTATION_LOCK_BYTES) {
-        throw new OpsWorkerTaskStoreBusyError();
-      }
-      let record: MutationLockRecord;
-      try {
-        const value = JSON.parse(readRegularFile(
-          this.path,
-          MAX_MUTATION_LOCK_BYTES,
-        )) as Partial<MutationLockRecord>;
-        if (
-          !Number.isSafeInteger(value.pid)
-          || (value.pid as number) < 1
-          || typeof value.nonce !== "string"
-          || !/^[a-f0-9]{32}$/.test(value.nonce)
-        ) throw new Error("invalid mutation lock");
-        record = { pid: value.pid as number, nonce: value.nonce };
+        existing = readMutationLock(this.path);
       } catch {
         throw new OpsWorkerTaskStoreBusyError();
       }
-      try {
-        process.kill(record.pid, 0);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-          const rechecked = assertRegularFile(this.path);
-          if (rechecked.ino !== stats.ino) throw new OpsWorkerTaskStoreBusyError();
-          unlinkSync(this.path);
-          continue;
-        }
-        if ((error as NodeJS.ErrnoException).code !== undefined) {
-          throw new OpsWorkerTaskStoreBusyError();
-        }
+      const owner = inspectMutationLockOwner(existing.record.pid);
+      if (
+        owner.status === "STALE"
+        || (
+          owner.status === "ACTIVE"
+          && owner.processStartToken !== existing.record.processStartToken
+        )
+      ) {
+        const rechecked = readMutationLock(this.path);
+        if (
+          rechecked.stats.ino !== existing.stats.ino
+          || rechecked.raw !== existing.raw
+        ) throw new OpsWorkerTaskStoreBusyError();
+        unlinkSync(this.path);
+        continue;
       }
+      if (owner.status === "AMBIGUOUS") throw new OpsWorkerTaskStoreBusyError();
       const waiter = new Int32Array(new SharedArrayBuffer(4));
       Atomics.wait(waiter, 0, 0, 10);
     }
@@ -273,14 +360,13 @@ class OpsWorkerTaskStoreMutationGuard {
 
   release(): void {
     if (this.acquiredInode === undefined) return;
-    const stats = assertRegularFile(this.path);
-    const value = JSON.parse(readRegularFile(
-      this.path,
-      MAX_MUTATION_LOCK_BYTES,
-    )) as MutationLockRecord;
+    const current = readMutationLock(this.path);
+    const stats = current.stats;
+    const value = current.record;
     if (
       stats.ino !== this.acquiredInode
       || value.pid !== this.record.pid
+      || value.processStartToken !== this.record.processStartToken
       || value.nonce !== this.record.nonce
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
@@ -289,6 +375,41 @@ class OpsWorkerTaskStoreMutationGuard {
     }
     unlinkSync(this.path);
     this.acquiredInode = undefined;
+  }
+
+  private publishCompleteRecord(): boolean {
+    const temporaryPath = `${this.path}.${process.pid}.${this.record.nonce}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+      writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+      fsyncSync(descriptor);
+      this.faultInjector?.("after-mutation-lock-temp-fsync");
+      const inode = fstatSync(descriptor).ino;
+      closeSync(descriptor);
+      descriptor = undefined;
+      try {
+        linkSync(temporaryPath, this.path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw error;
+      }
+      this.acquiredInode = inode;
+      return true;
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+      try {
+        unlinkSync(temporaryPath);
+      } catch (error) {
+        if (!isMissingError(error)) {
+          // A leftover private hard link does not affect canonical lock ownership.
+        }
+      }
+    }
   }
 }
 
@@ -468,7 +589,10 @@ export class OpsWorkerTaskStore {
 
   private withMutationLock<T>(operation: () => T): T {
     this.ensureSafeDirectories();
-    const guard = new OpsWorkerTaskStoreMutationGuard(this.stateDirectory);
+    const guard = new OpsWorkerTaskStoreMutationGuard(
+      this.stateDirectory,
+      this.faultInjector,
+    );
     guard.acquire();
     try {
       return operation();

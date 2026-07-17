@@ -5,7 +5,10 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { OpsWorkerSupervisor } from "./supervisor.js";
+import {
+  isOpsWorkerUnresolvedOrphan,
+  type OpsWorkerSupervisor,
+} from "./supervisor.js";
 import {
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
@@ -85,7 +88,8 @@ export function inspectOpsWorkerStatus(
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     supervisorInstanceId: supervisor.supervisorInstanceId,
     totalTasks: tasks.length,
-    activeProcessGroups: states.RUNNING,
+    activeProcessGroups: tasks.filter((task) =>
+      task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
     states,
   };
 }

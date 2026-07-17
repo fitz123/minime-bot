@@ -11,6 +11,7 @@ import {
   type OpsWorkerPiAttemptDependencies,
 } from "./pi-attempt.js";
 import {
+  isOpsWorkerUnresolvedOrphan,
   OpsWorkerSupervisor,
   type OpsWorkerLockOwnerStatus,
   type OpsWorkerStartupRunResult,
@@ -226,7 +227,8 @@ function taskSummary(tasks: readonly OpsWorkerTask[]): {
     service: "minime-ops-worker",
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     totalTasks: tasks.length,
-    activeProcessGroups: states.RUNNING,
+    activeProcessGroups: tasks.filter((task) =>
+      task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
     states,
   };
 }

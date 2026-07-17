@@ -640,6 +640,33 @@ describe("ops worker durable task store", () => {
     assert.equal(recovered.list().length, 1);
   });
 
+  it("publishes complete mutation locks and reclaims a reused PID identity", (t) => {
+    const directory = testStateDirectory(t);
+    const interrupted = makeStore(t, {
+      directory,
+      faultInjector(point) {
+        if (point === "after-mutation-lock-temp-fsync") {
+          throw new Error("synthetic mutation-lock publication crash");
+        }
+      },
+    });
+    assert.throws(
+      () => interrupted.create(makeTask()),
+      /synthetic mutation-lock publication crash/,
+    );
+    const canonicalLock = join(directory, ".task-store.lock");
+    assert.equal(existsSync(canonicalLock), false);
+
+    writeFileSync(canonicalLock, `${JSON.stringify({
+      pid: process.pid,
+      processStartToken: `sha256:${"0".repeat(64)}`,
+      nonce: "1".repeat(32),
+    })}\n`, { mode: 0o600 });
+    const recovered = makeStore(t, { directory });
+    assert.doesNotThrow(() => recovered.create(makeTask()));
+    assert.equal(existsSync(canonicalLock), false);
+  });
+
   it("rejects traversal identifiers and symlinked state paths", (t) => {
     const store = makeStore(t);
     assert.throws(() => store.get("../outside"), /traversal-safe/);

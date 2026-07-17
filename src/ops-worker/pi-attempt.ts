@@ -450,7 +450,15 @@ export class OpsWorkerPiAttemptRunner {
     }
     const identity = await this.readFreshIdentity(pid, () => exitSettled);
     if (identity.status === "GONE") {
-      const exit = await exitPromise;
+      const exit = await boundedExitWait(exitPromise, this.sleep);
+      if (exit === null) {
+        const blocked = this.supervisor.blockUnverifiedPiLaunch(
+          task.id,
+          `Pi PID ${pid} was reported gone but its child lifecycle did not settle`,
+        );
+        abandonUnverifiedChild(child);
+        return { classification: "CRASH", task: blocked };
+      }
       return {
         classification: "CRASH",
         task: this.supervisor.recordPreLaunchInfrastructureOutcome(
@@ -460,15 +468,16 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
     if (identity.status !== "OWNED" || identity.identity.processGroupId !== pid) {
-      await exitPromise;
+      const blocked = this.supervisor.blockUnverifiedPiLaunch(
+        task.id,
+        `Pi PID ${pid}: ${identity.status === "AMBIGUOUS"
+          ? identity.summary
+          : "fresh process-group identity could not be proven"}`,
+      );
+      abandonUnverifiedChild(child);
       return {
         classification: "CRASH",
-        task: this.supervisor.blockUnverifiedPiLaunch(
-          task.id,
-          identity.status === "AMBIGUOUS"
-            ? identity.summary
-            : "Fresh Pi process-group identity could not be proven",
-        ),
+        task: blocked,
       };
     }
     const activeRun: OpsWorkerActiveRun = {
@@ -653,7 +662,7 @@ export class OpsWorkerPiAttemptRunner {
       );
       return {
         classification,
-        task: await this.supervisor.runDoneCheck(taskId),
+        task: await this.supervisor.runDoneCheck(taskId, this.abortSignal),
       };
     }
     if (classification === "SESSION_CORRUPT") {
@@ -1234,6 +1243,12 @@ function waitForChildExit(
       queueMicrotask(() => finish(child.exitCode, child.signalCode));
     }
   });
+}
+
+function abandonUnverifiedChild(child: ChildProcess): void {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.unref();
 }
 
 function formatAttemptEvidence(exit: OpsWorkerPiExit): string {

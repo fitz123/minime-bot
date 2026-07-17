@@ -16,6 +16,7 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
   OpsWorkerDoneCheckRegistry,
+  type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import {
@@ -148,7 +149,7 @@ interface Harness {
 
 async function makeHarness(
   t: TestContext,
-  check: () => OpsWorkerDoneCheckResult = () => ({
+  check: OpsWorkerDoneCheckDefinition["run"] = () => ({
     result: "PASS",
     summary: "Fixture is deterministically complete.",
   }),
@@ -512,6 +513,32 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
+  it("interrupts the deterministic check after a natural Pi success", async (t) => {
+    let markCheckStarted: (() => void) | undefined;
+    const checkStarted = new Promise<void>((resolveStarted) => {
+      markCheckStarted = resolveStarted;
+    });
+    const harness = await makeHarness(t, () => {
+      markCheckStarted?.();
+      return new Promise<OpsWorkerDoneCheckResult>(() => undefined);
+    });
+    harness.store.create(makeTask("shutdown-success-check"));
+    harness.setScenario("success");
+    const controller = new AbortController();
+    const running = harness.runner({ abortSignal: controller.signal })
+      .runAttempt("shutdown-success-check");
+    await checkStarted;
+
+    controller.abort();
+    const result = await running;
+
+    assert.equal(result.state, "CHECKING");
+    assert.equal(result.lastOutcome?.result, "ERROR");
+    assert.match(result.lastOutcome?.summary ?? "", /ABORTED/);
+    assert.equal(result.schedule.nextRunAt, null);
+    assert.ok(result.schedule.nextCheckAt);
+  });
+
   it("fails fresh launches closed before persisting RUNNING", async (t) => {
     const harness = await makeHarness(t);
 
@@ -567,9 +594,12 @@ describe("ops worker Pi standard-session attempts", () => {
         },
       })],
     ] as const) {
-      harness.store.create(makeTask(taskId));
+      const isolated = await makeHarness(t);
+      isolated.setScenario("wait");
+      isolated.store.create(makeTask(taskId));
       let signals = 0;
-      const blocked = await harness.runner({
+      const startedAt = Date.now();
+      const blocked = await isolated.runner({
         dependencies: {
           readProcessIdentity: inspection,
           signalProcessGroup: () => { signals += 1; },
@@ -578,6 +608,9 @@ describe("ops worker Pi standard-session attempts", () => {
       assert.equal(blocked.state, "BLOCKED");
       assert.equal(blocked.activeRun, null);
       assert.equal(signals, 0);
+      assert.ok(Date.now() - startedAt < 2_500);
+      isolated.store.create(makeTask(`${taskId}-next`));
+      assert.equal(isolated.supervisor.selectNextTask(), undefined);
     }
   });
 
