@@ -11,6 +11,7 @@ import {
   createBoundedCodexSearchSignal,
   executeCodexWebSearch,
   formatCodexWebSearchWarn,
+  MAX_CODEX_WEB_SEARCH_QUERY_CHARS,
   MAX_CODEX_WEB_SEARCH_TEXT_CHARS,
   parseCodexWebSearchSse,
   resolveCodexWebSearchOAuth,
@@ -342,6 +343,13 @@ describe("Codex web search streamed response parsing", () => {
         }),
         classification: "rate_limit",
       },
+      {
+        body: sseEvent({ type: "response.output_text.delta", delta: "partial" }) + sseEvent({
+          type: "response.incomplete",
+          response: { id: "resp-incomplete", status: "incomplete", incomplete_details: { reason: "max_output_tokens" } },
+        }),
+        classification: "unknown",
+      },
     ];
     const { context } = makeContext();
     for (const entry of cases) {
@@ -431,24 +439,102 @@ describe("Codex web search cleanup and bounded failures", () => {
     assert.equal(cancelled, true);
   });
 
-  it("blocks private query content before auth or fetch", async () => {
+  it("bounds OAuth resolution before fetch and honors parent cancellation", async () => {
+    for (const mode of ["timeout", "parent"] as const) {
+      const { context } = makeContext();
+      context.modelRegistry.getApiKeyAndHeaders = async () => new Promise(() => {});
+      const parent = new AbortController();
+      let fetchCalls = 0;
+      const pending = executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          throw new Error("must not fetch");
+        }) as typeof fetch,
+      }, parent.signal);
+      if (mode === "parent") setImmediate(() => parent.abort(new Error("cancelled by caller")));
+      const result = await pending;
+      assert.equal(result.failure?.classification, mode === "timeout" ? "timeout" : "transport");
+      assert.equal(fetchCalls, 0);
+    }
+  });
+
+  it("cancels live SSE readers on timeout and parent cancellation", async () => {
+    for (const mode of ["timeout", "parent"] as const) {
+      const { context } = makeContext();
+      const parent = new AbortController();
+      let cancelled = false;
+      const response = new Response(new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+      }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      const pending = executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
+        fetchImpl: (async () => response) as typeof fetch,
+      }, parent.signal);
+      if (mode === "parent") setImmediate(() => parent.abort(new Error("cancelled by caller")));
+      const result = await pending;
+      assert.equal(result.failure?.classification, mode === "timeout" ? "timeout" : "transport");
+      assert.equal(cancelled, true);
+    }
+  });
+
+  it("covers every private-query branch and length boundary before auth or fetch", async () => {
+    const commonSecretPrefix = ["gh", "p_"].join("");
     const blocked = [
-      "token=<redacted>",
+      "a".repeat(MAX_CODEX_WEB_SEARCH_QUERY_CHARS + 1),
+      "line one\nline two",
+      "```private code```",
+      "-----BEGIN PRIVATE KEY-----",
+      "Bearer abcdefghijklmnopqrstuvwxyz",
+      `${commonSecretPrefix}${"a".repeat(20)}`,
+      `eyJ${"a".repeat(12)}.${"b".repeat(12)}.${"c".repeat(8)}`,
+      "password=abcd",
       "read /private/project/file.ts",
       "inspect config.local.yaml",
-      "line one\nline two",
-      "Bearer abcdefghijklmnopqrstuvwxyz",
+      `search ${"Aa0".repeat(11)}`,
     ];
-    for (const query of blocked) assert.ok(validateCodexWebSearchQuery(query), query);
+    const allowed = [
+      "a".repeat(MAX_CODEX_WEB_SEARCH_QUERY_CHARS),
+      "how bearer auth works",
+      "public configuration documentation",
+      "token economy in transformers",
+    ];
+    for (const query of blocked) {
+      assert.ok(validateCodexWebSearchQuery(query), query.slice(0, 80));
+      const { context, calls } = makeContext();
+      let fetchCalls = 0;
+      const result = await executeCodexWebSearch({ query }, {
+        context,
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          throw new Error("must not fetch");
+        }) as typeof fetch,
+      });
+      assert.equal(result.ok, false);
+      assert.match(result.text, /blocked/);
+      assert.equal(calls.getAuth, 0);
+      assert.equal(fetchCalls, 0);
+    }
+    for (const query of allowed) assert.equal(validateCodexWebSearchQuery(query), undefined, query.slice(0, 80));
 
-    const { context, calls } = makeContext();
-    const result = await executeCodexWebSearch({ query: blocked[0] }, {
-      context,
-      fetchImpl: (async () => { throw new Error("must not fetch"); }) as typeof fetch,
-    });
-    assert.equal(result.ok, false);
-    assert.match(result.text, /blocked/);
-    assert.equal(calls.getAuth, 0);
+    for (const query of ["", "   ", 42]) {
+      const { context, calls } = makeContext();
+      let fetchCalls = 0;
+      const result = await executeCodexWebSearch({ query } as never, {
+        context,
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          throw new Error("must not fetch");
+        }) as typeof fetch,
+      });
+      assert.equal(result.failure?.classification, "schema");
+      assert.equal(calls.getAuth, 0);
+      assert.equal(fetchCalls, 0);
+    }
   });
 
   it("formats bounded warnings without queries, bodies, or credentials", () => {

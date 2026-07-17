@@ -243,6 +243,11 @@ function assertPackFiles(files: readonly string[]): void {
   const retiredKnowledgeWrapper = ["recovery", "knowledge", "tools"].join("-");
   assert.ok(!files.some((file) => file.includes(retiredOutputExtension)), "recovery output extension should not be packed");
   assert.ok(!files.some((file) => file.includes(retiredKnowledgeWrapper)), "recovery-only knowledge wrapper should not be packed");
+  const retiredProviderMarker = ["tavi", "ly"].join("");
+  assert.ok(
+    !files.some((file) => file.toLowerCase().includes(retiredProviderMarker)),
+    "retired provider artifacts should not be packed",
+  );
   assert.ok(!files.some((file) => file.startsWith("src/")), "source TS should not be packed");
   assert.ok(!files.some((file) => file.startsWith(".claude/")), "source extension wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");

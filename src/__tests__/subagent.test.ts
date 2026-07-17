@@ -133,11 +133,14 @@ describe("subagent: buildSubagentSpawnArgs", () => {
 
 describe("subagent: bundled agent tool allowlists", () => {
   it("keeps bundled search roles on web_search only and preserves their existing Bash boundary", () => {
-    for (const agentName of ["scout", "reviewer", "planner"]) {
+    const expectedTools = new Map([
+      ["planner", ["read", "grep", "find", "ls", "web_search"]],
+      ["reviewer", ["read", "grep", "find", "ls", "bash", "web_search"]],
+      ["scout", ["read", "grep", "find", "ls", "bash", "web_search"]],
+    ]);
+    for (const [agentName, expected] of expectedTools) {
       const tools = readBundledAgentTools(agentName);
-      assert.ok(tools, `${agentName} must have an explicit tools allowlist`);
-      assert.equal(tools.filter((tool) => tool === "web_search").length, 1, `${agentName} must include web_search once`);
-      assert.equal(tools.includes("bash"), agentName !== "planner", `${agentName} Bash boundary changed`);
+      assert.deepEqual(tools, expected, `${agentName} must retain its exact read-only search allowlist`);
       const args = buildSubagentSpawnArgs({ tools }, `task for ${agentName}`);
       assert.equal(args[args.indexOf("--tools") + 1], tools.join(","));
     }

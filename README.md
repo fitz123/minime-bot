@@ -153,6 +153,21 @@ reported by the package quota sampler and `/status`; there is no separate
 provider credit monitor, incident outbox, billing path, or provider-specific
 Prometheus metric family for web search.
 
+### Cron delivery targets
+
+Each cron may set `deliveryChatId` and, when needed, `deliveryThreadId` in its
+cron definition. When `deliveryChatId` is omitted, the runner uses the top-level
+`defaultDeliveryChatId`; `defaultDeliveryThreadId` is inherited only when the
+cron targets that default chat. A cron-level thread always takes precedence.
+Set top-level `adminChatId` to receive a failure notification when delivery to
+the cron target fails.
+
+```yaml
+adminChatId: <admin-chat-id>
+defaultDeliveryChatId: <default-chat-id>
+defaultDeliveryThreadId: <positive-topic-id>
+```
+
 Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.

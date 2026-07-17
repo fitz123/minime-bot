@@ -221,13 +221,27 @@ function classifiedFailure(
 /** Resolve only the active model's refreshed, stored OAuth credential. */
 export async function resolveCodexWebSearchOAuth(
   context: CodexWebSearchExecutionContext,
+  signal?: AbortSignal,
 ): Promise<ResolvedCodexOAuth | undefined> {
   const model = context.model;
   if (!model || model.provider !== CODEX_WEB_SEARCH_PROVIDER || !context.modelRegistry.isUsingOAuth(model)) {
     return undefined;
   }
 
-  const auth = await context.modelRegistry.getApiKeyAndHeaders(model);
+  if (signal?.aborted) throw signal.reason ?? new Error("Codex OAuth resolution aborted");
+  const authPromise = context.modelRegistry.getApiKeyAndHeaders(model);
+  let abortAuth: (() => void) | undefined;
+  const auth = signal
+    ? await Promise.race([
+      authPromise,
+      new Promise<never>((_resolve, reject) => {
+        abortAuth = () => reject(signal.reason ?? new Error("Codex OAuth resolution aborted"));
+        signal.addEventListener("abort", abortAuth, { once: true });
+      }),
+    ]).finally(() => {
+      if (abortAuth) signal.removeEventListener("abort", abortAuth);
+    })
+    : await authPromise;
   if (!auth.ok || !auth.apiKey) return undefined;
 
   const stored = context.modelRegistry.authStorage.get(CODEX_WEB_SEARCH_PROVIDER);
@@ -556,6 +570,9 @@ export async function parseCodexWebSearchSse(
       const terminal = asRecord(event.response);
       if (!terminal) throw new CodexSearchSchemaError("missing terminal response");
       const status = terminal.status;
+      if (event.type === "response.incomplete" || status === "incomplete") {
+        throw new CodexSearchProviderError("unknown");
+      }
       if (status === "failed" || status === "cancelled") {
         throw new CodexSearchProviderError(classifyProviderCode(asRecord(terminal.error)?.code));
       }
@@ -688,21 +705,22 @@ export async function executeCodexWebSearch(
     );
   }
 
-  let auth: ResolvedCodexOAuth | undefined;
-  try {
-    auth = await resolveCodexWebSearchOAuth(deps.context);
-  } catch {
-    // Registry/provider diagnostics can contain credential details; keep them private.
-  }
-  if (!auth) {
-    const result = classifiedFailure("auth");
-    deps.warn?.({ classification: "auth", detail: "request-failed" });
-    return result;
-  }
-
-  const request = buildCodexWebSearchRequest(auth, { ...args, query });
   const bounded = createBoundedCodexSearchSignal(signal, deps.requestTimeoutMs ?? CODEX_WEB_SEARCH_TIMEOUT_MS);
   try {
+    let auth: ResolvedCodexOAuth | undefined;
+    try {
+      auth = await resolveCodexWebSearchOAuth(deps.context, bounded.signal);
+    } catch (error) {
+      if (bounded.signal.aborted) throw error;
+      // Registry/provider diagnostics can contain credential details; keep them private.
+    }
+    if (!auth) {
+      const result = classifiedFailure("auth");
+      deps.warn?.({ classification: "auth", detail: "request-failed" });
+      return result;
+    }
+
+    const request = buildCodexWebSearchRequest(auth, { ...args, query });
     const response = await (deps.fetchImpl ?? fetch)(request.url, {
       method: request.method,
       headers: request.headers,
