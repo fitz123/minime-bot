@@ -6,6 +6,7 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 const [scenario, ...args] = process.argv.slice(2);
@@ -78,6 +79,9 @@ switch (scenario) {
   case "success":
     process.stdout.write("fake Pi success claim\n");
     break;
+  case "success-diagnostic":
+    process.stdout.write("Investigated a prior HTTP 429 and maximum context length message successfully.\n");
+    break;
   case "crash":
     process.stderr.write("fake Pi crashed\n");
     process.exitCode = 2;
@@ -101,6 +105,18 @@ switch (scenario) {
   case "wait":
     setInterval(() => undefined, 1_000);
     break;
+  case "leader-exits-child-survives": {
+    const descendant = spawn(
+      process.execPath,
+      ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+      { stdio: "ignore" },
+    );
+    setTimeout(() => {
+      process.stdout.write(`descendant-ready:${String(descendant.pid)}\n`);
+    }, 50);
+    setInterval(() => undefined, 1_000);
+    break;
+  }
   default:
     process.stderr.write(`unknown fake Pi scenario ${String(scenario)}\n`);
     process.exitCode = 64;

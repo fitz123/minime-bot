@@ -233,9 +233,10 @@ function taskSummary(tasks: readonly OpsWorkerTask[]): {
 
 function defaultProcessStartToken(): string {
   const inspected = readOpsWorkerProcessIdentity(process.pid);
-  return inspected.status === "OWNED"
-    ? inspected.identity.processStartToken
-    : `unverified-${process.pid}`;
+  if (inspected.status !== "OWNED") {
+    throw new Error("Cannot start ops-worker without a proven supervisor process identity");
+  }
+  return inspected.identity.processStartToken;
 }
 
 function defaultInspectLockOwner(
@@ -253,13 +254,38 @@ function dependencies(options: RunOpsWorkerCliOptions): Required<
   Pick<OpsWorkerCliDependencies, "taskRegistry" | "doneChecks" | "now" | "randomId">
 > & OpsWorkerCliDependencies {
   const supplied = options.dependencies ?? {};
+  const doneChecks = supplied.doneChecks ?? EMPTY_OPS_WORKER_DONE_CHECK_REGISTRY;
+  const taskRegistry = supplied.taskRegistry ?? {
+    ...EMPTY_OPS_WORKER_TASK_CONTRACT_REGISTRY,
+    doneChecks: doneChecks.contracts,
+  };
+  assertCompatibleDoneCheckRegistries(taskRegistry, doneChecks);
   return {
     ...supplied,
-    taskRegistry: supplied.taskRegistry ?? EMPTY_OPS_WORKER_TASK_CONTRACT_REGISTRY,
-    doneChecks: supplied.doneChecks ?? EMPTY_OPS_WORKER_DONE_CHECK_REGISTRY,
+    taskRegistry,
+    doneChecks,
     now: supplied.now ?? (() => new Date()),
     randomId: supplied.randomId ?? randomUUID,
   };
+}
+
+function assertCompatibleDoneCheckRegistries(
+  taskRegistry: OpsWorkerTaskContractRegistry,
+  doneChecks: OpsWorkerDoneCheckRegistry,
+): void {
+  const contractNames = Object.keys(taskRegistry.doneChecks).sort();
+  const executionNames = Object.keys(doneChecks.contracts).sort();
+  if (
+    contractNames.length !== executionNames.length
+    || contractNames.some((name, index) => name !== executionNames[index])
+    || contractNames.some((name) =>
+      taskRegistry.doneChecks[name].validateParams
+        !== doneChecks.contracts[name].validateParams)
+  ) {
+    throw new TypeError(
+      "Ops-worker persistence and execution done-check registries must match exactly",
+    );
+  }
 }
 
 function createStore(
@@ -464,6 +490,8 @@ async function runStart(
     const runner = new OpsWorkerPiAttemptRunner({
       supervisor,
       workspaceCwd: workspace,
+      authorizationProfiles: deps.taskRegistry.authorizationProfiles,
+      abortSignal: signal,
       dependencies: deps.piAttemptDependencies,
     });
     writeLine(

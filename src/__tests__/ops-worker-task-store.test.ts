@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -15,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import {
   OPS_WORKER_LIMITS,
@@ -34,6 +36,9 @@ import {
 
 const NOW = "2026-07-17T12:00:00.000Z";
 const LATER = "2026-07-17T12:01:00.000Z";
+const STORE_CREATE_FIXTURE = fileURLToPath(
+  new URL("./fixtures/ops-worker-store-create.ts", import.meta.url),
+);
 
 function exactObject(
   value: unknown,
@@ -54,10 +59,12 @@ const registry: OpsWorkerTaskContractRegistry = {
     "operator.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
+      tools: ["read", "grep", "find", "ls"],
     },
     "issue.full-cycle.v1": {
       sourceKinds: ["authorized-issue"],
       scope: ["repository-read", "repository-write", "pull-request", "issue-lifecycle"],
+      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
   },
   doneChecks: {
@@ -314,6 +321,91 @@ describe("ops worker task contract", () => {
     );
   });
 
+  it("enforces every done-check parameter boundary before and after registered validation", () => {
+    const parseParams = (
+      params: unknown,
+      selectedRegistry = registry,
+    ): OpsWorkerTask => {
+      const task = makeTask();
+      task.doneCheck = { name: "lax-fixture", params: params as JsonObject };
+      return parseOpsWorkerTask(task, selectedRegistry);
+    };
+    const nested = (depth: number): JsonObject => {
+      let value: JsonObject = { leaf: true };
+      for (let index = 0; index < depth; index += 1) value = { nested: value };
+      return value;
+    };
+    const itemObject = (count: number): JsonObject => Object.fromEntries(
+      Array.from({ length: count }, (_unused, index) => [`value${index}`, index]),
+    ) as JsonObject;
+    const sizedObject = (bytes: number): JsonObject => {
+      const result: JsonObject = { a: "", b: "", c: "", d: "", e: "" };
+      let remaining = bytes - Buffer.byteLength(JSON.stringify(result), "utf8");
+      for (const key of Object.keys(result)) {
+        const length = Math.min(
+          OPS_WORKER_LIMITS.maxDoneCheckParamStringBytes,
+          remaining,
+        );
+        result[key] = "x".repeat(length);
+        remaining -= length;
+      }
+      assert.equal(remaining, 0);
+      assert.equal(Buffer.byteLength(JSON.stringify(result), "utf8"), bytes);
+      return result;
+    };
+
+    assert.doesNotThrow(() => parseParams(nested(
+      OPS_WORKER_LIMITS.maxDoneCheckParamDepth - 1,
+    )));
+    assert.doesNotThrow(() => parseParams(itemObject(
+      OPS_WORKER_LIMITS.maxDoneCheckParamItems - 1,
+    )));
+    assert.doesNotThrow(() => parseParams({
+      values: Array(OPS_WORKER_LIMITS.maxDoneCheckParamArrayLength).fill(null),
+    }));
+    assert.doesNotThrow(() => parseParams({
+      text: "é".repeat(OPS_WORKER_LIMITS.maxDoneCheckParamStringBytes / 2),
+    }));
+    assert.doesNotThrow(() => parseParams(sizedObject(
+      OPS_WORKER_LIMITS.maxDoneCheckParamsBytes,
+    )));
+
+    for (const [params, message] of [
+      [nested(OPS_WORKER_LIMITS.maxDoneCheckParamDepth), /nested too deeply/],
+      [itemObject(OPS_WORKER_LIMITS.maxDoneCheckParamItems), /too many values/],
+      [{ values: Array(OPS_WORKER_LIMITS.maxDoneCheckParamArrayLength + 1).fill(null) }, /array is too large/],
+      [{ text: "é".repeat(OPS_WORKER_LIMITS.maxDoneCheckParamStringBytes / 2 + 1) }, /string value is too large/],
+      [sizedObject(OPS_WORKER_LIMITS.maxDoneCheckParamsBytes + 1), /must be at most 8192/],
+      [{ value: Number.NaN }, /number must be finite/],
+      [{ "not.safe": true }, /unsafe parameter field name/],
+    ] as const) {
+      assert.throws(() => parseParams(params), message);
+    }
+
+    const accessorParams: Record<string, unknown> = {};
+    Object.defineProperty(accessorParams, "value", {
+      enumerable: true,
+      get: () => true,
+    });
+    assert.throws(() => parseParams(accessorParams), /accessor fields are not allowed/);
+
+    const unsafeValidatorRegistry: OpsWorkerTaskContractRegistry = {
+      ...registry,
+      doneChecks: {
+        ...registry.doneChecks,
+        "lax-fixture": {
+          validateParams(): JsonObject {
+            return { command: "validator-introduced" } as JsonObject;
+          },
+        },
+      },
+    };
+    assert.throws(
+      () => parseParams({}, unsafeValidatorRegistry),
+      /cannot select commands, executables, URLs, or authorization/,
+    );
+  });
+
   it("requires process-group proof only for RUNNING tasks", () => {
     const missingIdentity = clone(makeTask());
     missingIdentity.state = "RUNNING";
@@ -499,6 +591,53 @@ describe("ops worker durable task store", () => {
     store.replace(completed, { event: "TRANSITION" });
     assert.doesNotThrow(() => store.create(duplicate));
     assert.equal(store.list().length, 2);
+  });
+
+  it("serializes concurrent cross-process correlation creation", async (t) => {
+    const root = testStateDirectory(t);
+    const directory = join(root, "state");
+    const readyPath = join(root, "first-ready");
+    const releasePath = join(root, "release-first");
+    const runFixture = (
+      taskId: string,
+      barrier = false,
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> => {
+      const child = spawn(process.execPath, [
+        "--import",
+        "tsx",
+        STORE_CREATE_FIXTURE,
+        directory,
+        taskId,
+        "operator:shared:concurrent",
+        ...(barrier ? [readyPath, releasePath] : []),
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      return new Promise((resolveChild) => {
+        child.once("close", (code) => resolveChild({ code, stdout, stderr }));
+      });
+    };
+
+    const first = runFixture("concurrent-a", true);
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(readyPath)) {
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for first store writer");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    const second = runFixture("concurrent-b");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    writeFileSync(releasePath, "release\n", "utf8");
+    const results = await Promise.all([first, second]);
+
+    assert.deepEqual(results.map((result) => result.code).sort(), [0, 1]);
+    assert.equal(
+      results.some((result) => /OpsWorkerDuplicateCorrelationError/.test(result.stderr)),
+      true,
+    );
+    const recovered = new OpsWorkerTaskStore(directory, { registry });
+    assert.equal(recovered.list().length, 1);
   });
 
   it("rejects traversal identifiers and symlinked state paths", (t) => {

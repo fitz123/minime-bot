@@ -49,6 +49,19 @@ export const OPS_WORKER_AUTHORIZATION_SCOPES = [
 export type OpsWorkerAuthorizationScope =
   (typeof OPS_WORKER_AUTHORIZATION_SCOPES)[number];
 
+export const OPS_WORKER_AUTHORIZATION_TOOLS = [
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+] as const;
+
+export type OpsWorkerAuthorizationTool =
+  (typeof OPS_WORKER_AUTHORIZATION_TOOLS)[number];
+
 export const OPS_WORKER_EVIDENCE_KINDS = [
   "alert",
   "operator",
@@ -202,6 +215,8 @@ export interface OpsWorkerTemplateContract {
 export interface OpsWorkerAuthorizationProfileContract {
   sourceKinds: readonly OpsWorkerSourceKind[];
   scope: readonly OpsWorkerAuthorizationScope[];
+  /** Fixed Pi tool allowlist selected by trusted package code, never task data. */
+  tools: readonly OpsWorkerAuthorizationTool[];
 }
 
 export interface OpsWorkerDoneCheckContract {
@@ -231,6 +246,8 @@ export const OPS_WORKER_LIMITS = {
   maxDoneCheckParamsBytes: 8 * 1024,
   maxDoneCheckParamDepth: 6,
   maxDoneCheckParamItems: 128,
+  maxDoneCheckParamArrayLength: 64,
+  maxDoneCheckParamStringBytes: 2 * 1024,
 } as const;
 
 const TASK_KEYS = [
@@ -508,7 +525,11 @@ function parseSafeJson(
     return fail(path, "is nested too deeply");
   }
   if (value === null || typeof value === "boolean" || typeof value === "string") {
-    if (typeof value === "string" && Buffer.byteLength(value, "utf8") > 2 * 1024) {
+    if (
+      typeof value === "string"
+      && Buffer.byteLength(value, "utf8")
+        > OPS_WORKER_LIMITS.maxDoneCheckParamStringBytes
+    ) {
       return fail(path, "string value is too large");
     }
     return value;
@@ -520,7 +541,7 @@ function parseSafeJson(
     return value;
   }
   if (Array.isArray(value)) {
-    if (value.length > 64) {
+    if (value.length > OPS_WORKER_LIMITS.maxDoneCheckParamArrayLength) {
       return fail(path, "array is too large");
     }
     return value.map((item, index) => parseSafeJson(item, `${path}[${index}]`, depth + 1, budget));
@@ -598,6 +619,22 @@ function parseAuthorization(
   }
   if (!contract.sourceKinds.includes(sourceKind)) {
     fail("task.authorization.profile", `profile is not registered for source kind ${sourceKind}`);
+  }
+  if (!Array.isArray(contract.tools) || contract.tools.length === 0) {
+    fail("task.authorization.profile", "registered profile must provide a fixed tool allowlist");
+  }
+  const tools = contract.tools.map((tool, index) =>
+    expectEnum(tool, OPS_WORKER_AUTHORIZATION_TOOLS, `registry.authorization.tools[${index}]`));
+  if (new Set(tools).size !== tools.length) {
+    fail("task.authorization.profile", "registered profile tool allowlist must not contain duplicates");
+  }
+  const readOnlyScope = contract.scope.every((scope) =>
+    scope === "inspect" || scope === "repository-read");
+  if (readOnlyScope && tools.some((tool) => tool === "bash" || tool === "edit" || tool === "write")) {
+    fail(
+      "task.authorization.profile",
+      "read-only profiles cannot enable mutation or shell tools",
+    );
   }
   if (!Array.isArray(authorization.scope)) {
     fail("task.authorization.scope", "must be an array");

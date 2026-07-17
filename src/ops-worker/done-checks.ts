@@ -67,6 +67,7 @@ export type OpsWorkerDoneCheckErrorCode =
   | "UNKNOWN_CHECK"
   | "INVALID_PARAMS"
   | "TIMEOUT"
+  | "ABORTED"
   | "EXECUTION_ERROR"
   | "INVALID_RESULT";
 
@@ -264,6 +265,7 @@ export class OpsWorkerDoneCheckRegistry {
   async run(
     check: OpsWorkerDoneCheck,
     context: Omit<OpsWorkerDoneCheckContext, "signal">,
+    externalSignal?: AbortSignal,
   ): Promise<OpsWorkerDoneCheckResult> {
     const definition = hasOwn(this.definitions, check.name)
       ? this.definitions[check.name]
@@ -287,6 +289,7 @@ export class OpsWorkerDoneCheckRegistry {
 
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
+    let removeExternalAbort: (() => void) | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         controller.abort();
@@ -296,6 +299,21 @@ export class OpsWorkerDoneCheckRegistry {
         ));
       }, definition.timeoutMs);
     });
+    const externalAbort = new Promise<never>((_resolve, reject) => {
+      if (!externalSignal) return;
+      const abort = (): void => {
+        controller.abort();
+        reject(new OpsWorkerDoneCheckExecutionError(
+          "ABORTED",
+          `Done check ${JSON.stringify(check.name)} was interrupted by worker shutdown`,
+        ));
+      };
+      if (externalSignal.aborted) abort();
+      else {
+        externalSignal.addEventListener("abort", abort, { once: true });
+        removeExternalAbort = () => externalSignal.removeEventListener("abort", abort);
+      }
+    });
     let rawResult: unknown;
     try {
       const execution = Promise.resolve().then(() =>
@@ -303,7 +321,7 @@ export class OpsWorkerDoneCheckRegistry {
           ...context,
           signal: controller.signal,
         }));
-      rawResult = await Promise.race([execution, timeout]);
+      rawResult = await Promise.race([execution, timeout, externalAbort]);
     } catch (error) {
       if (error instanceof OpsWorkerDoneCheckExecutionError) throw error;
       throw new OpsWorkerDoneCheckExecutionError(
@@ -312,8 +330,17 @@ export class OpsWorkerDoneCheckRegistry {
       );
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      removeExternalAbort?.();
     }
-    return parseResult(rawResult, context.checkedAt);
+    try {
+      return parseResult(rawResult, context.checkedAt);
+    } catch (error) {
+      if (error instanceof OpsWorkerDoneCheckExecutionError) throw error;
+      throw new OpsWorkerDoneCheckExecutionError(
+        "INVALID_RESULT",
+        `Done check ${JSON.stringify(check.name)} returned an unserializable result`,
+      );
+    }
   }
 }
 

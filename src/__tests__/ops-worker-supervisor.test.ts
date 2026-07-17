@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, type TestContext } from "node:test";
@@ -19,7 +25,6 @@ import {
   OpsWorkerSupervisor,
   OpsWorkerSupervisorAlreadyRunningError,
   OpsWorkerSupervisorStateError,
-  assertOpsWorkerStateTransition,
 } from "../ops-worker/supervisor.js";
 import {
   type JsonObject,
@@ -64,6 +69,7 @@ function taskRegistry(
           "authorized-issue",
         ],
         scope: ["inspect"],
+        tools: ["read", "grep", "find", "ls"],
       },
     },
     doneChecks: checks.contracts,
@@ -307,6 +313,57 @@ describe("ops worker done-check registry", () => {
         error instanceof OpsWorkerDoneCheckExecutionError
         && error.code === "INVALID_RESULT",
     );
+
+    const unserializableRegistry = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        timeoutMs: 100,
+        validateParams: validateFixtureParams,
+        run: () => ({
+          result: "DEFER",
+          summary: "wait",
+          nextCheckAt: 1n,
+        }),
+      },
+    });
+    await assert.rejects(
+      unserializableRegistry.run(
+        { name: "fixture-check", params: { sampleCount: 1 } },
+        { taskId: "task-a", checkedAt: NOW },
+      ),
+      (error: unknown) =>
+        error instanceof OpsWorkerDoneCheckExecutionError
+        && error.code === "INVALID_RESULT",
+    );
+  });
+
+  it("aborts an active check when worker shutdown is requested", async () => {
+    let observedAbort = false;
+    const registry = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        timeoutMs: 10_000,
+        validateParams: validateFixtureParams,
+        run: (_params, context) => new Promise(() => {
+          context.signal.addEventListener("abort", () => {
+            observedAbort = true;
+          });
+        }),
+      },
+    });
+    const controller = new AbortController();
+    const pending = registry.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
+      controller.signal,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(
+      pending,
+      (error: unknown) =>
+        error instanceof OpsWorkerDoneCheckExecutionError
+        && error.code === "ABORTED",
+    );
+    assert.equal(observedAbort, true);
   });
 });
 
@@ -338,14 +395,6 @@ describe("ops worker supervisor", () => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("task-pass"));
 
-    assert.throws(
-      () => assertOpsWorkerStateTransition("QUEUED", "DONE"),
-      OpsWorkerSupervisorStateError,
-    );
-    assert.throws(
-      () => assertOpsWorkerStateTransition("CHECKING", "DONE"),
-      /reserved for a fresh deterministic done-check PASS/,
-    );
     assert.throws(
       () => harness.supervisor.recordPiSuccessClaim("task-pass", "claim"),
       /requires RUNNING/,
@@ -478,6 +527,32 @@ describe("ops worker supervisor", () => {
     assert.equal(task.activeRun, null);
   });
 
+  it("blocks at the bounded infrastructure-failure limit and retries only BLOCKED tasks", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-infrastructure-bound");
+    task.rounds.consecutiveInfrastructureFailures = 999;
+    harness.store.create(task);
+    assert.throws(
+      () => harness.supervisor.retryBlockedTask(task.id),
+      /Operator retry requires BLOCKED, found QUEUED/,
+    );
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+
+    const blocked = harness.supervisor.recordResumableInfrastructureOutcome(
+      task.id,
+      "NETWORK",
+      "Persistent synthetic network failure",
+    );
+
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.rounds.consecutiveInfrastructureFailures, 1_000);
+    assert.equal(blocked.rounds.remediation, 0);
+    assert.equal(blocked.report.state, "PENDING");
+    const retried = harness.supervisor.retryBlockedTask(task.id);
+    assert.equal(retried.state, "RESUMABLE");
+    assert.equal(retried.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
   it("enforces one supervisor instance and at most one active process group", async (t) => {
     const harness = await makeHarness(t);
     const secondStore = new OpsWorkerTaskStore(harness.directory, {
@@ -522,6 +597,121 @@ describe("ops worker supervisor", () => {
     );
   });
 
+  it("reclaims only a proven stale, unchanged supervisor lock", async (t) => {
+    const makeLockHarness = (suffix: string): {
+      directory: string;
+      store: OpsWorkerTaskStore;
+      doneChecks: OpsWorkerDoneCheckRegistry;
+    } => {
+      const directory = mkdtempSync(join(tmpdir(), `minime-ops-worker-lock-${suffix}-`));
+      t.after(() => rmSync(directory, { recursive: true, force: true }));
+      const doneChecks = new OpsWorkerDoneCheckRegistry({
+        "fixture-check": {
+          timeoutMs: 100,
+          validateParams: validateFixtureParams,
+          run: () => ({ result: "PASS", summary: "fixture passed" }),
+        },
+      });
+      return {
+        directory,
+        store: new OpsWorkerTaskStore(directory, { registry: taskRegistry(doneChecks) }),
+        doneChecks,
+      };
+    };
+    const lockRecord = (instanceId: string) => ({
+      schemaVersion: 1,
+      instanceId,
+      pid: 999_999,
+      processStartToken: `${instanceId}-start`,
+      startedAt: NOW,
+    });
+
+    const stale = makeLockHarness("stale");
+    writeFileSync(
+      join(stale.directory, "supervisor.lock"),
+      `${JSON.stringify(lockRecord("stale-owner"))}\n`,
+      { mode: 0o600 },
+    );
+    const replacement = new OpsWorkerSupervisor({
+      store: stale.store,
+      doneChecks: stale.doneChecks,
+      instanceId: "replacement-owner",
+      processStartToken: "replacement-owner-start",
+      inspectLockOwner: () => "STALE",
+    });
+    await replacement.start();
+    replacement.close();
+
+    const malformed = makeLockHarness("malformed");
+    writeFileSync(join(malformed.directory, "supervisor.lock"), "not-json\n", { mode: 0o600 });
+    const malformedSupervisor = new OpsWorkerSupervisor({
+      store: malformed.store,
+      doneChecks: malformed.doneChecks,
+      instanceId: "malformed-replacement",
+      processStartToken: "malformed-replacement-start",
+      inspectLockOwner: () => "STALE",
+    });
+    await assert.rejects(malformedSupervisor.start(), /malformed and therefore ambiguous/);
+
+    const oversized = makeLockHarness("oversized");
+    writeFileSync(join(oversized.directory, "supervisor.lock"), "x".repeat(4_097), { mode: 0o600 });
+    const oversizedSupervisor = new OpsWorkerSupervisor({
+      store: oversized.store,
+      doneChecks: oversized.doneChecks,
+      instanceId: "oversized-replacement",
+      processStartToken: "oversized-replacement-start",
+      inspectLockOwner: () => "STALE",
+    });
+    await assert.rejects(oversizedSupervisor.start(), /oversized supervisor lock/);
+
+    const symlinked = makeLockHarness("symlink");
+    const outsideLock = join(symlinked.directory, "outside.lock");
+    writeFileSync(outsideLock, `${JSON.stringify(lockRecord("outside-owner"))}\n`, { mode: 0o600 });
+    symlinkSync(outsideLock, join(symlinked.directory, "supervisor.lock"));
+    const symlinkSupervisor = new OpsWorkerSupervisor({
+      store: symlinked.store,
+      doneChecks: symlinked.doneChecks,
+      instanceId: "symlink-replacement",
+      processStartToken: "symlink-replacement-start",
+      inspectLockOwner: () => "STALE",
+    });
+    await assert.rejects(symlinkSupervisor.start(), /Refusing unsafe supervisor lock/);
+
+    const changed = makeLockHarness("changed");
+    const changedPath = join(changed.directory, "supervisor.lock");
+    writeFileSync(
+      changedPath,
+      `${JSON.stringify(lockRecord("first-owner"))}\n`,
+      { mode: 0o600 },
+    );
+    const changedSupervisor = new OpsWorkerSupervisor({
+      store: changed.store,
+      doneChecks: changed.doneChecks,
+      instanceId: "changed-replacement",
+      processStartToken: "changed-replacement-start",
+      inspectLockOwner: () => {
+        writeFileSync(
+          changedPath,
+          `${JSON.stringify(lockRecord("new-live-owner"))}\n`,
+          { mode: 0o600 },
+        );
+        return "STALE";
+      },
+    });
+    await assert.rejects(changedSupervisor.start(), /changed during stale-owner inspection/);
+    assert.match(readFileSync(changedPath, "utf8"), /new-live-owner/);
+
+    assert.throws(
+      () => new OpsWorkerSupervisor({
+        store: changed.store,
+        doneChecks: changed.doneChecks,
+        instanceId: "missing-identity",
+        processStartToken: undefined as unknown as string,
+      }),
+      /process start token contains unsafe characters/,
+    );
+  });
+
   it("reconciles a prior RUNNING snapshot on restart", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -549,6 +739,44 @@ describe("ops worker supervisor", () => {
     assert.equal(recovered?.activeRun, null);
     assert.equal(recovered?.lastOutcome?.kind, "RECONCILIATION");
     assert.equal(recovered?.rounds.remediation, 0);
+  });
+
+  it("reconciles every persisted RUNNING snapshot independently", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-multi-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "multi-first-supervisor",
+    });
+    for (const [id, attemptId] of [
+      ["multi-running-a", "attempt-a"],
+      ["multi-running-b", "attempt-b"],
+    ]) {
+      const task = makeTask(id);
+      task.state = "RUNNING";
+      task.activeRun = {
+        ...activeRun("prior-supervisor"),
+        attemptId,
+        pid: id.endsWith("a") ? 401 : 402,
+        processGroupId: id.endsWith("a") ? 401 : 402,
+      };
+      first.store.create(task);
+    }
+    first.close();
+    const reconciledIds: string[] = [];
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "multi-restarted-supervisor",
+      reconcileActiveRun: (task) => {
+        reconciledIds.push(task.id);
+        return { status: "GONE", summary: "fixture group is gone" };
+      },
+    });
+
+    assert.deepEqual(reconciledIds.sort(), ["multi-running-a", "multi-running-b"]);
+    assert.equal(restarted.store.get("multi-running-a")?.state, "RESUMABLE");
+    assert.equal(restarted.store.get("multi-running-b")?.state, "RESUMABLE");
   });
 
   it("blocks ambiguous startup ownership and persists report attempts across restart", async (t) => {

@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   mkdirSync,
   mkdtempSync,
@@ -21,6 +23,7 @@ import {
   inspectOpsWorkerActiveRun,
   OPS_WORKER_PI_LIMITS,
   OpsWorkerPiAttemptRunner,
+  type OpsWorkerPiAttemptDependencies,
   type OpsWorkerProcessInspection,
 } from "../ops-worker/pi-attempt.js";
 import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
@@ -65,6 +68,7 @@ function registry(
           "authorized-issue",
         ],
         scope: ["inspect"],
+        tools: ["read", "grep", "find", "ls"],
       },
     },
     doneChecks: doneChecks.contracts,
@@ -134,7 +138,12 @@ interface Harness {
   children: ChildProcess[];
   invocations: string[][];
   setScenario(scenario: string): void;
-  runner(): OpsWorkerPiAttemptRunner;
+  runner(options?: {
+    attemptTimeoutMs?: number;
+    stallTimeoutMs?: number;
+    abortSignal?: AbortSignal;
+    dependencies?: OpsWorkerPiAttemptDependencies;
+  }): OpsWorkerPiAttemptRunner;
 }
 
 async function makeHarness(
@@ -193,11 +202,14 @@ async function makeHarness(
     setScenario(value): void {
       scenario = value;
     },
-    runner(): OpsWorkerPiAttemptRunner {
+    runner(options = {}): OpsWorkerPiAttemptRunner {
       return new OpsWorkerPiAttemptRunner({
         supervisor,
         workspaceCwd: workspace,
-        attemptTimeoutMs: 5_000,
+        authorizationProfiles: registry(doneChecks).authorizationProfiles,
+        abortSignal: options.abortSignal,
+        attemptTimeoutMs: options.attemptTimeoutMs ?? 5_000,
+        stallTimeoutMs: options.stallTimeoutMs,
         termGraceMs: 200,
         killGraceMs: 200,
         preemptionPollMs: 20,
@@ -218,6 +230,7 @@ async function makeHarness(
             ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
               process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
           ),
+          ...options.dependencies,
         },
       });
     },
@@ -280,7 +293,23 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(!args.includes("--no-session"));
     assert.ok(!args.includes("payload-selected-model"));
     assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
+    assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+    assert.match(
+      args[args.indexOf("--append-system-prompt") + 1],
+      /Do not use sudo or perform irreversible deletion/,
+    );
     assert.equal(result.evidence.some((entry) => /success claim/.test(entry.summary)), true);
+  });
+
+  it("treats clean exit as a claim even when successful output mentions old errors", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("success-with-diagnostics"));
+    harness.setScenario("success-diagnostic");
+
+    const result = await harness.runner().runAttempt("success-with-diagnostics");
+
+    assert.equal(result.state, "DONE");
+    assert.equal(result.lastOutcome?.result, "PASS");
   });
 
   it("runs a ready deterministic check without requiring a Pi success claim", async (t) => {
@@ -405,18 +434,151 @@ describe("ops worker Pi standard-session attempts", () => {
     );
     await assert.rejects(
       runner.runAttempt("second-low"),
-      /already owns active task low-priority/,
+      /launch slot is already reserved by task low-priority/,
     );
     assert.equal(harness.supervisor.getTask("low-priority")?.state, "RUNNING");
 
     harness.store.create(makeTask("urgent", { sourceKind: "alertmanager" }));
     const preempted = await running;
-    assert.equal(preempted.state, "RESUMABLE");
+    assert.equal(preempted.state, "RESUMABLE", JSON.stringify(preempted.lastOutcome));
     assert.equal(preempted.lastOutcome?.result, "PREEMPTED");
     assert.equal(preempted.rounds.remediation, 0);
     assert.equal(preempted.activeRun, null);
     assert.equal(harness.supervisor.getTask("urgent")?.state, "QUEUED");
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("stops a no-progress attempt at the stall bound without spending remediation", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("stall-timeout"));
+    harness.setScenario("wait");
+    const running = harness.runner({
+      attemptTimeoutMs: 2_000,
+      stallTimeoutMs: 80,
+    }).runAttempt("stall-timeout");
+    await waitFor(() => harness.supervisor.getTask("stall-timeout")?.state === "RUNNING");
+    const active = harness.supervisor.getTask("stall-timeout")?.activeRun;
+    assert.ok(active);
+
+    const result = await running;
+
+    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
+    assert.equal(result.lastOutcome?.result, "STALL");
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.activeRun, null);
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("kills a surviving same-group descendant after the Pi leader exits on TERM", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("descendant-cleanup"));
+    harness.setScenario("leader-exits-child-survives");
+    const running = harness.runner({
+      attemptTimeoutMs: 2_000,
+      stallTimeoutMs: 120,
+    }).runAttempt("descendant-cleanup");
+    await waitFor(() => harness.supervisor.getTask("descendant-cleanup")?.state === "RUNNING");
+    const active = harness.supervisor.getTask("descendant-cleanup")?.activeRun;
+    assert.ok(active);
+
+    const result = await running;
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "STALL");
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+    assert.throws(
+      () => process.kill(-active.processGroupId, 0),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH",
+    );
+  });
+
+  it("turns shutdown into bounded owned-group cleanup and a resumable task", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("shutdown-cleanup"));
+    harness.setScenario("wait");
+    const controller = new AbortController();
+    const running = harness.runner({ abortSignal: controller.signal })
+      .runAttempt("shutdown-cleanup");
+    await waitFor(() => harness.supervisor.getTask("shutdown-cleanup")?.state === "RUNNING");
+    const active = harness.supervisor.getTask("shutdown-cleanup")?.activeRun;
+    assert.ok(active);
+
+    controller.abort();
+    const result = await running;
+
+    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /worker shutdown/);
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("fails fresh launches closed before persisting RUNNING", async (t) => {
+    const harness = await makeHarness(t);
+
+    harness.store.create(makeTask("spawn-throws"));
+    const spawnFailure = await harness.runner({
+      dependencies: {
+        spawnProcess: () => { throw new Error("synthetic spawn failure"); },
+      },
+    }).runAttempt("spawn-throws");
+    assert.equal(spawnFailure.state, "RESUMABLE");
+    assert.equal(spawnFailure.lastOutcome?.result, "CRASH");
+
+    harness.store.create(makeTask("missing-pid"));
+    const missingPid = await harness.runner({
+      dependencies: {
+        spawnProcess: () => {
+          const child = new EventEmitter() as ChildProcess;
+          Object.assign(child, {
+            pid: undefined,
+            stdout: new PassThrough(),
+            stderr: new PassThrough(),
+            exitCode: null,
+            signalCode: null,
+          });
+          queueMicrotask(() => child.emit("close", 1, null));
+          return child;
+        },
+      },
+    }).runAttempt("missing-pid");
+    assert.equal(missingPid.state, "RESUMABLE");
+    assert.equal(missingPid.activeRun, null);
+
+    harness.store.create(makeTask("identity-gone"));
+    harness.setScenario("success");
+    const identityGone = await harness.runner({
+      dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
+    }).runAttempt("identity-gone");
+    assert.equal(identityGone.state, "RESUMABLE");
+    assert.equal(identityGone.activeRun, null);
+
+    for (const [taskId, inspection] of [
+      ["identity-ambiguous", (_pid: number): OpsWorkerProcessInspection => ({
+        status: "AMBIGUOUS",
+        summary: "synthetic ambiguous identity",
+      })],
+      ["identity-mismatch", (pid: number): OpsWorkerProcessInspection => ({
+        status: "OWNED",
+        identity: {
+          pid,
+          processGroupId: pid + 1,
+          processStartToken: "mismatched-group",
+          ownershipNoncePresent: true,
+        },
+      })],
+    ] as const) {
+      harness.store.create(makeTask(taskId));
+      let signals = 0;
+      const blocked = await harness.runner({
+        dependencies: {
+          readProcessIdentity: inspection,
+          signalProcessGroup: () => { signals += 1; },
+        },
+      }).runAttempt(taskId);
+      assert.equal(blocked.state, "BLOCKED");
+      assert.equal(blocked.activeRun, null);
+      assert.equal(signals, 0);
+    }
   });
 
   it("restart reconciliation stops proven ownership and blocks an ambiguous orphan without signaling", async (t) => {
@@ -440,6 +602,7 @@ describe("ops worker Pi standard-session attempts", () => {
           ? { status: "OWNED", identity: activeRun }
           : { status: "GONE" };
       },
+      inspectGroup: () => ({ status: "GONE" }),
       signal: (_group, signal) => signals.push(signal),
       sleep: async () => undefined,
       termGraceMs: 1,
@@ -454,9 +617,8 @@ describe("ops worker Pi standard-session attempts", () => {
     const escalatedSignals: NodeJS.Signals[] = [];
     let killed = false;
     const requiresKill = createOpsWorkerPiStartupReconciler({
-      inspect: () => killed
-        ? { status: "GONE" }
-        : { status: "OWNED", identity: activeRun },
+      inspect: () => ({ status: "OWNED", identity: activeRun }),
+      inspectGroup: () => killed ? { status: "GONE" } : { status: "PRESENT" },
       signal: (_group, signal) => {
         escalatedSignals.push(signal);
         if (signal === "SIGKILL") killed = true;

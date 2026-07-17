@@ -50,6 +50,7 @@ function fixtureContracts(): FixtureContracts {
         "fixture.inspect.v1": {
           sourceKinds: ["operator-cli"],
           scope: ["inspect"],
+          tools: ["read", "grep", "find", "ls"],
         },
       },
       doneChecks: doneChecks.contracts,
@@ -357,6 +358,86 @@ describe("ops worker CLI and inactive runtime", () => {
     const completed = store.get(taskId);
     assert.equal(completed?.state, "DONE");
     assert.equal(completed?.lastOutcome?.result, "PASS");
+  });
+
+  it("stops active Pi work before worker shutdown releases the supervisor", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controller = new AbortController();
+    const deps = dependencies(contracts, {
+      abortSignal: controller.signal,
+      schedulerPollMs: 20,
+      piAttemptDependencies: {
+        resolveInvocation: (args) => ({
+          command: process.execPath,
+          args: [FAKE_PI_PROCESS, "wait", ...args],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+      },
+    });
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    const taskId = JSON.parse(submitted.stdout).id as string;
+    const running = runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+    ], fixture.root, deps);
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+    });
+    const deadline = Date.now() + 2_000;
+    while (store.get(taskId)?.state !== "RUNNING") {
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for active CLI attempt");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    const activeRun = store.get(taskId)?.activeRun;
+    assert.ok(activeRun);
+
+    controller.abort();
+    const stopped = await running;
+
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal(store.get(taskId)?.state, "RESUMABLE");
+    assert.equal(store.get(taskId)?.activeRun, null);
+    assert.throws(
+      () => process.kill(-activeRun.processGroupId, 0),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH",
+    );
+  });
+
+  it("rejects persistence and execution done-check registry drift", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const mismatched = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        timeoutMs: 500,
+        validateParams: (value) => value as JsonObject,
+        run: () => ({ result: "PASS", summary: "mismatched fixture" }),
+      },
+    });
+
+    const result = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      dependencies(contracts, { doneChecks: mismatched }),
+    );
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /registries must match exactly/);
   });
 
   it("serves loopback health/status only and exposes no HTTP task intake", async (t) => {

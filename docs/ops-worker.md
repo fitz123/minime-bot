@@ -5,10 +5,11 @@ The ops worker is an opt-in, inactive-by-default core. Installing or starting
 single-instance supervisor, ordinary Pi session continuation, deterministic
 done checks, a local CLI skeleton, and read-only loopback health/status.
 
-PR 1 intentionally registers no production task templates or done-check
-implementations. Trusted package adapters register those contracts in later
-PRs. This keeps task input from selecting commands, executables, URLs, models,
-tools, or authorization scopes.
+The installed PR-1 binary registers no task templates, authorization profiles,
+or done checks. Submission and start define the adapter-facing contract but
+cannot execute production work until trusted package code registers all three.
+Each trusted authorization profile fixes both its scopes and Pi tool allowlist;
+task input cannot select commands, executables, URLs, models, tools, or scopes.
 
 ## Commands
 
@@ -24,7 +25,7 @@ minime-bot worker submit --state-dir "$STATE_DIR" \
   --template <registered-template> \
   --authorization <registered-profile> \
   --done-check <registered-check> \
-  --done-check-params '<registered-parameters-json>' \
+  [--done-check-params '<registered-parameters-json>'] \
   --correlation-key <source-correlation-key> \
   --objective <bounded-objective>
 minime-bot worker retry --state-dir "$STATE_DIR" --id <task-id>
@@ -35,6 +36,11 @@ minime-bot worker cancel --state-dir "$STATE_DIR" --id <task-id> --reason <reaso
 Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
 invocation, model/tool flags, authorization scope, remediation budget, task
 priority, and source kind are not task-supplied CLI options.
+
+`worker start` also accepts `--host` (only `127.0.0.1` or `::1`) and `--port`
+(an integer from 0 through 65535). Omitted done-check parameters default to an
+empty object. `status`, `list`, `inspect`, `submit`, `retry`, and `cancel`
+accept `--json` for machine-readable output.
 
 Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. `retry` and `cancel` acquire the supervisor's single-instance

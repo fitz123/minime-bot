@@ -6,7 +6,7 @@ Implement **PR 1 only** from the approved ADR-094 plan: an opt-in, inactive-by-d
 
 Primary issue: https://github.com/fitz123/minime-bot/issues/58
 Required deferred consumer: https://github.com/fitz123/minime-bot/issues/70
-Approved architecture: `/Users/ninja/.minime/workspace/artifacts/plans/2026-07-16-minimal-autonomous-ops-worker.md`
+Approved architecture: ADR-094 (external architecture record; not packaged)
 Governance: ADR-094 supersedes ADR-086; ADR-092 applies to delegated model context.
 
 ## Non-negotiable boundaries

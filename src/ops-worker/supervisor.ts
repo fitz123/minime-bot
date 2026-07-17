@@ -31,6 +31,7 @@ const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SUPERVISOR_LOCK_SCHEMA_VERSION = 1 as const;
 const SUPERVISOR_LOCK_FILE_NAME = "supervisor.lock";
 const MAX_SUPERVISOR_LOCK_BYTES = 4 * 1024;
+const MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES = 1_000;
 const INSTANCE_ID_PATTERN =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const TIMESTAMP_PATTERN =
@@ -82,7 +83,7 @@ export interface OpsWorkerSupervisorOptions {
   store: OpsWorkerTaskStore;
   doneChecks: OpsWorkerDoneCheckRegistry;
   instanceId: string;
-  processStartToken?: string;
+  processStartToken: string;
   now?: () => Date;
   infrastructureRetryMs?: number;
   /**
@@ -157,8 +158,34 @@ function assertRegularOwnedFile(path: string): Stats {
   return stats;
 }
 
+function readSupervisorLock(path: string): {
+  stats: Stats;
+  raw: string;
+  owner: OpsWorkerSupervisorLockRecord;
+} {
+  const beforeOpen = assertRegularOwnedFile(path);
+  const descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW);
+  try {
+    const stats = fstatSync(descriptor);
+    if (
+      !stats.isFile()
+      || stats.ino !== beforeOpen.ino
+      || (typeof process.getuid === "function" && stats.uid !== process.getuid())
+      || stats.size > MAX_SUPERVISOR_LOCK_BYTES
+    ) {
+      throw new OpsWorkerSupervisorAlreadyRunningError(
+        "Supervisor lock changed during safe open",
+      );
+    }
+    const raw = readFileSync(descriptor, "utf8");
+    return { stats, raw, owner: parseLockRecord(raw) };
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function assertIdentifier(value: string, label: string): void {
-  if (!INSTANCE_ID_PATTERN.test(value)) {
+  if (typeof value !== "string" || !INSTANCE_ID_PATTERN.test(value)) {
     throw new TypeError(`${label} contains unsafe characters`);
   }
 }
@@ -253,8 +280,10 @@ class OpsWorkerSingleInstanceGuard {
         if (!isAlreadyExistsError(error)) throw error;
       }
 
-      const existingStats = assertRegularOwnedFile(this.path);
-      const owner = parseLockRecord(readFileSync(this.path, "utf8"));
+      const existing = readSupervisorLock(this.path);
+      const existingStats = existing.stats;
+      const ownerRaw = existing.raw;
+      const owner = existing.owner;
       const status = this.inspectOwner?.(owner) ?? "AMBIGUOUS";
       if (status !== "STALE") {
         throw new OpsWorkerSupervisorAlreadyRunningError(
@@ -264,8 +293,11 @@ class OpsWorkerSingleInstanceGuard {
           owner,
         );
       }
-      const rechecked = assertRegularOwnedFile(this.path);
-      if (rechecked.ino !== existingStats.ino) {
+      const rechecked = readSupervisorLock(this.path);
+      if (
+        rechecked.stats.ino !== existingStats.ino
+        || rechecked.raw !== ownerRaw
+      ) {
         throw new OpsWorkerSupervisorAlreadyRunningError(
           "Supervisor lock changed during stale-owner inspection",
           owner,
@@ -281,8 +313,9 @@ class OpsWorkerSingleInstanceGuard {
   release(): void {
     if (this.acquiredInode === undefined) return;
     try {
-      const stats = assertRegularOwnedFile(this.path);
-      const owner = parseLockRecord(readFileSync(this.path, "utf8"));
+      const current = readSupervisorLock(this.path);
+      const stats = current.stats;
+      const owner = current.owner;
       if (
         stats.ino !== this.acquiredInode
         || owner.instanceId !== this.record.instanceId
@@ -302,18 +335,6 @@ class OpsWorkerSingleInstanceGuard {
       throw error;
     }
   }
-}
-
-export function assertOpsWorkerStateTransition(
-  from: OpsWorkerTaskState,
-  to: OpsWorkerTaskState,
-): void {
-  if (to === "DONE") {
-    throw new OpsWorkerSupervisorStateError(
-      "DONE is reserved for a fresh deterministic done-check PASS",
-    );
-  }
-  assertStructuralStateTransition(from, to);
 }
 
 function assertStructuralStateTransition(
@@ -361,8 +382,7 @@ export class OpsWorkerSupervisor {
 
   constructor(options: OpsWorkerSupervisorOptions) {
     assertIdentifier(options.instanceId, "Supervisor instance id");
-    const processStartToken = options.processStartToken
-      ?? `unverified-${process.pid}`;
+    const processStartToken = options.processStartToken;
     assertIdentifier(processStartToken, "Supervisor process start token");
     const infrastructureRetryMs = options.infrastructureRetryMs ?? 60_000;
     if (
@@ -571,6 +591,7 @@ export class OpsWorkerSupervisor {
     return this.transition(taskId, "CHECKING", (replacement, at) => {
       replacement.activeRun = null;
       replacement.session.resume = true;
+      replacement.rounds.consecutiveInfrastructureFailures = 0;
       replacement.schedule.nextRunAt = null;
       replacement.schedule.nextCheckAt = null;
       replacement.lastOutcome = {
@@ -596,10 +617,12 @@ export class OpsWorkerSupervisor {
     evidenceSummary?: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    return this.transition(taskId, "RESUMABLE", (task, at) => {
+    const existing = this.requireTask(taskId);
+    const target = this.infrastructureFailureTarget(existing);
+    return this.transition(taskId, target, (task, at) => {
       task.activeRun = null;
       task.session.resume = true;
-      task.rounds.consecutiveInfrastructureFailures += 1;
+      this.incrementInfrastructureFailures(task);
       task.schedule.nextCheckAt = null;
       task.schedule.nextRunAt = nextRunAt
         ?? new Date(this.now().getTime() + this.infrastructureRetryMs).toISOString();
@@ -612,7 +635,9 @@ export class OpsWorkerSupervisor {
       if (evidenceSummary) {
         appendEvidence(task, this.piEvidence(at, evidenceSummary));
       }
-    }, `Recorded resumable infrastructure outcome ${result}`);
+    }, target === "BLOCKED"
+      ? `Blocked after bounded infrastructure failures (${result})`
+      : `Recorded resumable infrastructure outcome ${result}`);
   }
 
   recordPreLaunchInfrastructureOutcome(
@@ -626,9 +651,10 @@ export class OpsWorkerSupervisor {
         `Pre-launch failure requires QUEUED or RESUMABLE, found ${existing.state}`,
       );
     }
-    return this.transition(taskId, "RESUMABLE", (task, at) => {
+    const target = this.infrastructureFailureTarget(existing);
+    return this.transition(taskId, target, (task, at) => {
       task.activeRun = null;
-      task.rounds.consecutiveInfrastructureFailures += 1;
+      this.incrementInfrastructureFailures(task);
       task.schedule.nextCheckAt = null;
       task.schedule.nextRunAt = new Date(
         this.now().getTime() + this.infrastructureRetryMs,
@@ -639,7 +665,9 @@ export class OpsWorkerSupervisor {
         result: "CRASH",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
-    }, "Recorded Pi attempt launch failure");
+    }, target === "BLOCKED"
+      ? "Blocked after bounded Pi launch failures"
+      : "Recorded Pi attempt launch failure");
   }
 
   recordPreemption(
@@ -686,7 +714,7 @@ export class OpsWorkerSupervisor {
       task.activeRun = null;
       task.session.sessionId = newSessionId;
       task.session.resume = false;
-      task.rounds.consecutiveInfrastructureFailures += 1;
+      this.incrementInfrastructureFailures(task);
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       const boundedSummary = truncateUtf8(
@@ -710,10 +738,11 @@ export class OpsWorkerSupervisor {
         artifact: null,
       });
     };
-    if (existing.state === "RUNNING") {
+    const target = this.infrastructureFailureTarget(existing);
+    if (existing.state === "RUNNING" || target === "BLOCKED") {
       return this.transition(
         taskId,
-        "RESUMABLE",
+        target,
         applyReset,
         "Quarantined corrupt standard Pi session and prepared a fresh session",
       );
@@ -762,7 +791,7 @@ export class OpsWorkerSupervisor {
     }, "Blocked Pi launch whose process-group identity could not be proven");
   }
 
-  async runDoneCheck(taskId: string): Promise<OpsWorkerTask> {
+  async runDoneCheck(taskId: string, signal?: AbortSignal): Promise<OpsWorkerTask> {
     this.assertStarted();
     const task = this.requireTask(taskId);
     if (task.state !== "CHECKING") {
@@ -777,13 +806,14 @@ export class OpsWorkerSupervisor {
       result = await this.doneChecks.run(task.doneCheck, {
         taskId: task.id,
         checkedAt,
-      });
+      }, signal);
     } catch (error) {
       if (!(error instanceof OpsWorkerDoneCheckExecutionError)) throw error;
       this.assertFreshCheckSnapshot(taskId, baseline);
-      return this.transition(taskId, "RESUMABLE", (current, at) => {
+      const target = this.infrastructureFailureTarget(this.requireTask(taskId));
+      return this.transition(taskId, target, (current, at) => {
         current.activeRun = null;
-        current.rounds.consecutiveInfrastructureFailures += 1;
+        this.incrementInfrastructureFailures(current);
         current.schedule.nextCheckAt = null;
         current.schedule.nextRunAt = new Date(
           this.now().getTime() + this.infrastructureRetryMs,
@@ -801,7 +831,9 @@ export class OpsWorkerSupervisor {
           summary: `Done check deferred by infrastructure (${error.code})`,
           artifact: null,
         });
-      }, "Done check error is resumable");
+      }, target === "BLOCKED"
+        ? "Done check reached the bounded infrastructure-failure limit"
+        : "Done check error is resumable");
     }
     this.assertFreshCheckSnapshot(taskId, baseline);
     return this.applyDoneCheckResult(taskId, result);
@@ -809,6 +841,12 @@ export class OpsWorkerSupervisor {
 
   retryBlockedTask(taskId: string): OpsWorkerTask {
     this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "BLOCKED") {
+      throw new OpsWorkerSupervisorStateError(
+        `Operator retry requires BLOCKED, found ${existing.state}`,
+      );
+    }
     return this.transition(taskId, "RESUMABLE", (task) => {
       task.rounds.remediation = 0;
       task.rounds.consecutiveInfrastructureFailures = 0;
@@ -877,20 +915,6 @@ export class OpsWorkerSupervisor {
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {
     const running = this.store.list().filter((task) => task.state === "RUNNING");
     const reconciled: OpsWorkerStartupReconciliation[] = [];
-    if (running.length > 1) {
-      for (const task of running) {
-        this.blockAmbiguousRun(
-          task.id,
-          "Multiple persisted active process groups violate single-owner state",
-        );
-        reconciled.push({
-          taskId: task.id,
-          state: "BLOCKED",
-          result: "AMBIGUOUS_ORPHAN",
-        });
-      }
-      return reconciled;
-    }
     for (const task of running) {
       let result: OpsWorkerStartupRunResult = { status: "AMBIGUOUS" };
       try {
@@ -901,9 +925,10 @@ export class OpsWorkerSupervisor {
         result = { status: "AMBIGUOUS" };
       }
       if (result.status === "GONE" || result.status === "STOPPED") {
-        this.transition(task.id, "RESUMABLE", (replacement, at) => {
+        const target = this.infrastructureFailureTarget(task);
+        this.transition(task.id, target, (replacement, at) => {
           replacement.activeRun = null;
-          replacement.rounds.consecutiveInfrastructureFailures += 1;
+          this.incrementInfrastructureFailures(replacement);
           replacement.schedule.nextRunAt = null;
           replacement.schedule.nextCheckAt = null;
           replacement.lastOutcome = {
@@ -918,7 +943,7 @@ export class OpsWorkerSupervisor {
         }, "Reconciled interrupted attempt as resumable");
         reconciled.push({
           taskId: task.id,
-          state: "RESUMABLE",
+          state: target,
           result: "CRASH",
         });
       } else {
@@ -969,6 +994,7 @@ export class OpsWorkerSupervisor {
     if (result.result === "DEFER") {
       return this.transition(taskId, "CHECKING", (task, at) => {
         task.activeRun = null;
+        task.rounds.consecutiveInfrastructureFailures = 0;
         task.schedule.nextRunAt = null;
         task.schedule.nextCheckAt = result.nextCheckAt;
         task.lastOutcome = this.checkOutcome(at, "DEFER", result.summary);
@@ -1007,6 +1033,29 @@ export class OpsWorkerSupervisor {
     task.rounds.consecutiveInfrastructureFailures = 0;
     task.schedule.nextRunAt = null;
     task.schedule.nextCheckAt = null;
+  }
+
+  private infrastructureFailureTarget(
+    task: OpsWorkerTask,
+  ): "RESUMABLE" | "BLOCKED" {
+    return task.rounds.consecutiveInfrastructureFailures + 1
+        >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
+      ? "BLOCKED"
+      : "RESUMABLE";
+  }
+
+  private incrementInfrastructureFailures(task: OpsWorkerTask): void {
+    task.rounds.consecutiveInfrastructureFailures = Math.min(
+      MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES,
+      task.rounds.consecutiveInfrastructureFailures + 1,
+    );
+    if (
+      task.rounds.consecutiveInfrastructureFailures
+        >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
+    ) {
+      task.report.state = "PENDING";
+      task.report.lastError = null;
+    }
   }
 
   private checkOutcome(

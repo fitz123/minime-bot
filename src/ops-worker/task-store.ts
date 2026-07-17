@@ -17,7 +17,7 @@ import {
   type Stats,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
   isOpsWorkerTerminalState,
@@ -63,6 +63,7 @@ export type OpsWorkerTaskStoreFaultPoint =
   | "after-temp-file-fsync"
   | "after-snapshot-rename"
   | "after-task-directory-fsync"
+  | "after-correlation-check"
   | "before-journal-append"
   | "after-journal-fsync";
 
@@ -98,9 +99,18 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
   }
 }
 
+export class OpsWorkerTaskStoreBusyError extends Error {
+  constructor() {
+    super("Another ops-worker task-store mutation is in progress");
+    this.name = "OpsWorkerTaskStoreBusyError";
+  }
+}
+
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SNAPSHOT_SUFFIX = ".json";
 const JOURNAL_FILE_NAME = "journal.jsonl";
+const MUTATION_LOCK_FILE_NAME = ".task-store.lock";
+const MAX_MUTATION_LOCK_BYTES = 512;
 const MAX_AUDIT_SUMMARY_BYTES = 2 * 1024;
 
 function isMissingError(error: unknown): boolean {
@@ -133,15 +143,16 @@ function verifyDirectory(path: string): void {
   }
 }
 
-function ensureDirectory(path: string): void {
+function ensureDirectory(path: string): boolean {
   try {
     verifyDirectory(path);
-    return;
+    return false;
   } catch (error) {
     if (!isMissingError(error)) throw error;
   }
   mkdirSync(path, { recursive: true, mode: 0o700 });
   verifyDirectory(path);
+  return true;
 }
 
 function assertRegularFile(path: string): Stats {
@@ -181,6 +192,103 @@ function fsyncDirectory(path: string): void {
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);
+  }
+}
+
+interface MutationLockRecord {
+  pid: number;
+  nonce: string;
+}
+
+class OpsWorkerTaskStoreMutationGuard {
+  private readonly path: string;
+  private readonly record: MutationLockRecord;
+  private acquiredInode: bigint | number | undefined;
+
+  constructor(stateDirectory: string) {
+    this.path = join(stateDirectory, MUTATION_LOCK_FILE_NAME);
+    this.record = {
+      pid: process.pid,
+      nonce: randomBytes(16).toString("hex"),
+    };
+  }
+
+  acquire(): void {
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      let descriptor: number | undefined;
+      try {
+        descriptor = openSync(
+          this.path,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+          0o600,
+        );
+        writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+        this.acquiredInode = fstatSync(descriptor).ino;
+        closeSync(descriptor);
+        return;
+      } catch (error) {
+        if (descriptor !== undefined) closeSync(descriptor);
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+
+      const stats = assertRegularFile(this.path);
+      if (stats.size > MAX_MUTATION_LOCK_BYTES) {
+        throw new OpsWorkerTaskStoreBusyError();
+      }
+      let record: MutationLockRecord;
+      try {
+        const value = JSON.parse(readRegularFile(
+          this.path,
+          MAX_MUTATION_LOCK_BYTES,
+        )) as Partial<MutationLockRecord>;
+        if (
+          !Number.isSafeInteger(value.pid)
+          || (value.pid as number) < 1
+          || typeof value.nonce !== "string"
+          || !/^[a-f0-9]{32}$/.test(value.nonce)
+        ) throw new Error("invalid mutation lock");
+        record = { pid: value.pid as number, nonce: value.nonce };
+      } catch {
+        throw new OpsWorkerTaskStoreBusyError();
+      }
+      try {
+        process.kill(record.pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          const rechecked = assertRegularFile(this.path);
+          if (rechecked.ino !== stats.ino) throw new OpsWorkerTaskStoreBusyError();
+          unlinkSync(this.path);
+          continue;
+        }
+        if ((error as NodeJS.ErrnoException).code !== undefined) {
+          throw new OpsWorkerTaskStoreBusyError();
+        }
+      }
+      const waiter = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(waiter, 0, 0, 10);
+    }
+    throw new OpsWorkerTaskStoreBusyError();
+  }
+
+  release(): void {
+    if (this.acquiredInode === undefined) return;
+    const stats = assertRegularFile(this.path);
+    const value = JSON.parse(readRegularFile(
+      this.path,
+      MAX_MUTATION_LOCK_BYTES,
+    )) as MutationLockRecord;
+    if (
+      stats.ino !== this.acquiredInode
+      || value.pid !== this.record.pid
+      || value.nonce !== this.record.nonce
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Refusing to remove a task-store mutation lock whose ownership changed",
+      );
+    }
+    unlinkSync(this.path);
+    this.acquiredInode = undefined;
   }
 }
 
@@ -316,16 +424,19 @@ export class OpsWorkerTaskStore {
   ): OpsWorkerTaskStoreWriteResult {
     const task = parseOpsWorkerTask(value, this.registry);
     assertAuditInput(audit);
-    this.ensureSafeDirectories();
-    const snapshotPath = this.snapshotPath(task.id);
-    if (assertPathMissingOrRegularFile(snapshotPath)) {
-      throw new OpsWorkerTaskStoreSafetyError(
-        `Refusing to replace existing task ${task.id} through create`,
-      );
-    }
-    this.assertJournalSafe();
-    this.assertUniqueActiveCorrelation(task);
-    return this.write(task, snapshotPath, audit);
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const snapshotPath = this.snapshotPath(task.id);
+      if (assertPathMissingOrRegularFile(snapshotPath)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to replace existing task ${task.id} through create`,
+        );
+      }
+      this.assertJournalSafe();
+      this.assertUniqueActiveCorrelation(task);
+      this.injectFault("after-correlation-check");
+      return this.write(task, snapshotPath, audit);
+    });
   }
 
   replace(
@@ -334,18 +445,36 @@ export class OpsWorkerTaskStore {
   ): OpsWorkerTaskStoreWriteResult {
     const task = parseOpsWorkerTask(value, this.registry);
     assertAuditInput(audit);
-    this.ensureSafeDirectories();
-    const snapshotPath = this.snapshotPath(task.id);
-    const existing = this.readSnapshot(snapshotPath);
-    this.assertImmutableIdentity(existing, task);
-    this.assertJournalSafe();
-    this.assertUniqueActiveCorrelation(task);
-    return this.write(task, snapshotPath, audit);
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const snapshotPath = this.snapshotPath(task.id);
+      const existing = this.readSnapshot(snapshotPath);
+      this.assertImmutableIdentity(existing, task);
+      this.assertJournalSafe();
+      this.assertUniqueActiveCorrelation(task);
+      this.injectFault("after-correlation-check");
+      return this.write(task, snapshotPath, audit);
+    });
   }
 
   private ensureSafeDirectories(): void {
-    ensureDirectory(this.stateDirectory);
-    ensureDirectory(this.tasksDirectory);
+    if (ensureDirectory(this.stateDirectory)) {
+      fsyncDirectory(dirname(this.stateDirectory));
+    }
+    if (ensureDirectory(this.tasksDirectory)) {
+      fsyncDirectory(this.stateDirectory);
+    }
+  }
+
+  private withMutationLock<T>(operation: () => T): T {
+    this.ensureSafeDirectories();
+    const guard = new OpsWorkerTaskStoreMutationGuard(this.stateDirectory);
+    guard.acquire();
+    try {
+      return operation();
+    } finally {
+      guard.release();
+    }
   }
 
   private snapshotPath(taskId: string): string {
