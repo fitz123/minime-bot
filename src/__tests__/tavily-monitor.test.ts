@@ -55,13 +55,13 @@ function usageResponse(overrides: {
   paygoUsage?: number;
   paygoLimit?: number;
   keyUsage?: number;
-  keyLimit?: number;
+  keyLimit?: number | null;
   extra?: Record<string, unknown>;
 } = {}): Record<string, unknown> {
   return {
     key: {
       usage: overrides.keyUsage ?? 700,
-      limit: overrides.keyLimit ?? 1_000,
+      limit: overrides.keyLimit === undefined ? 1_000 : overrides.keyLimit,
       search_usage: 600,
       extract_usage: 100,
     },
@@ -369,12 +369,49 @@ describe("Tavily usage parsing and bounded requests", () => {
     );
   });
 
+  it("omits the key limit pair when Tavily explicitly reports a null limit", () => {
+    const sample = parseTavilyUsageResponse(
+      usageResponse({ keyUsage: 700, keyLimit: null, planUsage: 100 }),
+      new Date("2026-07-16T09:00:00.000Z"),
+    );
+
+    assert.deepEqual(sample.key, {
+      usage: 700,
+      searchUsage: 600,
+      extractUsage: 100,
+    });
+    assert.equal(isTavilyUsageRecoverable(sample), true);
+
+    const exhaustedAccount = parseTavilyUsageResponse(
+      usageResponse({
+        keyUsage: 10_000,
+        keyLimit: null,
+        planUsage: 1_000,
+        paygoUsage: 1_250,
+      }),
+    );
+    assert.equal(
+      isTavilyUsageRecoverable(exhaustedAccount),
+      false,
+      "an absent key cap does not bypass account capacity requirements",
+    );
+
+    const exhaustedFiniteKey = parseTavilyUsageResponse(
+      usageResponse({ keyUsage: 1_000, keyLimit: 1_000, planUsage: 100 }),
+    );
+    assert.equal(isTavilyUsageRecoverable(exhaustedFiniteKey), false);
+  });
+
   it("rejects malformed, missing, negative, and non-finite usage fields", () => {
     const malformed: unknown[] = [
       undefined,
       {},
       { key: {}, account: {} },
+      { ...usageResponse(), key: { usage: 1 } },
       { ...usageResponse(), key: { usage: -1, limit: 1_000 } },
+      { ...usageResponse(), key: { usage: 1, limit: "unlimited" } },
+      { ...usageResponse(), key: { usage: 1, limit: -1 } },
+      { ...usageResponse(), key: { usage: 1, limit: Number.NaN } },
       {
         ...usageResponse(),
         account: { ...(usageResponse().account as Record<string, unknown>), paygo_limit: "1250" },
@@ -456,7 +493,7 @@ describe("Tavily usage parsing and bounded requests", () => {
 describe("Tavily fixed recovery verification", () => {
   it("requires current recoverable usage and validated fixed Search and Extract probes", async () => {
     const { fetchImpl, calls } = sequenceFetch([
-      jsonResponse(usageResponse({ planUsage: 100, paygoUsage: 0 })),
+      jsonResponse(usageResponse({ keyLimit: null, planUsage: 100, paygoUsage: 0 })),
       jsonResponse(successfulSearchResponse()),
       jsonResponse(successfulExtractResponse()),
     ]);
@@ -1274,6 +1311,39 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.equal(restored.getState().notificationKeys.includes(firstKey), true, "delivery dedupe key survives removal");
   });
 
+  it("round-trips finite and absent key limit pairs through durable state", async () => {
+    const workspace = temporaryWorkspace();
+    let response = usageResponse({ keyLimit: 1_000, planUsage: 100 });
+    const options = {
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: () => new Date("2026-07-16T12:00:00.000Z"),
+      fetchImpl: (async () => jsonResponse(response)) as typeof fetch,
+    };
+    const monitor = new TavilyMonitor(options);
+
+    await monitor.sampleUsage();
+    const finiteState = monitor.getState();
+    assert.deepEqual(new TavilyMonitor(options).getState(), finiteState);
+    assert.deepEqual(finiteState.latestSample?.key, {
+      usage: 700,
+      limit: 1_000,
+      remaining: 300,
+      searchUsage: 600,
+      extractUsage: 100,
+    });
+
+    response = usageResponse({ keyLimit: null, planUsage: 100 });
+    await monitor.sampleUsage();
+    const absentState = monitor.getState();
+    assert.deepEqual(new TavilyMonitor(options).getState(), absentState);
+    assert.deepEqual(absentState.latestSample?.key, {
+      usage: 700,
+      searchUsage: 600,
+      extractUsage: 100,
+    });
+  });
+
   it("does not mutate live state or delete a child event when persistence fails", () => {
     const workspace = temporaryWorkspace();
     const eventPath = writeExhaustionEvent(
@@ -1314,6 +1384,27 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
       { ...valid, privateQuery: "must-not-be-accepted" },
       { ...valid, telemetryStats: undefined },
       { ...valid, notificationKeys: ["duplicate", "duplicate"] },
+      {
+        ...valid,
+        latestSample: {
+          ...(valid.latestSample as Record<string, unknown>),
+          key: { usage: 700, limit: 1_000 },
+        },
+      },
+      {
+        ...valid,
+        latestSample: {
+          ...(valid.latestSample as Record<string, unknown>),
+          key: { usage: 700, remaining: 300 },
+        },
+      },
+      {
+        ...valid,
+        latestSample: {
+          ...(valid.latestSample as Record<string, unknown>),
+          key: { usage: 700, limit: 1_000, remaining: 299 },
+        },
+      },
     ];
     for (const document of invalidDocuments) {
       writeFileSync(statePath, typeof document === "string" ? document : JSON.stringify(document), "utf8");

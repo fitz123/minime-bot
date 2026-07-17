@@ -18,12 +18,12 @@ Represent a provider-reported nullable key limit by omitting `key.limit` and `ke
 ## Tasks
 
 ### Task 1: Parse and validate a nullable key limit
-- [ ] Update the key sample type so `limit` and `remaining` are an optional pair; leave account quota counters unchanged.
-- [ ] Parse an explicit `null` key limit as an absent optional pair, preserve the existing finite-limit path, and reject missing or malformed values.
-- [ ] Treat an absent key limit as unconstrained in recoverability while preserving account capacity requirements.
-- [ ] Update persisted-state validation to accept only a consistent absent pair or valid finite pair.
-- [ ] Add parser, recoverability, malformed-input, recovery-probe, and legacy/new state round-trip tests.
-- [ ] Run focused monitor tests and `npm run typecheck` before Task 2.
+- [x] Update the key sample type so `limit` and `remaining` are an optional pair; leave account quota counters unchanged.
+- [x] Parse an explicit `null` key limit as an absent optional pair, preserve the existing finite-limit path, and reject missing or malformed values.
+- [x] Treat an absent key limit as unconstrained in recoverability while preserving account capacity requirements.
+- [x] Update persisted-state validation to accept only a consistent absent pair or valid finite pair.
+- [x] Add parser, recoverability, malformed-input, recovery-probe, and legacy/new state round-trip tests.
+- [x] Run focused monitor tests and `npm run typecheck` before Task 2.
 
 ### Task 2: Prove sampler and metrics behavior
 - [ ] Add an end-to-end sampler test showing a null-key-limit usage response records a successful sample rather than `usage_invalid`.
