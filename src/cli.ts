@@ -578,7 +578,11 @@ function runLaunchdCommand(
   stdout: WriteFn,
 ): number {
   if (action !== "crons" || args[0] !== "sync") {
-    throw new CliUsageError(`unknown launchd command: ${["launchd", action, ...args].filter(Boolean).join(" ")}`);
+    const command = ["launchd", action, action === "crons" ? args[0] : undefined]
+      .filter((token): token is string => Boolean(token))
+      .map((token) => token.startsWith("--") ? token.split("=", 1)[0] : token)
+      .join(" ");
+    throw new CliUsageError(`unknown launchd command: ${command}`);
   }
 
   const commandOptions = parseLaunchdCronSyncOptions(args.slice(1));

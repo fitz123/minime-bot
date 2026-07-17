@@ -384,7 +384,7 @@ describe("minime-bot CLI", () => {
   });
 
   it("rejects missing, duplicate, and unknown run cron script option forms", () => {
-    const cases: Array<{ args: string[]; expected: RegExp }> = [
+    const cases: Array<{ args: string[]; expected: RegExp; suppliedValues?: string[] }> = [
       {
         args: ["--run-cron-script"],
         expected: /--run-cron-script requires a path/,
@@ -400,10 +400,12 @@ describe("minime-bot CLI", () => {
           "--run-cron-script=/tmp/second/run-cron.sh",
         ],
         expected: /--run-cron-script may only be specified once/,
+        suppliedValues: ["/tmp/first/run-cron.sh", "/tmp/second/run-cron.sh"],
       },
       {
         args: ["--run-cron-script-path=/tmp/release/run-cron.sh"],
         expected: /unknown launchd option: --run-cron-script-path\n$/,
+        suppliedValues: ["/tmp/release/run-cron.sh"],
       },
     ];
 
@@ -412,8 +414,25 @@ describe("minime-bot CLI", () => {
       assert.equal(result.code, 2);
       assert.equal(result.stdout, "");
       assert.match(result.stderr, testCase.expected);
-      assert.doesNotMatch(result.stderr, /\/tmp\/release\/run-cron\.sh/);
+      for (const suppliedValue of testCase.suppliedValues ?? []) {
+        assert.equal(result.stderr.includes(suppliedValue), false);
+      }
     }
+  });
+
+  it("does not echo a runner override from an unknown launchd command", () => {
+    const runner = "/tmp/example-release/current/scripts/run-cron.sh";
+    const result = runWithCapture([
+      "launchd",
+      "crons",
+      "typo",
+      `--run-cron-script=${runner}`,
+    ], BOT_ROOT);
+
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /unknown launchd command: launchd crons typo/);
+    assert.equal(result.stderr.includes(runner), false);
   });
 
   it("rejects an invalid runner override before launchd writes or commands", () => {
@@ -428,10 +447,12 @@ describe("minime-bot CLI", () => {
         {
           args: ["--run-cron-script", "relative/run-cron.sh"],
           expected: /Invalid run cron script override: must be an absolute path/,
+          suppliedValue: "relative/run-cron.sh",
         },
         {
           args: [`--run-cron-script=${runner} `],
           expected: /Invalid run cron script override: basename must be run-cron\.sh/,
+          suppliedValue: `${runner} `,
         },
       ];
 
@@ -459,7 +480,7 @@ describe("minime-bot CLI", () => {
         assert.equal(result.code, 1);
         assert.equal(result.stdout, "");
         assert.match(result.stderr, testCase.expected);
-        assert.equal(result.stderr.includes(runner), false);
+        assert.equal(result.stderr.includes(testCase.suppliedValue), false);
       }
       assert.equal(existsSync(launchAgentsDir), false);
       assert.equal(existsSync(logDir), false);

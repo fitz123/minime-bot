@@ -20,7 +20,7 @@ Public scope is package code/tests/docs only. Private deployment-wrapper wiring 
 - The default remains the normalized package-root `scripts/run-cron.sh` path and retains current compatibility.
 - An explicit value must be a normalized absolute path whose basename is `run-cron.sh`; it must resolve to an existing regular executable file.
 - Preserve the caller's validated lexical path in rendered plists so an atomic `current` symlink remains stable across slot switches; use canonical paths only for validation.
-- Symlink policy: allow at most one operator-owned directory symlink component (the atomic slot selector), never a final-file symlink. Its resolved target must remain beneath the symlink's parent trust directory. The trust directory, symlink, resolved directories, and file must be owned by the current user and not group/world writable. Reject escaping, dangling, multi-symlink, wrong-owner, or writable components. Regular non-symlink fixtures are allowed when their containing directory and file meet the same owner/mode rules.
+- Symlink policy: allow at most one current-user-owned directory symlink component (the atomic slot selector), never a final-file symlink. Its resolved target must remain beneath the symlink's parent trust directory. The trust directory, resolved directories, and file must be owned by the current user and not group/world writable; POSIX symlink mode bits are not enforced because replacement safety comes from the parent trust directory. Reject escaping, dangling, multi-symlink, wrong-owner, or writable components. Regular non-symlink fixtures are allowed when their containing directory and file meet the same owner/mode rules.
 - Validate the explicit override while resolving context, before cron loading, directory creation, plist writes, pruning, or launchctl/plutil commands. Dry-run remains zero-write/zero-command.
 - Use the validated value consistently in rendering, plan comparison, writes, rollback, and rebootstrap because those phases consume the same generated context.
 - Error messages identify the failed invariant but do not echo the supplied path.
@@ -56,8 +56,8 @@ git diff --check origin/main...HEAD
 
 ### Task 3: Documentation and final validation
 
-- [ ] Document the option and generic atomic release-slot use case in `README.md` and `docs/launchd-operations.md`; state that ordinary installations omit it.
-- [ ] Run focused launchd/CLI/package-install tests, then the complete validation command set.
-- [ ] Run Ralphex correctness/security and requirement/integration review to a clean result; fix every verified critical/major finding with regression coverage.
-- [ ] Verify the final public diff contains no private paths, identifiers, secrets, control-workspace files, generated output, or unrelated refactors.
-- [ ] Leave the branch clean and committed; PR/release/private wrapper/activation are post-Ralphex full-cycle steps.
+- [x] Document the option and generic atomic release-slot use case in `README.md` and `docs/launchd-operations.md`; state that ordinary installations omit it.
+- [x] Run focused launchd/CLI/package-install tests, then the complete validation command set.
+- [x] Run Ralphex correctness/security and requirement/integration review to a clean result; fix every verified critical/major finding with regression coverage.
+- [x] Verify the final public diff contains no private paths, identifiers, secrets, control-workspace files, generated output, or unrelated refactors.
+- [x] Leave the branch clean and committed; PR/release/private wrapper/activation are post-Ralphex full-cycle steps.

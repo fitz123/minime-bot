@@ -132,12 +132,15 @@ The override is not a general arbitrary-script hook. Validation requires:
 - a normalized absolute path with basename `run-cron.sh`;
 - an existing regular final file, not a final-file symlink, executable by its
   owner;
-- no symlinks for a regular path, or at most one operator-owned directory
+- no symlinks for a direct path, or at most one current-user-owned directory
   symlink for an atomic slot selector;
 - a directory-symlink target contained beneath the symlink's parent trust
   directory; and
-- current-user ownership and no group/world write bits on the trust directory,
-  resolved directories, and runner file.
+- for a direct path, current-user ownership and no group/world write bits on
+  the containing directory and runner file; or
+- for a selector path, those ownership and mode rules on the parent trust
+  directory, resolved directories, and runner file. Symlink mode bits are not
+  enforced because POSIX systems do not use them for replacement safety.
 
 Escaping, dangling, multi-symlink, wrong-owner, writable-component, missing,
 non-executable, and incorrectly named paths are rejected. Explicit override
