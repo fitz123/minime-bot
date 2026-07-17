@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.14
+
+- Strip the known trailing `Продолжение следует` ASR artifact at the shared transcription boundary while preserving legitimate occurrences and existing empty-transcript handling.
+
 ## 2026.7.13
 
 - Accept Tavily `/usage` payloads with a nullable per-key limit while preserving strict account plan/PAYGO validation, successful sampling, and quota metrics.
