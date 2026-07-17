@@ -1,5 +1,7 @@
 # Issue #71: Accept Tavily's nullable per-key usage limit
 
+Status: implementation complete and validated on 2026-07-17.
+
 ## Goal
 
 Fix the post-deploy sampler regression where Tavily returns `key.limit: null` while the required account plan and PAYGO counters remain valid. Treat the nullable per-key limit as “no key-specific cap” without fabricating a value or weakening account validation. Keep the existing provider, single-key SOPS contract, egress guards, metrics schema, and incident/recovery behavior unchanged.

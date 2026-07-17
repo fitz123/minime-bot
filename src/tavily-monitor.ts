@@ -893,18 +893,13 @@ function validHttpStatus(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 599;
 }
 
-function validQuotaCounter(value: unknown, optionalUsageFields = false): boolean {
+function validQuotaCounter(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  const allowed = optionalUsageFields
-    ? ["usage", "limit", "remaining", "searchUsage", "extractUsage"]
-    : ["usage", "limit", "remaining"];
-  return hasOnlyKeys(value, allowed) &&
+  return hasOnlyKeys(value, ["usage", "limit", "remaining"]) &&
     nonnegativeFiniteNumber(value.usage) &&
     nonnegativeFiniteNumber(value.limit) &&
     nonnegativeFiniteNumber(value.remaining) &&
-    value.remaining === Math.max(0, value.limit - value.usage) &&
-    (value.searchUsage === undefined || nonnegativeFiniteNumber(value.searchUsage)) &&
-    (value.extractUsage === undefined || nonnegativeFiniteNumber(value.extractUsage));
+    value.remaining === Math.max(0, value.limit - value.usage);
 }
 
 function validKeyQuotaCounter(value: unknown): boolean {

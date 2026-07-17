@@ -371,16 +371,20 @@ describe("Tavily usage parsing and bounded requests", () => {
 
   it("omits the key limit pair when Tavily explicitly reports a null limit", () => {
     const sample = parseTavilyUsageResponse(
-      usageResponse({ keyUsage: 700, keyLimit: null, planUsage: 100 }),
+      usageResponse({ keyUsage: 10_000, keyLimit: null, planUsage: 100 }),
       new Date("2026-07-16T09:00:00.000Z"),
     );
 
     assert.deepEqual(sample.key, {
-      usage: 700,
+      usage: 10_000,
       searchUsage: 600,
       extractUsage: 100,
     });
-    assert.equal(isTavilyUsageRecoverable(sample), true);
+    assert.equal(
+      isTavilyUsageRecoverable(sample),
+      true,
+      "high key usage remains recoverable when the provider reports no key-specific cap",
+    );
 
     const exhaustedAccount = parseTavilyUsageResponse(
       usageResponse({
