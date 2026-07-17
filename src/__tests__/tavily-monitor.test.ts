@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   lstatSync,
   mkdirSync,
@@ -149,7 +149,7 @@ function writeExhaustionEvent(
 }
 
 describe("Tavily usage parsing and bounded requests", () => {
-  it("keeps isolated usage and recovery-probe timeouts live until stalled fetches abort", async () => {
+  it("keeps isolated usage and recovery-probe timeouts live until stalled fetches abort", () => {
     const monitorModule = pathToFileURL(resolve("src/tavily-monitor.ts")).href;
     const childScript = `
       import {
@@ -207,36 +207,122 @@ describe("Tavily usage parsing and bounded requests", () => {
       }
       process.stdout.write("bounded\\n");
     `;
-    const child = spawn(
+    const child = spawnSync(
       process.execPath,
       ["--import", "tsx", "--input-type=module", "-e", childScript],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { encoding: "utf8", timeout: 5_000 },
     );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
 
-    const exitCode = await new Promise<number | null>((resolveExit, rejectExit) => {
-      const watchdog = setTimeout(() => {
-        child.kill();
-        rejectExit(new Error("isolated Tavily timeout child did not exit"));
-      }, 5_000);
-      watchdog.unref();
-      child.once("error", (error) => {
-        clearTimeout(watchdog);
-        rejectExit(error);
-      });
-      child.once("close", (code) => {
-        clearTimeout(watchdog);
-        resolveExit(code);
-      });
-    });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout, "bounded\n");
+  });
 
-    assert.equal(exitCode, 0, stderr);
-    assert.equal(stdout, "bounded\n");
+  it("cancels isolated usage and recovery-probe timers after early settlement", () => {
+    const monitorModule = pathToFileURL(resolve("src/tavily-monitor.ts")).href;
+    const childScript = `
+      import {
+        parseTavilyUsageResponse,
+        requestTavilyUsage,
+        verifyTavilyRecovery,
+      } from ${JSON.stringify(monitorModule)};
+
+      const longTimeoutMs = 60_000;
+      const usageBody = {
+        key: { usage: 1, limit: 100 },
+        account: {
+          current_plan: "Researcher",
+          plan_usage: 1,
+          plan_limit: 100,
+          paygo_usage: 0,
+          paygo_limit: 0,
+        },
+      };
+      const searchBody = {
+        results: [{ title: "Tavily", url: "https://tavily.com/", content: "Tavily" }],
+      };
+      const extractBody = {
+        results: [{ url: "https://tavily.com/", raw_content: "Tavily" }],
+      };
+      const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+      const invalidJsonResponse = () => new Response("{", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+      const sequenceFetch = (...steps) => async () => {
+        const step = steps.shift();
+        if (step instanceof Error) throw step;
+        if (!step) throw new Error("unexpected test fetch");
+        return step;
+      };
+      const expect = (condition, message) => {
+        if (!condition) throw new Error(message);
+      };
+      const usageOptions = { apiKey: "fixture-key", timeoutMs: longTimeoutMs };
+
+      const rejectedUsage = await requestTavilyUsage({
+        ...usageOptions,
+        fetchImpl: async () => { throw new Error("offline"); },
+      });
+      expect(!rejectedUsage.ok, "usage rejection path was not exercised");
+
+      const httpUsage = await requestTavilyUsage({
+        ...usageOptions,
+        fetchImpl: async () => jsonResponse({}, 503),
+      });
+      expect(!httpUsage.ok, "usage HTTP failure path was not exercised");
+
+      const invalidUsage = await requestTavilyUsage({
+        ...usageOptions,
+        fetchImpl: async () => invalidJsonResponse(),
+      });
+      expect(!invalidUsage.ok, "usage JSON failure path was not exercised");
+
+      const successfulUsage = await requestTavilyUsage({
+        ...usageOptions,
+        fetchImpl: async () => jsonResponse(usageBody),
+      });
+      expect(successfulUsage.ok, "usage success path was not exercised");
+      const sample = parseTavilyUsageResponse(usageBody);
+      const verify = (fetchImpl) => verifyTavilyRecovery({
+        apiKey: "fixture-key",
+        usageSample: sample,
+        probeTimeoutMs: longTimeoutMs,
+        fetchImpl,
+      });
+
+      const successfulRecovery = await verify(sequenceFetch(
+        jsonResponse(searchBody),
+        jsonResponse(extractBody),
+      ));
+      expect(successfulRecovery.ok, "recovery success paths were not exercised");
+
+      for (const [name, fetchImpl] of [
+        ["search rejection", sequenceFetch(new Error("offline"))],
+        ["search HTTP failure", sequenceFetch(jsonResponse({}, 503))],
+        ["search JSON failure", sequenceFetch(invalidJsonResponse())],
+        ["extract rejection", sequenceFetch(jsonResponse(searchBody), new Error("offline"))],
+        ["extract HTTP failure", sequenceFetch(jsonResponse(searchBody), jsonResponse({}, 503))],
+        ["extract JSON failure", sequenceFetch(jsonResponse(searchBody), invalidJsonResponse())],
+      ]) {
+        const result = await verify(fetchImpl);
+        expect(!result.ok, name + " path was not exercised");
+      }
+
+      process.stdout.write("cancelled\\n");
+    `;
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout, "cancelled\n");
   });
 
   it("builds authenticated GET /usage and parses all quota-relevant counters", () => {

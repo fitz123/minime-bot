@@ -1,5 +1,7 @@
 # Issue #71: Fix Linux timeout regression
 
+Status: implementation complete and validated on 2026-07-17.
+
 ## Overview
 
 Fix the source-verified Ubuntu CI failure in the new bounded Tavily request tests without expanding issue #71 scope. The failed current-head run reports `Promise resolution is still pending but the event loop has already resolved` while awaiting a stalled fetch: `timeoutController()` creates the abort timer and immediately calls `unref()`, so the timer no longer guarantees the bounded request promise can finish when no other referenced handle exists.
