@@ -94,7 +94,7 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge update --workspace <agent-workspace> --op upsert --type project --slug <slug> --frontmatter <json> --body-file <file> [--json]
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
-  minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>]
+  minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>] [--run-cron-script <absolute-path>]
   minime-bot recovery config validate --workspace <control-workspace> [--config <path>]
   minime-bot recovery status --workspace <control-workspace> [--config <path>]
   minime-bot recovery incidents|invocations --workspace <control-workspace> [--config <path>] [--id <id>] [--limit <1-100>]
@@ -111,8 +111,9 @@ const HELP_TEXT = `Usage:
   minime-bot recovery bot-rollback --restart-operation-id <reviewed-id>
 
 Options:
-  --workspace <path>  Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
-  -h, --help          Show this help text.
+  --workspace <path>         Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
+  --run-cron-script <path>  Preserve an explicit executable run-cron.sh path during launchd cron sync.
+  -h, --help                 Show this help text.
 
 Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
@@ -291,12 +292,14 @@ interface LaunchdCronSyncCliOptions {
   dryRun: boolean;
   prune: boolean;
   launchAgentsDir?: string;
+  runCronScript?: string;
 }
 
 function parseLaunchdCronSyncOptions(args: readonly string[]): LaunchdCronSyncCliOptions {
   let dryRun = false;
   let prune = true;
   let launchAgentsDir: string | undefined;
+  let runCronScript: string | undefined;
 
   for (let i = 0; i < args.length; i += 1) {
     const rawArg = args[i];
@@ -329,11 +332,36 @@ function parseLaunchdCronSyncOptions(args: readonly string[]): LaunchdCronSyncCl
       launchAgentsDir = value;
       continue;
     }
+    if (rawArg === "--run-cron-script") {
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        throw new CliUsageError("--run-cron-script requires a path");
+      }
+      if (runCronScript !== undefined) {
+        throw new CliUsageError("--run-cron-script may only be specified once");
+      }
+      runCronScript = value;
+      i += 1;
+      continue;
+    }
+    if (rawArg.startsWith("--run-cron-script=")) {
+      const value = rawArg.slice("--run-cron-script=".length);
+      if (!value) {
+        throw new CliUsageError("--run-cron-script requires a path");
+      }
+      if (runCronScript !== undefined) {
+        throw new CliUsageError("--run-cron-script may only be specified once");
+      }
+      runCronScript = value;
+      continue;
+    }
 
-    throw new CliUsageError(`unknown launchd option: ${rawArg}`);
+    const equalsIndex = rawArg.indexOf("=");
+    const optionName = equalsIndex >= 0 ? rawArg.slice(0, equalsIndex) : rawArg;
+    throw new CliUsageError(`unknown launchd option: ${optionName}`);
   }
 
-  return { dryRun, prune, launchAgentsDir };
+  return { dryRun, prune, launchAgentsDir, runCronScript };
 }
 
 function parseFrontmatterJson(raw: string): unknown {
@@ -550,7 +578,11 @@ function runLaunchdCommand(
   stdout: WriteFn,
 ): number {
   if (action !== "crons" || args[0] !== "sync") {
-    throw new CliUsageError(`unknown launchd command: ${["launchd", action, ...args].filter(Boolean).join(" ")}`);
+    const command = ["launchd", action, action === "crons" ? args[0] : undefined]
+      .filter((token): token is string => Boolean(token))
+      .map((token) => token.startsWith("--") ? token.split("=", 1)[0] : token)
+      .join(" ");
+    throw new CliUsageError(`unknown launchd command: ${command}`);
   }
 
   const commandOptions = parseLaunchdCronSyncOptions(args.slice(1));
@@ -559,6 +591,7 @@ function runLaunchdCommand(
     dryRun: commandOptions.dryRun,
     prune: commandOptions.prune,
     launchAgentsDir: commandOptions.launchAgentsDir,
+    runCronScript: commandOptions.runCronScript,
     cwd: options.cwd ?? process.cwd(),
     env: options.env ?? process.env,
     homeDir: options.launchdHomeDir,

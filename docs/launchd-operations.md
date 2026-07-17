@@ -105,6 +105,53 @@ left alone temporarily.
 Cron sync never owns the bot service label. It must not bootout, bootstrap,
 kill, signal, or otherwise restart `ai.minime.telegram-bot`.
 
+### Explicit cron runner for atomic release slots
+
+Ordinary installations should not set `--run-cron-script`. When the option is
+absent, generated plists continue to invoke the package's
+`scripts/run-cron.sh`.
+
+A deployment that maintains immutable release slots behind one atomic directory
+selector can preserve that stable lexical runner path during cron-only planning
+and sync:
+
+```bash
+minime-bot launchd crons sync --workspace /path/to/control-workspace --dry-run \
+  --run-cron-script /path/to/deployment/current/scripts/run-cron.sh
+minime-bot launchd crons sync --workspace /path/to/control-workspace \
+  --run-cron-script=/path/to/deployment/current/scripts/run-cron.sh
+```
+
+Both split and `=` forms are supported. The caller's validated lexical path is
+written to every generated cron plist; it is not replaced with the canonical
+slot path. An atomic switch of `current` can therefore select a new release
+without causing runner-only plist updates.
+
+The override is not a general arbitrary-script hook. Validation requires:
+
+- a normalized absolute path with basename `run-cron.sh`;
+- an existing regular final file, not a final-file symlink, readable and
+  executable by its owner;
+- no symlinks for a direct path, or at most one current-user-owned directory
+  symlink for an atomic slot selector;
+- a directory-symlink target contained beneath the symlink's parent trust
+  directory; and
+- for a direct path, current-user ownership and no group/world write bits on
+  the containing directory and runner file; or
+- for a selector path, those ownership and mode rules on the parent trust
+  directory, resolved directories, and runner file. Symlink mode bits are not
+  enforced because POSIX systems do not use them for replacement safety; and
+- ancestors of the direct containing directory or selector trust directory
+  must be root/current-user owned and not group/world writable. Writable sticky
+  ancestors are accepted when the protected child entry is root/current-user
+  owned.
+
+Escaping, dangling, multi-symlink, wrong-owner, writable-component, missing,
+unreadable, non-executable, and incorrectly named paths are rejected. Explicit
+override validation happens before cron loading, directory creation, plist
+writes, pruning, or `plutil`/`launchctl` execution. Dry-run remains zero-write
+and zero-command.
+
 ## Cron deploy versus bot restart
 
 Cron prompt and timeout changes are runtime config changes, not bot restart

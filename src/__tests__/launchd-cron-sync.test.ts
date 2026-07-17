@@ -1,8 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   generateLaunchdCronPlists,
   syncLaunchdCrons,
@@ -25,7 +35,7 @@ interface CommandCall {
 }
 
 function createFixture(prefix = "minime-launchd-crons-"): Fixture {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const workspace = join(root, "workspace");
   const home = join(root, "home");
   const logDir = join(root, "logs");
@@ -76,6 +86,452 @@ function captureRunner(calls: CommandCall[], bootoutStatus = 0): LaunchdCommandR
 function cleanup(fixture: Fixture): void {
   rmSync(fixture.root, { recursive: true, force: true });
 }
+
+function writeRunner(directory: string, mode = 0o700): string {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const runner = join(directory, "run-cron.sh");
+  writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(runner, mode);
+  return runner;
+}
+
+function generateWithRunner(fixture: Fixture, runCronScript?: string) {
+  writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+  return generateLaunchdCronPlists({
+    workspace: fixture.workspace,
+    launchAgentsDir: fixture.launchAgentsDir,
+    runCronScript,
+    env: fixture.env,
+    homeDir: fixture.home,
+  });
+}
+
+function assertRunCronRejection(
+  action: () => unknown,
+  suppliedValue: string,
+  expectedInvariant: RegExp,
+): void {
+  assert.throws(action, (err: unknown) => {
+    assert.ok(err instanceof Error);
+    assert.match(err.message, expectedInvariant);
+    assert.equal(err.message.includes(suppliedValue), false);
+    return true;
+  });
+}
+
+describe("launchd cron runner selection", () => {
+  it("keeps the package-root runner as the default", () => {
+    const fixture = createFixture();
+    try {
+      const result = generateWithRunner(fixture);
+      const expectedRunner = join(result.context.packageRoot, "scripts", "run-cron.sh");
+
+      assert.equal(result.context.runCronScript, expectedRunner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(expectedRunner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("accepts and preserves an explicit regular executable runner", () => {
+    const fixture = createFixture();
+    try {
+      const runner = writeRunner(join(fixture.root, "deployment", "scripts"));
+      const result = generateWithRunner(fixture, runner);
+
+      assert.equal(result.context.runCronScript, runner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(runner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("accepts a current-user-owned runner beneath a writable sticky ancestor", () => {
+    const fixture = createFixture();
+    try {
+      const stickyParent = join(fixture.root, "sticky-parent");
+      mkdirSync(stickyParent, { mode: 0o700 });
+      const runner = writeRunner(join(stickyParent, "owned-deployment", "scripts"));
+      chmodSync(stickyParent, 0o1777);
+
+      const result = generateWithRunner(fixture, runner);
+
+      assert.equal(result.context.runCronScript, runner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(runner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("accepts one contained current directory symlink and preserves its lexical path", () => {
+    const fixture = createFixture();
+    try {
+      const deployment = join(fixture.root, "deployment");
+      const runner = writeRunner(join(deployment, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      const result = generateWithRunner(fixture, lexicalRunner);
+
+      assert.notEqual(lexicalRunner, runner);
+      assert.equal(result.context.runCronScript, lexicalRunner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(lexicalRunner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("accepts a contained selector target whose directory name starts with two dots", () => {
+    const fixture = createFixture();
+    try {
+      const deployment = join(fixture.root, "deployment");
+      const runner = writeRunner(join(deployment, "..slots", "blue", "scripts"));
+      symlinkSync(join("..slots", "blue"), join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      const result = generateWithRunner(fixture, lexicalRunner);
+
+      assert.notEqual(lexicalRunner, runner);
+      assert.equal(result.context.runCronScript, lexicalRunner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(lexicalRunner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects selector targets that hide symlinks behind parent traversal", () => {
+    const fixture = createFixture();
+    try {
+      const deployment = join(fixture.root, "deployment");
+      writeRunner(join(deployment, "slots", "blue", "scripts"));
+
+      const external = join(fixture.root, "external");
+      const externalNested = join(external, "nested");
+      mkdirSync(externalNested, { recursive: true });
+      symlinkSync(externalNested, join(deployment, "pivot"), "dir");
+      symlinkSync(join(deployment, "slots"), join(external, "slots"), "dir");
+      chmodSync(external, 0o777);
+
+      symlinkSync("pivot/../slots/blue", join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, lexicalRunner),
+        lexicalRunner,
+        /Invalid run cron script override: directory symlink target must not contain parent directory references/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects relative, unnormalized, missing, wrong-name, unreadable, and non-executable runners", () => {
+    const fixture = createFixture();
+    try {
+      const relativeRunner = "relative/run-cron.sh";
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, "relative/run-cron.sh"),
+        relativeRunner,
+        /Invalid run cron script override: must be an absolute path/,
+      );
+
+      const validRunner = writeRunner(join(fixture.root, "normalized", "scripts"));
+      const unnormalizedRunner = `${dirname(validRunner)}/../scripts/run-cron.sh`;
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, unnormalizedRunner),
+        unnormalizedRunner,
+        /Invalid run cron script override: path must be normalized/,
+      );
+
+      const missingRunner = join(fixture.root, "missing", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, missingRunner),
+        missingRunner,
+        /Invalid run cron script override: must resolve to an existing path/,
+      );
+
+      const nonRegular = join(fixture.root, "non-regular", "run-cron.sh");
+      mkdirSync(nonRegular, { recursive: true });
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, nonRegular),
+        nonRegular,
+        /Invalid run cron script override: must resolve to a regular file/,
+      );
+
+      const wrongName = join(fixture.root, "normalized", "scripts", "runner.sh");
+      writeFileSync(wrongName, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(wrongName, 0o700);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, wrongName),
+        wrongName,
+        /Invalid run cron script override: basename must be run-cron\.sh/,
+      );
+
+      const nonExecutable = writeRunner(join(fixture.root, "non-executable"), 0o600);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, nonExecutable),
+        nonExecutable,
+        /Invalid run cron script override: file must be readable and executable by its owner/,
+      );
+
+      const unreadable = writeRunner(join(fixture.root, "unreadable"), 0o100);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, unreadable),
+        unreadable,
+        /Invalid run cron script override: file must be readable and executable by its owner/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects final-file, dangling, escaping, and multiple symlinks", () => {
+    const fixture = createFixture();
+    try {
+      const finalLinkDir = join(fixture.root, "final-link");
+      mkdirSync(finalLinkDir, { recursive: true });
+      const finalTarget = join(finalLinkDir, "runner-target");
+      writeFileSync(finalTarget, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(finalTarget, 0o700);
+      const finalLink = join(finalLinkDir, "run-cron.sh");
+      symlinkSync("runner-target", finalLink, "file");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, finalLink),
+        finalLink,
+        /Invalid run cron script override: final file must not be a symlink/,
+      );
+
+      const danglingDeployment = join(fixture.root, "dangling-deployment");
+      mkdirSync(danglingDeployment, { recursive: true });
+      symlinkSync(join("slots", "missing"), join(danglingDeployment, "current"), "dir");
+      const danglingRunner = join(danglingDeployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, danglingRunner),
+        danglingRunner,
+        /Invalid run cron script override: must resolve to an existing path/,
+      );
+
+      const escapingDeployment = join(fixture.root, "escaping-deployment");
+      const outsideRunner = writeRunner(join(fixture.root, "outside-slot", "scripts"));
+      mkdirSync(escapingDeployment, { recursive: true });
+      symlinkSync(join("..", "outside-slot"), join(escapingDeployment, "current"), "dir");
+      const escapingRunner = join(escapingDeployment, "current", "scripts", "run-cron.sh");
+      assert.notEqual(escapingRunner, outsideRunner);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, escapingRunner),
+        escapingRunner,
+        /Invalid run cron script override: directory symlink target must not contain parent directory references/,
+      );
+
+      const multipleDeployment = join(fixture.root, "multiple-deployment");
+      const slot = join(multipleDeployment, "slots", "blue");
+      writeRunner(join(slot, "real-scripts"));
+      symlinkSync("real-scripts", join(slot, "scripts"), "dir");
+      symlinkSync(join("slots", "blue"), join(multipleDeployment, "current"), "dir");
+      const multipleRunner = join(multipleDeployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, multipleRunner),
+        multipleRunner,
+        /Invalid run cron script override: path must contain at most one directory symlink/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects writable regular, trust, resolved-directory, and file components", () => {
+    const fixture = createFixture();
+    try {
+      const writableDir = join(fixture.root, "writable");
+      const writableRunner = writeRunner(writableDir);
+      chmodSync(writableDir, 0o777);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableRunner),
+        writableRunner,
+        /Invalid run cron script override: containing directory must not be group or world writable/,
+      );
+
+      const writableFile = writeRunner(join(fixture.root, "writable-file"), 0o722);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableFile),
+        writableFile,
+        /Invalid run cron script override: file must not be group or world writable/,
+      );
+
+      const writableTrust = join(fixture.root, "writable-trust");
+      writeRunner(join(writableTrust, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(writableTrust, "current"), "dir");
+      chmodSync(writableTrust, 0o777);
+      const writableTrustRunner = join(writableTrust, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableTrustRunner),
+        writableTrustRunner,
+        /Invalid run cron script override: trust directory must not be group or world writable/,
+      );
+
+      const writableSlot = join(fixture.root, "writable-slot");
+      writeRunner(join(writableSlot, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(writableSlot, "current"), "dir");
+      chmodSync(join(writableSlot, "slots", "blue"), 0o777);
+      const writableSlotRunner = join(writableSlot, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableSlotRunner),
+        writableSlotRunner,
+        /Invalid run cron script override: resolved directory must not be group or world writable/,
+      );
+
+      const writableScripts = join(fixture.root, "writable-scripts");
+      writeRunner(join(writableScripts, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(writableScripts, "current"), "dir");
+      chmodSync(join(writableScripts, "slots", "blue", "scripts"), 0o777);
+      const writableScriptsRunner = join(writableScripts, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableScriptsRunner),
+        writableScriptsRunner,
+        /Invalid run cron script override: resolved directory must not be group or world writable/,
+      );
+
+      const writableSelectorFile = join(fixture.root, "writable-selector-file");
+      writeRunner(join(writableSelectorFile, "slots", "blue", "scripts"), 0o722);
+      symlinkSync(join("slots", "blue"), join(writableSelectorFile, "current"), "dir");
+      const writableSelectorRunner = join(
+        writableSelectorFile,
+        "current",
+        "scripts",
+        "run-cron.sh",
+      );
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, writableSelectorRunner),
+        writableSelectorRunner,
+        /Invalid run cron script override: file must not be group or world writable/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects replaceable ancestors above direct and selector trust directories", () => {
+    const fixture = createFixture();
+    try {
+      const directParent = join(fixture.root, "replaceable-direct-parent");
+      const directRunner = writeRunner(join(directParent, "deployment", "scripts"));
+      chmodSync(directParent, 0o777);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, directRunner),
+        directRunner,
+        /Invalid run cron script override: ancestor directories must not be group or world writable unless sticky/,
+      );
+
+      const selectorParent = join(fixture.root, "replaceable-selector-parent");
+      const deployment = join(selectorParent, "deployment");
+      writeRunner(join(deployment, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(deployment, "current"), "dir");
+      chmodSync(selectorParent, 0o777);
+      const selectorRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, selectorRunner),
+        selectorRunner,
+        /Invalid run cron script override: ancestor directories must not be group or world writable unless sticky/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects wrong-owner regular and atomic-selector components", (t) => {
+    const regularFixture = createFixture();
+    try {
+      const ownedRunner = writeRunner(join(regularFixture.root, "wrong-owner"));
+      if (typeof process.getuid !== "function") {
+        assert.fail("ownership test requires process.getuid");
+      }
+      const actualUid = process.getuid();
+      t.mock.method(process as { getuid: () => number }, "getuid", () => actualUid + 1);
+      assertRunCronRejection(
+        () => generateWithRunner(regularFixture, ownedRunner),
+        ownedRunner,
+        /Invalid run cron script override: containing directory must be owned by the current user/,
+      );
+    } finally {
+      cleanup(regularFixture);
+      t.mock.restoreAll();
+    }
+
+    const selectorFixture = createFixture();
+    try {
+      const deployment = join(selectorFixture.root, "wrong-owner-selector");
+      writeRunner(join(deployment, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(deployment, "current"), "dir");
+
+      if (typeof process.getuid !== "function") {
+        assert.fail("ownership test requires process.getuid");
+      }
+      const actualUid = process.getuid();
+      t.mock.method(process as { getuid: () => number }, "getuid", () => actualUid + 1);
+      const selectorRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(selectorFixture, selectorRunner),
+        selectorRunner,
+        /Invalid run cron script override: directory symlink must be owned by the current user/,
+      );
+    } finally {
+      cleanup(selectorFixture);
+    }
+  });
+
+  it("rejects an invalid override before cron loading, writes, or commands", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, "crons:\n  - name: [");
+      const untouchedLaunchAgentsDir = join(fixture.root, "untouched", "LaunchAgents");
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: untouchedLaunchAgentsDir,
+          runCronScript: "relative/run-cron.sh",
+          env: fixture.env,
+          homeDir: fixture.home,
+          commandRunner: captureRunner(calls),
+        }),
+        /Invalid run cron script override: must be an absolute path/,
+      );
+      assert.equal(existsSync(untouchedLaunchAgentsDir), false);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("keeps valid override dry-run zero-write with absent output directories", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const untouchedLaunchAgentsDir = join(fixture.root, "dry-run", "LaunchAgents");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: untouchedLaunchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: fixture.env,
+        homeDir: fixture.home,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "create:ai.minime.cron.active",
+      ]);
+      assert.equal(result.context.runCronScript, runner);
+      assert.equal(existsSync(untouchedLaunchAgentsDir), false);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+});
 
 describe("launchd cron plist sync", () => {
   it("uses crons.local.yaml overrides when rendering StartCalendarInterval", () => {
@@ -220,6 +676,7 @@ describe("launchd cron plist sync", () => {
     const calls: CommandCall[] = [];
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
       writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
@@ -228,6 +685,7 @@ describe("launchd cron plist sync", () => {
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         dryRun: true,
         env: fixture.env,
         homeDir: fixture.home,
@@ -236,6 +694,7 @@ describe("launchd cron plist sync", () => {
       });
 
       assert.equal(calls.length, 0);
+      assert.equal(result.context.runCronScript, runner);
       assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.active.plist")), false);
       assert.match(readFileSync(stalePath, "utf8"), /ai\.minime\.cron\.stale/);
       assert.equal(readFileSync(botPath, "utf8"), "bot");
@@ -313,6 +772,45 @@ describe("launchd cron plist sync", () => {
     }
   });
 
+  it("applies and rebootstraps a plist with the lexical atomic-selector runner", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const deployment = join(fixture.root, "deployment");
+      const canonicalRunner = writeRunner(join(deployment, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: lexicalRunner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      const plistPath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      const content = readFileSync(plistPath, "utf8");
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "create:ai.minime.cron.active",
+      ]);
+      assert.equal(result.context.runCronScript, lexicalRunner);
+      assert.match(content, new RegExp(`<string>${escapeRegex(lexicalRunner)}</string>`));
+      assert.doesNotMatch(content, new RegExp(`<string>${escapeRegex(canonicalRunner)}</string>`));
+      assert.deepEqual(calls.map((call) => [call.command, call.args[0]]), [
+        ["/usr/bin/plutil", "-lint"],
+        ["/bin/launchctl", "bootout"],
+        ["/bin/launchctl", "bootstrap"],
+      ]);
+      assert.equal(calls[2].args[2], plistPath);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("keeps stale cron plists when prune is disabled", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
@@ -339,14 +837,16 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("does not run commands for unchanged active plists", () => {
+  it("keeps a matching explicit-runner plist unchanged without running commands", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const generated = generateLaunchdCronPlists({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         env: fixture.env,
         homeDir: fixture.home,
         uid: 501,
@@ -356,6 +856,7 @@ describe("launchd cron plist sync", () => {
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         env: fixture.env,
         homeDir: fixture.home,
         uid: 501,
@@ -366,6 +867,70 @@ describe("launchd cron plist sync", () => {
         "unchanged:ai.minime.cron.active",
       ]);
       assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("plans only one create when adding a cron with matching explicit-runner plists", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    const runner = writeRunner(join(fixture.root, "release", "scripts"));
+    const cronsYaml = (includeNew: boolean): string => [
+      "crons:",
+      "  - name: existing-morning",
+      '    schedule: "0 8 * * *"',
+      '    prompt: "run morning task"',
+      "    agentId: main",
+      "    deliveryChatId: 111",
+      "  - name: existing-evening",
+      '    schedule: "0 18 * * *"',
+      '    prompt: "run evening task"',
+      "    agentId: main",
+      "    deliveryChatId: 111",
+      ...(includeNew ? [
+        "  - name: new-midday",
+        '    schedule: "0 12 * * *"',
+        '    prompt: "run midday task"',
+        "    agentId: main",
+        "    deliveryChatId: 111",
+      ] : []),
+      "",
+    ].join("\n");
+
+    try {
+      writeCrons(fixture.workspace, cronsYaml(false));
+      const initial = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      for (const plist of initial.plists) {
+        writeFileSync(plist.plistPath, plist.content, "utf8");
+      }
+      writeCrons(fixture.workspace, cronsYaml(true));
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "unchanged:ai.minime.cron.existing-evening",
+        "unchanged:ai.minime.cron.existing-morning",
+        "create:ai.minime.cron.new-midday",
+      ]);
+      assert.equal(calls.length, 0);
+      assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.new-midday.plist")), false);
     } finally {
       cleanup(fixture);
     }

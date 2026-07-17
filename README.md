@@ -419,6 +419,35 @@ minime-bot launchd crons sync --workspace /path/to/control-workspace --no-prune
 minime-bot launchd crons sync --workspace /path/to/control-workspace --launch-agents-dir /tmp/LaunchAgents
 ```
 
+Ordinary installations should omit `--run-cron-script`; cron plists then use
+the package's `scripts/run-cron.sh`. A deployment that atomically switches
+between release slots may preserve its stable selector path during cron-only
+sync, including dry-run, with an explicit override:
+
+```bash
+minime-bot launchd crons sync --workspace /path/to/control-workspace \
+  --run-cron-script /path/to/deployment/current/scripts/run-cron.sh
+```
+
+The override is deliberately narrow. It must be a normalized absolute path to
+an existing regular file named `run-cron.sh`, with owner read and execute bits.
+A direct path's containing directory and file must be current-user owned and
+not group/world writable. At most one current-user-owned directory symlink is
+allowed; its target must stay below its parent trust directory, and that trust
+directory, the resolved directories, and the file must meet the same ownership
+and mode rules. Ancestors of the containing or trust directory must be owned by
+root or the current user and must not be group/world writable; writable sticky
+ancestors are allowed when their path entry is root/current-user owned. Invalid
+overrides fail before plist writes or launchd commands.
+The validated lexical path is retained in the plist so an atomic `current`
+selector can switch slots without rewriting cron plists.
+
+Programmatic callers of `generateLaunchdCronPlists()`,
+`writeLaunchdCronPlists()`, `planLaunchdCronSync()`, and `syncLaunchdCrons()`
+may pass the same path as `runCronScript`. Explicit API values use the same
+validation and lexical-path behavior as the CLI option and fail before cron
+loading or side effects.
+
 The sync command owns only the `ai.minime.cron.*` namespace. By default it
 creates or updates active cron plists, lint-checks changed plists, re-bootstraps
 changed active cron labels, and prunes stale or disabled owned cron plists by
