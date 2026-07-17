@@ -143,7 +143,7 @@ function captureRunner(calls: CommandCall[]): LaunchdCommandRunner {
 }
 
 function writeRunner(directory: string): string {
-  mkdirSync(directory, { recursive: true });
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const runner = join(directory, "run-cron.sh");
   writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
   chmodSync(runner, 0o700);

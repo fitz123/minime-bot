@@ -627,8 +627,8 @@ function validateOwnedRunCronComponent(
   if ((stats.mode & 0o022) !== 0) {
     throw invalidRunCronScript(`${kind} must not be group or world writable`);
   }
-  if (requireExecutable && (stats.mode & 0o100) === 0) {
-    throw invalidRunCronScript("file must be executable by its owner");
+  if (requireExecutable && (stats.mode & 0o500) !== 0o500) {
+    throw invalidRunCronScript("file must be readable and executable by its owner");
   }
 }
 
@@ -646,7 +646,7 @@ function absolutePathComponents(path: string): string[] {
 
 function pathComponentsBetween(parent: string, child: string): string[] {
   const rel = relative(parent, child);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw invalidRunCronScript("resolved file must remain beneath the symlink trust directory");
   }
   const components: string[] = [];
@@ -883,7 +883,7 @@ function xmlEscape(value: string): string {
 
 function pathInside(dir: string, path: string): boolean {
   const rel = relative(dir, path);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 function resolveCliPath(path: string, cwd: string): string {

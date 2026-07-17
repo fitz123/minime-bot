@@ -88,7 +88,7 @@ function cleanup(fixture: Fixture): void {
 }
 
 function writeRunner(directory: string, mode = 0o700): string {
-  mkdirSync(directory, { recursive: true });
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const runner = join(directory, "run-cron.sh");
   writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
   chmodSync(runner, mode);
@@ -163,7 +163,24 @@ describe("launchd cron runner selection", () => {
     }
   });
 
-  it("rejects relative, unnormalized, missing, wrong-name, and non-executable runners", () => {
+  it("accepts a contained selector target whose directory name starts with two dots", () => {
+    const fixture = createFixture();
+    try {
+      const deployment = join(fixture.root, "deployment");
+      const runner = writeRunner(join(deployment, "..slots", "blue", "scripts"));
+      symlinkSync(join("..slots", "blue"), join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      const result = generateWithRunner(fixture, lexicalRunner);
+
+      assert.notEqual(lexicalRunner, runner);
+      assert.equal(result.context.runCronScript, lexicalRunner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(lexicalRunner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects relative, unnormalized, missing, wrong-name, unreadable, and non-executable runners", () => {
     const fixture = createFixture();
     try {
       const relativeRunner = "relative/run-cron.sh";
@@ -209,7 +226,14 @@ describe("launchd cron runner selection", () => {
       assertRunCronRejection(
         () => generateWithRunner(fixture, nonExecutable),
         nonExecutable,
-        /Invalid run cron script override: file must be executable by its owner/,
+        /Invalid run cron script override: file must be readable and executable by its owner/,
+      );
+
+      const unreadable = writeRunner(join(fixture.root, "unreadable"), 0o100);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, unreadable),
+        unreadable,
+        /Invalid run cron script override: file must be readable and executable by its owner/,
       );
     } finally {
       cleanup(fixture);

@@ -1,5 +1,7 @@
 # Preserve explicit cron runner during launchd sync (#84)
 
+Status: implementation complete and validated on 2026-07-17.
+
 ## Goal
 
 Add a narrow, deployment-owned `--run-cron-script <absolute-path>` override to launchd cron generation/sync so a recovery deployment can preserve its atomic active-slot runner during cron-only dry-run and apply. Keep package-root runner behavior unchanged when the option is absent. Fail closed on unsafe overrides before any filesystem or launchctl mutation.
@@ -18,7 +20,7 @@ Public scope is package code/tests/docs only. Private deployment-wrapper wiring 
 
 - CLI/API name: `--run-cron-script`; support both split and `=` CLI forms. API option: `runCronScript?: string` on generation/planning/sync options.
 - The default remains the normalized package-root `scripts/run-cron.sh` path and retains current compatibility.
-- An explicit value must be a normalized absolute path whose basename is `run-cron.sh`; it must resolve to an existing regular executable file.
+- An explicit value must be a normalized absolute path whose basename is `run-cron.sh`; it must resolve to an existing regular file that is readable and executable by its owner.
 - Preserve the caller's validated lexical path in rendered plists so an atomic `current` symlink remains stable across slot switches; use canonical paths only for validation.
 - Symlink policy: allow at most one current-user-owned directory symlink component (the atomic slot selector), never a final-file symlink. Its resolved target must remain beneath the symlink's parent trust directory. The trust directory, resolved directories, and file must be owned by the current user and not group/world writable; POSIX symlink mode bits are not enforced because replacement safety comes from the parent trust directory. Reject escaping, dangling, multi-symlink, wrong-owner, or writable components. Regular non-symlink fixtures are allowed when their containing directory and file meet the same owner/mode rules.
 - Validate the explicit override while resolving context, before cron loading, directory creation, plist writes, pruning, or launchctl/plutil commands. Dry-run remains zero-write/zero-command.
@@ -43,9 +45,9 @@ git diff --check origin/main...HEAD
 ### Task 1: Add the safe API override
 
 - [x] Extend launchd generation/sync options with `runCronScript?: string` and resolve it through a dedicated validation helper.
-- [x] Implement the absolute/normalized/name/executable/ownership/mode/symlink-containment policy above without changing default package-root behavior.
+- [x] Implement the absolute/normalized/name/readable-executable/ownership/mode/symlink-containment policy above without changing default package-root behavior.
 - [x] Keep the validated lexical path in `LaunchdCronContext.runCronScript` and fail before mutation/commands.
-- [x] Add focused tests proving default behavior, explicit regular runner behavior, accepted atomic `current` directory symlink, and rejection of relative, missing, non-executable, wrong-name, final-symlink, escaping, multiple-symlink, and writable-component inputs.
+- [x] Add focused tests proving default behavior, explicit regular runner behavior, accepted atomic `current` directory symlink, and rejection of relative, missing, unreadable, non-executable, wrong-name, final-symlink, escaping, multiple-symlink, and writable-component inputs.
 
 ### Task 2: Wire CLI, planning, and narrow-sync regressions
 

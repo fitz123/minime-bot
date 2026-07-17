@@ -130,8 +130,8 @@ without causing runner-only plist updates.
 The override is not a general arbitrary-script hook. Validation requires:
 
 - a normalized absolute path with basename `run-cron.sh`;
-- an existing regular final file, not a final-file symlink, executable by its
-  owner;
+- an existing regular final file, not a final-file symlink, readable and
+  executable by its owner;
 - no symlinks for a direct path, or at most one current-user-owned directory
   symlink for an atomic slot selector;
 - a directory-symlink target contained beneath the symlink's parent trust
@@ -143,10 +143,10 @@ The override is not a general arbitrary-script hook. Validation requires:
   enforced because POSIX systems do not use them for replacement safety.
 
 Escaping, dangling, multi-symlink, wrong-owner, writable-component, missing,
-non-executable, and incorrectly named paths are rejected. Explicit override
-validation happens before cron loading, directory creation, plist writes,
-pruning, or `plutil`/`launchctl` execution. Dry-run remains zero-write and
-zero-command.
+unreadable, non-executable, and incorrectly named paths are rejected. Explicit
+override validation happens before cron loading, directory creation, plist
+writes, pruning, or `plutil`/`launchctl` execution. Dry-run remains zero-write
+and zero-command.
 
 ## Cron deploy versus bot restart
 

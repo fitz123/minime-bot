@@ -430,14 +430,20 @@ minime-bot launchd crons sync --workspace /path/to/control-workspace \
 ```
 
 The override is deliberately narrow. It must be a normalized absolute path to
-an existing, owner-executable regular file named `run-cron.sh`. A direct path's
-containing directory and file must be current-user owned and not group/world
-writable. At most one current-user-owned directory symlink is allowed; its
-target must stay below its parent trust directory, and that trust directory,
-the resolved directories, and the file must meet the same ownership and mode
-rules. Invalid overrides fail before plist writes or launchd commands. The
-validated lexical path is retained in the plist so an atomic `current` selector
-can switch slots without rewriting cron plists.
+an existing regular file named `run-cron.sh`, with owner read and execute bits.
+A direct path's containing directory and file must be current-user owned and
+not group/world writable. At most one current-user-owned directory symlink is
+allowed; its target must stay below its parent trust directory, and that trust
+directory, the resolved directories, and the file must meet the same ownership
+and mode rules. Invalid overrides fail before plist writes or launchd commands.
+The validated lexical path is retained in the plist so an atomic `current`
+selector can switch slots without rewriting cron plists.
+
+Programmatic callers of `generateLaunchdCronPlists()`,
+`writeLaunchdCronPlists()`, `planLaunchdCronSync()`, and `syncLaunchdCrons()`
+may pass the same path as `runCronScript`. Explicit API values use the same
+validation and lexical-path behavior as the CLI option and fail before cron
+loading or side effects.
 
 The sync command owns only the `ai.minime.cron.*` namespace. By default it
 creates or updates active cron plists, lint-checks changed plists, re-bootstraps
