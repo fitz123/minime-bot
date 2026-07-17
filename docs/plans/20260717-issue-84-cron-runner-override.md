@@ -42,10 +42,10 @@ git diff --check origin/main...HEAD
 
 ### Task 1: Add the safe API override
 
-- [ ] Extend launchd generation/sync options with `runCronScript?: string` and resolve it through a dedicated validation helper.
-- [ ] Implement the absolute/normalized/name/executable/ownership/mode/symlink-containment policy above without changing default package-root behavior.
-- [ ] Keep the validated lexical path in `LaunchdCronContext.runCronScript` and fail before mutation/commands.
-- [ ] Add focused tests proving default behavior, explicit regular runner behavior, accepted atomic `current` directory symlink, and rejection of relative, missing, non-executable, wrong-name, final-symlink, escaping, multiple-symlink, and writable-component inputs.
+- [x] Extend launchd generation/sync options with `runCronScript?: string` and resolve it through a dedicated validation helper.
+- [x] Implement the absolute/normalized/name/executable/ownership/mode/symlink-containment policy above without changing default package-root behavior.
+- [x] Keep the validated lexical path in `LaunchdCronContext.runCronScript` and fail before mutation/commands.
+- [x] Add focused tests proving default behavior, explicit regular runner behavior, accepted atomic `current` directory symlink, and rejection of relative, missing, non-executable, wrong-name, final-symlink, escaping, multiple-symlink, and writable-component inputs.
 
 ### Task 2: Wire CLI, planning, and narrow-sync regressions
 

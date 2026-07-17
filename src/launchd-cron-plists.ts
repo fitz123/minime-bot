@@ -1,15 +1,30 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
+  readlinkSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { basename, isAbsolute, join, normalize, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { loadMergedCrons } from "./cron-loader.js";
 import {
   expandCronField,
@@ -66,6 +81,7 @@ export interface RenderedLaunchdCronPlist {
 export interface GenerateLaunchdCronPlistsOptions {
   workspace?: string;
   launchAgentsDir?: string;
+  runCronScript?: string;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeDir?: string;
@@ -457,12 +473,15 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
   const uid = options.uid ?? resolveUid();
   const launchctlBin = env.LAUNCHCTL_BIN?.trim() || DEFAULT_LAUNCHCTL_BIN;
   const plutilBin = env.PLUTIL_BIN?.trim() || DEFAULT_PLUTIL_BIN;
+  const runCronScript = options.runCronScript === undefined
+    ? resolve(contract.paths.packageRoot, "scripts", "run-cron.sh")
+    : validateExplicitRunCronScript(options.runCronScript);
   return {
     contract,
     launchAgentsDir,
     logDir: contract.paths.logDir,
     packageRoot: contract.paths.packageRoot,
-    runCronScript: resolve(contract.paths.packageRoot, "scripts", "run-cron.sh"),
+    runCronScript,
     homeDir,
     uid,
     launchdDomain: `gui/${uid}`,
@@ -471,6 +490,180 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
     env,
     cwd,
   };
+}
+
+function validateExplicitRunCronScript(runCronScript: string): string {
+  if (!isAbsolute(runCronScript)) {
+    throw invalidRunCronScript("must be an absolute path");
+  }
+  if (normalize(runCronScript) !== runCronScript || resolve(runCronScript) !== runCronScript) {
+    throw invalidRunCronScript("path must be normalized");
+  }
+  if (basename(runCronScript) !== "run-cron.sh") {
+    throw invalidRunCronScript("basename must be run-cron.sh");
+  }
+
+  const symlinks = new Map<string, Stats>();
+  inspectRunCronPath(runCronScript, symlinks);
+  if (symlinks.size > 1) {
+    throw invalidRunCronScript("path must contain at most one directory symlink");
+  }
+
+  const finalStats = inspectRunCronComponent(runCronScript);
+  if (finalStats.isSymbolicLink()) {
+    throw invalidRunCronScript("final file must not be a symlink");
+  }
+  if (!finalStats.isFile()) {
+    throw invalidRunCronScript("must resolve to a regular file");
+  }
+
+  const currentUid = resolveUid();
+  if (symlinks.size === 0) {
+    validateOwnedRunCronComponent(dirname(runCronScript), currentUid, "containing directory");
+    validateOwnedRunCronComponent(runCronScript, currentUid, "file", true);
+    return runCronScript;
+  }
+
+  const [symlinkPath, symlinkStats] = symlinks.entries().next().value!;
+  if (symlinkStats.uid !== currentUid) {
+    throw invalidRunCronScript("directory symlink must be owned by the current user");
+  }
+  // POSIX symlink mode bits are not enforced and normally read as 0777. The
+  // non-writable, owner-controlled trust directory governs replacement of the link.
+
+  const trustDir = dirname(symlinkPath);
+  const canonicalTrustDir = inspectRunCronRealpath(trustDir, "trust directory must exist");
+  const rawTarget = resolve(trustDir, inspectRunCronReadlink(symlinkPath));
+  inspectRunCronPath(rawTarget, symlinks);
+  if (symlinks.size > 1) {
+    throw invalidRunCronScript("path must contain at most one directory symlink");
+  }
+
+  let canonicalTarget: string;
+  try {
+    const targetStats = statSync(symlinkPath);
+    if (!targetStats.isDirectory()) {
+      throw invalidRunCronScript("directory symlink must resolve to a directory");
+    }
+    canonicalTarget = realpathSync(symlinkPath);
+  } catch (err) {
+    if (isInvalidRunCronScriptError(err)) {
+      throw err;
+    }
+    throw invalidRunCronScript("directory symlink must resolve to an existing directory");
+  }
+  if (!pathInside(canonicalTrustDir, canonicalTarget)) {
+    throw invalidRunCronScript("directory symlink target must remain beneath its parent trust directory");
+  }
+
+  const canonicalRunCronScript = inspectRunCronRealpath(runCronScript, "must resolve to an existing file");
+  if (!pathInside(canonicalTrustDir, canonicalRunCronScript)) {
+    throw invalidRunCronScript("resolved file must remain beneath the symlink trust directory");
+  }
+
+  validateOwnedRunCronComponent(canonicalTrustDir, currentUid, "trust directory");
+  for (const component of pathComponentsBetween(canonicalTrustDir, canonicalRunCronScript)) {
+    const isFile = component === canonicalRunCronScript;
+    validateOwnedRunCronComponent(component, currentUid, isFile ? "file" : "resolved directory", isFile);
+  }
+  return runCronScript;
+}
+
+function inspectRunCronPath(
+  path: string,
+  symlinks: Map<string, Stats>,
+): void {
+  const components = absolutePathComponents(path);
+  for (let index = 0; index < components.length; index += 1) {
+    const component = components[index];
+    const stats = inspectRunCronComponent(component);
+    if (stats.isSymbolicLink()) {
+      symlinks.set(component, stats);
+      if (symlinks.size > 1) {
+        throw invalidRunCronScript("path must contain at most one directory symlink");
+      }
+      continue;
+    }
+    if (index < components.length - 1 && !stats.isDirectory()) {
+      throw invalidRunCronScript("path contains a component that is not a directory");
+    }
+  }
+}
+
+function inspectRunCronComponent(path: string): Stats {
+  try {
+    return lstatSync(path);
+  } catch {
+    throw invalidRunCronScript("must resolve to an existing path");
+  }
+}
+
+function inspectRunCronRealpath(path: string, invariant: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    throw invalidRunCronScript(invariant);
+  }
+}
+
+function inspectRunCronReadlink(path: string): string {
+  try {
+    return readlinkSync(path);
+  } catch {
+    throw invalidRunCronScript("directory symlink target must be readable");
+  }
+}
+
+function validateOwnedRunCronComponent(
+  path: string,
+  currentUid: number,
+  kind: string,
+  requireExecutable = false,
+): void {
+  const stats = inspectRunCronComponent(path);
+  if (stats.uid !== currentUid) {
+    throw invalidRunCronScript(`${kind} must be owned by the current user`);
+  }
+  if ((stats.mode & 0o022) !== 0) {
+    throw invalidRunCronScript(`${kind} must not be group or world writable`);
+  }
+  if (requireExecutable && (stats.mode & 0o100) === 0) {
+    throw invalidRunCronScript("file must be executable by its owner");
+  }
+}
+
+function absolutePathComponents(path: string): string[] {
+  const root = parse(path).root;
+  const names = path.slice(root.length).split(sep).filter(Boolean);
+  const components: string[] = [];
+  let current = root;
+  for (const name of names) {
+    current = join(current, name);
+    components.push(current);
+  }
+  return components;
+}
+
+function pathComponentsBetween(parent: string, child: string): string[] {
+  const rel = relative(parent, child);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw invalidRunCronScript("resolved file must remain beneath the symlink trust directory");
+  }
+  const components: string[] = [];
+  let current = parent;
+  for (const name of rel.split(sep)) {
+    current = join(current, name);
+    components.push(current);
+  }
+  return components;
+}
+
+function invalidRunCronScript(invariant: string): Error {
+  return new Error(`Invalid run cron script override: ${invariant}`);
+}
+
+function isInvalidRunCronScriptError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith("Invalid run cron script override:");
 }
 
 function defaultCommandRunner(command: string, args: readonly string[]): LaunchdCommandResult {
