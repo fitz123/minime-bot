@@ -422,31 +422,45 @@ describe("minime-bot CLI", () => {
     const home = join(workspace, "home");
     const logDir = join(workspace, "logs");
     const launchAgentsDir = join(workspace, "untouched", "LaunchAgents");
+    const runner = writeRunner(join(workspace, "release", "scripts"));
     try {
-      const result = runWithCapture(
-        [
-          "launchd",
-          "crons",
-          "sync",
-          "--workspace",
-          workspace,
-          "--launch-agents-dir",
-          launchAgentsDir,
-          "--run-cron-script",
-          "relative/run-cron.sh",
-        ],
-        workspace,
-        { HOME: home, LOG_DIR: logDir, UID: "501" },
+      const cases = [
         {
-          launchdCommandRunner: captureRunner(calls),
-          launchdHomeDir: home,
-          launchdUid: 501,
+          args: ["--run-cron-script", "relative/run-cron.sh"],
+          expected: /Invalid run cron script override: must be an absolute path/,
         },
-      );
+        {
+          args: [`--run-cron-script=${runner} `],
+          expected: /Invalid run cron script override: basename must be run-cron\.sh/,
+        },
+      ];
 
-      assert.equal(result.code, 1);
-      assert.equal(result.stdout, "");
-      assert.match(result.stderr, /Invalid run cron script override: must be an absolute path/);
+      for (const testCase of cases) {
+        const result = runWithCapture(
+          [
+            "launchd",
+            "crons",
+            "sync",
+            "--workspace",
+            workspace,
+            "--launch-agents-dir",
+            launchAgentsDir,
+            ...testCase.args,
+          ],
+          workspace,
+          { HOME: home, LOG_DIR: logDir, UID: "501" },
+          {
+            launchdCommandRunner: captureRunner(calls),
+            launchdHomeDir: home,
+            launchdUid: 501,
+          },
+        );
+
+        assert.equal(result.code, 1);
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, testCase.expected);
+        assert.equal(result.stderr.includes(runner), false);
+      }
       assert.equal(existsSync(launchAgentsDir), false);
       assert.equal(existsSync(logDir), false);
       assert.equal(calls.length, 0);

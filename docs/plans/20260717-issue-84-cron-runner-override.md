@@ -49,10 +49,10 @@ git diff --check origin/main...HEAD
 
 ### Task 2: Wire CLI, planning, and narrow-sync regressions
 
-- [ ] Parse `--run-cron-script <path>` and `--run-cron-script=<path>`, reject missing/duplicate/unknown forms, and forward it to `syncLaunchdCrons()`.
-- [ ] Update help text and CLI tests without private or deployment-specific paths.
-- [ ] Add regressions proving a matching existing plist is `unchanged`, and that adding one cron with a matching override plans only one `create` while all existing jobs remain `unchanged`.
-- [ ] Prove invalid overrides fail before filesystem writes or command execution and dry-run with an override remains zero-write/zero-command.
+- [x] Parse `--run-cron-script <path>` and `--run-cron-script=<path>`, reject missing/duplicate/unknown forms, and forward it to `syncLaunchdCrons()`.
+- [x] Update help text and CLI tests without private or deployment-specific paths.
+- [x] Add regressions proving a matching existing plist is `unchanged`, and that adding one cron with a matching override plans only one `create` while all existing jobs remain `unchanged`.
+- [x] Prove invalid overrides fail before filesystem writes or command execution and dry-run with an override remains zero-write/zero-command.
 
 ### Task 3: Documentation and final validation
 

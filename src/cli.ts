@@ -345,7 +345,7 @@ function parseLaunchdCronSyncOptions(args: readonly string[]): LaunchdCronSyncCl
       continue;
     }
     if (rawArg.startsWith("--run-cron-script=")) {
-      const value = rawArg.slice("--run-cron-script=".length).trim();
+      const value = rawArg.slice("--run-cron-script=".length);
       if (!value) {
         throw new CliUsageError("--run-cron-script requires a path");
       }
