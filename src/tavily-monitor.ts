@@ -89,14 +89,20 @@ export interface TavilyQuotaCounter {
   remaining: number;
 }
 
+export type TavilyKeyQuotaCounter = {
+  usage: number;
+  searchUsage?: number;
+  extractUsage?: number;
+} & (
+  | { limit: number; remaining: number }
+  | { limit?: never; remaining?: never }
+);
+
 export interface TavilyUsageSample {
   observedAt: string;
   cycleGeneration: string;
   resetAt?: string;
-  key: TavilyQuotaCounter & {
-    searchUsage?: number;
-    extractUsage?: number;
-  };
+  key: TavilyKeyQuotaCounter;
   account: {
     currentPlan: string;
     plan: TavilyQuotaCounter;
@@ -344,6 +350,13 @@ function quotaCounter(usage: number, limit: number): TavilyQuotaCounter {
   return { usage, limit, remaining: Math.max(0, limit - usage) };
 }
 
+function keyQuotaCounter(record: Record<string, unknown>): TavilyKeyQuotaCounter {
+  const usage = counter(record, "usage");
+  if (!("limit" in record)) throw new Error("Tavily usage response is invalid");
+  if (record.limit === null) return { usage };
+  return quotaCounter(usage, counter(record, "limit"));
+}
+
 function providerResetAt(root: Record<string, unknown>, account: Record<string, unknown>): string | undefined {
   const candidates = [
     root.reset_at,
@@ -432,7 +445,7 @@ export function parseTavilyUsageResponse(raw: unknown, observedAt: Date = new Da
     cycleGeneration: tavilyBillingCycleGeneration(observedAt),
     ...(resetAt === undefined ? {} : { resetAt }),
     key: {
-      ...quotaCounter(counter(key, "usage"), counter(key, "limit")),
+      ...keyQuotaCounter(key),
       ...(optionalCounter(key, "search_usage") === undefined
         ? {}
         : { searchUsage: optionalCounter(key, "search_usage") }),
@@ -547,7 +560,7 @@ export async function requestTavilyUsage(
 
 /** True when the API key and at least one account credit path can serve requests. */
 export function isTavilyUsageRecoverable(sample: TavilyUsageSample): boolean {
-  const keyHasCapacity = sample.key.usage < sample.key.limit;
+  const keyHasCapacity = sample.key.limit === undefined || sample.key.usage < sample.key.limit;
   const accountHasCapacity = sample.account.plan.usage < sample.account.plan.limit ||
     (sample.account.paygo.limit > 0 && sample.account.paygo.usage < sample.account.paygo.limit);
   return keyHasCapacity && accountHasCapacity;
@@ -880,18 +893,30 @@ function validHttpStatus(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 599;
 }
 
-function validQuotaCounter(value: unknown, optionalUsageFields = false): boolean {
+function validQuotaCounter(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  const allowed = optionalUsageFields
-    ? ["usage", "limit", "remaining", "searchUsage", "extractUsage"]
-    : ["usage", "limit", "remaining"];
-  return hasOnlyKeys(value, allowed) &&
+  return hasOnlyKeys(value, ["usage", "limit", "remaining"]) &&
     nonnegativeFiniteNumber(value.usage) &&
     nonnegativeFiniteNumber(value.limit) &&
     nonnegativeFiniteNumber(value.remaining) &&
-    value.remaining === Math.max(0, value.limit - value.usage) &&
-    (value.searchUsage === undefined || nonnegativeFiniteNumber(value.searchUsage)) &&
-    (value.extractUsage === undefined || nonnegativeFiniteNumber(value.extractUsage));
+    value.remaining === Math.max(0, value.limit - value.usage);
+}
+
+function validKeyQuotaCounter(value: unknown): boolean {
+  if (!isRecord(value) ||
+      !hasOnlyKeys(value, ["usage", "limit", "remaining", "searchUsage", "extractUsage"]) ||
+      !nonnegativeFiniteNumber(value.usage) ||
+      (value.searchUsage !== undefined && !nonnegativeFiniteNumber(value.searchUsage)) ||
+      (value.extractUsage !== undefined && !nonnegativeFiniteNumber(value.extractUsage))) {
+    return false;
+  }
+  const hasLimit = "limit" in value;
+  const hasRemaining = "remaining" in value;
+  if (!hasLimit && !hasRemaining) return true;
+  return hasLimit && hasRemaining &&
+    nonnegativeFiniteNumber(value.limit) &&
+    nonnegativeFiniteNumber(value.remaining) &&
+    value.remaining === Math.max(0, value.limit - value.usage);
 }
 
 function validUsageSample(value: unknown): value is TavilyUsageSample {
@@ -900,7 +925,7 @@ function validUsageSample(value: unknown): value is TavilyUsageSample {
       !isCanonicalIsoTimestamp(value.observedAt) ||
       value.cycleGeneration !== tavilyBillingCycleGeneration(value.observedAt as string) ||
       (value.resetAt !== undefined && !isCanonicalIsoTimestamp(value.resetAt)) ||
-      !validQuotaCounter(value.key, true) ||
+      !validKeyQuotaCounter(value.key) ||
       !isRecord(value.account) ||
       !hasOnlyKeys(value.account, ["currentPlan", "plan", "paygo", "searchUsage", "extractUsage"]) ||
       typeof value.account.currentPlan !== "string" ||

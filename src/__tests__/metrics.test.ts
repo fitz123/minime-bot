@@ -427,7 +427,7 @@ describe("Tavily durable metrics", () => {
     };
   }
 
-  it("registers exact low-cardinality names and restores gauges and durable counters", async () => {
+  it("restores account gauges and durable counters from a null-key-limit sample", async () => {
     const sampledAt = "2026-07-16T11:58:00.000Z";
     let collectedAt = new Date("2026-07-16T12:00:00.000Z");
     const state = baseTavilyState({
@@ -435,7 +435,7 @@ describe("Tavily durable metrics", () => {
       latestSample: {
         observedAt: sampledAt,
         cycleGeneration: "2026-07",
-        key: { usage: 950, limit: 1_000, remaining: 50 },
+        key: { usage: 950 },
         account: {
           currentPlan: "Researcher",
           plan: { usage: 950, limit: 1_000, remaining: 50 },
