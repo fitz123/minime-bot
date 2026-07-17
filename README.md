@@ -419,6 +419,25 @@ minime-bot launchd crons sync --workspace /path/to/control-workspace --no-prune
 minime-bot launchd crons sync --workspace /path/to/control-workspace --launch-agents-dir /tmp/LaunchAgents
 ```
 
+Ordinary installations should omit `--run-cron-script`; cron plists then use
+the package's `scripts/run-cron.sh`. A deployment that atomically switches
+between release slots may preserve its stable selector path during cron-only
+sync, including dry-run, with an explicit override:
+
+```bash
+minime-bot launchd crons sync --workspace /path/to/control-workspace \
+  --run-cron-script /path/to/deployment/current/scripts/run-cron.sh
+```
+
+The override is deliberately narrow. It must be a normalized absolute path to
+an existing, owner-executable regular file named `run-cron.sh`. At most one
+operator-owned directory symlink is allowed, its target must stay below its
+parent trust directory, and all validated directories and the file must be
+owned by the current user and not group/world writable. Invalid overrides fail
+before plist writes or launchd commands. The validated lexical path is retained
+in the plist so an atomic `current` selector can switch slots without rewriting
+cron plists.
+
 The sync command owns only the `ai.minime.cron.*` namespace. By default it
 creates or updates active cron plists, lint-checks changed plists, re-bootstraps
 changed active cron labels, and prunes stale or disabled owned cron plists by
