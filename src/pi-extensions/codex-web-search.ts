@@ -381,7 +381,6 @@ export function createBoundedCodexSearchSignal(
     timedOut = true;
     controller.abort(new Error("Codex web search timeout"));
   }, timeoutMs);
-  timer.unref();
 
   return {
     signal: controller.signal,
