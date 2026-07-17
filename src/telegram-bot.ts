@@ -35,14 +35,6 @@ import {
   type PollProgressProbe,
   type UpdateProcessingProbe,
 } from "./poll-progress.js";
-import {
-  parseTavilyCallbackData,
-  type TavilyDeliveryDestination,
-  type TavilyOperatorActions,
-} from "./tavily-monitor-runtime.js";
-import type { TavilyStatusSnapshot } from "./tavily-monitor.js";
-
-
 // Re-export for backward compatibility (tests import from here)
 export { isImageMimeType, imageExtensionForMime };
 
@@ -62,15 +54,7 @@ export const BOT_COMMANDS = [
   { command: "status", description: "Show bot status" },
 ] as const;
 
-export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction", "callback_query"] as const;
-
-export function isTavilyCallbackDestination(
-  message: { chat: { id: number }; message_thread_id?: number } | undefined,
-  destination: TavilyDeliveryDestination | undefined,
-): boolean {
-  if (!message || !destination || message.chat.id !== destination.chatId) return false;
-  return message.message_thread_id === destination.threadId;
-}
+export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
 
 /**
  * Extract Telegram chat-targeting fields from an API request payload for
@@ -712,9 +696,6 @@ export const AUTO_RETRY_OPTIONS = {
   rethrowHttpErrors: false,
 } as const;
 
-/** Symbol-only payload marker: durable Tavily outbox delivery owns its retries. */
-export const TAVILY_DURABLE_DELIVERY = Symbol("tavily-durable-delivery");
-
 /**
  * Build the Pi steer decision for passive echo context. Normal user messages
  * stay on MessageQueue's collect-buffer path because Pi steer responses do not
@@ -756,9 +737,7 @@ export function makeSteerFn(
 export function createTelegramAutoRetryTransformer(): Transformer {
   const retry = autoRetry(AUTO_RETRY_OPTIONS);
   return async (prev, method, payload, signal) => {
-    const durableTavilyDelivery = typeof payload === "object" && payload !== null &&
-      (payload as Record<PropertyKey, unknown>)[TAVILY_DURABLE_DELIVERY] === true;
-    if (method === "sendMessageDraft" || method === "getUpdates" || durableTavilyDelivery) {
+    if (method === "sendMessageDraft" || method === "getUpdates") {
       return prev(method, payload, signal);
     }
     return retry(prev, method, payload, signal);
@@ -777,8 +756,6 @@ export function createTelegramBot(
   opts?: {
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
-    tavilyActions?: TavilyOperatorActions;
-    getTavilyStatus?: () => TavilyStatusSnapshot | undefined;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -825,56 +802,6 @@ export function createTelegramBot(
     bot.use(async (_ctx, next) => {
       onUpdate();
       await next();
-    });
-  }
-
-  // Tavily incident callbacks are authorized against the exact configured
-  // owner destination, which does not need to be a normal agent binding.
-  if (opts?.tavilyActions) {
-    const tavilyActions = opts.tavilyActions;
-    bot.on("callback_query:data", async (ctx, next) => {
-      const data = ctx.callbackQuery.data;
-      if (!data.startsWith("tavily:")) {
-        await next();
-        return;
-      }
-      const action = parseTavilyCallbackData(data);
-      const callbackMessage = ctx.callbackQuery.message;
-      const message = callbackMessage && "chat" in callbackMessage
-        ? callbackMessage as { chat: { id: number }; message_thread_id?: number }
-        : undefined;
-      const destination = tavilyActions.getDeliveryDestination();
-      if (!action || !isTavilyCallbackDestination(message, destination)) {
-        await ctx.answerCallbackQuery({ text: "This Tavily action is not available here." }).catch(() => {});
-        return;
-      }
-
-      if (action.action === "acknowledge") {
-        let accepted: boolean;
-        try {
-          accepted = await tavilyActions.acknowledgeIncident(action.generation);
-        } catch {
-          await ctx.answerCallbackQuery({ text: "The Tavily action could not be completed." }).catch(() => {});
-          return;
-        }
-        await ctx.answerCallbackQuery({
-          text: accepted
-            ? "Tavily degraded mode acknowledged."
-            : "This Tavily incident action is stale.",
-        }).catch(() => {});
-        return;
-      }
-
-      if (!tavilyActions.isIncidentActive(action.generation)) {
-        await ctx.answerCallbackQuery({ text: "This Tavily incident action is stale." }).catch(() => {});
-        return;
-      }
-      await ctx.answerCallbackQuery({ text: "Rechecking Tavily credits…" }).catch(() => {});
-      try {
-        await tavilyActions.recheckIncident(action.generation);
-      } catch {
-        log.warn("telegram-bot", "Failed to queue a durable Tavily recovery check result");
-      }
     });
   }
 
@@ -948,7 +875,6 @@ export function createTelegramBot(
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth: sessionManager.getSessionHealth(key),
       quotaStatus: readQuotaStatus(),
-      tavilyStatus: opts?.getTavilyStatus?.(),
     }));
   });
 

@@ -118,82 +118,75 @@ By default, the workspace provides:
 - `crons.yaml` for scheduled prompts when present.
 - `data/`, `.tmp/`, logs, and media locations used by runtime state.
 
-### Tavily web tools and quota incidents
+### Codex web search and direct URL workflows
 
-`web_search` and `web_fetch` use Tavily exclusively. Both Pi children and the
-main-process quota monitor read the same `tavily.api_key` value from the control
-workspace's `config/secrets.sops.yaml`; there is no environment-key fallback,
-alternate provider, key rotation, or automatic request retry. Keep that file
-encrypted with SOPS and do not place the decrypted key in config, logs, or
-process arguments.
+The package registers one model-facing `web_search` tool. Its wrapper obtains
+the refreshed OAuth credential and active `openai-codex` model from Pi's model
+registry, then sends one bounded request to the fixed Codex subscription
+Responses endpoint. It does not read `OPENAI_API_KEY`, accept a configurable
+endpoint, switch providers, retry automatically, or apply a package-specific
+search quota.
 
-One process owns `data/tavily/writer.lock`, restores the durable monitor, and
-samples Tavily account usage immediately after acquiring that lease and every
-five minutes thereafter. An overlapping replacement retries the nonblocking
-lease acquisition every second and recovers a stale owner; Telegram and Discord
-can continue starting while it waits, but Tavily `/status` data and incident
-processing are unavailable until ownership transfers. Pi children hand bounded
-tool failures to the lease holder through an owner-only event spool polled every
-two seconds. Consolidated quota samples, threshold deduplication, the active
-incident generation, acknowledgement or resolution, and the notification outbox
-are stored atomically under the control workspace's `data/tavily/` directory.
-Unacknowledged exhaustion incidents are reminded every six hours. State and
-events contain only bounded classifications and counters, never keys, queries,
-requested URLs, provider response bodies, delivery IDs, or host paths.
+Interactive sessions, cron runs, package subagents, ask-agent children, and the
+recovery runtime each load the canonical `dist/extensions/pi/web-tools.js`
+wrapper once. Dynamic-workflow sessions inherit the same globally deployed
+wrapper. Search-only bundled roles keep `web_search` without receiving Bash.
 
-Base-plan and PAYGO usage each notify once at 80% and 95% per monthly billing
-cycle. Tavily HTTP 432 or 433 responses from either web tool open one shared
-critical incident. Notifications go to `adminChatId` when set; otherwise they
-use `defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`.
-Transient delivery failures use the durable outbox with bounded backoff;
-the owner-only Telegram transport also starts in Discord-backed deployments
-without normal Telegram agent bindings when both a Telegram token source and an
-owner destination are configured. Use `telegramTokenSopsKey` together with
-`secrets.sopsFile`, or use `telegramTokenEnv`; configure `adminChatId`, or fall
-back to `defaultDeliveryChatId` plus an optional positive
-`defaultDeliveryThreadId`. `adminChatId` takes precedence and never uses the
-fallback thread. For example, replace the placeholders in this fragment:
+Search queries pass a bounded content-safety check before leaving the host.
+Responses expose bounded answer text, citations, web-action metadata, response
+identity, and token usage when Codex supplies them; failures return only a fixed
+classification without provider bodies or credentials.
 
-```yaml
-secrets:
-  sopsFile: config/secrets.sops.yaml
-telegramTokenSopsKey: telegram.bot_token
-# Or use: telegramTokenEnv: MINIME_TELEGRAM_TOKEN
-adminChatId: <owner-chat-id>
-# Or omit adminChatId and use:
-# defaultDeliveryChatId: <fallback-chat-id>
-# defaultDeliveryThreadId: <positive-topic-id>
+Direct URL reading and browser interaction are deliberately outside the package
+tool. On macOS, install the official `agent-browser` Homebrew formula globally.
+The `read` command requires version 0.30.0 or newer, and browser interaction
+requires the one-time Chrome for Testing installation:
+
+```bash
+brew install agent-browser
+agent-browser install
+agent-browser --version
+agent-browser doctor
 ```
 
-Missing destinations and deterministic Telegram 4xx failures remain visible
-terminal diagnostics and suppress further incident reminders. After correcting
-the destination, an explicit process restart permits one fresh delivery attempt
-instead of retrying forever.
+Treat `agent-browser` upgrades as manual, planned host maintenance. Upgrade the
+Homebrew formula intentionally, rerun the doctor check, and do not use
+`brew pin`:
 
-Incident messages provide generation-bound Telegram actions:
-`acknowledge degraded mode` stops reminders, while `credits fixed — recheck`
-runs one bounded verification. Recheck succeeds only when current `/usage` is
-recoverable and fixed Search and Extract probes both return validated non-empty
-results. Failed explicit rechecks are reported through the same durable outbox.
-The sampler uses the same verification once when active usage first becomes
-recoverable; neither path retries provider requests automatically.
+```bash
+brew upgrade agent-browser
+agent-browser doctor
+```
 
-`/status` includes sample freshness, base-plan and PAYGO counters, the latest
-bounded failure class, and incident/acknowledgement state. Prometheus exports
-the corresponding low-cardinality `bot_tavily_*` metrics described in
-[`docs/monitoring.md`](docs/monitoring.md). During an overlapping process
-replacement, the new metrics listener retries its configured occupied address
-every second until the old process releases it; scrapes may therefore continue
-to reach the old process briefly. Other listen errors remain logged, and
-shutdown cancels a pending address retry.
+Bash-capable full agents then use the host-installed CLI:
 
-PAYGO enablement and its credit limit are manual Tavily Billing operations. The
-runtime reports and verifies credits but never changes billing. To roll back,
-install and restart the previous package release while retaining
-`data/tavily/`; the earlier runtime ignores these files, and retaining them
-preserves incident and delivery deduplication if this version is restored. Only
-remove that directory when intentionally discarding the durable history and
-pending outbox after operator review.
+```bash
+agent-browser skills get core --full
+agent-browser read https://example.com
+agent-browser open https://example.com
+agent-browser snapshot
+agent-browser close
+```
+
+Roles without Bash remain search-only. Codex subscription limits continue to be
+reported by the package quota sampler and `/status`; there is no separate
+provider credit monitor, incident outbox, billing path, or provider-specific
+Prometheus metric family for web search.
+
+### Cron delivery targets
+
+Each cron may set `deliveryChatId` and, when needed, `deliveryThreadId` in its
+cron definition. When `deliveryChatId` is omitted, the runner uses the top-level
+`defaultDeliveryChatId`; `defaultDeliveryThreadId` is inherited only when the
+cron targets that default chat. A cron-level thread always takes precedence.
+Set top-level `adminChatId` to receive a failure notification when delivery to
+the cron target fails.
+
+```yaml
+adminChatId: <admin-chat-id>
+defaultDeliveryChatId: <default-chat-id>
+defaultDeliveryThreadId: <positive-topic-id>
+```
 
 Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
@@ -375,8 +368,8 @@ restart. When Discord has live agent bindings, the process keeps Discord online,
 waits for grammY's final Telegram polling cleanup to settle, and retries Telegram
 after exponential delays from five seconds up to one minute; all `getUpdates`
 calls, including the signal-less final update-offset confirmation, are bounded
-at 45 seconds. A successful polling-loop request resets that delay. An owner-only
-Telegram alert transport does not count as a conversational platform.
+at 45 seconds. A successful polling-loop request resets that delay. A started
+transport counts only when it has conversational bindings.
 
 ## Launchd Operations
 

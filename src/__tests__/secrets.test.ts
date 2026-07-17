@@ -14,7 +14,7 @@ import {
 
 describe("SOPS extract expression conversion", () => {
   it("converts safe dot paths into sops extract expressions", () => {
-    assert.equal(sopsExtractExpression("tavily.api_key"), '["tavily"]["api_key"]');
+    assert.equal(sopsExtractExpression("example.api_key"), '["example"]["api_key"]');
     assert.equal(sopsExtractExpression("telegram.bot-token_1"), '["telegram"]["bot-token_1"]');
   });
 
@@ -42,10 +42,10 @@ describe("SOPS secret reader", () => {
     };
 
     try {
-      assert.equal(readSopsSecret({ file, key: "tavily.api_key", execFileSync }), "value-from-sops");
+      assert.equal(readSopsSecret({ file, key: "example.api_key", execFileSync }), "value-from-sops");
       assert.deepEqual(calls, [{
         file: "sops",
-        args: ["-d", "--extract", '["tavily"]["api_key"]', file],
+        args: ["-d", "--extract", '["example"]["api_key"]', file],
         timeout: 10_000,
       }]);
     } finally {
@@ -65,11 +65,11 @@ describe("SOPS secret reader", () => {
 
     try {
       assert.throws(
-        () => readSopsSecret({ file, key: "tavily.api key", execFileSync }),
+        () => readSopsSecret({ file, key: "example.api key", execFileSync }),
         (err: unknown) => err instanceof SecretSourceError &&
           err.failure.source === "sops" &&
           err.failure.kind === "invalid-key" &&
-          err.failure.key === "tavily.api key",
+          err.failure.key === "example.api key",
       );
       assert.equal(calls, 0);
     } finally {
@@ -88,11 +88,11 @@ describe("SOPS secret reader", () => {
 
     try {
       assert.throws(
-        () => readSopsSecret({ file: missingFile, key: "tavily.api_key", execFileSync }),
+        () => readSopsSecret({ file: missingFile, key: "example.api_key", execFileSync }),
         (err: unknown) => err instanceof SecretSourceError &&
           err.failure.source === "sops" &&
           err.failure.kind === "missing-file" &&
-          err.failure.key === "tavily.api_key",
+          err.failure.key === "example.api_key",
       );
       assert.equal(calls, 0);
     } finally {
@@ -110,12 +110,12 @@ describe("SOPS secret reader", () => {
 
     try {
       assert.throws(
-        () => readSopsSecret({ file, key: "tavily.api_key", execFileSync }),
+        () => readSopsSecret({ file, key: "example.api_key", execFileSync }),
         (err: unknown) => {
           assert.ok(err instanceof SecretSourceError);
           assert.equal(err.failure.source, "sops");
           assert.equal(err.failure.kind, "decrypt-failed");
-          assert.equal(err.failure.key, "tavily.api_key");
+          assert.equal(err.failure.key, "example.api_key");
           assert.doesNotMatch(err.message, /sensitive stderr text/);
           return true;
         },
@@ -135,12 +135,12 @@ describe("SOPS secret reader", () => {
 
     try {
       assert.throws(
-        () => readSopsSecret({ file, key: "tavily.api_key", execFileSync }),
+        () => readSopsSecret({ file, key: "example.api_key", execFileSync }),
         (err: unknown) => {
           assert.ok(err instanceof SecretSourceError);
           assert.equal(err.failure.source, "sops");
           assert.equal(err.failure.kind, "timeout");
-          assert.equal(err.failure.key, "tavily.api_key");
+          assert.equal(err.failure.key, "example.api_key");
           assert.doesNotMatch(err.message, /sensitive timeout stderr text/);
           return true;
         },
@@ -276,17 +276,17 @@ describe("secret resolver", () => {
     assert.throws(
       () => resolveSecret({
         sopsFile,
-        sopsKey: "tavily.api_key",
-        envVar: "TAVILY_API_KEY",
-        fieldName: "tavily.apiKey",
+        sopsKey: "example.api_key",
+        envVar: "EXAMPLE_API_KEY",
+        fieldName: "example.apiKey",
         env: {},
         execFileSync,
       }),
       (err: unknown) => {
         assert.ok(err instanceof SecretResolutionError);
         assert.deepEqual(err.failures.map((failure) => failure.kind), ["command-not-found", "unset"]);
-        assert.match(err.message, /SOPS key 'tavily\.api_key' failed \(command-not-found\)/);
-        assert.match(err.message, /env var 'TAVILY_API_KEY' failed \(unset\)/);
+        assert.match(err.message, /SOPS key 'example\.api_key' failed \(command-not-found\)/);
+        assert.match(err.message, /env var 'EXAMPLE_API_KEY' failed \(unset\)/);
         assert.doesNotMatch(err.message, /sensitive text/);
         return true;
       },

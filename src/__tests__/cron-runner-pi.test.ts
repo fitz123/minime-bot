@@ -103,7 +103,10 @@ function makeDeps(
     buildAgentConfig: (_cron, cwd) => makeAgent(cwd),
     buildEnv: () => ({}),
     assembleContext: () => null,
-    resolveExtensionArgs: () => ["--extension", "/first-party/knowledge-tools.ts"],
+    resolveExtensionArgs: () => [
+      "--extension", "/first-party/web-tools.ts",
+      "--extension", "/first-party/knowledge-tools.ts",
+    ],
     ...overrides,
   };
 }
@@ -155,7 +158,10 @@ describe("cron-runner runPi", () => {
       "high",
     ]);
     assertCronSystemInstruction(flagValue(capture.args, "--append-system-prompt"));
-    assert.deepStrictEqual(flagValues(capture.args, "--extension"), ["/first-party/knowledge-tools.ts"]);
+    assert.deepStrictEqual(flagValues(capture.args, "--extension"), [
+      "/first-party/web-tools.ts",
+      "/first-party/knowledge-tools.ts",
+    ]);
     assert.strictEqual(capture.options.input, undefined);
     assert.strictEqual(capture.options.cwd, ws);
     assert.strictEqual(capture.options.timeout, 1234);
@@ -200,8 +206,9 @@ describe("cron-runner runPi", () => {
     }
 
     const extensions = flagValues(captures[0].args, "--extension");
-    assert.strictEqual(extensions.length, 1);
-    assert.ok(extensions[0].endsWith("knowledge-tools.ts"));
+    assert.strictEqual(extensions.length, 2);
+    assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);
+    assert.ok(extensions[1].endsWith("knowledge-tools.ts"));
     assert.ok(!extensions.includes(extraExtension));
   });
 
@@ -286,7 +293,10 @@ describe("cron-runner runPi", () => {
     assert.ok(appendIdx < noContextIdx);
     assert.ok(noContextIdx < cronInstructionIdx);
     assert.ok(cronInstructionIdx < args.indexOf("--extension"));
-    assert.deepStrictEqual(flagValues(args, "--extension"), ["/first-party/knowledge-tools.ts"]);
+    assert.deepStrictEqual(flagValues(args, "--extension"), [
+      "/first-party/web-tools.ts",
+      "/first-party/knowledge-tools.ts",
+    ]);
   });
 
   it("suppresses flat context loading when context assembly throws", () => {
@@ -395,7 +405,7 @@ describe("cron-runner runPi", () => {
     const openAiKeyEnv = ["OPENAI", "API", "KEY"].join("_");
     const piSessionDirEnv = ["PI", "CODING", "AGENT", "SESSION", "DIR"].join("_");
     const telegramTokenEnv = ["TELEGRAM", "BOT", "TOKEN"].join("_");
-    const tavilyKeyEnv = ["TAVILY", "API", "KEY"].join("_");
+    const externalServiceKeyEnv = ["EXTERNAL", "SERVICE", "API", "KEY"].join("_");
     const sessionSecretEnv = ["MINIME", "SESSION", "SECRET"].join("_");
     const githubTokenEnv = ["GITHUB", "TOKEN"].join("_");
     const awsSecretEnv = ["AWS", "SECRET", "ACCESS", "KEY"].join("_");
@@ -403,7 +413,7 @@ describe("cron-runner runPi", () => {
     const oldOpenAiKey = process.env[openAiKeyEnv];
     const oldPiSessionDir = process.env[piSessionDirEnv];
     const oldTelegramToken = process.env[telegramTokenEnv];
-    const oldTavilyKey = process.env[tavilyKeyEnv];
+    const oldExternalServiceKey = process.env[externalServiceKeyEnv];
     const oldSessionSecret = process.env[sessionSecretEnv];
     const oldGithubToken = process.env[githubTokenEnv];
     const oldAwsSecret = process.env[awsSecretEnv];
@@ -414,7 +424,7 @@ describe("cron-runner runPi", () => {
     const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const oldConfigPath = process.env[MINIME_CONFIG_PATH_ENV];
     const oldCronsPath = process.env[MINIME_CRONS_PATH_ENV];
-    const fixtureValues = ["cron-telegram-fixture", "cron-discord-fixture", "cron-tavily-fixture"];
+    const fixtureValues = ["cron-telegram-fixture", "cron-discord-fixture", "cron-external-service-fixture"];
 
     try {
       delete process.env.HOME;
@@ -425,7 +435,7 @@ describe("cron-runner runPi", () => {
       process.env.CLAUDECODE = "session-marker";
       process.env[telegramTokenEnv] = fixtureValues[0];
       process.env[discordTokenEnv] = fixtureValues[1];
-      process.env[tavilyKeyEnv] = fixtureValues[2];
+      process.env[externalServiceKeyEnv] = fixtureValues[2];
       process.env[sessionSecretEnv] = "fixture";
       process.env[githubTokenEnv] = "fixture";
       process.env[awsSecretEnv] = "fixture";
@@ -457,7 +467,7 @@ describe("cron-runner runPi", () => {
       assert.strictEqual(env.CLAUDECODE, undefined);
       assert.strictEqual(env[telegramTokenEnv], undefined);
       assert.strictEqual(env[discordTokenEnv], undefined);
-      assert.strictEqual(env[tavilyKeyEnv], undefined);
+      assert.strictEqual(env[externalServiceKeyEnv], undefined);
       assert.strictEqual(env[sessionSecretEnv], undefined);
       assert.strictEqual(env[githubTokenEnv], undefined);
       assert.strictEqual(env[awsSecretEnv], undefined);
@@ -503,10 +513,10 @@ describe("cron-runner runPi", () => {
       } else {
         process.env[telegramTokenEnv] = oldTelegramToken;
       }
-      if (oldTavilyKey === undefined) {
-        delete process.env[tavilyKeyEnv];
+      if (oldExternalServiceKey === undefined) {
+        delete process.env[externalServiceKeyEnv];
       } else {
-        process.env[tavilyKeyEnv] = oldTavilyKey;
+        process.env[externalServiceKeyEnv] = oldExternalServiceKey;
       }
       if (oldDiscordToken === undefined) {
         delete process.env[discordTokenEnv];

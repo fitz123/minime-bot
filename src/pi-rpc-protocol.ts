@@ -34,7 +34,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 /**
  * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
  *   codex-transport-overflow (Codex request-byte overflow normalization),
- *   web-tools (Tavily web_search/web_fetch),
+ *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn),
  *   ask-agent (configured full-agent question handoff).
@@ -88,11 +88,10 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
 );
 
 /**
- * Wrappers a Pi print-mode cron must load. Crons need the Knowledge wrapper so
- * managed wiki writes are protected, but do not get interactive web-tools or
- * subagent parity.
+ * Wrappers a Pi print-mode cron must load. Crons receive the canonical search
+ * wrapper and the Knowledge wrapper, but no child-spawning tools.
  */
-export const PI_CRON_WRAPPER_RELPATHS = ["knowledge-tools.ts"] as const;
+export const PI_CRON_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
 
 export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
   "codex-transport-overflow.js",

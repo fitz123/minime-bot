@@ -77,6 +77,14 @@ function flagValue(args: readonly string[], flag: string): string {
   return args[index + 1];
 }
 
+function flagValues(args: readonly string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let index = args.indexOf(flag); index !== -1; index = args.indexOf(flag, index + 2)) {
+    values.push(args[index + 1]);
+  }
+  return values;
+}
+
 describe("Pi spawn workspace contract", () => {
   it("uses per-agent sibling workspace cwd/context while reading config secrets from the control workspace", () => {
     const root = mkdtempSync(join(tmpdir(), "minime-pi-spawn-workspaces-"));
@@ -133,13 +141,13 @@ describe("Pi spawn workspace contract", () => {
     const secretEnvKeys = [
       ["TELEGRAM", "BOT", "TOKEN"].join("_"),
       ["DISCORD", "BOT", "TOKEN"].join("_"),
-      ["TAVILY", "API", "KEY"].join("_"),
+      ["EXTERNAL", "SERVICE", "API", "KEY"].join("_"),
     ] as const;
     const oldSecretValues = new Map(secretEnvKeys.map((key) => [key, process.env[key]]));
     const fixtureValues = [
       "parent-telegram-fixture",
       "parent-discord-fixture",
-      "parent-tavily-fixture",
+      "parent-external-service-fixture",
       "resolved-telegram-token",
     ];
 
@@ -148,7 +156,7 @@ describe("Pi spawn workspace contract", () => {
       process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = join(root, "stale-agent-workspace");
       process.env[RETIRED_CONTROL_WORKSPACE_ENV] = join(root, "retired-control-workspace");
       process.env[RETIRED_AGENT_WORKSPACE_ENV] = join(root, "retired-agent-workspace");
-      process.env[PI_EXTENSIONS_DISABLED_ENV] = "1";
+      delete process.env[PI_EXTENSIONS_DISABLED_ENV];
       process.env[secretEnvKeys[0]] = fixtureValues[0];
       process.env[secretEnvKeys[1]] = fixtureValues[1];
       process.env[secretEnvKeys[2]] = fixtureValues[2];
@@ -182,6 +190,12 @@ describe("Pi spawn workspace contract", () => {
         for (const value of fixtureValues) {
           assert.doesNotMatch(serializedChildContract, new RegExp(value));
         }
+        const extensions = flagValues(capture.args, "--extension");
+        assert.equal(extensions.length, 5);
+        assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);
+        assert.equal(extensions.some((path) => path.endsWith("knowledge-tools.ts")), true);
+        assert.equal(extensions.some((path) => path.endsWith("subagent/index.ts")), true);
+        assert.equal(extensions.some((path) => path.endsWith("ask-agent/index.ts")), true);
       }
       assert.equal(
         (spawnCaptures[0].options.env as NodeJS.ProcessEnv)[MINIME_AGENT_WORKSPACE_ROOT_ENV],

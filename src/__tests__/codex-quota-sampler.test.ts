@@ -390,7 +390,7 @@ bindings:
       CLAUDECODE: "1",
       TELEGRAM_BOT_TOKEN: "secret",
       DISCORD_BOT_TOKEN: "secret",
-      TAVILY_API_KEY: "secret",
+      EXTERNAL_SERVICE_API_KEY: "secret",
       NODE_EXPORTER_TEXTFILE_DIR: "/ignored",
       PATH: "/usr/bin",
       HOME: "/Users/test",
@@ -400,7 +400,7 @@ bindings:
     assert.equal(env.CLAUDECODE, undefined);
     assert.equal(env.TELEGRAM_BOT_TOKEN, undefined);
     assert.equal(env.DISCORD_BOT_TOKEN, undefined);
-    assert.equal(env.TAVILY_API_KEY, undefined);
+    assert.equal(env.EXTERNAL_SERVICE_API_KEY, undefined);
     assert.equal(env.NODE_EXPORTER_TEXTFILE_DIR, undefined);
     assert.equal(env.HOME, "/Users/test");
     assert.equal(env.CODEX_QUOTA_STATE_FILE, config.stateFile);

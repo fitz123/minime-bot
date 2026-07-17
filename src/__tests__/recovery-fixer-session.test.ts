@@ -756,6 +756,10 @@ describe("exact-session recovery fixer", () => {
       "web-tools.ts",
       "knowledge-tools.ts",
     ]);
+    assert.equal(
+      PI_RECOVERY_WRAPPER_RELPATHS.filter((path) => path === "web-tools.ts").length,
+      1,
+    );
     assert.equal(PI_RECOVERY_WRAPPER_RELPATHS.some((path) => /subagent|ask-agent/.test(path)), false);
     const source = readFileSync(resolve("src/recovery/fixer-session.ts"), "utf8");
     assert.doesNotMatch(source, /new SessionManager|chatId|--no-session/);

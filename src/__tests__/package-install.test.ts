@@ -189,8 +189,6 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
     "dist/pi-runtime.js",
-    "dist/tavily-monitor.js",
-    "dist/tavily-monitor-runtime.js",
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
@@ -198,9 +196,6 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/codex-transport-overflow.js",
-    "dist/pi-extensions/tavily.js",
-    "dist/pi-extensions/tavily-events.js",
-    "dist/pi-extensions/tavily-secret.js",
     "dist/pi-extensions/recovery-mode.js",
     "dist/pi-extensions/recovery-protocol.js",
     "dist/recovery/fixer-session.js",
@@ -248,6 +243,11 @@ function assertPackFiles(files: readonly string[]): void {
   const retiredKnowledgeWrapper = ["recovery", "knowledge", "tools"].join("-");
   assert.ok(!files.some((file) => file.includes(retiredOutputExtension)), "recovery output extension should not be packed");
   assert.ok(!files.some((file) => file.includes(retiredKnowledgeWrapper)), "recovery-only knowledge wrapper should not be packed");
+  const retiredProviderMarker = ["tavi", "ly"].join("");
+  assert.ok(
+    !files.some((file) => file.toLowerCase().includes(retiredProviderMarker)),
+    "retired provider artifacts should not be packed",
+  );
   assert.ok(!files.some((file) => file.startsWith("src/")), "source TS should not be packed");
   assert.ok(!files.some((file) => file.startsWith(".claude/")), "source extension wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");
@@ -259,6 +259,11 @@ function assertPackFiles(files: readonly string[]): void {
     files.filter((file) => file === "dist/extensions/pi/recovery.js").length,
     1,
     "recovery wrapper must be packaged exactly once without a dangling source artifact",
+  );
+  assert.equal(
+    files.filter((file) => file === "dist/extensions/pi/web-tools.js").length,
+    1,
+    "canonical web-tools wrapper must be packaged exactly once",
   );
 }
 
@@ -1138,7 +1143,6 @@ const projectDir = process.cwd();
 const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
 const agentWorkspace = join(workspace, "agent-workspace");
-const controlTavilySopsFile = join(workspace, "config", "secrets.sops.yaml");
 const controlWorkspaceEnv = "MINIME_CONTROL_WORKSPACE_ROOT";
 const agentWorkspaceEnv = "MINIME_AGENT_WORKSPACE_ROOT";
 const retiredControlWorkspaceEnv = ["MINIME", "WORKSPACE", "ROOT"].join("_");
@@ -1157,6 +1161,14 @@ function extensionPathsFromArgs(args) {
     paths.push(args[idx + 1]);
   }
   return paths;
+}
+
+function assertCanonicalWebWrapper(label, paths) {
+  assert.equal(
+    paths.filter((path) => path.endsWith("/web-tools.js")).length,
+    1,
+    label + " must load the canonical web-tools wrapper exactly once",
+  );
 }
 
 function assertNoGuardContract(label, args) {
@@ -1201,20 +1213,8 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
-const tavilyMonitorCore = await importPackageFile("dist/tavily-monitor.js");
-const tavilyMonitorRuntime = await importPackageFile("dist/tavily-monitor-runtime.js");
 const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-protocol.js");
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
-assert.equal(typeof tavilyMonitorCore.TavilyMonitor, "function");
-assert.equal(typeof tavilyMonitorRuntime.TavilyMonitorRuntime, "function");
-assert.deepEqual(
-  tavilyMonitorRuntime.resolveTavilyDeliveryDestination({
-    adminChatId: undefined,
-    defaultDeliveryChatId: 111,
-    defaultDeliveryThreadId: 7,
-  }),
-  { chatId: 111, threadId: 7 },
-);
 assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
 assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
 assert.equal(recoveryFixer.classifyRecoveryFixerResult({ is_error: true }), "provider_error");
@@ -1225,6 +1225,7 @@ assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
+assertCanonicalWebWrapper("interactive parent", extensionPaths);
 assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -1252,6 +1253,7 @@ assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("subagent child", extensionPathsFromArgs(subagentChildExtensionArgs));
 assertNoGuardContract("subagent child extension args must not load the retired guard", subagentChildExtensionArgs);
 
 const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
@@ -1260,9 +1262,20 @@ const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(cronExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["knowledge-tools.js"],
+  ["web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("cron", extensionPathsFromArgs(cronExtensionArgs));
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
+
+const recoveryExtensionArgs = piRpc.resolvePiExtensionArgs({
+  env: {},
+  relpaths: piRpc.PI_RECOVERY_WRAPPER_RELPATHS,
+});
+assert.deepEqual(
+  extensionPathsFromArgs(recoveryExtensionArgs).map((path) => relative(artifactDir, path)),
+  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+);
+assertCanonicalWebWrapper("recovery", extensionPathsFromArgs(recoveryExtensionArgs));
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);
@@ -1284,7 +1297,6 @@ assert.equal(childEnv[retiredControlWorkspaceEnv], undefined);
 assert.equal(childEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(childEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(childEnv.DISCORD_BOT_TOKEN, undefined);
-assert.equal(childEnv.TAVILY_API_KEY, undefined);
 
 const workspaceContract = await importPackageFile("dist/workspace-contract.js");
 const validator = await importPackageFile("dist/workspace-validator.js");
@@ -1330,21 +1342,8 @@ const fakePi = {
 };
 
 const fakeBinDir = join(projectDir, "fake-bin");
-const sopsArgvFile = join(projectDir, "sops-argv.txt");
 mkdirSync(fakeBinDir, { recursive: true });
-writeFileSync(
-  join(fakeBinDir, "sops"),
-  [
-    "#!/bin/bash",
-    "printf '%s\\n' \"$@\" > \"$SOPS_ARGV_FILE\"",
-    "printf 'tvly-installed-wrapper-key\\n'",
-    "",
-  ].join("\n"),
-  "utf8",
-);
-chmodSync(join(fakeBinDir, "sops"), 0o755);
 process.env.PATH = fakeBinDir + ":" + process.env.PATH;
-process.env.SOPS_ARGV_FILE = sopsArgvFile;
 
 const callerControlledCwd = join(projectDir, "caller-controlled-subagent-cwd");
 mkdirSync(callerControlledCwd, { recursive: true });
@@ -1357,21 +1356,20 @@ assert.equal(subagentChildEnv[retiredControlWorkspaceEnv], undefined);
 assert.equal(subagentChildEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(subagentChildEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.DISCORD_BOT_TOKEN, undefined);
-assert.equal(subagentChildEnv.TAVILY_API_KEY, undefined);
 
 process.chdir(agentWorkspace);
 
 const fetchCalls = [];
 const oldFetch = globalThis.fetch;
-let webResponseStatus = 200;
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url: String(url), init });
-  return {
-    ok: webResponseStatus >= 200 && webResponseStatus < 300,
-    status: webResponseStatus,
-    json: async () => ({ results: [] }),
-    text: async () => "{\"results\":[]}",
-  };
+  return new Response([
+    'data: {"type":"response.output_text.delta","delta":"Installed "}',
+    'data: {"type":"response.output_text.delta","delta":"answer."}',
+    'data: {"type":"response.completed","response":{"id":"resp_installed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}',
+    'data: [DONE]',
+    '',
+  ].join("\n\n"), { status: 200, headers: { "Content-Type": "text/event-stream" } });
 };
 
 const webTools = await importFile(join(artifactDir, "web-tools.js"));
@@ -1384,10 +1382,48 @@ const askAgent = await importFile(join(artifactDir, "ask-agent", "index.js"));
 askAgent.default(fakePi);
 assert.deepEqual(
   registeredTools
-    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
+    .filter((name) => ["web_search", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
     .sort(),
-  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
+  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_search"],
 );
+assert.equal(registeredTools.filter((name) => name === "web_search").length, 1);
+
+// pi-dynamic-workflows creates in-memory sessions with SettingsManager and
+// createAgentSession. Model that exact Pi boundary using the globally configured
+// installed wrapper: the child inherits web_search from settings and receives no
+// second custom registration path.
+const piCodingAgent = await importFile(
+  join(projectDir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"),
+);
+const workflowAgentDir = join(projectDir, "workflow-agent-dir");
+mkdirSync(workflowAgentDir, { recursive: true });
+const workflowSettings = piCodingAgent.SettingsManager.inMemory({
+  extensions: [join(artifactDir, "web-tools.js")],
+});
+const workflowChild = await piCodingAgent.createAgentSession({
+  cwd: agentWorkspace,
+  agentDir: workflowAgentDir,
+  settingsManager: workflowSettings,
+  sessionManager: piCodingAgent.SessionManager.inMemory(agentWorkspace),
+  customTools: piCodingAgent.createCodingTools(agentWorkspace),
+});
+try {
+  assert.deepEqual(workflowChild.extensionsResult.errors, []);
+  assertCanonicalWebWrapper(
+    "dynamic-workflow in-memory child",
+    workflowChild.extensionsResult.extensions.map((extension) => extension.path),
+  );
+  assert.equal(
+    workflowChild.session.getActiveToolNames().filter((name) => name === "web_search").length,
+    1,
+  );
+  assert.equal(
+    workflowChild.session.getAllTools().filter((tool) => tool.name === "web_search").length,
+    1,
+  );
+} finally {
+  workflowChild.session.dispose();
+}
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
 const piInvocation = await importPackageFile("dist/pi-extensions/pi-invocation.js");
@@ -1478,6 +1514,7 @@ assert.deepEqual(
   askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("ask-agent child", askAgentLoadedExtensions);
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("subagent")));
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("ask-agent")));
 askAgentSmokeChild.stdout.emitData(JSON.stringify({
@@ -1599,6 +1636,7 @@ try {
     askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
     ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
   );
+  assertCanonicalWebWrapper("ask-agent wrapper child", askAgentWrapperExtensions);
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
   assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);
@@ -1618,52 +1656,53 @@ try {
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");
   assert.ok(searchTool, "web_search should be registered");
-  const searchResult = await searchTool.execute("call-1", { query: "installed wrapper" });
-  assert.equal(searchResult.details.ok, true);
-  assert.equal(fetchCalls.length, 1);
-  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer tvly-installed-wrapper-key");
-  assert.deepEqual(readFileSync(sopsArgvFile, "utf8").trim().split("\n"), [
-    "-d",
-    "--extract",
-    "[\"tavily\"][\"api_key\"]",
-    controlTavilySopsFile,
-  ]);
-
-  const installedMonitor = new tavilyMonitorCore.TavilyMonitor({
-    controlWorkspaceRoot: workspace,
-    apiKey: "installed-monitor-fixture-key",
-    fetchImpl: async (url, init) => {
-      assert.equal(String(url), tavilyMonitorCore.TAVILY_USAGE_URL);
-      assert.equal(init.headers.Authorization, "Bearer installed-monitor-fixture-key");
-      return new Response(JSON.stringify({
-        key: { usage: 1, limit: 100, search_usage: 1, extract_usage: 0 },
-        account: {
-          current_plan: "Fixture",
-          plan_usage: 1,
-          plan_limit: 100,
-          paygo_usage: 0,
-          paygo_limit: 50,
-          search_usage: 1,
-          extract_usage: 0,
-        },
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
+  const codexContext = {
+    model: { provider: "openai-codex", id: "gpt-installed", api: "openai-codex-responses" },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "installed-oauth-token" }),
+      authStorage: {
+        get: () => ({
+          type: "oauth",
+          access: "installed-oauth-token",
+          accountId: "installed-account-id",
+        }),
+      },
     },
-  });
-  const usageResult = await installedMonitor.sampleUsage();
-  assert.equal(usageResult.ok, true);
-  assert.equal(installedMonitor.getState().latestSample.account.plan.remaining, 99);
-  assert.ok(existsSync(join(workspace, "data", "tavily", "state.json")));
-  assert.equal(existsSync(join(projectDir, "data", "tavily", "state.json")), false);
+  };
+  const oldOpenAiApiKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-be-used";
+  const searchResult = await searchTool.execute(
+    "call-1",
+    { query: "installed wrapper" },
+    undefined,
+    undefined,
+    codexContext,
+  );
+  if (oldOpenAiApiKey === undefined) {
+    delete process.env.OPENAI_API_KEY;
+  } else {
+    process.env.OPENAI_API_KEY = oldOpenAiApiKey;
+  }
+  assert.equal(searchResult.details.ok, true);
+  assert.equal(searchResult.content[0].text, "Installed answer.");
+  assert.equal(searchResult.details.provider, "openai-codex");
+  assert.equal(searchResult.details.model, "gpt-installed");
+  assert.equal(searchResult.details.responseId, "resp_installed");
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(fetchCalls[0].init.method, "POST");
+  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer installed-oauth-token");
+  assert.equal(fetchCalls[0].init.headers["ChatGPT-Account-Id"], "installed-account-id");
+  const searchBody = JSON.parse(fetchCalls[0].init.body);
+  assert.equal(searchBody.model, "gpt-installed");
+  assert.deepEqual(searchBody.tools, [{
+    type: "web_search",
+    external_web_access: true,
+    search_context_size: "medium",
+  }]);
+  assert.equal(JSON.stringify(fetchCalls[0]).includes("must-not-be-used"), false);
 
-  webResponseStatus = 432;
-  const exhaustedResult = await searchTool.execute("call-2", { query: "installed quota event" });
-  assert.equal(exhaustedResult.details.ok, false);
-  assert.match(exhaustedResult.content[0].text, /base-plan credits are exhausted/);
-  assert.equal(installedMonitor.drainChildEvents(), 1);
-  const installedState = installedMonitor.getState();
-  assert.equal(installedState.incident.lastClassification, "base_plan_exhausted");
-  assert.deepEqual(installedState.incident.observedTools, ["web_search"]);
-  assert.equal(installedState.outbox.filter((entry) => entry.kind === "incident").length, 1);
 } finally {
   globalThis.fetch = oldFetch;
 }

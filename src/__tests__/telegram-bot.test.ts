@@ -1,17 +1,11 @@
 process.env.TZ = "UTC";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
+import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, TELEGRAM_ALLOWED_UPDATES, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
-import {
-  TAVILY_DURABLE_DELIVERY,
-  TELEGRAM_ALLOWED_UPDATES,
-  isTavilyCallbackDestination,
-} from "../telegram-bot.js";
-import type { TavilyOperatorActions } from "../tavily-monitor-runtime.js";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -203,6 +197,10 @@ describe("isImageMimeType", () => {
 });
 
 describe("BOT_COMMANDS", () => {
+  it("polls only conversational update types", () => {
+    assert.deepEqual(TELEGRAM_ALLOWED_UPDATES, ["message", "message_reaction"]);
+  });
+
   it("contains start, reconnect, clean, and status commands", () => {
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status"]);
@@ -1093,22 +1091,6 @@ describe("createTelegramAutoRetryTransformer", () => {
     assert.strictEqual((result as { ok: boolean }).ok, false);
   });
 
-  it("returns durable Tavily sends to the outbox after one API attempt", async () => {
-    const transformer = createTelegramAutoRetryTransformer();
-    let callCount = 0;
-    const prev = async () => {
-      callCount++;
-      return { ok: false, error_code: 429, parameters: { retry_after: 3 } } as const;
-    };
-    const result = await transformer(prev as never, "sendMessage", {
-      chat_id: 555000111,
-      text: "bounded Tavily notification",
-      [TAVILY_DURABLE_DELIVERY]: true,
-    } as never);
-    assert.strictEqual(callCount, 1);
-    assert.strictEqual((result as { ok: boolean }).ok, false);
-  });
-
   it("retries sendMessage on 429 via autoRetry", async () => {
     const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
@@ -1503,32 +1485,6 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
   });
 
-  it("/status includes the current privacy-safe Tavily diagnostics", async () => {
-    const mockSM = createMockSessionManager();
-    const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot } = initBot(mockSM, apiCalls, {
-      getTavilyStatus: () => ({
-        sampleState: "error",
-        latestAttemptAt: new Date(Date.now() - 60_000).toISOString(),
-        lastFailure: {
-          classification: "rate_limited",
-          source: "web_fetch",
-          observedAt: new Date(Date.now() - 60_000).toISOString(),
-          httpStatus: 429,
-        },
-        incident: "active",
-        acknowledged: false,
-      }),
-    });
-
-    await bot.handleUpdate(makeCommandUpdate("status", 31));
-    const text = String(apiCalls.find((call) => call.method === "sendMessage")?.payload.text);
-    assert.match(text, /Tavily: error \(attempt 1m ago\)/);
-    assert.match(text, /Last failure: rate_limited \(web_fetch, 1m ago\)/);
-    assert.match(text, /Incident: active \(unacknowledged\)/);
-    assert.doesNotMatch(text, /HTTP 429|chat_id|generation|state\.json/);
-  });
-
   it("handles delayed command and text updates through their normal paths", async () => {
     const delayedDate = Math.floor(Date.now() / 1000) - 60 * 60;
     const apiCalls: Array<{ method: string; payload: any }> = [];
@@ -1592,250 +1548,6 @@ describe("command handler wiring", () => {
       assert.ok(reply, `media handler ${index} must send a visible reply`);
       assert.match(String(reply.payload.text), /metadata/i);
     }
-  });
-});
-
-describe("Tavily Telegram incident actions", () => {
-  const destination = { chatId: -1007100, threadId: 17 };
-  const config: BotConfig = {
-    telegramToken: "test:fake-token-for-tavily-actions",
-    adminChatId: undefined,
-    defaultDeliveryChatId: destination.chatId,
-    defaultDeliveryThreadId: destination.threadId,
-    agents: {
-      main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" },
-    },
-    bindings: [{ chatId: 111111111, agentId: "main", kind: "dm" }],
-    sessionDefaults: {
-      idleTimeoutMs: 60_000,
-      maxConcurrentSessions: 2,
-      maxMessageAgeMs: 300_000,
-      requireMention: false,
-      maxMediaBytes: 209_715_200,
-    },
-  };
-
-  function sessionManager(): SessionManager {
-    return {
-      sendSessionMessage: () => { throw new Error("unexpected session message"); },
-      getActive: () => undefined,
-    } as unknown as SessionManager;
-  }
-
-  function callbackUpdate(
-    data: string,
-    updateId: number,
-    chatId = destination.chatId,
-    threadId: number | undefined = destination.threadId,
-  ) {
-    return {
-      update_id: updateId,
-      callback_query: {
-        id: `callback-${updateId}`,
-        from: { id: 7100, is_bot: false, first_name: "Operator" },
-        chat_instance: "fixture-instance",
-        data,
-        message: {
-          message_id: 70,
-          date: Math.floor(Date.now() / 1_000),
-          chat: { id: chatId, type: "supergroup" as const, title: "Ops" },
-          ...(threadId === undefined ? {} : { message_thread_id: threadId }),
-        },
-      },
-    };
-  }
-
-  function initActionsBot(actions: TavilyOperatorActions) {
-    const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot } = createTelegramBot(config, sessionManager(), { tavilyActions: actions });
-    bot.api.config.use(async (_prev, method, payload) => {
-      apiCalls.push({ method, payload });
-      return { ok: true, result: true } as any;
-    });
-    bot.botInfo = {
-      id: 999,
-      is_bot: true,
-      first_name: "TestBot",
-      username: "test_bot",
-      can_join_groups: true,
-      can_read_all_group_messages: false,
-      supports_inline_queries: false,
-      can_manage_bots: false,
-      supports_join_request_queries: false,
-      can_connect_to_business: false,
-      has_main_web_app: false,
-      has_topics_enabled: false,
-      allows_users_to_create_topics: false,
-    };
-    return { bot, apiCalls };
-  }
-
-  it("polls callback_query updates and authorizes the exact destination/thread", async () => {
-    const acknowledged: string[] = [];
-    const actions: TavilyOperatorActions = {
-      getDeliveryDestination: () => destination,
-      isIncidentActive: () => true,
-      acknowledgeIncident: async (generation) => {
-        acknowledged.push(generation);
-        return true;
-      },
-      recheckIncident: async () => assert.fail("recheck was not expected"),
-    };
-    const { bot, apiCalls } = initActionsBot(actions);
-
-    assert.deepEqual(TELEGRAM_ALLOWED_UPDATES, ["message", "message_reaction", "callback_query"]);
-    assert.equal(isTavilyCallbackDestination(
-      { chat: { id: destination.chatId }, message_thread_id: destination.threadId },
-      destination,
-    ), true);
-    assert.equal(isTavilyCallbackDestination(
-      { chat: { id: destination.chatId }, message_thread_id: 18 },
-      destination,
-    ), false);
-
-    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-1", 1, -1007200));
-    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-1", 2, destination.chatId, 18));
-    assert.deepEqual(acknowledged, []);
-    const rejected = apiCalls.filter((call) => call.method === "answerCallbackQuery");
-    assert.equal(rejected.length, 2);
-    assert.ok(rejected.every((call) => /not available/.test(String(call.payload.text))));
-
-    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-1", 3));
-    assert.deepEqual(acknowledged, ["2026-07-1"]);
-    assert.match(
-      String(apiCalls.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text),
-      /acknowledged/,
-    );
-  });
-
-  it("answers stale generations without acknowledging them", async () => {
-    let acknowledgements = 0;
-    const actions: TavilyOperatorActions = {
-      getDeliveryDestination: () => destination,
-      isIncidentActive: () => true,
-      acknowledgeIncident: async () => {
-        acknowledgements++;
-        return false;
-      },
-      recheckIncident: async () => assert.fail("recheck was not expected"),
-    };
-    const { bot, apiCalls } = initActionsBot(actions);
-
-    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-99", 4));
-    assert.equal(acknowledgements, 1);
-    assert.match(
-      String(apiCalls.find((call) => call.method === "answerCallbackQuery")?.payload.text),
-      /stale/,
-    );
-  });
-
-  it("delegates recheck reporting to the durable runtime without a direct send", async () => {
-    let rechecks = 0;
-    const failure = {
-      ok: false,
-      generation: "2026-07-1",
-      stage: "search_probe" as const,
-      classification: "probe_failed" as const,
-    } as const;
-    const actions: TavilyOperatorActions = {
-      getDeliveryDestination: () => destination,
-      isIncidentActive: () => true,
-      acknowledgeIncident: async () => assert.fail("acknowledgement was not expected"),
-      recheckIncident: async () => {
-        rechecks++;
-        return failure;
-      },
-    };
-    const { bot, apiCalls } = initActionsBot(actions);
-
-    await bot.handleUpdate(callbackUpdate("tavily:recheck:2026-07-1", 5));
-    assert.equal(rechecks, 1);
-    assert.match(
-      String(apiCalls.find((call) => call.method === "answerCallbackQuery")?.payload.text),
-      /Rechecking/,
-    );
-    assert.equal(apiCalls.some((call) => call.method === "sendMessage"), false);
-  });
-
-  it("avoids duplicate success sends and rejects stale rechecks before execution", async () => {
-    for (const result of [
-      {
-        ok: true as const,
-        generation: "2026-07-1",
-        sample: {
-          observedAt: "2026-07-16T12:00:00.000Z",
-          cycleGeneration: "2026-07",
-          key: { usage: 1, limit: 10, remaining: 9 },
-          account: {
-            currentPlan: "Researcher",
-            plan: { usage: 1, limit: 10, remaining: 9 },
-            paygo: { usage: 0, limit: 0, remaining: 0 },
-          },
-        },
-      },
-      {
-        ok: false as const,
-        generation: "2026-07-1",
-        stage: "incident" as const,
-        classification: "stale_incident" as const,
-      },
-    ]) {
-      const actions: TavilyOperatorActions = {
-        getDeliveryDestination: () => destination,
-        isIncidentActive: () => result.ok,
-        acknowledgeIncident: async () => assert.fail("acknowledgement was not expected"),
-        recheckIncident: async () => {
-          if (!result.ok) assert.fail("stale recheck must be rejected before execution");
-          return result;
-        },
-      };
-      const { bot, apiCalls } = initActionsBot(actions);
-      await bot.handleUpdate(callbackUpdate("tavily:recheck:2026-07-1", result.ok ? 6 : 7));
-      assert.equal(apiCalls.filter((call) => call.method === "answerCallbackQuery").length, 1);
-      assert.match(
-        String(apiCalls.find((call) => call.method === "answerCallbackQuery")?.payload.text),
-        result.ok ? /Rechecking/ : /stale/,
-      );
-      assert.equal(apiCalls.some((call) => call.method === "sendMessage"), false);
-    }
-  });
-
-  it("handles owner callbacks even when there are no normal Telegram bindings", async () => {
-    let acknowledgements = 0;
-    const actions: TavilyOperatorActions = {
-      getDeliveryDestination: () => destination,
-      isIncidentActive: () => true,
-      acknowledgeIncident: async () => {
-        acknowledgements += 1;
-        return true;
-      },
-      recheckIncident: async () => assert.fail("recheck was not expected"),
-    };
-    const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot } = createTelegramBot({ ...config, bindings: [] }, sessionManager(), { tavilyActions: actions });
-    bot.api.config.use(async (_prev, method, payload) => {
-      apiCalls.push({ method, payload });
-      return { ok: true, result: true } as any;
-    });
-    bot.botInfo = {
-      id: 999,
-      is_bot: true,
-      first_name: "TestBot",
-      username: "test_bot",
-      can_join_groups: true,
-      can_read_all_group_messages: false,
-      supports_inline_queries: false,
-      can_manage_bots: false,
-      supports_join_request_queries: false,
-      can_connect_to_business: false,
-      has_main_web_app: false,
-      has_topics_enabled: false,
-      allows_users_to_create_topics: false,
-    };
-
-    await bot.handleUpdate(callbackUpdate("tavily:ack:2026-07-1", 8));
-    assert.equal(acknowledgements, 1);
-    assert.match(String(apiCalls[0]?.payload.text), /acknowledged/);
   });
 });
 

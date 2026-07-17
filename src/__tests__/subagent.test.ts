@@ -113,7 +113,9 @@ describe("subagent: buildSubagentSpawnArgs", () => {
 
   it("injects the child's --extension args before the task", () => {
     const extensionArgs = [
+      "--extension", "/abs/codex-transport-overflow.ts",
       "--extension", "/abs/web-tools.ts",
+      "--extension", "/abs/knowledge-tools.ts",
     ];
     const args = buildSubagentSpawnArgs({}, "delegate", { extensionArgs });
     const taskIdx = args.indexOf("Task: delegate");
@@ -130,12 +132,15 @@ describe("subagent: buildSubagentSpawnArgs", () => {
 });
 
 describe("subagent: bundled agent tool allowlists", () => {
-  it("allows web tools for explicit scout, reviewer, and planner allowlists", () => {
-    for (const agentName of ["scout", "reviewer", "planner"]) {
+  it("keeps bundled search roles on web_search only and preserves their existing Bash boundary", () => {
+    const expectedTools = new Map([
+      ["planner", ["read", "grep", "find", "ls", "web_search"]],
+      ["reviewer", ["read", "grep", "find", "ls", "bash", "web_search"]],
+      ["scout", ["read", "grep", "find", "ls", "bash", "web_search"]],
+    ]);
+    for (const [agentName, expected] of expectedTools) {
       const tools = readBundledAgentTools(agentName);
-      assert.ok(tools, `${agentName} must have an explicit tools allowlist`);
-      assert.ok(tools.includes("web_search"), `${agentName} tools must include web_search`);
-      assert.ok(tools.includes("web_fetch"), `${agentName} tools must include web_fetch`);
+      assert.deepEqual(tools, expected, `${agentName} must retain its exact read-only search allowlist`);
       const args = buildSubagentSpawnArgs({ tools }, `task for ${agentName}`);
       assert.equal(args[args.indexOf("--tools") + 1], tools.join(","));
     }
@@ -242,19 +247,19 @@ describe("subagent: wrapper spawn environment", () => {
     }
   });
 
-  it("does not inject ambient bot or Tavily secrets into subagent child argv", () => {
+  it("does not inject ambient bot or external-service secrets into subagent child argv", () => {
     const telegramTokenEnv = ["TELEGRAM", "BOT", "TOKEN"].join("_");
     const discordTokenEnv = ["DISCORD", "BOT", "TOKEN"].join("_");
-    const tavilyKeyEnv = ["TAVILY", "API", "KEY"].join("_");
+    const externalServiceKeyEnv = ["EXTERNAL", "SERVICE", "API", "KEY"].join("_");
     const oldTelegram = process.env[telegramTokenEnv];
     const oldDiscord = process.env[discordTokenEnv];
-    const oldTavily = process.env[tavilyKeyEnv];
-    const fixtureValues = ["subagent-telegram-fixture", "subagent-discord-fixture", "subagent-tavily-fixture"];
+    const oldExternalService = process.env[externalServiceKeyEnv];
+    const fixtureValues = ["subagent-telegram-fixture", "subagent-discord-fixture", "subagent-external-service-fixture"];
 
     try {
       process.env[telegramTokenEnv] = fixtureValues[0];
       process.env[discordTokenEnv] = fixtureValues[1];
-      process.env[tavilyKeyEnv] = fixtureValues[2];
+      process.env[externalServiceKeyEnv] = fixtureValues[2];
 
       const args = buildSubagentSpawnArgs({}, "delegate safely", {
         extensionArgs: ["--extension", "/abs/web-tools.ts"],
@@ -275,10 +280,10 @@ describe("subagent: wrapper spawn environment", () => {
       } else {
         process.env[discordTokenEnv] = oldDiscord;
       }
-      if (oldTavily === undefined) {
-        delete process.env[tavilyKeyEnv];
+      if (oldExternalService === undefined) {
+        delete process.env[externalServiceKeyEnv];
       } else {
-        process.env[tavilyKeyEnv] = oldTavily;
+        process.env[externalServiceKeyEnv] = oldExternalService;
       }
     }
   });
