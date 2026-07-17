@@ -32,7 +32,6 @@ import { buildStatusReport } from "./status-report.js";
 import {
   createPollProgressProbe,
   createUpdateProcessingProbe,
-  TELEGRAM_API_TIMEOUT_SECONDS,
   type PollProgressProbe,
   type UpdateProcessingProbe,
 } from "./poll-progress.js";
@@ -786,9 +785,7 @@ export function createTelegramBot(
     throw new Error("telegramToken is required for Telegram bot");
   }
   const token = config.telegramToken;
-  const bot = new Bot(token, {
-    client: { timeoutSeconds: TELEGRAM_API_TIMEOUT_SECONDS },
-  });
+  const bot = new Bot(token);
 
   // Log Telegram API errors, especially 429 rate limits, and count every API
   // call attempt by binding (inner transformer — sees each individual attempt

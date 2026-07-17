@@ -4,10 +4,11 @@ import type { Context, MiddlewareFn, Transformer } from "grammy";
 export const TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 30;
 
 /**
- * Bound every grammY API request above one complete long-poll cadence. This is
- * also the only bound on bot.stop()'s signal-less final offset confirmation.
+ * Bound getUpdates above one complete long-poll cadence. This also bounds
+ * bot.stop()'s signal-less final offset confirmation without imposing a short
+ * timeout on potentially large Telegram media uploads.
  */
-export const TELEGRAM_API_TIMEOUT_SECONDS = TELEGRAM_LONG_POLL_TIMEOUT_SECONDS + 15;
+export const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS = TELEGRAM_LONG_POLL_TIMEOUT_SECONDS + 15;
 
 /**
  * A successful poll should normally complete once per long-poll timeout. Three
@@ -50,6 +51,7 @@ export interface UpdateProcessingProbe {
 export function createPollProgressProbe(
   now: () => number = Date.now,
   onSuccessfulPoll?: () => void,
+  getUpdatesTimeoutMs = TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS * 1000,
 ): PollProgressProbe {
   const initializedAtMs = now();
   let lastPollStartedAtMs: number | null = null;
@@ -64,10 +66,18 @@ export function createPollProgressProbe(
       return prev(method, payload, signal);
     }
 
+    const controller = new AbortController();
+    const forwardAbort = (): void => controller.abort();
+    if (signal?.aborted) forwardAbort();
+    else signal?.addEventListener("abort", forwardAbort, { once: true });
+    const timeout = setTimeout(() => controller.abort(), getUpdatesTimeoutMs);
+
     lastPollStartedAtMs = now();
     inFlightCount++;
     try {
-      const response = await prev(method, payload, signal);
+      // grammY types signals through its abort-controller shim while Node's
+      // native signal is structurally compatible at runtime.
+      const response = await prev(method, payload, controller.signal as never);
       if (response.ok) {
         lastPollSucceededAtMs = now();
         lastPollFailedAtMs = null;
@@ -83,6 +93,8 @@ export function createPollProgressProbe(
       failedPollCount++;
       throw error;
     } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", forwardAbort);
       inFlightCount--;
     }
   };

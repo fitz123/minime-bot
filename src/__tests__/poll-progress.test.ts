@@ -4,6 +4,7 @@ import {
   createPollProgressProbe,
   createUpdateProcessingProbe,
   DEFAULT_POLL_STALL_THRESHOLD_MS,
+  TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
   TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
 
@@ -29,6 +30,52 @@ describe("poll-progress probe", () => {
   it("derives a conservative stall threshold from the explicit poll timeout", () => {
     assert.ok(DEFAULT_POLL_STALL_THRESHOLD_MS > TELEGRAM_LONG_POLL_TIMEOUT_SECONDS * 1000);
     assert.equal(DEFAULT_POLL_STALL_THRESHOLD_MS, TELEGRAM_LONG_POLL_TIMEOUT_SECONDS * 3 * 1000);
+    assert.equal(TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS, 45);
+    assert.ok(TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS > TELEGRAM_LONG_POLL_TIMEOUT_SECONDS);
+  });
+
+  it("bounds signal-less getUpdates calls used by final offset confirmation", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const probe = createPollProgressProbe(Date.now, undefined, 5);
+    const pendingPoll = async (
+      _method: string,
+      _payload: unknown,
+      signal?: AbortSignal,
+    ): Promise<never> => {
+      receivedSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("poll aborted")), { once: true });
+      });
+    };
+
+    await assert.rejects(
+      probe.transformer(pendingPoll as never, "getUpdates", {}),
+      /poll aborted/,
+    );
+    assert.equal(receivedSignal?.aborted, true);
+    assert.equal(probe.snapshot().failedPollCount, 1);
+    assert.equal(probe.snapshot().inFlight, false);
+  });
+
+  it("forwards caller cancellation into the bounded getUpdates signal", async () => {
+    const caller = new AbortController();
+    const probe = createPollProgressProbe(Date.now, undefined, 60_000);
+    let receivedSignal: AbortSignal | undefined;
+    const pendingPoll = async (
+      _method: string,
+      _payload: unknown,
+      signal?: AbortSignal,
+    ): Promise<never> => {
+      receivedSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("poll cancelled")), { once: true });
+      });
+    };
+
+    const call = probe.transformer(pendingPoll as never, "getUpdates", {}, caller.signal as never);
+    caller.abort();
+    await assert.rejects(call, /poll cancelled/);
+    assert.equal(receivedSignal?.aborted, true);
   });
 
   it("ignores non-getUpdates methods", async () => {
