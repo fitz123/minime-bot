@@ -459,6 +459,7 @@ describe("Tavily durable metrics", () => {
       notificationStats: { delivered: 4, retried: 2, terminal: 1 },
       incident: {
         generation: "private-generation-must-not-be-a-label",
+        exhaustionSequence: 1,
         openedAt: "2026-07-16T11:57:00.000Z",
         lastObservedAt: "2026-07-16T11:57:00.000Z",
         lastClassification: "base_plan_exhausted",

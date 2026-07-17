@@ -9,7 +9,6 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
-  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -197,9 +196,8 @@ describe("tavily: child failure event writer", () => {
         version: 1,
         pid: 71,
         token: "stale-owner",
+        acquiredAt: "2026-07-16T10:20:30.000Z",
       })}\n`, { mode: 0o600 });
-      const acquiredAt = new Date("2026-07-16T10:20:30.000Z");
-      utimesSync(lockPath, acquiredAt, acquiredAt);
 
       const replacement = acquireTavilyEventPublicationLock(controlWorkspace, {
         pid: 72,
@@ -1246,7 +1244,7 @@ describe("web-tools Pi wrapper", () => {
     return mod.default;
   }
 
-  it("persists non-quota failures and stays graceful when event persistence fails", async () => {
+  it("persists non-quota failures and fails closed when publication registration fails", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "web-tools-wrapper-missing-"));
     const oldCwd = process.cwd();
     const oldWarn = console.warn;
@@ -1284,9 +1282,9 @@ describe("web-tools Pi wrapper", () => {
       symlinkSync(tmpDir, spool, "dir");
       const fetchResult = await registered[1].execute("call-2", { url: "https://example.com" });
       assert.equal(fetchResult.details.ok, false);
-      assert.match(fetchResult.content[0].text, /web_fetch is unavailable/);
+      assert.match(fetchResult.content[0].text, /monitoring state could not be updated safely/);
       assert.ok(warnings.some((warning) =>
-        warning === "[web-tools] tool=web_fetch reason=event-write-failed classification=credential_missing"));
+        warning === "[web-tools] tool=web_fetch reason=event-write-failed"));
     } finally {
       console.warn = oldWarn;
       if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
@@ -1414,8 +1412,11 @@ describe("web-tools Pi wrapper", () => {
     const oldPath = process.env.PATH;
     const oldWorkspace = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
     const oldFetch = globalThis.fetch;
+    const oldWarn = console.warn;
     const registered: RegisteredTool[] = [];
     const fetchCalls: FetchCall[] = [];
+    const warnings: string[] = [];
+    let sabotageCompletion = false;
 
     try {
       mkdirSync(join(controlWorkspace, "config"), { recursive: true });
@@ -1436,8 +1437,18 @@ describe("web-tools Pi wrapper", () => {
       process.env.PATH = `${binDir}:${oldPath ?? ""}`;
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
       process.chdir(childWorkspace);
+      console.warn = (message?: unknown) => warnings.push(String(message));
       globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         fetchCalls.push({ url: String(url), init });
+        if (sabotageCompletion) {
+          const spool = tavilyEventSpoolDirectory(controlWorkspace);
+          const marker = readdirSync(spool).find((file) =>
+            file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX));
+          assert.ok(marker);
+          rmSync(join(spool, marker), { force: true });
+          rmSync(spool, { recursive: true });
+          writeFileSync(spool, "blocked\n", "utf8");
+        }
         return jsonResponse({ results: [] });
       }) as typeof fetch;
 
@@ -1454,8 +1465,30 @@ describe("web-tools Pi wrapper", () => {
         '["tavily"]["api_key"]',
         join(controlWorkspace, TAVILY_SOPS_FILE_RELPATH),
       ]);
+      const spool = tavilyEventSpoolDirectory(controlWorkspace);
+      assert.equal(
+        readdirSync(spool).some((file) => file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)),
+        false,
+      );
+      const barrier = await acquireTavilyEventRecoveryBarrier(controlWorkspace, {
+        inFlightWaitTimeoutMs: 0,
+      });
+      barrier.release();
+
+      sabotageCompletion = true;
+      const completionFailure = await registered[0].execute("call-2", { query: "docs" });
+      assert.equal(completionFailure.details.ok, false);
+      assert.match(completionFailure.content[0].text, /monitoring state could not be updated safely/);
+      assert.equal(fetchCalls.length, 2, "the registered request reaches Tavily before completion fails");
+
+      const registrationFailure = await registered[1].execute("call-3", { url: "https://example.com/" });
+      assert.equal(registrationFailure.details.ok, false);
+      assert.match(registrationFailure.content[0].text, /monitoring state could not be updated safely/);
+      assert.equal(fetchCalls.length, 2, "an unregistered request never reaches Tavily");
+      assert.equal(warnings.filter((warning) => /reason=event-write-failed/.test(warning)).length, 2);
     } finally {
       globalThis.fetch = oldFetch;
+      console.warn = oldWarn;
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
       if (oldWorkspace === undefined) delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];

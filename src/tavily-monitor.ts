@@ -175,6 +175,8 @@ export interface TavilyNotification {
 
 export interface TavilyIncident {
   generation: string;
+  /** Monotonic within the incident; absent only in state written before this field existed. */
+  exhaustionSequence?: number;
   openedAt: string;
   lastObservedAt: string;
   lastClassification: "base_plan_exhausted" | "paygo_exhausted";
@@ -964,6 +966,7 @@ function validIncident(value: unknown): value is TavilyIncident {
   if (!isRecord(value) ||
       !hasOnlyKeys(value, [
         "generation",
+        "exhaustionSequence",
         "openedAt",
         "lastObservedAt",
         "lastClassification",
@@ -976,6 +979,8 @@ function validIncident(value: unknown): value is TavilyIncident {
         "recoveryUsageObservedAt",
       ]) ||
       !boundedString(value.generation, 80) ||
+      (value.exhaustionSequence !== undefined &&
+        (!Number.isSafeInteger(value.exhaustionSequence) || (value.exhaustionSequence as number) < 1)) ||
       !isCanonicalIsoTimestamp(value.openedAt) ||
       !isCanonicalIsoTimestamp(value.lastObservedAt) ||
       (value.lastClassification !== "base_plan_exhausted" &&
@@ -1202,10 +1207,47 @@ function cancelPendingNotifications(
   kinds: readonly TavilyNotificationKind[],
 ): void {
   const canceledKinds = new Set<TavilyNotificationKind>(kinds);
+  const canceledKeys = new Set(state.outbox
+    .filter((entry) => entry.status === "pending" &&
+      entry.incidentGeneration === generation &&
+      canceledKinds.has(entry.kind))
+    .map((entry) => entry.key));
   state.outbox = state.outbox.filter((entry) =>
     entry.status !== "pending" ||
     entry.incidentGeneration !== generation ||
     !canceledKinds.has(entry.kind));
+  state.notificationKeys = state.notificationKeys.filter((key) => !canceledKeys.has(key));
+}
+
+function pruneThresholdNotificationHistory(
+  state: TavilyMonitorState,
+  cycleGeneration: string,
+): void {
+  const currentPrefix = `threshold:${cycleGeneration}:`;
+  state.notificationKeys = state.notificationKeys.filter((key) =>
+    !key.startsWith("threshold:") || key.startsWith(currentPrefix));
+  state.outbox = state.outbox.filter((entry) =>
+    (entry.kind !== "threshold_warning" && entry.kind !== "threshold_critical") ||
+    entry.key.startsWith(currentPrefix));
+}
+
+function pruneIncidentNotificationHistory(state: TavilyMonitorState, generation: string): void {
+  const prefix = `incident:${generation}:`;
+  state.notificationKeys = state.notificationKeys.filter((key) => !key.startsWith(prefix));
+  state.outbox = state.outbox.filter((entry) => entry.incidentGeneration !== generation);
+}
+
+function coalesceIncidentNotification(
+  state: TavilyMonitorState,
+  generation: string,
+  kind: TavilyNotificationKind,
+): void {
+  const removedKeys = new Set(state.outbox
+    .filter((entry) => entry.incidentGeneration === generation && entry.kind === kind)
+    .map((entry) => entry.key));
+  state.outbox = state.outbox.filter((entry) =>
+    entry.incidentGeneration !== generation || entry.kind !== kind);
+  state.notificationKeys = state.notificationKeys.filter((key) => !removedKeys.has(key));
 }
 
 function recordUsageSampleStat(state: TavilyMonitorState, outcome: "success" | "failure"): void {
@@ -1397,6 +1439,7 @@ export class TavilyMonitor {
       }
       state.latestSample = result.sample;
       state.latestSampleStatus = { classification: "ok", observedAt: result.sample.observedAt };
+      pruneThresholdNotificationHistory(state, result.sample.cycleGeneration);
       addThresholdNotifications(state, result.sample, now);
       const incident = state.incident;
       if (!incident || incident.resolvedAt) return;
@@ -1446,6 +1489,7 @@ export class TavilyMonitor {
 
     const existing = state.incident;
     if (existing && !existing.resolvedAt) {
+      existing.exhaustionSequence = (existing.exhaustionSequence ?? 1) + 1;
       existing.lastObservedAt = laterTimestamp(existing.lastObservedAt, event.observedAt);
       if (event.observedAt >= existing.lastObservedAt) existing.lastClassification = event.classification;
       if (!existing.observedTools.includes(event.tool)) existing.observedTools.push(event.tool);
@@ -1458,13 +1502,14 @@ export class TavilyMonitor {
     if (existing?.resolvedAt) {
       const recoveryCutoff = existing.recoveryUsageObservedAt ?? existing.resolvedAt;
       if (new Date(event.observedAt).getTime() <= new Date(recoveryCutoff).getTime()) return;
-      cancelPendingNotifications(state, existing.generation, ["recovery"]);
+      pruneIncidentNotificationHistory(state, existing.generation);
     }
 
     const generation = incidentGeneration(state, event.observedAt);
     const reminderAt = new Date(new Date(event.observedAt).getTime() + this.reminderIntervalMs).toISOString();
     state.incident = {
       generation,
+      exhaustionSequence: 1,
       openedAt: event.observedAt,
       lastObservedAt: event.observedAt,
       lastClassification: event.classification,
@@ -1545,18 +1590,24 @@ export class TavilyMonitor {
       const current = state.incident;
       if (!current || current.resolvedAt || current.acknowledgedAt || current.deliveryTerminalAt) return;
       const scheduledAt = current.nextReminderAt;
-      queued = addNotification(state, {
-        key: `incident:${current.generation}:reminder:${scheduledAt}`,
-        kind: "reminder",
-        createdAt: now,
-        incidentGeneration: current.generation,
-        message: notificationMessageForQuota(
-          "Tavily credit exhaustion reminder.",
-          exhaustionScope(current.lastClassification),
-          state.latestSample,
-          current.generation,
-        ),
-      });
+      const deliveryAlreadyPending = state.outbox.some((entry) =>
+        entry.status === "pending" &&
+        entry.incidentGeneration === current.generation &&
+        (entry.kind === "incident" || entry.kind === "reminder"));
+      if (!deliveryAlreadyPending) {
+        queued = addNotification(state, {
+          key: `incident:${current.generation}:reminder:${scheduledAt}`,
+          kind: "reminder",
+          createdAt: now,
+          incidentGeneration: current.generation,
+          message: notificationMessageForQuota(
+            "Tavily credit exhaustion reminder.",
+            exhaustionScope(current.lastClassification),
+            state.latestSample,
+            current.generation,
+          ),
+        });
+      }
       let next = new Date(scheduledAt).getTime();
       const nowMs = new Date(now).getTime();
       do next += this.reminderIntervalMs; while (next <= nowMs);
@@ -1568,9 +1619,12 @@ export class TavilyMonitor {
   /** Re-arm relevant terminal notices once after an explicit restart with a usable destination. */
   resumeTerminalDeliveries(): number {
     const incident = this.state.incident;
+    const currentCycle = tavilyBillingCycleGeneration(validDate(this.now()).toISOString());
     const resumable = (entry: TavilyNotification): boolean => {
       if (entry.status !== "terminal") return false;
-      if (entry.kind === "threshold_warning" || entry.kind === "threshold_critical") return true;
+      if (entry.kind === "threshold_warning" || entry.kind === "threshold_critical") {
+        return entry.key.startsWith(`threshold:${currentCycle}:`);
+      }
       if (!incident || entry.incidentGeneration !== incident.generation) return false;
       if (entry.kind === "recovery") return incident.resolvedAt !== undefined;
       if (entry.kind === "recheck_failure") return incident.resolvedAt === undefined;
@@ -1654,6 +1708,7 @@ export class TavilyMonitor {
         delete state.pendingAutomaticVerification;
       }
       if (notifyOperator) {
+        coalesceIncidentNotification(state, generation, "recheck_failure");
         const failureSequence = state.notificationKeys.length + 1;
         addNotification(state, {
           key: `incident:${generation}:recheck-failure:${now}:${failureSequence}`,
@@ -1690,6 +1745,7 @@ export class TavilyMonitor {
       };
     }
     const lastObservedBeforeVerification = incident.lastObservedAt;
+    const exhaustionSequenceBeforeVerification = incident.exhaustionSequence ?? 1;
 
     const result = await verifyTavilyRecovery({
       apiKey: this.apiKey,
@@ -1743,7 +1799,8 @@ export class TavilyMonitor {
           (current.lastObservedAt === result.sample.observedAt &&
             current.lastObservedAt !== lastObservedBeforeVerification));
       if (current?.generation === generation && !current.resolvedAt &&
-          exhaustionAfterUsage) {
+          ((current.exhaustionSequence ?? 1) !== exhaustionSequenceBeforeVerification ||
+            exhaustionAfterUsage)) {
         return this.verificationFailure(
           generation,
           "usage_state",
@@ -1816,7 +1873,10 @@ export class TavilyMonitor {
     this.commit((state) => {
       const index = state.outbox.findIndex((entry) => entry.key === key);
       if (index < 0) return;
-      state.outbox.splice(index, 1);
+      const [delivered] = state.outbox.splice(index, 1);
+      if (delivered.kind === "reminder" || delivered.kind === "recheck_failure") {
+        state.notificationKeys = state.notificationKeys.filter((candidate) => candidate !== key);
+      }
       state.notificationStats.delivered += 1;
     });
     return true;

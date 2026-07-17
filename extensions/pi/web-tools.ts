@@ -31,7 +31,6 @@ import {
 } from "../../src/pi-extensions/tavily.js";
 import {
   beginTavilyToolRequestPublication,
-  writeTavilyChildEvent,
   type TavilyToolRequestPublication,
 } from "../../src/pi-extensions/tavily-events.js";
 import {
@@ -63,17 +62,10 @@ export default function (pi: ExtensionAPI): void {
 
   const deps: RunToolDeps = { apiKey, fetchImpl: fetch, warn };
 
-  const persistFailure = (
-    tool: "web_search" | "web_fetch",
-    result: WebToolResult,
-  ): void => {
-    if (!controlWorkspaceRoot || !result.failure) return;
-    try {
-      writeTavilyChildEvent(controlWorkspaceRoot, tool, result.failure);
-    } catch {
-      warn({ tool, reason: "event-write-failed", classification: result.failure.classification });
-    }
-  };
+  const monitoringUnavailable = (tool: "web_search" | "web_fetch"): WebToolResult => ({
+    ok: false,
+    text: `${tool} failed: Tavily monitoring state could not be updated safely.`,
+  });
 
   const runTool = async (
     tool: "web_search" | "web_fetch",
@@ -85,6 +77,7 @@ export default function (pi: ExtensionAPI): void {
         publication = beginTavilyToolRequestPublication(controlWorkspaceRoot);
       } catch {
         warn({ tool, reason: "event-write-failed" });
+        return monitoringUnavailable(tool);
       }
     }
 
@@ -93,7 +86,6 @@ export default function (pi: ExtensionAPI): void {
     try {
       result = await execute();
       observedAt = new Date();
-      return result;
     } finally {
       if (publication) {
         try {
@@ -104,11 +96,11 @@ export default function (pi: ExtensionAPI): void {
             reason: "event-write-failed",
             ...(result?.failure === undefined ? {} : { classification: result.failure.classification }),
           });
+          result = monitoringUnavailable(tool);
         }
-      } else if (result) {
-        persistFailure(tool, result);
       }
     }
+    return result as WebToolResult;
   };
 
   // Pi's tool `execute` signature is `(toolCallId, params, signal, onUpdate, ctx)`

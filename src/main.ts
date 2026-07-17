@@ -342,7 +342,9 @@ async function main(): Promise<void> {
   // Start Discord bot if configured
   if (config.discord) {
     try {
-      const result = await createDiscordBot(config, config.discord, sessionManager);
+      const result = await createDiscordBot(config, config.discord, sessionManager, {
+        getTavilyStatus: () => tavilySupervisor?.getStatus(),
+      });
       discordClient = result.client;
       messageQueues.push(result.messageQueue);
       log.info("main", "Discord bot started");

@@ -127,15 +127,19 @@ alternate provider, key rotation, or automatic request retry. Keep that file
 encrypted with SOPS and do not place the decrypted key in config, logs, or
 process arguments.
 
-The main process samples Tavily account usage immediately at startup and every
-five minutes. Pi children hand bounded tool failures to it through an owner-only
-event spool polled every two seconds. Consolidated quota samples, threshold
-deduplication, the active incident generation, acknowledgement or resolution,
-and the notification outbox are stored atomically under the control workspace's
-`data/tavily/` directory. Unacknowledged exhaustion incidents are reminded every
-six hours. State and events contain only bounded classifications and counters,
-never keys, queries, requested URLs, provider response bodies, delivery IDs, or
-host paths.
+One process owns `data/tavily/writer.lock`, restores the durable monitor, and
+samples Tavily account usage immediately after acquiring that lease and every
+five minutes thereafter. An overlapping replacement retries the nonblocking
+lease acquisition every second and recovers a stale owner; Telegram and Discord
+can continue starting while it waits, but Tavily `/status` data and incident
+processing are unavailable until ownership transfers. Pi children hand bounded
+tool failures to the lease holder through an owner-only event spool polled every
+two seconds. Consolidated quota samples, threshold deduplication, the active
+incident generation, acknowledgement or resolution, and the notification outbox
+are stored atomically under the control workspace's `data/tavily/` directory.
+Unacknowledged exhaustion incidents are reminded every six hours. State and
+events contain only bounded classifications and counters, never keys, queries,
+requested URLs, provider response bodies, delivery IDs, or host paths.
 
 Base-plan and PAYGO usage each notify once at 80% and 95% per monthly billing
 cycle. Tavily HTTP 432 or 433 responses from either web tool open one shared
@@ -177,7 +181,11 @@ recoverable; neither path retries provider requests automatically.
 `/status` includes sample freshness, base-plan and PAYGO counters, the latest
 bounded failure class, and incident/acknowledgement state. Prometheus exports
 the corresponding low-cardinality `bot_tavily_*` metrics described in
-[`docs/monitoring.md`](docs/monitoring.md).
+[`docs/monitoring.md`](docs/monitoring.md). During an overlapping process
+replacement, the new metrics listener retries its configured occupied address
+every second until the old process releases it; scrapes may therefore continue
+to reach the old process briefly. Other listen errors remain logged, and
+shutdown cancels a pending address retry.
 
 PAYGO enablement and its credit limit are manual Tavily Billing operations. The
 runtime reports and verifies credits but never changes billing. To roll back,

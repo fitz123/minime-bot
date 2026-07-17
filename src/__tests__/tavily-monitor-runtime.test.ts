@@ -335,6 +335,52 @@ describe("Tavily monitor lifecycle", () => {
     await runtime.stop();
   });
 
+  it("runs the five-minute usage timer and delivers newly reached thresholds", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    const usageValues = [100, 800];
+    let usageRequests = 0;
+    const timers: Array<{ callback: () => void; intervalMs: number; unref: () => void }> = [];
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        const usage = usageValues[Math.min(usageRequests, usageValues.length - 1)];
+        usageRequests += 1;
+        return jsonResponse(usageResponse(usage));
+      }) as typeof fetch,
+    });
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+      setIntervalImpl: (callback, intervalMs) => {
+        const handle = { callback, intervalMs, unref() {} };
+        timers.push(handle);
+        return handle;
+      },
+      clearIntervalImpl: () => {},
+    });
+
+    await runtime.start();
+    assert.equal(usageRequests, 1);
+    assert.equal(deliveries.length, 0);
+
+    clock.set("2026-07-16T12:05:00.000Z");
+    const usageTimer = timers.find((timer) => timer.intervalMs === TAVILY_USAGE_SAMPLE_INTERVAL_MS);
+    assert.ok(usageTimer);
+    usageTimer.callback();
+    await runtime.processNow();
+
+    assert.equal(usageRequests, 2);
+    assert.equal(monitor.getState().latestSample?.account.plan.usage, 800);
+    assert.equal(deliveries.filter((delivery) => /quota warning \(80%\)/.test(delivery.text)).length, 1);
+    await runtime.stop();
+  });
+
   it("starts idempotently and clears both lifecycle timers on shutdown", async () => {
     const workspace = temporaryWorkspace();
     const installed: unknown[] = [];
@@ -826,6 +872,47 @@ describe("Tavily durable notification delivery", () => {
     assert.equal(restored.getState().outbox.length, 0);
   });
 
+  it("does not replay a terminal threshold warning from a prior billing cycle", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+    });
+    await monitor.sampleUsage();
+    const missingDestination = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    await missingDestination.processNow();
+    assert.equal(monitor.getState().outbox[0].status, "terminal");
+
+    clock.set("2026-08-01T00:00:00.000Z");
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(100))) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const configured = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await configured.start();
+    await configured.stop();
+
+    assert.equal(deliveries.length, 0);
+    assert.equal(restored.getState().outbox.length, 0);
+    assert.equal(restored.getState().notificationKeys.some((key) => key.startsWith("threshold:2026-07:")), false);
+  });
+
   it("retries a terminal recovery notice without replaying its resolved incident", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");
@@ -873,6 +960,57 @@ describe("Tavily durable notification delivery", () => {
     await configured.stop();
     assert.equal(deliveries.filter((delivery) => /^Tavily recovered\./.test(delivery.text)).length, 1);
     assert.equal(deliveries.some((delivery) => /exhaustion incident/.test(delivery.text)), false);
+  });
+
+  it("retries one terminal recheck failure after restart while the incident stays active", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "terminal-recheck");
+    let recheckCall = 0;
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        recheckCall += 1;
+        return recheckCall === 1
+          ? jsonResponse(usageResponse(100))
+          : jsonResponse({ results: [] });
+      }) as typeof fetch,
+    });
+    const missingDestination = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    await missingDestination.processNow();
+    const generation = monitor.getState().incident?.generation as string;
+    const failed = await missingDestination.recheckIncident(generation);
+    assert.equal(failed.ok, false);
+    assert.equal(monitor.getState().outbox.some((entry) =>
+      entry.kind === "recheck_failure" && entry.status === "terminal"), true);
+
+    clock.set("2026-07-16T12:05:00.000Z");
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(1_000))) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const configured = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await configured.start();
+    await configured.stop();
+
+    assert.equal(deliveries.filter((delivery) => /recovery check failed/.test(delivery.text)).length, 1);
+    assert.equal(restored.getState().incident?.resolvedAt, undefined);
+    assert.equal(restored.getState().outbox.some((entry) => entry.kind === "recheck_failure"), false);
   });
 
   it("aborts the active delivery during shutdown without starting the next due notification", async () => {

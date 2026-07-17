@@ -240,11 +240,10 @@ function readPublicationLock(path: string): TavilyEventPublicationLockRecord {
       typeof record.token !== "string" || !/^[A-Za-z0-9-]{1,80}$/.test(record.token) ||
       (record.processIdentity !== undefined &&
         (typeof record.processIdentity !== "string" || !validProcessIdentity(record.processIdentity))) ||
-      (record.acquiredAt !== undefined && !isCanonicalIsoTimestamp(record.acquiredAt))) {
+      !isCanonicalIsoTimestamp(record.acquiredAt)) {
     throw new Error("Tavily event publication lock is invalid");
   }
-  const acquiredAt = record.acquiredAt ?? lstatSync(path).mtime.toISOString();
-  return { ...record, acquiredAt } as unknown as TavilyEventPublicationLockRecord;
+  return record as unknown as TavilyEventPublicationLockRecord;
 }
 
 function lockOwnerMatchesLiveProcess(

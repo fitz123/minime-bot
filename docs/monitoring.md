@@ -23,13 +23,16 @@ host-native alert path documented below. Tavily remains the only provider for
 `config/secrets.sops.yaml`; there is no plaintext environment fallback,
 alternate provider, multi-key rotation, or billing mutation.
 
-On startup, the monitor restores its owner-only atomic state, drains pending Pi
-child events, and samples Tavily `/usage`. It samples again every five minutes
-and polls child events every two seconds. Base-plan and PAYGO scopes each emit
-deduplicated 80% warnings and 95% critical notices per monthly billing-cycle
-generation. A tool HTTP 432 or 433 opens or refreshes one shared exhaustion
-incident, and an active unacknowledged generation produces one reminder every
-six hours.
+One process holds `data/tavily/writer.lock`. After acquiring that lease it
+restores the owner-only atomic state, drains pending Pi child events, and samples
+Tavily `/usage`; it samples again every five minutes and polls child events every
+two seconds. An overlapping replacement retries nonblocking lease acquisition
+every second and recovers a stale owner. Its transports continue starting while
+it waits, but Tavily `/status` data and incident processing remain unavailable
+until ownership transfers. Base-plan and PAYGO scopes each emit deduplicated 80%
+warnings and 95% critical notices per monthly billing-cycle generation. A tool
+HTTP 432 or 433 opens or refreshes one shared exhaustion incident, and an active
+unacknowledged generation produces one reminder every six hours.
 
 State, incident acknowledgement and resolution, notification deduplication, and
 the delivery outbox persist below the control workspace's `data/tavily/`
@@ -87,10 +90,26 @@ exports these low-cardinality series:
 - `bot_tavily_failures_total{classification,tool}`
 - `bot_tavily_notifications_total{outcome}`
 
-Labels are bounded and never contain a key, query, requested URL, destination,
-incident generation, provider body, or host path. A missing sample sets the
-presence gauge to zero; stale and failed attempts remain visible through
-freshness, success, `/status`, and the bounded failure counters.
+The bounded label vocabulary is:
+
+- usage sample `outcome`: `success` or `failure`
+- notification `outcome`: `delivered`, `retried`, or `terminal`
+- failure `tool`: `usage`, `web_search`, `web_fetch`, `recovery_search`, or
+  `recovery_extract`
+- failure `classification`: `credential_missing`, `credential_invalid`,
+  `rate_limited`, `base_plan_exhausted`, `paygo_exhausted`,
+  `provider_unavailable`, `extraction_failed`, `request_failed`,
+  `usage_invalid`, `usage_exhausted`, or `probe_failed`
+
+Labels never contain a key, query, requested URL, destination, incident
+generation, provider body, or host path. A missing sample sets the presence
+gauge to zero; stale and failed attempts remain visible through freshness,
+success, `/status`, and the bounded failure counters.
+
+During an overlapping process replacement, the new Prometheus listener retries
+an occupied configured host/port every second until the old listener releases
+it. Scrapes can briefly continue reaching the old process. Other listen errors
+remain logged, and shutdown cancels any pending address retry.
 
 Enable PAYGO and set or raise its credit limit manually in Tavily Billing. The
 monitor observes those changes but cannot make them. To roll back this monitor,

@@ -549,8 +549,9 @@ describe("Tavily threshold and durable incident state", () => {
     usage = usageResponse({ planUsage: 800, paygoUsage: 0, paygoLimit: 1_250 });
     await monitor.sampleUsage();
     const state = monitor.getState();
-    assert.equal(state.outbox.length, 5);
+    assert.equal(state.outbox.length, 1, "prior-cycle threshold notices are no longer actionable");
     assert.ok(state.notificationKeys.includes("threshold:2026-08:plan:80"));
+    assert.equal(state.notificationKeys.some((key) => key.startsWith("threshold:2026-07:")), false);
     for (const notification of state.outbox) {
       assert.match(notification.message, /Provider: Tavily/);
       assert.match(notification.message, /Usage:/);
@@ -626,6 +627,9 @@ describe("Tavily threshold and durable incident state", () => {
     monitor.drainChildEvents();
     const generation = monitor.getState().incident?.generation as string;
     assert.ok(generation);
+    const incidentKey = monitor.getState().outbox.find((entry) => entry.kind === "incident")?.key;
+    assert.ok(incidentKey);
+    assert.equal(monitor.recordNotificationDelivered(incidentKey), true);
 
     clock.set("2026-07-16T17:59:59.999Z");
     assert.equal(monitor.queueDueReminder(), false);
@@ -633,6 +637,12 @@ describe("Tavily threshold and durable incident state", () => {
     assert.equal(monitor.queueDueReminder(), true);
     assert.equal(monitor.queueDueReminder(), false);
     assert.equal(monitor.getState().outbox.filter((entry) => entry.kind === "reminder").length, 1);
+    const firstReminderKey = monitor.getState().outbox.find((entry) => entry.kind === "reminder")?.key;
+    assert.ok(firstReminderKey);
+    assert.equal(monitor.recordNotificationDelivered(firstReminderKey), true);
+    assert.equal(monitor.getState().notificationKeys.includes(firstReminderKey), false);
+    clock.set("2026-07-17T00:00:00.000Z");
+    assert.equal(monitor.queueDueReminder(), true);
 
     assert.equal(monitor.acknowledgeIncident("stale-generation"), false);
     assert.equal(monitor.acknowledgeIncident(generation), true);
@@ -825,12 +835,11 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
         }
         if (calls === 2 || calls === 5) return jsonResponse(successfulSearchResponse());
         if (calls === 3) {
-          clock.set("2026-07-16T12:06:00.000Z");
           writeExhaustionEvent(
             workspace,
             "web_fetch",
             "paygo_exhausted",
-            "2026-07-16T12:06:00.000Z",
+            "2026-07-16T12:05:00.000Z",
             "during-verification",
           );
         }
@@ -847,7 +856,8 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
       assert.equal(result.classification, "usage_exhausted");
     }
     assert.equal(monitor.getState().incident?.resolvedAt, undefined);
-    assert.equal(monitor.getState().incident?.lastObservedAt, "2026-07-16T12:06:00.000Z");
+    assert.equal(monitor.getState().incident?.lastObservedAt, "2026-07-16T12:05:00.000Z");
+    assert.equal(monitor.getState().incident?.exhaustionSequence, 2);
     assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recovery"), false);
 
     clock.set("2026-07-16T12:10:00.000Z");
