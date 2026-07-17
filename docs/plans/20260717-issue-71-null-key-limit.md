@@ -32,11 +32,13 @@ Represent a provider-reported nullable key limit by omitting `key.limit` and `ke
 - [x] Run focused monitor, runtime, metrics, and status tests before Task 3.
 
 ### Task 3: Validate scope and package
-- [ ] Confirm `git diff --check` passes and the diff is limited to the monitor, relevant tests, and this plan.
-- [ ] Run full `npm test`.
-- [ ] Run `npm run build`.
-- [ ] Run `npm pack --dry-run`.
-- [ ] Record concise validation evidence in the plan.
+- [x] Confirm `git diff --check` passes and the diff is limited to the monitor, relevant tests, and this plan.
+- [x] Run full `npm test`.
+- [x] Run `npm run build`.
+- [x] Run `npm pack --dry-run`.
+- [x] Record concise validation evidence in the plan.
+
+Validation evidence (2026-07-17): `git diff --check` passed; the branch diff is limited to `src/tavily-monitor.ts`, `src/__tests__/tavily-monitor.test.ts`, `src/__tests__/metrics.test.ts`, and this plan. `npm test` passed 1,948 tests in 309 suites with zero failures. `npm run build` passed. `npm pack --dry-run` passed with 223 files in the package preview.
 
 ## Post-Completion
 
