@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.15
+
+- Replace Tavily with one package-owned Codex subscription OAuth `web_search` across interactive, delegated, cron, workflow, and recovery runtimes.
+- Remove `web_fetch`, Tavily credentials, monitoring, incidents, metrics, and fallback paths; use the host-installed official `agent-browser` workflow for direct and rendered pages.
+
 ## 2026.7.14
 
 - Strip the known trailing `Продолжение следует` ASR artifact at the shared transcription boundary while preserving legitimate occurrences and existing empty-transcript handling.
