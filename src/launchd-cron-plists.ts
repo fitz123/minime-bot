@@ -535,7 +535,11 @@ function validateExplicitRunCronScript(runCronScript: string): string {
 
   const trustDir = dirname(symlinkPath);
   const canonicalTrustDir = inspectRunCronRealpath(trustDir, "trust directory must exist");
-  const rawTarget = resolve(trustDir, inspectRunCronReadlink(symlinkPath));
+  const linkTarget = inspectRunCronReadlink(symlinkPath);
+  if (linkTarget.split(sep).includes("..")) {
+    throw invalidRunCronScript("directory symlink target must not contain parent directory references");
+  }
+  const rawTarget = resolve(trustDir, linkTarget);
   inspectRunCronPath(rawTarget, symlinks);
   if (symlinks.size > 1) {
     throw invalidRunCronScript("path must contain at most one directory symlink");

@@ -197,6 +197,31 @@ describe("launchd cron runner selection", () => {
     }
   });
 
+  it("rejects selector targets that hide symlinks behind parent traversal", () => {
+    const fixture = createFixture();
+    try {
+      const deployment = join(fixture.root, "deployment");
+      writeRunner(join(deployment, "slots", "blue", "scripts"));
+
+      const external = join(fixture.root, "external");
+      const externalNested = join(external, "nested");
+      mkdirSync(externalNested, { recursive: true });
+      symlinkSync(externalNested, join(deployment, "pivot"), "dir");
+      symlinkSync(join(deployment, "slots"), join(external, "slots"), "dir");
+      chmodSync(external, 0o777);
+
+      symlinkSync("pivot/../slots/blue", join(deployment, "current"), "dir");
+      const lexicalRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, lexicalRunner),
+        lexicalRunner,
+        /Invalid run cron script override: directory symlink target must not contain parent directory references/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("rejects relative, unnormalized, missing, wrong-name, unreadable, and non-executable runners", () => {
     const fixture = createFixture();
     try {
@@ -292,7 +317,7 @@ describe("launchd cron runner selection", () => {
       assertRunCronRejection(
         () => generateWithRunner(fixture, escapingRunner),
         escapingRunner,
-        /Invalid run cron script override: directory symlink target must remain beneath its parent trust directory/,
+        /Invalid run cron script override: directory symlink target must not contain parent directory references/,
       );
 
       const multipleDeployment = join(fixture.root, "multiple-deployment");
