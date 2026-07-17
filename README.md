@@ -138,7 +138,27 @@ identity, and token usage when Codex supplies them; failures return only a fixed
 classification without provider bodies or credentials.
 
 Direct URL reading and browser interaction are deliberately outside the package
-tool. Bash-capable full agents use the host-installed `agent-browser` CLI:
+tool. On macOS, install the official `agent-browser` Homebrew formula globally.
+The `read` command requires version 0.30.0 or newer, and browser interaction
+requires the one-time Chrome for Testing installation:
+
+```bash
+brew install agent-browser
+agent-browser install
+agent-browser --version
+agent-browser doctor
+```
+
+Treat `agent-browser` upgrades as manual, planned host maintenance. Upgrade the
+Homebrew formula intentionally, rerun the doctor check, and do not use
+`brew pin`:
+
+```bash
+brew upgrade agent-browser
+agent-browser doctor
+```
+
+Bash-capable full agents then use the host-installed CLI:
 
 ```bash
 agent-browser skills get core --full

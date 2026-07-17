@@ -11,11 +11,30 @@ export const CODEX_WEB_SEARCH_PROVIDER = "openai-codex";
 export const CODEX_WEB_SEARCH_TIMEOUT_MS = 60_000;
 export const MAX_CODEX_WEB_SEARCH_QUERY_CHARS = 300;
 export const MAX_CODEX_WEB_SEARCH_TEXT_CHARS = 50_000;
-const MAX_CITATIONS = 50;
 const MAX_WEB_ACTIONS = 50;
 const MAX_ACTION_VALUES = 20;
 const MAX_URL_CHARS = 2_048;
 const MAX_METADATA_TEXT_CHARS = 512;
+const MAX_HTTP_ERROR_BODY_CHARS = 4_096;
+const RATE_LIMIT_ERROR_CODES = new Set([
+  "rate_limit",
+  "rate_limit_exceeded",
+  "usage_limit",
+  "usage_limit_reached",
+  "usage_not_included",
+  "quota_exceeded",
+]);
+const AUTH_ERROR_CODES = new Set([
+  "auth_error",
+  "authentication_error",
+  "forbidden",
+  "invalid_api_key",
+  "invalid_oauth_token",
+  "invalid_token",
+  "oauth_token_expired",
+  "token_expired",
+  "unauthorized",
+]);
 
 export interface CodexWebSearchArgs {
   query?: unknown;
@@ -123,6 +142,12 @@ interface ResolvedCodexOAuth {
   accountId: string;
   provider: string;
   model: string;
+}
+
+interface NormalizedCodexWebSearchControls {
+  maxResults: number;
+  includeAnswer: boolean;
+  searchContextSize: "medium" | "high";
 }
 
 const SENSITIVE_ASSIGNMENT_PATTERN =
@@ -270,16 +295,20 @@ function normalizeMaxResults(raw: unknown): number {
   return Math.min(20, Math.floor(parsed));
 }
 
-/** Build the single fixed-endpoint Codex Responses request. */
-export function buildCodexWebSearchRequest(
+function normalizeCodexWebSearchControls(args: CodexWebSearchArgs): NormalizedCodexWebSearchControls {
+  return {
+    maxResults: normalizeMaxResults(args.max_results),
+    includeAnswer: args.include_answer !== false,
+    searchContextSize: args.search_depth === "advanced" ? "high" : "medium",
+  };
+}
+
+function buildNormalizedCodexWebSearchRequest(
   auth: ResolvedCodexOAuth,
-  args: CodexWebSearchArgs,
+  query: string,
+  controls: NormalizedCodexWebSearchControls,
 ): CodexWebSearchHttpRequest {
-  const query = typeof args.query === "string" ? args.query.trim() : "";
-  const maxResults = normalizeMaxResults(args.max_results);
-  const includeAnswer = args.include_answer !== false;
-  const searchContextSize = args.search_depth === "advanced" ? "high" : "medium";
-  const responseInstruction = includeAnswer
+  const responseInstruction = controls.includeAnswer
     ? "Answer the query using web search. Cite factual claims with the returned web sources."
     : "Use web search and return a concise source list with titles and URLs, without a synthesized answer.";
 
@@ -299,18 +328,27 @@ export function buildCodexWebSearchRequest(
       model: auth.model,
       store: false,
       stream: true,
-      instructions: `${responseInstruction} Use no more than ${maxResults} distinct sources.`,
+      instructions: `${responseInstruction} Use no more than ${controls.maxResults} distinct sources.`,
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: query }] }],
       tools: [{
         type: "web_search",
         external_web_access: true,
-        search_context_size: searchContextSize,
+        search_context_size: controls.searchContextSize,
       }],
       tool_choice: "required",
       parallel_tool_calls: true,
       include: [],
     }),
   };
+}
+
+/** Build the single fixed-endpoint Codex Responses request. */
+export function buildCodexWebSearchRequest(
+  auth: ResolvedCodexOAuth,
+  args: CodexWebSearchArgs,
+): CodexWebSearchHttpRequest {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  return buildNormalizedCodexWebSearchRequest(auth, query, normalizeCodexWebSearchControls(args));
 }
 
 export interface BoundedRequestSignal {
@@ -364,9 +402,9 @@ class CodexSearchProviderError extends Error {
 }
 
 function classifyProviderCode(raw: unknown): CodexWebSearchFailureClassification {
-  const code = typeof raw === "string" ? raw : "";
-  if (/rate_limit|usage_limit|quota/i.test(code)) return "rate_limit";
-  if (/auth|token|unauthorized|forbidden/i.test(code)) return "auth";
+  const code = typeof raw === "string" ? raw.toLowerCase() : "";
+  if (RATE_LIMIT_ERROR_CODES.has(code)) return "rate_limit";
+  if (AUTH_ERROR_CODES.has(code)) return "auth";
   return "unknown";
 }
 
@@ -397,7 +435,7 @@ function boundedStringArray(raw: unknown, maxChars: number): string[] {
   return values;
 }
 
-function normalizeWebAction(raw: unknown): CodexWebAction | undefined {
+function normalizeWebAction(raw: unknown, maxSources = MAX_ACTION_VALUES): CodexWebAction | undefined {
   const action = asRecord(raw);
   if (action?.type === "search") {
     const fallbackQuery = boundedString(action.query, MAX_METADATA_TEXT_CHARS);
@@ -407,9 +445,9 @@ function normalizeWebAction(raw: unknown): CodexWebAction | undefined {
       ? action.sources.flatMap((source) => {
         const url = boundedString(asRecord(source)?.url, MAX_URL_CHARS);
         return url ? [url] : [];
-      }).slice(0, MAX_ACTION_VALUES)
+      })
       : [];
-    return { type: "search", queries, sources: [...new Set(sources)] };
+    return { type: "search", queries, sources: [...new Set(sources)].slice(0, maxSources) };
   }
   if (action?.type === "open_page") {
     const url = boundedString(action.url, MAX_URL_CHARS);
@@ -421,6 +459,34 @@ function normalizeWebAction(raw: unknown): CodexWebAction | undefined {
     if (url && pattern) return { type: "find_in_page", url, pattern };
   }
   return undefined;
+}
+
+function limitWebActionSources(
+  actions: readonly CodexWebAction[],
+  citations: readonly CodexWebCitation[],
+  maxSources: number,
+): CodexWebAction[] {
+  const exposedSources = new Set(citations.map((citation) => citation.url));
+  const includeSource = (url: string): boolean => {
+    if (exposedSources.has(url)) return true;
+    if (exposedSources.size >= maxSources) return false;
+    exposedSources.add(url);
+    return true;
+  };
+
+  const limited: CodexWebAction[] = [];
+  for (const action of actions) {
+    if (action.type === "search") {
+      limited.push({ ...action, sources: action.sources.filter(includeSource) });
+      continue;
+    }
+    if (action.type === "open_page") {
+      limited.push(!action.url || includeSource(action.url) ? action : { type: "open_page" });
+      continue;
+    }
+    if (includeSource(action.url)) limited.push(action);
+  }
+  return limited;
 }
 
 function parseUsage(raw: unknown): CodexWebSearchUsage | undefined {
@@ -462,14 +528,18 @@ function extractMessageTextAndCitations(
   return parts.join("");
 }
 
-function formatSearchOutput(answer: string, citations: readonly CodexWebCitation[]): {
+function formatSearchOutput(
+  answer: string,
+  citations: readonly CodexWebCitation[],
+  includeAnswer: boolean,
+): {
   text: string;
   truncated: boolean;
 } {
   const sources = citations.length === 0
     ? ""
     : `\n\nSources:\n${citations.map((citation) => `- ${citation.title}: ${citation.url}`).join("\n")}`;
-  const combined = `${answer.trim()}${sources}`.trim();
+  const combined = `${includeAnswer ? answer.trim() : ""}${sources}`.trim();
   if (combined.length <= MAX_CODEX_WEB_SEARCH_TEXT_CHARS) return { text: combined, truncated: false };
   return {
     text: combined.slice(0, MAX_CODEX_WEB_SEARCH_TEXT_CHARS),
@@ -482,12 +552,14 @@ export async function parseCodexWebSearchSse(
   response: Response,
   selected: Pick<ResolvedCodexOAuth, "provider" | "model">,
   signal?: AbortSignal,
+  controls?: Pick<NormalizedCodexWebSearchControls, "maxResults" | "includeAnswer">,
 ): Promise<CodexWebSearchResult> {
   if (!response.body) throw new CodexSearchSchemaError("missing response body");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let answerDelta = "";
+  let deltaTruncated = false;
   let finalAnswer = "";
   let responseId: string | undefined;
   let usage: CodexWebSearchUsage | undefined;
@@ -497,10 +569,12 @@ export async function parseCodexWebSearchSse(
   const citationKeys = new Set<string>();
   const webActions: CodexWebAction[] = [];
   const actionKeys = new Set<string>();
+  const maxResults = normalizeMaxResults(controls?.maxResults);
+  const includeAnswer = controls?.includeAnswer !== false;
 
   const addCitation = (citation: CodexWebCitation): void => {
-    const key = `${citation.url}\u0000${citation.startIndex ?? ""}\u0000${citation.endIndex ?? ""}`;
-    if (citationKeys.has(key) || citations.length >= MAX_CITATIONS) return;
+    const key = citation.url;
+    if (citationKeys.has(key) || citations.length >= maxResults) return;
     citationKeys.add(key);
     citations.push(citation);
   };
@@ -519,7 +593,7 @@ export async function parseCodexWebSearchSse(
       const text = extractMessageTextAndCitations(item, addCitation);
       if (text) textParts.push(text);
       if (item.type === "web_search_call") {
-        const action = normalizeWebAction(item.action);
+        const action = normalizeWebAction(item.action, maxResults);
         if (action) addAction(action);
       }
     }
@@ -535,8 +609,10 @@ export async function parseCodexWebSearchSse(
       return;
     }
     if (event.type === "response.output_text.delta") {
-      if (typeof event.delta === "string" && answerDelta.length < MAX_CODEX_WEB_SEARCH_TEXT_CHARS) {
-        answerDelta += event.delta.slice(0, MAX_CODEX_WEB_SEARCH_TEXT_CHARS - answerDelta.length);
+      if (typeof event.delta === "string") {
+        const remaining = MAX_CODEX_WEB_SEARCH_TEXT_CHARS - answerDelta.length;
+        if (event.delta.length > remaining) deltaTruncated = true;
+        if (remaining > 0) answerDelta += event.delta.slice(0, remaining);
       }
       return;
     }
@@ -548,7 +624,7 @@ export async function parseCodexWebSearchSse(
     if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
       const item = asRecord(event.item);
       if (item?.type === "web_search_call") {
-        const action = normalizeWebAction(item.action);
+        const action = normalizeWebAction(item.action, maxResults);
         if (action) addAction(action);
       }
       if (event.type === "response.output_item.done") {
@@ -583,7 +659,7 @@ export async function parseCodexWebSearchSse(
       sawTerminal = true;
     }
   };
-  const consumeChunk = (chunk: string): void => {
+  const consumeChunk = (chunk: string): boolean => {
     const lines = chunk.split(/\r?\n/);
     const eventType = lines
       .find((line) => line.startsWith("event:"))
@@ -594,7 +670,8 @@ export async function parseCodexWebSearchSse(
       .map((line) => line.slice(5).trim())
       .join("\n")
       .trim();
-    if (!data || data === "[DONE]") return;
+    if (!data) return false;
+    if (data === "[DONE]") return true;
     let parsed: unknown;
     try {
       parsed = JSON.parse(data);
@@ -606,6 +683,7 @@ export async function parseCodexWebSearchSse(
       parsed = { ...parsedRecord, type: eventType };
     }
     handleEvent(parsed);
+    return sawTerminal;
   };
   const abortReader = (): void => {
     void reader.cancel().catch(() => {});
@@ -613,7 +691,7 @@ export async function parseCodexWebSearchSse(
   signal?.addEventListener("abort", abortReader, { once: true });
 
   try {
-    while (true) {
+    stream: while (true) {
       if (signal?.aborted) throw signal.reason ?? new Error("request aborted");
       const { done, value } = await reader.read();
       if (signal?.aborted) throw signal.reason ?? new Error("request aborted");
@@ -627,12 +705,14 @@ export async function parseCodexWebSearchSse(
         const separator = buffer.slice(boundary).startsWith("\r\n\r\n") ? 4 : 2;
         const chunk = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + separator);
-        consumeChunk(chunk);
+        if (consumeChunk(chunk)) break stream;
         boundary = buffer.search(/\r?\n\r?\n/);
       }
     }
-    buffer += decoder.decode();
-    if (buffer.trim()) consumeChunk(buffer);
+    if (streamFinished) {
+      buffer += decoder.decode();
+      if (buffer.trim()) consumeChunk(buffer);
+    }
   } finally {
     signal?.removeEventListener("abort", abortReader);
     if (!streamFinished) {
@@ -651,8 +731,13 @@ export async function parseCodexWebSearchSse(
 
   if (!sawTerminal) throw new CodexSearchSchemaError("missing terminal event");
   const answer = finalAnswer || answerDelta;
-  if (!answer.trim()) throw new CodexSearchSchemaError("missing answer text");
-  const formatted = formatSearchOutput(answer, citations);
+  if (includeAnswer && !answer.trim()) throw new CodexSearchSchemaError("missing answer text");
+  const formatted = formatSearchOutput(answer, citations, includeAnswer);
+  if (!formatted.text) throw new CodexSearchSchemaError("missing search output");
+  const limitedWebActions = limitWebActionSources(webActions, citations, maxResults);
+  const answerTruncated = finalAnswer
+    ? finalAnswer.length > MAX_CODEX_WEB_SEARCH_TEXT_CHARS
+    : deltaTruncated;
   return {
     ok: true,
     text: formatted.text,
@@ -662,9 +747,9 @@ export async function parseCodexWebSearchSse(
     model: selected.model,
     ...(responseId ? { responseId } : {}),
     citations,
-    webActions,
+    webActions: limitedWebActions,
     ...(usage ? { usage } : {}),
-    truncated: formatted.truncated || answer.length > MAX_CODEX_WEB_SEARCH_TEXT_CHARS,
+    truncated: formatted.truncated || (includeAnswer && answerTruncated),
   };
 }
 
@@ -674,6 +759,50 @@ export async function cancelCodexWebSearchResponse(response: Response): Promise<
     await response.body?.cancel();
   } catch {
     // Cleanup must not replace the bounded failure classification.
+  }
+}
+
+async function readBoundedCodexErrorCode(response: Response): Promise<string | undefined> {
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let body = "";
+  let streamFinished = false;
+
+  const findKnownCode = (): string | undefined => {
+    for (const match of body.matchAll(/"(?:code|type)"\s*:\s*"([A-Za-z0-9_-]{1,64})"/g)) {
+      if (classifyProviderCode(match[1]) !== "unknown") return match[1];
+    }
+    return undefined;
+  };
+
+  try {
+    while (body.length < MAX_HTTP_ERROR_BODY_CHARS) {
+      const { done, value } = await reader.read();
+      if (done) {
+        streamFinished = true;
+        body += decoder.decode().slice(0, MAX_HTTP_ERROR_BODY_CHARS - body.length);
+        return findKnownCode();
+      }
+      const remaining = MAX_HTTP_ERROR_BODY_CHARS - body.length;
+      body += decoder.decode(value, { stream: true }).slice(0, remaining);
+      const code = findKnownCode();
+      if (code) return code;
+    }
+    return undefined;
+  } finally {
+    if (!streamFinished) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the bounded HTTP failure classification.
+      }
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // The runtime may release the reader after cancellation.
+    }
   }
 }
 
@@ -720,7 +849,8 @@ export async function executeCodexWebSearch(
       return result;
     }
 
-    const request = buildCodexWebSearchRequest(auth, { ...args, query });
+    const controls = normalizeCodexWebSearchControls(args);
+    const request = buildNormalizedCodexWebSearchRequest(auth, query, controls);
     const response = await (deps.fetchImpl ?? fetch)(request.url, {
       method: request.method,
       headers: request.headers,
@@ -729,12 +859,15 @@ export async function executeCodexWebSearch(
     });
     if (!response.ok) {
       const status = response.status;
-      await cancelCodexWebSearchResponse(response);
-      const classification = classifyHttpStatus(status);
+      const statusClassification = classifyHttpStatus(status);
+      const classification = statusClassification === "unknown"
+        ? classifyProviderCode(await readBoundedCodexErrorCode(response))
+        : statusClassification;
+      if (statusClassification !== "unknown") await cancelCodexWebSearchResponse(response);
       deps.warn?.({ classification, httpStatus: status, detail: "request-failed" });
       return classifiedFailure(classification, status);
     }
-    return await parseCodexWebSearchSse(response, auth, bounded.signal);
+    return await parseCodexWebSearchSse(response, auth, bounded.signal, controls);
   } catch (error) {
     const classification = bounded.didTimeout()
       ? "timeout"

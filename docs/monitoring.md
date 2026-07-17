@@ -29,8 +29,11 @@ calling model as bounded classifications.
 
 Direct URL reads and browser automation do not go through `web_search`.
 Bash-capable full agents use the host `agent-browser` executable (`read` for
-agent-readable text, or `open` followed by `snapshot` for browser state).
-Search-only roles do not receive Bash solely for URL access.
+agent-readable text, or `open` followed by `snapshot` for browser state). The
+[README host workflow](../README.md#codex-web-search-and-direct-url-workflows)
+documents the required Homebrew installation, minimum version, first-time
+browser setup, doctor check, and manual no-pin upgrade policy. Search-only roles
+do not receive Bash solely for URL access.
 
 During an overlapping process replacement, the in-process Prometheus listener
 retries an occupied configured host/port every second until the old listener

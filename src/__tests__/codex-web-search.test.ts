@@ -222,6 +222,46 @@ describe("Codex web search auth and request", () => {
     assert.match(String(body.instructions), /without a synthesized answer/i);
   });
 
+  it("normalizes every compatible request control boundary", () => {
+    const auth = {
+      token: "oauth-fixture",
+      accountId: "account-fixture",
+      provider: CODEX_WEB_SEARCH_PROVIDER,
+      model: "gpt-active",
+    };
+    const cases = [
+      { args: {}, maxResults: 5, contextSize: "medium", includesAnswer: true },
+      { args: { max_results: 0 }, maxResults: 5, contextSize: "medium", includesAnswer: true },
+      { args: { max_results: "invalid" }, maxResults: 5, contextSize: "medium", includesAnswer: true },
+      { args: { max_results: 7.9 }, maxResults: 7, contextSize: "medium", includesAnswer: true },
+      { args: { max_results: 99 }, maxResults: 20, contextSize: "medium", includesAnswer: true },
+      {
+        args: { max_results: 1, search_depth: "advanced", include_answer: false },
+        maxResults: 1,
+        contextSize: "high",
+        includesAnswer: false,
+      },
+    ];
+
+    for (const entry of cases) {
+      const request = buildCodexWebSearchRequest(auth, {
+        query: "current primary documentation",
+        ...entry.args,
+      });
+      const body = JSON.parse(request.body) as {
+        instructions: string;
+        tools: Array<{ search_context_size: string }>;
+      };
+      assert.match(body.instructions, new RegExp(`no more than ${entry.maxResults} distinct sources`, "i"));
+      assert.equal(body.tools[0]?.search_context_size, entry.contextSize);
+      if (entry.includesAnswer) {
+        assert.match(body.instructions, /answer the query/i);
+      } else {
+        assert.match(body.instructions, /without a synthesized answer/i);
+      }
+    }
+  });
+
   it("ignores OPENAI_API_KEY and selects the active model for the HTTP call", async () => {
     const previous = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "forbidden-environment-key";
@@ -307,6 +347,95 @@ describe("Codex web search streamed response parsing", () => {
     assert.equal(result.responseId, "resp-delta");
   });
 
+  it("reports truncation when a delta-only answer exceeds the text cap", async () => {
+    const body = [
+      sseEvent({
+        type: "response.output_text.delta",
+        delta: "x".repeat(MAX_CODEX_WEB_SEARCH_TEXT_CHARS + 1),
+      }),
+      sseEvent({
+        type: "response.completed",
+        response: { id: "resp-delta-cap", status: "completed", output: [] },
+      }),
+    ].join("");
+    const result = await parseCodexWebSearchSse(
+      sseResponse(body),
+      { provider: CODEX_WEB_SEARCH_PROVIDER, model: "gpt-active" },
+    );
+    assert.equal(result.text.length, MAX_CODEX_WEB_SEARCH_TEXT_CHARS);
+    assert.equal(result.truncated, true);
+  });
+
+  it("finishes and cancels the reader as soon as a terminal event arrives", async () => {
+    let cancelled = false;
+    const encoded = new TextEncoder().encode(`${successSse()}data: not-json\n\n`);
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoded);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const result = await parseCodexWebSearchSse(
+      response,
+      { provider: CODEX_WEB_SEARCH_PROVIDER, model: "gpt-active" },
+      AbortSignal.timeout(100),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(cancelled, true);
+  });
+
+  it("enforces source count and answer omission independently of provider output", async () => {
+    const response = {
+      id: "resp-adversarial-controls",
+      status: "completed",
+      output: [
+        {
+          type: "web_search_call",
+          action: {
+            type: "search",
+            queries: ["fixture query"],
+            sources: [
+              { type: "url", url: "https://example.com/one" },
+              { type: "url", url: "https://example.com/two" },
+            ],
+          },
+        },
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: "provider synthesized answer that must be hidden",
+            annotations: [
+              { type: "url_citation", title: "One", url: "https://example.com/one" },
+              { type: "url_citation", title: "Two", url: "https://example.com/two" },
+              { type: "url_citation", title: "One duplicate", url: "https://example.com/one" },
+            ],
+          }],
+        },
+      ],
+    };
+    const { context } = makeContext();
+    const result = await executeCodexWebSearch({
+      query: "safe query",
+      max_results: 1,
+      include_answer: false,
+    }, {
+      context,
+      fetchImpl: (async () => sseResponse(sseEvent({ type: "response.completed", response }))) as typeof fetch,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.text, "Sources:\n- One: https://example.com/one");
+    assert.deepEqual(result.citations, [{ title: "One", url: "https://example.com/one" }]);
+    assert.deepEqual(result.webActions, [{
+      type: "search",
+      queries: ["fixture query"],
+      sources: ["https://example.com/one"],
+    }]);
+    assert.doesNotMatch(result.text, /provider synthesized answer/);
+  });
+
   it("uses SSE event names when Codex omits type from data payloads", async () => {
     const body = [
       'event: response.output_item.done\ndata: {"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"event-framed answer","annotations":[{"type":"url_citation","title":"RFC Editor","url":"https://www.rfc-editor.org/rfc/rfc9110"}]}]}}\n\n',
@@ -364,14 +493,13 @@ describe("Codex web search streamed response parsing", () => {
 });
 
 describe("Codex web search cleanup and bounded failures", () => {
-  it("classifies HTTP failures and cancels bodies without reading them", async () => {
+  it("classifies HTTP failures and cancels bodies when status is sufficient", async () => {
     const expected = new Map([
       [401, "auth"],
       [403, "auth"],
       [408, "timeout"],
       [429, "rate_limit"],
       [503, "transport"],
-      [400, "unknown"],
     ]);
     for (const [status, classification] of expected) {
       let cancelled = false;
@@ -389,6 +517,36 @@ describe("Codex web search cleanup and bounded failures", () => {
       assert.equal(result.failure?.httpStatus, status);
       assert.equal(cancelled, true);
     }
+  });
+
+  it("classifies bounded provider error codes independently of HTTP status", async () => {
+    for (const [code, classification] of [
+      ["usage_limit_reached", "rate_limit"],
+      ["usage_not_included", "rate_limit"],
+      ["rate_limit_exceeded", "rate_limit"],
+      ["authentication_error", "auth"],
+    ] as const) {
+      const { context } = makeContext();
+      const result = await executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        fetchImpl: (async () => new Response(JSON.stringify({
+          error: { code, message: "private provider diagnostic" },
+        }), { status: 400 })) as typeof fetch,
+      });
+      assert.equal(result.failure?.classification, classification, code);
+      assert.equal(result.failure?.httpStatus, 400);
+      assert.doesNotMatch(result.text, /private provider diagnostic|usage_limit|authentication_error/);
+    }
+
+    const { context } = makeContext();
+    const unknown = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      fetchImpl: (async () => new Response(JSON.stringify({
+        error: { code: "unrecognized_code", message: "private provider diagnostic" },
+      }), { status: 400 })) as typeof fetch,
+    });
+    assert.equal(unknown.failure?.classification, "unknown");
+    assert.doesNotMatch(unknown.text, /private provider diagnostic|unrecognized_code/);
   });
 
   it("classifies transport, unknown, and timeout failures", async () => {
