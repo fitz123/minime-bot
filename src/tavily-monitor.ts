@@ -474,7 +474,6 @@ function timeoutController(timeoutMs: number): { controller: AbortController; ca
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  timer.unref();
   return { controller, cancel: () => clearTimeout(timer) };
 }
 

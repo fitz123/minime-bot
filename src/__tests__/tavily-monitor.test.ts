@@ -149,6 +149,96 @@ function writeExhaustionEvent(
 }
 
 describe("Tavily usage parsing and bounded requests", () => {
+  it("keeps isolated usage and recovery-probe timeouts live until stalled fetches abort", async () => {
+    const monitorModule = pathToFileURL(resolve("src/tavily-monitor.ts")).href;
+    const childScript = `
+      import {
+        parseTavilyUsageResponse,
+        requestTavilyUsage,
+        verifyTavilyRecovery,
+      } from ${JSON.stringify(monitorModule)};
+
+      function stalledFetch(_input, init) {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+
+      let usageAttempts = 0;
+      const usageResult = await requestTavilyUsage({
+        apiKey: "fixture-key",
+        timeoutMs: 25,
+        fetchImpl: (...args) => {
+          usageAttempts += 1;
+          return stalledFetch(...args);
+        },
+      });
+      if (usageResult.ok ||
+          usageResult.diagnostic.classification !== "provider_unavailable" ||
+          usageAttempts !== 1) {
+        throw new Error("isolated usage request did not time out once");
+      }
+
+      const sample = parseTavilyUsageResponse({
+        key: { usage: 1, limit: 100 },
+        account: {
+          current_plan: "Researcher",
+          plan_usage: 1,
+          plan_limit: 100,
+          paygo_usage: 0,
+          paygo_limit: 0,
+        },
+      }, new Date("2026-07-17T00:00:00.000Z"));
+      let probeAttempts = 0;
+      const recoveryResult = await verifyTavilyRecovery({
+        apiKey: "fixture-key",
+        usageSample: sample,
+        probeTimeoutMs: 25,
+        fetchImpl: (...args) => {
+          probeAttempts += 1;
+          return stalledFetch(...args);
+        },
+      });
+      if (recoveryResult.ok ||
+          recoveryResult.stage !== "search_probe" ||
+          recoveryResult.classification !== "provider_unavailable" ||
+          probeAttempts !== 1) {
+        throw new Error("isolated recovery probe did not time out once");
+      }
+      process.stdout.write("bounded\\n");
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+
+    const exitCode = await new Promise<number | null>((resolveExit, rejectExit) => {
+      const watchdog = setTimeout(() => {
+        child.kill();
+        rejectExit(new Error("isolated Tavily timeout child did not exit"));
+      }, 5_000);
+      watchdog.unref();
+      child.once("error", (error) => {
+        clearTimeout(watchdog);
+        rejectExit(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(watchdog);
+        resolveExit(code);
+      });
+    });
+
+    assert.equal(exitCode, 0, stderr);
+    assert.equal(stdout, "bounded\n");
+  });
+
   it("builds authenticated GET /usage and parses all quota-relevant counters", () => {
     assert.deepEqual(buildTavilyUsageRequest("fixture-key"), {
       url: TAVILY_USAGE_URL,

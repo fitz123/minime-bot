@@ -16,10 +16,10 @@ The same run also hit the pre-existing recovery-supervisor nondeterminism tracke
 ## Implementation Steps
 
 ### Task 1: Make bounded Tavily requests complete without ambient event-loop handles
-- [ ] Correct the timeout lifecycle in `src/tavily-monitor.ts` so stalled usage and recovery-probe fetches abort and resolve even when the timeout is the only event-loop handle.
-- [ ] Preserve cancellation after every success/failure path, one provider attempt, existing sanitized classifications, and fixed timeout bounds.
-- [ ] Add or update focused tests in `src/__tests__/tavily-monitor.test.ts`, including an isolated child-process regression that fails under the current unreferenced-timer behavior.
-- [ ] Run the focused Tavily monitor tests and `npm run typecheck`.
+- [x] Correct the timeout lifecycle in `src/tavily-monitor.ts` so stalled usage and recovery-probe fetches abort and resolve even when the timeout is the only event-loop handle.
+- [x] Preserve cancellation after every success/failure path, one provider attempt, existing sanitized classifications, and fixed timeout bounds.
+- [x] Add or update focused tests in `src/__tests__/tavily-monitor.test.ts`, including an isolated child-process regression that fails under the current unreferenced-timer behavior.
+- [x] Run the focused Tavily monitor tests and `npm run typecheck`.
 
 ### Task 2: Validate the PR correction
 - [ ] Run `git diff --check` and verify the new diff remains limited to the timeout fix, its regression test, and this plan.
