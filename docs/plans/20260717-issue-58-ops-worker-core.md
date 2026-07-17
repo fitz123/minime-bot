@@ -53,11 +53,11 @@ If Node's test argument forwarding does not support the focused command, run the
 
 ### Task 3: Launch and resume one standard Pi session in one owned process group
 
-- [ ] Add `src/ops-worker/pi-attempt.ts`. First trace the pinned Pi CLI/session implementation and use only its ordinary supported session-directory/create/resume behavior; record code citations in the implementation/task notes or tests.
-- [ ] Spawn Pi through the package-owned invocation resolver (`resolvePackageOwnedPiInvocation`, `src/pi-runtime.ts`) and reuse or extract the existing spawn-environment hardening and result-classification helpers from `src/pi-rpc-protocol.ts` and `src/cron-runner.ts` where suitable instead of duplicating them. Use no shell and one owned process group, bounded stdout/stderr evidence, and persist identity (PID, process group, start time) sufficient to avoid PID-reuse kills. Do not allow task payload to alter executable/model/provider/tool flags.
-- [ ] Implement bounded TERM/KILL for an unambiguously owned group, higher-priority preemption to `RESUMABLE`, restart reconciliation, and standard-session continuation. If ownership is ambiguous, do not signal and mark `BLOCKED`.
-- [ ] Classify quota/network/context overflow/crash as resumable without spending remediation budget; preserve the same standard session where valid. Quarantine a corrupt session and create a fresh standard session with bounded loss-of-context evidence.
-- [ ] Test with a fake Pi executable/process fixture: exit success but failed check, check pass without a success claim, crash/resume, preemption, context/quota classification, corrupt-session quarantine, ambiguous orphan, and exactly one active process group.
+- [x] Add `src/ops-worker/pi-attempt.ts`. First trace the pinned Pi CLI/session implementation and use only its ordinary supported session-directory/create/resume behavior; record code citations in the implementation/task notes or tests.
+- [x] Spawn Pi through the package-owned invocation resolver (`resolvePackageOwnedPiInvocation`, `src/pi-runtime.ts`) and reuse or extract the existing spawn-environment hardening and result-classification helpers from `src/pi-rpc-protocol.ts` and `src/cron-runner.ts` where suitable instead of duplicating them. Use no shell and one owned process group, bounded stdout/stderr evidence, and persist identity (PID, process group, start time) sufficient to avoid PID-reuse kills. Do not allow task payload to alter executable/model/provider/tool flags.
+- [x] Implement bounded TERM/KILL for an unambiguously owned group, higher-priority preemption to `RESUMABLE`, restart reconciliation, and standard-session continuation. If ownership is ambiguous, do not signal and mark `BLOCKED`.
+- [x] Classify quota/network/context overflow/crash as resumable without spending remediation budget; preserve the same standard session where valid. Quarantine a corrupt session and create a fresh standard session with bounded loss-of-context evidence.
+- [x] Test with a fake Pi executable/process fixture: exit success but failed check, check pass without a success claim, crash/resume, preemption, context/quota classification, corrupt-session quarantine, ambiguous orphan, and exactly one active process group.
 
 ### Task 4: Add inactive-by-default CLI/API skeleton and complete package validation
 

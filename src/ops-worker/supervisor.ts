@@ -39,10 +39,10 @@ const TIMESTAMP_PATTERN =
 const ALLOWED_STATE_TRANSITIONS: Readonly<
   Record<OpsWorkerTaskState, readonly OpsWorkerTaskState[]>
 > = {
-  QUEUED: ["RUNNING", "CHECKING", "CANCELLED"],
+  QUEUED: ["RUNNING", "CHECKING", "RESUMABLE", "BLOCKED", "CANCELLED"],
   RUNNING: ["CHECKING", "RESUMABLE", "BLOCKED"],
   CHECKING: ["CHECKING", "RESUMABLE", "BLOCKED", "DONE", "CANCELLED"],
-  RESUMABLE: ["RUNNING", "CHECKING", "CANCELLED"],
+  RESUMABLE: ["RUNNING", "CHECKING", "RESUMABLE", "BLOCKED", "CANCELLED"],
   BLOCKED: ["RESUMABLE", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
@@ -357,6 +357,7 @@ export class OpsWorkerSupervisor {
     | undefined;
   private readonly guard: OpsWorkerSingleInstanceGuard;
   private started = false;
+  private piLaunchReservation: string | null = null;
 
   constructor(options: OpsWorkerSupervisorOptions) {
     assertIdentifier(options.instanceId, "Supervisor instance id");
@@ -410,6 +411,11 @@ export class OpsWorkerSupervisor {
 
   close(): void {
     if (!this.started) return;
+    if (this.piLaunchReservation !== null) {
+      throw new OpsWorkerSupervisorStateError(
+        `Cannot close supervisor while task ${this.piLaunchReservation} owns the Pi launch slot`,
+      );
+    }
     this.guard.release();
     this.started = false;
   }
@@ -422,6 +428,65 @@ export class OpsWorkerSupervisor {
   getTask(taskId: string): OpsWorkerTask | undefined {
     this.assertStarted();
     return this.store.get(taskId);
+  }
+
+  get stateDirectory(): string {
+    return this.store.stateDirectory;
+  }
+
+  get supervisorInstanceId(): string {
+    return this.instanceId;
+  }
+
+  reservePiProcessGroupLaunch(taskId: string): void {
+    this.assertStarted();
+    this.requireTask(taskId);
+    if (this.piLaunchReservation !== null) {
+      throw new OpsWorkerSupervisorStateError(
+        `Pi launch slot is already reserved by task ${this.piLaunchReservation}`,
+      );
+    }
+    if (this.store.list().some((task) => task.state === "RUNNING")) {
+      throw new OpsWorkerSupervisorStateError(
+        "A supervisor may own at most one active process group",
+      );
+    }
+    this.piLaunchReservation = taskId;
+  }
+
+  releasePiProcessGroupLaunch(taskId: string): void {
+    if (this.piLaunchReservation !== taskId) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} does not own the Pi launch slot`,
+      );
+    }
+    this.piLaunchReservation = null;
+  }
+
+  preparePiSession(
+    taskId: string,
+    sessionId: string,
+    resume: boolean,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    assertIdentifier(sessionId, "Pi session id");
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Pi session preparation requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    const replacement = structuredClone(existing);
+    replacement.updatedAt = this.nextUpdatedAt(existing);
+    replacement.session.sessionId = sessionId;
+    replacement.session.resume = resume;
+    this.store.replace(replacement, {
+      event: "UPDATED",
+      summary: resume
+        ? "Prepared standard Pi session continuation"
+        : "Prepared new standard Pi session",
+    });
+    return this.requireTask(taskId);
   }
 
   selectNextTask(): OpsWorkerScheduledTask | undefined {
@@ -491,7 +556,11 @@ export class OpsWorkerSupervisor {
     }, "Queued deterministic done check");
   }
 
-  recordPiSuccessClaim(taskId: string, summary: string): OpsWorkerTask {
+  recordPiSuccessClaim(
+    taskId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
     if (task.state !== "RUNNING") {
@@ -501,6 +570,7 @@ export class OpsWorkerSupervisor {
     }
     return this.transition(taskId, "CHECKING", (replacement, at) => {
       replacement.activeRun = null;
+      replacement.session.resume = true;
       replacement.schedule.nextRunAt = null;
       replacement.schedule.nextCheckAt = null;
       replacement.lastOutcome = {
@@ -509,6 +579,9 @@ export class OpsWorkerSupervisor {
         result: "SUCCESS_CLAIM",
         summary,
       };
+      if (evidenceSummary) {
+        appendEvidence(replacement, this.piEvidence(at, evidenceSummary));
+      }
     }, "Pi claim queued deterministic done check");
   }
 
@@ -520,10 +593,12 @@ export class OpsWorkerSupervisor {
     >,
     summary: string,
     nextRunAt?: string,
+    evidenceSummary?: string,
   ): OpsWorkerTask {
     this.assertStarted();
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
+      task.session.resume = true;
       task.rounds.consecutiveInfrastructureFailures += 1;
       task.schedule.nextCheckAt = null;
       task.schedule.nextRunAt = nextRunAt
@@ -534,7 +609,157 @@ export class OpsWorkerSupervisor {
         result,
         summary,
       };
+      if (evidenceSummary) {
+        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
     }, `Recorded resumable infrastructure outcome ${result}`);
+  }
+
+  recordPreLaunchInfrastructureOutcome(
+    taskId: string,
+    summary: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Pre-launch failure requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.rounds.consecutiveInfrastructureFailures += 1;
+      task.schedule.nextCheckAt = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.infrastructureRetryMs,
+      ).toISOString();
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "CRASH",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    }, "Recorded Pi attempt launch failure");
+  }
+
+  recordPreemption(
+    taskId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.session.resume = true;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.lastOutcome = {
+        at,
+        kind: "PREEMPTION",
+        result: "PREEMPTED",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (evidenceSummary) {
+        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, "Preempted owned Pi process group for higher-priority work");
+  }
+
+  resetPiSession(
+    taskId: string,
+    newSessionId: string,
+    summary: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    assertIdentifier(newSessionId, "Pi session id");
+    const existing = this.requireTask(taskId);
+    if (
+      existing.state !== "QUEUED"
+      && existing.state !== "RESUMABLE"
+      && existing.state !== "RUNNING"
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        `Pi session reset requires QUEUED, RESUMABLE, or RUNNING, found ${existing.state}`,
+      );
+    }
+    const applyReset = (task: OpsWorkerTask, at: string): void => {
+      task.activeRun = null;
+      task.session.sessionId = newSessionId;
+      task.session.resume = false;
+      task.rounds.consecutiveInfrastructureFailures += 1;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      const boundedSummary = truncateUtf8(
+        summary,
+        OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+      );
+      task.lastOutcome = {
+        at,
+        kind: "SESSION_RESET",
+        result: "CRASH",
+        summary: boundedSummary,
+      };
+      appendEvidence(task, {
+        at,
+        kind: "system",
+        trust: "trusted",
+        summary: truncateUtf8(
+          boundedSummary,
+          OPS_WORKER_LIMITS.maxEvidenceSummaryBytes,
+        ),
+        artifact: null,
+      });
+    };
+    if (existing.state === "RUNNING") {
+      return this.transition(
+        taskId,
+        "RESUMABLE",
+        applyReset,
+        "Quarantined corrupt standard Pi session and prepared a fresh session",
+      );
+    }
+    const replacement = structuredClone(existing);
+    replacement.updatedAt = this.nextUpdatedAt(existing);
+    applyReset(replacement, replacement.updatedAt);
+    this.store.replace(replacement, {
+      event: "RECONCILIATION",
+      summary: "Quarantined corrupt standard Pi session and prepared a fresh session",
+    });
+    return this.requireTask(taskId);
+  }
+
+  blockAmbiguousActiveRun(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const task = this.requireTask(taskId);
+    if (task.state !== "RUNNING") {
+      throw new OpsWorkerSupervisorStateError(
+        `Ambiguous active run requires RUNNING, found ${task.state}`,
+      );
+    }
+    return this.blockAmbiguousRun(taskId, summary);
+  }
+
+  blockUnverifiedPiLaunch(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const task = this.requireTask(taskId);
+    if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Unverified Pi launch requires QUEUED or RESUMABLE, found ${task.state}`,
+      );
+    }
+    return this.transition(taskId, "BLOCKED", (replacement, at) => {
+      replacement.activeRun = null;
+      replacement.schedule.nextRunAt = null;
+      replacement.schedule.nextCheckAt = null;
+      replacement.lastOutcome = {
+        at,
+        kind: "RECONCILIATION",
+        result: "AMBIGUOUS_ORPHAN",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      replacement.report.state = "PENDING";
+      replacement.report.lastError = null;
+    }, "Blocked Pi launch whose process-group identity could not be proven");
   }
 
   async runDoneCheck(taskId: string): Promise<OpsWorkerTask> {
@@ -714,6 +939,7 @@ export class OpsWorkerSupervisor {
   private blockAmbiguousRun(taskId: string, summary: string): OpsWorkerTask {
     return this.transition(taskId, "BLOCKED", (task, at) => {
       task.activeRun = null;
+      task.session.resume = true;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.lastOutcome = {
@@ -797,6 +1023,16 @@ export class OpsWorkerSupervisor {
       kind: "check",
       trust: "trusted",
       summary,
+      artifact: null,
+    };
+  }
+
+  private piEvidence(at: string, summary: string): OpsWorkerEvidence {
+    return {
+      at,
+      kind: "pi",
+      trust: "untrusted",
+      summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxEvidenceSummaryBytes),
       artifact: null,
     };
   }

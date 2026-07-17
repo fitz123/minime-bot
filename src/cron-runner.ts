@@ -35,6 +35,10 @@ import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
 } from "./pi-runtime.js";
+import {
+  normalizePiProcessOutput as normalizeSpawnOutput,
+  sanitizePiProcessOutput as sanitizeCapturedOutput,
+} from "./pi-process-utils.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
@@ -578,26 +582,9 @@ function scrubLegacyRuntimeEnv(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
-function normalizeSpawnOutput(value: string | Buffer | null | undefined): string {
-  if (value === undefined || value === null) {
-    return "";
-  }
-  if (Buffer.isBuffer(value)) {
-    return value.toString("utf8");
-  }
-  return value;
-}
-
 function buildCronSystemInstruction(): string {
   const today = new Date().toISOString().split("T")[0];
   return `Today is ${today}. Respond concisely.`;
-}
-
-function sanitizeCapturedOutput(value: string): string {
-  return value
-    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "?")
-    .trim();
 }
 
 function formatCapturedOutputExcerpt(label: "stdout" | "stderr", value: string): string | undefined {
