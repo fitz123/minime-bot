@@ -365,9 +365,10 @@ Polling failure recovery depends on the active conversational platforms. A
 Telegram-only deployment with Telegram agent bindings exits for supervisor
 restart. When Discord has live agent bindings, the process keeps Discord online,
 waits for grammY's final Telegram polling cleanup to settle, and retries Telegram
-after exponential delays from five seconds up to one minute; a successful
-polling-loop request resets that delay. An owner-only Telegram alert transport
-does not count as a conversational platform.
+after exponential delays from five seconds up to one minute; all Telegram API
+calls, including the signal-less final update-offset confirmation, are bounded
+at 45 seconds. A successful polling-loop request resets that delay. An owner-only
+Telegram alert transport does not count as a conversational platform.
 
 ## Launchd Operations
 

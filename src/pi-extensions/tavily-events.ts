@@ -22,6 +22,7 @@ export const TAVILY_EVENT_PUBLICATION_LOCK_RELPATH =
 export const TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX = ".request-";
 export const TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX = ".active";
 export const TAVILY_EVENT_RECOVERY_WAIT_TIMEOUT_MS = 35_000;
+export const TAVILY_EVENT_RECOVERY_WAIT_INTERVAL_MS = 500;
 
 const publicationLocksHeldByThisProcess = new Map<string, {
   depth: number;
@@ -421,11 +422,19 @@ export function beginTavilyToolRequestPublication(
       directory,
       `${TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX}${pid}-${token}${TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX}`,
     );
-    writeFileSync(markerPath, `${JSON.stringify(record)}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
+    const candidatePath = `${markerPath}.tmp`;
+    try {
+      writeFileSync(candidatePath, `${JSON.stringify(record)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      // Publish only a complete marker. A crash before the hard link leaves an
+      // ignored staging file rather than a truncated active request record.
+      linkSync(candidatePath, markerPath);
+    } finally {
+      try { unlinkSync(candidatePath); } catch { /* best-effort staging cleanup */ }
+    }
   } finally {
     lock.release();
   }
@@ -473,7 +482,22 @@ function liveInFlightRequestCount(
       continue;
     }
     const path = join(directory, file);
-    const owner = readPublicationLock(path);
+    let owner: TavilyEventPublicationLockRecord;
+    try {
+      owner = readPublicationLock(path);
+    } catch (error) {
+      if (isMissing(error)) continue;
+      // Active markers are published under this lock, so a malformed plain
+      // owner-only file cannot be a partially written live request. Recover
+      // crash debris without unlinking symlinks or foreign-owned files.
+      try {
+        assertPrivateFile(path);
+        unlinkSync(path);
+      } catch (cleanupError) {
+        if (!isMissing(cleanupError)) throw error;
+      }
+      continue;
+    }
     if (lockOwnerMatchesLiveProcess(
       owner,
       isProcessAlive,
@@ -505,7 +529,8 @@ export async function acquireTavilyEventRecoveryBarrier(
 ): Promise<TavilyEventPublicationLock> {
   const inFlightWaitTimeoutMs = options.inFlightWaitTimeoutMs ??
     TAVILY_EVENT_RECOVERY_WAIT_TIMEOUT_MS;
-  const inFlightWaitIntervalMs = options.inFlightWaitIntervalMs ?? 10;
+  const inFlightWaitIntervalMs = options.inFlightWaitIntervalMs ??
+    TAVILY_EVENT_RECOVERY_WAIT_INTERVAL_MS;
   if (!Number.isFinite(inFlightWaitTimeoutMs) || inFlightWaitTimeoutMs < 0 ||
       !Number.isFinite(inFlightWaitIntervalMs) || inFlightWaitIntervalMs <= 0) {
     throw new Error("Tavily in-flight request wait is invalid");

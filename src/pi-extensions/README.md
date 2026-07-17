@@ -61,8 +61,11 @@ an owner-only in-flight marker before provider I/O, then publishes any bounded
 failure and removes its marker under that lock. Recovery waits for all live
 markers before taking the lock for its final drain and resolution commit, so an
 exhaustion response from a pre-commit request cannot race behind a false
-recovery. Markers left by crashed or PID-reused children are recovered using the
-same bounded process-instance checks as the lock.
+recovery. Active markers are staged and atomically published; malformed crash
+debris and markers left by crashed or PID-reused children are recovered using
+the same bounded process-instance checks as the lock. Barrier polling uses a
+coarse bounded cadence so process-instance validation cannot starve the main
+event loop.
 
 `PI_EXTENSIONS_DISABLED=1` stops new child events because it disables the web
 tools themselves; it does not delete existing monitor state. For a package

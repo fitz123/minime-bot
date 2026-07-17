@@ -4,6 +4,12 @@ import type { Context, MiddlewareFn, Transformer } from "grammy";
 export const TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 30;
 
 /**
+ * Bound every grammY API request above one complete long-poll cadence. This is
+ * also the only bound on bot.stop()'s signal-less final offset confirmation.
+ */
+export const TELEGRAM_API_TIMEOUT_SECONDS = TELEGRAM_LONG_POLL_TIMEOUT_SECONDS + 15;
+
+/**
  * A successful poll should normally complete once per long-poll timeout. Three
  * full cadences leave room for request turnover and scheduler delay without
  * hiding a genuinely stuck polling loop.

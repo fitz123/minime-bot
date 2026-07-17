@@ -12,6 +12,10 @@ import {
   isTavilyCallbackDestination,
 } from "../telegram-bot.js";
 import type { TavilyOperatorActions } from "../tavily-monitor-runtime.js";
+import {
+  TELEGRAM_API_TIMEOUT_SECONDS,
+  TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
+} from "../poll-progress.js";
 
 const testBindings: TelegramBinding[] = [
   { chatId: 111111111, agentId: "main", kind: "dm", label: "User1 DM" },
@@ -1417,6 +1421,14 @@ describe("command handler wiring", () => {
     };
     return result;
   }
+
+  it("bounds grammY API calls above the configured long-poll cadence", () => {
+    const { bot } = createTelegramBot(handlerConfig, createMockSessionManager());
+
+    assert.equal(bot.api.options?.timeoutSeconds, TELEGRAM_API_TIMEOUT_SECONDS);
+    assert.ok(TELEGRAM_API_TIMEOUT_SECONDS > TELEGRAM_LONG_POLL_TIMEOUT_SECONDS);
+    assert.equal(TELEGRAM_API_TIMEOUT_SECONDS, 45);
+  });
 
   it("installs and exposes polling and update-processing probes", async () => {
     const mockSM = createMockSessionManager();

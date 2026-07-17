@@ -41,6 +41,7 @@ import {
   TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX,
   TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX,
   TAVILY_EVENT_PUBLICATION_LOCK_RELPATH,
+  TAVILY_EVENT_RECOVERY_WAIT_INTERVAL_MS,
   TAVILY_EVENT_SPOOL_RELPATH,
   acquireTavilyEventRecoveryBarrier,
   acquireTavilyEventPublicationLock,
@@ -262,6 +263,32 @@ describe("tavily: child failure event writer", () => {
       barrier.release();
       assert.equal(readdirSync(spool).some((file) =>
         file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)), false);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores staging markers and removes a truncated active marker during recovery", async () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-truncated-marker-"));
+    try {
+      const spool = join(controlWorkspace, TAVILY_EVENT_SPOOL_RELPATH);
+      mkdirSync(spool, { recursive: true, mode: 0o700 });
+      const stagingPath = join(spool, ".request-70-staging.active.tmp");
+      const truncatedPath = join(spool, ".request-71-truncated.active");
+      writeFileSync(stagingPath, '{"version":', { mode: 0o600 });
+      writeFileSync(truncatedPath, '{"version":', { mode: 0o600 });
+
+      const barrier = await acquireTavilyEventRecoveryBarrier(controlWorkspace, {
+        pid: 72,
+        uniqueId: () => "recovery-barrier",
+        getProcessIdentity: () => "recovery-instance",
+        inFlightWaitTimeoutMs: 0,
+      });
+      barrier.release();
+
+      assert.equal(readdirSync(spool).includes(".request-70-staging.active.tmp"), true);
+      assert.equal(readdirSync(spool).includes(".request-71-truncated.active"), false);
+      assert.equal(TAVILY_EVENT_RECOVERY_WAIT_INTERVAL_MS, 500);
     } finally {
       rmSync(controlWorkspace, { recursive: true, force: true });
     }
