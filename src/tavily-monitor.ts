@@ -24,10 +24,10 @@ import {
 import {
   TAVILY_CHILD_EVENT_VERSION,
   TAVILY_LOCK_PROCESS_START_CLOCK_SKEW_MS,
+  acquireTavilyEventRecoveryBarrier,
   tavilyProcessIdentity,
   tavilyProcessStartedAt,
   tavilyEventSpoolDirectory,
-  withTavilyEventPublicationLock,
   type TavilyChildEvent,
 } from "./pi-extensions/tavily-events.js";
 
@@ -1565,19 +1565,39 @@ export class TavilyMonitor {
     return queued;
   }
 
-  /** Retry one active incident after an operator explicitly restarts with a usable destination. */
-  resumeIncidentDelivery(): boolean {
+  /** Re-arm relevant terminal notices once after an explicit restart with a usable destination. */
+  resumeTerminalDeliveries(): number {
     const incident = this.state.incident;
-    if (!incident || incident.resolvedAt || incident.acknowledgedAt || !incident.deliveryTerminalAt) {
-      return false;
-    }
+    const resumable = (entry: TavilyNotification): boolean => {
+      if (entry.status !== "terminal") return false;
+      if (entry.kind === "threshold_warning" || entry.kind === "threshold_critical") return true;
+      if (!incident || entry.incidentGeneration !== incident.generation) return false;
+      if (entry.kind === "recovery") return incident.resolvedAt !== undefined;
+      if (entry.kind === "recheck_failure") return incident.resolvedAt === undefined;
+      return incident.resolvedAt === undefined && incident.acknowledgedAt === undefined;
+    };
+    const resumableKeys = new Set(this.state.outbox.filter(resumable).map((entry) => entry.key));
+    if (resumableKeys.size === 0) return 0;
     this.commit((state, now) => {
       const current = state.incident;
-      if (!current || current.resolvedAt || current.acknowledgedAt || !current.deliveryTerminalAt) return;
-      delete current.deliveryTerminalAt;
-      current.nextReminderAt = now;
+      let resumedCurrentIncident = false;
+      for (const entry of state.outbox) {
+        if (!resumableKeys.has(entry.key) || entry.status !== "terminal") continue;
+        entry.status = "pending";
+        entry.nextAttemptAt = now;
+        delete entry.lastFailure;
+        if (current && entry.incidentGeneration === current.generation && !current.resolvedAt) {
+          resumedCurrentIncident = true;
+        }
+      }
+      if (current && resumedCurrentIncident) {
+        delete current.deliveryTerminalAt;
+        current.nextReminderAt = new Date(
+          new Date(now).getTime() + this.reminderIntervalMs,
+        ).toISOString();
+      }
     });
-    return true;
+    return resumableKeys.size;
   }
 
   acknowledgeIncident(generation: string): boolean {
@@ -1700,10 +1720,11 @@ export class TavilyMonitor {
       false,
       usageSample === undefined,
     );
-    return withTavilyEventPublicationLock(this.controlWorkspaceRoot, () => {
-      // A writer takes the same lock before it timestamps or stages an event.
-      // Acquiring it here therefore waits for every already-started publication
-      // before recovery can be committed or exposed to the delivery runtime.
+    const publicationBarrier = await acquireTavilyEventRecoveryBarrier(this.controlWorkspaceRoot);
+    try {
+      // Tool requests register before provider I/O and publish failures before
+      // completing. The barrier waits for all registered requests, then keeps
+      // new requests out until recovery is committed.
       this.drainChildEvents();
       const current = this.state.incident;
       const exhaustionAfterUsage = current?.lastObservedAt !== undefined &&
@@ -1755,7 +1776,9 @@ export class TavilyMonitor {
         };
       }
       return { ok: true, generation, sample: result.sample };
-    });
+    } finally {
+      publicationBarrier.release();
+    }
   }
 
   recheckIncident(generation: string): Promise<TavilyRecoveryResult> {

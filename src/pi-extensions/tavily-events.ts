@@ -5,6 +5,7 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -18,6 +19,9 @@ export const TAVILY_CHILD_EVENT_VERSION = 1 as const;
 export const TAVILY_EVENT_SPOOL_RELPATH = "data/tavily/events";
 export const TAVILY_EVENT_PUBLICATION_LOCK_RELPATH =
   `${TAVILY_EVENT_SPOOL_RELPATH}/.publish.lock`;
+export const TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX = ".request-";
+export const TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX = ".active";
+export const TAVILY_EVENT_RECOVERY_WAIT_TIMEOUT_MS = 35_000;
 
 const publicationLocksHeldByThisProcess = new Map<string, {
   depth: number;
@@ -54,6 +58,19 @@ export interface TavilyEventPublicationLockOptions {
 export interface TavilyEventPublicationLock {
   path: string;
   release: () => void;
+}
+
+export interface TavilyToolRequestPublication {
+  complete: (
+    tool: TavilyChildEvent["tool"],
+    failure: TavilyFailure | undefined,
+    observedAt: Date,
+  ) => string | undefined;
+}
+
+export interface TavilyEventRecoveryBarrierOptions extends TavilyEventPublicationLockOptions {
+  inFlightWaitTimeoutMs?: number;
+  inFlightWaitIntervalMs?: number;
 }
 
 interface TavilyEventPublicationLockRecord {
@@ -267,6 +284,25 @@ function publicationLockHandle(
   };
 }
 
+function publicationOwnerRecord(
+  pid: number,
+  token: string,
+  getProcessIdentity: (pid: number) => string | undefined,
+  now: () => Date,
+): TavilyEventPublicationLockRecord {
+  const processIdentity = getProcessIdentity(pid);
+  if (processIdentity !== undefined && !validProcessIdentity(processIdentity)) {
+    throw new Error("Tavily event publication process identity is invalid");
+  }
+  return {
+    version: 1,
+    pid,
+    token,
+    ...(processIdentity === undefined ? {} : { processIdentity }),
+    acquiredAt: isoNow(now),
+  };
+}
+
 /**
  * Serialize child-event publication with the monitor's recovery commit. The
  * lock is process-reentrant for synchronous callbacks and recovers records
@@ -307,17 +343,7 @@ export function acquireTavilyEventPublicationLock(
     const token = (options.uniqueId?.() ?? randomUUID()).replaceAll(/[^A-Za-z0-9-]/g, "");
     if (!token) throw new Error("Tavily event publication lock token is invalid");
     const candidatePath = join(directory, `.publish-${pid}-${token}.tmp`);
-    const processIdentity = getProcessIdentity(pid);
-    if (processIdentity !== undefined && !validProcessIdentity(processIdentity)) {
-      throw new Error("Tavily event publication lock process identity is invalid");
-    }
-    const record: TavilyEventPublicationLockRecord = {
-      version: 1,
-      pid,
-      token,
-      ...(processIdentity === undefined ? {} : { processIdentity }),
-      acquiredAt: isoNow(now),
-    };
+    const record = publicationOwnerRecord(pid, token, getProcessIdentity, now);
     writeFileSync(candidatePath, `${JSON.stringify(record)}\n`, {
       encoding: "utf8",
       flag: "wx",
@@ -366,6 +392,142 @@ export function acquireTavilyEventPublicationLock(
       throw new Error("Timed out waiting for Tavily event publication lock");
     }
     Atomics.wait(publicationWaitBuffer, 0, 0, Math.min(waitIntervalMs, deadline - Date.now()));
+  }
+}
+
+/**
+ * Register a provider request before it starts. Completion publishes any
+ * sanitized failure and removes the marker under the same lock used by the
+ * recovery commit, so recovery cannot pass an already-started request.
+ */
+export function beginTavilyToolRequestPublication(
+  controlWorkspaceRoot: string,
+  options: TavilyEventPublicationLockOptions = {},
+): TavilyToolRequestPublication {
+  const lock = acquireTavilyEventPublicationLock(controlWorkspaceRoot, options);
+  let markerPath: string;
+  try {
+    const directory = ensureTavilyEventSpool(controlWorkspaceRoot);
+    const pid = options.pid ?? process.pid;
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      throw new Error("Tavily in-flight request PID is invalid");
+    }
+    const token = (options.uniqueId?.() ?? randomUUID()).replaceAll(/[^A-Za-z0-9-]/g, "");
+    if (!token) throw new Error("Tavily in-flight request token is invalid");
+    const getProcessIdentity = options.getProcessIdentity ?? tavilyProcessIdentity;
+    const now = options.now ?? (() => new Date());
+    const record = publicationOwnerRecord(pid, token, getProcessIdentity, now);
+    markerPath = join(
+      directory,
+      `${TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX}${pid}-${token}${TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX}`,
+    );
+    writeFileSync(markerPath, `${JSON.stringify(record)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } finally {
+    lock.release();
+  }
+
+  let completed = false;
+  return {
+    complete: (tool, failure, observedAt) => {
+      if (completed) return undefined;
+      if (!Number.isFinite(observedAt.getTime())) {
+        throw new Error("Tavily request observation time is invalid");
+      }
+      const completionLock = acquireTavilyEventPublicationLock(controlWorkspaceRoot, options);
+      try {
+        return failure === undefined
+          ? undefined
+          : writeTavilyChildEvent(controlWorkspaceRoot, tool, failure, {
+            now: () => observedAt,
+            uniqueId: options.uniqueId,
+            pid: options.pid,
+          });
+      } finally {
+        try {
+          unlinkSync(markerPath);
+          completed = true;
+        } finally {
+          completionLock.release();
+        }
+      }
+    },
+  };
+}
+
+function liveInFlightRequestCount(
+  controlWorkspaceRoot: string,
+  options: TavilyEventPublicationLockOptions,
+): number {
+  const directory = ensureTavilyEventSpool(controlWorkspaceRoot);
+  const isProcessAlive = options.isProcessAlive ?? defaultProcessIsAlive;
+  const getProcessIdentity = options.getProcessIdentity ?? tavilyProcessIdentity;
+  const getProcessStartedAt = options.getProcessStartedAt ?? tavilyProcessStartedAt;
+  let live = 0;
+  for (const file of readdirSync(directory)) {
+    if (!file.startsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX) ||
+        !file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)) {
+      continue;
+    }
+    const path = join(directory, file);
+    const owner = readPublicationLock(path);
+    if (lockOwnerMatchesLiveProcess(
+      owner,
+      isProcessAlive,
+      getProcessIdentity,
+      getProcessStartedAt,
+    )) {
+      live += 1;
+      continue;
+    }
+    try {
+      const current = readPublicationLock(path);
+      if (current.token === owner.token && current.processIdentity === owner.processIdentity) {
+        unlinkSync(path);
+      }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+  }
+  return live;
+}
+
+/**
+ * Acquire the recovery commit lock only after all registered requests have
+ * completed. New requests cannot register until the returned lock is released.
+ */
+export async function acquireTavilyEventRecoveryBarrier(
+  controlWorkspaceRoot: string,
+  options: TavilyEventRecoveryBarrierOptions = {},
+): Promise<TavilyEventPublicationLock> {
+  const inFlightWaitTimeoutMs = options.inFlightWaitTimeoutMs ??
+    TAVILY_EVENT_RECOVERY_WAIT_TIMEOUT_MS;
+  const inFlightWaitIntervalMs = options.inFlightWaitIntervalMs ?? 10;
+  if (!Number.isFinite(inFlightWaitTimeoutMs) || inFlightWaitTimeoutMs < 0 ||
+      !Number.isFinite(inFlightWaitIntervalMs) || inFlightWaitIntervalMs <= 0) {
+    throw new Error("Tavily in-flight request wait is invalid");
+  }
+  const deadline = Date.now() + inFlightWaitTimeoutMs;
+  for (;;) {
+    const lock = acquireTavilyEventPublicationLock(controlWorkspaceRoot, options);
+    let liveRequests: number;
+    try {
+      liveRequests = liveInFlightRequestCount(controlWorkspaceRoot, options);
+    } catch (error) {
+      lock.release();
+      throw error;
+    }
+    if (liveRequests === 0) return lock;
+    lock.release();
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for Tavily in-flight requests");
+    }
+    await new Promise<void>((resolveWait) => {
+      setTimeout(resolveWait, Math.min(inFlightWaitIntervalMs, deadline - Date.now()));
+    });
   }
 }
 

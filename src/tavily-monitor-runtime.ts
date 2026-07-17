@@ -354,7 +354,7 @@ export class TavilyMonitorRuntime implements TavilyOperatorActions {
       void this.enqueue(() => this.sampleTransition());
     }, this.usageSampleIntervalMs);
     this.startup = this.enqueue(async () => {
-      if (this.destination) this.monitor.resumeIncidentDelivery();
+      if (this.destination) this.monitor.resumeTerminalDeliveries();
       this.monitor.drainChildEvents();
       await this.monitor.runPendingAutomaticRecovery();
       await this.sampleTransition();

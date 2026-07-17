@@ -783,7 +783,96 @@ describe("Tavily durable notification delivery", () => {
     await configured.start();
     await configured.stop();
     assert.equal(restored.getState().incident?.deliveryTerminalAt, undefined);
-    assert.equal(deliveries.filter((delivery) => /exhaustion reminder/.test(delivery.text)).length, 1);
+    assert.equal(deliveries.filter((delivery) => /exhaustion incident/.test(delivery.text)).length, 1);
+    assert.equal(deliveries.some((delivery) => /exhaustion reminder/.test(delivery.text)), false);
+  });
+
+  it("retries a terminal threshold warning once after a configured restart", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+    });
+    await monitor.sampleUsage();
+    const missingDestination = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    await missingDestination.processNow();
+    assert.equal(monitor.getState().outbox[0].status, "terminal");
+
+    clock.set("2026-07-16T12:05:00.000Z");
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(800))) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const configured = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await configured.start();
+    await configured.stop();
+    assert.equal(deliveries.filter((delivery) => /quota warning \(80%\)/.test(delivery.text)).length, 1);
+    assert.equal(restored.getState().outbox.length, 0);
+  });
+
+  it("retries a terminal recovery notice without replaying its resolved incident", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "terminal-recovery");
+    const recoveryResponses = [
+      usageResponse(100),
+      successfulSearchResponse(),
+      successfulExtractResponse(),
+    ];
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () =>
+        jsonResponse(recoveryResponses.shift() as Record<string, unknown>)) as typeof fetch,
+    });
+    const missingDestination = new TavilyMonitorRuntime({
+      monitor,
+      destination: undefined,
+      deliver: async () => assert.fail("missing destination must not deliver"),
+      now: clock.now,
+    });
+    await missingDestination.processNow();
+    const generation = monitor.getState().incident?.generation as string;
+    assert.equal((await monitor.recheckIncident(generation)).ok, true);
+    await missingDestination.processNow();
+    assert.equal(monitor.getState().outbox.some((entry) =>
+      entry.kind === "recovery" && entry.status === "terminal"), true);
+
+    clock.set("2026-07-16T12:05:00.000Z");
+    const restored = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => jsonResponse(usageResponse(100))) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const configured = new TavilyMonitorRuntime({
+      monitor: restored,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await configured.start();
+    await configured.stop();
+    assert.equal(deliveries.filter((delivery) => /^Tavily recovered\./.test(delivery.text)).length, 1);
+    assert.equal(deliveries.some((delivery) => /exhaustion incident/.test(delivery.text)), false);
   });
 
   it("aborts the active delivery during shutdown without starting the next due notification", async () => {

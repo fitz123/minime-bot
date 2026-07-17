@@ -38,9 +38,13 @@ import {
 } from "../pi-extensions/tavily.js";
 import {
   TAVILY_CHILD_EVENT_VERSION,
+  TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX,
+  TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX,
   TAVILY_EVENT_PUBLICATION_LOCK_RELPATH,
   TAVILY_EVENT_SPOOL_RELPATH,
+  acquireTavilyEventRecoveryBarrier,
   acquireTavilyEventPublicationLock,
+  beginTavilyToolRequestPublication,
   tavilyEventSpoolDirectory,
   writeTavilyChildEvent,
 } from "../pi-extensions/tavily-events.js";
@@ -210,6 +214,54 @@ describe("tavily: child failure event writer", () => {
       assert.equal(replacement.path, lockPath);
       replacement.release();
       assert.equal(readdirSync(dirname(lockPath)).includes(".publish.lock"), false);
+    } finally {
+      rmSync(controlWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an in-flight marker until failure publication and recovers a crashed request", async () => {
+    const controlWorkspace = mkdtempSync(join(tmpdir(), "tavily-event-in-flight-"));
+    try {
+      const publication = beginTavilyToolRequestPublication(controlWorkspace, {
+        pid: 71,
+        uniqueId: () => "active-request",
+        isProcessAlive: () => true,
+        getProcessIdentity: () => "request-instance",
+        now: () => new Date("2026-07-16T10:20:00.000Z"),
+      });
+      const spool = tavilyEventSpoolDirectory(controlWorkspace);
+      assert.ok(readdirSync(spool).some((file) =>
+        file.startsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX) &&
+        file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)));
+
+      const eventPath = publication.complete(
+        "web_search",
+        { classification: "base_plan_exhausted", httpStatus: 432 },
+        new Date("2026-07-16T10:20:30.000Z"),
+      );
+      assert.ok(eventPath);
+      assert.equal(readdirSync(spool).some((file) =>
+        file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)), false);
+      assert.equal(JSON.parse(readFileSync(eventPath, "utf8")).observedAt, "2026-07-16T10:20:30.000Z");
+
+      beginTavilyToolRequestPublication(controlWorkspace, {
+        pid: 72,
+        uniqueId: () => "crashed-request",
+        isProcessAlive: () => true,
+        getProcessIdentity: () => "crashed-instance",
+        now: () => new Date("2026-07-16T10:21:00.000Z"),
+      });
+      const barrier = await acquireTavilyEventRecoveryBarrier(controlWorkspace, {
+        pid: 73,
+        uniqueId: () => "recovery-barrier",
+        isProcessAlive: (pid) => pid !== 72,
+        getProcessIdentity: () => undefined,
+        getProcessStartedAt: () => undefined,
+        inFlightWaitTimeoutMs: 0,
+      });
+      barrier.release();
+      assert.equal(readdirSync(spool).some((file) =>
+        file.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)), false);
     } finally {
       rmSync(controlWorkspace, { recursive: true, force: true });
     }
@@ -1231,6 +1283,7 @@ describe("web-tools Pi wrapper", () => {
     const warnings: string[] = [];
     const statuses = [432, 433, 432, 433];
     const signals: Array<AbortSignal | null | undefined> = [];
+    const inFlightMarkersAtFetch: number[] = [];
 
     try {
       mkdirSync(join(controlWorkspace, "config"), { recursive: true });
@@ -1243,8 +1296,12 @@ describe("web-tools Pi wrapper", () => {
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlWorkspace;
       process.chdir(childWorkspace);
       console.warn = (message?: unknown) => warnings.push(String(message));
+      const spool = tavilyEventSpoolDirectory(controlWorkspace);
       globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
         signals.push(init?.signal);
+        inFlightMarkersAtFetch.push(readdirSync(spool).filter((name) =>
+          name.startsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_PREFIX) &&
+          name.endsWith(TAVILY_EVENT_IN_FLIGHT_REQUEST_SUFFIX)).length);
         const status = statuses.shift();
         assert.ok(status);
         return jsonResponse(
@@ -1267,7 +1324,6 @@ describe("web-tools Pi wrapper", () => {
         () => fetchTool.execute("fetch-433", { url: "https://1.1.1.1/" }, controller.signal),
       ];
       const expectedText = [/base-plan/, /PAYGO/, /base-plan/, /PAYGO/];
-      const spool = tavilyEventSpoolDirectory(controlWorkspace);
 
       for (const [index, run] of calls.entries()) {
         const result = await run();
@@ -1277,6 +1333,7 @@ describe("web-tools Pi wrapper", () => {
       }
 
       assert.equal(signals.length, 4);
+      assert.deepEqual(inFlightMarkersAtFetch, [1, 1, 1, 1]);
       assert.ok(signals.every((signal) => signal instanceof AbortSignal));
       assert.ok(signals.every((signal) => signal !== controller.signal));
       const events = readdirSync(spool)

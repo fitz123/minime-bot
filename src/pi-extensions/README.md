@@ -56,10 +56,13 @@ Ownership is enforced by the nonblocking single-writer lease at
 `data/tavily/writer.lock`; a replacement waits asynchronously, and a stale lease
 whose owning process is no longer alive can be recovered before constructing a
 fresh monitor. Child publication and recovery commits also share the
-process-reentrant `data/tavily/events/.publish.lock`. A child writer takes that
-lock before timestamping or staging an event, while recovery takes it before its
-final drain and resolution commit, preventing an already-started exhaustion
-publication from racing behind a false recovery.
+process-reentrant `data/tavily/events/.publish.lock`. Each tool request registers
+an owner-only in-flight marker before provider I/O, then publishes any bounded
+failure and removes its marker under that lock. Recovery waits for all live
+markers before taking the lock for its final drain and resolution commit, so an
+exhaustion response from a pre-commit request cannot race behind a false
+recovery. Markers left by crashed or PID-reused children are recovered using the
+same bounded process-instance checks as the lock.
 
 `PI_EXTENSIONS_DISABLED=1` stops new child events because it disables the web
 tools themselves; it does not delete existing monitor state. For a package

@@ -29,7 +29,11 @@ import {
   type TavilyWarn,
   type WebToolResult,
 } from "../../src/pi-extensions/tavily.js";
-import { writeTavilyChildEvent } from "../../src/pi-extensions/tavily-events.js";
+import {
+  beginTavilyToolRequestPublication,
+  writeTavilyChildEvent,
+  type TavilyToolRequestPublication,
+} from "../../src/pi-extensions/tavily-events.js";
 import {
   readTavilyApiKeyFromSops,
   tavilyControlWorkspaceRoot,
@@ -71,6 +75,42 @@ export default function (pi: ExtensionAPI): void {
     }
   };
 
+  const runTool = async (
+    tool: "web_search" | "web_fetch",
+    execute: () => Promise<WebToolResult>,
+  ): Promise<WebToolResult> => {
+    let publication: TavilyToolRequestPublication | undefined;
+    if (controlWorkspaceRoot) {
+      try {
+        publication = beginTavilyToolRequestPublication(controlWorkspaceRoot);
+      } catch {
+        warn({ tool, reason: "event-write-failed" });
+      }
+    }
+
+    let result: WebToolResult | undefined;
+    let observedAt: Date | undefined;
+    try {
+      result = await execute();
+      observedAt = new Date();
+      return result;
+    } finally {
+      if (publication) {
+        try {
+          publication.complete(tool, result?.failure, observedAt ?? new Date());
+        } catch {
+          warn({
+            tool,
+            reason: "event-write-failed",
+            ...(result?.failure === undefined ? {} : { classification: result.failure.classification }),
+          });
+        }
+      } else if (result) {
+        persistFailure(tool, result);
+      }
+    }
+  };
+
   // Pi's tool `execute` signature is `(toolCallId, params, signal, onUpdate, ctx)`
   // and it MUST resolve to an `AgentToolResult` (`{ content, details }`), NOT a
   // bare string — see the vendor `subagent/index.ts` and the
@@ -83,8 +123,10 @@ export default function (pi: ExtensionAPI): void {
       params: Record<string, unknown>,
       signal?: AbortSignal,
     ) => {
-      const result = await executeWebSearch(params ?? {}, deps, signal);
-      persistFailure("web_search", result);
+      const result = await runTool(
+        "web_search",
+        () => executeWebSearch(params ?? {}, deps, signal),
+      );
       return { content: [{ type: "text" as const, text: result.text }], details: { ok: result.ok } };
     },
   });
@@ -96,8 +138,10 @@ export default function (pi: ExtensionAPI): void {
       params: Record<string, unknown>,
       signal?: AbortSignal,
     ) => {
-      const result = await executeWebFetch(params ?? {}, deps, signal);
-      persistFailure("web_fetch", result);
+      const result = await runTool(
+        "web_fetch",
+        () => executeWebFetch(params ?? {}, deps, signal),
+      );
       return { content: [{ type: "text" as const, text: result.text }], details: { ok: result.ok } };
     },
   });

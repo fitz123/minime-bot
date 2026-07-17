@@ -856,7 +856,7 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     assert.ok(monitor.getState().incident?.resolvedAt);
   });
 
-  it("waits for an already-started cross-process event publication before resolving", async () => {
+  it("waits for a cross-process request that observed exhaustion before publishing", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:05:00.000Z");
     writeExhaustionEvent(
@@ -882,23 +882,17 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
     const eventsModule = pathToFileURL(resolve("src/pi-extensions/tavily-events.ts")).href;
     const childScript = `
       import {
-        acquireTavilyEventPublicationLock,
-        writeTavilyChildEvent,
+        beginTavilyToolRequestPublication,
       } from ${JSON.stringify(eventsModule)};
       const workspace = process.argv[1];
-      const lock = acquireTavilyEventPublicationLock(workspace);
-      process.stdout.write("locked\\n");
+      const publication = beginTavilyToolRequestPublication(workspace);
+      process.stdout.write("observed\\n");
       setTimeout(() => {
-        writeTavilyChildEvent(
-          workspace,
+        publication.complete(
           "web_fetch",
           { classification: "paygo_exhausted", httpStatus: 433 },
-          {
-            now: () => new Date("2026-07-16T12:06:00.000Z"),
-            uniqueId: () => "in-progress",
-          },
+          new Date("2026-07-16T12:06:00.000Z"),
         );
-        lock.release();
       }, 150);
     `;
     const child = spawn(
@@ -915,11 +909,11 @@ describe("Tavily recovery, later generations, and atomic restart persistence", (
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
         output += chunk;
-        if (output.includes("locked\n")) resolveLocked();
+        if (output.includes("observed\n")) resolveLocked();
       });
       child.once("error", rejectLocked);
       child.once("exit", (code) => {
-        if (!output.includes("locked\n")) {
+        if (!output.includes("observed\n")) {
           rejectLocked(new Error(`publication child exited early (${code}): ${stderr}`));
         }
       });
