@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.13
+
+- Accept Tavily `/usage` payloads with a nullable per-key limit while preserving strict account plan/PAYGO validation, successful sampling, and quota metrics.
+
 ## 2026.7.12
 
 - Keep Tavily as the sole provider for `web_search` and `web_fetch` while adding five-minute quota sampling, durable acknowledgement-driven exhaustion incidents, and bounded recovery verification.
