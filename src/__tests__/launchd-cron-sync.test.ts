@@ -146,6 +146,23 @@ describe("launchd cron runner selection", () => {
     }
   });
 
+  it("accepts a current-user-owned runner beneath a writable sticky ancestor", () => {
+    const fixture = createFixture();
+    try {
+      const stickyParent = join(fixture.root, "sticky-parent");
+      mkdirSync(stickyParent, { mode: 0o700 });
+      const runner = writeRunner(join(stickyParent, "owned-deployment", "scripts"));
+      chmodSync(stickyParent, 0o1777);
+
+      const result = generateWithRunner(fixture, runner);
+
+      assert.equal(result.context.runCronScript, runner);
+      assert.match(result.plists[0].content, new RegExp(`<string>${escapeRegex(runner)}</string>`));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("accepts one contained current directory symlink and preserves its lexical path", () => {
     const fixture = createFixture();
     try {
@@ -359,6 +376,34 @@ describe("launchd cron runner selection", () => {
         () => generateWithRunner(fixture, writableSelectorRunner),
         writableSelectorRunner,
         /Invalid run cron script override: file must not be group or world writable/,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("rejects replaceable ancestors above direct and selector trust directories", () => {
+    const fixture = createFixture();
+    try {
+      const directParent = join(fixture.root, "replaceable-direct-parent");
+      const directRunner = writeRunner(join(directParent, "deployment", "scripts"));
+      chmodSync(directParent, 0o777);
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, directRunner),
+        directRunner,
+        /Invalid run cron script override: ancestor directories must not be group or world writable unless sticky/,
+      );
+
+      const selectorParent = join(fixture.root, "replaceable-selector-parent");
+      const deployment = join(selectorParent, "deployment");
+      writeRunner(join(deployment, "slots", "blue", "scripts"));
+      symlinkSync(join("slots", "blue"), join(deployment, "current"), "dir");
+      chmodSync(selectorParent, 0o777);
+      const selectorRunner = join(deployment, "current", "scripts", "run-cron.sh");
+      assertRunCronRejection(
+        () => generateWithRunner(fixture, selectorRunner),
+        selectorRunner,
+        /Invalid run cron script override: ancestor directories must not be group or world writable unless sticky/,
       );
     } finally {
       cleanup(fixture);

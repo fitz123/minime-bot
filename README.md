@@ -435,7 +435,10 @@ A direct path's containing directory and file must be current-user owned and
 not group/world writable. At most one current-user-owned directory symlink is
 allowed; its target must stay below its parent trust directory, and that trust
 directory, the resolved directories, and the file must meet the same ownership
-and mode rules. Invalid overrides fail before plist writes or launchd commands.
+and mode rules. Ancestors of the containing or trust directory must be owned by
+root or the current user and must not be group/world writable; writable sticky
+ancestors are allowed when their path entry is root/current-user owned. Invalid
+overrides fail before plist writes or launchd commands.
 The validated lexical path is retained in the plist so an atomic `current`
 selector can switch slots without rewriting cron plists.
 

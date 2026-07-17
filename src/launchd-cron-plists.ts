@@ -519,7 +519,9 @@ function validateExplicitRunCronScript(runCronScript: string): string {
 
   const currentUid = resolveUid();
   if (symlinks.size === 0) {
-    validateOwnedRunCronComponent(dirname(runCronScript), currentUid, "containing directory");
+    const containingDir = dirname(runCronScript);
+    validateOwnedRunCronComponent(containingDir, currentUid, "containing directory");
+    validateRunCronAncestorDirectories(containingDir, currentUid);
     validateOwnedRunCronComponent(runCronScript, currentUid, "file", true);
     return runCronScript;
   }
@@ -562,6 +564,7 @@ function validateExplicitRunCronScript(runCronScript: string): string {
   }
 
   validateOwnedRunCronComponent(canonicalTrustDir, currentUid, "trust directory");
+  validateRunCronAncestorDirectories(canonicalTrustDir, currentUid);
   for (const component of pathComponentsBetween(canonicalTrustDir, canonicalRunCronScript)) {
     const isFile = component === canonicalRunCronScript;
     validateOwnedRunCronComponent(component, currentUid, isFile ? "file" : "resolved directory", isFile);
@@ -629,6 +632,38 @@ function validateOwnedRunCronComponent(
   }
   if (requireExecutable && (stats.mode & 0o500) !== 0o500) {
     throw invalidRunCronScript("file must be readable and executable by its owner");
+  }
+}
+
+function validateRunCronAncestorDirectories(directory: string, currentUid: number): void {
+  let child = directory;
+  for (;;) {
+    const parent = dirname(child);
+    if (parent === child) {
+      return;
+    }
+
+    const parentStats = inspectRunCronComponent(parent);
+    if (!parentStats.isDirectory()) {
+      throw invalidRunCronScript("ancestor path contains a component that is not a directory");
+    }
+    if (parentStats.uid !== 0 && parentStats.uid !== currentUid) {
+      throw invalidRunCronScript("ancestor directories must be owned by root or the current user");
+    }
+
+    const parentIsWritable = (parentStats.mode & 0o022) !== 0;
+    const parentIsSticky = (parentStats.mode & 0o1000) !== 0;
+    if (parentIsWritable && !parentIsSticky) {
+      throw invalidRunCronScript("ancestor directories must not be group or world writable unless sticky");
+    }
+    if (parentIsWritable) {
+      const childStats = inspectRunCronComponent(child);
+      if (childStats.uid !== 0 && childStats.uid !== currentUid) {
+        throw invalidRunCronScript("entries beneath writable sticky ancestors must be owned by root or the current user");
+      }
+    }
+
+    child = parent;
   }
 }
 

@@ -140,7 +140,11 @@ The override is not a general arbitrary-script hook. Validation requires:
   the containing directory and runner file; or
 - for a selector path, those ownership and mode rules on the parent trust
   directory, resolved directories, and runner file. Symlink mode bits are not
-  enforced because POSIX systems do not use them for replacement safety.
+  enforced because POSIX systems do not use them for replacement safety; and
+- ancestors of the direct containing directory or selector trust directory
+  must be root/current-user owned and not group/world writable. Writable sticky
+  ancestors are accepted when the protected child entry is root/current-user
+  owned.
 
 Escaping, dangling, multi-symlink, wrong-owner, writable-component, missing,
 unreadable, non-executable, and incorrectly named paths are rejected. Explicit
