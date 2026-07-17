@@ -103,7 +103,10 @@ function makeDeps(
     buildAgentConfig: (_cron, cwd) => makeAgent(cwd),
     buildEnv: () => ({}),
     assembleContext: () => null,
-    resolveExtensionArgs: () => ["--extension", "/first-party/knowledge-tools.ts"],
+    resolveExtensionArgs: () => [
+      "--extension", "/first-party/web-tools.ts",
+      "--extension", "/first-party/knowledge-tools.ts",
+    ],
     ...overrides,
   };
 }
@@ -155,7 +158,10 @@ describe("cron-runner runPi", () => {
       "high",
     ]);
     assertCronSystemInstruction(flagValue(capture.args, "--append-system-prompt"));
-    assert.deepStrictEqual(flagValues(capture.args, "--extension"), ["/first-party/knowledge-tools.ts"]);
+    assert.deepStrictEqual(flagValues(capture.args, "--extension"), [
+      "/first-party/web-tools.ts",
+      "/first-party/knowledge-tools.ts",
+    ]);
     assert.strictEqual(capture.options.input, undefined);
     assert.strictEqual(capture.options.cwd, ws);
     assert.strictEqual(capture.options.timeout, 1234);
@@ -200,8 +206,9 @@ describe("cron-runner runPi", () => {
     }
 
     const extensions = flagValues(captures[0].args, "--extension");
-    assert.strictEqual(extensions.length, 1);
-    assert.ok(extensions[0].endsWith("knowledge-tools.ts"));
+    assert.strictEqual(extensions.length, 2);
+    assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);
+    assert.ok(extensions[1].endsWith("knowledge-tools.ts"));
     assert.ok(!extensions.includes(extraExtension));
   });
 
@@ -286,7 +293,10 @@ describe("cron-runner runPi", () => {
     assert.ok(appendIdx < noContextIdx);
     assert.ok(noContextIdx < cronInstructionIdx);
     assert.ok(cronInstructionIdx < args.indexOf("--extension"));
-    assert.deepStrictEqual(flagValues(args, "--extension"), ["/first-party/knowledge-tools.ts"]);
+    assert.deepStrictEqual(flagValues(args, "--extension"), [
+      "/first-party/web-tools.ts",
+      "/first-party/knowledge-tools.ts",
+    ]);
   });
 
   it("suppresses flat context loading when context assembly throws", () => {

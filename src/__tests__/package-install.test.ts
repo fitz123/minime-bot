@@ -260,6 +260,11 @@ function assertPackFiles(files: readonly string[]): void {
     1,
     "recovery wrapper must be packaged exactly once without a dangling source artifact",
   );
+  assert.equal(
+    files.filter((file) => file === "dist/extensions/pi/web-tools.js").length,
+    1,
+    "canonical web-tools wrapper must be packaged exactly once",
+  );
 }
 
 describe("package artifact install", () => {
@@ -1158,6 +1163,14 @@ function extensionPathsFromArgs(args) {
   return paths;
 }
 
+function assertCanonicalWebWrapper(label, paths) {
+  assert.equal(
+    paths.filter((path) => path.endsWith("/web-tools.js")).length,
+    1,
+    label + " must load the canonical web-tools wrapper exactly once",
+  );
+}
+
 function assertNoGuardContract(label, args) {
   assert.doesNotMatch(JSON.stringify(args), retiredGuardWrapperPattern, label);
 }
@@ -1224,6 +1237,7 @@ assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
 );
+assertCanonicalWebWrapper("interactive parent", extensionPaths);
 assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
@@ -1251,6 +1265,7 @@ assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("subagent child", extensionPathsFromArgs(subagentChildExtensionArgs));
 assertNoGuardContract("subagent child extension args must not load the retired guard", subagentChildExtensionArgs);
 
 const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
@@ -1259,9 +1274,20 @@ const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(cronExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["knowledge-tools.js"],
+  ["web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("cron", extensionPathsFromArgs(cronExtensionArgs));
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
+
+const recoveryExtensionArgs = piRpc.resolvePiExtensionArgs({
+  env: {},
+  relpaths: piRpc.PI_RECOVERY_WRAPPER_RELPATHS,
+});
+assert.deepEqual(
+  extensionPathsFromArgs(recoveryExtensionArgs).map((path) => relative(artifactDir, path)),
+  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+);
+assertCanonicalWebWrapper("recovery", extensionPathsFromArgs(recoveryExtensionArgs));
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);
@@ -1374,6 +1400,46 @@ assert.deepEqual(
     .sort(),
   ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_search"],
 );
+assert.equal(registeredTools.filter((name) => name === "web_search").length, 1);
+assert.equal(registeredTools.includes("web_fetch"), false);
+
+// pi-dynamic-workflows creates in-memory sessions with SettingsManager and
+// createAgentSession. Model that exact Pi boundary using the globally configured
+// installed wrapper: the child inherits web_search from settings and receives no
+// second custom registration path.
+const piCodingAgent = await importFile(
+  join(projectDir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"),
+);
+const workflowAgentDir = join(projectDir, "workflow-agent-dir");
+mkdirSync(workflowAgentDir, { recursive: true });
+const workflowSettings = piCodingAgent.SettingsManager.inMemory({
+  extensions: [join(artifactDir, "web-tools.js")],
+});
+const workflowChild = await piCodingAgent.createAgentSession({
+  cwd: agentWorkspace,
+  agentDir: workflowAgentDir,
+  settingsManager: workflowSettings,
+  sessionManager: piCodingAgent.SessionManager.inMemory(agentWorkspace),
+  customTools: piCodingAgent.createCodingTools(agentWorkspace),
+});
+try {
+  assert.deepEqual(workflowChild.extensionsResult.errors, []);
+  assertCanonicalWebWrapper(
+    "dynamic-workflow in-memory child",
+    workflowChild.extensionsResult.extensions.map((extension) => extension.path),
+  );
+  assert.equal(
+    workflowChild.session.getActiveToolNames().filter((name) => name === "web_search").length,
+    1,
+  );
+  assert.equal(
+    workflowChild.session.getAllTools().filter((tool) => tool.name === "web_search").length,
+    1,
+  );
+  assert.equal(workflowChild.session.getAllTools().some((tool) => tool.name === "web_fetch"), false);
+} finally {
+  workflowChild.session.dispose();
+}
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
 const piInvocation = await importPackageFile("dist/pi-extensions/pi-invocation.js");
@@ -1464,6 +1530,7 @@ assert.deepEqual(
   askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
+assertCanonicalWebWrapper("ask-agent child", askAgentLoadedExtensions);
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("subagent")));
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("ask-agent")));
 askAgentSmokeChild.stdout.emitData(JSON.stringify({
@@ -1585,6 +1652,7 @@ try {
     askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
     ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
   );
+  assertCanonicalWebWrapper("ask-agent wrapper child", askAgentWrapperExtensions);
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
   assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);

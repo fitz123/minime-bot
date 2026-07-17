@@ -42,11 +42,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 2: Propagate one registration to every runtime surface
 
-- [ ] Add `web-tools` to the cron extension list so LLM crons receive `web_search` once.
-- [ ] Assert interactive parent, package subagent, `ask_agent`, cron, and recovery extension inventories each load the canonical wrapper exactly once.
-- [ ] Verify dynamic-workflow children receive the globally deployed wrapper without adding a second registration path.
-- [ ] Update bundled planner/reviewer/scout allowlists to keep `web_search`, remove `web_fetch`, and avoid granting Bash solely for URL fetching.
-- [ ] Update protocol, package-install, spawn-workspace, subagent, ask-agent, cron, and recovery tests for the exact runtime matrix and tool inventory.
+- [x] Add `web-tools` to the cron extension list so LLM crons receive `web_search` once.
+- [x] Assert interactive parent, package subagent, `ask_agent`, cron, and recovery extension inventories each load the canonical wrapper exactly once.
+- [x] Verify dynamic-workflow children receive the globally deployed wrapper without adding a second registration path.
+- [x] Update bundled planner/reviewer/scout allowlists to keep `web_search`, remove `web_fetch`, and avoid granting Bash solely for URL fetching.
+- [x] Update protocol, package-install, spawn-workspace, subagent, ask-agent, cron, and recovery tests for the exact runtime matrix and tool inventory.
 
 ### Task 3: Pass the exact candidate evidence gate
 

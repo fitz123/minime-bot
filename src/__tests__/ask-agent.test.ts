@@ -175,6 +175,7 @@ describe("ask-agent helper", () => {
         },
         callerContext: "caller supplied context",
         extensionArgs: [
+          "--extension", "/abs/codex-transport-overflow.ts",
           "--extension", "/abs/web-tools.ts",
           "--extension", "/abs/knowledge-tools.ts",
           "--extension", "/approved/extra.ts",
@@ -198,6 +199,7 @@ describe("ask-agent helper", () => {
     assert.equal(args[args.indexOf("--append-system-prompt") + 1], "/tmp/target.bundle.md");
     assert.ok(args.includes("--no-context-files"));
     assert.deepEqual(args.slice(args.indexOf("--extension"), -1), [
+      "--extension", "/abs/codex-transport-overflow.ts",
       "--extension", "/abs/web-tools.ts",
       "--extension", "/abs/knowledge-tools.ts",
       "--extension", "/approved/extra.ts",
@@ -725,7 +727,11 @@ describe("ask-agent helper", () => {
         command: "/runtime/node",
         args: ["/package/pi-coding-agent/dist/cli.js", ...args],
       }),
-      extensionArgs: ["--extension", "/abs/web-tools.ts"],
+      extensionArgs: [
+        "--extension", "/abs/codex-transport-overflow.ts",
+        "--extension", "/abs/web-tools.ts",
+        "--extension", "/abs/knowledge-tools.ts",
+      ],
       env: { PATH: "/usr/bin" },
     });
 
@@ -746,7 +752,14 @@ describe("ask-agent helper", () => {
     assert.deepEqual(calls[0].options.env, { PATH: "/usr/bin" });
     assert.equal(calls[0].args[calls[0].args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
     assert.ok(calls[0].args.includes("--append-system-prompt"));
-    assert.ok(calls[0].args.includes("/abs/web-tools.ts"));
+    const extensionPaths = calls[0].args
+      .flatMap((arg, index, args) => arg === "--extension" ? [args[index + 1]] : []);
+    assert.deepEqual(extensionPaths, [
+      "/abs/codex-transport-overflow.ts",
+      "/abs/web-tools.ts",
+      "/abs/knowledge-tools.ts",
+    ]);
+    assert.equal(extensionPaths.filter((path) => path.endsWith("web-tools.ts")).length, 1);
   });
 
   it("returns all final assistant text blocks from the target child", async () => {

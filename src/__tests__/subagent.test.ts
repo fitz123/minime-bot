@@ -113,7 +113,9 @@ describe("subagent: buildSubagentSpawnArgs", () => {
 
   it("injects the child's --extension args before the task", () => {
     const extensionArgs = [
+      "--extension", "/abs/codex-transport-overflow.ts",
       "--extension", "/abs/web-tools.ts",
+      "--extension", "/abs/knowledge-tools.ts",
     ];
     const args = buildSubagentSpawnArgs({}, "delegate", { extensionArgs });
     const taskIdx = args.indexOf("Task: delegate");
@@ -130,12 +132,13 @@ describe("subagent: buildSubagentSpawnArgs", () => {
 });
 
 describe("subagent: bundled agent tool allowlists", () => {
-  it("allows web tools for explicit scout, reviewer, and planner allowlists", () => {
+  it("keeps bundled search roles on web_search only and preserves their existing Bash boundary", () => {
     for (const agentName of ["scout", "reviewer", "planner"]) {
       const tools = readBundledAgentTools(agentName);
       assert.ok(tools, `${agentName} must have an explicit tools allowlist`);
-      assert.ok(tools.includes("web_search"), `${agentName} tools must include web_search`);
-      assert.ok(tools.includes("web_fetch"), `${agentName} tools must include web_fetch`);
+      assert.equal(tools.filter((tool) => tool === "web_search").length, 1, `${agentName} must include web_search once`);
+      assert.equal(tools.includes("web_fetch"), false, `${agentName} must not include web_fetch`);
+      assert.equal(tools.includes("bash"), agentName !== "planner", `${agentName} Bash boundary changed`);
       const args = buildSubagentSpawnArgs({ tools }, `task for ${agentName}`);
       assert.equal(args[args.indexOf("--tools") + 1], tools.join(","));
     }

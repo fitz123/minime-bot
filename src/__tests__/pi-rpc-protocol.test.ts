@@ -26,6 +26,7 @@ import {
   PI_CRON_WRAPPER_RELPATHS,
   PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
   PI_EXTENSION_WRAPPER_RELPATHS,
+  PI_RECOVERY_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
@@ -479,6 +480,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.doesNotMatch(
@@ -507,8 +509,27 @@ describe("Pi extension loading (--extension)", () => {
     assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
   });
 
-  it("the Pi cron wrapper subset is knowledge-tools only", () => {
-    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["knowledge-tools.ts"]);
+  it("loads the canonical web-tools wrapper exactly once on every package-managed runtime inventory", () => {
+    const inventories: Record<string, readonly string[]> = {
+      interactive: PI_EXTENSION_WRAPPER_RELPATHS,
+      subagent: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
+      askAgent: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
+      cron: PI_CRON_WRAPPER_RELPATHS,
+      recovery: PI_RECOVERY_WRAPPER_RELPATHS,
+    };
+
+    for (const [runtime, relpaths] of Object.entries(inventories)) {
+      assert.equal(
+        relpaths.filter((relpath) => relpath === "web-tools.ts").length,
+        1,
+        `${runtime} must load web-tools exactly once`,
+      );
+    }
+  });
+
+  it("the Pi cron wrapper subset exposes search and Knowledge without child-spawning tools", () => {
+    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
+    assert.equal(PI_CRON_WRAPPER_RELPATHS.some((path) => /subagent|ask-agent/.test(path)), false);
   });
 
   it("resolves only the requested relpaths subset for subagent children", () => {
@@ -606,9 +627,10 @@ describe("Pi extension loading (--extension)", () => {
     }
   });
 
-  it("resolves only the requested relpaths subset (Pi cron loads knowledge-tools)", () => {
+  it("resolves only the requested relpaths subset for Pi cron search and Knowledge", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_CRON_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
   });
@@ -635,6 +657,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.ok(!subagentChildArgs.includes(extraExtension));
