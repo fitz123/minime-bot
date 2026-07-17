@@ -381,6 +381,7 @@ function createTask(
       resume: false,
     },
     activeRun: null,
+    unverifiedRun: null,
     lastOutcome: null,
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,

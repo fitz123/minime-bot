@@ -44,6 +44,7 @@ import {
   type OpsWorkerAuthorizationTool,
   type OpsWorkerOutcomeResult,
   type OpsWorkerTask,
+  type OpsWorkerUnverifiedRun,
 } from "./types.js";
 
 export const OPS_WORKER_PI_LIMITS = {
@@ -84,8 +85,8 @@ export interface OpsWorkerProcessIdentity {
   pid: number;
   processGroupId: number;
   processStartToken: string;
-  /** Present on fresh Task-3 launches; omitted from the durable task schema. */
-  ownershipNoncePresent?: boolean;
+  /** Read only for fresh-launch binding; omitted from verified durable identity. */
+  ownershipNonce?: string;
 }
 
 export type OpsWorkerProcessInspection =
@@ -154,6 +155,11 @@ export interface StopOwnedRunOptions {
   sleep: (milliseconds: number) => Promise<void>;
   termGraceMs: number;
   killGraceMs: number;
+}
+
+export interface OpsWorkerStartupReconcilerOptions
+  extends Partial<StopOwnedRunOptions> {
+  inspectUnverified?: (pid: number) => OpsWorkerProcessInspection;
 }
 
 class BoundedStreamCapture {
@@ -395,7 +401,9 @@ export class OpsWorkerPiAttemptRunner {
       this.authorizationTools(task),
     );
     const invocation = this.resolveInvocation(args);
+    const attemptId = `attempt-${this.randomId()}`;
     const ownershipNonce = `owner-${this.randomId()}`;
+    const launchedAt = this.now().toISOString();
     let child: ChildProcess;
     try {
       const env = this.buildEnv(this.workspaceCwd);
@@ -448,12 +456,25 @@ export class OpsWorkerPiAttemptRunner {
         ),
       };
     }
-    const identity = await this.readFreshIdentity(pid, () => exitSettled);
+    const unverifiedRun: OpsWorkerUnverifiedRun = {
+      attemptId,
+      supervisorInstanceId: this.supervisor.supervisorInstanceId,
+      pid,
+      expectedProcessGroupId: pid,
+      launchedAt,
+      ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
+    };
+    const identity = await this.readFreshIdentity(
+      pid,
+      ownershipNonce,
+      () => exitSettled,
+    );
     if (identity.status === "GONE") {
       const exit = await boundedExitWait(exitPromise, this.sleep);
       if (exit === null) {
         const blocked = this.supervisor.blockUnverifiedPiLaunch(
           task.id,
+          unverifiedRun,
           `Pi PID ${pid} was reported gone but its child lifecycle did not settle`,
         );
         abandonUnverifiedChild(child);
@@ -470,6 +491,7 @@ export class OpsWorkerPiAttemptRunner {
     if (identity.status !== "OWNED" || identity.identity.processGroupId !== pid) {
       const blocked = this.supervisor.blockUnverifiedPiLaunch(
         task.id,
+        unverifiedRun,
         `Pi PID ${pid}: ${identity.status === "AMBIGUOUS"
           ? identity.summary
           : "fresh process-group identity could not be proven"}`,
@@ -481,7 +503,7 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
     const activeRun: OpsWorkerActiveRun = {
-      attemptId: `attempt-${this.randomId()}`,
+      attemptId,
       supervisorInstanceId: this.supervisor.supervisorInstanceId,
       pid,
       processGroupId: identity.identity.processGroupId,
@@ -505,7 +527,11 @@ export class OpsWorkerPiAttemptRunner {
           classification: "CRASH",
           task: current.state === "RUNNING"
             ? this.supervisor.blockAmbiguousActiveRun(task.id, stopped.summary ?? errorMessage(error))
-            : this.supervisor.blockUnverifiedPiLaunch(task.id, stopped.summary ?? errorMessage(error)),
+            : this.supervisor.blockUnverifiedPiLaunch(
+              task.id,
+              unverifiedRun,
+              stopped.summary ?? errorMessage(error),
+            ),
         };
       }
       await boundedExitWait(exitPromise, this.sleep);
@@ -683,6 +709,7 @@ export class OpsWorkerPiAttemptRunner {
 
   private async readFreshIdentity(
     pid: number,
+    expectedOwnershipNonce: string,
     isExited: () => boolean,
   ): Promise<OpsWorkerProcessInspection> {
     const deadline = Date.now() + OPS_WORKER_PI_LIMITS.processInspectionTimeoutMs;
@@ -692,14 +719,29 @@ export class OpsWorkerPiAttemptRunner {
     };
     do {
       last = this.readProcessIdentity(pid);
-      if (
-        last.status === "OWNED"
-        && last.identity.ownershipNoncePresent !== false
-      ) return last;
+      if (last.status === "OWNED") {
+        if (last.identity.pid !== pid) {
+          return {
+            status: "AMBIGUOUS",
+            summary: "Fresh Pi identity inspection returned a different PID",
+          };
+        }
+        if (last.identity.ownershipNonce === expectedOwnershipNonce) return last;
+        if (last.identity.ownershipNonce !== undefined) {
+          return {
+            status: "AMBIGUOUS",
+            summary: "Fresh Pi process did not carry the expected launch nonce",
+          };
+        }
+      }
       if (isExited()) return last;
       await this.sleep(OPS_WORKER_PI_LIMITS.processInspectionPollMs);
     } while (Date.now() < deadline);
-    return last;
+    if (last.status === "GONE") return last;
+    return {
+      status: "AMBIGUOUS",
+      summary: "Fresh Pi process did not prove the expected launch nonce before timeout",
+    };
   }
 
   private async waitForHigherPriority(
@@ -883,7 +925,7 @@ export function readOpsWorkerProcessIdentity(
           processStartToken: hashStartToken(
             `linux:${startTicks}:${ownershipNonce ?? "legacy"}`,
           ),
-          ownershipNoncePresent: ownershipNonce !== null,
+          ownershipNonce: ownershipNonce ?? undefined,
         },
       };
     } catch (error) {
@@ -915,7 +957,7 @@ export function readOpsWorkerProcessIdentity(
       processStartToken: hashStartToken(
         `ps:${match[3]}:${ownershipNonce ?? "legacy"}`,
       ),
-      ownershipNoncePresent: ownershipNonce !== null,
+      ownershipNonce: ownershipNonce ?? undefined,
     },
   };
 }
@@ -977,9 +1019,11 @@ export function inspectOpsWorkerProcessGroup(
 }
 
 export function createOpsWorkerPiStartupReconciler(
-  options: Partial<StopOwnedRunOptions> = {},
+  options: OpsWorkerStartupReconcilerOptions = {},
 ): (task: OpsWorkerTask) => Promise<OpsWorkerStartupRunResult> {
   const inspect = options.inspect ?? inspectOpsWorkerActiveRun;
+  const inspectUnverified = options.inspectUnverified
+    ?? readOpsWorkerProcessIdentity;
   const inspectGroup = options.inspectGroup ?? inspectOpsWorkerProcessGroup;
   const signal = options.signal ?? signalOpsWorkerProcessGroup;
   const sleep = options.sleep
@@ -991,6 +1035,16 @@ export function createOpsWorkerPiStartupReconciler(
   const killGraceMs = options.killGraceMs
     ?? OPS_WORKER_PI_LIMITS.defaultKillGraceMs;
   return async (task) => {
+    if (task.unverifiedRun) {
+      return reconcileUnverifiedRun(task.unverifiedRun, {
+        inspect: inspectUnverified,
+        inspectGroup,
+        signal,
+        sleep,
+        termGraceMs,
+        killGraceMs,
+      });
+    }
     if (!task.activeRun) {
       return {
         status: "AMBIGUOUS",
@@ -1008,6 +1062,89 @@ export function createOpsWorkerPiStartupReconciler(
   };
 }
 
+async function reconcileUnverifiedRun(
+  run: OpsWorkerUnverifiedRun,
+  options: {
+    inspect: (pid: number) => OpsWorkerProcessInspection;
+    inspectGroup: (processGroupId: number) => OpsWorkerProcessGroupInspection;
+    signal: (processGroupId: number, signal: NodeJS.Signals) => void;
+    sleep: (milliseconds: number) => Promise<void>;
+    termGraceMs: number;
+    killGraceMs: number;
+  },
+): Promise<OpsWorkerStartupRunResult> {
+  const inspected = options.inspect(run.pid);
+  if (inspected.status === "GONE") {
+    const group = options.inspectGroup(run.expectedProcessGroupId);
+    if (group.status === "GONE") {
+      return { status: "GONE", summary: "Unverified Pi launch is now proven gone" };
+    }
+    return {
+      status: "AMBIGUOUS",
+      summary: group.status === "AMBIGUOUS"
+        ? group.summary
+        : "Unverified Pi leader is gone while its expected process-group id remains present",
+    };
+  }
+  if (inspected.status === "AMBIGUOUS") return inspected;
+
+  const nonceMatches = inspected.identity.ownershipNonce !== undefined
+    && hashOwnershipNonce(inspected.identity.ownershipNonce)
+      === run.ownershipNonceHash;
+  if (
+    inspected.identity.pid !== run.pid
+    || inspected.identity.processGroupId !== run.expectedProcessGroupId
+    || !nonceMatches
+  ) {
+    const group = options.inspectGroup(run.expectedProcessGroupId);
+    if (group.status === "GONE" && !nonceMatches) {
+      return {
+        status: "GONE",
+        summary: "Unverified Pi launch identity was replaced and its expected group is gone",
+      };
+    }
+    return {
+      status: "AMBIGUOUS",
+      summary: "Unverified Pi launch still does not match its persisted PID, group, and nonce proof",
+    };
+  }
+
+  const verifiedRun: OpsWorkerActiveRun = {
+    attemptId: run.attemptId,
+    supervisorInstanceId: run.supervisorInstanceId,
+    pid: run.pid,
+    processGroupId: run.expectedProcessGroupId,
+    processStartedAt: run.launchedAt,
+    processStartToken: inspected.identity.processStartToken,
+  };
+  const inspectVerified = (): OpsWorkerProcessInspection => {
+    const current = options.inspect(run.pid);
+    if (current.status !== "OWNED") return current;
+    if (
+      current.identity.pid !== verifiedRun.pid
+      || current.identity.processGroupId !== verifiedRun.processGroupId
+      || current.identity.processStartToken !== verifiedRun.processStartToken
+      || current.identity.ownershipNonce === undefined
+      || hashOwnershipNonce(current.identity.ownershipNonce)
+        !== run.ownershipNonceHash
+    ) {
+      return {
+        status: "AMBIGUOUS",
+        summary: "Unverified Pi launch ownership changed during reconciliation",
+      };
+    }
+    return current;
+  };
+  return stopOwnedProcessGroup(verifiedRun, {
+    inspect: inspectVerified,
+    inspectGroup: options.inspectGroup,
+    signal: options.signal,
+    sleep: options.sleep,
+    termGraceMs: options.termGraceMs,
+    killGraceMs: options.killGraceMs,
+  });
+}
+
 export async function stopOwnedProcessGroup(
   run: OpsWorkerActiveRun,
   options: StopOwnedRunOptions,
@@ -1021,6 +1158,10 @@ export async function stopOwnedProcessGroup(
     if (group.status === "AMBIGUOUS") {
       return { status: "AMBIGUOUS", summary: group.summary };
     }
+    return {
+      status: "AMBIGUOUS",
+      summary: "Persisted Pi leader is gone while its process-group id is present; group continuity cannot be proven",
+    };
   }
   if (initial.status === "AMBIGUOUS") {
     return { status: "AMBIGUOUS", summary: initial.summary };
@@ -1042,6 +1183,15 @@ export async function stopOwnedProcessGroup(
 
   const beforeKill = options.inspectGroup(run.processGroupId);
   if (beforeKill.status !== "PRESENT") return stopResult(beforeKill, "TERM");
+  const ownerBeforeKill = options.inspect(run);
+  if (ownerBeforeKill.status !== "OWNED") {
+    return {
+      status: "AMBIGUOUS",
+      summary: ownerBeforeKill.status === "AMBIGUOUS"
+        ? ownerBeforeKill.summary
+        : "Pi leader exited after TERM; refusing PGID-only KILL without renewed ownership proof",
+    };
+  }
   try {
     options.signal(run.processGroupId, "SIGKILL");
   } catch (error) {
@@ -1285,6 +1435,10 @@ function infrastructureSummary(
 
 function hashStartToken(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function hashOwnershipNonce(value: string): string {
+  return hashStartToken(`ownership-nonce:${value}`);
 }
 
 function readLinuxOwnershipNonce(pid: number): string | null {

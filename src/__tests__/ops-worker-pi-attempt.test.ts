@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
@@ -124,6 +125,7 @@ function makeTask(
       resume: false,
     },
     activeRun: null,
+    unverifiedRun: null,
     lastOutcome: null,
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,
@@ -470,7 +472,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
-  it("kills a surviving same-group descendant after the Pi leader exits on TERM", async (t) => {
+  it("does not KILL a surviving group after the proven Pi leader exits", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("descendant-cleanup"));
     harness.setScenario("leader-exits-child-survives");
@@ -481,16 +483,21 @@ describe("ops worker Pi standard-session attempts", () => {
     await waitFor(() => harness.supervisor.getTask("descendant-cleanup")?.state === "RUNNING");
     const active = harness.supervisor.getTask("descendant-cleanup")?.activeRun;
     assert.ok(active);
+    t.after(() => {
+      try {
+        process.kill(-active.processGroupId, "SIGKILL");
+      } catch {
+        // The isolated fixture group is already gone.
+      }
+    });
 
     const result = await running;
 
-    assert.equal(result.state, "RESUMABLE");
-    assert.equal(result.lastOutcome?.result, "STALL");
+    assert.equal(result.state, "BLOCKED");
+    assert.equal(result.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.deepEqual(result.activeRun, active);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
-    assert.throws(
-      () => process.kill(-active.processGroupId, 0),
-      (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH",
-    );
+    assert.doesNotThrow(() => process.kill(-active.processGroupId, 0));
   });
 
   it("turns shutdown into bounded owned-group cleanup and a resumable task", async (t) => {
@@ -590,7 +597,16 @@ describe("ops worker Pi standard-session attempts", () => {
           pid,
           processGroupId: pid + 1,
           processStartToken: "mismatched-group",
-          ownershipNoncePresent: true,
+          ownershipNonce: "owner-unrelated",
+        },
+      })],
+      ["identity-wrong-nonce", (pid: number): OpsWorkerProcessInspection => ({
+        status: "OWNED",
+        identity: {
+          pid,
+          processGroupId: pid,
+          processStartToken: "unrelated-nonce",
+          ownershipNonce: "owner-unrelated",
         },
       })],
     ] as const) {
@@ -607,6 +623,8 @@ describe("ops worker Pi standard-session attempts", () => {
       }).runAttempt(taskId);
       assert.equal(blocked.state, "BLOCKED");
       assert.equal(blocked.activeRun, null);
+      assert.equal(blocked.unverifiedRun?.pid, isolated.children.at(-1)?.pid);
+      assert.match(blocked.unverifiedRun?.ownershipNonceHash ?? "", /^sha256:[a-f0-9]{64}$/);
       assert.equal(signals, 0);
       assert.ok(Date.now() - startedAt < 2_500);
       isolated.store.create(makeTask(`${taskId}-next`));
@@ -664,6 +682,80 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     assert.equal((await requiresKill(task)).status, "STOPPED");
     assert.deepEqual(escalatedSignals, ["SIGTERM", "SIGKILL"]);
+
+    const pgidReuseSignals: NodeJS.Signals[] = [];
+    const vanishedLeader = createOpsWorkerPiStartupReconciler({
+      inspect: () => ({ status: "GONE" }),
+      inspectGroup: () => ({ status: "PRESENT" }),
+      signal: (_group, signal) => pgidReuseSignals.push(signal),
+      sleep: async () => undefined,
+      termGraceMs: 1,
+      killGraceMs: 1,
+    });
+    assert.equal((await vanishedLeader(task)).status, "AMBIGUOUS");
+    assert.deepEqual(pgidReuseSignals, []);
+
+    const noPgidOnlyKillSignals: NodeJS.Signals[] = [];
+    let ownershipChecks = 0;
+    const leaderExitsAfterTerm = createOpsWorkerPiStartupReconciler({
+      inspect: () => {
+        ownershipChecks += 1;
+        return ownershipChecks === 1
+          ? { status: "OWNED", identity: activeRun }
+          : { status: "GONE" };
+      },
+      inspectGroup: () => ({ status: "PRESENT" }),
+      signal: (_group, signal) => noPgidOnlyKillSignals.push(signal),
+      sleep: async () => undefined,
+      termGraceMs: 1,
+      killGraceMs: 1,
+    });
+    assert.equal((await leaderExitsAfterTerm(task)).status, "AMBIGUOUS");
+    assert.deepEqual(noPgidOnlyKillSignals, ["SIGTERM"]);
+
+    const unverifiedTask = makeTask("restart-unverified");
+    unverifiedTask.state = "BLOCKED";
+    unverifiedTask.lastOutcome = {
+      at: unverifiedTask.updatedAt,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Synthetic unverified launch requires restart reconciliation.",
+    };
+    unverifiedTask.unverifiedRun = {
+      attemptId: "attempt-unverified",
+      supervisorInstanceId: "prior-supervisor",
+      pid: 505,
+      expectedProcessGroupId: 505,
+      launchedAt: unverifiedTask.updatedAt,
+      ownershipNonceHash: `sha256:${createHash("sha256")
+        .update("ownership-nonce:owner-restart")
+        .digest("hex")}`,
+    };
+    let unverifiedStopped = false;
+    const unverifiedSignals: NodeJS.Signals[] = [];
+    const reconcileUnverified = createOpsWorkerPiStartupReconciler({
+      inspectUnverified: () => ({
+        status: "OWNED",
+        identity: {
+          pid: 505,
+          processGroupId: 505,
+          processStartToken: "unverified-start-token",
+          ownershipNonce: "owner-restart",
+        },
+      }),
+      inspectGroup: () => unverifiedStopped
+        ? { status: "GONE" }
+        : { status: "PRESENT" },
+      signal: (_group, signal) => {
+        unverifiedSignals.push(signal);
+        unverifiedStopped = true;
+      },
+      sleep: async () => undefined,
+      termGraceMs: 1,
+      killGraceMs: 1,
+    });
+    assert.equal((await reconcileUnverified(unverifiedTask)).status, "STOPPED");
+    assert.deepEqual(unverifiedSignals, ["SIGTERM"]);
 
     const root = mkdtempSync(join(tmpdir(), "minime-ops-worker-orphan-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));

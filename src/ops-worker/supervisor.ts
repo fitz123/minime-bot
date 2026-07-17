@@ -27,6 +27,7 @@ import {
   type OpsWorkerOutcomeResult,
   type OpsWorkerTask,
   type OpsWorkerTaskState,
+  type OpsWorkerUnverifiedRun,
 } from "./types.js";
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
@@ -596,6 +597,7 @@ export class OpsWorkerSupervisor {
     }
     return this.transition(taskId, "RUNNING", (task) => {
       task.activeRun = structuredClone(activeRun);
+      task.unverifiedRun = null;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.lastOutcome = null;
@@ -809,7 +811,11 @@ export class OpsWorkerSupervisor {
     return this.blockAmbiguousRun(taskId, summary);
   }
 
-  blockUnverifiedPiLaunch(taskId: string, summary: string): OpsWorkerTask {
+  blockUnverifiedPiLaunch(
+    taskId: string,
+    unverifiedRun: OpsWorkerUnverifiedRun,
+    summary: string,
+  ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
     if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
@@ -819,6 +825,7 @@ export class OpsWorkerSupervisor {
     }
     return this.transition(taskId, "BLOCKED", (replacement, at) => {
       replacement.activeRun = null;
+      replacement.unverifiedRun = structuredClone(unverifiedRun);
       replacement.schedule.nextRunAt = null;
       replacement.schedule.nextCheckAt = null;
       replacement.lastOutcome = {
@@ -954,7 +961,9 @@ export class OpsWorkerSupervisor {
       );
     }
     const replacement = structuredClone(task);
-    replacement.updatedAt = this.nextUpdatedAt(task);
+    // updatedAt remains the DONE transition timestamp so the fresh PASS proof
+    // is not rewritten by report-transport bookkeeping. The REPORT journal
+    // entry supplies the mutation time for report attempts.
     replacement.report.attempts += 1;
     replacement.report.state = result.sent ? "SENT" : "PENDING";
     replacement.report.lastError = result.sent
@@ -970,7 +979,10 @@ export class OpsWorkerSupervisor {
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {
     const running = this.store.list().filter((task) =>
       task.state === "RUNNING"
-      || (isOpsWorkerUnresolvedOrphan(task) && task.activeRun !== null));
+      || (
+        isOpsWorkerUnresolvedOrphan(task)
+        && (task.activeRun !== null || task.unverifiedRun !== null)
+      ));
     const reconciled: OpsWorkerStartupReconciliation[] = [];
     for (const task of running) {
       let result: OpsWorkerStartupRunResult = { status: "AMBIGUOUS" };
@@ -985,6 +997,7 @@ export class OpsWorkerSupervisor {
         const target = this.infrastructureFailureTarget(task);
         this.transition(task.id, target, (replacement, at) => {
           replacement.activeRun = null;
+          replacement.unverifiedRun = null;
           this.incrementInfrastructureFailures(replacement);
           replacement.schedule.nextRunAt = null;
           replacement.schedule.nextCheckAt = null;
@@ -1022,6 +1035,7 @@ export class OpsWorkerSupervisor {
 
   private blockAmbiguousRun(taskId: string, summary: string): OpsWorkerTask {
     return this.transition(taskId, "BLOCKED", (task, at) => {
+      task.unverifiedRun = null;
       task.session.resume = true;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;

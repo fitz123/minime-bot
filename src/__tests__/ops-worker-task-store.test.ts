@@ -133,6 +133,7 @@ function makeTask(
       resume: false,
     },
     activeRun: null,
+    unverifiedRun: null,
     lastOutcome: null,
     report: {
       state: "NONE",
@@ -426,6 +427,32 @@ describe("ops worker task contract", () => {
     assert.throws(
       () => parseOpsWorkerTask(unexpectedIdentity, registry),
       /must be null unless state is RUNNING/,
+    );
+
+    const unexpectedFence = clone(makeTask());
+    unexpectedFence.unverifiedRun = {
+      attemptId: "attempt-unverified",
+      supervisorInstanceId: "supervisor-1",
+      pid: 456,
+      expectedProcessGroupId: 456,
+      launchedAt: NOW,
+      ownershipNonceHash: `sha256:${"b".repeat(64)}`,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(unexpectedFence, registry),
+      /must be null unless retaining an ambiguous blocked launch fence/,
+    );
+
+    unexpectedFence.state = "BLOCKED";
+    unexpectedFence.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Synthetic unverified launch remains fenced.",
+    };
+    assert.equal(
+      parseOpsWorkerTask(unexpectedFence, registry).unverifiedRun?.pid,
+      456,
     );
   });
 });

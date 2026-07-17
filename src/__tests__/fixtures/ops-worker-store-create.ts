@@ -56,6 +56,7 @@ const task: OpsWorkerTask = {
   schedule: { nextRunAt: null, nextCheckAt: null },
   session: { directory: `sessions/${taskId}`, sessionId: null, resume: false },
   activeRun: null,
+  unverifiedRun: null,
   lastOutcome: null,
   report: { state: "NONE", attempts: 0, lastError: null },
   createdAt: now,

@@ -129,6 +129,7 @@ function makeTask(
       resume: false,
     },
     activeRun: null,
+    unverifiedRun: null,
     lastOutcome: null,
     report: {
       state: "NONE",
@@ -419,6 +420,21 @@ describe("ops worker supervisor", () => {
     assert.equal(done.state, "DONE");
     assert.equal(done.lastOutcome?.result, "PASS");
     assert.equal(done.report.state, "PENDING");
+    const completionAt = done.updatedAt;
+    const failedReport = harness.supervisor.recordReportAttempt(
+      "task-pass",
+      { sent: false, error: "Synthetic report transport failure" },
+    );
+    assert.equal(failedReport.updatedAt, completionAt);
+    assert.equal(failedReport.report.attempts, 1);
+    assert.equal(failedReport.report.state, "PENDING");
+    const sentReport = harness.supervisor.recordReportAttempt(
+      "task-pass",
+      { sent: true },
+    );
+    assert.equal(sentReport.updatedAt, completionAt);
+    assert.equal(sentReport.report.attempts, 2);
+    assert.equal(sentReport.report.state, "SENT");
     assert.throws(
       () => harness.supervisor.cancelTask("task-pass", "too late"),
       /Illegal ops-worker transition DONE -> CANCELLED/,
@@ -865,6 +881,46 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.report.attempts, 2);
     assert.equal(sent.report.lastError, null);
+  });
+
+  it("reconciles a durable unverified-launch fence after the process and group are gone", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-unverified-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "unverified-first",
+    });
+    first.store.create(makeTask("task-unverified"));
+    const blocked = first.supervisor.blockUnverifiedPiLaunch(
+      "task-unverified",
+      {
+        attemptId: "attempt-unverified",
+        supervisorInstanceId: "unverified-first",
+        pid: 4321,
+        expectedProcessGroupId: 4321,
+        launchedAt: NOW,
+        ownershipNonceHash: `sha256:${"a".repeat(64)}`,
+      },
+      "Synthetic launch identity inspection failed",
+    );
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.activeRun, null);
+    assert.equal(blocked.unverifiedRun?.pid, 4321);
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "unverified-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Synthetic unverified process and group are gone",
+      }),
+    });
+    const reconciled = restarted.store.get("task-unverified");
+    assert.equal(reconciled?.state, "RESUMABLE");
+    assert.equal(reconciled?.activeRun, null);
+    assert.equal(reconciled?.unverifiedRun, null);
+    assert.equal(restarted.supervisor.selectNextTask()?.task.id, "task-unverified");
   });
 
   it("retains correlation ownership until a fresh PASS reaches DONE", async (t) => {

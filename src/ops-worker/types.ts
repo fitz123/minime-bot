@@ -175,6 +175,21 @@ export interface OpsWorkerActiveRun {
   processStartToken: string;
 }
 
+/**
+ * Durable safety fence for a child that was spawned but whose exact OS
+ * process identity could not be proven before launch inspection timed out.
+ * The nonce is stored only as a hash so restart reconciliation can bind a
+ * later inspection without publishing the raw per-attempt token.
+ */
+export interface OpsWorkerUnverifiedRun {
+  attemptId: string;
+  supervisorInstanceId: string;
+  pid: number;
+  expectedProcessGroupId: number;
+  launchedAt: string;
+  ownershipNonceHash: string;
+}
+
 export interface OpsWorkerLastOutcome {
   at: string;
   kind: OpsWorkerOutcomeKind;
@@ -202,6 +217,7 @@ export interface OpsWorkerTask {
   schedule: OpsWorkerSchedule;
   session: OpsWorkerSession;
   activeRun: OpsWorkerActiveRun | null;
+  unverifiedRun: OpsWorkerUnverifiedRun | null;
   lastOutcome: OpsWorkerLastOutcome | null;
   report: OpsWorkerReport;
   createdAt: string;
@@ -264,6 +280,7 @@ const TASK_KEYS = [
   "schedule",
   "session",
   "activeRun",
+  "unverifiedRun",
   "lastOutcome",
   "report",
   "createdAt",
@@ -759,6 +776,78 @@ function parseActiveRun(value: unknown): OpsWorkerActiveRun | null {
   };
 }
 
+function parseUnverifiedRun(value: unknown): OpsWorkerUnverifiedRun | null {
+  if (value === null) return null;
+  const unverifiedRun = expectObject(value, "task.unverifiedRun");
+  expectExactKeys(
+    unverifiedRun,
+    [
+      "attemptId",
+      "supervisorInstanceId",
+      "pid",
+      "expectedProcessGroupId",
+      "launchedAt",
+      "ownershipNonceHash",
+    ],
+    "task.unverifiedRun",
+  );
+  const attemptId = expectString(
+    unverifiedRun.attemptId,
+    "task.unverifiedRun.attemptId",
+  );
+  const supervisorInstanceId = expectString(
+    unverifiedRun.supervisorInstanceId,
+    "task.unverifiedRun.supervisorInstanceId",
+  );
+  for (const [path, identifier] of [
+    ["task.unverifiedRun.attemptId", attemptId],
+    ["task.unverifiedRun.supervisorInstanceId", supervisorInstanceId],
+  ] as const) {
+    if (!INSTANCE_ID_PATTERN.test(identifier)) {
+      fail(path, "contains unsafe characters");
+    }
+  }
+  const ownershipNonceHash = expectString(
+    unverifiedRun.ownershipNonceHash,
+    "task.unverifiedRun.ownershipNonceHash",
+  );
+  if (!SHA256_PATTERN.test(ownershipNonceHash)) {
+    fail(
+      "task.unverifiedRun.ownershipNonceHash",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  const pid = expectInteger(
+    unverifiedRun.pid,
+    "task.unverifiedRun.pid",
+    1,
+    2_147_483_647,
+  );
+  const expectedProcessGroupId = expectInteger(
+    unverifiedRun.expectedProcessGroupId,
+    "task.unverifiedRun.expectedProcessGroupId",
+    1,
+    2_147_483_647,
+  );
+  if (expectedProcessGroupId !== pid) {
+    fail(
+      "task.unverifiedRun.expectedProcessGroupId",
+      "must equal the detached launch leader PID",
+    );
+  }
+  return {
+    attemptId,
+    supervisorInstanceId,
+    pid,
+    expectedProcessGroupId,
+    launchedAt: expectTimestamp(
+      unverifiedRun.launchedAt,
+      "task.unverifiedRun.launchedAt",
+    ),
+    ownershipNonceHash,
+  };
+}
+
 function parseLastOutcome(value: unknown): OpsWorkerLastOutcome | null {
   if (value === null) return null;
   const outcome = expectObject(value, "task.lastOutcome");
@@ -834,16 +923,29 @@ export function parseOpsWorkerTask(
   }
   const state = expectEnum(task.state, OPS_WORKER_TASK_STATES, "task.state");
   const activeRun = parseActiveRun(task.activeRun);
+  const unverifiedRun = parseUnverifiedRun(task.unverifiedRun);
   if (state === "RUNNING" && activeRun === null) {
     fail("task.activeRun", "must identify the owned process group while state is RUNNING");
   }
   const lastOutcome = parseLastOutcome(task.lastOutcome);
   const preservesAmbiguousRun = state === "BLOCKED"
     && lastOutcome?.result === "AMBIGUOUS_ORPHAN";
+  if (activeRun !== null && unverifiedRun !== null) {
+    fail(
+      "task.unverifiedRun",
+      "cannot coexist with a verified active process-group identity",
+    );
+  }
   if (state !== "RUNNING" && activeRun !== null && !preservesAmbiguousRun) {
     fail(
       "task.activeRun",
       "must be null unless state is RUNNING or retains an ambiguous blocked process group",
+    );
+  }
+  if (unverifiedRun !== null && !preservesAmbiguousRun) {
+    fail(
+      "task.unverifiedRun",
+      "must be null unless retaining an ambiguous blocked launch fence",
     );
   }
   if (
@@ -877,6 +979,7 @@ export function parseOpsWorkerTask(
     schedule: parseSchedule(task.schedule),
     session: parseSession(task.session, id),
     activeRun,
+    unverifiedRun,
     lastOutcome,
     report: parseReport(task.report),
     createdAt,
