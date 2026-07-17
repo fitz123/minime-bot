@@ -11,6 +11,7 @@ export const CODEX_WEB_SEARCH_PROVIDER = "openai-codex";
 export const CODEX_WEB_SEARCH_TIMEOUT_MS = 60_000;
 export const MAX_CODEX_WEB_SEARCH_QUERY_CHARS = 300;
 export const MAX_CODEX_WEB_SEARCH_TEXT_CHARS = 50_000;
+export const MAX_CODEX_WEB_SEARCH_RESPONSE_BYTES = 1_000_000;
 const MAX_WEB_ACTIONS = 50;
 const MAX_ACTION_VALUES = 20;
 const MAX_URL_CHARS = 2_048;
@@ -558,6 +559,7 @@ export async function parseCodexWebSearchSse(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let responseBytes = 0;
   let answerDelta = "";
   let deltaTruncated = false;
   let finalAnswer = "";
@@ -698,6 +700,10 @@ export async function parseCodexWebSearchSse(
       if (done) {
         streamFinished = true;
         break;
+      }
+      responseBytes += value.byteLength;
+      if (responseBytes > MAX_CODEX_WEB_SEARCH_RESPONSE_BYTES) {
+        throw new CodexSearchSchemaError("response body exceeds byte limit");
       }
       buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.search(/\r?\n\r?\n/);
@@ -855,6 +861,7 @@ export async function executeCodexWebSearch(
       method: request.method,
       headers: request.headers,
       body: request.body,
+      redirect: "error",
       signal: bounded.signal,
     });
     if (!response.ok) {

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -12,6 +13,7 @@ import {
   executeCodexWebSearch,
   formatCodexWebSearchWarn,
   MAX_CODEX_WEB_SEARCH_QUERY_CHARS,
+  MAX_CODEX_WEB_SEARCH_RESPONSE_BYTES,
   MAX_CODEX_WEB_SEARCH_TEXT_CHARS,
   parseCodexWebSearchSse,
   resolveCodexWebSearchOAuth,
@@ -290,6 +292,43 @@ describe("Codex web search auth and request", () => {
       else process.env.OPENAI_API_KEY = previous;
     }
   });
+
+  it("rejects redirects without issuing a second credential-bearing request", async (t) => {
+    const requests: string[] = [];
+    const server = createServer((request, response) => {
+      requests.push(request.url ?? "");
+      if (request.url === "/start") {
+        response.writeHead(307, { location: "/redirected" });
+        response.end();
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(successSse());
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(0, "127.0.0.1", resolveListen);
+    });
+    t.after(() => new Promise<void>((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    }));
+    const address = server.address();
+    assert(address && typeof address !== "string");
+
+    const { context } = makeContext();
+    let redirectMode: RequestRedirect | undefined;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      fetchImpl: ((_url: string | URL | Request, init?: RequestInit) => {
+        redirectMode = init?.redirect;
+        return fetch(`http://127.0.0.1:${address.port}/start`, init);
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "transport");
+    assert.equal(redirectMode, "error");
+    assert.deepEqual(requests, ["/start"]);
+  });
 });
 
 describe("Codex web search streamed response parsing", () => {
@@ -383,6 +422,29 @@ describe("Codex web search streamed response parsing", () => {
       AbortSignal.timeout(100),
     );
     assert.equal(result.ok, true);
+    assert.equal(cancelled, true);
+  });
+
+  it("rejects and cancels successful response bodies beyond the byte cap", async () => {
+    let cancelled = false;
+    const oversized = new Uint8Array(MAX_CODEX_WEB_SEARCH_RESPONSE_BYTES + 1);
+    oversized.fill(0x61);
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(oversized);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const { context } = makeContext();
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      requestTimeoutMs: 20,
+      fetchImpl: (async () => response) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "schema");
     assert.equal(cancelled, true);
   });
 
