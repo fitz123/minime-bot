@@ -27,7 +27,7 @@ npm run build
 npm pack --dry-run
 ```
 
-## Task 1: Implement and verify shared trailing-artifact removal
+### Task 1: Implement and verify shared trailing-artifact removal
 
 - [ ] Add a small pure postprocessor in `src/voice.ts` backed by an ordered list of known anchored suffix patterns.
 - [ ] Apply it exactly once to trimmed `whisper-cli` stdout before `transcribeAudio` returns.
