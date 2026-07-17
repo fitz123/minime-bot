@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -15,7 +16,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCli, type CliRunOptions, type RecoveryCommandRunner } from "../cli.js";
-import type { LaunchdCommandRunner } from "../launchd-cron-plists.js";
+import {
+  generateLaunchdCronPlists,
+  type LaunchdCommandRunner,
+} from "../launchd-cron-plists.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
@@ -138,6 +142,14 @@ function captureRunner(calls: CommandCall[]): LaunchdCommandRunner {
   };
 }
 
+function writeRunner(directory: string): string {
+  mkdirSync(directory, { recursive: true });
+  const runner = join(directory, "run-cron.sh");
+  writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(runner, 0o700);
+  return realpathSync(runner);
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -154,6 +166,8 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
+    assert.match(result.stdout, /--run-cron-script <absolute-path>/);
+    assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
     assert.match(result.stdout, /minime-bot recovery config validate/);
     assert.match(result.stdout, /never SQL or shell/);
     assert.match(result.stdout, /closed observe, diagnose, and enabled mode gates/);
@@ -313,6 +327,129 @@ describe("minime-bot CLI", () => {
       assert.match(result.stdout, /rebootstrap ai\.minime\.cron\.smoke/);
       assert.match(result.stdout, /Summary: create 1, update 0, unchanged 0, delete 0/);
       assert.equal(existsSync(join(launchAgentsDir, "ai.minime.cron.smoke.plist")), false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("parses and forwards split and equals run cron script overrides", () => {
+    for (const form of ["split", "equals"] as const) {
+      const workspace = createWorkspace();
+      const home = join(workspace, "home");
+      const logDir = join(workspace, "logs");
+      const launchAgentsDir = join(workspace, "launch-agents");
+      const runner = writeRunner(join(workspace, "release", "scripts"));
+      const env = { HOME: home, LOG_DIR: logDir, UID: "501" };
+      try {
+        mkdirSync(launchAgentsDir, { recursive: true });
+        const generated = generateLaunchdCronPlists({
+          workspace,
+          launchAgentsDir,
+          runCronScript: runner,
+          env,
+          cwd: workspace,
+          homeDir: home,
+          uid: 501,
+        });
+        writeFileSync(generated.plists[0].plistPath, generated.plists[0].content, "utf8");
+        const runnerArgs = form === "split"
+          ? ["--run-cron-script", runner]
+          : [`--run-cron-script=${runner}`];
+
+        const result = runWithCapture(
+          [
+            "launchd",
+            "crons",
+            "sync",
+            "--workspace",
+            workspace,
+            "--dry-run",
+            "--launch-agents-dir",
+            launchAgentsDir,
+            ...runnerArgs,
+          ],
+          workspace,
+          env,
+          { launchdHomeDir: home, launchdUid: 501 },
+        );
+
+        assert.equal(result.code, 0, form);
+        assert.equal(result.stderr, "", form);
+        assert.match(result.stdout, /unchanged ai\.minime\.cron\.smoke/, form);
+        assert.match(result.stdout, /Summary: create 0, update 0, unchanged 1, delete 0/, form);
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("rejects missing, duplicate, and unknown run cron script option forms", () => {
+    const cases: Array<{ args: string[]; expected: RegExp }> = [
+      {
+        args: ["--run-cron-script"],
+        expected: /--run-cron-script requires a path/,
+      },
+      {
+        args: ["--run-cron-script="],
+        expected: /--run-cron-script requires a path/,
+      },
+      {
+        args: [
+          "--run-cron-script",
+          "/tmp/first/run-cron.sh",
+          "--run-cron-script=/tmp/second/run-cron.sh",
+        ],
+        expected: /--run-cron-script may only be specified once/,
+      },
+      {
+        args: ["--run-cron-script-path=/tmp/release/run-cron.sh"],
+        expected: /unknown launchd option: --run-cron-script-path\n$/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const result = runWithCapture(["launchd", "crons", "sync", ...testCase.args], BOT_ROOT);
+      assert.equal(result.code, 2);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, testCase.expected);
+      assert.doesNotMatch(result.stderr, /\/tmp\/release\/run-cron\.sh/);
+    }
+  });
+
+  it("rejects an invalid runner override before launchd writes or commands", () => {
+    const workspace = createWorkspace();
+    const calls: CommandCall[] = [];
+    const home = join(workspace, "home");
+    const logDir = join(workspace, "logs");
+    const launchAgentsDir = join(workspace, "untouched", "LaunchAgents");
+    try {
+      const result = runWithCapture(
+        [
+          "launchd",
+          "crons",
+          "sync",
+          "--workspace",
+          workspace,
+          "--launch-agents-dir",
+          launchAgentsDir,
+          "--run-cron-script",
+          "relative/run-cron.sh",
+        ],
+        workspace,
+        { HOME: home, LOG_DIR: logDir, UID: "501" },
+        {
+          launchdCommandRunner: captureRunner(calls),
+          launchdHomeDir: home,
+          launchdUid: 501,
+        },
+      );
+
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /Invalid run cron script override: must be an absolute path/);
+      assert.equal(existsSync(launchAgentsDir), false);
+      assert.equal(existsSync(logDir), false);
+      assert.equal(calls.length, 0);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

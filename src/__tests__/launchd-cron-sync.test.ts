@@ -440,6 +440,7 @@ describe("launchd cron plist sync", () => {
     const calls: CommandCall[] = [];
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
       writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
@@ -448,6 +449,7 @@ describe("launchd cron plist sync", () => {
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         dryRun: true,
         env: fixture.env,
         homeDir: fixture.home,
@@ -456,6 +458,7 @@ describe("launchd cron plist sync", () => {
       });
 
       assert.equal(calls.length, 0);
+      assert.equal(result.context.runCronScript, runner);
       assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.active.plist")), false);
       assert.match(readFileSync(stalePath, "utf8"), /ai\.minime\.cron\.stale/);
       assert.equal(readFileSync(botPath, "utf8"), "bot");
@@ -559,14 +562,16 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("does not run commands for unchanged active plists", () => {
+  it("keeps a matching explicit-runner plist unchanged without running commands", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const generated = generateLaunchdCronPlists({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         env: fixture.env,
         homeDir: fixture.home,
         uid: 501,
@@ -576,6 +581,7 @@ describe("launchd cron plist sync", () => {
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
         env: fixture.env,
         homeDir: fixture.home,
         uid: 501,
@@ -586,6 +592,70 @@ describe("launchd cron plist sync", () => {
         "unchanged:ai.minime.cron.active",
       ]);
       assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("plans only one create when adding a cron with matching explicit-runner plists", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    const runner = writeRunner(join(fixture.root, "release", "scripts"));
+    const cronsYaml = (includeNew: boolean): string => [
+      "crons:",
+      "  - name: existing-morning",
+      '    schedule: "0 8 * * *"',
+      '    prompt: "run morning task"',
+      "    agentId: main",
+      "    deliveryChatId: 111",
+      "  - name: existing-evening",
+      '    schedule: "0 18 * * *"',
+      '    prompt: "run evening task"',
+      "    agentId: main",
+      "    deliveryChatId: 111",
+      ...(includeNew ? [
+        "  - name: new-midday",
+        '    schedule: "0 12 * * *"',
+        '    prompt: "run midday task"',
+        "    agentId: main",
+        "    deliveryChatId: 111",
+      ] : []),
+      "",
+    ].join("\n");
+
+    try {
+      writeCrons(fixture.workspace, cronsYaml(false));
+      const initial = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      for (const plist of initial.plists) {
+        writeFileSync(plist.plistPath, plist.content, "utf8");
+      }
+      writeCrons(fixture.workspace, cronsYaml(true));
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "unchanged:ai.minime.cron.existing-evening",
+        "unchanged:ai.minime.cron.existing-morning",
+        "create:ai.minime.cron.new-midday",
+      ]);
+      assert.equal(calls.length, 0);
+      assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.new-midday.plist")), false);
     } finally {
       cleanup(fixture);
     }
