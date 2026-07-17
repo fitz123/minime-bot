@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.12
+
+- Keep Tavily as the sole provider for `web_search` and `web_fetch` while adding five-minute quota sampling, durable acknowledgement-driven exhaustion incidents, and bounded recovery verification.
+- Expose sanitized Tavily quota diagnostics and Prometheus metrics, including distinct credential, rate-limit, plan/PAYGO exhaustion, provider-outage, and extraction failures.
+
 ## 2026.7.11
 
 - Make LLM cron jobs inherit the selected agent's normalized model for both context assembly and Pi execution instead of using a stale package-level pin.
