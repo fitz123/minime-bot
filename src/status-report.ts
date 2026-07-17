@@ -1,4 +1,5 @@
 import type { SessionHealth } from "./session-manager.js";
+import type { TavilyQuotaCounter, TavilyStatusSnapshot } from "./tavily-monitor.js";
 import {
   formatCompactDuration,
   formatResetEta,
@@ -18,6 +19,7 @@ export interface BuildStatusReportOptions {
   uptimeSeconds: number;
   sessionHealth?: SessionHealth;
   quotaStatus?: QuotaStatus;
+  tavilyStatus?: TavilyStatusSnapshot;
   now?: Date;
   lastSuccessStaleMs?: number;
 }
@@ -38,7 +40,47 @@ export function buildStatusReport(options: BuildStatusReportOptions): string {
     lines.push("", ...quotaLines);
   }
 
+  if (options.tavilyStatus) {
+    lines.push("", ...formatTavilyBlock(options.tavilyStatus, now));
+  }
+
   return lines.join("\n");
+}
+
+function formatTavilyBlock(status: TavilyStatusSnapshot, now: Date): string[] {
+  const sampleAge = status.sampledAt === undefined
+    ? undefined
+    : formatSampleAge(status.sampledAt, now);
+  const attemptAge = status.latestAttemptAt === undefined
+    ? undefined
+    : formatSampleAge(status.latestAttemptAt, now);
+  const heading = status.sampleState === "fresh"
+    ? `Tavily: fresh (sample ${sampleAge ?? "unknown"})`
+    : status.sampleState === "stale"
+      ? `Tavily: stale (sample ${sampleAge ?? "unknown"})`
+      : status.sampleState === "error"
+        ? `Tavily: error (attempt ${attemptAge ?? "unknown"})`
+        : "Tavily: unavailable (no successful sample)";
+  const lines = [heading];
+  if (status.plan) lines.push(`  Plan: ${formatTavilyCredits(status.plan)}`);
+  if (status.paygo) lines.push(`  PAYGO: ${formatTavilyCredits(status.paygo)}`);
+  if (status.lastFailure) {
+    const age = formatSampleAge(status.lastFailure.observedAt, now) ?? "unknown";
+    lines.push(
+      `  Last failure: ${status.lastFailure.classification} (${status.lastFailure.source}, ${age})`,
+    );
+  }
+  lines.push(`  Incident: ${formatTavilyIncident(status)}`);
+  return lines;
+}
+
+function formatTavilyCredits(counter: TavilyQuotaCounter): string {
+  return `${counter.usage}/${counter.limit} used (${counter.remaining} remaining)`;
+}
+
+function formatTavilyIncident(status: TavilyStatusSnapshot): string {
+  if (status.incident !== "active") return status.incident;
+  return status.acknowledged ? "active (acknowledged)" : "active (unacknowledged)";
 }
 
 function formatSessionHealth(

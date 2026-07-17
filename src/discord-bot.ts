@@ -21,6 +21,7 @@ import { messagesReceived } from "./metrics.js";
 import { isImageMimeType } from "./mime.js";
 import { readQuotaStatus } from "./quota-status.js";
 import { buildStatusReport } from "./status-report.js";
+import type { TavilyStatusSnapshot } from "./tavily-monitor.js";
 /** Check if a message is too old to process (same logic as telegram-bot.ts). */
 function isStaleMessage(messageTimestampMs: number, maxAgeMs: number): boolean {
   return Date.now() - messageTimestampMs > maxAgeMs;
@@ -156,13 +157,14 @@ interface DiscordCommandHandlerOptions {
   discordConfig: DiscordConfig;
   sessionManager: SessionManager;
   messageQueue: Pick<MessageQueue, "clear">;
+  getTavilyStatus?: () => TavilyStatusSnapshot | undefined;
 }
 
 export async function handleDiscordChatInputCommand(
   interaction: DiscordCommandInteractionLike,
   options: DiscordCommandHandlerOptions,
 ): Promise<void> {
-  const { config, discordConfig, sessionManager, messageQueue } = options;
+  const { config, discordConfig, sessionManager, messageQueue, getTavilyStatus } = options;
   const isThread = interaction.channel?.isThread() ?? false;
   const channelId = isThread && interaction.channel && "parentId" in interaction.channel
     ? (interaction.channel.parentId ?? interaction.channelId)
@@ -204,6 +206,7 @@ export async function handleDiscordChatInputCommand(
         uptimeSeconds: Math.floor(process.uptime()),
         sessionHealth: sessionManager.getSessionHealth(key),
         quotaStatus: readQuotaStatus(),
+        tavilyStatus: getTavilyStatus?.(),
       }));
       break;
     }
@@ -250,6 +253,7 @@ export async function createDiscordBot(
   config: BotConfig,
   discordConfig: DiscordConfig,
   sessionManager: SessionManager,
+  options: { getTavilyStatus?: () => TavilyStatusSnapshot | undefined } = {},
 ): Promise<DiscordBotResult> {
   const client = new Client({
     intents: [
@@ -419,6 +423,7 @@ export async function createDiscordBot(
         discordConfig,
         sessionManager,
         messageQueue,
+        getTavilyStatus: options.getTavilyStatus,
       });
     } catch (err) {
       log.error("discord-bot", `Interaction handler error:`, err);

@@ -26,6 +26,53 @@ removes the Knowledge tools and also removes the scoped managed-wiki protection;
 use it only as an operator bypass when a Pi session must start without package
 extensions.
 
+## Tavily web tools and quota handoff
+
+The `web-tools` wrapper keeps `web_search` and `web_fetch` on Tavily's Search
+and Extract APIs. It reads only the control workspace's SOPS value at
+`tavily.api_key`; it does not accept an environment-key fallback, a second key,
+or another provider. Successful schemas and rendering are stable, and requests
+retain the package's query, URL, DNS, and cancellation guards with no automatic
+retry.
+
+Tool failures are reduced to fixed classifications. Each failure may write one
+owner-only JSON event below the control workspace's `data/tavily/events/`
+spool, containing only the version, tool, classification, HTTP status when
+known, and observation time. In particular, HTTP 432 base-plan exhaustion and
+HTTP 433 PAYGO exhaustion are committed before the tool returns. Queries,
+requested URLs, keys, provider bodies, and host paths are never event fields.
+
+The main-process `TavilyMonitor` drains that spool every two seconds and owns
+the consolidated atomic state and durable notification outbox in
+`data/tavily/state.json`. It samples `/usage` immediately and every five minutes,
+deduplicates base-plan and PAYGO 80%/95% thresholds by monthly cycle, and sends
+six-hour reminders for an active unacknowledged exhaustion incident. Telegram
+acknowledge and recheck actions are bound to the current incident generation.
+A recovery is persisted only after current usage plus fixed Search and Extract
+probes all validate. PAYGO activation and limit changes remain manual Tavily
+Billing work; no package code mutates billing.
+
+Ownership is enforced by the nonblocking single-writer lease at
+`data/tavily/writer.lock`; a replacement waits asynchronously, and a stale lease
+whose owning process is no longer alive can be recovered before constructing a
+fresh monitor. Child publication and recovery commits also share the
+process-reentrant `data/tavily/events/.publish.lock`. Each tool request registers
+an owner-only in-flight marker before provider I/O, then publishes any bounded
+failure and removes its marker under that lock. Recovery waits for all live
+markers before taking the lock for its final drain and resolution commit, so an
+exhaustion response from a pre-commit request cannot race behind a false
+recovery. Active markers are staged and atomically published; malformed crash
+debris and markers left by crashed or PID-reused children are recovered using
+the same bounded process-instance checks as the lock. Barrier polling uses a
+coarse bounded cadence so process-instance validation cannot starve the main
+event loop.
+
+`PI_EXTENSIONS_DISABLED=1` stops new child events because it disables the web
+tools themselves; it does not delete existing monitor state. For a package
+rollback, retain `data/tavily/` so a later return to this version preserves
+deduplication and pending delivery. Remove it only when an operator explicitly
+accepts losing that durable history.
+
 ## Location lock (Task 0)
 
 There are TWO kinds of files in this feature, deliberately split:

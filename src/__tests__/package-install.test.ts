@@ -189,6 +189,8 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
     "dist/pi-runtime.js",
+    "dist/tavily-monitor.js",
+    "dist/tavily-monitor-runtime.js",
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
@@ -197,6 +199,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/tavily.js",
+    "dist/pi-extensions/tavily-events.js",
     "dist/pi-extensions/tavily-secret.js",
     "dist/pi-extensions/recovery-mode.js",
     "dist/pi-extensions/recovery-protocol.js",
@@ -1198,8 +1201,20 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
+const tavilyMonitorCore = await importPackageFile("dist/tavily-monitor.js");
+const tavilyMonitorRuntime = await importPackageFile("dist/tavily-monitor-runtime.js");
 const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-protocol.js");
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
+assert.equal(typeof tavilyMonitorCore.TavilyMonitor, "function");
+assert.equal(typeof tavilyMonitorRuntime.TavilyMonitorRuntime, "function");
+assert.deepEqual(
+  tavilyMonitorRuntime.resolveTavilyDeliveryDestination({
+    adminChatId: undefined,
+    defaultDeliveryChatId: 111,
+    defaultDeliveryThreadId: 7,
+  }),
+  { chatId: 111, threadId: 7 },
+);
 assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
 assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
 assert.equal(recoveryFixer.classifyRecoveryFixerResult({ is_error: true }), "provider_error");
@@ -1348,11 +1363,12 @@ process.chdir(agentWorkspace);
 
 const fetchCalls = [];
 const oldFetch = globalThis.fetch;
+let webResponseStatus = 200;
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url: String(url), init });
   return {
-    ok: true,
-    status: 200,
+    ok: webResponseStatus >= 200 && webResponseStatus < 300,
+    status: webResponseStatus,
     json: async () => ({ results: [] }),
     text: async () => "{\"results\":[]}",
   };
@@ -1612,6 +1628,42 @@ try {
     "[\"tavily\"][\"api_key\"]",
     controlTavilySopsFile,
   ]);
+
+  const installedMonitor = new tavilyMonitorCore.TavilyMonitor({
+    controlWorkspaceRoot: workspace,
+    apiKey: "installed-monitor-fixture-key",
+    fetchImpl: async (url, init) => {
+      assert.equal(String(url), tavilyMonitorCore.TAVILY_USAGE_URL);
+      assert.equal(init.headers.Authorization, "Bearer installed-monitor-fixture-key");
+      return new Response(JSON.stringify({
+        key: { usage: 1, limit: 100, search_usage: 1, extract_usage: 0 },
+        account: {
+          current_plan: "Fixture",
+          plan_usage: 1,
+          plan_limit: 100,
+          paygo_usage: 0,
+          paygo_limit: 50,
+          search_usage: 1,
+          extract_usage: 0,
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const usageResult = await installedMonitor.sampleUsage();
+  assert.equal(usageResult.ok, true);
+  assert.equal(installedMonitor.getState().latestSample.account.plan.remaining, 99);
+  assert.ok(existsSync(join(workspace, "data", "tavily", "state.json")));
+  assert.equal(existsSync(join(projectDir, "data", "tavily", "state.json")), false);
+
+  webResponseStatus = 432;
+  const exhaustedResult = await searchTool.execute("call-2", { query: "installed quota event" });
+  assert.equal(exhaustedResult.details.ok, false);
+  assert.match(exhaustedResult.content[0].text, /base-plan credits are exhausted/);
+  assert.equal(installedMonitor.drainChildEvents(), 1);
+  const installedState = installedMonitor.getState();
+  assert.equal(installedState.incident.lastClassification, "base_plan_exhausted");
+  assert.deepEqual(installedState.incident.observedTools, ["web_search"]);
+  assert.equal(installedState.outbox.filter((entry) => entry.kind === "incident").length, 1);
 } finally {
   globalThis.fetch = oldFetch;
 }

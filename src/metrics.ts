@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import client from "prom-client";
 import { log } from "./logger.js";
+import type { TavilyMonitorState } from "./tavily-monitor.js";
 
 // Use the default registry
 const register = client.register;
@@ -213,6 +214,80 @@ export const finalDeliveryFailures = new client.Counter({
   help: "Total user-visible final response delivery failures",
 });
 
+// --- Tavily quota and incident monitoring ---
+
+let tavilySampleObservedAtMs: number | undefined;
+let tavilyMetricsClock: () => Date = () => new Date();
+
+export const tavilyUsageSamplePresent = new client.Gauge({
+  name: "bot_tavily_usage_sample_present",
+  help: "Whether a successful Tavily usage sample is available",
+});
+
+export const tavilyUsageSampleAge = new client.Gauge({
+  name: "bot_tavily_usage_sample_age_seconds",
+  help: "Age in seconds of the latest successful Tavily usage sample, or zero when missing",
+  collect() {
+    const nowMs = tavilyMetricsClock().getTime();
+    this.set(tavilySampleObservedAtMs === undefined || !Number.isFinite(nowMs)
+      ? 0
+      : Math.max(0, nowMs - tavilySampleObservedAtMs) / 1_000);
+  },
+});
+
+export const tavilyUsageSampleSuccess = new client.Gauge({
+  name: "bot_tavily_usage_sample_success",
+  help: "Whether the latest Tavily usage sampling attempt succeeded",
+});
+
+export const tavilyPlanUsage = new client.Gauge({
+  name: "bot_tavily_plan_usage",
+  help: "Tavily base-plan credits used in the latest successful sample",
+});
+
+export const tavilyPlanLimit = new client.Gauge({
+  name: "bot_tavily_plan_limit",
+  help: "Tavily base-plan credit limit in the latest successful sample",
+});
+
+export const tavilyPaygoUsage = new client.Gauge({
+  name: "bot_tavily_paygo_usage",
+  help: "Tavily PAYGO credits used in the latest successful sample",
+});
+
+export const tavilyPaygoLimit = new client.Gauge({
+  name: "bot_tavily_paygo_limit",
+  help: "Tavily PAYGO credit limit in the latest successful sample",
+});
+
+export const tavilyIncidentActive = new client.Gauge({
+  name: "bot_tavily_incident_active",
+  help: "Whether a Tavily credit exhaustion incident is active",
+});
+
+export const tavilyIncidentAcknowledged = new client.Gauge({
+  name: "bot_tavily_incident_acknowledged",
+  help: "Whether the active Tavily credit exhaustion incident is acknowledged",
+});
+
+export const tavilyUsageSamples = new client.Counter({
+  name: "bot_tavily_usage_samples_total",
+  help: "Durable Tavily usage sampling outcomes",
+  labelNames: ["outcome"] as const,
+});
+
+export const tavilyFailures = new client.Counter({
+  name: "bot_tavily_failures_total",
+  help: "Durable Tavily failures by bounded classification and tool",
+  labelNames: ["classification", "tool"] as const,
+});
+
+export const tavilyNotifications = new client.Counter({
+  name: "bot_tavily_notifications_total",
+  help: "Durable Tavily notification delivery outcomes",
+  labelNames: ["outcome"] as const,
+});
+
 // --- Helpers ---
 
 /**
@@ -377,17 +452,70 @@ export function recordFinalDeliveryFailure(): void {
   finalDeliveryFailures.inc();
 }
 
+/**
+ * Synchronize Tavily metrics from the durable monitor state. Counters are
+ * rebuilt from persisted totals so process restarts do not erase incident
+ * history and replayed transitions cannot double-count it.
+ */
+export function recordTavilyMonitorMetrics(
+  state: TavilyMonitorState,
+  observedAt: Date = new Date(),
+  collectNow: () => Date = () => new Date(),
+): void {
+  const sample = state.latestSample;
+  const sampleObservedAt = sample === undefined ? undefined : new Date(sample.observedAt).getTime();
+  tavilySampleObservedAtMs = sampleObservedAt;
+  tavilyMetricsClock = collectNow;
+  tavilyUsageSamplePresent.set(sample === undefined ? 0 : 1);
+  tavilyUsageSampleAge.set(sampleObservedAt === undefined
+    ? 0
+    : Math.max(0, observedAt.getTime() - sampleObservedAt) / 1_000);
+  tavilyUsageSampleSuccess.set(state.latestSampleStatus?.classification === "ok" ? 1 : 0);
+  tavilyPlanUsage.set(sample?.account.plan.usage ?? 0);
+  tavilyPlanLimit.set(sample?.account.plan.limit ?? 0);
+  tavilyPaygoUsage.set(sample?.account.paygo.usage ?? 0);
+  tavilyPaygoLimit.set(sample?.account.paygo.limit ?? 0);
+
+  const activeIncident = state.incident !== undefined && state.incident.resolvedAt === undefined;
+  tavilyIncidentActive.set(activeIncident ? 1 : 0);
+  tavilyIncidentAcknowledged.set(activeIncident && state.incident?.acknowledgedAt !== undefined ? 1 : 0);
+
+  tavilyUsageSamples.reset();
+  tavilyUsageSamples.inc({ outcome: "success" }, state.telemetryStats.usageSamples.success);
+  tavilyUsageSamples.inc({ outcome: "failure" }, state.telemetryStats.usageSamples.failure);
+
+  tavilyFailures.reset();
+  for (const failure of state.telemetryStats.failures) {
+    tavilyFailures.inc({ classification: failure.classification, tool: failure.tool }, failure.count);
+  }
+
+  tavilyNotifications.reset();
+  tavilyNotifications.inc({ outcome: "delivered" }, state.notificationStats.delivered);
+  tavilyNotifications.inc({ outcome: "retried" }, state.notificationStats.retried);
+  tavilyNotifications.inc({ outcome: "terminal" }, state.notificationStats.terminal);
+}
+
 // --- HTTP server ---
 
 let metricsServer: Server | null = null;
+let metricsListenRetry: ReturnType<typeof setTimeout> | null = null;
+
+export interface MetricsServerOptions {
+  addressInUseRetryMs?: number;
+}
 
 /**
  * Start the Prometheus metrics HTTP server on the given port.
  * Serves /metrics in standard Prometheus text format.
  * Returns the server instance.
  */
-export function startMetricsServer(port: number, host?: string): Server {
+export function startMetricsServer(
+  port: number,
+  host?: string,
+  options: MetricsServerOptions = {},
+): Server {
   const listenHost = host ?? "127.0.0.1";
+  const addressInUseRetryMs = Math.max(1, options.addressInUseRetryMs ?? 1_000);
   const server = createServer(async (req, res) => {
     if (req.url === "/metrics" && req.method === "GET") {
       try {
@@ -405,15 +533,39 @@ export function startMetricsServer(port: number, host?: string): Server {
     }
   });
 
-  server.on("error", (err) => {
-    log.error("metrics", `Metrics server error: ${err.message}`);
-  });
+  const listen = () => {
+    if (metricsServer !== server) return;
+    server.listen(port, listenHost);
+  };
 
-  server.listen(port, listenHost, () => {
+  server.on("listening", () => {
+    if (metricsServer !== server) {
+      server.close();
+      return;
+    }
     log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
   });
 
+  server.on("error", (err) => {
+    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE" && metricsServer === server) {
+      if (metricsListenRetry === null) {
+        log.warn(
+          "metrics",
+          `Metrics address ${listenHost}:${port} is still in use; retrying in ${addressInUseRetryMs}ms`,
+        );
+        metricsListenRetry = setTimeout(() => {
+          metricsListenRetry = null;
+          listen();
+        }, addressInUseRetryMs);
+        metricsListenRetry.unref();
+      }
+      return;
+    }
+    log.error("metrics", `Metrics server error: ${err.message}`);
+  });
+
   metricsServer = server;
+  listen();
   return server;
 }
 
@@ -422,11 +574,19 @@ export function startMetricsServer(port: number, host?: string): Server {
  */
 export function stopMetricsServer(): Promise<void> {
   return new Promise((resolve) => {
-    if (metricsServer) {
-      metricsServer.close(() => resolve());
-      metricsServer = null;
-    } else {
-      resolve();
+    if (metricsListenRetry !== null) {
+      clearTimeout(metricsListenRetry);
+      metricsListenRetry = null;
     }
+    const server = metricsServer;
+    metricsServer = null;
+    if (!server || !server.listening) {
+      resolve();
+      return;
+    }
+    server.close((err) => {
+      if (err) log.error("metrics", `Failed to stop metrics server: ${err.message}`);
+      resolve();
+    });
   });
 }

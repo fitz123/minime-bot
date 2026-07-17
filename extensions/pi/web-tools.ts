@@ -27,8 +27,16 @@ import {
   WEB_SEARCH_TOOL,
   type RunToolDeps,
   type TavilyWarn,
+  type WebToolResult,
 } from "../../src/pi-extensions/tavily.js";
-import { readTavilyApiKeyFromSops } from "../../src/pi-extensions/tavily-secret.js";
+import {
+  beginTavilyToolRequestPublication,
+  type TavilyToolRequestPublication,
+} from "../../src/pi-extensions/tavily-events.js";
+import {
+  readTavilyApiKeyFromSops,
+  tavilyControlWorkspaceRoot,
+} from "../../src/pi-extensions/tavily-secret.js";
 
 /** Read the Tavily key for this Pi process; returns undefined if absent. */
 function readTavilyApiKey(): string | undefined {
@@ -37,6 +45,7 @@ function readTavilyApiKey(): string | undefined {
 
 export default function (pi: ExtensionAPI): void {
   const apiKey = readTavilyApiKey();
+  const controlWorkspaceRoot = tavilyControlWorkspaceRoot();
 
   const warn = (event: TavilyWarn): void => {
     // eslint-disable-next-line no-console -- structured warn-log for the Pi session
@@ -44,10 +53,55 @@ export default function (pi: ExtensionAPI): void {
   };
 
   if (!apiKey) {
-    warn({ tool: "web_search", reason: "missing-key" });
+    warn({
+      tool: "web_search",
+      reason: "missing-key",
+      classification: "credential_missing",
+    });
   }
 
   const deps: RunToolDeps = { apiKey, fetchImpl: fetch, warn };
+
+  const monitoringUnavailable = (tool: "web_search" | "web_fetch"): WebToolResult => ({
+    ok: false,
+    text: `${tool} failed: Tavily monitoring state could not be updated safely.`,
+  });
+
+  const runTool = async (
+    tool: "web_search" | "web_fetch",
+    execute: () => Promise<WebToolResult>,
+  ): Promise<WebToolResult> => {
+    let publication: TavilyToolRequestPublication | undefined;
+    if (controlWorkspaceRoot) {
+      try {
+        publication = beginTavilyToolRequestPublication(controlWorkspaceRoot);
+      } catch {
+        warn({ tool, reason: "event-write-failed" });
+        return monitoringUnavailable(tool);
+      }
+    }
+
+    let result: WebToolResult | undefined;
+    let observedAt: Date | undefined;
+    try {
+      result = await execute();
+      observedAt = new Date();
+    } finally {
+      if (publication) {
+        try {
+          publication.complete(tool, result?.failure, observedAt ?? new Date());
+        } catch {
+          warn({
+            tool,
+            reason: "event-write-failed",
+            ...(result?.failure === undefined ? {} : { classification: result.failure.classification }),
+          });
+          result = monitoringUnavailable(tool);
+        }
+      }
+    }
+    return result as WebToolResult;
+  };
 
   // Pi's tool `execute` signature is `(toolCallId, params, signal, onUpdate, ctx)`
   // and it MUST resolve to an `AgentToolResult` (`{ content, details }`), NOT a
@@ -56,16 +110,30 @@ export default function (pi: ExtensionAPI): void {
   // arguments are the SECOND positional (`params`); the first is the tool-call id.
   pi.registerTool({
     ...WEB_SEARCH_TOOL,
-    execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-      const result = await executeWebSearch(params ?? {}, deps);
+    execute: async (
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => {
+      const result = await runTool(
+        "web_search",
+        () => executeWebSearch(params ?? {}, deps, signal),
+      );
       return { content: [{ type: "text" as const, text: result.text }], details: { ok: result.ok } };
     },
   });
 
   pi.registerTool({
     ...WEB_FETCH_TOOL,
-    execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-      const result = await executeWebFetch(params ?? {}, deps);
+    execute: async (
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => {
+      const result = await runTool(
+        "web_fetch",
+        () => executeWebFetch(params ?? {}, deps, signal),
+      );
       return { content: [{ type: "text" as const, text: result.text }], details: { ok: result.ok } };
     },
   });

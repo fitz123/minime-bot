@@ -118,6 +118,83 @@ By default, the workspace provides:
 - `crons.yaml` for scheduled prompts when present.
 - `data/`, `.tmp/`, logs, and media locations used by runtime state.
 
+### Tavily web tools and quota incidents
+
+`web_search` and `web_fetch` use Tavily exclusively. Both Pi children and the
+main-process quota monitor read the same `tavily.api_key` value from the control
+workspace's `config/secrets.sops.yaml`; there is no environment-key fallback,
+alternate provider, key rotation, or automatic request retry. Keep that file
+encrypted with SOPS and do not place the decrypted key in config, logs, or
+process arguments.
+
+One process owns `data/tavily/writer.lock`, restores the durable monitor, and
+samples Tavily account usage immediately after acquiring that lease and every
+five minutes thereafter. An overlapping replacement retries the nonblocking
+lease acquisition every second and recovers a stale owner; Telegram and Discord
+can continue starting while it waits, but Tavily `/status` data and incident
+processing are unavailable until ownership transfers. Pi children hand bounded
+tool failures to the lease holder through an owner-only event spool polled every
+two seconds. Consolidated quota samples, threshold deduplication, the active
+incident generation, acknowledgement or resolution, and the notification outbox
+are stored atomically under the control workspace's `data/tavily/` directory.
+Unacknowledged exhaustion incidents are reminded every six hours. State and
+events contain only bounded classifications and counters, never keys, queries,
+requested URLs, provider response bodies, delivery IDs, or host paths.
+
+Base-plan and PAYGO usage each notify once at 80% and 95% per monthly billing
+cycle. Tavily HTTP 432 or 433 responses from either web tool open one shared
+critical incident. Notifications go to `adminChatId` when set; otherwise they
+use `defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`.
+Transient delivery failures use the durable outbox with bounded backoff;
+the owner-only Telegram transport also starts in Discord-backed deployments
+without normal Telegram agent bindings when both a Telegram token source and an
+owner destination are configured. Use `telegramTokenSopsKey` together with
+`secrets.sopsFile`, or use `telegramTokenEnv`; configure `adminChatId`, or fall
+back to `defaultDeliveryChatId` plus an optional positive
+`defaultDeliveryThreadId`. `adminChatId` takes precedence and never uses the
+fallback thread. For example, replace the placeholders in this fragment:
+
+```yaml
+secrets:
+  sopsFile: config/secrets.sops.yaml
+telegramTokenSopsKey: telegram.bot_token
+# Or use: telegramTokenEnv: MINIME_TELEGRAM_TOKEN
+adminChatId: <owner-chat-id>
+# Or omit adminChatId and use:
+# defaultDeliveryChatId: <fallback-chat-id>
+# defaultDeliveryThreadId: <positive-topic-id>
+```
+
+Missing destinations and deterministic Telegram 4xx failures remain visible
+terminal diagnostics and suppress further incident reminders. After correcting
+the destination, an explicit process restart permits one fresh delivery attempt
+instead of retrying forever.
+
+Incident messages provide generation-bound Telegram actions:
+`acknowledge degraded mode` stops reminders, while `credits fixed — recheck`
+runs one bounded verification. Recheck succeeds only when current `/usage` is
+recoverable and fixed Search and Extract probes both return validated non-empty
+results. Failed explicit rechecks are reported through the same durable outbox.
+The sampler uses the same verification once when active usage first becomes
+recoverable; neither path retries provider requests automatically.
+
+`/status` includes sample freshness, base-plan and PAYGO counters, the latest
+bounded failure class, and incident/acknowledgement state. Prometheus exports
+the corresponding low-cardinality `bot_tavily_*` metrics described in
+[`docs/monitoring.md`](docs/monitoring.md). During an overlapping process
+replacement, the new metrics listener retries its configured occupied address
+every second until the old process releases it; scrapes may therefore continue
+to reach the old process briefly. Other listen errors remain logged, and
+shutdown cancels a pending address retry.
+
+PAYGO enablement and its credit limit are manual Tavily Billing operations. The
+runtime reports and verifies credits but never changes billing. To roll back,
+install and restart the previous package release while retaining
+`data/tavily/`; the earlier runtime ignores these files, and retaining them
+preserves incident and delivery deduplication if this version is restored. Only
+remove that directory when intentionally discarding the durable history and
+pending outbox after operator review.
+
 Agent `workspaceCwd` values are resolved relative to the control workspace
 unless they are absolute paths. Pi extension artifacts are loaded from the
 package build under `dist/extensions/pi`.
@@ -291,6 +368,15 @@ Discord stale-message cutoff. The low-cardinality metrics are
 Because grammY pauses simple polling while middleware runs, bounded media
 preprocessing is tracked separately and allowed up to ten minutes before it is
 treated as a stalled handler.
+
+Polling failure recovery depends on the active conversational platforms. A
+Telegram-only deployment with Telegram agent bindings exits for supervisor
+restart. When Discord has live agent bindings, the process keeps Discord online,
+waits for grammY's final Telegram polling cleanup to settle, and retries Telegram
+after exponential delays from five seconds up to one minute; all `getUpdates`
+calls, including the signal-less final update-offset confirmation, are bounded
+at 45 seconds. A successful polling-loop request resets that delay. An owner-only
+Telegram alert transport does not count as a conversational platform.
 
 ## Launchd Operations
 

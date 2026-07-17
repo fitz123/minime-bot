@@ -623,8 +623,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
   }
 
-  // Resolve Telegram token from configured non-interactive secret sources.
-  // Optional — not needed for Discord-only setups.
+  // Resolve Telegram transport for normal bindings or an owner-only Tavily
+  // destination. A Discord-backed deployment may still need Telegram alerts.
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
   if (legacyTelegramKey) {
     throw new Error(
@@ -636,8 +636,11 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   validateConfiguredSopsSource(sopsFile, telegramTokenSopsKey, "telegramTokenSopsKey");
   const rawTelegramBindings = Array.isArray(raw.bindings) ? raw.bindings : [];
   const hasTelegramBindings = rawTelegramBindings.length > 0;
+  const hasOwnerDeliveryDestination = raw.adminChatId !== undefined ||
+    raw.defaultDeliveryChatId !== undefined;
   let telegramToken: string | undefined;
-  if (hasTelegramBindings && (telegramTokenSopsKey || telegramTokenEnv)) {
+  if ((hasTelegramBindings || hasOwnerDeliveryDestination) &&
+      (telegramTokenSopsKey || telegramTokenEnv)) {
     telegramToken = resolveSecrets
       ? resolveSecret({
         sopsFile,
@@ -709,8 +712,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // adminChatId (optional — used by cron-runner for delivery failure notifications)
   let adminChatId: number | undefined;
   if (raw.adminChatId !== undefined) {
-    if (!Number.isInteger(raw.adminChatId) || raw.adminChatId === 0) {
-      throw new Error(`Invalid adminChatId: ${raw.adminChatId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.adminChatId) || raw.adminChatId === 0) {
+      throw new Error(`Invalid adminChatId: ${raw.adminChatId} (must be a non-zero safe integer)`);
     }
     adminChatId = raw.adminChatId;
   }
@@ -718,8 +721,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // defaultDeliveryChatId (optional — used by cron-runner as fallback delivery target)
   let defaultDeliveryChatId: number | undefined;
   if (raw.defaultDeliveryChatId !== undefined) {
-    if (!Number.isInteger(raw.defaultDeliveryChatId) || raw.defaultDeliveryChatId === 0) {
-      throw new Error(`Invalid defaultDeliveryChatId: ${raw.defaultDeliveryChatId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.defaultDeliveryChatId) || raw.defaultDeliveryChatId === 0) {
+      throw new Error(`Invalid defaultDeliveryChatId: ${raw.defaultDeliveryChatId} (must be a non-zero safe integer)`);
     }
     defaultDeliveryChatId = raw.defaultDeliveryChatId;
   }
@@ -727,8 +730,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // defaultDeliveryThreadId (optional — used with defaultDeliveryChatId)
   let defaultDeliveryThreadId: number | undefined;
   if (raw.defaultDeliveryThreadId !== undefined) {
-    if (!Number.isInteger(raw.defaultDeliveryThreadId) || raw.defaultDeliveryThreadId === 0) {
-      throw new Error(`Invalid defaultDeliveryThreadId: ${raw.defaultDeliveryThreadId} (must be a non-zero integer)`);
+    if (!Number.isSafeInteger(raw.defaultDeliveryThreadId) || raw.defaultDeliveryThreadId <= 0) {
+      throw new Error(`Invalid defaultDeliveryThreadId: ${raw.defaultDeliveryThreadId} (must be a positive safe integer)`);
     }
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }

@@ -19,6 +19,7 @@ describe("config secret resolution: SOPS and env sources", () => {
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.TEST_TELEGRAM_TOKEN_ENV;
+    delete process.env.TEST_OWNER_TELEGRAM_TOKEN_ENV;
     delete process.env.TEST_DISCORD_TOKEN_ENV;
     delete process.env[MINIME_CONFIG_PATH_ENV];
     delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
@@ -282,6 +283,58 @@ discord:
     assert.equal(config.telegramToken, undefined);
     assert.equal(config.bindings.length, 0);
     assert.equal(config.discord!.token, "dc-token-from-env");
+  });
+
+  it("resolves an owner-only Telegram transport for a Discord-backed deployment", () => {
+    process.env.TEST_DISCORD_TOKEN_ENV = "dc-token-from-env";
+    process.env.TEST_OWNER_TELEGRAM_TOKEN_ENV = "owner-telegram-token";
+    writeFileSync(
+      configPath,
+      minimalAgentsYaml +
+        `
+telegramTokenEnv: TEST_OWNER_TELEGRAM_TOKEN_ENV
+bindings: []
+defaultDeliveryChatId: -1007100
+defaultDeliveryThreadId: 17
+discord:
+  tokenEnv: TEST_DISCORD_TOKEN_ENV
+  bindings:
+    - guildId: "999"
+      agentId: main
+      kind: channel
+`,
+    );
+
+    const config = loadConfig(configPath);
+
+    assert.equal(config.telegramToken, "owner-telegram-token");
+    assert.equal(config.bindings.length, 0);
+    assert.equal(config.defaultDeliveryChatId, -1007100);
+    assert.equal(config.defaultDeliveryThreadId, 17);
+  });
+
+  it("rejects owner delivery identifiers that cannot be represented safely", () => {
+    const invalidFields = [
+      ["adminChatId", Number.MAX_SAFE_INTEGER + 1, /Invalid adminChatId: .*non-zero safe integer/],
+      ["defaultDeliveryChatId", Number.MAX_SAFE_INTEGER + 1, /Invalid defaultDeliveryChatId: .*non-zero safe integer/],
+      ["defaultDeliveryThreadId", -1, /Invalid defaultDeliveryThreadId: .*positive safe integer/],
+    ] as const;
+
+    for (const [field, value, expected] of invalidFields) {
+      writeFileSync(
+        configPath,
+        minimalAgentsYaml +
+          `
+telegramTokenEnv: TEST_TELEGRAM_TOKEN_ENV
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+${field}: ${value}
+`,
+      );
+      assert.throws(() => loadConfig(configPath, { resolveSecrets: false }), expected);
+    }
   });
 
   it("validates telegramTokenEnv type (must be string)", () => {

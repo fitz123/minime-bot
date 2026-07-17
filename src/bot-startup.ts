@@ -32,6 +32,90 @@ export interface RetryOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+type TimeoutHandle = ReturnType<typeof setTimeout>;
+
+export interface TelegramPollingRestartSchedulerOptions {
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  setTimeoutFn?: (callback: () => void, ms: number) => TimeoutHandle;
+  clearTimeoutFn?: (handle: TimeoutHandle) => void;
+}
+
+export interface TelegramPollingRestartScheduler {
+  /** Queue one restart and return its delay, or undefined when one is already queued. */
+  schedule(restart: () => void): number | undefined;
+  /** Reset exponential backoff after a getUpdates call succeeds. */
+  reset(): void;
+  /** Cancel a pending restart during shutdown. */
+  cancel(): void;
+}
+
+/** Keep Telegram polling recoverable without taking down a healthy Discord bot. */
+export function createTelegramPollingRestartScheduler(
+  options: TelegramPollingRestartSchedulerOptions = {},
+): TelegramPollingRestartScheduler {
+  const baseDelayMs = Math.max(1, options.baseDelayMs ?? 5_000);
+  const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 60_000);
+  const setTimeoutFn: (callback: () => void, ms: number) => TimeoutHandle =
+    options.setTimeoutFn ?? ((callback, ms) => setTimeout(callback, ms));
+  const clearTimeoutFn: (handle: TimeoutHandle) => void =
+    options.clearTimeoutFn ?? ((handle) => clearTimeout(handle));
+  let attempt = 0;
+  let timer: TimeoutHandle | undefined;
+
+  return {
+    schedule(restart) {
+      if (timer !== undefined) return undefined;
+      const delayMs = Math.min(baseDelayMs * 2 ** Math.min(attempt, 30), maxDelayMs);
+      attempt += 1;
+      const handle = setTimeoutFn(() => {
+        timer = undefined;
+        restart();
+      }, delayMs);
+      timer = handle;
+      handle.unref?.();
+      return delayMs;
+    },
+    reset() {
+      attempt = 0;
+    },
+    cancel() {
+      if (timer === undefined) return;
+      clearTimeoutFn(timer);
+      timer = undefined;
+    },
+  };
+}
+
+export interface ActiveAgentPlatformState {
+  telegramStarted: boolean;
+  telegramBindingCount: number;
+  discordStarted: boolean;
+  discordBindingCount: number;
+}
+
+/** Alert-only transports do not count as a usable conversational platform. */
+export function hasActiveAgentPlatform(state: ActiveAgentPlatformState): boolean {
+  return (state.telegramStarted && state.telegramBindingCount > 0) ||
+    (state.discordStarted && state.discordBindingCount > 0);
+}
+
+export interface TelegramFailurePlatformState {
+  telegramBindingCount: number;
+  discordStarted: boolean;
+  discordBindingCount: number;
+}
+
+/**
+ * Restart only when failed Telegram polling was the sole conversational
+ * platform. Alert-only Telegram and deployments with a live Discord platform
+ * can keep serving while Telegram polling is unavailable.
+ */
+export function shouldRestartForTelegramFailure(state: TelegramFailurePlatformState): boolean {
+  return state.telegramBindingCount > 0 &&
+    !(state.discordStarted && state.discordBindingCount > 0);
+}
+
 /**
  * Start non-critical Telegram setup without delaying grammY's first getUpdates.
  * Synchronous throws and rejected promises are routed to the same error callback.
@@ -60,8 +144,16 @@ export function stopTelegramBotInBackground(
   bot: { stop: () => Promise<void> },
   onError: (error: unknown) => void,
 ): void {
+  void stopTelegramBot(bot, onError);
+}
+
+/** Wait until grammY has finished its final update-offset confirmation. */
+export async function stopTelegramBot(
+  bot: { stop: () => Promise<void> },
+  onError: (error: unknown) => void,
+): Promise<void> {
   try {
-    void bot.stop().catch(onError);
+    await bot.stop();
   } catch (error) {
     onError(error);
   }
