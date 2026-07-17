@@ -22,9 +22,9 @@ The same run also hit the pre-existing recovery-supervisor nondeterminism tracke
 - [x] Run the focused Tavily monitor tests and `npm run typecheck`.
 
 ### Task 2: Validate the PR correction
-- [ ] Run `git diff --check` and verify the new diff remains limited to the timeout fix, its regression test, and this plan.
-- [ ] Run `npm test`, `npm run build`, and `npm pack --dry-run`; if only the already-tracked issue #79 recovery-supervisor nondeterminism appears, rerun unchanged once and record that distinction rather than modifying unrelated recovery code.
-- [ ] Mark this plan complete with concise validation evidence.
+- [x] Run `git diff --check` and verify the new diff remains limited to the timeout fix, its regression test, and this plan. Passed; the correction changes only `src/tavily-monitor.ts`, `src/__tests__/tavily-monitor.test.ts`, and this plan.
+- [x] Run `npm test`, `npm run build`, and `npm pack --dry-run`; if only the already-tracked issue #79 recovery-supervisor nondeterminism appears, rerun unchanged once and record that distinction rather than modifying unrelated recovery code. All passed; `npm test` completed 1,945 tests with zero failures, including the recovery-supervisor suite, so no issue #79 rerun was needed.
+- [x] Mark this plan complete with concise validation evidence. Build and package validation passed, and the dry-run package contained 223 files.
 
 ## Post-Completion
 
