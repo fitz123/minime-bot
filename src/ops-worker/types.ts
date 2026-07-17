@@ -803,6 +803,20 @@ export function parseOpsWorkerTask(
   if (state !== "RUNNING" && activeRun !== null) {
     fail("task.activeRun", "must be null unless state is RUNNING");
   }
+  const lastOutcome = parseLastOutcome(task.lastOutcome);
+  if (
+    state === "DONE"
+    && (
+      lastOutcome?.kind !== "DONE_CHECK"
+      || lastOutcome.result !== "PASS"
+      || lastOutcome.at !== updatedAt
+    )
+  ) {
+    fail(
+      "task.lastOutcome",
+      "DONE requires a fresh DONE_CHECK PASS recorded with the snapshot transition",
+    );
+  }
   const parsed: OpsWorkerTask = {
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
@@ -821,7 +835,7 @@ export function parseOpsWorkerTask(
     schedule: parseSchedule(task.schedule),
     session: parseSession(task.session, id),
     activeRun,
-    lastOutcome: parseLastOutcome(task.lastOutcome),
+    lastOutcome,
     report: parseReport(task.report),
     createdAt,
     updatedAt,

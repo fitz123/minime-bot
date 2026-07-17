@@ -46,10 +46,10 @@ If Node's test argument forwarding does not support the focused command, run the
 
 ### Task 2: Implement state transitions and deterministic done-check authority
 
-- [ ] Add `src/ops-worker/done-checks.ts` with a closed named registry, strict per-check parameter validation, bounded timeout/output, and tri-state results `PASS`, `ACTION_REQUIRED`, `DEFER`. PR 1 ships the registry plus test-registered fixture checks only; production check implementations land in PR 2. Use dependency injection in tests; no shell and no payload-selected executable/URL.
-- [ ] Add `src/ops-worker/supervisor.ts` with a single-instance guard, deterministic scheduler selection, fixed priority ordering, remediation budget, resumable infrastructure outcomes, startup reconciliation, and durable transitions.
-- [ ] Enforce that `DONE` is reachable only after a fresh `PASS`; Pi success followed by `ACTION_REQUIRED` returns check evidence to the same task and queues/resumes it; `DEFER` schedules a later check without spending remediation budget; check errors become resumable.
-- [ ] Cover illegal transitions, restart recovery, duplicate/correlation behavior needed by the core, budget exhaustion to `BLOCKED`, and report-state persistence. Do not implement Alertmanager or Telegram behavior in this PR.
+- [x] Add `src/ops-worker/done-checks.ts` with a closed named registry, strict per-check parameter validation, bounded timeout/output, and tri-state results `PASS`, `ACTION_REQUIRED`, `DEFER`. PR 1 ships the registry plus test-registered fixture checks only; production check implementations land in PR 2. Use dependency injection in tests; no shell and no payload-selected executable/URL.
+- [x] Add `src/ops-worker/supervisor.ts` with a single-instance guard, deterministic scheduler selection, fixed priority ordering, remediation budget, resumable infrastructure outcomes, startup reconciliation, and durable transitions.
+- [x] Enforce that `DONE` is reachable only after a fresh `PASS`; Pi success followed by `ACTION_REQUIRED` returns check evidence to the same task and queues/resumes it; `DEFER` schedules a later check without spending remediation budget; check errors become resumable.
+- [x] Cover illegal transitions, restart recovery, duplicate/correlation behavior needed by the core, budget exhaustion to `BLOCKED`, and report-state persistence. Do not implement Alertmanager or Telegram behavior in this PR.
 
 ### Task 3: Launch and resume one standard Pi session in one owned process group
 
