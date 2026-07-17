@@ -1008,6 +1008,54 @@ describe("Tavily operator transition runtime", () => {
     assert.equal(monitor.getState().notificationStats.delivered, 2);
   });
 
+  it("durably reports an explicit recheck when the recovery barrier fails", async () => {
+    const workspace = temporaryWorkspace();
+    const clock = mutableClock("2026-07-16T12:00:00.000Z");
+    writeExhaustionEvent(workspace, "2026-07-16T12:00:00.000Z", "barrier-failure");
+    let calls = 0;
+    const monitor = new TavilyMonitor({
+      controlWorkspaceRoot: workspace,
+      apiKey: "fixture-key",
+      now: clock.now,
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1) return jsonResponse(usageResponse(100));
+        if (calls === 2) return jsonResponse(successfulSearchResponse());
+        if (calls === 3) {
+          const eventDirectory = tavilyEventSpoolDirectory(workspace);
+          rmSync(eventDirectory, { recursive: true });
+          writeFileSync(eventDirectory, "not a directory", { mode: 0o600 });
+          return jsonResponse(successfulExtractResponse());
+        }
+        throw new Error("unexpected test fetch");
+      }) as typeof fetch,
+    });
+    const deliveries: TavilyDeliveryPayload[] = [];
+    const runtime = new TavilyMonitorRuntime({
+      monitor,
+      destination: { chatId: 71 },
+      deliver: async (payload) => { deliveries.push(payload); },
+      now: clock.now,
+    });
+    await runtime.processNow();
+    deliveries.splice(0);
+    const generation = monitor.getState().incident?.generation as string;
+
+    const result = await runtime.recheckIncident(generation);
+
+    assert.deepEqual(result, {
+      ok: false,
+      generation,
+      stage: "usage_state",
+      classification: "request_failed",
+    });
+    assert.equal(monitor.getState().incident?.resolvedAt, undefined);
+    assert.equal(monitor.getState().lastVerification?.ok, false);
+    assert.equal(deliveries.length, 1);
+    assert.match(deliveries[0].text, /failed at usage_state \(request_failed\).*remains active/);
+    assert.equal(monitor.getState().outbox.some((entry) => entry.kind === "recheck_failure"), false);
+  });
+
   it("coalesces concurrent rechecks into one bounded usage/Search/Extract flight", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-16T12:00:00.000Z");

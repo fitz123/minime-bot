@@ -1720,7 +1720,18 @@ export class TavilyMonitor {
       false,
       usageSample === undefined,
     );
-    const publicationBarrier = await acquireTavilyEventRecoveryBarrier(this.controlWorkspaceRoot);
+    let publicationBarrier: Awaited<ReturnType<typeof acquireTavilyEventRecoveryBarrier>>;
+    try {
+      publicationBarrier = await acquireTavilyEventRecoveryBarrier(this.controlWorkspaceRoot);
+    } catch {
+      return this.verificationFailure(
+        generation,
+        "usage_state",
+        "request_failed",
+        undefined,
+        notifyOperator,
+      );
+    }
     try {
       // Tool requests register before provider I/O and publish failures before
       // completing. The barrier waits for all registered requests, then keeps
