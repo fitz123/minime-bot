@@ -433,8 +433,8 @@ describe("Codex web search cleanup and bounded failures", () => {
 
   it("blocks private query content before auth or fetch", async () => {
     const blocked = [
-      "token=abcd1234-secret",
-      "read /Users/private/project/file.ts",
+      "token=<redacted>",
+      "read /private/project/file.ts",
       "inspect config.local.yaml",
       "line one\nline two",
       "Bearer abcdefghijklmnopqrstuvwxyz",

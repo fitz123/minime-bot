@@ -65,10 +65,10 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 5: Validate packaging, residue, and public hygiene
 
-- [ ] Run all Validation Commands and focused runtime-matrix tests.
-- [ ] Confirm active source, extensions, tests, and docs contain no `tavily`, `web_fetch`, Tavily metric, or Tavily secret/config references; allow only truthful historical changelog and completed-plan matches.
-- [ ] Confirm the packed artifact includes the canonical Codex wrapper and no Tavily modules.
-- [ ] Verify the diff contains no credentials, private queries/URLs, identities, chat metadata, operational logs, or operator-local absolute paths.
+- [x] Run all Validation Commands and focused runtime-matrix tests.
+- [x] Confirm active source, extensions, tests, and docs contain no `tavily`, `web_fetch`, Tavily metric, or Tavily secret/config references; allow only truthful historical changelog and completed-plan matches.
+- [x] Confirm the packed artifact includes the canonical Codex wrapper and no Tavily modules.
+- [x] Verify the diff contains no credentials, private queries/URLs, identities, chat metadata, operational logs, or operator-local absolute paths.
 
 ## Post-Completion
 
