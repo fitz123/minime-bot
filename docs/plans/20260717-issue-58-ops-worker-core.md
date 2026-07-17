@@ -39,10 +39,10 @@ If Node's test argument forwarding does not support the focused command, run the
 
 ### Task 1: Define the strict task contract and durable atomic store
 
-- [ ] Add `src/ops-worker/types.ts` with schema-versioned task envelopes covering source identity (`kind`, `correlationKey`, `template`), fixed numeric priority, bounded evidence, authorization profile reference with optional snapshot hash, fixed states, remediation/infrastructure counters, schedules, standard-session metadata, active process-group identity, last outcome, and report state required by ADR-094 PR 1.
-- [ ] Add strict runtime validation that rejects unknown/oversized/unsafe fields rather than trusting TypeScript types. Task input cannot supply commands, executables, URLs, or arbitrary authorization profiles.
-- [ ] Add `src/ops-worker/task-store.ts`: one `tasks/<id>.json` authoritative snapshot per task, same-directory temporary file, file fsync, atomic rename, directory fsync, and bounded append-only `journal.jsonl` audit after the snapshot. Recover from a snapshot even when the journal tail is missing or truncated.
-- [ ] Add traversal/symlink/duplicate-correlation protections and tests for crash boundaries, malformed snapshots, atomic replacement, and journal non-authority. Do not add a database or second state owner.
+- [x] Add `src/ops-worker/types.ts` with schema-versioned task envelopes covering source identity (`kind`, `correlationKey`, `template`), fixed numeric priority, bounded evidence, authorization profile reference with optional snapshot hash, fixed states, remediation/infrastructure counters, schedules, standard-session metadata, active process-group identity, last outcome, and report state required by ADR-094 PR 1.
+- [x] Add strict runtime validation that rejects unknown/oversized/unsafe fields rather than trusting TypeScript types. Task input cannot supply commands, executables, URLs, or arbitrary authorization profiles.
+- [x] Add `src/ops-worker/task-store.ts`: one `tasks/<id>.json` authoritative snapshot per task, same-directory temporary file, file fsync, atomic rename, directory fsync, and bounded append-only `journal.jsonl` audit after the snapshot. Recover from a snapshot even when the journal tail is missing or truncated.
+- [x] Add traversal/symlink/duplicate-correlation protections and tests for crash boundaries, malformed snapshots, atomic replacement, and journal non-authority. Do not add a database or second state owner.
 
 ### Task 2: Implement state transitions and deterministic done-check authority
 
