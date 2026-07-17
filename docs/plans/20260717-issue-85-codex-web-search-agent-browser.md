@@ -34,11 +34,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 1: Implement the package-owned Codex search transport
 
-- [ ] Add a focused search core under `src/pi-extensions/` that obtains the refreshed `openai-codex` OAuth token and account id through the Pi extension execution context's model registry/auth storage, never by reading `OPENAI_API_KEY`.
-- [ ] Call only the fixed subscription endpoint `https://chatgpt.com/backend-api/codex/responses` with the active `openai-codex` model, native `web_search`, one bounded request, normal timeout/abort cleanup, and no alternate endpoint/provider fallback.
-- [ ] Parse streamed Responses events into bounded answer text (50,000-character cap), citations, selected provider/model, web-action metadata, response id, and token usage when returned; classify auth, rate-limit, timeout, transport, schema, and unknown failures without exposing provider bodies or credentials.
-- [ ] Rewire `extensions/pi/web-tools.ts` to register only `web_search` with the compatible current schema and safe query-content boundary. Do not register `web_fetch`. Keep Tavily modules intact until Task 3 passes.
-- [ ] Add focused tests for request shape, OAuth-only auth, active-model selection, SSE parsing, citations/metadata/usage, output cap, abort/timeout cleanup, failure classes, and absence of API-key or alternate-provider paths.
+- [x] Add a focused search core under `src/pi-extensions/` that obtains the refreshed `openai-codex` OAuth token and account id through the Pi extension execution context's model registry/auth storage, never by reading `OPENAI_API_KEY`.
+- [x] Call only the fixed subscription endpoint `https://chatgpt.com/backend-api/codex/responses` with the active `openai-codex` model, native `web_search`, one bounded request, normal timeout/abort cleanup, and no alternate endpoint/provider fallback.
+- [x] Parse streamed Responses events into bounded answer text (50,000-character cap), citations, selected provider/model, web-action metadata, response id, and token usage when returned; classify auth, rate-limit, timeout, transport, schema, and unknown failures without exposing provider bodies or credentials.
+- [x] Rewire `extensions/pi/web-tools.ts` to register only `web_search` with the compatible current schema and safe query-content boundary. Do not register `web_fetch`. Keep Tavily modules intact until Task 3 passes.
+- [x] Add focused tests for request shape, OAuth-only auth, active-model selection, SSE parsing, citations/metadata/usage, output cap, abort/timeout cleanup, failure classes, and absence of API-key or alternate-provider paths.
 
 ### Task 2: Propagate one registration to every runtime surface
 

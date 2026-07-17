@@ -1138,7 +1138,6 @@ const projectDir = process.cwd();
 const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
 const agentWorkspace = join(workspace, "agent-workspace");
-const controlTavilySopsFile = join(workspace, "config", "secrets.sops.yaml");
 const controlWorkspaceEnv = "MINIME_CONTROL_WORKSPACE_ROOT";
 const agentWorkspaceEnv = "MINIME_AGENT_WORKSPACE_ROOT";
 const retiredControlWorkspaceEnv = ["MINIME", "WORKSPACE", "ROOT"].join("_");
@@ -1330,21 +1329,8 @@ const fakePi = {
 };
 
 const fakeBinDir = join(projectDir, "fake-bin");
-const sopsArgvFile = join(projectDir, "sops-argv.txt");
 mkdirSync(fakeBinDir, { recursive: true });
-writeFileSync(
-  join(fakeBinDir, "sops"),
-  [
-    "#!/bin/bash",
-    "printf '%s\\n' \"$@\" > \"$SOPS_ARGV_FILE\"",
-    "printf 'tvly-installed-wrapper-key\\n'",
-    "",
-  ].join("\n"),
-  "utf8",
-);
-chmodSync(join(fakeBinDir, "sops"), 0o755);
 process.env.PATH = fakeBinDir + ":" + process.env.PATH;
-process.env.SOPS_ARGV_FILE = sopsArgvFile;
 
 const callerControlledCwd = join(projectDir, "caller-controlled-subagent-cwd");
 mkdirSync(callerControlledCwd, { recursive: true });
@@ -1363,15 +1349,15 @@ process.chdir(agentWorkspace);
 
 const fetchCalls = [];
 const oldFetch = globalThis.fetch;
-let webResponseStatus = 200;
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url: String(url), init });
-  return {
-    ok: webResponseStatus >= 200 && webResponseStatus < 300,
-    status: webResponseStatus,
-    json: async () => ({ results: [] }),
-    text: async () => "{\"results\":[]}",
-  };
+  return new Response([
+    'data: {"type":"response.output_text.delta","delta":"Installed "}',
+    'data: {"type":"response.output_text.delta","delta":"answer."}',
+    'data: {"type":"response.completed","response":{"id":"resp_installed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}',
+    'data: [DONE]',
+    '',
+  ].join("\n\n"), { status: 200, headers: { "Content-Type": "text/event-stream" } });
 };
 
 const webTools = await importFile(join(artifactDir, "web-tools.js"));
@@ -1386,7 +1372,7 @@ assert.deepEqual(
   registeredTools
     .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
     .sort(),
-  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_fetch", "web_search"],
+  ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_search"],
 );
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
@@ -1618,16 +1604,48 @@ try {
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");
   assert.ok(searchTool, "web_search should be registered");
-  const searchResult = await searchTool.execute("call-1", { query: "installed wrapper" });
+  const codexContext = {
+    model: { provider: "openai-codex", id: "gpt-installed", api: "openai-codex-responses" },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "installed-oauth-token" }),
+      authStorage: {
+        get: () => ({
+          type: "oauth",
+          access: "installed-oauth-token",
+          accountId: "installed-account-id",
+        }),
+      },
+    },
+  };
+  const oldOpenAiApiKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-be-used";
+  const searchResult = await searchTool.execute(
+    "call-1",
+    { query: "installed wrapper" },
+    undefined,
+    undefined,
+    codexContext,
+  );
+  if (oldOpenAiApiKey === undefined) {
+    delete process.env.OPENAI_API_KEY;
+  } else {
+    process.env.OPENAI_API_KEY = oldOpenAiApiKey;
+  }
   assert.equal(searchResult.details.ok, true);
+  assert.equal(searchResult.content[0].text, "Installed answer.");
+  assert.equal(searchResult.details.provider, "openai-codex");
+  assert.equal(searchResult.details.model, "gpt-installed");
+  assert.equal(searchResult.details.responseId, "resp_installed");
   assert.equal(fetchCalls.length, 1);
-  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer tvly-installed-wrapper-key");
-  assert.deepEqual(readFileSync(sopsArgvFile, "utf8").trim().split("\n"), [
-    "-d",
-    "--extract",
-    "[\"tavily\"][\"api_key\"]",
-    controlTavilySopsFile,
-  ]);
+  assert.equal(fetchCalls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(fetchCalls[0].init.method, "POST");
+  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer installed-oauth-token");
+  assert.equal(fetchCalls[0].init.headers["ChatGPT-Account-Id"], "installed-account-id");
+  const searchBody = JSON.parse(fetchCalls[0].init.body);
+  assert.equal(searchBody.model, "gpt-installed");
+  assert.deepEqual(searchBody.tools, [{ type: "web_search", search_context_size: "medium" }]);
+  assert.equal(JSON.stringify(fetchCalls[0]).includes("must-not-be-used"), false);
 
   const installedMonitor = new tavilyMonitorCore.TavilyMonitor({
     controlWorkspaceRoot: workspace,
@@ -1655,15 +1673,6 @@ try {
   assert.ok(existsSync(join(workspace, "data", "tavily", "state.json")));
   assert.equal(existsSync(join(projectDir, "data", "tavily", "state.json")), false);
 
-  webResponseStatus = 432;
-  const exhaustedResult = await searchTool.execute("call-2", { query: "installed quota event" });
-  assert.equal(exhaustedResult.details.ok, false);
-  assert.match(exhaustedResult.content[0].text, /base-plan credits are exhausted/);
-  assert.equal(installedMonitor.drainChildEvents(), 1);
-  const installedState = installedMonitor.getState();
-  assert.equal(installedState.incident.lastClassification, "base_plan_exhausted");
-  assert.deepEqual(installedState.incident.observedTools, ["web_search"]);
-  assert.equal(installedState.outbox.filter((entry) => entry.kind === "incident").length, 1);
 } finally {
   globalThis.fetch = oldFetch;
 }
