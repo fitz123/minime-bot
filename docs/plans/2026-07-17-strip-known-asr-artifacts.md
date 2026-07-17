@@ -29,7 +29,7 @@ npm pack --dry-run
 
 ### Task 1: Implement and verify shared trailing-artifact removal
 
-- [ ] Add a small pure postprocessor in `src/voice.ts` backed by an ordered list of known anchored suffix patterns.
-- [ ] Apply it exactly once to trimmed `whisper-cli` stdout before `transcribeAudio` returns.
-- [ ] Add focused unit tests for ASCII/Unicode ellipsis, case/whitespace, no punctuation, artifact-only input, middle-of-text preservation, unrelated text, and surrounding valid text/punctuation.
-- [ ] Run focused and full validation; keep the diff limited to the shared voice path and tests.
+- [x] Add a small pure postprocessor in `src/voice.ts` backed by an ordered list of known anchored suffix patterns.
+- [x] Apply it exactly once to trimmed `whisper-cli` stdout before `transcribeAudio` returns.
+- [x] Add focused unit tests for ASCII/Unicode ellipsis, case/whitespace, no punctuation, artifact-only input, middle-of-text preservation, unrelated text, and surrounding valid text/punctuation.
+- [x] Run focused and full validation; keep the diff limited to the shared voice path and tests.

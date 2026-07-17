@@ -15,6 +15,9 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 100;
 const DOWNLOAD_MAX_RETRY_AFTER_MS = 5_000;
+const KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS: readonly RegExp[] = [
+  /\s*продолжение\s+следует(?:\s*[.!?…]+)?\s*$/iu,
+];
 
 export type MediaPipelineStage =
   | "metadata"
@@ -75,6 +78,14 @@ export function mediaPipelineFailureMessage(
 
 export function requireTranscript(transcript: string): string {
   if (!transcript) throw new MediaPipelineError("empty-transcript");
+  return transcript;
+}
+
+export function stripKnownTrailingAsrArtifacts(transcript: string): string {
+  for (const pattern of KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS) {
+    const processed = transcript.replace(pattern, "");
+    if (processed !== transcript) return processed;
+  }
   return transcript;
 }
 
@@ -272,7 +283,7 @@ export async function transcribeAudio(filePath: string): Promise<string> {
         "--no-prints",
         "--language", process.env.WHISPER_LANGUAGE ?? "auto",
       ], { timeout: 120_000 });
-      return stdout.trim();
+      return stripKnownTrailingAsrArtifacts(stdout.trim());
     } catch (error) {
       throw toMediaPipelineError(error, "transcription");
     }

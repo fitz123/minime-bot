@@ -12,6 +12,7 @@ import {
   convertToWav,
   mediaPipelineFailureMessage,
   requireTranscript,
+  stripKnownTrailingAsrArtifacts,
   FFMPEG_BIN,
   WHISPER_BIN,
   WHISPER_MODEL,
@@ -429,6 +430,46 @@ describe("media pipeline stages", () => {
       assert.match(message, pattern);
       assert.ok(message.length < 120);
     }
+  });
+});
+
+describe("stripKnownTrailingAsrArtifacts", () => {
+  it("strips known terminal artifacts and their punctuation variants", () => {
+    const cases = [
+      ["Текст Продолжение следует...", "Текст"],
+      ["Текст Продолжение следует…", "Текст"],
+      ["Текст ПРОДОЛЖЕНИЕ СЛЕДУЕТ!", "Текст"],
+      ["Текст\n  Продолжение   следует  ?!  ", "Текст"],
+      ["Текст Продолжение следует", "Текст"],
+      ["Продолжение следует...", ""],
+    ] as const;
+
+    for (const [transcript, expected] of cases) {
+      assert.strictEqual(stripKnownTrailingAsrArtifacts(transcript), expected);
+    }
+  });
+
+  it("preserves occurrences that are not terminal artifacts", () => {
+    const cases = [
+      "Продолжение следует, но это часть сообщения.",
+      "Фраза «Продолжение следует» написана в середине.",
+      "Совершенно другой текст...",
+    ];
+
+    for (const transcript of cases) {
+      assert.strictEqual(stripKnownTrailingAsrArtifacts(transcript), transcript);
+    }
+  });
+
+  it("preserves valid text and punctuation surrounding a terminal artifact", () => {
+    assert.strictEqual(
+      stripKnownTrailingAsrArtifacts("Ответ готов! Продолжение следует..."),
+      "Ответ готов!",
+    );
+    assert.strictEqual(
+      stripKnownTrailingAsrArtifacts("Это Продолжение следует, а это — конец."),
+      "Это Продолжение следует, а это — конец.",
+    );
   });
 });
 
