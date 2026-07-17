@@ -16,7 +16,7 @@ const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 100;
 const DOWNLOAD_MAX_RETRY_AFTER_MS = 5_000;
 const KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS: readonly RegExp[] = [
-  /\s*продолжение\s+следует(?:\s*[.!?…]+)?\s*$/iu,
+  /(?<![\p{L}\p{M}\p{N}_])продолжение\s+следует(?:\s*[.!?…]+)?\s*$/iu,
 ];
 
 export type MediaPipelineStage =
@@ -84,7 +84,7 @@ export function requireTranscript(transcript: string): string {
 export function stripKnownTrailingAsrArtifacts(transcript: string): string {
   for (const pattern of KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS) {
     const processed = transcript.replace(pattern, "");
-    if (processed !== transcript) return processed;
+    if (processed !== transcript) return processed.trimEnd();
   }
   return transcript;
 }
