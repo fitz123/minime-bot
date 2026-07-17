@@ -286,13 +286,15 @@ export function buildCodexWebSearchRequest(
       store: false,
       stream: true,
       instructions: `${responseInstruction} Use no more than ${maxResults} distinct sources.`,
-      input: [{ role: "user", content: [{ type: "input_text", text: query }] }],
-      tools: [{ type: "web_search", search_context_size: searchContextSize }],
-      tool_choice: "auto",
-      parallel_tool_calls: false,
-      include: ["web_search_call.action.sources"],
-      text: { verbosity: "medium" },
-      max_output_tokens: 8_192,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: query }] }],
+      tools: [{
+        type: "web_search",
+        external_web_access: true,
+        search_context_size: searchContextSize,
+      }],
+      tool_choice: "required",
+      parallel_tool_calls: true,
+      include: [],
     }),
   };
 }
@@ -565,8 +567,12 @@ export async function parseCodexWebSearchSse(
     }
   };
   const consumeChunk = (chunk: string): void => {
-    const data = chunk
-      .split(/\r?\n/)
+    const lines = chunk.split(/\r?\n/);
+    const eventType = lines
+      .find((line) => line.startsWith("event:"))
+      ?.slice(6)
+      .trim();
+    const data = lines
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trim())
       .join("\n")
@@ -577,6 +583,10 @@ export async function parseCodexWebSearchSse(
       parsed = JSON.parse(data);
     } catch {
       throw new CodexSearchSchemaError("invalid event JSON");
+    }
+    const parsedRecord = asRecord(parsed);
+    if (eventType && parsedRecord && typeof parsedRecord.type !== "string") {
+      parsed = { ...parsedRecord, type: eventType };
     }
     handleEvent(parsed);
   };

@@ -50,10 +50,10 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 3: Pass the exact candidate evidence gate
 
-- [ ] Build the feature worktree and identify its `dist/extensions/pi/web-tools.js` artifact.
-- [ ] Run an isolated Pi process/session that explicitly loads only the built candidate wrapper while the deployed Tavily artifact remains untouched.
-- [ ] Execute one benign `web_search` call and prove the registered name is exactly `web_search`, registration count is one, auth type is OAuth, the endpoint/model are the approved subscription pair, `OPENAI_API_KEY` is absent, citations are useful, and metadata/usage are returned when supplied by Codex.
-- [ ] Stop without removing Tavily if any gate assertion fails.
+- [x] Build the feature worktree and identify its `dist/extensions/pi/web-tools.js` artifact.
+- [x] Run an isolated Pi process/session that explicitly loads only the built candidate wrapper while the deployed Tavily artifact remains untouched.
+- [x] Execute one benign `web_search` call and prove the registered name is exactly `web_search`, registration count is one, auth type is OAuth, the endpoint/model are the approved subscription pair, `OPENAI_API_KEY` is absent, citations are useful, and metadata/usage are returned when supplied by Codex.
+- [x] Stop without removing Tavily if any gate assertion fails.
 
 ### Task 4: Remove Tavily and `web_fetch` after the gate
 

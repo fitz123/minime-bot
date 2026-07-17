@@ -1712,7 +1712,11 @@ try {
   assert.equal(fetchCalls[0].init.headers["ChatGPT-Account-Id"], "installed-account-id");
   const searchBody = JSON.parse(fetchCalls[0].init.body);
   assert.equal(searchBody.model, "gpt-installed");
-  assert.deepEqual(searchBody.tools, [{ type: "web_search", search_context_size: "medium" }]);
+  assert.deepEqual(searchBody.tools, [{
+    type: "web_search",
+    external_web_access: true,
+    search_context_size: "medium",
+  }]);
   assert.equal(JSON.stringify(fetchCalls[0]).includes("must-not-be-used"), false);
 
   const installedMonitor = new tavilyMonitorCore.TavilyMonitor({

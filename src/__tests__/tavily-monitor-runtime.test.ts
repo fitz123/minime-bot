@@ -1063,8 +1063,8 @@ describe("Tavily durable notification delivery", () => {
       monitor,
       destination: { chatId: 71 },
       deliveryTimeoutMs: 5,
-      retryBaseMs: 10,
-      retryMaxMs: 10,
+      retryBaseMs: 60_000,
+      retryMaxMs: 60_000,
       deliver: async (_payload, signal) => {
         await new Promise<void>((_resolve, reject) => {
           signal.addEventListener("abort", () => reject(new Error("timed out")), { once: true });

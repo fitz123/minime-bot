@@ -202,8 +202,21 @@ describe("Codex web search auth and request", () => {
     assert.equal(body.model, "gpt-active");
     assert.equal(body.stream, true);
     assert.equal(body.store, false);
-    assert.deepEqual(body.tools, [{ type: "web_search", search_context_size: "high" }]);
-    assert.deepEqual(body.include, ["web_search_call.action.sources"]);
+    assert.deepEqual(body.input, [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "current primary documentation" }],
+    }]);
+    assert.deepEqual(body.tools, [{
+      type: "web_search",
+      external_web_access: true,
+      search_context_size: "high",
+    }]);
+    assert.equal(body.tool_choice, "required");
+    assert.equal(body.parallel_tool_calls, true);
+    assert.deepEqual(body.include, []);
+    assert.equal(body.max_output_tokens, undefined);
+    assert.equal(body.text, undefined);
     assert.match(String(body.instructions), /no more than 7 distinct sources/i);
     assert.match(String(body.instructions), /without a synthesized answer/i);
   });
@@ -291,6 +304,21 @@ describe("Codex web search streamed response parsing", () => {
     );
     assert.equal(result.text, "delta answer");
     assert.equal(result.responseId, "resp-delta");
+  });
+
+  it("uses SSE event names when Codex omits type from data payloads", async () => {
+    const body = [
+      'event: response.output_item.done\ndata: {"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"event-framed answer","annotations":[{"type":"url_citation","title":"RFC Editor","url":"https://www.rfc-editor.org/rfc/rfc9110"}]}]}}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"resp-event-framed","status":"completed","usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}\n\n',
+    ].join("");
+    const result = await parseCodexWebSearchSse(
+      sseResponse(body),
+      { provider: CODEX_WEB_SEARCH_PROVIDER, model: "gpt-active" },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.text, "event-framed answer\n\nSources:\n- RFC Editor: https://www.rfc-editor.org/rfc/rfc9110");
+    assert.equal(result.responseId, "resp-event-framed");
+    assert.deepEqual(result.usage, { inputTokens: 4, outputTokens: 5, totalTokens: 9 });
   });
 
   it("caps model-facing output at 50,000 characters", async () => {
