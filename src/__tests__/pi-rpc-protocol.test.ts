@@ -1004,7 +1004,7 @@ describe("buildPiSpawnEnv", () => {
       "PI_CODING_AGENT_SESSION_DIR",
       "PI_RPC_TEST_MARKER",
       "SSH_AUTH_SOCK",
-      "TAVILY_API_KEY",
+      "EXTERNAL_SERVICE_API_KEY",
       "TELEGRAM_BOT_TOKEN",
       "MINIME_SESSION_SECRET",
       RETIRED_SCHEMA_PATH_ENV,
@@ -1037,7 +1037,7 @@ describe("buildPiSpawnEnv", () => {
       process.env.PI_CODING_AGENT_SESSION_DIR = "/tmp/pi-sessions";
       process.env.PI_RPC_TEST_MARKER = "keep";
       process.env.SSH_AUTH_SOCK = "/tmp/ssh-agent.sock";
-      process.env.TAVILY_API_KEY = "fixture";
+      process.env.EXTERNAL_SERVICE_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
       process.env.MINIME_SESSION_SECRET = "fixture";
       process.env[RETIRED_SCHEMA_PATH_ENV] = "/tmp/schema.md";
@@ -1059,7 +1059,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env.PI_CODING_AGENT_SESSION_DIR, "/tmp/pi-sessions");
       assert.strictEqual(env.PI_RPC_TEST_MARKER, undefined);
       assert.strictEqual(env.SSH_AUTH_SOCK, undefined);
-      assert.strictEqual(env.TAVILY_API_KEY, undefined);
+      assert.strictEqual(env.EXTERNAL_SERVICE_API_KEY, undefined);
       assert.strictEqual(env.TELEGRAM_BOT_TOKEN, undefined);
       assert.strictEqual(env.MINIME_SESSION_SECRET, undefined);
       assert.strictEqual(env[RETIRED_SCHEMA_PATH_ENV], undefined);
@@ -1491,7 +1491,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       "PATH",
       "PI_CODING_AGENT_SESSION_DIR",
       "SSH_AUTH_SOCK",
-      "TAVILY_API_KEY",
+      "EXTERNAL_SERVICE_API_KEY",
       "TELEGRAM_BOT_TOKEN",
       RETIRED_AGENT_WORKSPACE_ENV,
       RETIRED_CONTROL_WORKSPACE_ENV,
@@ -1510,7 +1510,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       process.env.PATH = "/usr/bin";
       process.env.PI_CODING_AGENT_SESSION_DIR = "/tmp/pi-sessions";
       process.env.SSH_AUTH_SOCK = "/tmp/ssh-agent.sock";
-      process.env.TAVILY_API_KEY = "fixture";
+      process.env.EXTERNAL_SERVICE_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
       process.env[RETIRED_AGENT_WORKSPACE_ENV] = "/tmp/retired-agent-workspace";
       process.env[RETIRED_CONTROL_WORKSPACE_ENV] = "/tmp/retired-control-workspace";
@@ -1534,7 +1534,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       assert.strictEqual(env.GITHUB_TOKEN, undefined);
       assert.strictEqual(env.OPENAI_API_KEY, undefined);
       assert.strictEqual(env.SSH_AUTH_SOCK, undefined);
-      assert.strictEqual(env.TAVILY_API_KEY, undefined);
+      assert.strictEqual(env.EXTERNAL_SERVICE_API_KEY, undefined);
       assert.strictEqual(env.TELEGRAM_BOT_TOKEN, undefined);
     } finally {
       for (const key of envKeys) {
@@ -1552,7 +1552,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "pi-subagent-child-env-control-contract-"));
     const envKeys = [
       "DISCORD_BOT_TOKEN",
-      "TAVILY_API_KEY",
+      "EXTERNAL_SERVICE_API_KEY",
       "TELEGRAM_BOT_TOKEN",
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
@@ -1563,7 +1563,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
 
     try {
       process.env.DISCORD_BOT_TOKEN = "fixture";
-      process.env.TAVILY_API_KEY = "fixture";
+      process.env.EXTERNAL_SERVICE_API_KEY = "fixture";
       process.env.TELEGRAM_BOT_TOKEN = "fixture";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       process.env[MINIME_CONFIG_PATH_ENV] = "settings/bot.yaml";
@@ -1576,7 +1576,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], join(workspaceRoot, "settings", "bot.yaml"));
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], join(workspaceRoot, "ops", "crons.yaml"));
       assert.strictEqual(env.DISCORD_BOT_TOKEN, undefined);
-      assert.strictEqual(env.TAVILY_API_KEY, undefined);
+      assert.strictEqual(env.EXTERNAL_SERVICE_API_KEY, undefined);
       assert.strictEqual(env.TELEGRAM_BOT_TOKEN, undefined);
     } finally {
       for (const key of envKeys) {

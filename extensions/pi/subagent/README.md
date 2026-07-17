@@ -32,8 +32,8 @@ from upstream:
    then explicitly loads the Codex transport overflow normalizer, web-tools, and
    knowledge-tools/protection via `PI_SUBAGENT_CHILD_WRAPPER_RELPATHS`. Children
    do not load `subagent/index.ts`, so recursive subagent spawning stays
-   disabled. Missing wrappers fail during spawn arg resolution; a missing Tavily
-   key leaves web tools registered but returning graceful unavailable results.
+   disabled. Missing wrappers fail during spawn arg resolution; web search uses
+   the child's active Codex subscription OAuth through Pi's model registry.
 4. **Noninteractive project-agent guard**: project agents can be discovered with
    `agentScope: "project"` or `"both"`, but running one requires an interactive
    confirmation. Bot-created RPC sessions cancel that unsupported dialog, so the
@@ -205,9 +205,9 @@ their required confirmation is cancelled.
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|
-| `scout` | Fast codebase recon | Codex default | read, grep, find, ls, bash, web_search, web_fetch |
-| `planner` | Implementation plans | Codex default | read, grep, find, ls, web_search, web_fetch |
-| `reviewer` | Code review | Codex default | read, grep, find, ls, bash, web_search, web_fetch |
+| `scout` | Fast codebase recon | Codex default | read, grep, find, ls, bash, web_search |
+| `planner` | Implementation plans | Codex default | read, grep, find, ls, web_search |
+| `reviewer` | Code review | Codex default | read, grep, find, ls, bash, web_search |
 | `worker` | General-purpose | Codex default | (all default) |
 
 ## Workflow Prompts

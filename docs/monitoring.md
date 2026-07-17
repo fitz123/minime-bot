@@ -14,109 +14,28 @@ Copy them outside the package and replace every placeholder. Keep the package
 checkout, installed package, control workspace, and runtime state in distinct
 locations.
 
-## In-process Tavily quota monitoring
+## Codex subscription quota and web search
 
-The Node runtime includes a specialized Tavily monitor in addition to the
-host-native alert path documented below. Tavily remains the only provider for
-`web_search` and `web_fetch`. The tools and monitor share the single
-`tavily.api_key` SOPS entry in the control workspace's
-`config/secrets.sops.yaml`; there is no plaintext environment fallback,
-alternate provider, multi-key rotation, or billing mutation.
+`web_search` uses Pi's existing `openai-codex` subscription OAuth and active
+model through one fixed Codex Responses endpoint. The tool does not own a
+credential file, billing integration, retry loop, durable incident state, or a
+provider-specific Prometheus metric family.
 
-One process holds `data/tavily/writer.lock`. After acquiring that lease it
-restores the owner-only atomic state, drains pending Pi child events, and samples
-Tavily `/usage`; it samples again every five minutes and polls child events every
-two seconds. An overlapping replacement retries nonblocking lease acquisition
-every second and recovers a stale owner. Its transports continue starting while
-it waits, but Tavily `/status` data and incident processing remain unavailable
-until ownership transfers. Base-plan and PAYGO scopes each emit deduplicated 80%
-warnings and 95% critical notices per monthly billing-cycle generation. A tool
-HTTP 432 or 433 opens or refreshes one shared exhaustion incident, and an active
-unacknowledged generation produces one reminder every six hours.
+The out-of-band `minime-codex-quota-sampler` remains the single quota source for
+interactive work and search. It writes the cached snapshot used by `/status`
+and the `codex_usage_*` node-exporter textfile metrics, including bounded probe
+success and timestamp series. Search failures themselves are returned to the
+calling model as bounded classifications.
 
-State, incident acknowledgement and resolution, notification deduplication, and
-the delivery outbox persist below the control workspace's `data/tavily/`
-directory. The monitor saves an event transition before deleting its spool file
-and saves a successful notification delivery before removing the outbox entry.
-Transient Telegram transport, rate-limit, and server failures retry from the
-durable outbox with backoff from 30 seconds up to one hour. A missing configured
-destination or deterministic Telegram 4xx response is recorded as a terminal
-delivery diagnostic and suppresses further reminders for that incident. After
-the destination is corrected, an explicit process restart permits one fresh
-delivery attempt. Delivery uses `adminChatId` when configured, otherwise
-`defaultDeliveryChatId` and its optional `defaultDeliveryThreadId`. When a
-Telegram token source and owner destination are configured, this owner-only
-transport also runs in Discord-backed deployments with no Telegram agent
-bindings.
+Direct URL reads and browser automation do not go through `web_search`.
+Bash-capable full agents use the host `agent-browser` executable (`read` for
+agent-readable text, or `open` followed by `snapshot` for browser state).
+Search-only roles do not receive Bash solely for URL access.
 
-The token source is either `telegramTokenSopsKey` together with
-`secrets.sopsFile`, or `telegramTokenEnv`. Both it and one destination are
-required. `adminChatId` takes precedence; `defaultDeliveryThreadId` is a
-positive topic ID used only with the fallback `defaultDeliveryChatId`:
-
-```yaml
-secrets:
-  sopsFile: config/secrets.sops.yaml
-telegramTokenSopsKey: telegram.bot_token
-# Or use: telegramTokenEnv: MINIME_TELEGRAM_TOKEN
-adminChatId: <owner-chat-id>
-# Fallback instead of adminChatId:
-# defaultDeliveryChatId: <fallback-chat-id>
-# defaultDeliveryThreadId: <positive-topic-id>
-```
-
-Incident messages expose `acknowledge degraded mode` and
-`credits fixed — recheck`. Actions are accepted only at the exact configured
-chat/thread and for the current incident generation. Acknowledgement stops
-reminders but does not resolve the incident. Recheck is single-flight and
-bounded: current `/usage`, a fixed one-result Search probe, and a fixed Extract
-probe must all return validated non-empty results. The monitor uses the same
-verification once when an active incident's usage first becomes recoverable.
-Failed verification leaves the incident open, and provider calls are never
-automatically retried. Explicit recheck failures are delivered through the same
-durable outbox as incident and recovery notices.
-
-`/status` reports only sample freshness, plan/PAYGO used and limit values, the
-latest bounded failure class, and incident/acknowledgement state. Prometheus
-exports these low-cardinality series:
-
-- `bot_tavily_usage_sample_present`
-- `bot_tavily_usage_sample_age_seconds`
-- `bot_tavily_usage_sample_success`
-- `bot_tavily_plan_usage` and `bot_tavily_plan_limit`
-- `bot_tavily_paygo_usage` and `bot_tavily_paygo_limit`
-- `bot_tavily_incident_active` and `bot_tavily_incident_acknowledged`
-- `bot_tavily_usage_samples_total{outcome}`
-- `bot_tavily_failures_total{classification,tool}`
-- `bot_tavily_notifications_total{outcome}`
-
-The bounded label vocabulary is:
-
-- usage sample `outcome`: `success` or `failure`
-- notification `outcome`: `delivered`, `retried`, or `terminal`
-- failure `tool`: `usage`, `web_search`, `web_fetch`, `recovery_search`, or
-  `recovery_extract`
-- failure `classification`: `credential_missing`, `credential_invalid`,
-  `rate_limited`, `base_plan_exhausted`, `paygo_exhausted`,
-  `provider_unavailable`, `extraction_failed`, `request_failed`,
-  `usage_invalid`, `usage_exhausted`, or `probe_failed`
-
-Labels never contain a key, query, requested URL, destination, incident
-generation, provider body, or host path. A missing sample sets the presence
-gauge to zero; stale and failed attempts remain visible through freshness,
-success, `/status`, and the bounded failure counters.
-
-During an overlapping process replacement, the new Prometheus listener retries
-an occupied configured host/port every second until the old listener releases
-it. Scrapes can briefly continue reaching the old process. Other listen errors
-remain logged, and shutdown cancels any pending address retry.
-
-Enable PAYGO and set or raise its credit limit manually in Tavily Billing. The
-monitor observes those changes but cannot make them. To roll back this monitor,
-install and restart the prior package release and retain `data/tavily/`; the
-prior runtime ignores the files, while retaining them preserves deduplication
-and pending delivery if this release is restored. Delete that state only after
-reviewing and intentionally abandoning its incident history and outbox.
+During an overlapping process replacement, the in-process Prometheus listener
+retries an occupied configured host/port every second until the old listener
+releases it. Scrapes can briefly continue reaching the old process. Other listen
+errors remain logged, and shutdown cancels any pending address retry.
 
 ## Prerequisites
 

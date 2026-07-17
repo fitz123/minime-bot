@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { buildStatusReport } from "../status-report.js";
 import type { SessionHealth } from "../session-manager.js";
 import type { QuotaSnapshot, QuotaStatus } from "../quota-status.js";
-import type { TavilyStatusSnapshot } from "../tavily-monitor.js";
 
 const NOW = new Date("2026-06-05T12:00:00.000Z");
 
@@ -242,92 +241,4 @@ describe("buildStatusReport", () => {
     assert.match(text, /Codex quota: unavailable \(state file missing\)/);
   });
 
-  it("renders fresh Tavily usage, bounded failure, and acknowledged incident state", () => {
-    const tavilyStatus: TavilyStatusSnapshot = {
-      sampleState: "fresh",
-      sampledAt: "2026-06-05T11:58:00.000Z",
-      latestAttemptAt: "2026-06-05T11:58:00.000Z",
-      plan: { usage: 800, limit: 1_000, remaining: 200 },
-      paygo: { usage: 1_000, limit: 1_250, remaining: 250 },
-      lastFailure: {
-        classification: "base_plan_exhausted",
-        source: "web_search",
-        observedAt: "2026-06-05T11:57:00.000Z",
-        httpStatus: 432,
-      },
-      incident: "active",
-      acknowledged: true,
-    };
-
-    const text = baseReport({ tavilyStatus });
-    assert.match(text, /Tavily: fresh \(sample 2m ago\)/);
-    assert.match(text, /Plan: 800\/1000 used \(200 remaining\)/);
-    assert.match(text, /PAYGO: 1000\/1250 used \(250 remaining\)/);
-    assert.match(text, /Last failure: base_plan_exhausted \(web_search, 3m ago\)/);
-    assert.match(text, /Incident: active \(acknowledged\)/);
-    assert.doesNotMatch(text, /HTTP 432/);
-  });
-
-  it("distinguishes stale, missing, and error Tavily samples compactly", () => {
-    const stale = baseReport({
-      tavilyStatus: {
-        sampleState: "stale",
-        sampledAt: "2026-06-05T11:40:00.000Z",
-        latestAttemptAt: "2026-06-05T11:40:00.000Z",
-        plan: { usage: 10, limit: 1_000, remaining: 990 },
-        paygo: { usage: 0, limit: 1_250, remaining: 1_250 },
-        incident: "none",
-        acknowledged: false,
-      },
-    });
-    const missing = baseReport({
-      tavilyStatus: {
-        sampleState: "missing",
-        incident: "none",
-        acknowledged: false,
-      },
-    });
-    const error = baseReport({
-      tavilyStatus: {
-        sampleState: "error",
-        latestAttemptAt: "2026-06-05T11:59:00.000Z",
-        lastFailure: {
-          classification: "provider_unavailable",
-          source: "usage",
-          observedAt: "2026-06-05T11:59:00.000Z",
-        },
-        incident: "resolved",
-        acknowledged: false,
-      },
-    });
-
-    assert.match(stale, /Tavily: stale \(sample 20m ago\)/);
-    assert.match(stale, /Incident: none/);
-    assert.match(missing, /Tavily: unavailable \(no successful sample\)/);
-    assert.match(error, /Tavily: error \(attempt 1m ago\)/);
-    assert.match(error, /Last failure: provider_unavailable \(usage, 1m ago\)/);
-    assert.match(error, /Incident: resolved/);
-  });
-
-  it("never renders extra private fields from a Tavily status provider", () => {
-    const status = {
-      sampleState: "missing",
-      incident: "active",
-      acknowledged: false,
-      apiKey: "tvly-private-status-key",
-      query: "private provider query",
-      url: "https://private.invalid/path",
-      destination: "private-chat-id",
-      generation: "private-generation",
-      stateFile: "/Users/private/workspace/data/tavily/state.json",
-    } as TavilyStatusSnapshot & Record<string, unknown>;
-    const text = baseReport({ tavilyStatus: status });
-
-    assert.match(text, /Tavily: unavailable/);
-    assert.match(text, /Incident: active \(unacknowledged\)/);
-    assert.doesNotMatch(
-      text,
-      /tvly-private|provider query|private\.invalid|private-chat|private-generation|\/Users\/private/,
-    );
-  });
 });

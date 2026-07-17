@@ -51,7 +51,7 @@ describe("createTelegramPollingRestartScheduler", () => {
 });
 
 describe("hasActiveAgentPlatform", () => {
-  it("does not count an owner-only Telegram alert transport after Discord startup fails", () => {
+  it("does not count an unbound Telegram transport after Discord startup fails", () => {
     assert.equal(hasActiveAgentPlatform({
       telegramStarted: true,
       telegramBindingCount: 0,
@@ -83,14 +83,6 @@ describe("hasActiveAgentPlatform", () => {
 });
 
 describe("shouldRestartForTelegramFailure", () => {
-  it("keeps a Discord deployment alive when alert-only Telegram polling fails", () => {
-    assert.equal(shouldRestartForTelegramFailure({
-      telegramBindingCount: 0,
-      discordStarted: true,
-      discordBindingCount: 1,
-    }), false);
-  });
-
   it("keeps a live Discord platform alive when a bound Telegram platform fails", () => {
     assert.equal(shouldRestartForTelegramFailure({
       telegramBindingCount: 1,

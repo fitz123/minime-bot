@@ -285,7 +285,7 @@ discord:
     assert.equal(config.discord!.token, "dc-token-from-env");
   });
 
-  it("resolves an owner-only Telegram transport for a Discord-backed deployment", () => {
+  it("does not resolve a Telegram transport without Telegram bindings", () => {
     process.env.TEST_DISCORD_TOKEN_ENV = "dc-token-from-env";
     process.env.TEST_OWNER_TELEGRAM_TOKEN_ENV = "owner-telegram-token";
     writeFileSync(
@@ -307,7 +307,7 @@ discord:
 
     const config = loadConfig(configPath);
 
-    assert.equal(config.telegramToken, "owner-telegram-token");
+    assert.equal(config.telegramToken, undefined);
     assert.equal(config.bindings.length, 0);
     assert.equal(config.defaultDeliveryChatId, -1007100);
     assert.equal(config.defaultDeliveryThreadId, 17);

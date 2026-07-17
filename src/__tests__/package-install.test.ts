@@ -189,8 +189,6 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
     "dist/pi-runtime.js",
-    "dist/tavily-monitor.js",
-    "dist/tavily-monitor-runtime.js",
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
     "dist/pi-extensions/subagent-args.js",
@@ -198,9 +196,6 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/codex-transport-overflow.js",
-    "dist/pi-extensions/tavily.js",
-    "dist/pi-extensions/tavily-events.js",
-    "dist/pi-extensions/tavily-secret.js",
     "dist/pi-extensions/recovery-mode.js",
     "dist/pi-extensions/recovery-protocol.js",
     "dist/recovery/fixer-session.js",
@@ -1213,20 +1208,8 @@ class FakeChild extends EventEmitter {
 }
 
 const piRpc = await importPackageFile("dist/pi-rpc-protocol.js");
-const tavilyMonitorCore = await importPackageFile("dist/tavily-monitor.js");
-const tavilyMonitorRuntime = await importPackageFile("dist/tavily-monitor-runtime.js");
 const recoveryProtocol = await importPackageFile("dist/pi-extensions/recovery-protocol.js");
 const recoveryFixer = await importPackageFile("dist/recovery/fixer-session.js");
-assert.equal(typeof tavilyMonitorCore.TavilyMonitor, "function");
-assert.equal(typeof tavilyMonitorRuntime.TavilyMonitorRuntime, "function");
-assert.deepEqual(
-  tavilyMonitorRuntime.resolveTavilyDeliveryDestination({
-    adminChatId: undefined,
-    defaultDeliveryChatId: 111,
-    defaultDeliveryThreadId: 7,
-  }),
-  { chatId: 111, threadId: 7 },
-);
 assert.equal(typeof recoveryProtocol.RecoveryProtocolClient, "function");
 assert.equal(typeof recoveryFixer.runRecoveryFixer, "function");
 assert.equal(recoveryFixer.classifyRecoveryFixerResult({ is_error: true }), "provider_error");
@@ -1309,7 +1292,6 @@ assert.equal(childEnv[retiredControlWorkspaceEnv], undefined);
 assert.equal(childEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(childEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(childEnv.DISCORD_BOT_TOKEN, undefined);
-assert.equal(childEnv.TAVILY_API_KEY, undefined);
 
 const workspaceContract = await importPackageFile("dist/workspace-contract.js");
 const validator = await importPackageFile("dist/workspace-validator.js");
@@ -1369,7 +1351,6 @@ assert.equal(subagentChildEnv[retiredControlWorkspaceEnv], undefined);
 assert.equal(subagentChildEnv[retiredAgentWorkspaceEnv], undefined);
 assert.equal(subagentChildEnv.TELEGRAM_BOT_TOKEN, undefined);
 assert.equal(subagentChildEnv.DISCORD_BOT_TOKEN, undefined);
-assert.equal(subagentChildEnv.TAVILY_API_KEY, undefined);
 
 process.chdir(agentWorkspace);
 
@@ -1396,12 +1377,11 @@ const askAgent = await importFile(join(artifactDir, "ask-agent", "index.js"));
 askAgent.default(fakePi);
 assert.deepEqual(
   registeredTools
-    .filter((name) => ["web_search", "web_fetch", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
+    .filter((name) => ["web_search", "knowledge_search", "knowledge_get", "knowledge_update", "subagent", "ask_agent"].includes(name))
     .sort(),
   ["ask_agent", "knowledge_get", "knowledge_search", "knowledge_update", "subagent", "web_search"],
 );
 assert.equal(registeredTools.filter((name) => name === "web_search").length, 1);
-assert.equal(registeredTools.includes("web_fetch"), false);
 
 // pi-dynamic-workflows creates in-memory sessions with SettingsManager and
 // createAgentSession. Model that exact Pi boundary using the globally configured
@@ -1436,7 +1416,6 @@ try {
     workflowChild.session.getAllTools().filter((tool) => tool.name === "web_search").length,
     1,
   );
-  assert.equal(workflowChild.session.getAllTools().some((tool) => tool.name === "web_fetch"), false);
 } finally {
   workflowChild.session.dispose();
 }
@@ -1718,32 +1697,6 @@ try {
     search_context_size: "medium",
   }]);
   assert.equal(JSON.stringify(fetchCalls[0]).includes("must-not-be-used"), false);
-
-  const installedMonitor = new tavilyMonitorCore.TavilyMonitor({
-    controlWorkspaceRoot: workspace,
-    apiKey: "installed-monitor-fixture-key",
-    fetchImpl: async (url, init) => {
-      assert.equal(String(url), tavilyMonitorCore.TAVILY_USAGE_URL);
-      assert.equal(init.headers.Authorization, "Bearer installed-monitor-fixture-key");
-      return new Response(JSON.stringify({
-        key: { usage: 1, limit: 100, search_usage: 1, extract_usage: 0 },
-        account: {
-          current_plan: "Fixture",
-          plan_usage: 1,
-          plan_limit: 100,
-          paygo_usage: 0,
-          paygo_limit: 50,
-          search_usage: 1,
-          extract_usage: 0,
-        },
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    },
-  });
-  const usageResult = await installedMonitor.sampleUsage();
-  assert.equal(usageResult.ok, true);
-  assert.equal(installedMonitor.getState().latestSample.account.plan.remaining, 99);
-  assert.ok(existsSync(join(workspace, "data", "tavily", "state.json")));
-  assert.equal(existsSync(join(projectDir, "data", "tavily", "state.json")), false);
 
 } finally {
   globalThis.fetch = oldFetch;

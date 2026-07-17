@@ -430,7 +430,6 @@ const READ_ONLY_TOOLS = new Set([
   "knowledge_search",
   "ls",
   "read",
-  "web_fetch",
   "web_search",
 ]);
 
@@ -644,7 +643,7 @@ export function forbiddenRecoveryToolReason(
   event: Pick<ToolCallEvent, "toolName" | "input">,
 ): RecoveryGuardCategory | undefined {
   const input = event.input as Record<string, unknown>;
-  if (["web_fetch", "web_search"].includes(event.toolName)) return undefined;
+  if (event.toolName === "web_search") return undefined;
   if (event.toolName === "bash") return forbiddenRecoveryBashReason(input.command);
   if (["edit", "write", "read"].includes(event.toolName)) {
     const path = typeof input.path === "string" ? input.path : "";

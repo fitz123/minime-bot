@@ -137,7 +137,6 @@ describe("subagent: bundled agent tool allowlists", () => {
       const tools = readBundledAgentTools(agentName);
       assert.ok(tools, `${agentName} must have an explicit tools allowlist`);
       assert.equal(tools.filter((tool) => tool === "web_search").length, 1, `${agentName} must include web_search once`);
-      assert.equal(tools.includes("web_fetch"), false, `${agentName} must not include web_fetch`);
       assert.equal(tools.includes("bash"), agentName !== "planner", `${agentName} Bash boundary changed`);
       const args = buildSubagentSpawnArgs({ tools }, `task for ${agentName}`);
       assert.equal(args[args.indexOf("--tools") + 1], tools.join(","));
@@ -245,19 +244,19 @@ describe("subagent: wrapper spawn environment", () => {
     }
   });
 
-  it("does not inject ambient bot or Tavily secrets into subagent child argv", () => {
+  it("does not inject ambient bot or external-service secrets into subagent child argv", () => {
     const telegramTokenEnv = ["TELEGRAM", "BOT", "TOKEN"].join("_");
     const discordTokenEnv = ["DISCORD", "BOT", "TOKEN"].join("_");
-    const tavilyKeyEnv = ["TAVILY", "API", "KEY"].join("_");
+    const externalServiceKeyEnv = ["EXTERNAL", "SERVICE", "API", "KEY"].join("_");
     const oldTelegram = process.env[telegramTokenEnv];
     const oldDiscord = process.env[discordTokenEnv];
-    const oldTavily = process.env[tavilyKeyEnv];
-    const fixtureValues = ["subagent-telegram-fixture", "subagent-discord-fixture", "subagent-tavily-fixture"];
+    const oldExternalService = process.env[externalServiceKeyEnv];
+    const fixtureValues = ["subagent-telegram-fixture", "subagent-discord-fixture", "subagent-external-service-fixture"];
 
     try {
       process.env[telegramTokenEnv] = fixtureValues[0];
       process.env[discordTokenEnv] = fixtureValues[1];
-      process.env[tavilyKeyEnv] = fixtureValues[2];
+      process.env[externalServiceKeyEnv] = fixtureValues[2];
 
       const args = buildSubagentSpawnArgs({}, "delegate safely", {
         extensionArgs: ["--extension", "/abs/web-tools.ts"],
@@ -278,10 +277,10 @@ describe("subagent: wrapper spawn environment", () => {
       } else {
         process.env[discordTokenEnv] = oldDiscord;
       }
-      if (oldTavily === undefined) {
-        delete process.env[tavilyKeyEnv];
+      if (oldExternalService === undefined) {
+        delete process.env[externalServiceKeyEnv];
       } else {
-        process.env[tavilyKeyEnv] = oldTavily;
+        process.env[externalServiceKeyEnv] = oldExternalService;
       }
     }
   });

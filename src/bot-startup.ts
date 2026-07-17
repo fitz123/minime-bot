@@ -94,7 +94,7 @@ export interface ActiveAgentPlatformState {
   discordBindingCount: number;
 }
 
-/** Alert-only transports do not count as a usable conversational platform. */
+/** Only started transports with conversational bindings count as usable. */
 export function hasActiveAgentPlatform(state: ActiveAgentPlatformState): boolean {
   return (state.telegramStarted && state.telegramBindingCount > 0) ||
     (state.discordStarted && state.discordBindingCount > 0);
@@ -108,8 +108,8 @@ export interface TelegramFailurePlatformState {
 
 /**
  * Restart only when failed Telegram polling was the sole conversational
- * platform. Alert-only Telegram and deployments with a live Discord platform
- * can keep serving while Telegram polling is unavailable.
+ * platform. Deployments with a live Discord platform can keep serving while
+ * Telegram polling is unavailable.
  */
 export function shouldRestartForTelegramFailure(state: TelegramFailurePlatformState): boolean {
   return state.telegramBindingCount > 0 &&

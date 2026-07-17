@@ -495,10 +495,9 @@ describe("Codex web_search Pi wrapper", () => {
     }
   });
 
-  it("keeps the compatible schema but has no web_fetch descriptor", () => {
+  it("keeps the compatible web-search schema", () => {
     assert.equal(CODEX_WEB_SEARCH_TOOL.name, "web_search");
     assert.equal(CODEX_WEB_SEARCH_TOOL.parameters.properties.query.type, "string");
     assert.equal(CODEX_WEB_SEARCH_TOOL.parameters.properties.include_answer.type, "boolean");
-    assert.equal("web_fetch" in CODEX_WEB_SEARCH_TOOL, false);
   });
 });

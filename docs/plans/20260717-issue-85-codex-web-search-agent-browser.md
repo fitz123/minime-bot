@@ -57,11 +57,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 4: Remove Tavily and `web_fetch` after the gate
 
-- [ ] Remove Tavily search, fetch, SOPS helper/constants, event-spool, monitor/runtime, usage/recovery, durable incident/outbox, Telegram acknowledge/recheck, Discord/Telegram status, and `bot_tavily_*` metric code plus provider-specific tests.
-- [ ] Remove `web_fetch` from recovery read-only/external-tool filters, bundled role definitions, documentation, and tests while preserving `web_search` as read-only where intended.
-- [ ] Update active `README.md`, Pi-extension/subagent documentation, and monitoring documentation for Codex `web_search` plus host `agent-browser` direct-URL workflows.
-- [ ] Leave historical changelog entries and completed plans unchanged.
-- [ ] Confirm no Tavily fallback, active provider config/secret contract, PAYGO path, or dormant `web_fetch` registration remains.
+- [x] Remove Tavily search, fetch, SOPS helper/constants, event-spool, monitor/runtime, usage/recovery, durable incident/outbox, Telegram acknowledge/recheck, Discord/Telegram status, and `bot_tavily_*` metric code plus provider-specific tests.
+- [x] Remove `web_fetch` from recovery read-only/external-tool filters, bundled role definitions, documentation, and tests while preserving `web_search` as read-only where intended.
+- [x] Update active `README.md`, Pi-extension/subagent documentation, and monitoring documentation for Codex `web_search` plus host `agent-browser` direct-URL workflows.
+- [x] Leave historical changelog entries and completed plans unchanged.
+- [x] Confirm no Tavily fallback, active provider config/secret contract, PAYGO path, or dormant `web_fetch` registration remains.
 
 ### Task 5: Validate packaging, residue, and public hygiene
 

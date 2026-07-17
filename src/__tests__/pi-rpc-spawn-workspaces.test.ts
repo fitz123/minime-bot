@@ -141,13 +141,13 @@ describe("Pi spawn workspace contract", () => {
     const secretEnvKeys = [
       ["TELEGRAM", "BOT", "TOKEN"].join("_"),
       ["DISCORD", "BOT", "TOKEN"].join("_"),
-      ["TAVILY", "API", "KEY"].join("_"),
+      ["EXTERNAL", "SERVICE", "API", "KEY"].join("_"),
     ] as const;
     const oldSecretValues = new Map(secretEnvKeys.map((key) => [key, process.env[key]]));
     const fixtureValues = [
       "parent-telegram-fixture",
       "parent-discord-fixture",
-      "parent-tavily-fixture",
+      "parent-external-service-fixture",
       "resolved-telegram-token",
     ];
 

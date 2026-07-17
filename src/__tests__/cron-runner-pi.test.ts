@@ -405,7 +405,7 @@ describe("cron-runner runPi", () => {
     const openAiKeyEnv = ["OPENAI", "API", "KEY"].join("_");
     const piSessionDirEnv = ["PI", "CODING", "AGENT", "SESSION", "DIR"].join("_");
     const telegramTokenEnv = ["TELEGRAM", "BOT", "TOKEN"].join("_");
-    const tavilyKeyEnv = ["TAVILY", "API", "KEY"].join("_");
+    const externalServiceKeyEnv = ["EXTERNAL", "SERVICE", "API", "KEY"].join("_");
     const sessionSecretEnv = ["MINIME", "SESSION", "SECRET"].join("_");
     const githubTokenEnv = ["GITHUB", "TOKEN"].join("_");
     const awsSecretEnv = ["AWS", "SECRET", "ACCESS", "KEY"].join("_");
@@ -413,7 +413,7 @@ describe("cron-runner runPi", () => {
     const oldOpenAiKey = process.env[openAiKeyEnv];
     const oldPiSessionDir = process.env[piSessionDirEnv];
     const oldTelegramToken = process.env[telegramTokenEnv];
-    const oldTavilyKey = process.env[tavilyKeyEnv];
+    const oldExternalServiceKey = process.env[externalServiceKeyEnv];
     const oldSessionSecret = process.env[sessionSecretEnv];
     const oldGithubToken = process.env[githubTokenEnv];
     const oldAwsSecret = process.env[awsSecretEnv];
@@ -424,7 +424,7 @@ describe("cron-runner runPi", () => {
     const oldRetiredAgentWorkspace = process.env[RETIRED_AGENT_WORKSPACE_ENV];
     const oldConfigPath = process.env[MINIME_CONFIG_PATH_ENV];
     const oldCronsPath = process.env[MINIME_CRONS_PATH_ENV];
-    const fixtureValues = ["cron-telegram-fixture", "cron-discord-fixture", "cron-tavily-fixture"];
+    const fixtureValues = ["cron-telegram-fixture", "cron-discord-fixture", "cron-external-service-fixture"];
 
     try {
       delete process.env.HOME;
@@ -435,7 +435,7 @@ describe("cron-runner runPi", () => {
       process.env.CLAUDECODE = "session-marker";
       process.env[telegramTokenEnv] = fixtureValues[0];
       process.env[discordTokenEnv] = fixtureValues[1];
-      process.env[tavilyKeyEnv] = fixtureValues[2];
+      process.env[externalServiceKeyEnv] = fixtureValues[2];
       process.env[sessionSecretEnv] = "fixture";
       process.env[githubTokenEnv] = "fixture";
       process.env[awsSecretEnv] = "fixture";
@@ -467,7 +467,7 @@ describe("cron-runner runPi", () => {
       assert.strictEqual(env.CLAUDECODE, undefined);
       assert.strictEqual(env[telegramTokenEnv], undefined);
       assert.strictEqual(env[discordTokenEnv], undefined);
-      assert.strictEqual(env[tavilyKeyEnv], undefined);
+      assert.strictEqual(env[externalServiceKeyEnv], undefined);
       assert.strictEqual(env[sessionSecretEnv], undefined);
       assert.strictEqual(env[githubTokenEnv], undefined);
       assert.strictEqual(env[awsSecretEnv], undefined);
@@ -513,10 +513,10 @@ describe("cron-runner runPi", () => {
       } else {
         process.env[telegramTokenEnv] = oldTelegramToken;
       }
-      if (oldTavilyKey === undefined) {
-        delete process.env[tavilyKeyEnv];
+      if (oldExternalServiceKey === undefined) {
+        delete process.env[externalServiceKeyEnv];
       } else {
-        process.env[tavilyKeyEnv] = oldTavilyKey;
+        process.env[externalServiceKeyEnv] = oldExternalServiceKey;
       }
       if (oldDiscordToken === undefined) {
         delete process.env[discordTokenEnv];

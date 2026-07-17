@@ -3,13 +3,12 @@ import { SessionManager } from "./session-manager.js";
 import {
   createTelegramBot,
   BOT_COMMANDS,
-  TAVILY_DURABLE_DELIVERY,
   TELEGRAM_ALLOWED_UPDATES,
   type TelegramBotResult,
 } from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
-import { recordTavilyMonitorMetrics, startMetricsServer, stopMetricsServer } from "./metrics.js";
+import { startMetricsServer, stopMetricsServer } from "./metrics.js";
 import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
@@ -29,17 +28,6 @@ import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
 import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
-import { resolveWorkspaceContract } from "./workspace-contract.js";
-import { readTavilyApiKeyFromSops } from "./pi-extensions/tavily-secret.js";
-import {
-  TavilyMonitor,
-  tryAcquireTavilyWriterLease,
-} from "./tavily-monitor.js";
-import {
-  resolveTavilyDeliveryDestination,
-  TavilyMonitorSupervisor,
-  TavilyMonitorRuntime,
-} from "./tavily-monitor-runtime.js";
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -68,7 +56,6 @@ async function main(): Promise<void> {
   let echoWatcher: EchoWatcher | undefined;
   let discordClient: Client | undefined;
   let watchdog: Watchdog | undefined;
-  let tavilySupervisor: TavilyMonitorSupervisor | undefined;
   let telegramStartupTimeout: ReturnType<typeof setTimeout> | undefined;
   let telegramPollingRestart: TelegramPollingRestartScheduler | undefined;
 
@@ -87,7 +74,6 @@ async function main(): Promise<void> {
     telegramPollingRestart?.cancel();
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
-    const tavilyStop = tavilySupervisor?.stop();
     if (telegramBot) {
       stopTelegramBotInBackground(telegramBot, () => {
         log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
@@ -98,7 +84,6 @@ async function main(): Promise<void> {
     // updates, but already-scheduled debounce timers could still fire and start
     // new flush() work during the graceful shutdown wait window.
     for (const mq of messageQueues) mq.cancelAllDebounceTimers();
-    await tavilyStop;
     // Wait for busy sessions to finish their current turns BEFORE clearing
     // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
     // that would break in-flight sessions still reading those files.
@@ -135,56 +120,6 @@ async function main(): Promise<void> {
     requestShutdown("unhandledRejection", 1);
   });
 
-  const controlWorkspaceRoot = resolveWorkspaceContract().paths.controlWorkspaceRoot;
-  const telegramConfigured = Boolean(config.telegramToken);
-  const tavilyDestination = telegramConfigured
-    ? resolveTavilyDeliveryDestination(config)
-    : undefined;
-  tavilySupervisor = new TavilyMonitorSupervisor({
-    destination: tavilyDestination,
-    tryAcquireLease: () => tryAcquireTavilyWriterLease(controlWorkspaceRoot),
-    createRuntime: () => {
-      const monitor = new TavilyMonitor({
-        controlWorkspaceRoot,
-        apiKey: readTavilyApiKeyFromSops({ controlWorkspaceRoot }),
-        onStateChange: recordTavilyMonitorMetrics,
-      });
-      const runtime = new TavilyMonitorRuntime({
-        monitor,
-        destination: tavilyDestination,
-        deliver: async (payload, signal) => {
-          if (!telegramBot) {
-            // Bot construction/polling must not gate monitoring. Treat its
-            // startup window as transient so the durable outbox retries.
-            throw new Error("Telegram transport is not ready");
-          }
-          const sendOptions = {
-            ...(payload.threadId === undefined ? {} : { message_thread_id: payload.threadId }),
-            ...(payload.replyMarkup === undefined ? {} : { reply_markup: payload.replyMarkup }),
-            [TAVILY_DURABLE_DELIVERY]: true,
-          } as Parameters<typeof telegramBot.api.sendMessage>[2] & {
-            [TAVILY_DURABLE_DELIVERY]: true;
-          };
-          await telegramBot.api.sendMessage(
-            payload.chatId,
-            payload.text,
-            sendOptions,
-            signal as Parameters<typeof telegramBot.api.sendMessage>[3],
-          );
-        },
-        onError: () => log.error("main", "Tavily monitor transition failed"),
-      });
-      return { monitor, runtime };
-    },
-    onWait: () => log.warn("main", "Another process owns the Tavily monitor writer lease; waiting"),
-    onAcquired: () => log.info("main", "Tavily monitor writer lease acquired"),
-    onError: () => log.error("main", "Tavily monitor ownership transition failed"),
-  });
-  // Lease acquisition and immediate monitoring run independently of both
-  // transports. A replacement can therefore negotiate Telegram polling or
-  // start Discord while it waits for the previous writer to exit.
-  tavilySupervisor.start();
-
   // Telegram starts before Discord has finished connecting. Polling failures
   // wait for that startup decision so an auxiliary alert transport cannot take
   // down a healthy conversational platform merely because it failed first.
@@ -208,8 +143,6 @@ async function main(): Promise<void> {
       onSuccessfulPoll: () => {
         if (!telegramFailureHandled && !shuttingDown) telegramPollingRestart?.reset();
       },
-      tavilyActions: tavilySupervisor,
-      getTavilyStatus: () => tavilySupervisor?.getStatus(),
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
@@ -342,9 +275,7 @@ async function main(): Promise<void> {
   // Start Discord bot if configured
   if (config.discord) {
     try {
-      const result = await createDiscordBot(config, config.discord, sessionManager, {
-        getTavilyStatus: () => tavilySupervisor?.getStatus(),
-      });
+      const result = await createDiscordBot(config, config.discord, sessionManager);
       discordClient = result.client;
       messageQueues.push(result.messageQueue);
       log.info("main", "Discord bot started");
@@ -353,8 +284,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // Owner-only Telegram delivery is not an agent platform. Require at least
-  // one started transport with a conversational binding.
+  // Require at least one started transport with a conversational binding.
   if (!hasActiveAgentPlatform({
     telegramStarted: Boolean(telegramBot),
     telegramBindingCount: config.bindings.length,

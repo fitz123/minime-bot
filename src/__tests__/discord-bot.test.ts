@@ -370,14 +370,6 @@ describe("Discord slash command status wiring", () => {
         messageQueue: {
           clear: (key: string) => { calls.push(`clear:${key}`); },
         },
-        getTavilyStatus: () => ({
-          sampleState: "fresh",
-          sampledAt: new Date().toISOString(),
-          plan: { usage: 800, limit: 1_000, remaining: 200 },
-          paygo: { usage: 25, limit: 1_250, remaining: 1_225 },
-          incident: "active",
-          acknowledged: true,
-        }),
       },
     );
 
@@ -385,9 +377,6 @@ describe("Discord slash command status wiring", () => {
     assert.equal(typeof replies[0], "string");
     assert.match(String(replies[0]), /Sessions: 1\/2/);
     assert.match(String(replies[0]), /Session ID: session-123/);
-    assert.match(String(replies[0]), /Tavily: fresh/);
-    assert.match(String(replies[0]), /Plan: 800\/1000 used \(200 remaining\)/);
-    assert.match(String(replies[0]), /Incident: active \(acknowledged\)/);
     assert.ok(calls.includes("getSessionHealth:discord:parent-1:thread-1"));
     assert.ok(!calls.includes("sendSessionMessage"));
     assert.ok(!calls.includes("getOrCreateSession"));
