@@ -26,6 +26,7 @@ import {
   OPS_WORKER_PI_LIMITS,
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
+  type OpsWorkerProcessGroupInspection,
   type OpsWorkerProcessInspection,
 } from "../ops-worker/pi-attempt.js";
 import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
@@ -546,7 +547,43 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(result.schedule.nextCheckAt);
   });
 
-  it("fails fresh launches closed before persisting RUNNING", async (t) => {
+  it("persists a launch fence before spawn and fails fresh launches closed", async (t) => {
+    const beforeSpawn = await makeHarness(t);
+    beforeSpawn.store.create(makeTask("intent-before-spawn"));
+    const intentSpawnFailure = await beforeSpawn.runner({
+      dependencies: {
+        spawnProcess: () => {
+          const persisted = beforeSpawn.store.get("intent-before-spawn");
+          assert.equal(persisted?.state, "BLOCKED");
+          assert.equal(persisted?.unverifiedRun?.pid, null);
+          assert.equal(persisted?.unverifiedRun?.expectedProcessGroupId, null);
+          throw new Error("synthetic spawn rejection");
+        },
+      },
+    }).runAttempt("intent-before-spawn");
+    assert.equal(intentSpawnFailure.state, "RESUMABLE");
+    assert.equal(intentSpawnFailure.unverifiedRun, null);
+
+    const crashBoundary = await makeHarness(t);
+    crashBoundary.store.create(makeTask("crash-after-pid-fence"));
+    crashBoundary.setScenario("wait");
+    await assert.rejects(
+      crashBoundary.runner({
+        dependencies: {
+          launchFaultInjector: (point) => {
+            if (point === "after-unverified-run-persisted") {
+              throw new Error("synthetic supervisor crash after PID fence");
+            }
+          },
+        },
+      }).runAttempt("crash-after-pid-fence"),
+      /synthetic supervisor crash after PID fence/,
+    );
+    const fenced = crashBoundary.store.get("crash-after-pid-fence");
+    assert.equal(fenced?.state, "BLOCKED");
+    assert.equal(fenced?.unverifiedRun?.pid, crashBoundary.children.at(-1)?.pid);
+    assert.equal(crashBoundary.supervisor.selectNextTask(), undefined);
+
     const harness = await makeHarness(t);
 
     harness.store.create(makeTask("spawn-throws"));
@@ -558,8 +595,17 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(spawnFailure.state, "RESUMABLE");
     assert.equal(spawnFailure.lastOutcome?.result, "CRASH");
 
-    harness.store.create(makeTask("missing-pid"));
-    const missingPid = await harness.runner({
+    harness.store.create(makeTask("identity-gone"));
+    harness.setScenario("success");
+    const identityGone = await harness.runner({
+      dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
+    }).runAttempt("identity-gone");
+    assert.equal(identityGone.state, "RESUMABLE");
+    assert.equal(identityGone.activeRun, null);
+
+    const missingPidHarness = await makeHarness(t);
+    missingPidHarness.store.create(makeTask("missing-pid"));
+    const missingPid = await missingPidHarness.runner({
       dependencies: {
         spawnProcess: () => {
           const child = new EventEmitter() as ChildProcess;
@@ -575,16 +621,54 @@ describe("ops worker Pi standard-session attempts", () => {
         },
       },
     }).runAttempt("missing-pid");
-    assert.equal(missingPid.state, "RESUMABLE");
+    assert.equal(missingPid.state, "BLOCKED");
     assert.equal(missingPid.activeRun, null);
+    assert.equal(missingPid.unverifiedRun?.pid, null);
 
-    harness.store.create(makeTask("identity-gone"));
-    harness.setScenario("success");
-    const identityGone = await harness.runner({
-      dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
-    }).runAttempt("identity-gone");
-    assert.equal(identityGone.state, "RESUMABLE");
-    assert.equal(identityGone.activeRun, null);
+    for (const [taskId, inspection, group] of [
+      [
+        "settled-without-nonce",
+        (pid: number): OpsWorkerProcessInspection => ({
+          status: "OWNED",
+          identity: {
+            pid,
+            processGroupId: pid,
+            processStartToken: "reused-process",
+          },
+        }),
+        (): OpsWorkerProcessGroupInspection => ({ status: "GONE" }),
+      ],
+      [
+        "gone-leader-live-group",
+        (_pid: number): OpsWorkerProcessInspection => ({ status: "GONE" }),
+        (): OpsWorkerProcessGroupInspection => ({ status: "PRESENT" }),
+      ],
+    ] as const) {
+      const isolated = await makeHarness(t);
+      isolated.store.create(makeTask(taskId));
+      const blocked = await isolated.runner({
+        dependencies: {
+          spawnProcess: () => {
+            const child = new EventEmitter() as ChildProcess;
+            Object.assign(child, {
+              pid: 500_000 + isolated.children.length,
+              stdout: new PassThrough(),
+              stderr: new PassThrough(),
+              exitCode: null,
+              signalCode: null,
+              unref: () => undefined,
+            });
+            queueMicrotask(() => child.emit("close", 1, null));
+            return child;
+          },
+          readProcessIdentity: inspection,
+          inspectProcessGroup: group,
+        },
+      }).runAttempt(taskId);
+      assert.equal(blocked.state, "BLOCKED");
+      assert.equal(blocked.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+      assert.ok(blocked.unverifiedRun?.pid);
+    }
 
     for (const [taskId, inspection] of [
       ["identity-ambiguous", (_pid: number): OpsWorkerProcessInspection => ({
@@ -712,6 +796,39 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     assert.equal((await leaderExitsAfterTerm(task)).status, "AMBIGUOUS");
     assert.deepEqual(noPgidOnlyKillSignals, ["SIGTERM"]);
+
+    const pendingIntentTask = makeTask("restart-pending-intent");
+    pendingIntentTask.state = "BLOCKED";
+    pendingIntentTask.lastOutcome = {
+      at: pendingIntentTask.updatedAt,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Synthetic pre-spawn launch intent requires a global fence.",
+    };
+    pendingIntentTask.unverifiedRun = {
+      attemptId: "attempt-pending",
+      supervisorInstanceId: "prior-supervisor",
+      pid: null,
+      expectedProcessGroupId: null,
+      launchedAt: pendingIntentTask.updatedAt,
+      ownershipNonceHash: `sha256:${"a".repeat(64)}`,
+    };
+    let pendingIntentInspections = 0;
+    const reconcilePendingIntent = createOpsWorkerPiStartupReconciler({
+      inspectUnverified: () => {
+        pendingIntentInspections += 1;
+        return { status: "GONE" };
+      },
+      inspectGroup: () => {
+        pendingIntentInspections += 1;
+        return { status: "GONE" };
+      },
+      signal: () => {
+        pendingIntentInspections += 1;
+      },
+    });
+    assert.equal((await reconcilePendingIntent(pendingIntentTask)).status, "AMBIGUOUS");
+    assert.equal(pendingIntentInspections, 0);
 
     const unverifiedTask = makeTask("restart-unverified");
     unverifiedTask.state = "BLOCKED";

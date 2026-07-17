@@ -47,7 +47,7 @@ const ALLOWED_STATE_TRANSITIONS: Readonly<
   RUNNING: ["CHECKING", "RESUMABLE", "BLOCKED"],
   CHECKING: ["CHECKING", "RESUMABLE", "BLOCKED", "DONE", "CANCELLED"],
   RESUMABLE: ["RUNNING", "CHECKING", "RESUMABLE", "BLOCKED", "CANCELLED"],
-  BLOCKED: ["BLOCKED", "RESUMABLE", "CANCELLED"],
+  BLOCKED: ["RUNNING", "BLOCKED", "RESUMABLE", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -579,11 +579,104 @@ export class OpsWorkerSupervisor {
     return candidates[0];
   }
 
+  beginPiLaunch(
+    taskId: string,
+    launchIntent: OpsWorkerUnverifiedRun,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const task = this.requireTask(taskId);
+    if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Pi launch intent requires QUEUED or RESUMABLE, found ${task.state}`,
+      );
+    }
+    if (launchIntent.supervisorInstanceId !== this.instanceId) {
+      throw new OpsWorkerSupervisorStateError(
+        "Pi launch intent must belong to this supervisor instance",
+      );
+    }
+    if (launchIntent.pid !== null || launchIntent.expectedProcessGroupId !== null) {
+      throw new OpsWorkerSupervisorStateError(
+        "Pi launch intent must be persisted before a child PID is known",
+      );
+    }
+    return this.transition(taskId, "BLOCKED", (replacement, at) => {
+      replacement.activeRun = null;
+      replacement.unverifiedRun = structuredClone(launchIntent);
+      replacement.schedule.nextRunAt = null;
+      replacement.schedule.nextCheckAt = null;
+      replacement.lastOutcome = {
+        at,
+        kind: "RECONCILIATION",
+        result: "AMBIGUOUS_ORPHAN",
+        summary: "Persisted Pi launch intent before detached spawn",
+      };
+      replacement.report.state = "PENDING";
+      replacement.report.lastError = null;
+    }, "Persisted Pi launch intent before detached spawn");
+  }
+
+  bindUnverifiedPiLaunch(
+    taskId: string,
+    unverifiedRun: OpsWorkerUnverifiedRun,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    const intent = existing.unverifiedRun;
+    if (
+      existing.state !== "BLOCKED"
+      || intent === null
+      || intent.pid !== null
+      || intent.attemptId !== unverifiedRun.attemptId
+      || intent.supervisorInstanceId !== unverifiedRun.supervisorInstanceId
+      || intent.launchedAt !== unverifiedRun.launchedAt
+      || intent.ownershipNonceHash !== unverifiedRun.ownershipNonceHash
+      || unverifiedRun.pid === null
+      || unverifiedRun.expectedProcessGroupId !== unverifiedRun.pid
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Detached Pi PID does not match the persisted launch intent",
+      );
+    }
+    const replacement = structuredClone(existing);
+    replacement.updatedAt = this.nextUpdatedAt(existing);
+    replacement.unverifiedRun = structuredClone(unverifiedRun);
+    if (replacement.lastOutcome) {
+      replacement.lastOutcome.summary = "Bound detached Pi PID to the durable launch fence";
+    }
+    this.store.replace(replacement, {
+      event: "RECONCILIATION",
+      summary: "Bound detached Pi PID to the durable launch fence",
+    });
+    return this.requireTask(taskId);
+  }
+
   markRunning(taskId: string, activeRun: OpsWorkerActiveRun): OpsWorkerTask {
     this.assertStarted();
+    const existing = this.requireTask(taskId);
     if (activeRun.supervisorInstanceId !== this.instanceId) {
       throw new OpsWorkerSupervisorStateError(
         "Active run must belong to this supervisor instance",
+      );
+    }
+    if (existing.state === "BLOCKED") {
+      const fence = existing.unverifiedRun;
+      if (
+        fence === null
+        || fence.pid === null
+        || fence.expectedProcessGroupId === null
+        || fence.attemptId !== activeRun.attemptId
+        || fence.supervisorInstanceId !== activeRun.supervisorInstanceId
+        || fence.pid !== activeRun.pid
+        || fence.expectedProcessGroupId !== activeRun.processGroupId
+      ) {
+        throw new OpsWorkerSupervisorStateError(
+          "RUNNING identity does not match the durable Pi launch fence",
+        );
+      }
+    } else if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Starting an attempt requires QUEUED, RESUMABLE, or a matching launch fence; found ${existing.state}`,
       );
     }
     if (
@@ -601,6 +694,9 @@ export class OpsWorkerSupervisor {
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.lastOutcome = null;
+      task.report.state = "NONE";
+      task.report.attempts = 0;
+      task.report.lastError = null;
     }, "Started one supervisor-owned attempt");
   }
 
@@ -713,6 +809,45 @@ export class OpsWorkerSupervisor {
       : "Recorded Pi attempt launch failure");
   }
 
+  recordResolvedPiLaunchFailure(
+    taskId: string,
+    attemptId: string,
+    summary: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (
+      existing.state !== "BLOCKED"
+      || existing.unverifiedRun?.attemptId !== attemptId
+      || existing.unverifiedRun.supervisorInstanceId !== this.instanceId
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Resolved Pi launch failure must match this supervisor's durable launch fence",
+      );
+    }
+    const target = this.infrastructureFailureTarget(existing);
+    return this.transition(taskId, target, (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.report.state = "NONE";
+      task.report.attempts = 0;
+      task.report.lastError = null;
+      this.incrementInfrastructureFailures(task);
+      task.schedule.nextCheckAt = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.infrastructureRetryMs,
+      ).toISOString();
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "CRASH",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    }, target === "BLOCKED"
+      ? "Blocked after bounded resolved Pi launch failures"
+      : "Cleared resolved Pi launch fence after launch failure");
+  }
+
   recordPreemption(
     taskId: string,
     summary: string,
@@ -818,9 +953,28 @@ export class OpsWorkerSupervisor {
   ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
-    if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
+    const priorFence = task.unverifiedRun;
+    const matchesPersistedFence = task.state === "BLOCKED"
+      && priorFence !== null
+      && priorFence.attemptId === unverifiedRun.attemptId
+      && priorFence.supervisorInstanceId === unverifiedRun.supervisorInstanceId
+      && priorFence.launchedAt === unverifiedRun.launchedAt
+      && priorFence.ownershipNonceHash === unverifiedRun.ownershipNonceHash
+      && (
+        priorFence.pid === null
+          ? unverifiedRun.pid === null
+            && unverifiedRun.expectedProcessGroupId === null
+          : priorFence.pid === unverifiedRun.pid
+            && priorFence.expectedProcessGroupId
+              === unverifiedRun.expectedProcessGroupId
+      );
+    if (
+      task.state !== "QUEUED"
+      && task.state !== "RESUMABLE"
+      && !matchesPersistedFence
+    ) {
       throw new OpsWorkerSupervisorStateError(
-        `Unverified Pi launch requires QUEUED or RESUMABLE, found ${task.state}`,
+        `Unverified Pi launch requires a runnable task or its matching launch fence, found ${task.state}`,
       );
     }
     return this.transition(taskId, "BLOCKED", (replacement, at) => {

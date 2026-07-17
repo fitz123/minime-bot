@@ -176,16 +176,17 @@ export interface OpsWorkerActiveRun {
 }
 
 /**
- * Durable safety fence for a child that was spawned but whose exact OS
- * process identity could not be proven before launch inspection timed out.
- * The nonce is stored only as a hash so restart reconciliation can bind a
- * later inspection without publishing the raw per-attempt token.
+ * Durable safety fence for a launch that has started but whose exact OS
+ * process identity is not yet proven. A null PID/group is the pre-spawn
+ * intent; both are filled immediately after detached spawn. The nonce is
+ * stored only as a hash so restart reconciliation can bind a later inspection
+ * without publishing the raw per-attempt token.
  */
 export interface OpsWorkerUnverifiedRun {
   attemptId: string;
   supervisorInstanceId: string;
-  pid: number;
-  expectedProcessGroupId: number;
+  pid: number | null;
+  expectedProcessGroupId: number | null;
   launchedAt: string;
   ownershipNonceHash: string;
 }
@@ -817,22 +818,29 @@ function parseUnverifiedRun(value: unknown): OpsWorkerUnverifiedRun | null {
       "must be a lowercase sha256:<hex> digest",
     );
   }
-  const pid = expectInteger(
-    unverifiedRun.pid,
-    "task.unverifiedRun.pid",
-    1,
-    2_147_483_647,
-  );
-  const expectedProcessGroupId = expectInteger(
-    unverifiedRun.expectedProcessGroupId,
-    "task.unverifiedRun.expectedProcessGroupId",
-    1,
-    2_147_483_647,
-  );
-  if (expectedProcessGroupId !== pid) {
+  const pid = unverifiedRun.pid === null
+    ? null
+    : expectInteger(
+      unverifiedRun.pid,
+      "task.unverifiedRun.pid",
+      1,
+      2_147_483_647,
+    );
+  const expectedProcessGroupId = unverifiedRun.expectedProcessGroupId === null
+    ? null
+    : expectInteger(
+      unverifiedRun.expectedProcessGroupId,
+      "task.unverifiedRun.expectedProcessGroupId",
+      1,
+      2_147_483_647,
+    );
+  if (
+    (pid === null) !== (expectedProcessGroupId === null)
+    || (pid !== null && expectedProcessGroupId !== pid)
+  ) {
     fail(
       "task.unverifiedRun.expectedProcessGroupId",
-      "must equal the detached launch leader PID",
+      "must be null with pid or equal the detached launch leader PID",
     );
   }
   return {

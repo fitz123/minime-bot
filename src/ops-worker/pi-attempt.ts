@@ -129,6 +129,10 @@ export interface OpsWorkerPiAttemptDependencies {
   randomId?: () => string;
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
+  /** Test-only crash-boundary hook. Production callers should leave this unset. */
+  launchFaultInjector?: (
+    point: "after-launch-intent-persisted" | "after-unverified-run-persisted",
+  ) => void;
 }
 
 export interface OpsWorkerPiAttemptOptions {
@@ -235,6 +239,9 @@ export class OpsWorkerPiAttemptRunner {
   private readonly randomId: () => string;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly launchFaultInjector:
+    | NonNullable<OpsWorkerPiAttemptDependencies["launchFaultInjector"]>
+    | undefined;
 
   constructor(options: OpsWorkerPiAttemptOptions) {
     this.supervisor = options.supervisor;
@@ -299,6 +306,7 @@ export class OpsWorkerPiAttemptRunner {
       ?? ((milliseconds) => new Promise((resolveSleep) => {
         setTimeout(resolveSleep, milliseconds);
       }));
+    this.launchFaultInjector = dependencies.launchFaultInjector;
   }
 
   async runNext(): Promise<OpsWorkerTask | undefined> {
@@ -404,6 +412,16 @@ export class OpsWorkerPiAttemptRunner {
     const attemptId = `attempt-${this.randomId()}`;
     const ownershipNonce = `owner-${this.randomId()}`;
     const launchedAt = this.now().toISOString();
+    const launchIntent: OpsWorkerUnverifiedRun = {
+      attemptId,
+      supervisorInstanceId: this.supervisor.supervisorInstanceId,
+      pid: null,
+      expectedProcessGroupId: null,
+      launchedAt,
+      ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
+    };
+    this.supervisor.beginPiLaunch(task.id, launchIntent);
+    this.launchFaultInjector?.("after-launch-intent-persisted");
     let child: ChildProcess;
     try {
       const env = this.buildEnv(this.workspaceCwd);
@@ -418,8 +436,9 @@ export class OpsWorkerPiAttemptRunner {
     } catch (error) {
       return {
         classification: "CRASH",
-        task: this.supervisor.recordPreLaunchInfrastructureOutcome(
+        task: this.supervisor.recordResolvedPiLaunchFailure(
           task.id,
+          attemptId,
           `Pi process spawn failed: ${errorMessage(error)}`,
         ),
       };
@@ -448,21 +467,29 @@ export class OpsWorkerPiAttemptRunner {
     const pid = child.pid;
     if (pid === undefined) {
       const exit = await exitPromise;
+      const blocked = this.supervisor.blockUnverifiedPiLaunch(
+        task.id,
+        launchIntent,
+        `Pi process exposed no PID, so detached descendants cannot be ruled out: ${formatAttemptEvidence(exit)}`,
+      );
       return {
         classification: "CRASH",
-        task: this.supervisor.recordPreLaunchInfrastructureOutcome(
-          task.id,
-          `Pi process did not expose a PID: ${formatAttemptEvidence(exit)}`,
-        ),
+        task: blocked,
       };
     }
     const unverifiedRun: OpsWorkerUnverifiedRun = {
-      attemptId,
-      supervisorInstanceId: this.supervisor.supervisorInstanceId,
+      ...launchIntent,
       pid,
       expectedProcessGroupId: pid,
-      launchedAt,
-      ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
+    };
+    const persistUnverifiedRun = (): void => {
+      try {
+        this.supervisor.bindUnverifiedPiLaunch(task.id, unverifiedRun);
+      } catch (error) {
+        abandonUnverifiedChild(child);
+        throw error;
+      }
+      this.launchFaultInjector?.("after-unverified-run-persisted");
     };
     const identity = await this.readFreshIdentity(
       pid,
@@ -471,24 +498,36 @@ export class OpsWorkerPiAttemptRunner {
     );
     if (identity.status === "GONE") {
       const exit = await boundedExitWait(exitPromise, this.sleep);
-      if (exit === null) {
+      const group = this.inspectProcessGroup(pid);
+      if (exit === null || group.status !== "GONE") {
+        persistUnverifiedRun();
         const blocked = this.supervisor.blockUnverifiedPiLaunch(
           task.id,
           unverifiedRun,
-          `Pi PID ${pid} was reported gone but its child lifecycle did not settle`,
+          exit === null
+            ? `Pi PID ${pid} was reported gone but its child lifecycle did not settle`
+            : group.status === "AMBIGUOUS"
+            ? group.summary
+            : `Pi PID ${pid} exited before identity proof while detached process group ${pid} remains present`,
         );
         abandonUnverifiedChild(child);
         return { classification: "CRASH", task: blocked };
       }
       return {
         classification: "CRASH",
-        task: this.supervisor.recordPreLaunchInfrastructureOutcome(
+        task: this.supervisor.recordResolvedPiLaunchFailure(
           task.id,
+          attemptId,
           `Pi exited before its process-group identity was durably recorded: ${formatAttemptEvidence(exit)}`,
         ),
       };
     }
-    if (identity.status !== "OWNED" || identity.identity.processGroupId !== pid) {
+    if (
+      identity.status !== "OWNED"
+      || identity.identity.processGroupId !== pid
+      || identity.identity.ownershipNonce !== ownershipNonce
+    ) {
+      persistUnverifiedRun();
       const blocked = this.supervisor.blockUnverifiedPiLaunch(
         task.id,
         unverifiedRun,
@@ -510,6 +549,7 @@ export class OpsWorkerPiAttemptRunner {
       processStartedAt: this.now().toISOString(),
       processStartToken: identity.identity.processStartToken,
     };
+    persistUnverifiedRun();
     try {
       this.supervisor.markRunning(task.id, activeRun);
     } catch (error) {
@@ -544,9 +584,10 @@ export class OpsWorkerPiAttemptRunner {
             "CRASH",
             `Pi ownership was proven but RUNNING persistence failed: ${errorMessage(error)}`,
           )
-          : this.supervisor.recordPreLaunchInfrastructureOutcome(
+          : this.supervisor.recordResolvedPiLaunchFailure(
             task.id,
-            `Pi RUNNING persistence failed: ${errorMessage(error)}`,
+            attemptId,
+            `Pi RUNNING persistence failed after the owned group was proven stopped: ${errorMessage(error)}`,
           ),
       };
     }
@@ -734,7 +775,15 @@ export class OpsWorkerPiAttemptRunner {
           };
         }
       }
-      if (isExited()) return last;
+      if (isExited()) {
+        if (last.status === "GONE") return last;
+        return {
+          status: "AMBIGUOUS",
+          summary: last.status === "OWNED"
+            ? "Fresh Pi exited before proving the expected launch nonce"
+            : last.summary,
+        };
+      }
       await this.sleep(OPS_WORKER_PI_LIMITS.processInspectionPollMs);
     } while (Date.now() < deadline);
     if (last.status === "GONE") return last;
@@ -1073,9 +1122,17 @@ async function reconcileUnverifiedRun(
     killGraceMs: number;
   },
 ): Promise<OpsWorkerStartupRunResult> {
-  const inspected = options.inspect(run.pid);
+  if (run.pid === null || run.expectedProcessGroupId === null) {
+    return {
+      status: "AMBIGUOUS",
+      summary: "Pi launch intent has no persisted child identity; no process group may be signaled",
+    };
+  }
+  const pid = run.pid;
+  const expectedProcessGroupId = run.expectedProcessGroupId;
+  const inspected = options.inspect(pid);
   if (inspected.status === "GONE") {
-    const group = options.inspectGroup(run.expectedProcessGroupId);
+    const group = options.inspectGroup(expectedProcessGroupId);
     if (group.status === "GONE") {
       return { status: "GONE", summary: "Unverified Pi launch is now proven gone" };
     }
@@ -1092,11 +1149,11 @@ async function reconcileUnverifiedRun(
     && hashOwnershipNonce(inspected.identity.ownershipNonce)
       === run.ownershipNonceHash;
   if (
-    inspected.identity.pid !== run.pid
-    || inspected.identity.processGroupId !== run.expectedProcessGroupId
+    inspected.identity.pid !== pid
+    || inspected.identity.processGroupId !== expectedProcessGroupId
     || !nonceMatches
   ) {
-    const group = options.inspectGroup(run.expectedProcessGroupId);
+    const group = options.inspectGroup(expectedProcessGroupId);
     if (group.status === "GONE" && !nonceMatches) {
       return {
         status: "GONE",
@@ -1112,13 +1169,13 @@ async function reconcileUnverifiedRun(
   const verifiedRun: OpsWorkerActiveRun = {
     attemptId: run.attemptId,
     supervisorInstanceId: run.supervisorInstanceId,
-    pid: run.pid,
-    processGroupId: run.expectedProcessGroupId,
+    pid,
+    processGroupId: expectedProcessGroupId,
     processStartedAt: run.launchedAt,
     processStartToken: inspected.identity.processStartToken,
   };
   const inspectVerified = (): OpsWorkerProcessInspection => {
-    const current = options.inspect(run.pid);
+    const current = options.inspect(pid);
     if (current.status !== "OWNED") return current;
     if (
       current.identity.pid !== verifiedRun.pid
