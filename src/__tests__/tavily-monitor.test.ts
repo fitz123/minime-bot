@@ -730,10 +730,10 @@ describe("Tavily production writer lease", () => {
 });
 
 describe("Tavily threshold and durable incident state", () => {
-  it("deduplicates plan/PAYGO 80 and 95 thresholds by UTC monthly generation", async () => {
+  it("records null-key-limit samples and deduplicates account 80/95 thresholds by UTC month", async () => {
     const workspace = temporaryWorkspace();
     const clock = mutableClock("2026-07-01T00:00:00.000Z");
-    let usage = usageResponse({ planUsage: 799, paygoUsage: 999, paygoLimit: 1_250 });
+    let usage = usageResponse({ keyLimit: null, planUsage: 799, paygoUsage: 999, paygoLimit: 1_250 });
     const monitor = new TavilyMonitor({
       controlWorkspaceRoot: workspace,
       apiKey: "fixture-key",
@@ -741,11 +741,27 @@ describe("Tavily threshold and durable incident state", () => {
       fetchImpl: (async () => jsonResponse(usage)) as typeof fetch,
     });
 
-    await monitor.sampleUsage();
-    assert.equal(monitor.getState().outbox.length, 0);
+    const firstResult = await monitor.sampleUsage();
+    assert.equal(firstResult.ok, true, "an explicit null key limit is a successful sampler result");
+    const firstState = monitor.getState();
+    assert.deepEqual(firstState.latestSample?.key, {
+      usage: 700,
+      searchUsage: 600,
+      extractUsage: 100,
+    });
+    assert.deepEqual(firstState.latestSampleStatus, {
+      classification: "ok",
+      observedAt: "2026-07-01T00:00:00.000Z",
+    });
+    assert.deepEqual(firstState.telemetryStats.usageSamples, { success: 1, failure: 0 });
+    assert.equal(
+      firstState.telemetryStats.failures.some((failure) => failure.classification === "usage_invalid"),
+      false,
+    );
+    assert.equal(firstState.outbox.length, 0);
 
     clock.set("2026-07-02T00:00:00.000Z");
-    usage = usageResponse({ planUsage: 800, paygoUsage: 1_000, paygoLimit: 1_250 });
+    usage = usageResponse({ keyLimit: null, planUsage: 800, paygoUsage: 1_000, paygoLimit: 1_250 });
     await monitor.sampleUsage();
     assert.deepEqual(
       monitor.getState().outbox.map((entry) => entry.key).sort(),
@@ -753,13 +769,22 @@ describe("Tavily threshold and durable incident state", () => {
     );
 
     clock.set("2026-07-03T00:00:00.000Z");
-    usage = usageResponse({ planUsage: 950, paygoUsage: 1_188, paygoLimit: 1_250 });
+    usage = usageResponse({ keyLimit: null, planUsage: 950, paygoUsage: 1_188, paygoLimit: 1_250 });
     await monitor.sampleUsage();
     await monitor.sampleUsage();
-    assert.equal(monitor.getState().outbox.length, 4, "same-cycle samples remain deduplicated");
+    assert.deepEqual(
+      monitor.getState().outbox.map((entry) => entry.key).sort(),
+      [
+        "threshold:2026-07:paygo:80",
+        "threshold:2026-07:paygo:95",
+        "threshold:2026-07:plan:80",
+        "threshold:2026-07:plan:95",
+      ],
+      "account thresholds remain unchanged and same-cycle samples remain deduplicated",
+    );
 
     clock.set("2026-08-01T00:00:00.000Z");
-    usage = usageResponse({ planUsage: 800, paygoUsage: 0, paygoLimit: 1_250 });
+    usage = usageResponse({ keyLimit: null, planUsage: 800, paygoUsage: 0, paygoLimit: 1_250 });
     await monitor.sampleUsage();
     const state = monitor.getState();
     assert.equal(state.outbox.length, 1, "prior-cycle threshold notices are no longer actionable");

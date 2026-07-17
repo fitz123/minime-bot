@@ -26,10 +26,10 @@ Represent a provider-reported nullable key limit by omitting `key.limit` and `ke
 - [x] Run focused monitor tests and `npm run typecheck` before Task 2.
 
 ### Task 2: Prove sampler and metrics behavior
-- [ ] Add an end-to-end sampler test showing a null-key-limit usage response records a successful sample rather than `usage_invalid`.
-- [ ] Verify account-based 80%/95% threshold behavior remains unchanged for the nullable-key-limit sample.
-- [ ] Add metrics coverage proving successful-sample and account plan/PAYGO gauges are populated, including PAYGO limit 1,250.
-- [ ] Run focused monitor, runtime, metrics, and status tests before Task 3.
+- [x] Add an end-to-end sampler test showing a null-key-limit usage response records a successful sample rather than `usage_invalid`.
+- [x] Verify account-based 80%/95% threshold behavior remains unchanged for the nullable-key-limit sample.
+- [x] Add metrics coverage proving successful-sample and account plan/PAYGO gauges are populated, including PAYGO limit 1,250.
+- [x] Run focused monitor, runtime, metrics, and status tests before Task 3.
 
 ### Task 3: Validate scope and package
 - [ ] Confirm `git diff --check` passes and the diff is limited to the monitor, relevant tests, and this plan.
