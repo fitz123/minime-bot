@@ -157,27 +157,27 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 2: Cron outbox primitive (#65)
 
-- [ ] Create `src/cron-outbox.ts`: one durable single-slot pending-delivery record per
+- [x] Create `src/cron-outbox.ts`: one durable single-slot pending-delivery record per
   cron. Move `sanitizeCronMetricStem()` and `shortStableHash()` here from
   `src/cron-runner.ts`, export them, and import them back in `cron-runner.ts` (one
   definition, no import cycle). Record path:
   `join(resolveWorkspaceContract().paths.dataDir, "cron-outbox", "<stem>.json")`.
-- [ ] Define and export `CronOutboxRecord` (see Technical Details): `version: 1`,
+- [x] Define and export `CronOutboxRecord` (see Technical Details): `version: 1`,
   `cron`, `runId`, `kind: "output" | "failure-notice"`, `payload`, `chatId`,
   `threadId?`, `createdAt` (ISO), `attempts`.
-- [ ] Implement `writeCronOutboxRecord(record)` (mkdir recursive + tmp+rename atomic
+- [x] Implement `writeCronOutboxRecord(record)` (mkdir recursive + tmp+rename atomic
   write with the same dot-prefixed tmp naming as `writeAtomicTextFile`),
   `readCronOutboxRecord(cronName): CronOutboxRecord | "corrupt" | undefined` (missing
   file → `undefined`; unparseable JSON, wrong `version`, or non-string `payload` →
   `"corrupt"`; never throws), and `clearCronOutboxRecord(cronName)` (idempotent unlink).
-- [ ] Write tests `src/__tests__/cron-outbox.test.ts` (success): round-trip
+- [x] Write tests `src/__tests__/cron-outbox.test.ts` (success): round-trip
   write/read/clear under a temp `MINIME_CONTROL_WORKSPACE_ROOT` (via
   `installCronTestEnv()`); no stray tmp files after write; stem collision-safety for
   exotic cron names sharing a sanitized prefix.
-- [ ] Write tests (error/edge): malformed JSON → `"corrupt"`; wrong version →
+- [x] Write tests (error/edge): malformed JSON → `"corrupt"`; wrong version →
   `"corrupt"`; missing dir auto-created on write; clear of nonexistent record is a
   no-op; read with no outbox dir → `undefined`.
-- [ ] Run focused tests (`cron-outbox.test.ts` plus Task 1 files) — must pass before
+- [x] Run focused tests (`cron-outbox.test.ts` plus Task 1 files) — must pass before
   Task 3.
 
 ### Task 3: Wire durable delivery into the cron run (#65)

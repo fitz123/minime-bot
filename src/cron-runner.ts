@@ -19,7 +19,6 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
 import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
@@ -41,6 +40,7 @@ import {
 } from "./pi-process-utils.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
+import { sanitizeCronMetricStem } from "./cron-outbox.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -157,17 +157,6 @@ function log(taskName: string, msg: string): void {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   appendFileSync(logFile, line);
   process.stderr.write(line);
-}
-
-function shortStableHash(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 12);
-}
-
-function sanitizeCronMetricStem(cronName: string): string {
-  const safeName = cronName.trim()
-    .replace(/[^A-Za-z0-9_-]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return `${safeName || "unnamed"}_${shortStableHash(cronName)}`;
 }
 
 function escapePrometheusLabelValue(value: string): string {
