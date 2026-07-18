@@ -13,11 +13,16 @@ import {
   readExpectedOpsWorkerParityContract,
   writeOpsWorkerParityReport,
 } from "../../pi-extensions/ops-worker-parity-attestation.js";
+import { captureCodexQuotaFromHeaders } from "../../pi-extensions/codex-usage.js";
 
 const [scenario, ...args] = process.argv.slice(2);
+const quotaProbe = scenario.startsWith("quota-probe-");
 let privatePrompt = "";
 for await (const chunk of process.stdin) privatePrompt += chunk.toString();
-if (!privatePrompt.includes("Ops worker objective:")) {
+if (
+  (!quotaProbe && !privatePrompt.includes("Ops worker objective:"))
+  || (quotaProbe && !privatePrompt.includes("bounded quota smoke probe"))
+) {
   process.stderr.write("fake Pi requires its private prompt on stdin\n");
   process.exit(64);
 }
@@ -43,21 +48,26 @@ const createdSessionId = flagValue("--session-id");
 const resumedSessionId = flagValue("--session");
 const sessionId = createdSessionId ?? resumedSessionId;
 
-if (!sessionDirectory || !sessionId) {
+if (!quotaProbe && (!sessionDirectory || !sessionId)) {
   process.stderr.write("fake Pi requires ordinary session flags\n");
   process.exit(64);
 }
 
-mkdirSync(sessionDirectory, { recursive: true });
+if (quotaProbe && !args.includes("--no-session")) {
+  process.stderr.write("fake Pi quota probe requires --no-session\n");
+  process.exit(64);
+}
+
+if (sessionDirectory) mkdirSync(sessionDirectory, { recursive: true });
 let sessionFile;
-for (const file of readdirSync(sessionDirectory)) {
+for (const file of sessionDirectory ? readdirSync(sessionDirectory) : []) {
   if (file.endsWith(".jsonl") && file.includes(sessionId)) {
     sessionFile = join(sessionDirectory, file);
     break;
   }
 }
 
-if (resumedSessionId) {
+if (!quotaProbe && resumedSessionId) {
   if (!sessionFile) {
     process.stderr.write(`No session found matching '${sessionId}'\n`);
     process.exit(1);
@@ -72,7 +82,7 @@ if (resumedSessionId) {
   }
 }
 
-if (!sessionFile) {
+if (!quotaProbe && !sessionFile) {
   const timestamp = new Date().toISOString();
   sessionFile = join(
     sessionDirectory,
@@ -87,7 +97,7 @@ if (!sessionFile) {
   })}\n`, "utf8");
 }
 
-if (existsSync(sessionFile)) {
+if (sessionFile && existsSync(sessionFile)) {
   appendFileSync(sessionFile, `${JSON.stringify({
     type: "message",
     id: "fixture-message",
@@ -169,7 +179,26 @@ switch (scenario) {
     process.exitCode = 2;
     break;
   case "quota":
+    captureCodexQuotaFromHeaders({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
+    });
     process.stderr.write("HTTP 429 rate limit quota exhausted\n");
+    process.exitCode = 1;
+    break;
+  case "quota-probe-success":
+    captureCodexQuotaFromHeaders({
+      "x-codex-primary-used-percent": "10",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 18_000),
+    });
+    process.stdout.write("OK\n");
+    break;
+  case "quota-probe-quota":
+    captureCodexQuotaFromHeaders({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
+    });
+    process.stderr.write("HTTP 429 quota smoke probe rate limit\n");
     process.exitCode = 1;
     break;
   case "network":

@@ -225,7 +225,7 @@ describe("ops-worker before-provider parity attestation", () => {
     }
   });
 
-  it("ships a package-owned marker and before_agent_start gate", async () => {
+  it("ships a package-owned marker, parity gate, and attempt quota capture", async () => {
     const commands: string[] = [];
     const events: string[] = [];
     const wrapper = (await import(
@@ -236,6 +236,6 @@ describe("ops-worker before-provider parity attestation", () => {
       on: (event: string) => events.push(event),
     } as unknown as ExtensionAPI);
     assert.deepEqual(commands, ["minime-ops-parity-resource"]);
-    assert.deepEqual(events, ["before_agent_start"]);
+    assert.deepEqual(events, ["before_agent_start", "after_provider_response"]);
   });
 });

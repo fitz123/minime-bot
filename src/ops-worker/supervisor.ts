@@ -28,6 +28,13 @@ import {
   OpsWorkerLifecycle,
 } from "./lifecycle.js";
 import {
+  DEFAULT_OPS_WORKER_QUOTA_RECHECK_MS,
+  isAuthoritativeQuotaDecision,
+  type OpsWorkerQuotaAdmissionDecision,
+  type OpsWorkerQuotaAdmissionGate,
+  type OpsWorkerQuotaResponseDecision,
+} from "./quota.js";
+import {
   OPS_WORKER_TASK_STORE_NO_CHANGE,
   OpsWorkerTaskStore,
 } from "./task-store.js";
@@ -66,7 +73,7 @@ const ALLOWED_STATE_TRANSITIONS: Readonly<
   CANCELLED: [],
 };
 
-export type OpsWorkerScheduledAction = "RUN" | "CHECK";
+export type OpsWorkerScheduledAction = "RUN" | "CHECK" | "QUOTA_PROBE" | "WAIT";
 
 export interface OpsWorkerScheduledTask {
   action: OpsWorkerScheduledAction;
@@ -105,6 +112,8 @@ export interface OpsWorkerSupervisorOptions {
   infrastructureRetryMs?: number;
   authorizationQueryRetryMs?: number;
   authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+  quotaAdmission?: OpsWorkerQuotaAdmissionGate;
+  quotaRecheckMs?: number;
   /**
    * Trusted host identity inspection. Without it, an existing lock is
    * ambiguous and is never removed merely because its PID looks reusable.
@@ -488,6 +497,18 @@ export function isOpsWorkerUnresolvedOrphan(task: OpsWorkerTask): boolean {
     && task.lastOutcome?.result === "AMBIGUOUS_ORPHAN";
 }
 
+export function isOpsWorkerQuotaWait(task: OpsWorkerTask): boolean {
+  return task.lastOutcome?.result === "QUOTA"
+    || task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT"
+    || task.lastOutcome?.result === "QUOTA_TELEMETRY_ERROR"
+    || task.lastOutcome?.result === "QUOTA_PROBE_ERROR";
+}
+
+function isAuthoritativePersistedQuotaWait(task: OpsWorkerTask): boolean {
+  return task.lastOutcome?.result === "QUOTA"
+    || task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT";
+}
+
 function truncateUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   let result = "";
@@ -508,6 +529,8 @@ export class OpsWorkerSupervisor {
   private readonly instanceId: string;
   private readonly now: () => Date;
   private readonly infrastructureRetryMs: number;
+  private readonly quotaAdmission: OpsWorkerQuotaAdmissionGate | undefined;
+  private readonly quotaRecheckMs: number;
   private readonly reconcileActiveRun:
     | ((task: OpsWorkerTask) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>)
     | undefined;
@@ -531,11 +554,24 @@ export class OpsWorkerSupervisor {
         "infrastructureRetryMs must be an integer between 1 and 86400000",
       );
     }
+    const quotaRecheckMs = options.quotaRecheckMs
+      ?? DEFAULT_OPS_WORKER_QUOTA_RECHECK_MS;
+    if (
+      !Number.isSafeInteger(quotaRecheckMs)
+      || quotaRecheckMs < 1
+      || quotaRecheckMs > 24 * 60 * 60 * 1_000
+    ) {
+      throw new TypeError(
+        "quotaRecheckMs must be an integer between 1 and 86400000",
+      );
+    }
     this.store = options.store;
     this.doneChecks = options.doneChecks;
     this.instanceId = options.instanceId;
     this.now = options.now ?? (() => new Date());
     this.infrastructureRetryMs = infrastructureRetryMs;
+    this.quotaAdmission = options.quotaAdmission;
+    this.quotaRecheckMs = quotaRecheckMs;
     this.reconcileActiveRun = options.reconcileActiveRun;
     this.authorization = new OpsWorkerAuthorizationCoordinator(this.store, {
       verifiers: options.authorizationVerifiers,
@@ -681,6 +717,8 @@ export class OpsWorkerSupervisor {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const scheduled = this.selectScheduledTask(this.store.list());
       if (!scheduled) return undefined;
+      const quotaScheduled = await this.applyQuotaScheduling(scheduled, true);
+      if (quotaScheduled) return quotaScheduled;
       const claimed = await this.claimTaskCustody(
         scheduled.task.id,
         scheduled.action,
@@ -700,6 +738,14 @@ export class OpsWorkerSupervisor {
     action: OpsWorkerScheduledAction,
   ): Promise<OpsWorkerTask> {
     this.assertStarted();
+    if (action === "RUN" && this.quotaAdmission) {
+      const current = this.requireTask(taskId);
+      const quotaScheduled = await this.applyQuotaScheduling(
+        { action, task: current },
+        false,
+      );
+      if (quotaScheduled) return quotaScheduled.task;
+    }
     const claimed = await this.claimTaskCustody(taskId, action, false);
     if (!claimed) {
       throw new OpsWorkerSupervisorStateError(
@@ -731,7 +777,12 @@ export class OpsWorkerSupervisor {
         if (
           task.schedule.nextRunAt !== null
           && Date.parse(task.schedule.nextRunAt) > now
-        ) return [];
+        ) {
+          if (
+            !isOpsWorkerQuotaWait(task)
+            || this.quotaAdmission?.check().status !== "ADMITTED"
+          ) return [];
+        }
         return [{ action: "RUN", task }];
       }
       return [];
@@ -760,6 +811,11 @@ export class OpsWorkerSupervisor {
     action: OpsWorkerScheduledAction,
     requireCurrentSelection: boolean,
   ): Promise<OpsWorkerTask | undefined> {
+    if (action !== "RUN" && action !== "CHECK") {
+      throw new OpsWorkerSupervisorStateError(
+        `Custody cannot be claimed for scheduler action ${action}`,
+      );
+    }
     let selectionChanged = false;
     const result = await this.authorization.revalidate(taskId, {
       audit: {
@@ -810,6 +866,40 @@ export class OpsWorkerSupervisor {
       },
     });
     return selectionChanged ? undefined : result.task;
+  }
+
+  private async applyQuotaScheduling(
+    scheduled: OpsWorkerScheduledTask,
+    requireCurrentSelection: boolean,
+  ): Promise<OpsWorkerScheduledTask | undefined> {
+    if (scheduled.action !== "RUN" || !this.quotaAdmission) return undefined;
+    const task = this.requireTask(scheduled.task.id);
+    if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") return undefined;
+    const decision = this.quotaAdmission.check();
+    const wait = isOpsWorkerQuotaWait(task);
+    const authoritativeDeadline = wait
+      && isAuthoritativePersistedQuotaWait(task)
+      && task.schedule.nextRunAt !== null
+      && Date.parse(task.schedule.nextRunAt) <= this.now().getTime();
+    if (wait && (decision.status === "ADMITTED" || authoritativeDeadline)) {
+      if (task.custody.status !== "HELD" && decision.status === "ADMITTED") {
+        const claimed = await this.claimTaskCustody(
+          task.id,
+          "RUN",
+          requireCurrentSelection,
+        );
+        if (!claimed) return undefined;
+        return { action: "QUOTA_PROBE", task: claimed };
+      }
+      return { action: "QUOTA_PROBE", task };
+    }
+    if (decision.status === "NOT_ADMITTED") {
+      return {
+        action: "WAIT",
+        task: this.recordQuotaAdmissionWait(task.id, decision),
+      };
+    }
+    return undefined;
   }
 
   beginPiLaunch(
@@ -1028,6 +1118,218 @@ export class OpsWorkerSupervisor {
         appendEvidence(replacement, this.piEvidence(at, evidenceSummary));
       }
     }, "Pi claim queued deterministic done check");
+  }
+
+  recordQuotaAdmissionWait(
+    taskId: string,
+    decision: OpsWorkerQuotaAdmissionDecision,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    if (decision.status !== "NOT_ADMITTED") {
+      throw new OpsWorkerSupervisorStateError(
+        "Quota admission wait requires a NOT_ADMITTED decision",
+      );
+    }
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Quota admission wait requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    const nextRunAt = isAuthoritativeQuotaDecision(decision)
+      ? decision.nextProbeAt as string
+      : new Date(this.now().getTime() + this.quotaRecheckMs).toISOString();
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: "Recorded durable quota admission wait" },
+      (task) => {
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        task.schedule.nextRunAt = nextRunAt;
+        task.schedule.nextCheckAt = null;
+        task.lastOutcome = {
+          at,
+          kind: "INFRASTRUCTURE",
+          result: isAuthoritativeQuotaDecision(decision)
+            ? "QUOTA_ADMISSION_WAIT"
+            : "QUOTA_TELEMETRY_ERROR",
+          summary: truncateUtf8(
+            `${decision.summary}; evidence=${decision.evidenceHash}`,
+            OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+          ),
+        };
+      },
+    ).task;
+  }
+
+  recordQuotaResponseWait(
+    taskId: string,
+    response: OpsWorkerQuotaResponseDecision,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (
+      existing.state !== "QUEUED"
+      && existing.state !== "RUNNING"
+      && existing.state !== "RESUMABLE"
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        `Quota response wait requires QUEUED, RUNNING, or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    if (response.status === "TELEMETRY_ERROR") {
+      if (existing.state === "QUEUED") {
+        return this.recordQuotaProbeTelemetryError(taskId, response.summary);
+      }
+      return this.recordQuotaTelemetryError(taskId, response.summary, evidenceSummary);
+    }
+    if (existing.state === "QUEUED") {
+      return this.store.mutate(
+        taskId,
+        { event: "TRANSITION", summary: "Refreshed unclaimed authoritative quota reset wait" },
+        (task) => {
+          const at = this.nextUpdatedAt(task);
+          task.updatedAt = at;
+          task.schedule.nextCheckAt = null;
+          task.schedule.nextRunAt = response.resetAt;
+          task.lastOutcome = {
+            at,
+            kind: "INFRASTRUCTURE",
+            result: "QUOTA",
+            summary: truncateUtf8(
+              `${response.summary}; evidence=${response.evidenceHash}`,
+              OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+            ),
+          };
+          if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+        },
+      ).task;
+    }
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = task.session.sessionId !== null;
+      task.schedule.nextCheckAt = null;
+      task.schedule.nextRunAt = response.resetAt;
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA",
+        summary: truncateUtf8(
+          `${response.summary}; evidence=${response.evidenceHash}`,
+          OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+        ),
+      };
+      if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+    }, "Recorded authoritative quota reset wait");
+  }
+
+  recordQuotaProbeSuccess(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Quota probe success requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: "Quota smoke probe restored runnable state" },
+      (task) => {
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        task.schedule.nextRunAt = null;
+        task.schedule.nextCheckAt = null;
+        task.lastOutcome = {
+          at,
+          kind: "INFRASTRUCTURE",
+          result: "QUOTA_PROBE_PASS",
+          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+        };
+      },
+    ).task;
+  }
+
+  recordQuotaProbeError(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Quota probe error requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: "Recorded bounded quota probe error" },
+      (task) => {
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        task.schedule.nextRunAt = new Date(
+          this.now().getTime() + this.quotaRecheckMs,
+        ).toISOString();
+        task.schedule.nextCheckAt = null;
+        task.lastOutcome = {
+          at,
+          kind: "INFRASTRUCTURE",
+          result: "QUOTA_PROBE_ERROR",
+          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+        };
+      },
+    ).task;
+  }
+
+  recordQuotaProbeTelemetryError(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Quota probe telemetry error requires QUEUED or RESUMABLE, found ${existing.state}`,
+      );
+    }
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: "Recorded quota probe telemetry error" },
+      (task) => {
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        task.schedule.nextRunAt = new Date(
+          this.now().getTime() + this.quotaRecheckMs,
+        ).toISOString();
+        task.schedule.nextCheckAt = null;
+        task.lastOutcome = {
+          at,
+          kind: "INFRASTRUCTURE",
+          result: "QUOTA_TELEMETRY_ERROR",
+          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+        };
+      },
+    ).task;
+  }
+
+  private recordQuotaTelemetryError(
+    taskId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    const existing = this.requireTask(taskId);
+    const target = existing.state === "RUNNING" ? "RESUMABLE" : existing.state;
+    return this.transition(taskId, target, (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = task.session.sessionId !== null;
+      task.schedule.nextCheckAt = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.quotaRecheckMs,
+      ).toISOString();
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_TELEMETRY_ERROR",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+    }, "Recorded quota response telemetry error without inventing a reset");
   }
 
   recordResumableInfrastructureOutcome(

@@ -24,6 +24,10 @@ import {
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import type {
+  OpsWorkerQuotaAdmissionDecision,
+  OpsWorkerQuotaAdmissionGate,
+} from "../ops-worker/quota.js";
 import {
   OpsWorkerDuplicateCorrelationError,
   OpsWorkerTaskStore,
@@ -202,6 +206,7 @@ async function makeHarness(
     reconcileActiveRun?: ConstructorParameters<typeof OpsWorkerSupervisor>[0]["reconcileActiveRun"];
     faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
     authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+    quotaAdmission?: OpsWorkerQuotaAdmissionGate;
   } = {},
 ): Promise<Harness> {
   let currentNow = NOW;
@@ -234,6 +239,8 @@ async function makeHarness(
     authorizationVerifiers: options.authorizationVerifiers
       ?? fixtureAuthorizationVerifiers,
     authorizationQueryRetryMs: 1_000,
+    quotaAdmission: options.quotaAdmission,
+    quotaRecheckMs: 1_000,
   });
   await supervisor.start();
   let closed = false;
@@ -263,6 +270,32 @@ function activeRun(instanceId: string): NonNullable<OpsWorkerTask["activeRun"]> 
     processGroupId: 321,
     processStartedAt: NOW,
     processStartToken: "fixture-process-start",
+  };
+}
+
+function quotaDecision(
+  status: "ADMITTED" | "NOT_ADMITTED",
+  input: {
+    reason?: OpsWorkerQuotaAdmissionDecision["reason"];
+    nextResetAt?: string | null;
+    nextProbeAt?: string | null;
+    observedAt?: string;
+  } = {},
+): OpsWorkerQuotaAdmissionDecision {
+  const admitted = status === "ADMITTED";
+  return {
+    version: 1,
+    status,
+    reason: input.reason ?? (admitted ? "HEADROOM" : "LOW_REMAINING"),
+    observedAt: input.observedAt ?? NOW,
+    sampledAt: NOW,
+    activeWindows: ["5h"],
+    nextResetAt: input.nextResetAt ?? (admitted ? null : LATER),
+    nextProbeAt: input.nextProbeAt ?? (admitted ? null : LATER),
+    evidenceHash: `sha256:${(admitted ? "c" : "d").repeat(64)}`,
+    summary: admitted
+      ? "Codex quota admission passed for 5h"
+      : "Codex quota admission closed: LOW_REMAINING",
   };
 }
 
@@ -739,6 +772,194 @@ describe("ops worker supervisor", () => {
     );
     assert.equal(cancelled.custody.status, "RELEASED");
     assert.equal(cancelled.custody.releaseReason, "CANCELLED");
+  });
+
+  it("applies quota admission before initial custody and probes after fresh headroom", async (t) => {
+    let current = quotaDecision("NOT_ADMITTED");
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => current };
+    const harness = await makeHarness(t, { quotaAdmission: gate });
+    harness.store.create(makeTask("task-quota-admission"));
+
+    const waiting = await harness.supervisor.claimNextTask();
+    assert.equal(waiting?.action, "WAIT");
+    assert.equal(waiting?.task.state, "QUEUED");
+    assert.equal(waiting?.task.custody.status, "UNCLAIMED");
+    assert.equal(waiting?.task.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+    assert.equal(waiting?.task.schedule.nextRunAt, LATER);
+    assert.equal(waiting?.task.rounds.consecutiveInfrastructureFailures, 0);
+
+    current = quotaDecision("ADMITTED");
+    const probe = await harness.supervisor.claimNextTask();
+    assert.equal(probe?.action, "QUOTA_PROBE");
+    assert.equal(probe?.task.custody.status, "HELD");
+    const claimedAt = probe?.task.custody.claimedAt;
+
+    harness.supervisor.recordQuotaProbeSuccess(
+      "task-quota-admission",
+      "Exact worker quota smoke probe succeeded.",
+    );
+    current = quotaDecision("NOT_ADMITTED", {
+      reason: "STALE",
+      nextResetAt: null,
+      nextProbeAt: null,
+    });
+    const runnable = await harness.supervisor.claimNextTask();
+    assert.equal(runnable?.action, "RUN");
+    assert.equal(runnable?.task.custody.claimedAt, claimedAt);
+  });
+
+  it("retains held custody across quota response resets, rolling resets, and restart", async (t) => {
+    let current = quotaDecision("ADMITTED");
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => current };
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-quota-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const harness = await makeHarness(t, { quotaAdmission: gate, directory });
+    harness.store.create(makeTask("task-quota-owner", { sourceKind: "authorized-issue" }));
+    harness.store.create(makeTask("task-quota-successor", { sourceKind: "alertmanager" }));
+    const selected = await harness.supervisor.claimNextTask();
+    assert.equal(selected?.task.id, "task-quota-successor");
+    harness.supervisor.cancelTask("task-quota-successor", "Exercise the durable owner");
+    const owner = await harness.supervisor.claimNextTask();
+    assert.equal(owner?.task.id, "task-quota-owner");
+    const claimedAt = owner?.task.custody.claimedAt;
+    harness.supervisor.markRunning(
+      "task-quota-owner",
+      activeRun(harness.supervisor.supervisorInstanceId),
+    );
+
+    const waiting = harness.supervisor.recordQuotaResponseWait(
+      "task-quota-owner",
+      {
+        status: "WAIT",
+        resetAt: LATER,
+        sampledAt: NOW,
+        evidenceHash: `sha256:${"e".repeat(64)}`,
+        summary: `Codex quota response requires a reset-aware wait until ${LATER}`,
+      },
+    );
+    assert.equal(waiting.state, "RESUMABLE");
+    assert.equal(waiting.custody.status, "HELD");
+    assert.equal(waiting.custody.claimedAt, claimedAt);
+    assert.equal(waiting.lastOutcome?.result, "QUOTA");
+    assert.equal(waiting.schedule.nextRunAt, LATER);
+    assert.equal(waiting.rounds.consecutiveInfrastructureFailures, 0);
+    current = quotaDecision("NOT_ADMITTED");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    harness.setNow(LATER);
+    const probe = await harness.supervisor.claimNextTask();
+    assert.equal(probe?.action, "QUOTA_PROBE");
+    assert.equal(probe?.task.custody.claimedAt, claimedAt);
+    const rolledReset = "2026-07-17T13:00:00.000Z";
+    const rolled = harness.supervisor.recordQuotaResponseWait(
+      "task-quota-owner",
+      {
+        status: "WAIT",
+        resetAt: rolledReset,
+        sampledAt: LATER,
+        evidenceHash: `sha256:${"f".repeat(64)}`,
+        summary: `Codex quota response requires a reset-aware wait until ${rolledReset}`,
+      },
+    );
+    assert.equal(rolled.schedule.nextRunAt, rolledReset);
+    assert.equal(rolled.custody.claimedAt, claimedAt);
+
+    harness.close();
+    const restarted = await makeHarness(t, {
+      directory: harness.directory,
+      instanceId: "quota-restart-supervisor",
+      quotaAdmission: gate,
+    });
+    const persisted = restarted.store.get("task-quota-owner");
+    assert.equal(persisted?.state, "RESUMABLE");
+    assert.equal(persisted?.custody.status, "HELD");
+    assert.equal(persisted?.custody.claimedAt, claimedAt);
+    assert.equal(persisted?.schedule.nextRunAt, rolledReset);
+    assert.equal(restarted.supervisor.selectNextTask(), undefined);
+  });
+
+  it("types telemetry and probe failures without inventing reset deadlines or spending infrastructure budget", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-quota-errors");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    harness.store.create(task);
+
+    const telemetry = harness.supervisor.recordQuotaResponseWait(task.id, {
+      status: "TELEMETRY_ERROR",
+      reason: "RESETLESS",
+      evidenceHash: `sha256:${"1".repeat(64)}`,
+      summary: "Quota response telemetry is unusable: RESETLESS",
+    });
+    assert.equal(telemetry.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.equal(telemetry.schedule.nextRunAt, "2026-07-17T12:00:01.000Z");
+    assert.equal(telemetry.rounds.consecutiveInfrastructureFailures, 0);
+
+    const probe = harness.supervisor.recordQuotaProbeError(
+      task.id,
+      "Exact quota smoke probe timed out within its bounded deadline.",
+    );
+    assert.equal(probe.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(probe.schedule.nextRunAt, "2026-07-17T12:00:01.000Z");
+    assert.equal(probe.rounds.consecutiveInfrastructureFailures, 0);
+    assert.equal(probe.custody.status, "HELD");
+  });
+
+  it("refreshes an unclaimed reset wait when the reset-deadline probe is still quota-limited", async (t) => {
+    const denied = quotaDecision("NOT_ADMITTED");
+    const harness = await makeHarness(t, {
+      quotaAdmission: { check: () => denied },
+    });
+    const task = makeTask("task-unclaimed-reset-probe");
+    harness.store.create(task);
+    const initial = await harness.supervisor.claimNextTask();
+    assert.equal(initial?.action, "WAIT");
+    assert.equal(initial?.task.custody.status, "UNCLAIMED");
+
+    harness.setNow(LATER);
+    const probe = await harness.supervisor.claimNextTask();
+    assert.equal(probe?.action, "QUOTA_PROBE");
+    assert.equal(probe?.task.custody.status, "UNCLAIMED");
+    const rolledReset = "2026-07-17T13:05:00.000Z";
+    const refreshed = harness.supervisor.recordQuotaResponseWait(task.id, {
+      status: "WAIT",
+      resetAt: rolledReset,
+      sampledAt: LATER,
+      evidenceHash: `sha256:${"2".repeat(64)}`,
+      summary: `Codex quota response requires a reset-aware wait until ${rolledReset}`,
+    });
+    assert.equal(refreshed.state, "QUEUED");
+    assert.equal(refreshed.custody.status, "UNCLAIMED");
+    assert.equal(refreshed.schedule.nextRunAt, rolledReset);
+    assert.equal(refreshed.lastOutcome?.result, "QUOTA");
+
+    harness.supervisor.cancelTask(task.id, "Exercise unclaimed probe telemetry error");
+    const telemetryTask = makeTask("task-unclaimed-probe-telemetry");
+    harness.store.create(telemetryTask);
+    const telemetry = harness.supervisor.recordQuotaResponseWait(telemetryTask.id, {
+      status: "TELEMETRY_ERROR",
+      reason: "RESETLESS",
+      evidenceHash: `sha256:${"3".repeat(64)}`,
+      summary: "Quota response telemetry is unusable: RESETLESS",
+    });
+    assert.equal(telemetry.state, "QUEUED");
+    assert.equal(telemetry.custody.status, "UNCLAIMED");
+    assert.equal(telemetry.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.equal(telemetry.schedule.nextRunAt, "2026-07-17T12:05:01.000Z");
+
+    harness.supervisor.recordQuotaProbeSuccess(
+      telemetryTask.id,
+      "Exact unclaimed quota smoke probe succeeded",
+    );
+    const immediatelyRunnable = await harness.supervisor.claimNextTask();
+    assert.equal(immediatelyRunnable?.action, "RUN");
+    assert.equal(immediatelyRunnable?.task.id, telemetryTask.id);
+    assert.equal(immediatelyRunnable?.task.custody.status, "HELD");
   });
 
   it("allows DONE only through a fresh PASS, even without a Pi success claim", async (t) => {

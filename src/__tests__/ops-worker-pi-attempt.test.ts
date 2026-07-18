@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { assemblePiContext } from "../pi-context-assembler.js";
+import type { CodexQuotaSnapshot } from "../pi-extensions/codex-usage.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   resolvePiPrimaryResourceContract,
@@ -35,6 +36,10 @@ import {
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import type {
+  OpsWorkerQuotaAdmissionDecision,
+  OpsWorkerQuotaAdmissionGate,
+} from "../ops-worker/quota.js";
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
@@ -43,6 +48,7 @@ import {
   OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
+  type OpsWorkerQuotaProbeRequest,
   type OpsWorkerProcessGroupInspection,
   type OpsWorkerProcessInspection,
 } from "../ops-worker/pi-attempt.js";
@@ -76,6 +82,40 @@ const PRIMARY_TOOL_NAMES = [
   "configured_extra",
 ] as const;
 const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
+
+function admittedQuota(now = new Date()): OpsWorkerQuotaAdmissionDecision {
+  return {
+    version: 1,
+    status: "ADMITTED",
+    reason: "HEADROOM",
+    observedAt: now.toISOString(),
+    sampledAt: now.toISOString(),
+    activeWindows: ["5h"],
+    nextResetAt: null,
+    nextProbeAt: null,
+    evidenceHash: `sha256:${"c".repeat(64)}`,
+    summary: "Codex quota admission passed for 5h",
+  };
+}
+
+function quotaSnapshot(now = new Date()): CodexQuotaSnapshot {
+  const reset = new Date(Math.floor(now.getTime() / 1_000) * 1_000 + 60 * 60_000);
+  return {
+    provider: "codex",
+    sampledAt: now.toISOString(),
+    lastSuccess: now.toISOString(),
+    lastSuccessTimestamp: Math.floor(now.getTime() / 1_000),
+    windows: {
+      "5h": {
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetAt: reset.toISOString(),
+        resetTimestamp: Math.floor(reset.getTime() / 1_000),
+      },
+      week: {},
+    },
+  };
+}
 const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
   identity: "fixture-authorization",
   version: "1",
@@ -217,6 +257,7 @@ async function makeHarness(
     result: "PASS",
     summary: "Fixture is deterministically complete.",
   }),
+  options: { quotaAdmission?: OpsWorkerQuotaAdmissionGate } = {},
 ): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "minime-ops-worker-pi-"));
   const workspace = join(root, "workspace");
@@ -285,6 +326,8 @@ async function makeHarness(
     infrastructureRetryMs: 1,
     authorizationVerifiers: fixtureAuthorizationVerifiers,
     authorizationQueryRetryMs: 1,
+    quotaAdmission: options.quotaAdmission,
+    quotaRecheckMs: 1,
   });
   await supervisor.start();
   const children: ChildProcess[] = [];
@@ -634,6 +677,138 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(harness.invocations.length, 0);
   });
 
+  it("runs one exact-configuration quota smoke probe and refreshes quota waits", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("exact-quota-probe");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic authoritative quota wait.",
+    };
+    harness.store.create(task);
+    let request: OpsWorkerQuotaProbeRequest | undefined;
+    const sampled = quotaSnapshot();
+    const runner = harness.runner({
+      dependencies: {
+        runQuotaProbe: async (value) => {
+          request = value;
+          return { status: "SUCCESS", snapshot: sampled };
+        },
+      },
+    });
+
+    const resumed = await runner.runNext();
+    assert.equal(resumed?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(resumed?.custody.status, "HELD");
+    assert.equal(resumed?.rounds.consecutiveInfrastructureFailures, 0);
+    if (!request) throw new Error("Quota probe request was not captured");
+    const probeRequest = request as OpsWorkerQuotaProbeRequest;
+    assert.equal(probeRequest.model, "openai-codex/gpt-5.5");
+    assert.equal(probeRequest.thinking, "medium");
+    assert.equal(probeRequest.resources.digest, harness.primaryResources.digest);
+    assert.ok(probeRequest.args.includes("--no-session"));
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--model") + 1],
+      "openai-codex/gpt-5.5",
+    );
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--thinking") + 1],
+      "medium",
+    );
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--tools") + 1],
+      PRIMARY_TOOL_NAMES.join(","),
+    );
+    const extensions = probeRequest.args.flatMap((arg, index) =>
+      arg === "--extension" ? [probeRequest.args[index + 1]] : []);
+    assert.deepEqual(
+      extensions.slice(0, -1),
+      harness.primaryResources.extensionPaths,
+    );
+    assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
+    assert.deepEqual(
+      probeRequest.args.flatMap((arg, index) =>
+        arg === "--skill" ? [probeRequest.args[index + 1]] : []),
+      harness.primaryResources.skillPaths,
+    );
+
+    harness.supervisor.cancelTask(task.id, "Exercise another probe result");
+    const quotaAgain = makeTask("exact-quota-probe-again");
+    quotaAgain.state = "RESUMABLE";
+    quotaAgain.custody = {
+      status: "HELD",
+      claimedAt: quotaAgain.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    quotaAgain.lastOutcome = {
+      at: quotaAgain.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic rolling quota wait.",
+    };
+    harness.store.create(quotaAgain);
+    const quotaResult = await harness.runner({
+      dependencies: {
+        runQuotaProbe: async () => ({ status: "QUOTA", snapshot: sampled }),
+      },
+    }).runNext();
+    assert.equal(quotaResult?.lastOutcome?.result, "QUOTA");
+    assert.equal(quotaResult?.schedule.nextRunAt, sampled.windows["5h"].resetAt);
+    assert.equal(quotaResult?.custody.status, "HELD");
+    assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
+  it("executes the bounded probe child through parity and attempt-scoped quota capture", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("bounded-quota-probe-child");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait for the package-owned probe child.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+
+    const result = await harness.runner().runNext();
+
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(result?.custody.status, "HELD");
+    assert.equal(harness.invocations.length, 1);
+    assert.ok(harness.invocations[0].includes("--no-session"));
+    assert.equal(
+      harness.invocations[0][harness.invocations[0].indexOf("--model") + 1],
+      "openai-codex/gpt-5.5",
+    );
+    assert.equal(
+      harness.invocations[0][harness.invocations[0].indexOf("--thinking") + 1],
+      "medium",
+    );
+    assert.equal(
+      readdirSync(join(harness.supervisor.stateDirectory, "sessions", task.id))
+        .some((name) => name === "quota-smoke-telemetry.json"),
+      false,
+    );
+  });
+
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
     let checkCalls = 0;
     let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
@@ -838,7 +1013,13 @@ describe("ops worker Pi standard-session attempts", () => {
       if (scenario === "large-output") {
         assert.match(piEvidence.summary, /omitted \d+ earlier byte/);
       }
-      assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      if (scenario === "quota") {
+        assert.equal(harness.supervisor.selectNextTask(), undefined);
+        assert.ok(result.schedule.nextRunAt);
+        assert.ok(Date.parse(result.schedule.nextRunAt) > Date.now());
+      } else {
+        assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      }
       harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
   });
@@ -1237,9 +1418,10 @@ describe("ops worker Pi standard-session attempts", () => {
     const identityGone = await harness.runner({
       dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
     }).runAttempt("identity-gone");
-    assert.equal(identityGone.state, "DONE");
+    assert.equal(identityGone.state, "BLOCKED");
+    assert.equal(identityGone.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
     assert.equal(identityGone.activeRun, null);
-    assert.equal(identityGone.unverifiedRun, null);
+    assert.ok(identityGone.unverifiedRun);
 
     const missingPidHarness = await makeHarness(t);
     missingPidHarness.store.create(makeTask("missing-pid"));

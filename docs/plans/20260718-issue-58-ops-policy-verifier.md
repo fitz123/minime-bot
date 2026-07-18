@@ -62,11 +62,11 @@ Base source: `03e912f` (`origin/main` when this plan was prepared)
 
 ### Task 3: Add authoritative quota admission and reset-aware waits
 
-- [ ] Add `src/ops-worker/quota.ts` with a strict reader for the existing `CodexQuotaSnapshot`. For every active non-empty window, initial admission requires `remainingPercent >= 50` and `usedPercent <= elapsedWindowPercent + 10`; missing, stale, contradictory, durationless, or resetless telemetry returns typed not-admitted evidence.
-- [ ] Apply admission before claiming a new unheld task. An already-held task is never displaced by later admission failure; it enters a durable quota wait while successors remain fenced by the same custody owner.
-- [ ] Capture the exact attempt's server-reported quota telemetry through the existing Codex usage extension contract. After a real quota response, persist the authoritative reset timestamp and schedule a host-native wait; do not count quota as a terminal infrastructure failure and do not park an LLM.
-- [ ] At fresh telemetry headroom or the reset deadline, run one bounded smoke probe through the exact worker model/thinking/resource configuration. Resume immediately on success; on another quota result, refresh telemetry/reset and remain resumable. Missing/invalid telemetry or probe infrastructure failure is typed separately and bounded without inventing a reset.
-- [ ] Add deterministic multi-window, stale metadata, rolling-reset, exact-probe, restart, and retained-custody tests. Reuse existing quota parser/types; do not create a second sampler, quota service, or blind polling loop.
+- [x] Add `src/ops-worker/quota.ts` with a strict reader for the existing `CodexQuotaSnapshot`. For every active non-empty window, initial admission requires `remainingPercent >= 50` and `usedPercent <= elapsedWindowPercent + 10`; missing, stale, contradictory, durationless, or resetless telemetry returns typed not-admitted evidence.
+- [x] Apply admission before claiming a new unheld task. An already-held task is never displaced by later admission failure; it enters a durable quota wait while successors remain fenced by the same custody owner.
+- [x] Capture the exact attempt's server-reported quota telemetry through the existing Codex usage extension contract. After a real quota response, persist the authoritative reset timestamp and schedule a host-native wait; do not count quota as a terminal infrastructure failure and do not park an LLM.
+- [x] At fresh telemetry headroom or the reset deadline, run one bounded smoke probe through the exact worker model/thinking/resource configuration. Resume immediately on success; on another quota result, refresh telemetry/reset and remain resumable. Missing/invalid telemetry or probe infrastructure failure is typed separately and bounded without inventing a reset.
+- [x] Add deterministic multi-window, stale metadata, rolling-reset, exact-probe, restart, and retained-custody tests. Reuse existing quota parser/types; do not create a second sampler, quota service, or blind polling loop.
 
 ### Task 4: Add typed goal-appropriate composite verification
 

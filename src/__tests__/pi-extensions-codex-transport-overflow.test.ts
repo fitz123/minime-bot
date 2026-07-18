@@ -8,7 +8,10 @@ import {
 } from "../pi-extensions/codex-transport-overflow.js";
 
 type MessageEndHandler = (event: { message: unknown }) => unknown;
-type PiWrapper = (pi: { on(eventName: string, handler: MessageEndHandler): void }) => void;
+type PiWrapper = (pi: {
+  registerCommand(name: string, definition: { handler: () => Promise<void> }): void;
+  on(eventName: string, handler: MessageEndHandler): void;
+}) => void;
 
 async function loadCodexTransportOverflowWrapper(): Promise<PiWrapper> {
   const wrapperUrl = pathToFileURL(resolve("extensions/pi/codex-transport-overflow.ts"));
@@ -241,15 +244,20 @@ describe("Codex transport overflow normalization", () => {
   it("registers a message_end wrapper that returns a replacement only for normalized messages", async () => {
     const wrapper = await loadCodexTransportOverflowWrapper();
     let registeredEvent: string | undefined;
+    let registeredCommand: string | undefined;
     let handler: MessageEndHandler | undefined;
 
     wrapper({
+      registerCommand(name) {
+        registeredCommand = name;
+      },
       on(eventName, messageEndHandler) {
         registeredEvent = eventName;
         handler = messageEndHandler;
       },
     });
 
+    assert.equal(registeredCommand, "minime-codex-overflow-resource");
     assert.equal(registeredEvent, "message_end");
     assert.ok(handler);
 

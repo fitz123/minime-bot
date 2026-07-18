@@ -21,6 +21,7 @@ import {
   readSync,
   renameSync,
   statSync,
+  unlinkSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -33,6 +34,10 @@ import {
   buildPiSpawnEnv,
   DEFAULT_PI_MODEL,
 } from "../pi-rpc-protocol.js";
+import {
+  CODEX_QUOTA_ATTEMPT_FILE_ENV,
+  type CodexQuotaSnapshot,
+} from "../pi-extensions/codex-usage.js";
 import {
   OPS_WORKER_PARITY_ACK_PATH_ENV,
   OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
@@ -52,6 +57,12 @@ import {
 import type { AgentConfig, PiThinkingLevel } from "../types.js";
 import { hasFreshOpsWorkerAuthorizationPass } from "./authorization.js";
 import {
+  CodexQuotaFileReader,
+  evaluateOpsWorkerQuotaResponse,
+  type OpsWorkerQuotaReadStatus,
+} from "./quota.js";
+import {
+  isOpsWorkerQuotaWait,
   OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
   type OpsWorkerStartupRunResult,
@@ -80,6 +91,7 @@ export const OPS_WORKER_PI_LIMITS = {
   defaultTermGraceMs: 5_000,
   defaultKillGraceMs: 2_000,
   defaultParityTimeoutMs: 30_000,
+  defaultQuotaProbeTimeoutMs: 60_000,
   processInspectionPollMs: 25,
   processInspectionTimeoutMs: 1_000,
 } as const;
@@ -163,6 +175,9 @@ export interface OpsWorkerPiAttemptDependencies {
     options?: PiContextAssemblyOptions,
   ) => PiContextArtifacts | null;
   resolveParityExtensionPath?: () => string;
+  runQuotaProbe?: (
+    request: OpsWorkerQuotaProbeRequest,
+  ) => Promise<OpsWorkerQuotaProbeResult>;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
   launchFaultInjector?: (
     point: "after-launch-intent-persisted" | "after-unverified-run-persisted",
@@ -185,8 +200,25 @@ export interface OpsWorkerPiAttemptOptions {
   termGraceMs?: number;
   killGraceMs?: number;
   parityTimeoutMs?: number;
+  quotaProbeTimeoutMs?: number;
   dependencies?: OpsWorkerPiAttemptDependencies;
 }
+
+export interface OpsWorkerQuotaProbeRequest {
+  model: string;
+  thinking: PiThinkingLevel;
+  context: PiContextArtifacts;
+  resources: PiPrimaryResourceContract;
+  parityLaunch: OpsWorkerParityLaunch;
+  args: readonly string[];
+  attemptFile: string;
+}
+
+export type OpsWorkerQuotaProbeResult =
+  | { status: "SUCCESS"; snapshot: CodexQuotaSnapshot }
+  | { status: "QUOTA"; snapshot: CodexQuotaSnapshot }
+  | { status: "TELEMETRY_ERROR"; readStatus: OpsWorkerQuotaReadStatus }
+  | { status: "INFRASTRUCTURE_ERROR"; summary: string };
 
 export interface StopOwnedRunOptions {
   inspect: (run: OpsWorkerActiveRun) => OpsWorkerProcessInspection;
@@ -259,6 +291,7 @@ export class OpsWorkerPiAttemptRunner {
   private readonly termGraceMs: number;
   private readonly killGraceMs: number;
   private readonly parityTimeoutMs: number;
+  private readonly quotaProbeTimeoutMs: number;
   private readonly spawnProcess: SpawnProcess;
   private readonly resolveInvocation: (args: readonly string[]) => PiInvocation;
   private readonly buildEnv: (agentWorkspaceRoot: string) => Record<string, string>;
@@ -279,6 +312,9 @@ export class OpsWorkerPiAttemptRunner {
   >;
   private readonly assembleContext: NonNullable<OpsWorkerPiAttemptDependencies["assembleContext"]>;
   private readonly resolveParityExtensionPath: () => string;
+  private readonly runQuotaProbeProcess: (
+    request: OpsWorkerQuotaProbeRequest,
+  ) => Promise<OpsWorkerQuotaProbeResult>;
   private readonly launchFaultInjector:
     | NonNullable<OpsWorkerPiAttemptDependencies["launchFaultInjector"]>
     | undefined;
@@ -335,6 +371,12 @@ export class OpsWorkerPiAttemptRunner {
       "parityTimeoutMs",
       5 * 60_000,
     );
+    this.quotaProbeTimeoutMs = boundedDuration(
+      options.quotaProbeTimeoutMs,
+      OPS_WORKER_PI_LIMITS.defaultQuotaProbeTimeoutMs,
+      "quotaProbeTimeoutMs",
+      5 * 60_000,
+    );
     const dependencies = options.dependencies ?? {};
     this.spawnProcess = dependencies.spawnProcess
       ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
@@ -363,6 +405,8 @@ export class OpsWorkerPiAttemptRunner {
     this.assembleContext = dependencies.assembleContext ?? assemblePiContext;
     this.resolveParityExtensionPath = dependencies.resolveParityExtensionPath
       ?? resolveOpsWorkerParityExtensionPath;
+    this.runQuotaProbeProcess = dependencies.runQuotaProbe
+      ?? ((request) => this.executeQuotaProbe(request));
     this.launchFaultInjector = dependencies.launchFaultInjector;
   }
 
@@ -370,6 +414,10 @@ export class OpsWorkerPiAttemptRunner {
     if (this.abortSignal?.aborted) return undefined;
     const scheduled = await this.supervisor.claimNextTask();
     if (!scheduled) return undefined;
+    if (scheduled.action === "WAIT") return scheduled.task;
+    if (scheduled.action === "QUOTA_PROBE") {
+      return this.runQuotaSmokeProbe(scheduled.task.id);
+    }
     if (scheduled.action === "CHECK") {
       return this.runDoneCheckOrCurrent(scheduled.task.id);
     }
@@ -390,6 +438,7 @@ export class OpsWorkerPiAttemptRunner {
     if (
       authorized.custody.status !== "HELD"
       || !hasFreshOpsWorkerAuthorizationPass(authorized)
+      || isOpsWorkerQuotaWait(authorized)
     ) return authorized;
     this.supervisor.reservePiProcessGroupLaunch(taskId);
     try {
@@ -497,6 +546,8 @@ export class OpsWorkerPiAttemptRunner {
     );
     const invocation = this.resolveInvocation(args);
     const attemptId = `attempt-${this.randomId()}`;
+    const attemptQuotaFile = join(sessionDirectory, "quota-attempt-telemetry.json");
+    safeUnlink(attemptQuotaFile);
     const ownershipNonce = `owner-${this.randomId()}`;
     const launchedAt = this.now().toISOString();
     const launchIntent: OpsWorkerUnverifiedRun = {
@@ -516,6 +567,7 @@ export class OpsWorkerPiAttemptRunner {
       env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = parityLaunch.expectedPath;
       env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = parityLaunch.reportPath;
       env[OPS_WORKER_PARITY_ACK_PATH_ENV] = parityLaunch.ackPath;
+      env[CODEX_QUOTA_ATTEMPT_FILE_ENV] = attemptQuotaFile;
       child = this.spawnProcess(invocation.command, invocation.args, {
         cwd: this.workspaceCwd,
         env,
@@ -614,7 +666,9 @@ export class OpsWorkerPiAttemptRunner {
     );
     if (identity.status === "GONE") {
       const exit = await boundedExitWait(exitPromise, this.sleep);
-      const group = this.inspectProcessGroup(pid);
+      const group = exit === null
+        ? this.inspectProcessGroup(pid)
+        : await this.awaitProcessGroupGone(pid);
       if (exit === null || group.status !== "GONE") {
         const blocked = this.supervisor.blockUnverifiedPiLaunch(
           task.id,
@@ -707,14 +761,30 @@ export class OpsWorkerPiAttemptRunner {
       parityReadError = errorMessage(error);
     }
     if (parity === null || parity.status !== "PASS") {
-      const stopped = await stopOwnedProcessGroup(activeRun, {
-        inspect: this.inspectActiveRun,
-        inspectGroup: this.inspectProcessGroup,
-        signal: this.signalProcessGroup,
-        sleep: this.sleep,
-        termGraceMs: this.termGraceMs,
-        killGraceMs: this.killGraceMs,
-      });
+      const parityMismatchExit = parity?.status === "MISMATCH"
+        ? await boundedExitWait(exitPromise, this.sleep)
+        : null;
+      const stopped: OpsWorkerStartupRunResult = exitSettled || parityMismatchExit !== null
+        ? await (async () => {
+          if (parityMismatchExit === null) await exitPromise;
+          const group = await this.awaitProcessGroupGone(activeRun.processGroupId);
+          return group.status === "GONE"
+            ? { status: "GONE", summary: "Parity-failed Pi process group exited" }
+            : {
+              status: "AMBIGUOUS",
+              summary: group.status === "AMBIGUOUS"
+                ? group.summary
+                : "Parity-failed Pi leader exited while its process group remained present",
+            };
+        })()
+        : await stopOwnedProcessGroup(activeRun, {
+          inspect: this.inspectActiveRun,
+          inspectGroup: this.inspectProcessGroup,
+          signal: this.signalProcessGroup,
+          sleep: this.sleep,
+          termGraceMs: this.termGraceMs,
+          killGraceMs: this.killGraceMs,
+        });
       if (stopped.status === "AMBIGUOUS") {
         abandonDetachedChild(child);
         return {
@@ -815,7 +885,9 @@ export class OpsWorkerPiAttemptRunner {
 
     if (trigger.kind === "EXIT") {
       const group = this.inspectProcessGroup(activeRun.processGroupId);
-      if (group.status === "GONE") return this.finishNaturalExit(task.id, trigger.exit);
+      if (group.status === "GONE") {
+        return this.finishNaturalExit(task.id, trigger.exit, attemptQuotaFile);
+      }
       if (group.status === "AMBIGUOUS") {
         return {
           classification: "CRASH",
@@ -913,6 +985,7 @@ export class OpsWorkerPiAttemptRunner {
   private async finishNaturalExit(
     taskId: string,
     exit: OpsWorkerPiExit,
+    attemptQuotaFile: string,
   ): Promise<{
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
@@ -920,6 +993,7 @@ export class OpsWorkerPiAttemptRunner {
     const classification = classifyOpsWorkerPiExit(exit);
     const evidence = formatAttemptEvidence(exit);
     if (classification === "SUCCESS_CLAIM") {
+      safeUnlink(attemptQuotaFile);
       this.supervisor.recordPiSuccessClaim(
         taskId,
         "Pi exited successfully and claimed the remediation attempt completed",
@@ -931,8 +1005,25 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
     if (classification === "SESSION_CORRUPT") {
+      safeUnlink(attemptQuotaFile);
       return { classification, task: this.requireTask(taskId) };
     }
+    if (classification === "QUOTA") {
+      const response = evaluateOpsWorkerQuotaResponse(
+        new CodexQuotaFileReader(attemptQuotaFile).read(),
+        { now: this.now() },
+      );
+      safeUnlink(attemptQuotaFile);
+      return {
+        classification,
+        task: this.supervisor.recordQuotaResponseWait(
+          taskId,
+          response,
+          evidence,
+        ),
+      };
+    }
+    safeUnlink(attemptQuotaFile);
     const summary = infrastructureSummary(classification, exit);
     return {
       classification,
@@ -1056,6 +1147,201 @@ export class OpsWorkerPiAttemptRunner {
     };
   }
 
+  private async awaitProcessGroupGone(
+    processGroupId: number,
+  ): Promise<OpsWorkerProcessGroupInspection> {
+    const deadline = Date.now() + OPS_WORKER_PI_LIMITS.processInspectionTimeoutMs;
+    let inspected = this.inspectProcessGroup(processGroupId);
+    while (inspected.status === "PRESENT" && Date.now() < deadline) {
+      await this.sleep(OPS_WORKER_PI_LIMITS.processInspectionPollMs);
+      inspected = this.inspectProcessGroup(processGroupId);
+    }
+    return inspected;
+  }
+
+  private async runQuotaSmokeProbe(taskId: string): Promise<OpsWorkerTask> {
+    const task = this.requireRunnableTask(taskId);
+    if (!isOpsWorkerQuotaWait(task)) return task;
+    const context = this.assembleContext(this.primaryContextAgent, {
+      artifactWorkspaceCwd: this.workspaceCwd,
+    });
+    if (context === null) {
+      return this.supervisor.recordQuotaProbeError(
+        taskId,
+        "Exact quota smoke probe could not assemble canonical primary context",
+      );
+    }
+    const sessionDirectory = this.prepareSessionDirectory(task);
+    const parityLaunch = prepareOpsWorkerParityLaunch({
+      context,
+      resources: this.primaryResources,
+      parityExtensionPath: this.resolveParityExtensionPath(),
+      sessionDirectory,
+      opsPolicy: OPS_WORKER_SYSTEM_POLICY,
+    });
+    const args = buildPiQuotaProbeArgs(
+      this.model,
+      this.thinking,
+      context,
+      this.primaryResources,
+      parityLaunch.parityExtensionPath,
+    );
+    const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
+    safeUnlink(attemptFile);
+    let result: OpsWorkerQuotaProbeResult;
+    try {
+      result = await this.runQuotaProbeProcess({
+        model: this.model,
+        thinking: this.thinking,
+        context,
+        resources: this.primaryResources,
+        parityLaunch,
+        args,
+        attemptFile,
+      });
+    } catch (error) {
+      return this.supervisor.recordQuotaProbeError(
+        taskId,
+        `Exact quota smoke probe failed: ${errorMessage(error)}`,
+      );
+    }
+    if (result.status === "SUCCESS") {
+      return this.supervisor.recordQuotaProbeSuccess(
+        taskId,
+        "Exact worker model/thinking/resource quota smoke probe succeeded",
+      );
+    }
+    if (result.status === "QUOTA") {
+      const response = evaluateOpsWorkerQuotaResponse(
+        { status: "OK", snapshot: result.snapshot },
+        { now: this.now() },
+      );
+      return this.supervisor.recordQuotaResponseWait(taskId, response);
+    }
+    if (result.status === "TELEMETRY_ERROR") {
+      return this.supervisor.recordQuotaProbeTelemetryError(
+        taskId,
+        `Exact quota smoke probe telemetry was ${result.readStatus}`,
+      );
+    }
+    return this.supervisor.recordQuotaProbeError(taskId, result.summary);
+  }
+
+  private async executeQuotaProbe(
+    request: OpsWorkerQuotaProbeRequest,
+  ): Promise<OpsWorkerQuotaProbeResult> {
+    const invocation = this.resolveInvocation(request.args);
+    const env = this.buildEnv(this.primaryContextAgent.workspaceCwd);
+    env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = request.parityLaunch.expectedPath;
+    env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = request.parityLaunch.reportPath;
+    env[OPS_WORKER_PARITY_ACK_PATH_ENV] = request.parityLaunch.ackPath;
+    env[CODEX_QUOTA_ATTEMPT_FILE_ENV] = request.attemptFile;
+    let child: ChildProcess;
+    try {
+      child = this.spawnProcess(invocation.command, invocation.args, {
+        cwd: this.workspaceCwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: false,
+        shell: false,
+      });
+    } catch (error) {
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: `Exact quota smoke probe spawn failed: ${errorMessage(error)}`,
+      };
+    }
+    const stdout = new BoundedStreamCapture(OPS_WORKER_PI_LIMITS.maxCapturedStreamBytes);
+    const stderr = new BoundedStreamCapture(OPS_WORKER_PI_LIMITS.maxCapturedStreamBytes);
+    child.stdout?.on("data", (chunk: Buffer | string) => stdout.add(chunk));
+    child.stderr?.on("data", (chunk: Buffer | string) => stderr.add(chunk));
+    let inputError: Error | null = null;
+    if (!child.stdin) {
+      inputError = new Error("Quota smoke probe did not expose piped stdin");
+    } else {
+      child.stdin.on("error", (error) => {
+        inputError = error;
+      });
+      child.stdin.end(
+        "This is a bounded quota smoke probe. Reply with exactly OK and do not call tools.\n",
+        "utf8",
+      );
+    }
+    let exited = false;
+    const exitPromise = waitForChildExit(
+      child,
+      stdout,
+      stderr,
+      () => inputError,
+    ).then((exit) => {
+      exited = true;
+      return exit;
+    });
+    let parity: OpsWorkerParityAttestationReport | null;
+    try {
+      parity = await this.awaitParityReport(request.parityLaunch, () => exited);
+      if (parity?.status !== "PASS") {
+        await stopQuotaProbeChild(child, exitPromise, this.sleep);
+        return {
+          status: "INFRASTRUCTURE_ERROR",
+          summary: parity === null
+            ? "Exact quota smoke probe did not attest context/capability parity"
+            : `Exact quota smoke probe parity failed: ${parity.mismatch.join(", ")}`,
+        };
+      }
+      acknowledgeOpsWorkerParityPass(request.parityLaunch);
+    } catch (error) {
+      await stopQuotaProbeChild(child, exitPromise, this.sleep);
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: `Exact quota smoke probe parity failed: ${errorMessage(error)}`,
+      };
+    }
+    let timeout: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<{ kind: "TIMEOUT" }>((resolveTimeout) => {
+      timeout = setTimeout(
+        () => resolveTimeout({ kind: "TIMEOUT" }),
+        this.quotaProbeTimeoutMs,
+      );
+    });
+    const shutdownTrigger = createAbortTrigger(this.abortSignal);
+    const trigger = await Promise.race([
+      exitPromise.then((exit) => ({ kind: "EXIT" as const, exit })),
+      timeoutPromise,
+      shutdownTrigger.promise,
+    ]);
+    if (timeout) clearTimeout(timeout);
+    shutdownTrigger.close();
+    if (trigger.kind !== "EXIT") {
+      await stopQuotaProbeChild(child, exitPromise, this.sleep);
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: trigger.kind === "SHUTDOWN"
+          ? "Exact quota smoke probe was interrupted by worker shutdown"
+          : "Exact quota smoke probe exceeded its bounded deadline",
+      };
+    }
+    const { exit } = trigger;
+    const read = new CodexQuotaFileReader(request.attemptFile).read();
+    safeUnlink(request.attemptFile);
+    if (read.status !== "OK") {
+      return { status: "TELEMETRY_ERROR", readStatus: read.status };
+    }
+    const classification = classifyOpsWorkerPiExit(exit);
+    if (classification === "SUCCESS_CLAIM") {
+      return { status: "SUCCESS", snapshot: read.snapshot };
+    }
+    if (classification === "QUOTA") {
+      return { status: "QUOTA", snapshot: read.snapshot };
+    }
+    return {
+      status: "INFRASTRUCTURE_ERROR",
+      summary: classification === "SESSION_CORRUPT"
+        ? "Exact quota smoke probe unexpectedly reported session corruption"
+        : `Exact quota smoke probe failed: ${infrastructureSummary(classification, exit)}`,
+    };
+  }
+
   private prepareSessionDirectory(task: OpsWorkerTask): string {
     const expected = `sessions/${task.id}`;
     if (task.session.directory !== expected) {
@@ -1107,6 +1393,41 @@ export function buildPiAttemptArgs(
     sessionDirectory,
     task.session.resume ? "--session" : "--session-id",
     task.session.sessionId,
+    "--no-extensions",
+    "--no-skills",
+  ];
+  if (context.systemPromptPath) {
+    args.push("--system-prompt", context.systemPromptPath);
+  }
+  args.push(
+    "--append-system-prompt",
+    context.appendSystemPromptPath,
+    "--no-context-files",
+    "--append-system-prompt",
+    OPS_WORKER_SYSTEM_POLICY,
+  );
+  for (const extensionPath of [...resources.extensionPaths, parityExtensionPath]) {
+    args.push("--extension", extensionPath);
+  }
+  for (const skillPath of resources.skillPaths) args.push("--skill", skillPath);
+  args.push(
+    "--tools", resources.toolNames.join(","),
+    "--model", model,
+    "--thinking", thinking,
+  );
+  return args;
+}
+
+export function buildPiQuotaProbeArgs(
+  model: string,
+  thinking: string,
+  context: PiContextArtifacts,
+  resources: PiPrimaryResourceContract,
+  parityExtensionPath: string,
+): string[] {
+  const args = [
+    "-p",
+    "--no-session",
     "--no-extensions",
     "--no-skills",
   ];
@@ -1431,7 +1752,11 @@ export async function stopOwnedProcessGroup(
 ): Promise<OpsWorkerStartupRunResult> {
   const initial = options.inspect(run);
   if (initial.status === "GONE") {
-    const group = options.inspectGroup(run.processGroupId);
+    const group = await waitForOwnedGroupExit(
+      run,
+      options,
+      OPS_WORKER_PI_LIMITS.processInspectionTimeoutMs,
+    );
     if (group.status === "GONE") {
       return { status: "GONE", summary: "Owned Pi process group is already gone" };
     }
@@ -1465,6 +1790,22 @@ export async function stopOwnedProcessGroup(
   if (beforeKill.status !== "PRESENT") return stopResult(beforeKill, "TERM");
   const ownerBeforeKill = options.inspect(run);
   if (ownerBeforeKill.status !== "OWNED") {
+    if (ownerBeforeKill.status === "GONE") {
+      const settled = await waitForOwnedGroupExit(
+        run,
+        options,
+        OPS_WORKER_PI_LIMITS.processInspectionTimeoutMs,
+      );
+      if (settled.status === "GONE") {
+        return {
+          status: "STOPPED",
+          summary: "Pi leader exited after TERM and its process group became empty",
+        };
+      }
+      if (settled.status === "AMBIGUOUS") {
+        return { status: "AMBIGUOUS", summary: settled.summary };
+      }
+    }
     return {
       status: "AMBIGUOUS",
       summary: ownerBeforeKill.status === "AMBIGUOUS"
@@ -1594,6 +1935,14 @@ function ensureOwnedDirectory(path: string): void {
     throw new Error("Refusing ops-worker session directory owned by another user");
   }
   if ((stats.mode & 0o777) !== 0o700) chmodSync(path, 0o700);
+}
+
+function safeUnlink(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 function inspectStandardSession(
@@ -1967,6 +2316,17 @@ async function boundedExitWait(
     exit,
     sleep(1_000).then(() => null),
   ]);
+}
+
+async function stopQuotaProbeChild(
+  child: ChildProcess,
+  exit: Promise<OpsWorkerPiExit>,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<void> {
+  child.kill("SIGTERM");
+  if (await boundedExitWait(exit, sleep)) return;
+  child.kill("SIGKILL");
+  await boundedExitWait(exit, sleep);
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

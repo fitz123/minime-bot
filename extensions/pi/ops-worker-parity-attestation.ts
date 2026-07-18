@@ -8,6 +8,10 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  captureCodexQuotaFromProviderResponse,
+  formatCodexQuotaWriteError,
+} from "../../src/pi-extensions/codex-usage.js";
+import {
   OPS_WORKER_PARITY_ACK_PATH_ENV,
   OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
   OPS_WORKER_PARITY_FAILURE_EXIT_CODE,
@@ -53,6 +57,15 @@ export default function (pi: ExtensionAPI): void {
       // Pi contains extension handler errors and could otherwise continue to the
       // provider. This gate must terminate on every malformed or I/O failure.
       process.exit(OPS_WORKER_PARITY_FAILURE_EXIT_CODE);
+    }
+  });
+
+  pi.on("after_provider_response", (...args: unknown[]) => {
+    const event = args.length === 1 ? args[0] : args;
+    const result = captureCodexQuotaFromProviderResponse(event);
+    if (result.status === "write_error") {
+      // eslint-disable-next-line no-console -- bounded package-owned capture failure
+      console.warn(formatCodexQuotaWriteError(result.error));
     }
   });
 }
