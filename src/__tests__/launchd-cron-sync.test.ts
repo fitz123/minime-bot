@@ -95,6 +95,29 @@ function writeRunner(directory: string, mode = 0o700): string {
   return runner;
 }
 
+function writeSemanticPlutil(fixture: Fixture): string {
+  const plutil = join(fixture.root, "semantic-plutil.sh");
+  writeFileSync(plutil, `#!/bin/sh
+if [ "$#" -ne 5 ] || [ "$1" != "-convert" ] || [ "$2" != "json" ] || [ "$3" != "-o" ] || [ "$4" != "-" ]; then
+  exit 64
+fi
+if [ "$5" = "-" ]; then
+  input="$(cat)"
+  case "$input" in
+    *'<key>Label</key>'*) ;;
+    *) exit 65 ;;
+  esac
+elif [ -f "$5" ] && grep -q 'existing-format' "$5"; then
+  :
+else
+  exit 66
+fi
+printf '%s\\n' '{"Label":"ai.minime.cron.active","Nested":{"Enabled":true,"Values":[1,2]}}'
+`, "utf8");
+  chmodSync(plutil, 0o700);
+  return plutil;
+}
+
 function generateWithRunner(fixture: Fixture, runCronScript?: string) {
   writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
   return generateLaunchdCronPlists({
@@ -534,6 +557,42 @@ describe("launchd cron runner selection", () => {
 });
 
 describe("launchd cron plist sync", () => {
+  it("uses the configured plutil to keep differently formatted equal plists unchanged", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(generated.plists[0].plistPath, "existing-format", "utf8");
+      const plutil = writeSemanticPlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "unchanged:ai.minime.cron.active",
+      ]);
+      assert.equal(result.context.plutilBin, plutil);
+      assert.equal(readFileSync(generated.plists[0].plistPath, "utf8"), "existing-format");
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("uses crons.local.yaml overrides when rendering StartCalendarInterval", () => {
     const fixture = createFixture();
     try {

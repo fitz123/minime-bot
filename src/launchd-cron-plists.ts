@@ -25,6 +25,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { loadMergedCrons } from "./cron-loader.js";
 import {
   expandCronField,
@@ -340,7 +341,11 @@ export function planLaunchdCronSync(
   for (const plist of generated.plists) {
     const existing = existsSync(plist.plistPath) ? readFileSync(plist.plistPath, "utf8") : undefined;
     const action: LaunchdCronPlanAction =
-      existing === undefined ? "create" : existing === plist.content ? "unchanged" : "update";
+      existing === undefined
+        ? "create"
+        : existing === plist.content || plistsSemanticallyEqual(generated.context, plist.plistPath, plist.content)
+          ? "unchanged"
+          : "update";
     items.push({
       action,
       label: plist.label,
@@ -713,6 +718,39 @@ function defaultCommandRunner(command: string, args: readonly string[]): Launchd
     stderr: result.stderr ?? "",
     error: result.error,
   };
+}
+
+function plistsSemanticallyEqual(
+  context: LaunchdCronContext,
+  existingPath: string,
+  desiredContent: string,
+): boolean {
+  const existing = parsePlistJson(context.plutilBin, existingPath);
+  if (!existing.ok) {
+    return false;
+  }
+  const desired = parsePlistJson(context.plutilBin, "-", desiredContent);
+  return desired.ok && isDeepStrictEqual(existing.value, desired.value);
+}
+
+function parsePlistJson(
+  plutilBin: string,
+  inputPath: string,
+  input?: string,
+): { ok: true; value: unknown } | { ok: false } {
+  const result = spawnSync(
+    plutilBin,
+    ["-convert", "json", "-o", "-", inputPath],
+    { encoding: "utf8", input },
+  );
+  if (result.error || result.status !== 0) {
+    return { ok: false };
+  }
+  try {
+    return { ok: true, value: JSON.parse(result.stdout) as unknown };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function runPlutilLint(

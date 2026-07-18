@@ -37,10 +37,10 @@ git diff --check origin/main...HEAD
 
 ### Task 1: Semantic equality in planning
 
-- [ ] Add the raw-equal fast path plus read-only semantic plist comparison for differing bytes.
-- [ ] Use the resolved `context.plutilBin`; parse desired content via stdin and existing content from its file path; compare parsed values with deep strict equality.
-- [ ] Fail safely to `update` on command/exit/JSON failure without exposing parser output.
-- [ ] Keep create/delete/write/rebootstrap/rollback behavior unchanged.
+- [x] Add the raw-equal fast path plus read-only semantic plist comparison for differing bytes.
+- [x] Use the resolved `context.plutilBin`; parse desired content via stdin and existing content from its file path; compare parsed values with deep strict equality.
+- [x] Fail safely to `update` on command/exit/JSON failure without exposing parser output.
+- [x] Keep create/delete/write/rebootstrap/rollback behavior unchanged.
 
 ### Task 2: Production-shape regressions
 
