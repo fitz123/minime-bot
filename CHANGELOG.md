@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.7.16
+
+- Preserve an explicit validated cron runner during launchd cron generation and sync, including atomic release-slot selectors, narrow unchanged/create planning, and fail-closed zero-write validation.
+- Add the inactive-by-default ADR-094 ops-worker core with strict task envelopes, atomic state/audit persistence, deterministic scheduling, bounded process supervision, and no production registrations or activation.
+
 ## 2026.7.15
 
 - Replace Tavily with one package-owned Codex subscription OAuth `web_search` across interactive, delegated, cron, workflow, and recovery runtimes.
