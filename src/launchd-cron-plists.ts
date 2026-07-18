@@ -408,12 +408,10 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
     if (item.action === "unchanged") {
       continue;
     }
-    if (item.action === "update" || item.action === "delete") {
-      const activity = getCronJobActivity(planned.context, runner, commands, item.label);
-      if (activity === "active" || activity === "unknown") {
-        item.deferredReason = activity;
-        continue;
-      }
+    const activity = getCronJobActivity(planned.context, runner, commands, item.label);
+    if (activity === "active" || activity === "unknown") {
+      item.deferredReason = activity;
+      continue;
     }
     if (item.action === "delete") {
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);

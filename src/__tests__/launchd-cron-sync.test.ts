@@ -1145,6 +1145,45 @@ fi
     }
   });
 
+  for (const [activityCase, printResponse, expectedReason] of [
+    [
+      "active",
+      { status: 0, stdout: "state = running\n    pid = 4242\n", stderr: "" },
+      "active",
+    ],
+    [
+      "unknown",
+      { status: 5, stdout: "", stderr: "Operation not permitted" },
+      "unknown",
+    ],
+  ] satisfies Array<[string, LaunchdCommandResult, "active" | "unknown"]>) {
+    it(`defers a create when the existing launchd job is ${activityCase}`, () => {
+      const fixture = createFixture();
+      const calls: CommandCall[] = [];
+      try {
+        writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+        const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls, 0, [printResponse]),
+        });
+
+        assert.equal(existsSync(activePath), false);
+        assert.equal(result.items[0].deferredReason, expectedReason);
+        assert.deepEqual(calls.map((call) => call.args), [
+          ["print", "gui/501/ai.minime.cron.active"],
+        ]);
+      } finally {
+        cleanup(fixture);
+      }
+    });
+  }
+
   it("proceeds with updates and deletes when jobs are idle or known not loaded", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
@@ -1315,11 +1354,12 @@ fi
       assert.match(content, new RegExp(`<string>${escapeRegex(lexicalRunner)}</string>`));
       assert.doesNotMatch(content, new RegExp(`<string>${escapeRegex(canonicalRunner)}</string>`));
       assert.deepEqual(calls.map((call) => [call.command, call.args[0]]), [
+        ["/bin/launchctl", "print"],
         ["/usr/bin/plutil", "-lint"],
         ["/bin/launchctl", "bootout"],
         ["/bin/launchctl", "bootstrap"],
       ]);
-      assert.equal(calls[2].args[2], plistPath);
+      assert.equal(calls[3].args[2], plistPath);
     } finally {
       cleanup(fixture);
     }

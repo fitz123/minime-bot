@@ -283,22 +283,22 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] Verify #76: sentinel tests pass; spot-check that temporarily reverting
+- [x] Verify #76: sentinel tests pass; spot-check that temporarily reverting
   `resolveCronLogDir()` to import-time capture makes the sentinel fail, then restore.
-- [ ] Verify #65 against ADR-087: run identity persisted; generation vs delivery failure
+- [x] Verify #65 against ADR-087: run identity persisted; generation vs delivery failure
   distinguished (`kind`); output preserved across retries without regeneration; bounded
   attempts + expiry; queueable pending/unknown state blocks new generation; no path
   overwrites an existing owed record; terminal/retry evidence is explicit; single slot
   per cron prevents unbounded growth; at-least-once crash window is documented.
-- [ ] Verify #62: no code path issues `bootout` unless activity is proven `idle` or
+- [x] Verify #62: no code path issues `bootout` unless activity is proven `idle` or
   `not-loaded`; active/unknown states defer visibly; the same bounded helper covers
   replacement and rollback bootstrap; final rollback failure preserves previous plist
   contents and reports combined evidence.
-- [ ] Run the full suite: `npm test`; then `npm run build` and `npm run lint`.
-- [ ] Run `npm pack --dry-run` (new `dist/cron-outbox.*` ships), plus
+- [x] Run the full suite: `npm test`; then `npm run build` and `npm run lint`.
+- [x] Run `npm pack --dry-run` (new `dist/cron-outbox.*` ships), plus
   `npm run check:schema-guard-contract` and
   `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`.
-- [ ] Review `git diff --stat main...HEAD`: changes confined to `src/cron-runner.ts`,
+- [x] Review `git diff --stat main...HEAD`: changes confined to `src/cron-runner.ts`,
   `src/cron-outbox.ts`, `src/launchd-cron-plists.ts`, `src/__tests__/*`, `docs/*`,
   `README.md`, `CHANGELOG.md`.
 
