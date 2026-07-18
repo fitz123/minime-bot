@@ -38,6 +38,10 @@ import {
   syncLaunchdCrons,
   type LaunchdCommandRunner,
 } from "./launchd-cron-plists.js";
+import {
+  runOpsWorkerCliCommand,
+  type OpsWorkerCliDependencies,
+} from "./ops-worker/worker-cli.js";
 
 type WriteFn = (text: string) => void;
 
@@ -50,6 +54,7 @@ export interface CliRunOptions {
   launchdHomeDir?: string;
   launchdUid?: number;
   recoveryCommandRunner?: RecoveryCommandRunner;
+  workerDependencies?: OpsWorkerCliDependencies;
 }
 
 export interface RecoveryCommandResult {
@@ -109,6 +114,12 @@ const HELP_TEXT = `Usage:
   minime-bot recovery capsule-activate|bot-activate --release-id <id>
   minime-bot recovery capsule-bootstrap
   minime-bot recovery bot-rollback --restart-operation-id <reviewed-id>
+  minime-bot worker start --state-dir <path> --agent-workspace <path> [--host 127.0.0.1] [--port 9465] [--once]
+  minime-bot worker status|list --state-dir <path> [--json]
+  minime-bot worker inspect --state-dir <path> --id <task-id> [--json]
+  minime-bot worker submit --state-dir <path> --template <registered> --authorization <registered> --done-check <registered> --correlation-key <key> --objective <text> [--done-check-params <json>] [--json]
+  minime-bot worker retry --state-dir <path> --id <task-id> [--json]
+  minime-bot worker cancel --state-dir <path> --id <task-id> --reason <text> [--json]
 
 Options:
   --workspace <path>         Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
@@ -119,6 +130,7 @@ Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source rep
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
 Recovery control plane: host-native intake and verification with closed observe, diagnose, and enabled mode gates. Fixer execution uses a recovery-only wrapper; capsule and bot slot commands consume only staged local runtimes.
+Ops worker: inactive unless worker start is invoked. PR 1 accepts CLI submission only through trusted registries; its loopback HTTP surface is health/status only.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
@@ -798,6 +810,11 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
     if (scope === "recovery") {
       return runRecoveryCommand(action, rest, parsed, options, stdout, stderr);
     }
+    if (scope === "worker") {
+      throw new CliUsageError(
+        "worker commands require the asynchronous CLI entrypoint",
+      );
+    }
 
     if (rest.length > 0) {
       throw new CliUsageError(`unexpected argument: ${rest[0]}`);
@@ -825,6 +842,38 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
   return 2;
 }
 
+export async function runCliAsync(
+  argv: readonly string[] = process.argv.slice(2),
+  options: CliRunOptions = {},
+): Promise<number> {
+  const stdout = options.stdout ?? ((text: string) => process.stdout.write(text));
+  const stderr = options.stderr ?? ((text: string) => process.stderr.write(text));
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(argv);
+  } catch (error) {
+    writeLine(stderr, `Error: ${(error as Error).message}`);
+    return 2;
+  }
+  if (parsed.help || parsed.command[0] !== "worker") {
+    return runCli(argv, options);
+  }
+  if (parsed.workspace !== undefined) {
+    writeLine(
+      stderr,
+      "Error: worker commands do not accept --workspace; use --agent-workspace for worker start",
+    );
+    return 2;
+  }
+  const [, action, ...rest] = parsed.command;
+  return runOpsWorkerCliCommand(action, rest, {
+    cwd: cwdForCli(options),
+    stdout,
+    stderr,
+    dependencies: options.workerDependencies,
+  });
+}
+
 function realpathOrResolve(path: string): string {
   try {
     return realpathSync(path);
@@ -842,5 +891,10 @@ export function isDirectCliEntrypoint(
 }
 
 if (isDirectCliEntrypoint()) {
-  process.exitCode = runCli();
+  void runCliAsync().then((code) => {
+    process.exitCode = code;
+  }).catch((error: unknown) => {
+    process.stderr.write(`Error: ${(error as Error).message}\n`);
+    process.exitCode = 1;
+  });
 }

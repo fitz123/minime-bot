@@ -29,6 +29,7 @@
     "dist/knowledge/**/*.d.ts",
     "dist/knowledge/**/*.js",
     "dist/knowledge/**/*.js.map",
+    "dist/ops-worker/**",
     "dist/pi-extensions/**/*.d.ts",
     "dist/pi-extensions/**/*.js",
     "dist/pi-extensions/**/*.js.map",
@@ -52,6 +53,7 @@
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/monitoring.md",
+    "docs/ops-worker.md",
     "docs/recovery.md",
     "examples/recovery/*",
     "examples/monitoring/*"
