@@ -98,6 +98,22 @@ function admittedQuota(now = new Date()): OpsWorkerQuotaAdmissionDecision {
   };
 }
 
+function deniedQuota(nextProbeAt: string): OpsWorkerQuotaAdmissionDecision {
+  const observedAt = new Date().toISOString();
+  return {
+    version: 1,
+    status: "NOT_ADMITTED",
+    reason: "LOW_REMAINING",
+    observedAt,
+    sampledAt: observedAt,
+    activeWindows: ["5h"],
+    nextResetAt: nextProbeAt,
+    nextProbeAt,
+    evidenceHash: `sha256:${"d".repeat(64)}`,
+    summary: "Codex quota admission closed: LOW_REMAINING",
+  };
+}
+
 function quotaSnapshot(now = new Date()): CodexQuotaSnapshot {
   const reset = new Date(Math.floor(now.getTime() / 1_000) * 1_000 + 60 * 60_000);
   return {
@@ -785,6 +801,32 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(quotaResult?.schedule.nextRunAt, sampled.windows["5h"].resetAt);
     assert.equal(quotaResult?.custody.status, "HELD");
     assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
+  it("runs a due reset probe without claiming whole-cycle custody", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("unclaimed-quota-reset-probe");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+
+    const result = await harness.runner().runNext();
+
+    assert.equal(result?.state, "QUEUED");
+    assert.equal(result?.custody.status, "UNCLAIMED");
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(result?.schedule.nextRunAt, null);
+    assert.equal(result?.activeRun, null);
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(harness.invocations.length, 1);
   });
 
   it("executes the bounded probe child through parity and attempt-scoped quota capture", async (t) => {

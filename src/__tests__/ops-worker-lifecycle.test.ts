@@ -20,6 +20,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  hashOpsWorkerVerificationSubject,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerTask,
@@ -98,6 +99,42 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
   });
 }
 
+function attachProductFailureVerification(task: OpsWorkerTask): void {
+  const contractHash = `sha256:${"8".repeat(64)}`;
+  task.state = "RESUMABLE";
+  task.custody = {
+    status: "HELD",
+    claimedAt: NOW,
+    releasedAt: null,
+    releaseReason: null,
+  };
+  task.lifecycle.verifier = "fixture-verifier";
+  task.lifecycle.verifierVersion = "1";
+  task.lifecycle.verifierContractHash = contractHash;
+  task.verification = {
+    verifierIdentity: "fixture-verifier",
+    verifierVersion: "1",
+    contractHash,
+    subjectHash: hashOpsWorkerVerificationSubject(task),
+    checkedAt: NOW,
+    completedAt: NOW,
+    outcome: "PRODUCT_FAILURE",
+    summary: "The fixture still requires product remediation.",
+    nextCheckAt: null,
+    components: [{
+      identity: "fixture-component",
+      version: "1",
+      required: true,
+      convergence: "PRODUCT",
+      outcome: "PRODUCT_FAILURE",
+      observedAt: NOW,
+      evidenceHash: `sha256:${"7".repeat(64)}`,
+      summary: "The fixture product evidence failed.",
+      nextCheckAt: null,
+    }],
+  };
+}
+
 function makeHarness(t: TestContext): {
   directory: string;
   store: OpsWorkerTaskStore;
@@ -126,6 +163,78 @@ function makeHarness(t: TestContext): {
 }
 
 describe("ops worker package-owned lifecycle evidence", () => {
+  it("invalidates composite evidence across non-report lifecycle receipt changes", (t) => {
+    const identityHarness = makeHarness(t);
+    const identityTask = makeTask("verified-lifecycle-identity");
+    attachProductFailureVerification(identityTask);
+    identityHarness.store.create(identityTask);
+    const identity = identityHarness.lifecycle.updateLifecycleIdentity(identityTask.id, {
+      repository: "repository:example/minime-bot",
+    });
+    assert.equal(identity.verification, null);
+
+    const queryHarness = makeHarness(t);
+    const queryTask = makeTask("verified-receipt-query");
+    attachProductFailureVerification(queryTask);
+    queryHarness.store.create(queryTask);
+    const queried = queryHarness.lifecycle.beginMutationReceipt(queryTask.id, {
+      boundary: "merge",
+      operationId: "merge-query",
+      intent: { base: "main", head: "issue-58" },
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    assert.equal(queried.verification, null);
+
+    const claimHarness = makeHarness(t);
+    const claimIntent = { base: "main", head: "claim-review" };
+    const claimTask = makeTask("verified-receipt-claim");
+    claimTask.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-claim",
+      intentHash: hashOpsWorkerCanonicalPayload(claimIntent),
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ merged: false }),
+      mutationStartedAt: null,
+      outcome: null,
+      replayHistory: [],
+    };
+    attachProductFailureVerification(claimTask);
+    claimHarness.store.create(claimTask);
+    const claimed = claimHarness.lifecycle.claimMutationReceipt(claimTask.id, {
+      boundary: "merge",
+      operationId: "merge-claim",
+      intent: claimIntent,
+    });
+    assert.equal(claimed.claimed, true);
+    assert.equal(claimed.task.verification, null);
+
+    const finishHarness = makeHarness(t);
+    const finishIntent = { environment: "fixture" };
+    const finishTask = makeTask("verified-receipt-finish");
+    finishTask.mutationReceipts.deploy = {
+      boundary: "deploy",
+      operationId: "deploy-finish",
+      intentHash: hashOpsWorkerCanonicalPayload(finishIntent),
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ deployed: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    attachProductFailureVerification(finishTask);
+    finishHarness.store.create(finishTask);
+    const finished = finishHarness.lifecycle.finishMutationReceipt(finishTask.id, {
+      boundary: "deploy",
+      operationId: "deploy-finish",
+      intent: finishIntent,
+      result: "APPLIED",
+      evidence: { deployment: "fixture-deployment" },
+    });
+    assert.equal(finished.verification, null);
+    assert.equal(finished.mutationReceipts.deploy?.outcome?.result, "APPLIED");
+  });
+
   it("fails closed when a mutation claim has no injected authorization fence", (t) => {
     const harness = makeHarness(t);
     const task = makeTask("receipt-missing-authorization");

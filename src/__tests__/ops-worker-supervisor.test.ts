@@ -1890,6 +1890,39 @@ describe("ops worker supervisor", () => {
     assert.equal(recovered?.custody.status, "HELD");
   });
 
+  it("reconciles an unclaimed quota probe fence back to admission", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-unclaimed-probe-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "unclaimed-probe-first",
+    });
+    const task = makeTask("task-unclaimed-probe-restart");
+    task.state = "RUNNING";
+    task.activeRun = {
+      ...activeRun("unclaimed-probe-first"),
+      attemptId: "quota-probe-unclaimed-restart",
+    };
+    first.store.create(task);
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "unclaimed-probe-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Unclaimed quota probe process group is proven gone.",
+      }),
+    });
+    const recovered = restarted.store.get(task.id);
+    assert.equal(recovered?.state, "QUEUED");
+    assert.equal(recovered?.activeRun, null);
+    assert.equal(recovered?.unverifiedRun, null);
+    assert.equal(recovered?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.ok(recovered?.schedule.nextRunAt);
+    assert.equal(recovered?.custody.status, "UNCLAIMED");
+  });
+
   it("fails startup closed when multiple v1 snapshots migrate to held custody", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-multi-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));

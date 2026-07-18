@@ -6,6 +6,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_MUTATION_BOUNDARIES,
+  hashOpsWorkerVerificationSubject,
   isOpsWorkerTerminalState,
   type OpsWorkerLifecycleManifest,
   type OpsWorkerMutationBoundary,
@@ -378,6 +379,19 @@ function timestampAtOrAfter(now: Date, floor: string): string {
   return new Date(Math.max(milliseconds, Date.parse(floor))).toISOString();
 }
 
+function invalidateChangedCompositeVerification(task: OpsWorkerTask): void {
+  if (
+    task.verification === null
+    || task.verification.subjectHash === hashOpsWorkerVerificationSubject(task)
+  ) return;
+  if (task.state === "DONE") {
+    throw new OpsWorkerLifecycleError(
+      "DONE lifecycle proof fields are immutable after aggregate verification",
+    );
+  }
+  task.verification = null;
+}
+
 /**
  * Atomic, evidence-only lifecycle helpers. They never execute a mutation or
  * contact a transport; callers remain responsible for those external actions.
@@ -407,6 +421,7 @@ export class OpsWorkerLifecycle {
         if (!applyLifecycleIdentity(task.lifecycle, update)) {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
+        invalidateChangedCompositeVerification(task);
       },
     );
     return result.task;
@@ -470,7 +485,7 @@ export class OpsWorkerLifecycle {
           changed = true;
         }
         if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
-        task.verification = null;
+        invalidateChangedCompositeVerification(task);
       },
     );
     return result.task;
@@ -563,6 +578,7 @@ export class OpsWorkerLifecycle {
           outcome: null,
           replayHistory,
         };
+        invalidateChangedCompositeVerification(task);
       },
     );
     return result.task;
@@ -640,6 +656,7 @@ export class OpsWorkerLifecycle {
       );
     }
     receipt.mutationStartedAt = timestampAtOrAfter(this.now(), receipt.queryObservedAt);
+    invalidateChangedCompositeVerification(task);
     return true;
   }
 
@@ -673,6 +690,7 @@ export class OpsWorkerLifecycle {
             );
           }
           if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          invalidateChangedCompositeVerification(task);
           return;
         }
         assertMatchingOperation(receipt, input.operationId, intentHash);
@@ -701,6 +719,7 @@ export class OpsWorkerLifecycle {
           changed = true;
         }
         if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        invalidateChangedCompositeVerification(task);
       },
     );
     return result.task;

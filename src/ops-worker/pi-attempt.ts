@@ -1199,7 +1199,7 @@ export class OpsWorkerPiAttemptRunner {
     const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
     safeUnlink(attemptFile);
     let result: OpsWorkerQuotaProbeResult;
-    this.supervisor.reservePiProcessGroupLaunch(taskId);
+    this.supervisor.reserveQuotaProbeProcessGroupLaunch(taskId);
     try {
       result = await this.runQuotaProbeProcess({
         taskId,

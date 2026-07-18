@@ -2294,6 +2294,19 @@ function parseTaskCommon(
   };
 }
 
+export function isOpsWorkerUnclaimedQuotaProbeProcess(
+  task: Pick<OpsWorkerTask, "state" | "custody" | "activeRun" | "unverifiedRun" | "lastOutcome">,
+): boolean {
+  if (task.custody.status !== "UNCLAIMED") return false;
+  const attemptId = task.activeRun?.attemptId ?? task.unverifiedRun?.attemptId;
+  if (!attemptId?.startsWith("quota-probe-")) return false;
+  return task.state === "RUNNING"
+    || (
+      task.state === "BLOCKED"
+      && task.lastOutcome?.result === "AMBIGUOUS_ORPHAN"
+    );
+}
+
 function assertTaskCustodyMatchesState(task: OpsWorkerTask): void {
   const held = task.custody.status === "HELD";
   if (
@@ -2301,6 +2314,7 @@ function assertTaskCustodyMatchesState(task: OpsWorkerTask): void {
     || task.state === "CHECKING"
     || task.state === "RESUMABLE"
   ) {
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(task)) return;
     if (!held) {
       fail("task.custody.status", `${task.state} tasks must retain held custody`);
     }
@@ -2315,6 +2329,7 @@ function assertTaskCustodyMatchesState(task: OpsWorkerTask): void {
   if (task.state === "BLOCKED") {
     const ambiguous = task.lastOutcome?.result === "AMBIGUOUS_ORPHAN";
     if (ambiguous) {
+      if (isOpsWorkerUnclaimedQuotaProbeProcess(task)) return;
       if (!held) {
         fail("task.custody.status", "an ambiguous blocked task must retain held custody");
       }

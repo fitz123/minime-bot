@@ -41,6 +41,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   hashOpsWorkerVerificationSubject,
+  isOpsWorkerUnclaimedQuotaProbeProcess,
   type OpsWorkerActiveRun,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
@@ -101,7 +102,7 @@ export interface OpsWorkerStartupRunResult {
 
 export interface OpsWorkerStartupReconciliation {
   taskId: string;
-  state: "RESUMABLE" | "BLOCKED";
+  state: "QUEUED" | "RESUMABLE" | "BLOCKED";
   result: "CRASH" | "QUOTA_PROBE_ERROR" | "AMBIGUOUS_ORPHAN";
 }
 
@@ -645,9 +646,29 @@ export class OpsWorkerSupervisor {
   }
 
   reservePiProcessGroupLaunch(taskId: string): void {
+    this.reservePiLaunch(taskId, false);
+  }
+
+  reserveQuotaProbeProcessGroupLaunch(taskId: string): void {
     this.assertStarted();
     const task = this.requireTask(taskId);
-    if (task.custody.status !== "HELD") {
+    const unclaimedAuthoritativeProbe = task.custody.status === "UNCLAIMED"
+      && task.state === "QUEUED"
+      && isAuthoritativePersistedQuotaWait(task)
+      && task.schedule.nextRunAt !== null
+      && Date.parse(task.schedule.nextRunAt) <= this.now().getTime();
+    if (task.custody.status !== "HELD" && !unclaimedAuthoritativeProbe) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} must hold custody or have a due unclaimed authoritative quota probe before reserving the Pi launch slot`,
+      );
+    }
+    this.reservePiLaunch(taskId, unclaimedAuthoritativeProbe);
+  }
+
+  private reservePiLaunch(taskId: string, allowUnclaimedQuotaProbe: boolean): void {
+    this.assertStarted();
+    const task = this.requireTask(taskId);
+    if (task.custody.status !== "HELD" && !allowUnclaimedQuotaProbe) {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} must hold custody before reserving the Pi launch slot`,
       );
@@ -910,6 +931,11 @@ export class OpsWorkerSupervisor {
   ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
+    if (this.piLaunchReservation !== taskId) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} must reserve the Pi launch slot before persisting a launch intent`,
+      );
+    }
     if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
       throw new OpsWorkerSupervisorStateError(
         `Pi launch intent requires QUEUED or RESUMABLE, found ${task.state}`,
@@ -925,6 +951,8 @@ export class OpsWorkerSupervisor {
         "Pi launch intent must be persisted before a child PID is known",
       );
     }
+    const preserveUnclaimedQuotaProbe = task.custody.status === "UNCLAIMED"
+      && launchIntent.attemptId.startsWith("quota-probe-");
     return this.transition(taskId, "BLOCKED", (replacement, at) => {
       replacement.activeRun = null;
       replacement.unverifiedRun = structuredClone(launchIntent);
@@ -938,7 +966,9 @@ export class OpsWorkerSupervisor {
       };
       replacement.report.state = "PENDING";
       replacement.report.lastError = null;
-    }, "Persisted Pi launch intent before detached spawn");
+    }, "Persisted Pi launch intent before detached spawn", {
+      preserveUnclaimedQuotaProbe,
+    });
   }
 
   bindUnverifiedPiLaunch(
@@ -981,6 +1011,7 @@ export class OpsWorkerSupervisor {
   markRunning(taskId: string, activeRun: OpsWorkerActiveRun): OpsWorkerTask {
     this.assertStarted();
     const existing = this.requireTask(taskId);
+    const preserveUnclaimedQuotaProbe = isOpsWorkerUnclaimedQuotaProbeProcess(existing);
     if (activeRun.supervisorInstanceId !== this.instanceId) {
       throw new OpsWorkerSupervisorStateError(
         "Active run must belong to this supervisor instance",
@@ -1025,7 +1056,7 @@ export class OpsWorkerSupervisor {
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
-    }, "Started one supervisor-owned attempt");
+    }, "Started one supervisor-owned attempt", { preserveUnclaimedQuotaProbe });
   }
 
   recordPiParityPass(taskId: string, summary: string): OpsWorkerTask {
@@ -1166,6 +1197,30 @@ export class OpsWorkerSupervisor {
     ).task;
   }
 
+  private returnUnclaimedQuotaProbeToQueue(
+    taskId: string,
+    auditSummary: string,
+    mutate: (task: OpsWorkerTask, at: string) => void,
+  ): OpsWorkerTask {
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: auditSummary },
+      (task) => {
+        if (!isOpsWorkerUnclaimedQuotaProbeProcess(task)) {
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${taskId} is not an unclaimed quota probe process`,
+          );
+        }
+        const at = this.nextUpdatedAt(task);
+        task.state = "QUEUED";
+        task.updatedAt = at;
+        task.activeRun = null;
+        task.unverifiedRun = null;
+        mutate(task, at);
+      },
+    ).task;
+  }
+
   recordQuotaResponseWait(
     taskId: string,
     response: OpsWorkerQuotaResponseDecision,
@@ -1187,6 +1242,26 @@ export class OpsWorkerSupervisor {
         return this.recordQuotaProbeTelemetryError(taskId, response.summary);
       }
       return this.recordQuotaTelemetryError(taskId, response.summary, evidenceSummary);
+    }
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Refreshed unclaimed authoritative quota reset wait",
+        (task, at) => {
+          task.schedule.nextCheckAt = null;
+          task.schedule.nextRunAt = response.resetAt;
+          task.lastOutcome = {
+            at,
+            kind: "INFRASTRUCTURE",
+            result: "QUOTA",
+            summary: truncateUtf8(
+              `${response.summary}; evidence=${response.evidenceHash}`,
+              OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+            ),
+          };
+          if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+        },
+      );
     }
     if (existing.state === "QUEUED") {
       return this.store.mutate(
@@ -1253,6 +1328,13 @@ export class OpsWorkerSupervisor {
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
     };
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Unclaimed quota smoke probe restored initial admission",
+        applySuccess,
+      );
+    }
     if (existing.state === "RUNNING") {
       return this.transition(
         taskId,
@@ -1298,6 +1380,13 @@ export class OpsWorkerSupervisor {
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
     };
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Recorded bounded unclaimed quota probe error",
+        applyError,
+      );
+    }
     if (existing.state === "RUNNING") {
       return this.transition(
         taskId,
@@ -1343,6 +1432,13 @@ export class OpsWorkerSupervisor {
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
     };
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Recorded unclaimed quota probe telemetry error",
+        applyError,
+      );
+    }
     if (existing.state === "RUNNING") {
       return this.transition(
         taskId,
@@ -1368,6 +1464,9 @@ export class OpsWorkerSupervisor {
     evidenceSummary?: string,
   ): OpsWorkerTask {
     const existing = this.requireTask(taskId);
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.recordQuotaProbeTelemetryError(taskId, summary);
+    }
     const target = existing.state === "RUNNING" ? "RESUMABLE" : existing.state;
     return this.transition(taskId, target, (task, at) => {
       task.activeRun = null;
@@ -1451,7 +1550,28 @@ export class OpsWorkerSupervisor {
     summary: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    this.requireMatchingLaunchFence(taskId, attemptId);
+    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Cleared a resolved unclaimed quota probe launch fence",
+        (task, at) => {
+          task.schedule.nextRunAt = new Date(
+            this.now().getTime() + this.quotaRecheckMs,
+          ).toISOString();
+          task.schedule.nextCheckAt = null;
+          task.report.state = "NONE";
+          task.report.attempts = 0;
+          task.report.lastError = null;
+          task.lastOutcome = {
+            at,
+            kind: "INFRASTRUCTURE",
+            result: "QUOTA_PROBE_ERROR",
+            summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+          };
+        },
+      );
+    }
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
@@ -1544,7 +1664,29 @@ export class OpsWorkerSupervisor {
     summary: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    this.requireMatchingLaunchFence(taskId, attemptId);
+    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
+    if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
+      return this.returnUnclaimedQuotaProbeToQueue(
+        taskId,
+        "Cleared a resolved unclaimed quota probe launch fence",
+        (task, at) => {
+          task.session.resume = task.session.sessionId !== null;
+          task.schedule.nextRunAt = new Date(
+            this.now().getTime() + this.quotaRecheckMs,
+          ).toISOString();
+          task.schedule.nextCheckAt = null;
+          task.report.state = "NONE";
+          task.report.attempts = 0;
+          task.report.lastError = null;
+          task.lastOutcome = {
+            at,
+            kind: "INFRASTRUCTURE",
+            result: "QUOTA_PROBE_ERROR",
+            summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+          };
+        },
+      );
+    }
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
@@ -1652,6 +1794,7 @@ export class OpsWorkerSupervisor {
   ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
+    const preserveUnclaimedQuotaProbe = isOpsWorkerUnclaimedQuotaProbeProcess(task);
     const priorFence = task.unverifiedRun;
     const matchesPersistedFence = task.state === "BLOCKED"
       && priorFence !== null
@@ -1689,7 +1832,9 @@ export class OpsWorkerSupervisor {
       };
       replacement.report.state = "PENDING";
       replacement.report.lastError = null;
-    }, "Blocked Pi launch whose process-group identity could not be proven");
+    }, "Blocked Pi launch whose process-group identity could not be proven", {
+      preserveUnclaimedQuotaProbe,
+    });
   }
 
   async runDoneCheck(taskId: string, signal?: AbortSignal): Promise<OpsWorkerTask> {
@@ -2006,6 +2151,36 @@ export class OpsWorkerSupervisor {
         result = { status: "AMBIGUOUS" };
       }
       if (result.status === "GONE" || result.status === "STOPPED") {
+        if (
+          interruptedQuotaProbe
+          && isOpsWorkerUnclaimedQuotaProbeProcess(task)
+        ) {
+          this.returnUnclaimedQuotaProbeToQueue(
+            task.id,
+            "Reconciled interrupted unclaimed quota smoke probe as queued",
+            (replacement, at) => {
+              replacement.schedule.nextRunAt = new Date(
+                this.now().getTime() + this.quotaRecheckMs,
+              ).toISOString();
+              replacement.schedule.nextCheckAt = null;
+              replacement.lastOutcome = {
+                at,
+                kind: "INFRASTRUCTURE",
+                result: "QUOTA_PROBE_ERROR",
+                summary: truncateUtf8(
+                  result.summary ?? "Prior unclaimed quota smoke probe is no longer running",
+                  OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+                ),
+              };
+            },
+          );
+          reconciled.push({
+            taskId: task.id,
+            state: "QUEUED",
+            result: "QUOTA_PROBE_ERROR",
+          });
+          continue;
+        }
         this.transition(task.id, "RESUMABLE", (replacement, at) => {
           replacement.activeRun = null;
           replacement.unverifiedRun = null;
@@ -2051,6 +2226,9 @@ export class OpsWorkerSupervisor {
   }
 
   private blockAmbiguousRun(taskId: string, summary: string): OpsWorkerTask {
+    const preserveUnclaimedQuotaProbe = isOpsWorkerUnclaimedQuotaProbeProcess(
+      this.requireTask(taskId),
+    );
     return this.transition(taskId, "BLOCKED", (task, at) => {
       task.unverifiedRun = null;
       task.session.resume = true;
@@ -2064,7 +2242,7 @@ export class OpsWorkerSupervisor {
       };
       task.report.state = "PENDING";
       task.report.lastError = null;
-    }, "Blocked ambiguous persisted process group");
+    }, "Blocked ambiguous persisted process group", { preserveUnclaimedQuotaProbe });
   }
 
   private applyDoneCheckResult(
@@ -2250,7 +2428,15 @@ export class OpsWorkerSupervisor {
     };
   }
 
-  private applyCustodyTransition(task: OpsWorkerTask, at: string): void {
+  private applyCustodyTransition(
+    task: OpsWorkerTask,
+    at: string,
+    preserveUnclaimedQuotaProbe = false,
+  ): void {
+    if (
+      preserveUnclaimedQuotaProbe
+      && isOpsWorkerUnclaimedQuotaProbeProcess(task)
+    ) return;
     let releaseReason: OpsWorkerCustodyReleaseReason | undefined;
     if (task.state === "DONE") {
       releaseReason = "DONE";
@@ -2298,6 +2484,7 @@ export class OpsWorkerSupervisor {
       freshDoneCheckPass?: boolean;
       expectedBaseline?: string;
       notBefore?: string;
+      preserveUnclaimedQuotaProbe?: boolean;
     } = {},
   ): OpsWorkerTask {
     if (to === "DONE" && !options.freshDoneCheckPass) {
@@ -2320,7 +2507,11 @@ export class OpsWorkerSupervisor {
         task.state = to;
         task.updatedAt = updatedAt;
         mutate(task, updatedAt);
-        this.applyCustodyTransition(task, updatedAt);
+        this.applyCustodyTransition(
+          task,
+          updatedAt,
+          options.preserveUnclaimedQuotaProbe,
+        );
       },
     ).task;
   }
