@@ -819,6 +819,30 @@ export class OpsWorkerTaskStore {
   }
 
   private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+    const priorAuthorization = existing.authorizationVerification;
+    const nextAuthorization = replacement.authorizationVerification;
+    if (priorAuthorization !== null) {
+      if (nextAuthorization === null) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase authorization verification for task ${existing.id}`,
+        );
+      }
+      const priorCheckedAt = Date.parse(priorAuthorization.checkedAt);
+      const nextCheckedAt = Date.parse(nextAuthorization.checkedAt);
+      if (nextCheckedAt < priorCheckedAt) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to move authorization verification backwards for task ${existing.id}`,
+        );
+      }
+      if (
+        nextCheckedAt === priorCheckedAt
+        && JSON.stringify(nextAuthorization) !== JSON.stringify(priorAuthorization)
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change authorization evidence at the same checked time for task ${existing.id}`,
+        );
+      }
+    }
     const checkpointIdentities = (
       task: OpsWorkerTask,
     ): ReadonlyMap<string, string> => {

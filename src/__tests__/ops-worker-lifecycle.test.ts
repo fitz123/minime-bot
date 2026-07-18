@@ -53,7 +53,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 
 function makeTask(id = "lifecycle-task"): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id,
     source: {
       kind: "operator-cli",
@@ -75,6 +75,7 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
       scope: ["inspect"],
       snapshotHash: null,
     },
+    authorizationVerification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -106,6 +107,7 @@ function makeHarness(t: TestContext): {
   });
   const lifecycle = new OpsWorkerLifecycle(store, {
     now: () => new Date(currentNow),
+    authorizeMutationClaim: () => true,
   });
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return {
@@ -119,6 +121,34 @@ function makeHarness(t: TestContext): {
 }
 
 describe("ops worker package-owned lifecycle evidence", () => {
+  it("fails closed when a mutation claim has no injected authorization fence", (t) => {
+    const harness = makeHarness(t);
+    const task = makeTask("receipt-missing-authorization");
+    harness.store.create(task);
+    const lifecycle = new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date(NOW),
+    });
+    const operation = {
+      boundary: "merge" as const,
+      operationId: "merge-missing-authorization",
+      intent: { base: "main", head: "issue-58" },
+    };
+    lifecycle.beginMutationReceipt(task.id, {
+      ...operation,
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+
+    assert.throws(
+      () => lifecycle.claimMutationReceipt(task.id, operation),
+      /requires a fresh package-owned authorization PASS/,
+    );
+    assert.equal(
+      harness.store.get(task.id)?.mutationReceipts.merge?.mutationStartedAt,
+      null,
+    );
+  });
+
   it("records one checkpoint and makes identical canonical replay a true no-op", (t) => {
     const harness = makeHarness(t);
     const task = makeTask();

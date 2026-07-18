@@ -14,6 +14,11 @@ import {
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import {
+  hasFreshOpsWorkerAuthorizationPass,
+  OpsWorkerAuthorizationCoordinator,
+  type OpsWorkerAuthorizationVerifierRegistry,
+} from "./authorization.js";
+import {
   OpsWorkerDoneCheckExecutionError,
   type OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckResult,
@@ -98,6 +103,8 @@ export interface OpsWorkerSupervisorOptions {
   processStartToken: string;
   now?: () => Date;
   infrastructureRetryMs?: number;
+  authorizationQueryRetryMs?: number;
+  authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
   /**
    * Trusted host identity inspection. Without it, an existing lock is
    * ambiguous and is never removed merely because its PID looks reusable.
@@ -506,6 +513,7 @@ export class OpsWorkerSupervisor {
     | undefined;
   private readonly guard: OpsWorkerSingleInstanceGuard;
   private readonly lifecycle: OpsWorkerLifecycle;
+  private readonly authorization: OpsWorkerAuthorizationCoordinator;
   private started = false;
   private piLaunchReservation: string | null = null;
 
@@ -529,7 +537,16 @@ export class OpsWorkerSupervisor {
     this.now = options.now ?? (() => new Date());
     this.infrastructureRetryMs = infrastructureRetryMs;
     this.reconcileActiveRun = options.reconcileActiveRun;
-    this.lifecycle = new OpsWorkerLifecycle(this.store, { now: this.now });
+    this.authorization = new OpsWorkerAuthorizationCoordinator(this.store, {
+      verifiers: options.authorizationVerifiers,
+      now: this.now,
+      queryRetryMs: options.authorizationQueryRetryMs,
+    });
+    this.lifecycle = new OpsWorkerLifecycle(this.store, {
+      now: this.now,
+      authorizeMutationClaim: (task, receipt) =>
+        hasFreshOpsWorkerAuthorizationPass(task, receipt.queryObservedAt),
+    });
     const startedAt = this.now().toISOString();
     this.guard = new OpsWorkerSingleInstanceGuard(
       this.store.stateDirectory,
@@ -659,27 +676,31 @@ export class OpsWorkerSupervisor {
     return this.selectScheduledTask(this.store.list());
   }
 
-  claimNextTask(): OpsWorkerScheduledTask | undefined {
+  async claimNextTask(): Promise<OpsWorkerScheduledTask | undefined> {
     this.assertStarted();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const scheduled = this.selectScheduledTask(this.store.list());
       if (!scheduled) return undefined;
-      const claimed = this.claimTaskCustody(
+      const claimed = await this.claimTaskCustody(
         scheduled.task.id,
         scheduled.action,
         true,
       );
-      if (claimed) return { action: scheduled.action, task: claimed };
+      if (
+        claimed
+        && claimed.custody.status === "HELD"
+        && hasFreshOpsWorkerAuthorizationPass(claimed)
+      ) return { action: scheduled.action, task: claimed };
     }
     return undefined;
   }
 
-  ensureTaskCustody(
+  async ensureTaskCustody(
     taskId: string,
     action: OpsWorkerScheduledAction,
-  ): OpsWorkerTask {
+  ): Promise<OpsWorkerTask> {
     this.assertStarted();
-    const claimed = this.claimTaskCustody(taskId, action, false);
+    const claimed = await this.claimTaskCustody(taskId, action, false);
     if (!claimed) {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} changed while custody was being claimed`,
@@ -734,19 +755,18 @@ export class OpsWorkerSupervisor {
     return candidates[0];
   }
 
-  private claimTaskCustody(
+  private async claimTaskCustody(
     taskId: string,
     action: OpsWorkerScheduledAction,
     requireCurrentSelection: boolean,
-  ): OpsWorkerTask | undefined {
+  ): Promise<OpsWorkerTask | undefined> {
     let selectionChanged = false;
-    const result = this.store.mutate(
-      taskId,
-      {
+    const result = await this.authorization.revalidate(taskId, {
+      audit: {
         event: "TRANSITION",
-        summary: "Claimed exclusive whole-cycle custody",
+        summary: "Revalidated authorization and claimed exclusive custody",
       },
-      (task) => {
+      onPass: (task) => {
         const expectedStates: readonly OpsWorkerTaskState[] = action === "RUN"
           ? ["QUEUED", "RESUMABLE"]
           : ["CHECKING"];
@@ -788,7 +808,7 @@ export class OpsWorkerSupervisor {
           releaseReason: null,
         };
       },
-    );
+    });
     return selectionChanged ? undefined : result.task;
   }
 
@@ -915,7 +935,7 @@ export class OpsWorkerSupervisor {
     }, "Started one supervisor-owned attempt");
   }
 
-  requestDoneCheck(taskId: string): OpsWorkerTask {
+  async requestDoneCheck(taskId: string): Promise<OpsWorkerTask> {
     this.assertStarted();
     const task = this.requireTask(taskId);
     if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
@@ -923,11 +943,28 @@ export class OpsWorkerSupervisor {
         `Direct done-check request requires QUEUED or RESUMABLE, found ${task.state}`,
       );
     }
-    return this.transition(taskId, "CHECKING", (replacement) => {
-      replacement.activeRun = null;
-      replacement.schedule.nextRunAt = null;
-      replacement.schedule.nextCheckAt = null;
-    }, "Queued deterministic done check");
+    const authorization = await this.authorization.revalidate(taskId, {
+      audit: {
+        event: "TRANSITION",
+        summary: "Authorized and queued deterministic done check",
+      },
+      onPass: (replacement) => {
+        if (replacement.state !== "QUEUED" && replacement.state !== "RESUMABLE") {
+          throw new OpsWorkerSupervisorStateError(
+            `Direct done-check request requires QUEUED or RESUMABLE, found ${replacement.state}`,
+          );
+        }
+        assertStructuralStateTransition(replacement.state, "CHECKING");
+        const updatedAt = this.nextUpdatedAt(replacement);
+        replacement.state = "CHECKING";
+        replacement.updatedAt = updatedAt;
+        replacement.activeRun = null;
+        replacement.schedule.nextRunAt = null;
+        replacement.schedule.nextCheckAt = null;
+        this.applyCustodyTransition(replacement, updatedAt);
+      },
+    });
+    return authorization.task;
   }
 
   recordPiSuccessClaim(
@@ -1404,10 +1441,10 @@ export class OpsWorkerSupervisor {
     }, "Task cancelled");
   }
 
-  recordReportAttempt(
+  async recordReportAttempt(
     taskId: string,
     result: { sent: true } | { sent: false; error: string },
-  ): OpsWorkerTask {
+  ): Promise<OpsWorkerTask> {
     this.assertStarted();
     let task = this.requireTask(taskId);
     if (task.report.state !== "PENDING") {
@@ -1464,6 +1501,8 @@ export class OpsWorkerSupervisor {
         lastError: task.report.lastError,
       },
     });
+    const authorization = await this.authorization.revalidate(taskId);
+    if (!authorization.authorized) return authorization.task;
     const claim = this.lifecycle.claimMutationReceipt(taskId, operation);
     if (!claim.claimed) {
       throw new OpsWorkerSupervisorStateError(

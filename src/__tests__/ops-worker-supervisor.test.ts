@@ -12,6 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
+import type {
+  OpsWorkerAuthorizationVerifier,
+  OpsWorkerAuthorizationVerifierRegistry,
+} from "../ops-worker/authorization.js";
 import {
   OPS_WORKER_DONE_CHECK_LIMITS,
   OpsWorkerDoneCheckExecutionError,
@@ -44,6 +48,24 @@ import {
 
 const NOW = "2026-07-17T12:00:00.000Z";
 const LATER = "2026-07-17T12:05:00.000Z";
+const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
+const AUTHORIZATION_EVIDENCE_HASH = `sha256:${"b".repeat(64)}`;
+const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
+  identity: "fixture-authorization",
+  version: "1",
+  verify: () => ({
+    status: "PASS",
+    evidenceHash: AUTHORIZATION_EVIDENCE_HASH,
+    summary: "Authorization matches the trusted fixture policy.",
+  }),
+};
+const fixtureAuthorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry = {
+  alertmanager: fixtureAuthorizationVerifier,
+  "operator-cli": fixtureAuthorizationVerifier,
+  "operator-telegram": fixtureAuthorizationVerifier,
+  "registered-cron": fixtureAuthorizationVerifier,
+  "authorized-issue": fixtureAuthorizationVerifier,
+};
 const LIFECYCLE_UPDATE_FIXTURE = fileURLToPath(
   new URL("./fixtures/ops-worker-lifecycle-update.ts", import.meta.url),
 );
@@ -109,7 +131,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id,
     source: {
       kind: sourceKind,
@@ -132,8 +154,9 @@ function makeTask(
     authorization: {
       profile: "fixture.inspect.v1",
       scope: ["inspect"],
-      snapshotHash: null,
+      snapshotHash: AUTHORIZATION_CLAIM_HASH,
     },
+    authorizationVerification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -178,6 +201,7 @@ async function makeHarness(
     instanceId?: string;
     reconcileActiveRun?: ConstructorParameters<typeof OpsWorkerSupervisor>[0]["reconcileActiveRun"];
     faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
+    authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
   } = {},
 ): Promise<Harness> {
   let currentNow = NOW;
@@ -207,6 +231,9 @@ async function makeHarness(
     now: () => new Date(currentNow),
     infrastructureRetryMs: 1_000,
     reconcileActiveRun: options.reconcileActiveRun,
+    authorizationVerifiers: options.authorizationVerifiers
+      ?? fixtureAuthorizationVerifiers,
+    authorizationQueryRetryMs: 1_000,
   });
   await supervisor.start();
   let closed = false;
@@ -422,13 +449,161 @@ describe("ops worker supervisor", () => {
       sourceKind: "authorized-issue",
     }));
 
-    const claimed = harness.supervisor.claimNextTask();
+    const claimed = await harness.supervisor.claimNextTask();
 
     assert.equal(claimed?.action, "RUN");
     assert.equal(claimed?.task.id, "task-claim");
     assert.equal(claimed?.task.custody.status, "HELD");
     assert.ok(claimed?.task.custody.claimedAt);
     assert.deepEqual(harness.store.get("task-claim")?.custody, claimed?.task.custody);
+  });
+
+  it("revalidates before first custody and every resumed attempt, then blocks drift", async (t) => {
+    const statuses = ["PASS", "PASS", "DRIFT"] as const;
+    let checks = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "sequence-authorization",
+      version: "2",
+      verify: () => {
+        const status = statuses[Math.min(checks, statuses.length - 1)];
+        checks += 1;
+        return {
+          status,
+          evidenceHash: `sha256:${(status === "PASS" ? "c" : "d").repeat(64)}`,
+          summary: status === "PASS"
+            ? "Authorization matches the trusted fixture policy."
+            : "Authorization policy evidence has drifted.",
+        };
+      },
+    };
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: { "operator-cli": verifier },
+    });
+    harness.store.create(makeTask("task-authorization-drift"));
+
+    const first = await harness.supervisor.claimNextTask();
+    assert.equal(first?.task.custody.status, "HELD");
+    assert.equal(first?.task.authorizationVerification?.status, "PASS");
+    harness.supervisor.recordPreLaunchInfrastructureOutcome(
+      "task-authorization-drift",
+      "Synthetic pre-launch interruption",
+    );
+
+    const resumed = await harness.supervisor.ensureTaskCustody(
+      "task-authorization-drift",
+      "RUN",
+    );
+    assert.equal(resumed.authorizationVerification?.status, "PASS");
+    assert.equal(resumed.custody.status, "HELD");
+    harness.supervisor.recordPreLaunchInfrastructureOutcome(
+      "task-authorization-drift",
+      "Synthetic second pre-launch interruption",
+    );
+
+    const drifted = await harness.supervisor.ensureTaskCustody(
+      "task-authorization-drift",
+      "RUN",
+    );
+    assert.equal(checks, 3);
+    assert.equal(drifted.state, "BLOCKED");
+    assert.equal(drifted.custody.status, "RELEASED");
+    assert.equal(drifted.custody.releaseReason, "BLOCKED");
+    assert.equal(drifted.authorizationVerification?.status, "DRIFT");
+    assert.equal(drifted.lastOutcome?.kind, "AUTHORIZATION");
+    assert.equal(drifted.activeRun, null);
+    assert.equal(drifted.unverifiedRun, null);
+  });
+
+  it("retains held custody and remediation budget on authorization query errors", async (t) => {
+    let checks = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "query-authorization",
+      version: "1",
+      verify: () => {
+        checks += 1;
+        return checks === 1
+          ? {
+            status: "PASS",
+            evidenceHash: `sha256:${"e".repeat(64)}`,
+            summary: "Authorization matches the trusted fixture policy.",
+          }
+          : {
+            status: "QUERY_ERROR",
+            evidenceHash: `sha256:${"f".repeat(64)}`,
+            summary: "Authorization evidence could not be queried.",
+          };
+      },
+    };
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: { "operator-cli": verifier },
+    });
+    harness.store.create(makeTask("task-authorization-query"));
+    await harness.supervisor.claimNextTask();
+    const waiting = harness.supervisor.recordPreLaunchInfrastructureOutcome(
+      "task-authorization-query",
+      "Synthetic pre-launch interruption",
+    );
+    const remediationBefore = waiting.rounds.remediation;
+    const infrastructureBefore = waiting.rounds.consecutiveInfrastructureFailures;
+
+    const queried = await harness.supervisor.ensureTaskCustody(
+      "task-authorization-query",
+      "RUN",
+    );
+    assert.equal(queried.state, "RESUMABLE");
+    assert.equal(queried.custody.status, "HELD");
+    assert.equal(queried.authorizationVerification?.status, "QUERY_ERROR");
+    assert.equal(queried.rounds.remediation, remediationBefore);
+    assert.equal(
+      queried.rounds.consecutiveInfrastructureFailures,
+      infrastructureBefore,
+    );
+    assert.ok(queried.schedule.nextRunAt);
+  });
+
+  it("does not trust a persisted PASS after restart and keeps empty adapters inactive", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-auth-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "authorization-first",
+    });
+    first.store.create(makeTask("task-authorization-restart"));
+    assert.equal(
+      (await first.supervisor.claimNextTask())?.task.authorizationVerification?.status,
+      "PASS",
+    );
+    first.close();
+
+    const driftVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: "restart-authorization",
+      version: "2",
+      verify: () => ({
+        status: "DRIFT",
+        evidenceHash: `sha256:${"9".repeat(64)}`,
+        summary: "Authorization policy evidence has drifted after restart.",
+      }),
+    };
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "authorization-restarted",
+      authorizationVerifiers: { "operator-cli": driftVerifier },
+    });
+    assert.equal(await restarted.supervisor.claimNextTask(), undefined);
+    assert.equal(restarted.store.get("task-authorization-restart")?.state, "BLOCKED");
+    restarted.close();
+
+    const empty = await makeHarness(t, {
+      instanceId: "authorization-empty",
+      authorizationVerifiers: {},
+    });
+    empty.store.create(makeTask("task-authorization-missing"));
+    assert.equal(await empty.supervisor.claimNextTask(), undefined);
+    const notRun = empty.store.get("task-authorization-missing");
+    assert.equal(notRun?.state, "QUEUED");
+    assert.equal(notRun?.custody.status, "UNCLAIMED");
+    assert.equal(notRun?.authorizationVerification?.status, "QUERY_ERROR");
+    assert.ok(notRun?.schedule.nextRunAt);
   });
 
   it("serializes lifecycle evidence with a supervisor transition without losing either write", async (t) => {
@@ -531,7 +706,7 @@ describe("ops worker supervisor", () => {
       sourceKind: "alertmanager",
     }));
 
-    const checking = harness.supervisor.requestDoneCheck("task-custody-owner");
+    const checking = await harness.supervisor.requestDoneCheck("task-custody-owner");
     const claimedAt = checking.custody.claimedAt;
     const deferred = await harness.supervisor.runDoneCheck("task-custody-owner");
     assert.equal(deferred.state, "CHECKING");
@@ -557,7 +732,7 @@ describe("ops worker supervisor", () => {
       "task-custody-successor",
     );
 
-    harness.supervisor.requestDoneCheck("task-custody-successor");
+    await harness.supervisor.requestDoneCheck("task-custody-successor");
     const cancelled = harness.supervisor.cancelTask(
       "task-custody-successor",
       "Synthetic operator cancellation",
@@ -588,13 +763,13 @@ describe("ops worker supervisor", () => {
       () => harness.store.replace(forged),
       /DONE requires a fresh DONE_CHECK PASS/,
     );
-    harness.supervisor.requestDoneCheck("task-pass");
+    await harness.supervisor.requestDoneCheck("task-pass");
     const done = await harness.supervisor.runDoneCheck("task-pass");
     assert.equal(done.state, "DONE");
     assert.equal(done.lastOutcome?.result, "PASS");
     assert.equal(done.report.state, "PENDING");
     const completionAt = done.updatedAt;
-    const failedReport = harness.supervisor.recordReportAttempt(
+    const failedReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
       { sent: false, error: "Synthetic report transport failure" },
     );
@@ -613,7 +788,7 @@ describe("ops worker supervisor", () => {
     assert.equal(failedReport.mutationReceipts.report?.outcome, null);
     const reportIntentHash = failedReport.mutationReceipts.report?.intentHash;
     const firstQueryHash = failedReport.mutationReceipts.report?.queryResultHash;
-    const sentReport = harness.supervisor.recordReportAttempt(
+    const sentReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
       { sent: true },
     );
@@ -623,8 +798,8 @@ describe("ops worker supervisor", () => {
     assert.equal(sentReport.mutationReceipts.report?.intentHash, reportIntentHash);
     assert.notEqual(sentReport.mutationReceipts.report?.queryResultHash, firstQueryHash);
     assert.equal(sentReport.mutationReceipts.report?.outcome?.result, "APPLIED");
-    assert.throws(
-      () => harness.supervisor.recordReportAttempt("task-pass", { sent: true }),
+    await assert.rejects(
+      harness.supervisor.recordReportAttempt("task-pass", { sent: true }),
       /no pending report/,
     );
     assert.throws(
@@ -640,25 +815,67 @@ describe("ops worker supervisor", () => {
       faultInjector: (point) => {
         if (!armed || point !== "after-snapshot-rename") return;
         renamedSnapshots += 1;
-        if (renamedSnapshots === 4) {
+        if (renamedSnapshots === 5) {
           throw new Error("Synthetic crash after atomic report snapshot rename");
         }
       },
     });
     harness.store.create(makeTask("task-report-crash"));
-    harness.supervisor.requestDoneCheck("task-report-crash");
+    await harness.supervisor.requestDoneCheck("task-report-crash");
     await harness.supervisor.runDoneCheck("task-report-crash");
 
     armed = true;
-    assert.throws(
-      () => harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
+    await assert.rejects(
+      harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
       /Synthetic crash after atomic report snapshot rename/,
     );
-    assert.equal(renamedSnapshots, 4);
+    assert.equal(renamedSnapshots, 5);
     const persisted = harness.store.get("task-report-crash");
     assert.equal(persisted?.report.state, "SENT");
     assert.equal(persisted?.report.attempts, 1);
     assert.equal(persisted?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("revalidates after the external query and before claiming a mutation receipt", async (t) => {
+    let checks = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "mutation-authorization",
+      version: "1",
+      verify: () => {
+        checks += 1;
+        return checks === 1
+          ? {
+            status: "PASS",
+            evidenceHash: `sha256:${"1".repeat(64)}`,
+            summary: "Authorization matches the trusted fixture policy.",
+          }
+          : {
+            status: "DRIFT",
+            evidenceHash: `sha256:${"2".repeat(64)}`,
+            summary: "Authorization policy evidence drifted before mutation.",
+          };
+      },
+    };
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: { "operator-cli": verifier },
+    });
+    harness.store.create(makeTask("task-mutation-authorization"));
+    await harness.supervisor.requestDoneCheck("task-mutation-authorization");
+    await harness.supervisor.runDoneCheck("task-mutation-authorization");
+
+    const blocked = await harness.supervisor.recordReportAttempt(
+      "task-mutation-authorization",
+      { sent: true },
+    );
+    assert.equal(checks, 2);
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.authorizationVerification?.status, "DRIFT");
+    assert.equal(blocked.report.state, "PENDING");
+    assert.equal(
+      blocked.mutationReceipts.report?.mutationStartedAt,
+      null,
+    );
+    assert.equal(blocked.mutationReceipts.report?.outcome, null);
   });
 
   it("requires claimed report reconciliation before retrying a blocked task", async (t) => {
@@ -669,11 +886,11 @@ describe("ops worker supervisor", () => {
       }),
     });
     harness.store.create(makeTask("task-report-retry", { maxRemediation: 1 }));
-    harness.supervisor.requestDoneCheck("task-report-retry");
+    await harness.supervisor.requestDoneCheck("task-report-retry");
     const blocked = await harness.supervisor.runDoneCheck("task-report-retry");
     assert.equal(blocked.state, "BLOCKED");
 
-    harness.supervisor.recordReportAttempt("task-report-retry", {
+    await harness.supervisor.recordReportAttempt("task-report-retry", {
       sent: false,
       error: "Synthetic ambiguous report failure",
     });
@@ -681,14 +898,14 @@ describe("ops worker supervisor", () => {
       () => harness.supervisor.retryBlockedTask("task-report-retry"),
       /claimed report receipt still requires reconciliation/,
     );
-    harness.supervisor.recordReportAttempt("task-report-retry", { sent: true });
+    await harness.supervisor.recordReportAttempt("task-report-retry", { sent: true });
     const resumed = harness.supervisor.retryBlockedTask("task-report-retry");
     assert.equal(resumed.state, "RESUMABLE");
     assert.equal(resumed.report.state, "NONE");
     harness.supervisor.cancelTask("task-report-retry", "Release fixture custody");
 
     harness.store.create(makeTask("task-query-only-retry", { maxRemediation: 1 }));
-    harness.supervisor.requestDoneCheck("task-query-only-retry");
+    await harness.supervisor.requestDoneCheck("task-query-only-retry");
     await harness.supervisor.runDoneCheck("task-query-only-retry");
     new OpsWorkerLifecycle(harness.store, {
       now: () => new Date(LATER),
@@ -714,7 +931,7 @@ describe("ops worker supervisor", () => {
       }),
     });
     harness.store.create(makeTask("task-stale"));
-    harness.supervisor.requestDoneCheck("task-stale");
+    await harness.supervisor.requestDoneCheck("task-stale");
 
     const pending = harness.supervisor.runDoneCheck("task-stale");
     await new Promise((resolve) => setImmediate(resolve));
@@ -773,7 +990,7 @@ describe("ops worker supervisor", () => {
       implementation: () => result,
     });
     harness.store.create(makeTask("task-defer"));
-    harness.supervisor.requestDoneCheck("task-defer");
+    await harness.supervisor.requestDoneCheck("task-defer");
     const deferred = await harness.supervisor.runDoneCheck("task-defer");
     assert.equal(deferred.state, "CHECKING");
     assert.equal(deferred.schedule.nextCheckAt, LATER);
@@ -800,7 +1017,7 @@ describe("ops worker supervisor", () => {
     const bounded = makeTask("task-check-error-bound");
     bounded.rounds.consecutiveInfrastructureFailures = 999;
     harness.store.create(bounded);
-    harness.supervisor.requestDoneCheck(bounded.id);
+    await harness.supervisor.requestDoneCheck(bounded.id);
     const blocked = await harness.supervisor.runDoneCheck(bounded.id);
     assert.equal(blocked.state, "BLOCKED");
     assert.equal(blocked.rounds.consecutiveInfrastructureFailures, 1_000);
@@ -1132,6 +1349,7 @@ describe("ops worker supervisor", () => {
         mutationReceipts: _mutationReceipts,
         custody: _custody,
         submissionFingerprint: _submissionFingerprint,
+        authorizationVerification: _authorizationVerification,
         source,
         schemaVersion: _schemaVersion,
         ...common
@@ -1203,7 +1421,7 @@ describe("ops worker supervisor", () => {
       /prior process group remains unresolved/,
     );
 
-    const attempted = restarted.supervisor.recordReportAttempt(
+    const attempted = await restarted.supervisor.recordReportAttempt(
       "task-ambiguous",
       { sent: false, error: "Fixture report transport unavailable" },
     );
@@ -1218,7 +1436,7 @@ describe("ops worker supervisor", () => {
     });
     assert.equal(final.store.get("task-ambiguous")?.report.attempts, 1);
     assert.equal(final.store.get("task-ambiguous")?.mutationReceipts.report?.outcome, null);
-    const sent = final.supervisor.recordReportAttempt(
+    const sent = await final.supervisor.recordReportAttempt(
       "task-ambiguous",
       { sent: true },
     );
@@ -1282,7 +1500,7 @@ describe("ops worker supervisor", () => {
       OpsWorkerDuplicateCorrelationError,
     );
 
-    harness.supervisor.requestDoneCheck(first.id);
+    await harness.supervisor.requestDoneCheck(first.id);
     await harness.supervisor.runDoneCheck(first.id);
     harness.store.create(duplicate);
     assert.equal(harness.store.get(duplicate.id)?.state, "QUEUED");

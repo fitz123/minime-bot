@@ -9,6 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
+import type {
+  OpsWorkerAuthorizationVerifier,
+  OpsWorkerAuthorizationVerifierRegistry,
+} from "../ops-worker/authorization.js";
 import assert from "node:assert/strict";
 import { runCliAsync } from "../cli.js";
 import {
@@ -67,6 +71,19 @@ function fixtureContracts(): FixtureContracts {
   };
 }
 
+const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
+  identity: "fixture-authorization",
+  version: "1",
+  verify: () => ({
+    status: "PASS",
+    evidenceHash: `sha256:${"b".repeat(64)}`,
+    summary: "Authorization matches the trusted fixture policy.",
+  }),
+};
+const fixtureAuthorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry = {
+  "operator-cli": fixtureAuthorizationVerifier,
+};
+
 interface CliResult {
   code: number;
   stdout: string;
@@ -116,6 +133,7 @@ function dependencies(
     doneChecks: contracts.doneChecks,
     processStartToken: "ops-worker-cli-fixture-start",
     randomId: () => "fixture-task-id",
+    authorizationVerifiers: fixtureAuthorizationVerifiers,
     ...overrides,
   };
 }
@@ -181,7 +199,7 @@ describe("ops worker CLI and inactive runtime", () => {
       authorization: { scope: string[] };
     };
     assert.equal(task.id, "op-fixture-task-id");
-    assert.equal(task.schemaVersion, 2);
+    assert.equal(task.schemaVersion, 3);
     assert.equal(task.state, "QUEUED");
     assert.equal(task.source.deliveryKey, "operator-cli:fixture-delivery-one");
     assert.deepEqual(task.resource, {
@@ -202,7 +220,7 @@ describe("ops worker CLI and inactive runtime", () => {
       JSON.parse(status.stdout),
       {
         service: "minime-ops-worker",
-        schemaVersion: 2,
+        schemaVersion: 3,
         totalTasks: 1,
         activeProcessGroups: 0,
         custodyOwner: null,
@@ -259,6 +277,7 @@ describe("ops worker CLI and inactive runtime", () => {
       mutationReceipts: _mutationReceipts,
       custody: _custody,
       submissionFingerprint: _submissionFingerprint,
+      authorizationVerification: _authorizationVerification,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {
@@ -291,7 +310,7 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(inspected.code, 0, inspected.stderr);
     const normalized = JSON.parse(inspected.stdout) as OpsWorkerTask;
-    assert.equal(normalized.schemaVersion, 2);
+    assert.equal(normalized.schemaVersion, 3);
     assert.equal(normalized.source.deliveryKey, `legacy:${current.id}`);
     assert.deepEqual(normalized.resource, {
       kind: "host",
@@ -356,10 +375,11 @@ describe("ops worker CLI and inactive runtime", () => {
       instanceId: "fixture-cli-owner",
       processStartToken: "fixture-cli-owner-start",
       now: deps.now,
+      authorizationVerifiers: deps.authorizationVerifiers,
     });
     await supervisor.start();
     t.after(() => supervisor.close());
-    assert.equal(supervisor.claimNextTask()?.task.id, taskId);
+    assert.equal((await supervisor.claimNextTask())?.task.id, taskId);
 
     const checkpointArgs = [
       "worker",
@@ -446,7 +466,14 @@ describe("ops worker CLI and inactive runtime", () => {
       task: OpsWorkerTask;
     };
     assert.equal(replayedClaim.claimed, false);
-    assert.deepEqual(replayedClaim.task, claimed.task);
+    assert.deepEqual(
+      replayedClaim.task.mutationReceipts.merge,
+      claimed.task.mutationReceipts.merge,
+    );
+    assert.ok(
+      Date.parse(replayedClaim.task.authorizationVerification?.checkedAt ?? "")
+      > Date.parse(claimed.task.authorizationVerification?.checkedAt ?? ""),
+    );
 
     const finish = await runWorkerCli([
       "worker",
@@ -821,7 +848,7 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 2,
+      schemaVersion: 3,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);

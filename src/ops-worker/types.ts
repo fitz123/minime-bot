@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-export const OPS_WORKER_TASK_SCHEMA_VERSION = 2 as const;
+export const OPS_WORKER_TASK_SCHEMA_VERSION = 3 as const;
+export const OPS_WORKER_TASK_V2_SCHEMA_VERSION = 2 as const;
 export const OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION = 1 as const;
 
 export const OPS_WORKER_SOURCE_KINDS = [
@@ -87,6 +88,7 @@ export const OPS_WORKER_OUTCOME_KINDS = [
   "PI_EXIT",
   "DONE_CHECK",
   "INFRASTRUCTURE",
+  "AUTHORIZATION",
   "PREEMPTION",
   "SESSION_RESET",
   "RECONCILIATION",
@@ -276,6 +278,27 @@ export interface OpsWorkerAuthorization {
   snapshotHash: string | null;
 }
 
+export const OPS_WORKER_AUTHORIZATION_VERIFICATION_STATUSES = [
+  "PASS",
+  "DRIFT",
+  "QUERY_ERROR",
+  "INVALID_CLAIM",
+] as const;
+
+export type OpsWorkerAuthorizationVerificationStatus =
+  (typeof OPS_WORKER_AUTHORIZATION_VERIFICATION_STATUSES)[number];
+
+/** Bounded, redacted proof from one package-owned authorization verifier. */
+export interface OpsWorkerAuthorizationVerification {
+  validatorIdentity: string;
+  validatorVersion: string;
+  checkedSnapshotHash: string;
+  checkedAt: string;
+  status: OpsWorkerAuthorizationVerificationStatus;
+  evidenceHash: string;
+  summary: string;
+}
+
 export interface OpsWorkerRounds {
   remediation: number;
   maxRemediation: number;
@@ -352,6 +375,7 @@ export interface OpsWorkerTask {
   evidence: OpsWorkerEvidence[];
   doneCheck: OpsWorkerDoneCheck;
   authorization: OpsWorkerAuthorization;
+  authorizationVerification: OpsWorkerAuthorizationVerification | null;
   state: OpsWorkerTaskState;
   rounds: OpsWorkerRounds;
   schedule: OpsWorkerSchedule;
@@ -450,9 +474,17 @@ export type OpsWorkerTaskV1 = Omit<
   | "mutationReceipts"
   | "custody"
   | "submissionFingerprint"
+  | "authorizationVerification"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
+};
+
+export type OpsWorkerTaskV2 = Omit<
+  OpsWorkerTask,
+  "schemaVersion" | "authorizationVerification"
+> & {
+  schemaVersion: typeof OPS_WORKER_TASK_V2_SCHEMA_VERSION;
 };
 
 export interface OpsWorkerTemplateContract {
@@ -502,6 +534,7 @@ export const OPS_WORKER_LIMITS = {
   maxDoneCheckParamItems: 128,
   maxDoneCheckParamArrayLength: 64,
   maxDoneCheckParamStringBytes: 2 * 1024,
+  maxAuthorizationVerificationSummaryBytes: 1024,
 } as const;
 
 const V1_TASK_KEYS = [
@@ -525,7 +558,7 @@ const V1_TASK_KEYS = [
   "updatedAt",
 ] as const;
 
-const TASK_KEYS = [
+const V2_TASK_KEYS = [
   "schemaVersion",
   "id",
   "source",
@@ -550,6 +583,12 @@ const TASK_KEYS = [
   "report",
   "createdAt",
   "updatedAt",
+] as const;
+
+const TASK_KEYS = [
+  ...V2_TASK_KEYS.slice(0, V2_TASK_KEYS.indexOf("state")),
+  "authorizationVerification",
+  ...V2_TASK_KEYS.slice(V2_TASK_KEYS.indexOf("state")),
 ] as const;
 
 const TASK_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -1439,6 +1478,70 @@ function parseAuthorization(
   return { profile, scope: [...suppliedScope], snapshotHash };
 }
 
+function parseAuthorizationVerification(
+  value: unknown,
+): OpsWorkerAuthorizationVerification | null {
+  if (value === null) return null;
+  const verification = expectObject(value, "task.authorizationVerification");
+  expectExactKeys(
+    verification,
+    [
+      "validatorIdentity",
+      "validatorVersion",
+      "checkedSnapshotHash",
+      "checkedAt",
+      "status",
+      "evidenceHash",
+      "summary",
+    ],
+    "task.authorizationVerification",
+  );
+  const validatorIdentity = expectRegisteredName(
+    verification.validatorIdentity,
+    "task.authorizationVerification.validatorIdentity",
+  );
+  const validatorVersion = expectRegisteredName(
+    verification.validatorVersion,
+    "task.authorizationVerification.validatorVersion",
+  );
+  const checkedSnapshotHash = expectString(
+    verification.checkedSnapshotHash,
+    "task.authorizationVerification.checkedSnapshotHash",
+  );
+  const evidenceHash = expectString(
+    verification.evidenceHash,
+    "task.authorizationVerification.evidenceHash",
+  );
+  for (const [path, hash] of [
+    ["task.authorizationVerification.checkedSnapshotHash", checkedSnapshotHash],
+    ["task.authorizationVerification.evidenceHash", evidenceHash],
+  ] as const) {
+    if (!SHA256_PATTERN.test(hash)) {
+      fail(path, "must be a lowercase sha256:<hex> digest");
+    }
+  }
+  return {
+    validatorIdentity,
+    validatorVersion,
+    checkedSnapshotHash,
+    checkedAt: expectTimestamp(
+      verification.checkedAt,
+      "task.authorizationVerification.checkedAt",
+    ),
+    status: expectEnum(
+      verification.status,
+      OPS_WORKER_AUTHORIZATION_VERIFICATION_STATUSES,
+      "task.authorizationVerification.status",
+    ),
+    evidenceHash,
+    summary: expectBoundedText(
+      verification.summary,
+      "task.authorizationVerification.summary",
+      OPS_WORKER_LIMITS.maxAuthorizationVerificationSummaryBytes,
+    ),
+  };
+}
+
 function parseRounds(value: unknown): OpsWorkerRounds {
   const rounds = expectObject(value, "task.rounds");
   expectExactKeys(
@@ -1676,6 +1779,7 @@ type OpsWorkerTaskCommon = Omit<
   | "mutationReceipts"
   | "custody"
   | "submissionFingerprint"
+  | "authorizationVerification"
 >;
 
 function parseTaskCommon(
@@ -1875,6 +1979,7 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     evidence: copy.evidence,
     doneCheck: copy.doneCheck,
     authorization: copy.authorization,
+    authorizationVerification: null,
     state: copy.state,
     rounds: copy.rounds,
     schedule: copy.schedule,
@@ -1887,6 +1992,36 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     updatedAt: copy.updatedAt,
   });
   return migrated;
+}
+
+/** Pure migration for an already validated exact v2 snapshot. */
+export function migrateOpsWorkerTaskV2(task: OpsWorkerTaskV2): OpsWorkerTask {
+  const copy = structuredClone(task);
+  const {
+    schemaVersion: _schemaVersion,
+    id,
+    source,
+    resource,
+    lifecycle,
+    currentCheckpoint,
+    mutationReceipts,
+    custody,
+    submissionFingerprint,
+    ...common
+  } = copy;
+  return {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    id,
+    source,
+    resource,
+    lifecycle,
+    currentCheckpoint,
+    mutationReceipts,
+    custody,
+    submissionFingerprint,
+    authorizationVerification: null,
+    ...common,
+  };
 }
 
 function parseOpsWorkerTaskV1(
@@ -1926,6 +2061,48 @@ function parseOpsWorkerTaskV2(
   task: Record<string, unknown>,
   registry: OpsWorkerTaskContractRegistry,
 ): OpsWorkerTask {
+  expectExactKeys(task, V2_TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_V2_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSource(task.source, registry);
+  const submissionFingerprint = expectString(
+    task.submissionFingerprint,
+    "task.submissionFingerprint",
+  );
+  if (!SHA256_PATTERN.test(submissionFingerprint)) {
+    fail(
+      "task.submissionFingerprint",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  const previous: OpsWorkerTaskV2 = {
+    schemaVersion: OPS_WORKER_TASK_V2_SCHEMA_VERSION,
+    id,
+    source,
+    resource: parseResource(task.resource),
+    lifecycle: parseLifecycle(task.lifecycle),
+    currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
+    mutationReceipts: parseMutationReceipts(task.mutationReceipts),
+    custody: parseCustody(task.custody),
+    submissionFingerprint,
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  const parsed = migrateOpsWorkerTaskV2(previous);
+  assertTaskCustodyMatchesState(parsed);
+  assertParsedSnapshotSize(parsed);
+  return parsed;
+}
+
+function parseOpsWorkerTaskV3(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
   expectExactKeys(task, TASK_KEYS, "task");
   if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
     fail(
@@ -1956,6 +2133,9 @@ function parseOpsWorkerTaskV2(
     mutationReceipts: parseMutationReceipts(task.mutationReceipts),
     custody: parseCustody(task.custody),
     submissionFingerprint,
+    authorizationVerification: parseAuthorizationVerification(
+      task.authorizationVerification,
+    ),
     ...parseTaskCommon(task, id, source, registry),
   };
   assertTaskCustodyMatchesState(parsed);
@@ -1963,7 +2143,7 @@ function parseOpsWorkerTaskV2(
   return parsed;
 }
 
-/** Parse and copy exact v1 or v2 input. Unknown schema versions fail closed. */
+/** Parse and copy exact v1, v2, or v3 input. Unknown versions fail closed. */
 export function parseOpsWorkerTask(
   value: unknown,
   registry: OpsWorkerTaskContractRegistry,
@@ -1976,12 +2156,15 @@ export function parseOpsWorkerTask(
   if (descriptor.value === OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV1(task, registry);
   }
-  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+  if (descriptor.value === OPS_WORKER_TASK_V2_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV2(task, registry);
+  }
+  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV3(task, registry);
   }
   fail(
     "task.schemaVersion",
-    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION} or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
   );
 }
 

@@ -35,6 +35,7 @@ import {
   type PiInvocation,
 } from "../pi-runtime.js";
 import type { AgentConfig, PiThinkingLevel } from "../types.js";
+import { hasFreshOpsWorkerAuthorizationPass } from "./authorization.js";
 import {
   OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
@@ -321,7 +322,7 @@ export class OpsWorkerPiAttemptRunner {
 
   async runNext(): Promise<OpsWorkerTask | undefined> {
     if (this.abortSignal?.aborted) return undefined;
-    const scheduled = this.supervisor.claimNextTask();
+    const scheduled = await this.supervisor.claimNextTask();
     if (!scheduled) return undefined;
     if (scheduled.action === "CHECK") {
       return this.runDoneCheckOrCurrent(scheduled.task.id);
@@ -339,7 +340,11 @@ export class OpsWorkerPiAttemptRunner {
   }
 
   async runAttempt(taskId: string): Promise<OpsWorkerTask> {
-    this.supervisor.ensureTaskCustody(taskId, "RUN");
+    const authorized = await this.supervisor.ensureTaskCustody(taskId, "RUN");
+    if (
+      authorized.custody.status !== "HELD"
+      || !hasFreshOpsWorkerAuthorizationPass(authorized)
+    ) return authorized;
     this.supervisor.reservePiProcessGroupLaunch(taskId);
     try {
       if (this.abortSignal?.aborted) {

@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import {
+  hasFreshOpsWorkerAuthorizationPass,
+  OpsWorkerAuthorizationCoordinator,
+  type OpsWorkerAuthorizationVerifierRegistry,
+} from "./authorization.js";
+import {
   EMPTY_OPS_WORKER_DONE_CHECK_REGISTRY,
   type OpsWorkerDoneCheckRegistry,
 } from "./done-checks.js";
@@ -11,6 +16,7 @@ import {
   type OpsWorkerPiAttemptDependencies,
 } from "./pi-attempt.js";
 import {
+  hashOpsWorkerCanonicalPayload,
   OpsWorkerLifecycle,
   OpsWorkerLifecycleError,
   type OpsWorkerLifecycleIdentityUpdate,
@@ -68,6 +74,7 @@ export interface OpsWorkerCliDependencies {
     task: OpsWorkerTask,
   ) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>;
   piAttemptDependencies?: OpsWorkerPiAttemptDependencies;
+  authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
   abortSignal?: AbortSignal;
   schedulerPollMs?: number;
 }
@@ -397,6 +404,7 @@ function createSupervisor(
     inspectLockOwner: deps.inspectLockOwner ?? defaultInspectLockOwner,
     reconcileActiveRun: deps.reconcileActiveRun
       ?? createOpsWorkerPiStartupReconciler(),
+    authorizationVerifiers: deps.authorizationVerifiers,
   });
 }
 
@@ -425,6 +433,14 @@ function createTask(
       `authorization profile ${JSON.stringify(authorizationProfile)} is not registered`,
     );
   }
+  const authorizationSnapshotHash = hashOpsWorkerCanonicalPayload({
+    sourceKind: "operator-cli",
+    correlationKey: requiredValue(options, "correlation-key"),
+    deliveryKey: requiredValue(options, "delivery-key"),
+    resourceKey: requiredValue(options, "resource-key"),
+    profile: authorizationProfile,
+    scope: [...authorization.scope],
+  });
   return withOpsWorkerSubmissionFingerprint({
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
@@ -460,8 +476,9 @@ function createTask(
     authorization: {
       profile: authorizationProfile,
       scope: [...authorization.scope],
-      snapshotHash: null,
+      snapshotHash: authorizationSnapshotHash,
     },
+    authorizationVerification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -686,7 +703,15 @@ export async function runOpsWorkerCliCommand(
       printTask(result.task, json, cliOptions.stdout);
       return 0;
     }
-    const lifecycle = new OpsWorkerLifecycle(store, { now: deps.now });
+    const authorization = new OpsWorkerAuthorizationCoordinator(store, {
+      verifiers: deps.authorizationVerifiers,
+      now: deps.now,
+    });
+    const lifecycle = new OpsWorkerLifecycle(store, {
+      now: deps.now,
+      authorizeMutationClaim: (task, receipt) =>
+        hasFreshOpsWorkerAuthorizationPass(task, receipt.queryObservedAt),
+    });
     if (action === "checkpoint") {
       const task = lifecycle.recordCheckpoint(requiredValue(parsed, "id"), {
         checkpointId: requiredValue(parsed, "checkpoint-id"),
@@ -713,7 +738,17 @@ export async function runOpsWorkerCliCommand(
       return 0;
     }
     if (action === "receipt-claim") {
-      const result = lifecycle.claimMutationReceipt(requiredValue(parsed, "id"), {
+      const taskId = requiredValue(parsed, "id");
+      const decision = await authorization.revalidate(taskId);
+      if (!decision.authorized) {
+        printMutationClaim(
+          { task: decision.task, claimed: false },
+          json,
+          cliOptions.stdout,
+        );
+        return 0;
+      }
+      const result = lifecycle.claimMutationReceipt(taskId, {
         boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
         operationId: requiredValue(parsed, "operation-id"),
         intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),

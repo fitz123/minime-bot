@@ -17,6 +17,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import type {
+  OpsWorkerAuthorizationVerifier,
+  OpsWorkerAuthorizationVerifierRegistry,
+} from "../ops-worker/authorization.js";
 import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
@@ -51,6 +55,23 @@ import {
 const FAKE_PI_PROCESS = fileURLToPath(
   new URL("./fixtures/fake-pi-process.mjs", import.meta.url),
 );
+const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
+const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
+  identity: "fixture-authorization",
+  version: "1",
+  verify: () => ({
+    status: "PASS",
+    evidenceHash: `sha256:${"b".repeat(64)}`,
+    summary: "Authorization matches the trusted fixture policy.",
+  }),
+};
+const fixtureAuthorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry = {
+  alertmanager: fixtureAuthorizationVerifier,
+  "operator-cli": fixtureAuthorizationVerifier,
+  "operator-telegram": fixtureAuthorizationVerifier,
+  "registered-cron": fixtureAuthorizationVerifier,
+  "authorized-issue": fixtureAuthorizationVerifier,
+};
 
 function validateFixtureParams(value: unknown): JsonObject {
   assert.deepEqual(value, { expected: true });
@@ -104,7 +125,7 @@ function makeTask(
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id,
     source: {
       kind: sourceKind,
@@ -127,8 +148,9 @@ function makeTask(
     authorization: {
       profile: "fixture.inspect.v1",
       scope: ["inspect"],
-      snapshotHash: null,
+      snapshotHash: AUTHORIZATION_CLAIM_HASH,
     },
+    authorizationVerification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -194,6 +216,8 @@ async function makeHarness(
     instanceId: "pi-fixture-supervisor",
     processStartToken: "pi-fixture-supervisor-start",
     infrastructureRetryMs: 1,
+    authorizationVerifiers: fixtureAuthorizationVerifiers,
+    authorizationQueryRetryMs: 1,
   });
   await supervisor.start();
   const children: ChildProcess[] = [];
@@ -335,6 +359,7 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(task);
     const lifecycle = new OpsWorkerLifecycle(harness.store, {
       now: () => new Date("2026-07-18T09:05:00.000Z"),
+      authorizeMutationClaim: () => true,
     });
     lifecycle.recordCheckpoint(task.id, {
       checkpointId: "checkpoint-prompt",
@@ -440,7 +465,7 @@ describe("ops worker Pi standard-session attempts", () => {
   it("runs a ready deterministic check without requiring a Pi success claim", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("check-without-claim"));
-    harness.supervisor.requestDoneCheck("check-without-claim");
+    await harness.supervisor.requestDoneCheck("check-without-claim");
 
     const result = await harness.runner().runNext();
 
@@ -466,7 +491,7 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const task = makeTask("stale-checkpoint-check");
     harness.store.create(task);
-    harness.supervisor.requestDoneCheck(task.id);
+    await harness.supervisor.requestDoneCheck(task.id);
 
     const pending = harness.runner().runNext();
     await waitFor(() => resolveFirstCheck !== undefined);

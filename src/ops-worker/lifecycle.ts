@@ -77,6 +77,11 @@ export interface OpsWorkerMutationClaimResult {
 
 export interface OpsWorkerLifecycleOptions {
   now?: () => Date;
+  /** Trusted authorization fence; absent fences every external mutation claim. */
+  authorizeMutationClaim?: (
+    task: Readonly<OpsWorkerTask>,
+    receipt: Readonly<OpsWorkerMutationReceipt>,
+  ) => boolean;
 }
 
 export class OpsWorkerLifecycleError extends Error {
@@ -357,12 +362,16 @@ function timestampAtOrAfter(now: Date, floor: string): string {
  */
 export class OpsWorkerLifecycle {
   private readonly now: () => Date;
+  private readonly authorizeMutationClaim: NonNullable<
+    OpsWorkerLifecycleOptions["authorizeMutationClaim"]
+  >;
 
   constructor(
     private readonly store: OpsWorkerTaskStore,
     options: OpsWorkerLifecycleOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.authorizeMutationClaim = options.authorizeMutationClaim ?? (() => false);
   }
 
   updateLifecycleIdentity(
@@ -561,6 +570,11 @@ export class OpsWorkerLifecycle {
         assertMatchingOperation(receipt, input.operationId, intentHash);
         if (receipt.outcome !== null || receipt.mutationStartedAt !== null) {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        if (!this.authorizeMutationClaim(task, receipt)) {
+          throw new OpsWorkerLifecycleError(
+            `${input.boundary} mutation requires a fresh package-owned authorization PASS`,
+          );
         }
         receipt.mutationStartedAt = timestampAtOrAfter(
           this.now(),
