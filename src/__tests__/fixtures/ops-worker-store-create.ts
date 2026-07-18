@@ -11,10 +11,17 @@ import {
   createUnclaimedOpsWorkerCustody,
 } from "../../ops-worker/types.js";
 
-const [stateDirectory, taskId, correlationKey, readyPath, releasePath] =
+const [operation, stateDirectory, taskId, correlationKey, readyPath, releasePath] =
   process.argv.slice(2);
-if (!stateDirectory || !taskId || !correlationKey) {
-  throw new Error("store-create fixture requires state directory, task id, and correlation key");
+if (
+  (operation !== "create" && operation !== "mutate")
+  || !stateDirectory
+  || !taskId
+  || !correlationKey
+) {
+  throw new Error(
+    "store fixture requires create|mutate, state directory, task id, and correlation key",
+  );
 }
 
 const registry: OpsWorkerTaskContractRegistry = {
@@ -27,6 +34,21 @@ const registry: OpsWorkerTaskContractRegistry = {
     },
   },
   doneChecks: {
+    "fixture-health": {
+      validateParams(value: unknown): JsonObject {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+          throw new TypeError("fixture params must be an object");
+        }
+        const params = value as Record<string, unknown>;
+        if (
+          Object.keys(params).length !== 1
+          || !Number.isSafeInteger(params.sampleCount)
+        ) {
+          throw new TypeError("fixture sampleCount must be an integer");
+        }
+        return { sampleCount: params.sampleCount as number };
+      },
+    },
     "lax-fixture": {
       validateParams(value: unknown): JsonObject {
         if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -96,8 +118,19 @@ try {
       }
       : undefined,
   });
-  store.create(task);
-  process.stdout.write(`${taskId}\n`);
+  if (operation === "create") {
+    store.create(task);
+    process.stdout.write(`${taskId}\n`);
+  } else {
+    const result = store.mutate(
+      taskId,
+      { event: "UPDATED", summary: "Concurrent fixture mutation" },
+      (current) => {
+        current.rounds.remediation += 1;
+      },
+    );
+    process.stdout.write(`${result.task.rounds.remediation}\n`);
+  }
 } catch (error) {
   process.stderr.write(`${(error as Error).name}: ${(error as Error).message}\n`);
   process.exitCode = 1;

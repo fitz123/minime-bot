@@ -60,11 +60,11 @@ Base source: `f419d13` (`origin/main` when this plan was prepared)
 
 ### Task 2: Make adapter submission and task mutation atomic and idempotent
 
-- [ ] Write failing store tests in `src/__tests__/ops-worker-task-store.test.ts` and `src/__tests__/fixtures/ops-worker-store-create.ts` for concurrent read-modify-write, replay of the same delivery after terminal completion, conflicting reuse of one delivery key, and crash boundaries before/after snapshot rename.
-- [ ] Add a bounded `OpsWorkerTaskStore.mutate(taskId, audit, callback)` primitive in `src/ops-worker/task-store.ts` that acquires the existing mutation guard before reading, validates immutable identity and global invariants, writes one atomic authoritative snapshot, and appends only best-effort audit afterward.
-- [ ] Add idempotent create-or-return semantics keyed by immutable source delivery identity: an identical replay returns the existing task without another row or transition, while the same key with a different canonical submission fails closed. Keep `correlationKey` as active-episode deduplication rather than overloading it for delivery replay.
-- [ ] Refactor store-owned identity checks so source delivery identity, normalized resource identity, and creation time cannot change through `replace` or `mutate`; enforce at most one held custody owner while under the same mutation guard.
-- [ ] Preserve v1 read compatibility, journal non-authority, symlink/traversal protections, bounded files, and the existing no-database design; run the task-store tests before Task 3.
+- [x] Write failing store tests in `src/__tests__/ops-worker-task-store.test.ts` and `src/__tests__/fixtures/ops-worker-store-create.ts` for concurrent read-modify-write, replay of the same delivery after terminal completion, conflicting reuse of one delivery key, and crash boundaries before/after snapshot rename.
+- [x] Add a bounded `OpsWorkerTaskStore.mutate(taskId, audit, callback)` primitive in `src/ops-worker/task-store.ts` that acquires the existing mutation guard before reading, validates immutable identity and global invariants, writes one atomic authoritative snapshot, and appends only best-effort audit afterward.
+- [x] Add idempotent create-or-return semantics keyed by immutable source delivery identity: an identical replay returns the existing task without another row or transition, while the same key with a different canonical submission fails closed. Keep `correlationKey` as active-episode deduplication rather than overloading it for delivery replay.
+- [x] Refactor store-owned identity checks so source delivery identity, normalized resource identity, and creation time cannot change through `replace` or `mutate`; enforce at most one held custody owner while under the same mutation guard.
+- [x] Preserve v1 read compatibility, journal non-authority, symlink/traversal protections, bounded files, and the existing no-database design; run the task-store tests before Task 3.
 
 ### Task 3: Add package-owned atomic checkpoints and fixed mutation receipts
 

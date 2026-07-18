@@ -83,6 +83,15 @@ export interface OpsWorkerTaskStoreWriteResult {
   journalAppended: boolean;
 }
 
+export interface OpsWorkerTaskStoreCreateResult extends OpsWorkerTaskStoreWriteResult {
+  task: OpsWorkerTask;
+  created: boolean;
+}
+
+export interface OpsWorkerTaskStoreMutationResult extends OpsWorkerTaskStoreWriteResult {
+  task: OpsWorkerTask;
+}
+
 export class OpsWorkerDuplicateCorrelationError extends Error {
   readonly existingTaskId: string;
 
@@ -99,6 +108,18 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "OpsWorkerTaskStoreSafetyError";
+  }
+}
+
+export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyError {
+  readonly existingTaskId: string;
+
+  constructor(deliveryKey: string, existingTaskId: string) {
+    super(
+      `Delivery key ${JSON.stringify(deliveryKey)} conflicts with existing task ${existingTaskId}`,
+    );
+    this.name = "OpsWorkerDeliveryConflictError";
+    this.existingTaskId = existingTaskId;
   }
 }
 
@@ -542,11 +563,31 @@ export class OpsWorkerTaskStore {
   create(
     value: unknown,
     audit: OpsWorkerAuditInput = { event: "CREATED" },
-  ): OpsWorkerTaskStoreWriteResult {
+  ): OpsWorkerTaskStoreCreateResult {
     const task = parseOpsWorkerTask(value, this.registry);
     assertAuditInput(audit);
     return this.withMutationLock(() => {
       this.ensureSafeDirectories();
+      const currentTasks = this.list();
+      const deliveryMatches = currentTasks.filter(
+        (candidate) => candidate.source.deliveryKey === task.source.deliveryKey,
+      );
+      if (deliveryMatches.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      const replay = deliveryMatches[0];
+      if (replay) {
+        this.assertGlobalInvariants(currentTasks);
+        this.assertCanonicalSubmission(replay, task);
+        return {
+          task: replay,
+          created: false,
+          snapshotPath: this.snapshotPath(replay.id),
+          journalAppended: false,
+        };
+      }
       const snapshotPath = this.snapshotPath(task.id);
       if (assertPathMissingOrRegularFile(snapshotPath)) {
         throw new OpsWorkerTaskStoreSafetyError(
@@ -554,9 +595,13 @@ export class OpsWorkerTaskStore {
         );
       }
       this.assertJournalSafe();
-      this.assertUniqueActiveCorrelation(task);
+      this.assertGlobalInvariants([...currentTasks, task]);
       this.injectFault("after-correlation-check");
-      return this.write(task, snapshotPath, audit);
+      return {
+        task,
+        created: true,
+        ...this.write(task, snapshotPath, audit),
+      };
     });
   }
 
@@ -572,9 +617,37 @@ export class OpsWorkerTaskStore {
       const existing = this.readSnapshot(snapshotPath);
       this.assertImmutableIdentity(existing, task);
       this.assertJournalSafe();
-      this.assertUniqueActiveCorrelation(task);
+      this.assertGlobalInvariants(this.withReplacement(this.list(), task));
       this.injectFault("after-correlation-check");
       return this.write(task, snapshotPath, audit);
+    });
+  }
+
+  mutate(
+    taskId: string,
+    audit: OpsWorkerAuditInput,
+    callback: (task: OpsWorkerTask) => unknown,
+  ): OpsWorkerTaskStoreMutationResult {
+    assertOpsWorkerTaskId(taskId);
+    assertAuditInput(audit);
+    if (typeof callback !== "function") {
+      throw new OpsWorkerTaskStoreSafetyError("Task mutation callback must be a function");
+    }
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const snapshotPath = this.snapshotPath(taskId);
+      const existing = this.readSnapshot(snapshotPath);
+      const working = structuredClone(existing);
+      const returned = callback(working);
+      const task = parseOpsWorkerTask(returned === undefined ? working : returned, this.registry);
+      this.assertImmutableIdentity(existing, task);
+      this.assertJournalSafe();
+      this.assertGlobalInvariants(this.withReplacement(this.list(), task));
+      this.injectFault("after-correlation-check");
+      return {
+        task,
+        ...this.write(task, snapshotPath, audit),
+      };
     });
   }
 
@@ -618,22 +691,6 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertUniqueActiveCorrelation(candidate: OpsWorkerTask): void {
-    if (isOpsWorkerTerminalState(candidate.state)) return;
-    const duplicate = this.list().find(
-      (task) =>
-        task.id !== candidate.id
-        && !isOpsWorkerTerminalState(task.state)
-        && task.source.correlationKey === candidate.source.correlationKey,
-    );
-    if (duplicate) {
-      throw new OpsWorkerDuplicateCorrelationError(
-        candidate.source.correlationKey,
-        duplicate.id,
-      );
-    }
-  }
-
   private assertImmutableIdentity(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
     if (
       existing.id !== replacement.id
@@ -643,6 +700,73 @@ export class OpsWorkerTaskStore {
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
+      );
+    }
+  }
+
+  private assertCanonicalSubmission(existing: OpsWorkerTask, replay: OpsWorkerTask): void {
+    const canonical = (task: OpsWorkerTask): unknown => ({
+      source: task.source,
+      resource: task.resource,
+      priority: task.priority,
+      objective: task.objective,
+      doneCheck: task.doneCheck,
+      authorization: task.authorization,
+    });
+    if (JSON.stringify(canonical(existing)) !== JSON.stringify(canonical(replay))) {
+      throw new OpsWorkerDeliveryConflictError(
+        replay.source.deliveryKey,
+        existing.id,
+      );
+    }
+  }
+
+  private withReplacement(
+    tasks: readonly OpsWorkerTask[],
+    replacement: OpsWorkerTask,
+  ): OpsWorkerTask[] {
+    let found = false;
+    const prospective = tasks.map((task) => {
+      if (task.id !== replacement.id) return task;
+      found = true;
+      return replacement;
+    });
+    if (!found) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Cannot replace missing task ${replacement.id}`,
+      );
+    }
+    return prospective;
+  }
+
+  private assertGlobalInvariants(tasks: readonly OpsWorkerTask[]): void {
+    const deliveryOwners = new Map<string, string>();
+    const activeCorrelationOwners = new Map<string, string>();
+    const heldOwners: string[] = [];
+    for (const task of tasks) {
+      const deliveryOwner = deliveryOwners.get(task.source.deliveryKey);
+      if (deliveryOwner && deliveryOwner !== task.id) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      deliveryOwners.set(task.source.deliveryKey, task.id);
+
+      if (!isOpsWorkerTerminalState(task.state)) {
+        const correlationOwner = activeCorrelationOwners.get(task.source.correlationKey);
+        if (correlationOwner && correlationOwner !== task.id) {
+          throw new OpsWorkerDuplicateCorrelationError(
+            task.source.correlationKey,
+            correlationOwner,
+          );
+        }
+        activeCorrelationOwners.set(task.source.correlationKey, task.id);
+      }
+      if (task.custody.status === "HELD") heldOwners.push(task.id);
+    }
+    if (heldOwners.length > 1) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing multiple held custody owners: ${heldOwners.join(", ")}`,
       );
     }
   }

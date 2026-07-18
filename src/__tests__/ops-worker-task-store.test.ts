@@ -30,6 +30,7 @@ import {
   type OpsWorkerTaskV1,
 } from "../ops-worker/types.js";
 import {
+  OpsWorkerDeliveryConflictError,
   OpsWorkerDuplicateCorrelationError,
   OpsWorkerTaskStore,
   OpsWorkerTaskStoreSafetyError,
@@ -828,6 +829,49 @@ describe("ops worker durable task store", () => {
     assert.deepEqual(store.get(original.id), original);
   });
 
+  it("keeps source delivery identity, resource identity, and creation time immutable", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    for (const change of [
+      (task: OpsWorkerTask) => { task.source.deliveryKey = "fixture:changed-delivery"; },
+      (task: OpsWorkerTask) => {
+        task.resource = { kind: "repository", key: "github:example/minime-bot" };
+      },
+      (task: OpsWorkerTask) => {
+        task.createdAt = LATER;
+        task.updatedAt = LATER;
+      },
+    ]) {
+      assert.throws(
+        () => store.mutate(original.id, { event: "UPDATED" }, (task) => change(task)),
+        /immutable identity/,
+      );
+      assert.deepEqual(store.get(original.id), original);
+    }
+  });
+
+  it("applies read-modify-write callbacks to the latest snapshot under one guard", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const result = store.mutate(
+      original.id,
+      { event: "UPDATED", summary: "Increment remediation round" },
+      (task) => {
+        task.rounds.remediation += 1;
+        task.updatedAt = LATER;
+      },
+    );
+
+    assert.equal(result.task.rounds.remediation, 1);
+    assert.equal(result.task.updatedAt, LATER);
+    assert.equal(result.journalAppended, true);
+    assert.deepEqual(store.get(original.id), result.task);
+  });
+
   it("recovers the old snapshot when a crash occurs after temp-file fsync", (t) => {
     const directory = testStateDirectory(t);
     const initial = makeStore(t, { directory });
@@ -881,6 +925,42 @@ describe("ops worker durable task store", () => {
     const recovered = makeStore(t, { directory });
     assert.deepEqual(recovered.get(original.id), replacement);
     assert.equal(readFileSync(recovered.journalPath, "utf8"), oldJournal);
+  });
+
+  it("keeps the old mutation before rename and the new mutation after rename", (t) => {
+    for (const crashPoint of ["after-temp-file-fsync", "after-snapshot-rename"] as const) {
+      const directory = testStateDirectory(t);
+      const initial = makeStore(t, { directory });
+      const original = makeTask(`wt-mutate-${crashPoint}`);
+      initial.create(original);
+      const oldJournal = readFileSync(initial.journalPath, "utf8");
+      let armed = true;
+      const crashing = makeStore(t, {
+        directory,
+        faultInjector(point) {
+          if (armed && point === crashPoint) {
+            armed = false;
+            throw new Error(`simulated ${crashPoint} crash`);
+          }
+        },
+      });
+
+      assert.throws(
+        () => crashing.mutate(original.id, { event: "UPDATED" }, (task) => {
+          task.objective = `Mutation visible ${crashPoint}`;
+          task.updatedAt = LATER;
+        }),
+        new RegExp(`simulated ${crashPoint} crash`),
+      );
+      const recovered = makeStore(t, { directory });
+      assert.equal(
+        recovered.get(original.id)?.objective,
+        crashPoint === "after-snapshot-rename"
+          ? `Mutation visible ${crashPoint}`
+          : original.objective,
+      );
+      assert.equal(readFileSync(recovered.journalPath, "utf8"), oldJournal);
+    }
   });
 
   it("loads snapshots with a missing, truncated, or contradictory journal tail", (t) => {
@@ -944,12 +1024,99 @@ describe("ops worker durable task store", () => {
     assert.equal(store.list().length, 2);
   });
 
+  it("returns the original terminal task for an identical delivery replay", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    const created = store.create(original);
+    assert.equal(created.created, true);
+    assert.deepEqual(created.task, original);
+
+    const completed = clone(original);
+    completed.state = "DONE";
+    completed.updatedAt = LATER;
+    completed.lastOutcome = {
+      at: LATER,
+      kind: "DONE_CHECK",
+      result: "PASS",
+      summary: "Fresh fixture evidence passed.",
+    };
+    store.replace(completed, { event: "TRANSITION" });
+    const journalBeforeReplay = readFileSync(store.journalPath, "utf8");
+    const replay = makeTask("wt-20260717-replayed", original.source.correlationKey);
+    replay.source.deliveryKey = original.source.deliveryKey;
+    replay.createdAt = LATER;
+    replay.updatedAt = LATER;
+
+    const result = store.create(replay);
+
+    assert.equal(result.created, false);
+    assert.equal(result.journalAppended, false);
+    assert.deepEqual(result.task, completed);
+    assert.equal(store.list().length, 1);
+    assert.equal(readFileSync(store.journalPath, "utf8"), journalBeforeReplay);
+  });
+
+  it("fails closed when one delivery key is reused for a conflicting submission", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const conflict = makeTask("wt-20260717-conflict", original.source.correlationKey);
+    conflict.source.deliveryKey = original.source.deliveryKey;
+    conflict.objective = "A different canonical adapter submission";
+
+    assert.throws(
+      () => store.create(conflict),
+      (error: unknown) => {
+        assert.ok(error instanceof OpsWorkerDeliveryConflictError);
+        assert.equal(error.existingTaskId, original.id);
+        return true;
+      },
+    );
+    assert.deepEqual(store.list(), [original]);
+  });
+
+  it("enforces one held custody owner across create, replace, and mutate", (t) => {
+    const store = makeStore(t);
+    const first = makeTask("wt-held-first", "operator:held:first");
+    first.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    store.create(first);
+    const second = makeTask("wt-held-second", "operator:held:second");
+    store.create(second);
+
+    assert.throws(
+      () => store.mutate(second.id, { event: "TRANSITION" }, (task) => {
+        task.custody = {
+          status: "HELD",
+          claimedAt: NOW,
+          releasedAt: null,
+          releaseReason: null,
+        };
+      }),
+      /multiple held custody owners/,
+    );
+    const secondHeld = clone(second);
+    secondHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(() => store.replace(secondHeld), /multiple held custody owners/);
+    assert.deepEqual(store.get(second.id), second);
+  });
+
   it("serializes concurrent cross-process correlation creation", async (t) => {
     const root = testStateDirectory(t);
     const directory = join(root, "state");
     const readyPath = join(root, "first-ready");
     const releasePath = join(root, "release-first");
     const runFixture = (
+      operation: "create" | "mutate",
       taskId: string,
       barrier = false,
     ): Promise<{ code: number | null; stdout: string; stderr: string }> => {
@@ -957,6 +1124,7 @@ describe("ops worker durable task store", () => {
         "--import",
         "tsx",
         STORE_CREATE_FIXTURE,
+        operation,
         directory,
         taskId,
         "operator:shared:concurrent",
@@ -971,7 +1139,7 @@ describe("ops worker durable task store", () => {
       });
     };
 
-    const first = runFixture("concurrent-a", true);
+    const first = runFixture("create", "concurrent-a", true);
     let second:
       | Promise<{ code: number | null; stdout: string; stderr: string }>
       | undefined;
@@ -981,7 +1149,7 @@ describe("ops worker durable task store", () => {
         if (Date.now() >= deadline) throw new Error("Timed out waiting for first store writer");
         await new Promise((resolveWait) => setTimeout(resolveWait, 10));
       }
-      second = runFixture("concurrent-b");
+      second = runFixture("create", "concurrent-b");
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     } finally {
       writeFileSync(releasePath, "release\n", "utf8");
@@ -996,6 +1164,60 @@ describe("ops worker durable task store", () => {
     );
     const recovered = new OpsWorkerTaskStore(directory, { registry });
     assert.equal(recovered.list().length, 1);
+  });
+
+  it("serializes concurrent cross-process read-modify-write callbacks", async (t) => {
+    const root = testStateDirectory(t);
+    const directory = join(root, "state");
+    const readyPath = join(root, "first-ready");
+    const releasePath = join(root, "release-first");
+    const task = makeTask("concurrent-mutate", "operator:shared:mutation");
+    makeStore(t, { directory }).create(task);
+    const runFixture = (
+      barrier = false,
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> => {
+      const child = spawn(process.execPath, [
+        "--import",
+        "tsx",
+        STORE_CREATE_FIXTURE,
+        "mutate",
+        directory,
+        task.id,
+        task.source.correlationKey,
+        ...(barrier ? [readyPath, releasePath] : []),
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      return new Promise((resolveChild) => {
+        child.once("close", (code) => resolveChild({ code, stdout, stderr }));
+      });
+    };
+
+    const first = runFixture(true);
+    let second: ReturnType<typeof runFixture> | undefined;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= deadline) throw new Error("Timed out waiting for first store mutator");
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      second = runFixture();
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    } finally {
+      writeFileSync(releasePath, "release\n", "utf8");
+    }
+    assert.ok(second !== undefined);
+    const results = await Promise.all([first, second]);
+
+    assert.deepEqual(results.map((result) => result.code), [0, 0]);
+    assert.deepEqual(
+      results.map((result) => Number(result.stdout.trim())).sort(),
+      [1, 2],
+    );
+    const recovered = new OpsWorkerTaskStore(directory, { registry });
+    assert.equal(recovered.get(task.id)?.rounds.remediation, 2);
   });
 
   it("publishes complete mutation locks and reclaims a reused PID identity", (t) => {
