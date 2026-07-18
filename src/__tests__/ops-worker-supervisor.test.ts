@@ -438,6 +438,18 @@ describe("ops worker supervisor", () => {
     assert.equal(failedReport.updatedAt, completionAt);
     assert.equal(failedReport.report.attempts, 1);
     assert.equal(failedReport.report.state, "PENDING");
+    assert.match(failedReport.lifecycle.report ?? "", /^sha256:[a-f0-9]{64}$/);
+    assert.match(
+      failedReport.mutationReceipts.report?.intentHash ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+    assert.match(
+      failedReport.mutationReceipts.report?.queryResultHash ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+    assert.equal(failedReport.mutationReceipts.report?.outcome, null);
+    const reportIntentHash = failedReport.mutationReceipts.report?.intentHash;
+    const firstQueryHash = failedReport.mutationReceipts.report?.queryResultHash;
     const sentReport = harness.supervisor.recordReportAttempt(
       "task-pass",
       { sent: true },
@@ -445,6 +457,13 @@ describe("ops worker supervisor", () => {
     assert.equal(sentReport.updatedAt, completionAt);
     assert.equal(sentReport.report.attempts, 2);
     assert.equal(sentReport.report.state, "SENT");
+    assert.equal(sentReport.mutationReceipts.report?.intentHash, reportIntentHash);
+    assert.notEqual(sentReport.mutationReceipts.report?.queryResultHash, firstQueryHash);
+    assert.equal(sentReport.mutationReceipts.report?.outcome?.result, "APPLIED");
+    assert.throws(
+      () => harness.supervisor.recordReportAttempt("task-pass", { sent: true }),
+      /no pending report/,
+    );
     assert.throws(
       () => harness.supervisor.cancelTask("task-pass", "too late"),
       /Illegal ops-worker transition DONE -> CANCELLED/,
@@ -877,6 +896,7 @@ describe("ops worker supervisor", () => {
     );
     assert.equal(attempted.report.attempts, 1);
     assert.equal(attempted.report.state, "PENDING");
+    assert.equal(attempted.mutationReceipts.report?.outcome, null);
     restarted.close();
 
     const final = await makeHarness(t, {
@@ -884,6 +904,7 @@ describe("ops worker supervisor", () => {
       instanceId: "final-supervisor",
     });
     assert.equal(final.store.get("task-ambiguous")?.report.attempts, 1);
+    assert.equal(final.store.get("task-ambiguous")?.mutationReceipts.report?.outcome, null);
     const sent = final.supervisor.recordReportAttempt(
       "task-ambiguous",
       { sent: true },
@@ -891,6 +912,7 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.report.attempts, 2);
     assert.equal(sent.report.lastError, null);
+    assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
   it("reconciles a durable unverified-launch fence after the process and group are gone", async (t) => {

@@ -18,6 +18,10 @@ import {
   type OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckResult,
 } from "./done-checks.js";
+import {
+  hashOpsWorkerCanonicalPayload,
+  OpsWorkerLifecycle,
+} from "./lifecycle.js";
 import { OpsWorkerTaskStore } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
@@ -401,6 +405,10 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function timestampAtOrAfter(now: Date, floor: string): string {
+  return new Date(Math.max(now.getTime(), Date.parse(floor))).toISOString();
+}
+
 export class OpsWorkerSupervisor {
   private readonly store: OpsWorkerTaskStore;
   private readonly doneChecks: OpsWorkerDoneCheckRegistry;
@@ -411,6 +419,7 @@ export class OpsWorkerSupervisor {
     | ((task: OpsWorkerTask) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>)
     | undefined;
   private readonly guard: OpsWorkerSingleInstanceGuard;
+  private readonly lifecycle: OpsWorkerLifecycle;
   private started = false;
   private piLaunchReservation: string | null = null;
 
@@ -434,6 +443,7 @@ export class OpsWorkerSupervisor {
     this.now = options.now ?? (() => new Date());
     this.infrastructureRetryMs = infrastructureRetryMs;
     this.reconcileActiveRun = options.reconcileActiveRun;
+    this.lifecycle = new OpsWorkerLifecycle(this.store, { now: this.now });
     const startedAt = this.now().toISOString();
     this.guard = new OpsWorkerSingleInstanceGuard(
       this.store.stateDirectory,
@@ -1188,8 +1198,8 @@ export class OpsWorkerSupervisor {
     result: { sent: true } | { sent: false; error: string },
   ): OpsWorkerTask {
     this.assertStarted();
-    const task = this.requireTask(taskId);
-    if (task.report.state === "NONE") {
+    let task = this.requireTask(taskId);
+    if (task.report.state !== "PENDING") {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} has no pending report`,
       );
@@ -1199,20 +1209,104 @@ export class OpsWorkerSupervisor {
         `Task ${taskId} exhausted its bounded report-attempt counter`,
       );
     }
-    const replacement = structuredClone(task);
-    // updatedAt remains the DONE transition timestamp so the fresh PASS proof
-    // is not rewritten by report-transport bookkeeping. The REPORT journal
-    // entry supplies the mutation time for report attempts.
-    replacement.report.attempts += 1;
-    replacement.report.state = result.sent ? "SENT" : "PENDING";
-    replacement.report.lastError = result.sent
-      ? null
-      : truncateUtf8(result.error, OPS_WORKER_LIMITS.maxReportErrorBytes);
-    this.store.replace(replacement, {
-      event: "REPORT",
-      summary: result.sent ? "Report marked sent" : "Report attempt remains pending",
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: task.id,
+      deliveryKey: task.source.deliveryKey,
+      createdAt: task.createdAt,
     });
-    return this.requireTask(taskId);
+    const reportIntent = {
+      reportIdentity,
+      taskState: task.state,
+      lastOutcome: task.lastOutcome === null
+        ? null
+        : {
+          at: task.lastOutcome.at,
+          kind: task.lastOutcome.kind,
+          result: task.lastOutcome.result,
+          summary: task.lastOutcome.summary,
+        },
+    };
+    const reportPayloadHash = hashOpsWorkerCanonicalPayload(reportIntent);
+    const operation = {
+      boundary: "report" as const,
+      operationId: `report:${reportPayloadHash.slice("sha256:".length, 31)}`,
+      intent: reportIntent,
+    };
+    task = this.lifecycle.updateLifecycleIdentity(taskId, {
+      report: reportIdentity,
+    });
+    const previousReceipt = task.mutationReceipts.report;
+    const observedAt = previousReceipt?.mutationStartedAt === null
+      ? timestampAtOrAfter(this.now(), previousReceipt.queryObservedAt)
+      : previousReceipt?.mutationStartedAt
+      ? new Date(Math.max(
+        this.now().getTime(),
+        Date.parse(previousReceipt.mutationStartedAt) + 1,
+      )).toISOString()
+      : this.now().toISOString();
+    task = this.lifecycle.beginMutationReceipt(taskId, {
+      ...operation,
+      queryObservedAt: observedAt,
+      queryResult: {
+        state: task.report.state,
+        attempts: task.report.attempts,
+        lastError: task.report.lastError,
+      },
+    });
+    const claim = this.lifecycle.claimMutationReceipt(taskId, operation);
+    if (!claim.claimed) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
+      );
+    }
+    const recorded = this.store.mutate(
+      taskId,
+      {
+        event: "REPORT",
+        summary: result.sent ? "Report marked sent" : "Report attempt remains pending",
+      },
+      (replacement) => {
+        if (replacement.report.state !== "PENDING") {
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${taskId} has no pending report`,
+          );
+        }
+        if (replacement.report.attempts >= 1_000) {
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${taskId} exhausted its bounded report-attempt counter`,
+          );
+        }
+        const receipt = replacement.mutationReceipts.report;
+        if (
+          receipt === null
+          || receipt.operationId !== operation.operationId
+          || receipt.intentHash !== reportPayloadHash
+          || receipt.mutationStartedAt === null
+          || receipt.outcome !== null
+        ) {
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${taskId} report bookkeeping lacks its matching mutation receipt`,
+          );
+        }
+        // updatedAt remains the terminal transition timestamp so the fresh
+        // PASS proof is not rewritten by report bookkeeping.
+        replacement.report.attempts += 1;
+        replacement.report.state = result.sent ? "SENT" : "PENDING";
+        replacement.report.lastError = result.sent
+          ? null
+          : truncateUtf8(result.error, OPS_WORKER_LIMITS.maxReportErrorBytes);
+      },
+    ).task;
+    if (!result.sent) return recorded;
+    return this.lifecycle.finishMutationReceipt(taskId, {
+      ...operation,
+      result: "APPLIED",
+      evidence: {
+        sent: true,
+        attempt: recorded.report.attempts,
+        state: recorded.report.state,
+      },
+    });
   }
 
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {

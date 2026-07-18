@@ -92,6 +92,11 @@ export interface OpsWorkerTaskStoreMutationResult extends OpsWorkerTaskStoreWrit
   task: OpsWorkerTask;
 }
 
+/** Return from a mutation callback when the guarded read proves no write is needed. */
+export const OPS_WORKER_TASK_STORE_NO_CHANGE = Symbol(
+  "OPS_WORKER_TASK_STORE_NO_CHANGE",
+);
+
 export class OpsWorkerDuplicateCorrelationError extends Error {
   readonly existingTaskId: string;
 
@@ -639,6 +644,13 @@ export class OpsWorkerTaskStore {
       const existing = this.readSnapshot(snapshotPath);
       const working = structuredClone(existing);
       const returned = callback(working);
+      if (returned === OPS_WORKER_TASK_STORE_NO_CHANGE) {
+        return {
+          task: existing,
+          snapshotPath,
+          journalAppended: false,
+        };
+      }
       const task = parseOpsWorkerTask(returned === undefined ? working : returned, this.registry);
       this.assertImmutableIdentity(existing, task);
       this.assertJournalSafe();

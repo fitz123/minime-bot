@@ -21,6 +21,7 @@ import {
   type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
+import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
@@ -327,6 +328,55 @@ describe("ops worker Pi standard-session attempts", () => {
     ]);
   });
 
+  it("includes bounded resource and lifecycle resume evidence in the private prompt", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("lifecycle-prompt");
+    harness.store.create(task);
+    const lifecycle = new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date("2026-07-18T09:05:00.000Z"),
+    });
+    lifecycle.recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-prompt",
+      payload: { inspected: true },
+      summary: "Repository inspection reached the merge boundary.",
+      artifact: "artifacts/checkpoint-prompt.json",
+      lifecycle: {
+        repository: "github:example/minime-bot",
+        branch: "refs/heads/issue-58",
+      },
+    });
+    const receipt = {
+      boundary: "merge" as const,
+      operationId: "merge-prompt",
+      intent: { base: "main", head: "issue-58" },
+    };
+    lifecycle.beginMutationReceipt(task.id, {
+      ...receipt,
+      queryObservedAt: "2026-07-18T09:05:00.000Z",
+      queryResult: { merged: false },
+    });
+    lifecycle.claimMutationReceipt(task.id, receipt);
+    const promptPath = join(harness.root, "private-prompt.txt");
+
+    await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const prompt = readFileSync(promptPath, "utf8");
+    assert.match(prompt, /Normalized resource: host:local \(host\)/);
+    assert.match(prompt, /repository=github:example\/minime-bot/);
+    assert.match(prompt, /branch=refs\/heads\/issue-58/);
+    assert.match(prompt, /checkpoint-prompt/);
+    assert.match(prompt, /Repository inspection reached the merge boundary/);
+    assert.match(prompt, /merge-prompt.*mutation-started/);
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+  });
+
   it("falls back to Pi context discovery only for a genuinely empty workspace", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("empty-context"));
@@ -571,6 +621,30 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result.rounds.remediation, 0);
     assert.equal(result.activeRun, null);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("counts an authoritative checkpoint snapshot write as attempt progress", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("checkpoint-progress");
+    harness.store.create(task);
+    harness.setScenario("wait");
+    const running = harness.runner({
+      attemptTimeoutMs: 2_000,
+      stallTimeoutMs: 200,
+    }).runAttempt(task.id);
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-live",
+      payload: { progress: 1 },
+      summary: "A durable package-owned progress checkpoint.",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 130));
+
+    assert.equal(harness.supervisor.getTask(task.id)?.state, "RUNNING");
+    const result = await running;
+    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
+    assert.equal(result.lastOutcome?.result, "STALL");
   });
 
   it("does not KILL a surviving group after the proven Pi leader exits", async (t) => {
