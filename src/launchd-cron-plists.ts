@@ -738,9 +738,12 @@ function plistsSemanticallyEqual(
   // plists render only integer numeric scalars, so reject any existing real
   // after the value comparison rather than silently accepting type drift.
   const existingXml = convertPlist(context.plutilBin, "xml1", existingPath);
-  return existingXml.ok
-    && /<plist(?:\s[^>]*)?>/.test(existingXml.output)
-    && existingXml.output.includes("</plist>")
+  if (!existingXml.ok) {
+    return false;
+  }
+  const reparsedExisting = parsePlistJson(context.plutilBin, "-", existingXml.output);
+  return reparsedExisting.ok
+    && isDeepStrictEqual(existing.value, reparsedExisting.value)
     && !/<real(?:\s*\/)?\s*>/.test(existingXml.output);
 }
 

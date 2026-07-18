@@ -729,7 +729,10 @@ describe("launchd cron plist sync", () => {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
       const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
-      const existingContent = renderReorderedPlistFixture(fixture, runner, "active", 8);
+      const existingContent = renderReorderedPlistFixture(fixture, runner, "active", 8).replace(
+        "<integer>8</integer>",
+        "<real>8.0</real>",
+      );
       writeFileSync(activePath, existingContent, "utf8");
       const beforeEntries = readdirSync(fixture.launchAgentsDir).sort();
       const malformedJsonPlutil = join(fixture.root, "malformed-json-plutil");
@@ -751,11 +754,21 @@ fi
 exec "${fixturePlutil}" "$@"
 `, "utf8");
       chmodSync(xmlFailurePlutil, 0o700);
+      const malformedXmlPlutil = join(fixture.root, "malformed-xml-plutil");
+      writeFileSync(malformedXmlPlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%s\\n' '<plist><dict></plist>'
+  exit 0
+fi
+exec "${fixturePlutil}" "$@"
+`, "utf8");
+      chmodSync(malformedXmlPlutil, 0o700);
       const invalidPlutils = [
         join(fixture.root, "private-parser-path-must-not-leak"),
         "private-parser\0command-must-not-leak",
         malformedJsonPlutil,
         xmlFailurePlutil,
+        malformedXmlPlutil,
       ];
 
       for (const plutil of invalidPlutils) {
