@@ -738,15 +738,15 @@ function parsePlistJson(
   inputPath: string,
   input?: string,
 ): { ok: true; value: unknown } | { ok: false } {
-  const result = spawnSync(
-    plutilBin,
-    ["-convert", "json", "-o", "-", inputPath],
-    { encoding: "utf8", input },
-  );
-  if (result.error || result.status !== 0) {
-    return { ok: false };
-  }
   try {
+    const result = spawnSync(
+      plutilBin,
+      ["-convert", "json", "-o", "-", inputPath],
+      { encoding: "utf8", input },
+    );
+    if (result.error || result.status !== 0) {
+      return { ok: false };
+    }
     return { ok: true, value: JSON.parse(result.stdout) as unknown };
   } catch {
     return { ok: false };

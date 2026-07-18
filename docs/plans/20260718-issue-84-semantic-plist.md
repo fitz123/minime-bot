@@ -52,8 +52,8 @@ git diff --check origin/main...HEAD
 
 ### Task 3: Final validation and review
 
-- [ ] Document semantic-vs-byte planning behavior and the read-only dry-run parser boundary.
-- [ ] Run focused launchd/CLI/package-install tests and the complete validation command set.
-- [ ] Run Ralphex correctness/security and requirement/integration review until a clean iteration; fix every verified critical/major finding with regression coverage.
-- [ ] Verify the exact public diff contains only package source/tests/docs/completed plan and no private evidence or generated artifacts.
-- [ ] Leave the branch clean and committed. PR/release/deploy/production dry-run are post-Ralphex steps; issue #84 remains open until the real narrow sync and first-run verification pass.
+- [x] Document semantic-vs-byte planning behavior and the read-only dry-run parser boundary.
+- [x] Run focused launchd/CLI/package-install tests and the complete validation command set.
+- [x] Run Ralphex correctness/security and requirement/integration review until a clean iteration; fix every verified critical/major finding with regression coverage.
+- [x] Verify the exact public diff contains only package source/tests/docs/completed plan and no private evidence or generated artifacts.
+- [x] Leave the branch clean and committed. PR/release/deploy/production dry-run are post-Ralphex steps; issue #84 remains open until the real narrow sync and first-run verification pass.

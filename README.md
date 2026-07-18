@@ -462,6 +462,17 @@ operation. `--launch-agents-dir` overrides the default
 `~/Library/LaunchAgents` target. Cron sync must not bootout, bootstrap, signal,
 or otherwise restart `ai.minime.telegram-bot`.
 
+Planning uses byte identity as a fast path. If an existing plist has different
+bytes, the configured `plutil` converts the existing file and desired in-memory
+content to JSON for a deep value comparison. Formatting and dictionary key
+order do not cause updates; array order and scalar, runner, or schedule changes
+do. Parsing is fail-closed: startup, exit, or JSON failures plan `update`
+without exposing parser output, plist contents, or paths.
+
+Dry-run may perform that read-only parser comparison, with desired content sent
+on standard input, but creates no temporary files or directories and performs
+no writes, plist lint, launchctl calls, or other state mutation.
+
 Cron execution failures send `Cron FAIL: <task>` plus the error line to the
 delivery chat. When Pi diagnostics are available, the notification appends a
 `Diagnostics:` excerpt capped at 300 characters after sanitization and

@@ -92,9 +92,22 @@ minime-bot launchd crons sync --workspace /path/to/control-workspace --launch-ag
 ```
 
 `--dry-run` computes create, update, delete, and rebootstrap actions without
-writing plists or calling launchctl. The default non-dry-run mode writes active
-cron plists, lint-checks changed plists, bootouts changed active cron labels,
-and bootstraps them into the current user launchd domain.
+writing plists or calling launchctl. Planning first treats byte-identical
+existing and desired plists as unchanged. When their bytes differ, it converts
+both plists to JSON with the configured `plutil` and compares their parsed
+values. The existing plist is read from its path, while the desired in-memory
+plist is sent on standard input. Dictionary key order and XML formatting are
+therefore ignored, but array order, scalar types, runner paths, and schedules
+remain significant.
+
+This semantic comparison is the only command boundary used by dry-run. It uses
+`plutil -convert json -o -` for read-only output and creates no temporary files
+or directories. A parser startup, exit, or JSON failure conservatively plans
+the plist as `update`; parser output, plist contents, and paths are not included
+in planning output. Dry-run still performs no writes, plist lint, launchctl
+calls, or other state mutation. The default non-dry-run mode writes active cron
+plists, lint-checks changed plists, bootouts changed active cron labels, and
+bootstraps them into the current user launchd domain.
 
 Prune is enabled by default for the package-owned `ai.minime.cron.*` namespace.
 Pruning means a stale or disabled owned cron label is booted out, its plist is
@@ -150,7 +163,8 @@ Escaping, dangling, multi-symlink, wrong-owner, writable-component, missing,
 unreadable, non-executable, and incorrectly named paths are rejected. Explicit
 override validation happens before cron loading, directory creation, plist
 writes, pruning, or `plutil`/`launchctl` execution. Dry-run remains zero-write
-and zero-command.
+and never calls launchctl; when existing plist bytes differ, it may run only the
+read-only semantic `plutil` comparison described above.
 
 ## Cron deploy versus bot restart
 

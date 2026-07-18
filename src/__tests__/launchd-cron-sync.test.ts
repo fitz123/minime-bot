@@ -721,7 +721,7 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("fails parser startup safely without writes or leaked parser paths", () => {
+  it("fails returned, thrown, and malformed-JSON parser errors without writes or leaks", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
@@ -731,27 +731,42 @@ describe("launchd cron plist sync", () => {
       const existingContent = renderReorderedPlistFixture(fixture, runner, "active", 8);
       writeFileSync(activePath, existingContent, "utf8");
       const beforeEntries = readdirSync(fixture.launchAgentsDir).sort();
-      const missingPlutil = join(fixture.root, "private-parser-path-must-not-leak");
+      const malformedJsonPlutil = join(fixture.root, "malformed-json-plutil");
+      writeFileSync(malformedJsonPlutil, `#!/bin/sh
+if [ "$5" = "-" ]; then
+  printf '%s\\n' 'private-parser-invalid-json'
+else
+  printf '%s\\n' '{}'
+fi
+`, "utf8");
+      chmodSync(malformedJsonPlutil, 0o700);
+      const invalidPlutils = [
+        join(fixture.root, "private-parser-path-must-not-leak"),
+        "private-parser\0command-must-not-leak",
+        malformedJsonPlutil,
+      ];
 
-      const result = syncLaunchdCrons({
-        workspace: fixture.workspace,
-        launchAgentsDir: fixture.launchAgentsDir,
-        runCronScript: runner,
-        dryRun: true,
-        env: { ...fixture.env, PLUTIL_BIN: missingPlutil },
-        homeDir: fixture.home,
-        uid: 501,
-        commandRunner: captureRunner(calls),
-      });
-      const output = formatLaunchdCronSyncResult(result);
+      for (const plutil of invalidPlutils) {
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          runCronScript: runner,
+          dryRun: true,
+          env: { ...fixture.env, PLUTIL_BIN: plutil },
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls),
+        });
+        const output = formatLaunchdCronSyncResult(result);
 
-      assert.equal(result.items[0].action, "update");
-      assert.equal(readFileSync(activePath, "utf8"), existingContent);
-      assert.deepEqual(readdirSync(fixture.launchAgentsDir).sort(), beforeEntries);
-      assert.equal(existsSync(fixture.logDir), false);
-      assert.equal(calls.length, 0);
-      assert.doesNotMatch(output, /private-parser-path-must-not-leak/);
-      assert.equal(output.includes(missingPlutil), false);
+        assert.equal(result.items[0].action, "update");
+        assert.equal(readFileSync(activePath, "utf8"), existingContent);
+        assert.deepEqual(readdirSync(fixture.launchAgentsDir).sort(), beforeEntries);
+        assert.equal(existsSync(fixture.logDir), false);
+        assert.equal(calls.length, 0);
+        assert.doesNotMatch(output, /private-parser/);
+        assert.equal(output.includes(plutil), false);
+      }
     } finally {
       cleanup(fixture);
     }
