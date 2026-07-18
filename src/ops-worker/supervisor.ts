@@ -41,6 +41,7 @@ import {
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SUPERVISOR_LOCK_SCHEMA_VERSION = 1 as const;
 const SUPERVISOR_LOCK_FILE_NAME = "supervisor.lock";
+const SUPERVISOR_LOCK_RECOVERY_FILE_NAME = "supervisor.lock.recovery";
 const MAX_SUPERVISOR_LOCK_BYTES = 4 * 1024;
 const MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES = 1_000;
 const INSTANCE_ID_PATTERN =
@@ -256,12 +257,14 @@ function parseLockRecord(raw: string): OpsWorkerSupervisorLockRecord {
 
 class OpsWorkerSingleInstanceGuard {
   private readonly path: string;
+  private readonly recoveryPath: string;
   private readonly record: OpsWorkerSupervisorLockRecord;
   private readonly inspectOwner:
     | ((owner: OpsWorkerSupervisorLockRecord) => OpsWorkerLockOwnerStatus)
     | undefined;
   private readonly faultInjector: ((point: "after-temp-file-fsync") => void) | undefined;
   private acquiredInode: bigint | number | undefined;
+  private recoveryInode: bigint | number | undefined;
 
   constructor(
     stateDirectory: string,
@@ -272,6 +275,7 @@ class OpsWorkerSingleInstanceGuard {
     faultInjector: ((point: "after-temp-file-fsync") => void) | undefined,
   ) {
     this.path = join(stateDirectory, SUPERVISOR_LOCK_FILE_NAME);
+    this.recoveryPath = join(stateDirectory, SUPERVISOR_LOCK_RECOVERY_FILE_NAME);
     this.record = record;
     this.inspectOwner = inspectOwner;
     this.faultInjector = faultInjector;
@@ -279,6 +283,7 @@ class OpsWorkerSingleInstanceGuard {
 
   acquire(): void {
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      this.assertNoRecoveryGuard();
       if (this.publishCompleteRecord()) return;
 
       const existing = readSupervisorLock(this.path);
@@ -294,17 +299,41 @@ class OpsWorkerSingleInstanceGuard {
           owner,
         );
       }
-      const rechecked = readSupervisorLock(this.path);
-      if (
-        rechecked.stats.ino !== existingStats.ino
-        || rechecked.raw !== ownerRaw
-      ) {
-        throw new OpsWorkerSupervisorAlreadyRunningError(
-          "Supervisor lock changed during stale-owner inspection",
-          owner,
-        );
+      this.acquireRecoveryGuard();
+      try {
+        const rechecked = readSupervisorLock(this.path);
+        if (
+          rechecked.stats.ino !== existingStats.ino
+          || rechecked.raw !== ownerRaw
+        ) {
+          throw new OpsWorkerSupervisorAlreadyRunningError(
+            "Supervisor lock changed during stale-owner inspection",
+            owner,
+          );
+        }
+        const recheckedStatus = this.inspectOwner?.(rechecked.owner) ?? "AMBIGUOUS";
+        if (recheckedStatus !== "STALE") {
+          throw new OpsWorkerSupervisorAlreadyRunningError(
+            recheckedStatus === "ACTIVE"
+              ? `Ops worker supervisor ${rechecked.owner.instanceId} is already running`
+              : "Existing supervisor ownership is ambiguous",
+            rechecked.owner,
+          );
+        }
+        const confirmed = readSupervisorLock(this.path);
+        if (
+          confirmed.stats.ino !== rechecked.stats.ino
+          || confirmed.raw !== rechecked.raw
+        ) {
+          throw new OpsWorkerSupervisorAlreadyRunningError(
+            "Supervisor lock changed during stale-owner inspection",
+            rechecked.owner,
+          );
+        }
+        unlinkSync(this.path);
+      } finally {
+        this.releaseRecoveryGuard();
       }
-      unlinkSync(this.path);
     }
     throw new OpsWorkerSupervisorAlreadyRunningError(
       "Could not acquire the supervisor lock",
@@ -345,6 +374,59 @@ class OpsWorkerSingleInstanceGuard {
         }
       }
     }
+  }
+
+  private assertNoRecoveryGuard(): void {
+    try {
+      lstatSync(this.recoveryPath);
+    } catch (error) {
+      if (isMissingError(error)) return;
+      throw error;
+    }
+    throw new OpsWorkerSupervisorAlreadyRunningError(
+      "Supervisor stale-lock recovery is already in progress",
+    );
+  }
+
+  private acquireRecoveryGuard(): void {
+    let descriptor: number;
+    try {
+      descriptor = openSync(
+        this.recoveryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+    } catch (error) {
+      if (isAlreadyExistsError(error)) {
+        throw new OpsWorkerSupervisorAlreadyRunningError(
+          "Supervisor stale-lock recovery is already in progress",
+        );
+      }
+      throw error;
+    }
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+      fsyncSync(descriptor);
+      this.recoveryInode = fstatSync(descriptor).ino;
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  private releaseRecoveryGuard(): void {
+    if (this.recoveryInode === undefined) return;
+    const current = readSupervisorLock(this.recoveryPath);
+    if (
+      current.stats.ino !== this.recoveryInode
+      || current.owner.instanceId !== this.record.instanceId
+      || current.owner.processStartToken !== this.record.processStartToken
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Refusing to remove a supervisor stale-lock recovery guard whose ownership changed",
+      );
+    }
+    unlinkSync(this.recoveryPath);
+    this.recoveryInode = undefined;
   }
 
   release(): void {

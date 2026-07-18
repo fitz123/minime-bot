@@ -139,6 +139,7 @@ const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SNAPSHOT_SUFFIX = ".json";
 const JOURNAL_FILE_NAME = "journal.jsonl";
 const MUTATION_LOCK_FILE_NAME = ".task-store.lock";
+const MUTATION_LOCK_RECOVERY_FILE_NAME = ".task-store.lock.recovery";
 const MAX_MUTATION_LOCK_BYTES = 512;
 const MAX_AUDIT_SUMMARY_BYTES = 2 * 1024;
 
@@ -328,15 +329,18 @@ function readMutationLock(path: string): {
 
 class OpsWorkerTaskStoreMutationGuard {
   private readonly path: string;
+  private readonly recoveryPath: string;
   private readonly record: MutationLockRecord;
   private readonly faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined;
   private acquiredInode: bigint | number | undefined;
+  private recoveryInode: bigint | number | undefined;
 
   constructor(
     stateDirectory: string,
     faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined,
   ) {
     this.path = join(stateDirectory, MUTATION_LOCK_FILE_NAME);
+    this.recoveryPath = join(stateDirectory, MUTATION_LOCK_RECOVERY_FILE_NAME);
     const owner = inspectMutationLockOwner(process.pid);
     if (owner.status !== "ACTIVE") {
       throw new OpsWorkerTaskStoreSafetyError(
@@ -354,6 +358,7 @@ class OpsWorkerTaskStoreMutationGuard {
   acquire(): void {
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
+      this.assertNoRecoveryGuard();
       if (this.publishCompleteRecord()) return;
       let existing: ReturnType<typeof readMutationLock>;
       try {
@@ -369,12 +374,30 @@ class OpsWorkerTaskStoreMutationGuard {
           && owner.processStartToken !== existing.record.processStartToken
         )
       ) {
-        const rechecked = readMutationLock(this.path);
-        if (
-          rechecked.stats.ino !== existing.stats.ino
-          || rechecked.raw !== existing.raw
-        ) throw new OpsWorkerTaskStoreBusyError();
-        unlinkSync(this.path);
+        this.acquireRecoveryGuard();
+        try {
+          const rechecked = readMutationLock(this.path);
+          if (
+            rechecked.stats.ino !== existing.stats.ino
+            || rechecked.raw !== existing.raw
+          ) throw new OpsWorkerTaskStoreBusyError();
+          const recheckedOwner = inspectMutationLockOwner(rechecked.record.pid);
+          if (
+            recheckedOwner.status !== "STALE"
+            && !(
+              recheckedOwner.status === "ACTIVE"
+              && recheckedOwner.processStartToken !== rechecked.record.processStartToken
+            )
+          ) throw new OpsWorkerTaskStoreBusyError();
+          const confirmed = readMutationLock(this.path);
+          if (
+            confirmed.stats.ino !== rechecked.stats.ino
+            || confirmed.raw !== rechecked.raw
+          ) throw new OpsWorkerTaskStoreBusyError();
+          unlinkSync(this.path);
+        } finally {
+          this.releaseRecoveryGuard();
+        }
         continue;
       }
       if (owner.status === "AMBIGUOUS") throw new OpsWorkerTaskStoreBusyError();
@@ -436,6 +459,56 @@ class OpsWorkerTaskStoreMutationGuard {
         }
       }
     }
+  }
+
+  private assertNoRecoveryGuard(): void {
+    try {
+      lstatSync(this.recoveryPath);
+    } catch (error) {
+      if (isMissingError(error)) return;
+      throw error;
+    }
+    throw new OpsWorkerTaskStoreBusyError();
+  }
+
+  private acquireRecoveryGuard(): void {
+    let descriptor: number;
+    try {
+      descriptor = openSync(
+        this.recoveryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new OpsWorkerTaskStoreBusyError();
+      }
+      throw error;
+    }
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+      fsyncSync(descriptor);
+      this.recoveryInode = fstatSync(descriptor).ino;
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  private releaseRecoveryGuard(): void {
+    if (this.recoveryInode === undefined) return;
+    const current = readMutationLock(this.recoveryPath);
+    if (
+      current.stats.ino !== this.recoveryInode
+      || current.record.pid !== this.record.pid
+      || current.record.processStartToken !== this.record.processStartToken
+      || current.record.nonce !== this.record.nonce
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Refusing to remove a task-store stale-lock recovery guard whose ownership changed",
+      );
+    }
+    unlinkSync(this.recoveryPath);
+    this.recoveryInode = undefined;
   }
 }
 
@@ -726,6 +799,16 @@ export class OpsWorkerTaskStore {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
       );
+    }
+    for (const slot of Object.keys(existing.lifecycle) as Array<
+      keyof OpsWorkerTask["lifecycle"]
+    >) {
+      const current = existing.lifecycle[slot];
+      if (typeof current === "string" && replacement.lifecycle[slot] !== current) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change write-once lifecycle identity ${slot} of task ${existing.id}`,
+        );
+      }
     }
   }
 

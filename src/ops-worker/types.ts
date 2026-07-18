@@ -404,7 +404,8 @@ export interface OpsWorkerTaskContractRegistry {
 }
 
 export const OPS_WORKER_LIMITS = {
-  maxSnapshotBytes: 256 * 1024,
+  maxLegacySnapshotBytes: 256 * 1024,
+  maxSnapshotBytes: 512 * 1024,
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
@@ -476,6 +477,7 @@ const INSTANCE_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$
 const CORRELATION_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/+?-]{0,254}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
 const DELIVERY_KEY_PATTERN = CORRELATION_KEY_PATTERN;
 const RESOURCE_KEY_PATTERN = /^[a-z0-9][a-z0-9.-]{0,31}:[a-z0-9](?:[a-z0-9._/-]{0,222}[a-z0-9])?$/;
+const RESOURCE_IDENTITY_SEGMENT_PATTERN = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/;
 const LIFECYCLE_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/+?-]{0,510}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
@@ -731,11 +733,18 @@ function parseResource(value: unknown): OpsWorkerResourceIdentity {
   if (kind === "host" && (!key.startsWith("host:") || identity.includes("/"))) {
     fail("task.resource.key", "host resources must use host:<name>");
   }
-  if (kind === "repository" && (key.startsWith("host:") || !identity.includes("/"))) {
-    fail(
-      "task.resource.key",
-      "repository resources must use a non-host namespace and owner/name identity",
-    );
+  if (kind === "repository") {
+    const identitySegments = identity.split("/");
+    if (
+      key.startsWith("host:")
+      || identitySegments.length !== 2
+      || identitySegments.some((segment) => !RESOURCE_IDENTITY_SEGMENT_PATTERN.test(segment))
+    ) {
+      fail(
+        "task.resource.key",
+        "repository resources must use a non-host namespace and exactly one normalized owner/name identity",
+      );
+    }
   }
   return { kind, key };
 }
@@ -1702,7 +1711,7 @@ function legacyCustody(task: OpsWorkerTaskV1): OpsWorkerCustody {
     task.state === "RUNNING"
     || task.state === "CHECKING"
     || task.state === "RESUMABLE"
-    || ambiguousOrphan
+    || (task.state === "BLOCKED" && ambiguousOrphan)
   ) {
     return {
       status: "HELD",
@@ -1788,6 +1797,14 @@ function parseOpsWorkerTaskV1(
     ...parseTaskCommon(task, id, source, registry),
   };
   const migrated = migrateOpsWorkerTaskV1(legacy);
+  const legacyBytes = Buffer.byteLength(JSON.stringify(legacy), "utf8");
+  if (legacyBytes > OPS_WORKER_LIMITS.maxLegacySnapshotBytes) {
+    fail(
+      "task",
+      `serialized legacy snapshot exceeds ${OPS_WORKER_LIMITS.maxLegacySnapshotBytes} UTF-8 bytes`,
+    );
+  }
+  assertTaskCustodyMatchesState(migrated);
   assertParsedSnapshotSize(migrated);
   return migrated;
 }
@@ -1861,6 +1878,20 @@ export function parseOpsWorkerTaskJson(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     fail("task", `malformed JSON: ${message}`);
+  }
+  const schemaVersion = typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    ? Object.getOwnPropertyDescriptor(value, "schemaVersion")?.value
+    : undefined;
+  if (
+    schemaVersion === OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION
+    && bytes > OPS_WORKER_LIMITS.maxLegacySnapshotBytes
+  ) {
+    fail(
+      "task",
+      `legacy snapshot exceeds ${OPS_WORKER_LIMITS.maxLegacySnapshotBytes} UTF-8 bytes`,
+    );
   }
   return parseOpsWorkerTask(value, registry);
 }

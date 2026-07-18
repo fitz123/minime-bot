@@ -334,6 +334,50 @@ describe("ops worker task contract", () => {
     assert.equal(input.source.correlationKey, "operator:health:local");
   });
 
+  it("keeps a valid near-limit v1 snapshot readable after deterministic expansion", () => {
+    const input = makeV1Task();
+    const evidence = {
+      at: NOW,
+      kind: "operator" as const,
+      trust: "trusted" as const,
+      summary: "",
+      artifact: null,
+    };
+    input.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      () => ({ ...evidence }),
+    );
+    const baseBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+    const sharedSummaryBytes = Math.floor(
+      (OPS_WORKER_LIMITS.maxLegacySnapshotBytes - baseBytes)
+      / input.evidence.length,
+    );
+    for (const entry of input.evidence) {
+      entry.summary = "x".repeat(sharedSummaryBytes);
+    }
+    const bytesBeforeRemainder = Buffer.byteLength(JSON.stringify(input), "utf8");
+    input.evidence[0].summary += "x".repeat(
+      OPS_WORKER_LIMITS.maxLegacySnapshotBytes - bytesBeforeRemainder,
+    );
+    const raw = JSON.stringify(input);
+    assert.equal(
+      Buffer.byteLength(raw, "utf8"),
+      OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
+    );
+
+    const migrated = parseOpsWorkerTaskJson(raw, registry);
+
+    assert.equal(migrated.schemaVersion, 2);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      > OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
+    );
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      <= OPS_WORKER_LIMITS.maxSnapshotBytes,
+    );
+  });
+
   it("accepts dormant operator Telegram submissions only at operator priority", () => {
     const task = makeTask();
     task.source = {
@@ -374,6 +418,20 @@ describe("ops worker task contract", () => {
     const mismatched = clone(makeTask());
     mismatched.resource = { kind: "repository", key: "host:local" };
     assert.throws(() => parseOpsWorkerTask(mismatched, registry), /non-host namespace/);
+
+    for (const key of [
+      "github:owner/repository/extra",
+      "github:owner/./repository",
+      "github:owner-/repository",
+      "github:owner/_repository",
+    ]) {
+      const aliased = clone(makeTask());
+      aliased.resource = { kind: "repository", key };
+      assert.throws(
+        () => parseOpsWorkerTask(aliased, registry),
+        /exactly one normalized owner\/name identity/,
+      );
+    }
 
     const missingDelivery = clone(makeTask()) as unknown as Record<string, unknown>;
     delete (missingDelivery.source as Record<string, unknown>).deliveryKey;
@@ -575,6 +633,22 @@ describe("ops worker task contract", () => {
       ownershipNonceHash: `sha256:${"5".repeat(64)}`,
     };
     assert.equal(parseOpsWorkerTask(ambiguous, registry).custody.status, "HELD");
+
+    const cancelledWithStaleOutcome = legacyFor("CANCELLED");
+    cancelledWithStaleOutcome.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "A stale terminal outcome must not retain custody.",
+    };
+    const migratedCancelled = parseOpsWorkerTask(cancelledWithStaleOutcome, registry);
+    assert.deepEqual(migratedCancelled.custody, {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    });
+    assert.doesNotThrow(() => parseOpsWorkerTask(migratedCancelled, registry));
   });
 
   it("supports the deferred issue source without letting it change fixed priority or scope", () => {
@@ -942,6 +1016,30 @@ describe("ops worker durable task store", () => {
       );
       assert.deepEqual(store.get(original.id), original);
     }
+  });
+
+  it("enforces write-once lifecycle identities in every authoritative store mutation", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const identified = clone(original);
+    identified.lifecycle.repository = "github:example/minime-bot";
+    identified.updatedAt = LATER;
+    store.replace(identified);
+
+    const cleared = clone(identified);
+    cleared.lifecycle.repository = null;
+    assert.throws(
+      () => store.replace(cleared),
+      /write-once lifecycle identity repository/,
+    );
+    assert.throws(
+      () => store.mutate(original.id, { event: "UPDATED" }, (task) => {
+        task.lifecycle.repository = "github:example/other";
+      }),
+      /write-once lifecycle identity repository/,
+    );
+    assert.deepEqual(store.get(original.id), identified);
   });
 
   it("applies read-modify-write callbacks to the latest snapshot under one guard", (t) => {
@@ -1349,6 +1447,27 @@ describe("ops worker durable task store", () => {
     const recovered = makeStore(t, { directory });
     assert.doesNotThrow(() => recovered.create(makeTask()));
     assert.equal(existsSync(canonicalLock), false);
+    assert.equal(existsSync(join(directory, ".task-store.lock.recovery")), false);
+
+    const fencedDirectory = testStateDirectory(t);
+    const fencedLock = join(fencedDirectory, ".task-store.lock");
+    const recoveryGuard = join(fencedDirectory, ".task-store.lock.recovery");
+    const staleRecord = `${JSON.stringify({
+      pid: process.pid,
+      processStartToken: `sha256:${"0".repeat(64)}`,
+      nonce: "2".repeat(32),
+    })}\n`;
+    writeFileSync(fencedLock, staleRecord, { mode: 0o600 });
+    writeFileSync(recoveryGuard, "unfinished recovery\n", { mode: 0o600 });
+
+    assert.throws(
+      () => makeStore(t, { directory: fencedDirectory }).create(
+        makeTask("wt-recovery-fenced", "operator:recovery:fenced"),
+      ),
+      /Another ops-worker task-store mutation is in progress/,
+    );
+    assert.equal(readFileSync(fencedLock, "utf8"), staleRecord);
+    assert.equal(readFileSync(recoveryGuard, "utf8"), "unfinished recovery\n");
   });
 
   it("rejects traversal identifiers and symlinked state paths", (t) => {

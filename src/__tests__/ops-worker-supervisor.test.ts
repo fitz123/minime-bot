@@ -952,6 +952,29 @@ describe("ops worker supervisor", () => {
     });
     await replacement.start();
     replacement.close();
+    assert.equal(existsSync(join(stale.directory, "supervisor.lock.recovery")), false);
+
+    const recoveryFenced = makeLockHarness("recovery-fenced");
+    const recoveryFencedPath = join(recoveryFenced.directory, "supervisor.lock");
+    const recoveryFencedRecord = `${JSON.stringify(lockRecord("recovery-stale-owner"))}\n`;
+    writeFileSync(recoveryFencedPath, recoveryFencedRecord, { mode: 0o600 });
+    writeFileSync(
+      join(recoveryFenced.directory, "supervisor.lock.recovery"),
+      "unfinished recovery\n",
+      { mode: 0o600 },
+    );
+    const recoveryFencedSupervisor = new OpsWorkerSupervisor({
+      store: recoveryFenced.store,
+      doneChecks: recoveryFenced.doneChecks,
+      instanceId: "recovery-fenced-replacement",
+      processStartToken: "recovery-fenced-replacement-start",
+      inspectLockOwner: () => "STALE",
+    });
+    await assert.rejects(
+      recoveryFencedSupervisor.start(),
+      /stale-lock recovery is already in progress/,
+    );
+    assert.equal(readFileSync(recoveryFencedPath, "utf8"), recoveryFencedRecord);
 
     const malformed = makeLockHarness("malformed");
     writeFileSync(join(malformed.directory, "supervisor.lock"), "not-json\n", { mode: 0o600 });
