@@ -65,6 +65,11 @@ const registry: OpsWorkerTaskContractRegistry = {
       scope: ["inspect"],
       tools: ["read", "grep", "find", "ls"],
     },
+    "operator.repair.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["local-reversible-repair"],
+      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+    },
     "issue.full-cycle.v1": {
       sourceKinds: ["authorized-issue"],
       scope: ["repository-read", "repository-write", "pull-request", "issue-lifecycle"],
@@ -1029,6 +1034,39 @@ describe("ops worker durable task store", () => {
     }
   });
 
+  it("keeps the submitted execution contract immutable through replace and mutate", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const changes: Array<(task: OpsWorkerTask) => void> = [
+      (task) => {
+        task.objective = "Run a different objective with the original submission fingerprint";
+      },
+      (task) => {
+        task.doneCheck = { name: "lax-fixture", params: { sampleCount: 3 } };
+      },
+      (task) => {
+        task.authorization = {
+          profile: "operator.repair.v1",
+          scope: ["local-reversible-repair"],
+          snapshotHash: null,
+        };
+      },
+    ];
+
+    for (const change of changes) {
+      const replacement = clone(original);
+      change(replacement);
+      assert.throws(() => store.replace(replacement), /immutable identity/);
+      assert.throws(
+        () => store.mutate(original.id, { event: "UPDATED" }, change),
+        /immutable identity/,
+      );
+      assert.deepEqual(store.get(original.id), original);
+    }
+  });
+
   it("enforces write-once lifecycle identities in every authoritative store mutation", (t) => {
     const store = makeStore(t);
     const original = makeTask();
@@ -1080,7 +1118,7 @@ describe("ops worker durable task store", () => {
     initial.create(original);
     const replacement = clone(original);
     replacement.updatedAt = LATER;
-    replacement.objective = "Replacement that must not become visible before rename";
+    replacement.rounds.remediation = 1;
     let armed = true;
     const crashing = makeStore(t, {
       directory,
@@ -1110,7 +1148,7 @@ describe("ops worker durable task store", () => {
     const oldJournal = readFileSync(initial.journalPath, "utf8");
     const replacement = clone(original);
     replacement.updatedAt = LATER;
-    replacement.objective = "Durable replacement before non-authoritative audit";
+    replacement.rounds.remediation = 1;
     let armed = true;
     const crashing = makeStore(t, {
       directory,
@@ -1148,17 +1186,15 @@ describe("ops worker durable task store", () => {
 
       assert.throws(
         () => crashing.mutate(original.id, { event: "UPDATED" }, (task) => {
-          task.objective = `Mutation visible ${crashPoint}`;
+          task.rounds.remediation = 1;
           task.updatedAt = LATER;
         }),
         new RegExp(`simulated ${crashPoint} crash`),
       );
       const recovered = makeStore(t, { directory });
       assert.equal(
-        recovered.get(original.id)?.objective,
-        crashPoint === "after-snapshot-rename"
-          ? `Mutation visible ${crashPoint}`
-          : original.objective,
+        recovered.get(original.id)?.rounds.remediation,
+        crashPoint === "after-snapshot-rename" ? 1 : original.rounds.remediation,
       );
       assert.equal(readFileSync(recovered.journalPath, "utf8"), oldJournal);
     }
@@ -1543,7 +1579,7 @@ describe("ops worker durable task store", () => {
     symlinkSync(outsideJournal, store.journalPath);
     const replacement = clone(task);
     replacement.updatedAt = LATER;
-    replacement.objective = "Must not be written through unsafe journal setup";
+    replacement.rounds.remediation = 1;
 
     assert.throws(() => store.replace(replacement), /path is a symlink/);
     rmSync(store.journalPath, { force: true });

@@ -798,6 +798,9 @@ export class OpsWorkerTaskStore {
       || JSON.stringify(existing.source) !== JSON.stringify(replacement.source)
       || JSON.stringify(existing.resource) !== JSON.stringify(replacement.resource)
       || existing.submissionFingerprint !== replacement.submissionFingerprint
+      || existing.objective !== replacement.objective
+      || JSON.stringify(existing.doneCheck) !== JSON.stringify(replacement.doneCheck)
+      || JSON.stringify(existing.authorization) !== JSON.stringify(replacement.authorization)
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
@@ -833,6 +836,18 @@ export class OpsWorkerTaskStore {
     };
     const priorCheckpoints = checkpointIdentities(existing);
     const nextCheckpoints = checkpointIdentities(replacement);
+    const priorCurrentCheckpointId = existing.currentCheckpoint?.checkpointId;
+    const nextCurrentCheckpointId = replacement.currentCheckpoint?.checkpointId;
+    if (
+      priorCurrentCheckpointId !== undefined
+      && nextCurrentCheckpointId !== undefined
+      && nextCurrentCheckpointId !== priorCurrentCheckpointId
+      && priorCheckpoints.has(nextCurrentCheckpointId)
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing to restore historical checkpoint ${nextCurrentCheckpointId}`,
+      );
+    }
     for (const [checkpointId, contentHash] of priorCheckpoints) {
       if (nextCheckpoints.get(checkpointId) !== contentHash) {
         throw new OpsWorkerTaskStoreSafetyError(

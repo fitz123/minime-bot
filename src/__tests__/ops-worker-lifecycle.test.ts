@@ -222,7 +222,7 @@ describe("ops worker package-owned lifecycle evidence", () => {
       payload: { phase: "inspect" },
       summary: "Inspection finished.",
     };
-    harness.lifecycle.recordCheckpoint(task.id, checkpointA);
+    const recordedCheckpointA = harness.lifecycle.recordCheckpoint(task.id, checkpointA);
     harness.setNow(LATER);
     const checkpointB = harness.lifecycle.recordCheckpoint(task.id, {
       checkpointId: "checkpoint-b",
@@ -257,6 +257,32 @@ describe("ops worker package-owned lifecycle evidence", () => {
       () => harness.store.replace(erasedHistory),
       /refusing to forget or change checkpoint replay identity checkpoint-a/i,
     );
+
+    assert.ok(recordedCheckpointA.currentCheckpoint);
+    assert.ok(checkpointB.currentCheckpoint);
+    const rolledBack = structuredClone(checkpointB);
+    rolledBack.currentCheckpoint = {
+      ...structuredClone(recordedCheckpointA.currentCheckpoint),
+      replayHistory: [{
+        checkpointId: checkpointB.currentCheckpoint.checkpointId,
+        contentHash: hashOpsWorkerCanonicalPayload({
+          payloadHash: checkpointB.currentCheckpoint.payloadHash,
+          summary: checkpointB.currentCheckpoint.summary,
+          artifact: checkpointB.currentCheckpoint.artifact,
+        }),
+      }],
+    };
+    assert.throws(
+      () => harness.store.replace(rolledBack),
+      /refusing to restore historical checkpoint checkpoint-a/i,
+    );
+    assert.throws(
+      () => harness.store.mutate(task.id, { event: "UPDATED" }, (working) => {
+        working.currentCheckpoint = structuredClone(rolledBack.currentCheckpoint);
+      }),
+      /refusing to restore historical checkpoint checkpoint-a/i,
+    );
+    assert.deepEqual(harness.store.get(task.id), checkpointB);
   });
 
   it("requires a fresh query before a crashed mutation can be claimed again", (t) => {
