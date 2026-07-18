@@ -117,7 +117,11 @@ const HELP_TEXT = `Usage:
   minime-bot worker start --state-dir <path> --agent-workspace <path> [--host 127.0.0.1] [--port 9465] [--once]
   minime-bot worker status|list --state-dir <path> [--json]
   minime-bot worker inspect --state-dir <path> --id <task-id> [--json]
-  minime-bot worker submit --state-dir <path> --template <registered> --authorization <registered> --done-check <registered> --correlation-key <key> --objective <text> [--done-check-params <json>] [--json]
+  minime-bot worker submit --state-dir <path> --template <registered> --authorization <registered> --done-check <registered> --correlation-key <key> --delivery-key <adapter-delivery-key> --resource-key <normalized-resource-key> --objective <text> [--done-check-params <json>] [--json]
+  minime-bot worker checkpoint --state-dir <path> --id <task-id> --checkpoint-id <id> --summary <text> --payload <json> [--artifact <relative-path>] [--lifecycle <json>] [--json]
+  minime-bot worker receipt-query --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> --query-observed-at <timestamp> --query-result <json> [--json]
+  minime-bot worker receipt-claim --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> [--json]
+  minime-bot worker receipt-finish --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> --result <APPLIED|ALREADY_APPLIED|NOT_NEEDED> --evidence <json> [--lifecycle <json>] [--json]
   minime-bot worker retry --state-dir <path> --id <task-id> [--json]
   minime-bot worker cancel --state-dir <path> --id <task-id> --reason <text> [--json]
 
@@ -130,7 +134,7 @@ Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source rep
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
 Recovery control plane: host-native intake and verification with closed observe, diagnose, and enabled mode gates. Fixer execution uses a recovery-only wrapper; capsule and bot slot commands consume only staged local runtimes.
-Ops worker: inactive unless worker start is invoked. PR 1 accepts CLI submission only through trusted registries; its loopback HTTP surface is health/status only.
+Ops worker: inactive unless worker start is invoked. CLI submission uses trusted registries; checkpoint and receipt commands record evidence only, and the loopback HTTP surface is health/status only.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {

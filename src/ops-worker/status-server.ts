@@ -26,6 +26,7 @@ export interface OpsWorkerStatusSnapshot {
   supervisorInstanceId: string;
   totalTasks: number;
   activeProcessGroups: number;
+  custodyOwner: { id: string; state: OpsWorkerTaskState } | null;
   states: Record<OpsWorkerTaskState, number>;
 }
 
@@ -83,6 +84,10 @@ export function inspectOpsWorkerStatus(
     OPS_WORKER_TASK_STATES.map((state) => [state, 0]),
   ) as Record<OpsWorkerTaskState, number>;
   for (const task of tasks) states[task.state] += 1;
+  const custodyOwners = tasks.filter((task) => task.custody.status === "HELD");
+  if (custodyOwners.length > 1) {
+    throw new Error("Ops-worker status found multiple held custody owners");
+  }
   return {
     service: "minime-ops-worker",
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
@@ -90,6 +95,9 @@ export function inspectOpsWorkerStatus(
     totalTasks: tasks.length,
     activeProcessGroups: tasks.filter((task) =>
       task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
+    custodyOwner: custodyOwners[0]
+      ? { id: custodyOwners[0].id, state: custodyOwners[0].state }
+      : null,
     states,
   };
 }
