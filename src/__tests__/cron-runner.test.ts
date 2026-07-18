@@ -2,8 +2,34 @@ import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import { writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { loadCronTask, getAgentWorkspace, resolveCronAgentData, buildPiCronAgentConfig, buildDeliverArgs, loadAdminChatId, handleDeliveryFailure, loadDefaultDelivery, resolveCronEngine, runOneShot, classifyPiResult, writeCronHealthMetric, runScript, main } from "../cron-runner.js";
+import {
+  buildDeliverArgs,
+  buildPiCronAgentConfig,
+  classifyPiResult,
+  CRON_DELIVERY_RETRY_DELAYS_MS,
+  CRON_OUTBOX_EXPIRY_MS,
+  CRON_OUTBOX_MAX_ATTEMPTS,
+  DeliveryError,
+  getAgentWorkspace,
+  handleDeliveryFailure,
+  isQueueableDeliveryFailure,
+  loadAdminChatId,
+  loadCronTask,
+  loadDefaultDelivery,
+  main,
+  resolveCronAgentData,
+  resolveCronEngine,
+  runOneShot,
+  runScript,
+  writeCronHealthMetric,
+} from "../cron-runner.js";
 import type { CronAgentData, CronRunnerMainDeps, DeliveryDefaults } from "../cron-runner.js";
+import {
+  clearCronOutboxRecord,
+  readCronOutboxRecord,
+  writeCronOutboxRecord,
+  type CronOutboxRecord,
+} from "../cron-outbox.js";
 import type { CronJob } from "../types.js";
 import { installCronTestEnv } from "./cron-test-env.js";
 
@@ -43,6 +69,92 @@ describe("cron-runner", () => {
     it("does not include --thread when threadId is undefined", () => {
       const args = buildDeliverArgs(123456, undefined);
       assert.ok(!args.includes("--thread"));
+    });
+  });
+
+  describe("delivery failure classification", () => {
+    it("retains structured delivery error evidence", () => {
+      const err = new DeliveryError("Delivery failed: command failed", {
+        status: 7,
+        code: "ETIMEDOUT",
+        stderrExcerpt: "sanitized stderr",
+      });
+
+      assert.strictEqual(err.name, "DeliveryError");
+      assert.strictEqual(err.message, "Delivery failed: command failed");
+      assert.strictEqual(err.status, 7);
+      assert.strictEqual(err.code, "ETIMEDOUT");
+      assert.strictEqual(err.stderrExcerpt, "sanitized stderr");
+    });
+
+    it("queues every failure except proven deliver.sh pre-send validation errors", () => {
+      const cases: Array<{ name: string; error: unknown; expected: boolean }> = [
+        {
+          name: "invalid chat id",
+          error: new DeliveryError("Delivery failed: invalid chat", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: invalid chat_id",
+          }),
+          expected: false,
+        },
+        {
+          name: "invalid thread id",
+          error: new DeliveryError("Delivery failed: invalid thread", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: invalid thread_id",
+          }),
+          expected: false,
+        },
+        {
+          name: "empty message",
+          error: new DeliveryError("Delivery failed: empty", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: empty message",
+          }),
+          expected: false,
+        },
+        {
+          name: "same stderr with a different status",
+          error: new DeliveryError("Delivery failed: wrapper", {
+            status: 2,
+            stderrExcerpt: "[deliver] Error: invalid chat_id",
+          }),
+          expected: true,
+        },
+        {
+          name: "Telegram API rejection",
+          error: new DeliveryError("Delivery failed: API rejected", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: sendMessage failed: {\"ok\":false}",
+          }),
+          expected: true,
+        },
+        {
+          name: "curl transport exit",
+          error: new DeliveryError("Delivery failed: curl", { status: 28 }),
+          expected: true,
+        },
+        {
+          name: "spawn timeout",
+          error: new DeliveryError("Delivery failed: timeout", { code: "ETIMEDOUT" }),
+          expected: true,
+        },
+        {
+          name: "token load failure",
+          error: new DeliveryError("Delivery failed: token unavailable"),
+          expected: true,
+        },
+        { name: "ordinary error", error: new Error("unknown"), expected: true },
+        { name: "unknown thrown value", error: "network down", expected: true },
+      ];
+
+      for (const testCase of cases) {
+        assert.strictEqual(
+          isQueueableDeliveryFailure(testCase.error),
+          testCase.expected,
+          testCase.name,
+        );
+      }
     });
   });
 
@@ -1188,7 +1300,16 @@ bindings: []
         adminChatId: number | undefined;
       }>;
       metrics: Array<{ cronName: string; exitCode: number; success: boolean }>;
+      sleeps: number[];
+      outboxReads: string[];
+      outboxWrites: CronOutboxRecord[];
+      outboxClears: string[];
+      events: string[];
       exits: number[];
+    }
+
+    interface MainHarnessState {
+      pending: CronOutboxRecord | "corrupt" | undefined;
     }
 
     function makeMainCron(overrides: Partial<CronJob> = {}): CronJob {
@@ -1204,7 +1325,29 @@ bindings: []
       };
     }
 
-    function makeMainHarness(cron: CronJob): { calls: MainCalls; deps: CronRunnerMainDeps } {
+    function makePendingRecord(
+      cron: CronJob,
+      overrides: Partial<CronOutboxRecord> = {},
+    ): CronOutboxRecord {
+      return {
+        version: 1,
+        cron: cron.name,
+        runId: `${cron.name}@2026-07-17T09:00:01.234Z#4242`,
+        kind: "output",
+        payload: "owed output",
+        chatId: cron.deliveryChatId,
+        ...(cron.deliveryThreadId === undefined ? {} : { threadId: cron.deliveryThreadId }),
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+        ...overrides,
+      };
+    }
+
+    function makeMainHarness(cron: CronJob): {
+      calls: MainCalls;
+      deps: CronRunnerMainDeps;
+      state: MainHarnessState;
+    } {
       const calls: MainCalls = {
         consoleErrors: [],
         logs: [],
@@ -1217,8 +1360,14 @@ bindings: []
         deliveries: [],
         deliveryFailures: [],
         metrics: [],
+        sleeps: [],
+        outboxReads: [],
+        outboxWrites: [],
+        outboxClears: [],
+        events: [],
         exits: [],
       };
+      const state: MainHarnessState = { pending: undefined };
 
       const deps: CronRunnerMainDeps = {
         argv: ["node", "cron-runner.ts", "--task", cron.name],
@@ -1256,14 +1405,32 @@ bindings: []
         },
         runScript: (scriptCron: CronJob) => {
           calls.scripts.push(scriptCron.name);
+          calls.events.push(`generate:${scriptCron.name}`);
           return "script output";
         },
         runPi: (llmCron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => {
           calls.oneShots.push({ cronName: llmCron.name, workspaceCwd, engine: "pi", agentData });
+          calls.events.push(`generate:${llmCron.name}`);
           return "llm output";
         },
         deliver: (chatId: number, message: string, threadId?: number) => {
           calls.deliveries.push({ chatId, message, threadId });
+          calls.events.push(`deliver:${message}`);
+        },
+        sleep: async (ms: number) => {
+          calls.sleeps.push(ms);
+        },
+        readCronOutboxRecord: (cronName: string) => {
+          calls.outboxReads.push(cronName);
+          return state.pending;
+        },
+        writeCronOutboxRecord: (record: CronOutboxRecord) => {
+          calls.outboxWrites.push(record);
+          state.pending = record;
+        },
+        clearCronOutboxRecord: (cronName: string) => {
+          calls.outboxClears.push(cronName);
+          state.pending = undefined;
         },
         handleDeliveryFailure: (
           cronName: string,
@@ -1278,7 +1445,7 @@ bindings: []
         },
       };
 
-      return { calls, deps };
+      return { calls, deps, state };
     }
 
     async function assertMainExits(
@@ -1429,6 +1596,8 @@ bindings: []
       await main(deps);
 
       assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxReads, [cron.name]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 0, success: true },
       ]);
@@ -1447,6 +1616,8 @@ bindings: []
       await main(deps);
 
       assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxReads, [cron.name]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 0, success: true },
       ]);
@@ -1741,6 +1912,316 @@ bindings: []
       assert.match(message, /token \[redacted\] status=402/);
     });
 
+    it("queues failed output after bounded retries and redelivers it before the next generation", async () => {
+      const cron = makeMainCron({ name: "durable-output-test" });
+      const { calls, deps } = makeMainHarness(cron);
+      let failOutputDelivery = true;
+      deps.readCronOutboxRecord = (cronName: string) => {
+        calls.outboxReads.push(cronName);
+        return readCronOutboxRecord(cronName);
+      };
+      deps.writeCronOutboxRecord = (record: CronOutboxRecord) => {
+        calls.outboxWrites.push(record);
+        writeCronOutboxRecord(record);
+      };
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        clearCronOutboxRecord(cronName);
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        calls.events.push(`deliver:${message}`);
+        if (failOutputDelivery && message === "llm output") {
+          throw new Error("temporary delivery outage");
+        }
+      };
+
+      try {
+        await assertMainExits(deps, 1);
+
+        assert.deepStrictEqual(calls.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
+        assert.strictEqual(calls.outboxWrites.length, 1);
+        const queued = readCronOutboxRecord(cron.name);
+        assert.ok(queued !== undefined && queued !== "corrupt");
+        assert.deepStrictEqual(
+          {
+            version: queued.version,
+            cron: queued.cron,
+            kind: queued.kind,
+            payload: queued.payload,
+            chatId: queued.chatId,
+            threadId: queued.threadId,
+            attempts: queued.attempts,
+          },
+          {
+            version: 1,
+            cron: cron.name,
+            kind: "output",
+            payload: "llm output",
+            chatId: 111111111,
+            threadId: 42,
+            attempts: 0,
+          },
+        );
+        assert.match(
+          queued.runId,
+          new RegExp(`^${cron.name}@\\d{4}-\\d{2}-\\d{2}T.+Z#${process.pid}$`),
+        );
+        assert.ok(Number.isFinite(Date.parse(queued.createdAt)));
+        assert.ok(calls.logs.some((entry) =>
+          entry.message === `OUTBOX QUEUED runId=${queued.runId} kind=output`));
+
+        failOutputDelivery = false;
+        calls.events.length = 0;
+        calls.sleeps.length = 0;
+        await main(deps);
+
+        assert.deepStrictEqual(calls.events, [
+          "deliver:llm output",
+          `generate:${cron.name}`,
+          "deliver:llm output",
+        ]);
+        assert.strictEqual(readCronOutboxRecord(cron.name), undefined);
+        assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+        assert.deepStrictEqual(calls.sleeps, []);
+        assert.ok(calls.logs.some((entry) =>
+          entry.message === `OUTBOX REDELIVERED runId=${queued.runId} attempts=0`));
+      } finally {
+        clearCronOutboxRecord(cron.name);
+      }
+    });
+
+    it("queues a generation-failure notice after its delivery retries fail", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      deps.runPi = () => {
+        throw new Error("generation failed");
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("notification transport failed");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      const queued = calls.outboxWrites[0];
+      assert.strictEqual(queued.kind, "failure-notice");
+      assert.strictEqual(queued.chatId, cron.deliveryChatId);
+      assert.strictEqual(queued.threadId, cron.deliveryThreadId);
+      assert.strictEqual(queued.attempts, 0);
+      assert.match(queued.payload, /^⚠️ Cron FAIL: main-behavior-task/);
+      assert.match(queued.payload, /generation failed/);
+      assert.strictEqual(state.pending, queued);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX QUEUED runId=${queued.runId} kind=failure-notice`));
+    });
+
+    it("stops retrying after an in-process delivery retry succeeds", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      let attempts = 0;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("one transient failure");
+        }
+      };
+
+      await main(deps);
+
+      assert.strictEqual(attempts, 2);
+      assert.deepStrictEqual(calls.sleeps, [CRON_DELIVERY_RETRY_DELAYS_MS[0]]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
+      ]);
+    });
+
+    it("does not queue a deterministic deliver.sh validation failure", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const validationError = new DeliveryError("Delivery failed: invalid chat", {
+        status: 1,
+        stderrExcerpt: "[deliver] Error: invalid chat_id",
+      });
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw validationError;
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
+      assert.deepStrictEqual(calls.outboxReads, [cron.name]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.strictEqual(state.pending, undefined);
+      assert.doesNotMatch(calls.logs.map((entry) => entry.message).join("\n"), /OUTBOX QUEUED/);
+    });
+
+    it("clears an attempts-exhausted pending record, notifies admin, and continues", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
+      state.pending = pending;
+
+      await main(deps);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.strictEqual(
+        calls.logs.find((entry) => entry.message.startsWith("OUTBOX TERMINAL"))?.message,
+        `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=${CRON_OUTBOX_MAX_ATTEMPTS}`,
+      );
+      assert.strictEqual(calls.deliveries[0].chatId, 999999999);
+      assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+    });
+
+    it("clears an expired pending record, notifies admin, and continues", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, {
+        createdAt: new Date(Date.now() - CRON_OUTBOX_EXPIRY_MS - 1_000).toISOString(),
+        attempts: 4,
+      });
+      state.pending = pending;
+
+      await main(deps);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=4`));
+      assert.strictEqual(calls.deliveries[0].chatId, 999999999);
+      assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+    });
+
+    it("clears corrupt pending state with terminal evidence and continues", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      state.pending = "corrupt";
+
+      await main(deps);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.ok(calls.logs.some((entry) => entry.message === "OUTBOX TERMINAL corrupt"));
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: 111111111, message: "llm output", threadId: 42 },
+      ]);
+    });
+
+    it("clears a deterministically undeliverable pending record, notifies admin, and continues", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron);
+      state.pending = pending;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        if (message === pending.payload) {
+          throw new DeliveryError("Delivery failed: invalid thread", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: invalid thread_id",
+          });
+        }
+      };
+
+      await main(deps);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX TERMINAL deterministic runId=${pending.runId} attempts=0`));
+      assert.deepStrictEqual(calls.deliveries.map((call) => call.chatId), [
+        cron.deliveryChatId,
+        999999999,
+        cron.deliveryChatId,
+      ]);
+      assert.match(calls.deliveries[1].message, /Cron outbox deterministic/);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+    });
+
+    it("defers a queueable pending failure before generation and persists the next attempt", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, { attempts: 2 });
+      state.pending = pending;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("network unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.strictEqual(calls.outboxWrites[0].attempts, 3);
+      assert.strictEqual(state.pending, calls.outboxWrites[0]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX RETRY-DEFERRED runId=${pending.runId} attempts=3`));
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.deepStrictEqual(calls.scripts, []);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.sleeps, []);
+    });
+
+    it("fails closed before generation when outbox state cannot be read", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.readCronOutboxRecord = () => {
+        throw new Error("disk unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "OUTBOX STATE-READ-FAILED: disk unavailable"));
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.deepStrictEqual(calls.scripts, []);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.deliveries, []);
+    });
+
+    it("preserves an unexpected occupied slot discovered while queueing", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const existing = makePendingRecord(cron, {
+        runId: `${cron.name}@2026-07-17T08:00:00.000Z#3131`,
+        payload: "older owed output",
+      });
+      let reads = 0;
+      deps.readCronOutboxRecord = (cronName: string) => {
+        calls.outboxReads.push(cronName);
+        reads += 1;
+        if (reads === 1) {
+          return undefined;
+        }
+        state.pending = existing;
+        return existing;
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("network unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, existing);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.outboxReads, [cron.name, cron.name]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "OUTBOX QUEUE-SKIPPED pending-existing"));
+    });
+
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
@@ -1830,6 +2311,8 @@ bindings: []
       await assertMainExits(deps, 1);
 
       assert.deepStrictEqual(calls.deliveries, [
+        { chatId: 111111111, message: "llm output", threadId: 42 },
+        { chatId: 111111111, message: "llm output", threadId: 42 },
         { chatId: 111111111, message: "llm output", threadId: 42 },
       ]);
       assert.deepStrictEqual(calls.deliveryFailures, [

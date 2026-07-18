@@ -19,6 +19,7 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
@@ -40,7 +41,13 @@ import {
 } from "./pi-process-utils.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
-import { sanitizeCronMetricStem } from "./cron-outbox.js";
+import {
+  clearCronOutboxRecord,
+  readCronOutboxRecord,
+  sanitizeCronMetricStem,
+  writeCronOutboxRecord,
+  type CronOutboxRecord,
+} from "./cron-outbox.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,6 +60,9 @@ const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
+export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
+export const CRON_OUTBOX_MAX_ATTEMPTS = 10;
+export const CRON_OUTBOX_EXPIRY_MS = 48 * 60 * 60 * 1000;
 const NOTIFICATION_PRIVATE_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
 const NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN = String.raw`[A-Za-z0-9_.-]*(?:(?:api|access|private)[_.-]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*`;
@@ -466,6 +476,32 @@ function loadDeliveryTelegramToken(): string {
   }
 }
 
+export class DeliveryError extends Error {
+  readonly status: number | undefined;
+  readonly code: string | undefined;
+  readonly stderrExcerpt: string | undefined;
+
+  constructor(
+    message: string,
+    details: { status?: number; code?: string; stderrExcerpt?: string } = {},
+  ) {
+    super(message);
+    this.name = "DeliveryError";
+    this.status = details.status;
+    this.code = details.code;
+    this.stderrExcerpt = details.stderrExcerpt;
+  }
+}
+
+export function isQueueableDeliveryFailure(err: unknown): boolean {
+  return !(err instanceof DeliveryError
+    && err.status === 1
+    && err.stderrExcerpt !== undefined
+    && /\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/.test(
+      err.stderrExcerpt,
+    ));
+}
+
 function deliver(
   chatId: number,
   message: string,
@@ -484,7 +520,18 @@ function deliver(
       },
     });
   } catch (err) {
-    throw new Error(`Delivery failed: ${(err as Error).message}`);
+    const failure = err as {
+      message?: unknown;
+      status?: unknown;
+      code?: unknown;
+      stderr?: string | Buffer | null;
+    };
+    const sanitizedStderr = sanitizeCapturedOutput(normalizeSpawnOutput(failure.stderr));
+    throw new DeliveryError(`Delivery failed: ${failure.message}`, {
+      status: typeof failure.status === "number" ? failure.status : undefined,
+      code: typeof failure.code === "string" ? failure.code : undefined,
+      stderrExcerpt: sanitizedStderr ? sanitizedStderr.slice(0, 400) : undefined,
+    });
   }
 }
 
@@ -783,6 +830,12 @@ export interface CronRunnerMainDeps {
   runScript: (cron: CronJob) => string;
   runPi: (cron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => string;
   deliver: (chatId: number, message: string, threadId?: number) => void;
+  sleep: (ms: number) => Promise<void>;
+  readCronOutboxRecord: (
+    cronName: string,
+  ) => CronOutboxRecord | "corrupt" | undefined;
+  writeCronOutboxRecord: (record: CronOutboxRecord) => void;
+  clearCronOutboxRecord: (cronName: string) => void;
   handleDeliveryFailure: (
     cronName: string,
     targetChatId: number,
@@ -803,6 +856,10 @@ const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
   runScript,
   runPi: (cron, workspaceCwd, agentData) => runPi(cron, workspaceCwd, defaultPiDeps, agentData),
   deliver,
+  sleep,
+  readCronOutboxRecord,
+  writeCronOutboxRecord,
+  clearCronOutboxRecord,
   handleDeliveryFailure,
   writeCronHealthMetric,
 };
@@ -821,6 +878,64 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     deps.exit(1);
   }
   const taskName = deps.argv[taskIdx + 1];
+  const runId = `${taskName}@${new Date().toISOString()}#${process.pid}`;
+
+  const deliverWithRetry = async (
+    chatId: number,
+    payload: string,
+    threadId?: number,
+  ): Promise<void> => {
+    try {
+      deps.deliver(chatId, payload, threadId);
+      return;
+    } catch (initialError) {
+      let lastError: unknown = initialError;
+      for (const delayMs of CRON_DELIVERY_RETRY_DELAYS_MS) {
+        await deps.sleep(delayMs);
+        try {
+          deps.deliver(chatId, payload, threadId);
+          return;
+        } catch (retryError) {
+          lastError = retryError;
+        }
+      }
+      throw lastError;
+    }
+  };
+
+  const queueDeliveryIfEmpty = (
+    kind: CronOutboxRecord["kind"],
+    payload: string,
+    chatId: number,
+    threadId?: number,
+  ): void => {
+    try {
+      if (deps.readCronOutboxRecord(taskName) !== undefined) {
+        deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+        return;
+      }
+    } catch {
+      deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+      return;
+    }
+
+    try {
+      deps.writeCronOutboxRecord({
+        version: 1,
+        cron: taskName,
+        runId,
+        kind,
+        payload,
+        chatId,
+        ...(threadId === undefined ? {} : { threadId }),
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      deps.log(taskName, `OUTBOX QUEUED runId=${runId} kind=${kind}`);
+    } catch (err) {
+      deps.log(taskName, `OUTBOX QUEUE-WRITE-FAILED: ${errorFromUnknown(err).message}`);
+    }
+  };
 
   deps.log(taskName, `Starting cron task: ${taskName}`);
 
@@ -848,6 +963,79 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   }
 
   deps.log(taskName, `Loaded: type=${cron.type}, agent=${cron.agentId}, deliver=${cron.deliveryChatId}${cron.deliveryThreadId ? `, thread=${cron.deliveryThreadId}` : ""}`);
+
+  const notifyAdminOfTerminalOutbox = (
+    record: CronOutboxRecord,
+    reason: "gave-up" | "deterministic",
+  ): void => {
+    if (adminChatId === undefined) {
+      return;
+    }
+    try {
+      deps.deliver(
+        adminChatId,
+        `⚠️ Cron outbox ${reason}\nTask: ${taskName}\nRun: ${record.runId}\nAttempts: ${record.attempts}`,
+      );
+    } catch (err) {
+      deps.log(
+        taskName,
+        `OUTBOX ADMIN-NOTICE-FAILED runId=${record.runId}: ${errorFromUnknown(err).message}`,
+      );
+    }
+  };
+
+  let pendingRecord: CronOutboxRecord | "corrupt" | undefined;
+  try {
+    pendingRecord = deps.readCronOutboxRecord(taskName);
+  } catch (err) {
+    deps.log(taskName, `OUTBOX STATE-READ-FAILED: ${errorFromUnknown(err).message}`);
+    deps.writeCronHealthMetric(taskName, 1, false);
+    deps.exit(1);
+  }
+
+  if (pendingRecord === "corrupt") {
+    deps.clearCronOutboxRecord(taskName);
+    deps.log(taskName, "OUTBOX TERMINAL corrupt");
+  } else if (pendingRecord !== undefined) {
+    const expired = Date.now() - Date.parse(pendingRecord.createdAt) > CRON_OUTBOX_EXPIRY_MS;
+    if (expired || pendingRecord.attempts >= CRON_OUTBOX_MAX_ATTEMPTS) {
+      deps.clearCronOutboxRecord(taskName);
+      deps.log(
+        taskName,
+        `OUTBOX TERMINAL gave-up runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+      );
+      notifyAdminOfTerminalOutbox(pendingRecord, "gave-up");
+    } else {
+      try {
+        deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
+        deps.clearCronOutboxRecord(taskName);
+        deps.log(
+          taskName,
+          `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+        );
+      } catch (err) {
+        if (isQueueableDeliveryFailure(err)) {
+          const updatedRecord = {
+            ...pendingRecord,
+            attempts: pendingRecord.attempts + 1,
+          };
+          deps.writeCronOutboxRecord(updatedRecord);
+          deps.log(
+            taskName,
+            `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
+          );
+          deps.writeCronHealthMetric(taskName, 1, false);
+          deps.exit(1);
+        }
+        deps.clearCronOutboxRecord(taskName);
+        deps.log(
+          taskName,
+          `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+        );
+        notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
+      }
+    }
+  }
 
   let output: string;
   try {
@@ -886,8 +1074,16 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
 
     // Send failure notification to delivery chat; use admin fallback if delivery fails
     try {
-      deps.deliver(cron.deliveryChatId, failureNotification, cron.deliveryThreadId);
+      await deliverWithRetry(cron.deliveryChatId, failureNotification, cron.deliveryThreadId);
     } catch (deliveryErr) {
+      if (isQueueableDeliveryFailure(deliveryErr)) {
+        queueDeliveryIfEmpty(
+          "failure-notice",
+          failureNotification,
+          cron.deliveryChatId,
+          cron.deliveryThreadId,
+        );
+      }
       deps.handleDeliveryFailure(
         taskName,
         cron.deliveryChatId,
@@ -914,9 +1110,12 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
 
   // Deliver output to target chat
   try {
-    deps.deliver(cron.deliveryChatId, output, cron.deliveryThreadId);
+    await deliverWithRetry(cron.deliveryChatId, output, cron.deliveryThreadId);
     deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
   } catch (err) {
+    if (isQueueableDeliveryFailure(err)) {
+      queueDeliveryIfEmpty("output", output, cron.deliveryChatId, cron.deliveryThreadId);
+    }
     deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
     deps.writeCronHealthMetric(taskName, 1, false);
     deps.exit(1);

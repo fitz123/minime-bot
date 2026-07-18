@@ -182,28 +182,28 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 3: Wire durable delivery into the cron run (#65)
 
-- [ ] In `src/cron-runner.ts`, make `deliver()` throw an exported `DeliveryError`
+- [x] In `src/cron-runner.ts`, make `deliver()` throw an exported `DeliveryError`
   (extends `Error`) carrying `status` (child exit code), `code` (spawn error code such
   as `ETIMEDOUT`), and `stderrExcerpt` (sanitized via `sanitizeCapturedOutput`, first
   400 chars). Keep the exact existing `Delivery failed: ...` message text.
-- [ ] Add exported `isQueueableDeliveryFailure(err: unknown): boolean` — `false` only
+- [x] Add exported `isQueueableDeliveryFailure(err: unknown): boolean` — `false` only
   for a `DeliveryError` with `status === 1` whose `stderrExcerpt` matches
   `/\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/` (deliver.sh
   pre-send validation: provably non-retryable config errors); `true` for everything else
   (timeouts, curl exit codes, Telegram API rejections, token-load failures, unknown).
   Trade-off documented in Technical Details.
-- [ ] Add constants `CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000]`,
+- [x] Add constants `CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000]`,
   `CRON_OUTBOX_MAX_ATTEMPTS = 10`, `CRON_OUTBOX_EXPIRY_MS = 48 * 60 * 60 * 1000`, and
   `runId` format `` `${cronName}@${new Date().toISOString()}#${process.pid}` `` computed
   once at run start. Module constants only — no new config schema fields.
-- [ ] Extend `CronRunnerMainDeps` with `sleep(ms)` (default `setTimeout` from
+- [x] Extend `CronRunnerMainDeps` with `sleep(ms)` (default `setTimeout` from
   `node:timers/promises`), `readCronOutboxRecord`, `writeCronOutboxRecord`,
   `clearCronOutboxRecord` (defaults from `cron-outbox.ts`); update `makeMainHarness()`
   (now fail-closed, so compilation forces the additions).
-- [ ] Add a `deliverWithRetry` helper inside `main()`'s flow: attempt `deps.deliver`,
+- [x] Add a `deliverWithRetry` helper inside `main()`'s flow: attempt `deps.deliver`,
   and on failure retry after each delay in `CRON_DELIVERY_RETRY_DELAYS_MS` (awaited
   `deps.sleep`); rethrow the final error.
-- [ ] Add fail-safe outbox pickup in `main()` after `loadCronTask`/`loadAdminChatId`
+- [x] Add fail-safe outbox pickup in `main()` after `loadCronTask`/`loadAdminChatId`
   and before generation. Read this cron's record: `"corrupt"` → clear + log
   `OUTBOX TERMINAL corrupt`, then continue; expired (`now - createdAt >
   CRON_OUTBOX_EXPIRY_MS`) or `attempts >= CRON_OUTBOX_MAX_ATTEMPTS` → clear + log
@@ -217,7 +217,7 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   generation so an unknown owed result cannot be overwritten. A non-queueable pending
   delivery failure clears with `OUTBOX TERMINAL deterministic` + one best-effort admin
   notice, then continues.
-- [ ] Route both outbound failure points through queueing, keeping the existing
+- [x] Route both outbound failure points through queueing, keeping the existing
   `handleDeliveryFailure` + failure metric + exit-1 behavior unchanged afterward: (a)
   output delivery and (b) generation-failure notification use `deliverWithRetry`; if the
   final error is queueable, first re-read the slot and write the new `"output"` or
@@ -225,20 +225,20 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   runId=<id> kind=<kind>`. If a record unexpectedly exists, preserve it, log
   `OUTBOX QUEUE-SKIPPED pending-existing`, and fail the current run without overwrite.
   If the delivery error is non-queueable, do not queue.
-- [ ] Write tests (success paths): transient output-delivery failure retries in-process
+- [x] Write tests (success paths): transient output-delivery failure retries in-process
   (assert sleep delays) then queues a record with correct fields; a second `main()` run
   redelivers the pending payload before generating, clears the record, then delivers its
   own output (order asserted); failure-notice path queues the same way; in-process retry
   succeeding on attempt 2 leaves no record; NO_REPLY and empty-output runs still perform
   pickup and queue nothing.
-- [ ] Write tests (error/edge paths): non-queueable validation failure does not queue;
+- [x] Write tests (error/edge paths): non-queueable validation failure does not queue;
   pickup terminal paths (gave-up via attempts, gave-up via expiry, corrupt, deterministic)
   clear the record, log exact evidence, and send the admin notice where specified;
   queueable pickup failure persists `attempts + 1`, writes a failure metric, exits 1,
   and proves neither `runScript` nor `runPi` ran; thrown/unknown outbox read likewise
   exits before generation; an unexpected existing record at queue time is preserved;
   table-driven `isQueueableDeliveryFailure` cases cover every class above.
-- [ ] Run focused tests (`cron-runner.test.ts`, `cron-outbox.test.ts`,
+- [x] Run focused tests (`cron-runner.test.ts`, `cron-outbox.test.ts`,
   `cron-runner-isolation.test.ts`) — must pass before Task 4.
 
 ### Task 4: Safe launchd cron sync around active jobs (#62)
