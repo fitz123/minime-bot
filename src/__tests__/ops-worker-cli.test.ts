@@ -362,6 +362,7 @@ describe("ops worker CLI and inactive runtime", () => {
       submissionFingerprint: _submissionFingerprint,
       authorizationVerification: _authorizationVerification,
       verification: _verification,
+      legacyCompletion: _legacyCompletion,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {

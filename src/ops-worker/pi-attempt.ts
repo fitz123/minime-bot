@@ -210,6 +210,7 @@ export interface OpsWorkerPiAttemptOptions {
 }
 
 export interface OpsWorkerQuotaProbeRequest {
+  taskId: string;
   model: string;
   thinking: PiThinkingLevel;
   context: PiContextArtifacts;
@@ -1198,8 +1199,10 @@ export class OpsWorkerPiAttemptRunner {
     const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
     safeUnlink(attemptFile);
     let result: OpsWorkerQuotaProbeResult;
+    this.supervisor.reservePiProcessGroupLaunch(taskId);
     try {
       result = await this.runQuotaProbeProcess({
+        taskId,
         model: this.model,
         thinking: this.thinking,
         context,
@@ -1209,10 +1212,15 @@ export class OpsWorkerPiAttemptRunner {
         attemptFile,
       });
     } catch (error) {
+      const current = this.requireTask(taskId);
+      if (current.state === "BLOCKED") return current;
+      if (current.state === "RUNNING") throw error;
       return this.supervisor.recordQuotaProbeError(
         taskId,
         `Exact quota smoke probe failed: ${errorMessage(error)}`,
       );
+    } finally {
+      this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
     if (result.status === "SUCCESS") {
       return this.supervisor.recordQuotaProbeSuccess(
@@ -1240,9 +1248,22 @@ export class OpsWorkerPiAttemptRunner {
     request: OpsWorkerQuotaProbeRequest,
   ): Promise<OpsWorkerQuotaProbeResult> {
     const invocation = this.resolveInvocation(request.args);
+    const attemptId = `quota-probe-${this.randomId()}`;
+    const ownershipNonce = `owner-${this.randomId()}`;
+    const launchIntent: OpsWorkerUnverifiedRun = {
+      attemptId,
+      supervisorInstanceId: this.supervisor.supervisorInstanceId,
+      pid: null,
+      expectedProcessGroupId: null,
+      launchedAt: this.now().toISOString(),
+      ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
+    };
+    this.supervisor.beginPiLaunch(request.taskId, launchIntent);
+    this.launchFaultInjector?.("after-launch-intent-persisted");
     const env = this.buildEnv(this.workspaceCwd, {
       askCallerAgentId: this.primaryContextAgent.id,
     });
+    env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
     env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = request.parityLaunch.expectedPath;
     env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = request.parityLaunch.reportPath;
     env[OPS_WORKER_PARITY_ACK_PATH_ENV] = request.parityLaunch.ackPath;
@@ -1258,16 +1279,14 @@ export class OpsWorkerPiAttemptRunner {
         shell: false,
       });
     } catch (error) {
+      this.supervisor.clearResolvedPiLaunchFence(
+        request.taskId,
+        attemptId,
+        "Quota smoke probe spawn failed before a child process existed",
+      );
       return {
         status: "INFRASTRUCTURE_ERROR",
         summary: `Exact quota smoke probe spawn failed: ${errorMessage(error)}`,
-      };
-    }
-    if (!Number.isSafeInteger(child.pid) || (child.pid ?? 0) < 1) {
-      child.kill("SIGKILL");
-      return {
-        status: "INFRASTRUCTURE_ERROR",
-        summary: "Exact quota smoke probe did not expose a detached process-group leader PID",
       };
     }
     const stdout = new BoundedStreamCapture(OPS_WORKER_PI_LIMITS.maxCapturedStreamBytes);
@@ -1296,11 +1315,164 @@ export class OpsWorkerPiAttemptRunner {
       exited = true;
       return exit;
     });
+    const pid = child.pid;
+    if (!Number.isSafeInteger(pid) || (pid ?? 0) < 1) {
+      const exit = await boundedExitWait(exitPromise, this.sleep);
+      if (exit?.error !== null && exit !== null) {
+        abandonDetachedChild(child);
+        this.supervisor.clearResolvedPiLaunchFence(
+          request.taskId,
+          attemptId,
+          "Quota smoke probe spawn failed without creating a child process",
+        );
+        return {
+          status: "INFRASTRUCTURE_ERROR",
+          summary: `Exact quota smoke probe spawn failed: ${formatAttemptEvidence(exit)}`,
+        };
+      }
+      this.supervisor.blockUnverifiedPiLaunch(
+        request.taskId,
+        launchIntent,
+        "Quota smoke probe exposed no PID, so detached descendants cannot be ruled out",
+      );
+      abandonDetachedChild(child);
+      throw new Error("Quota smoke probe launch identity is ambiguous");
+    }
+    const processId = pid as number;
+    const unverifiedRun: OpsWorkerUnverifiedRun = {
+      ...launchIntent,
+      pid: processId,
+      expectedProcessGroupId: processId,
+    };
+    try {
+      this.supervisor.bindUnverifiedPiLaunch(request.taskId, unverifiedRun);
+    } catch (error) {
+      abandonDetachedChild(child);
+      throw error;
+    }
+    this.launchFaultInjector?.("after-unverified-run-persisted");
+    const identity = await this.readFreshIdentity(
+      processId,
+      ownershipNonce,
+      () => exited,
+    );
+    if (identity.status === "GONE") {
+      const exit = await boundedExitWait(exitPromise, this.sleep);
+      const group = exit === null
+        ? this.inspectProcessGroup(processId)
+        : await this.awaitProcessGroupGone(processId);
+      if (exit === null || group.status !== "GONE") {
+        this.supervisor.blockUnverifiedPiLaunch(
+          request.taskId,
+          unverifiedRun,
+          exit === null
+            ? `Quota smoke probe PID ${processId} disappeared before its child lifecycle settled`
+            : group.status === "AMBIGUOUS"
+            ? group.summary
+            : `Quota smoke probe leader exited while detached process group ${processId} remains present`,
+        );
+        abandonDetachedChild(child);
+        throw new Error("Quota smoke probe process group is ambiguous");
+      }
+      this.supervisor.clearResolvedPiLaunchFence(
+        request.taskId,
+        attemptId,
+        "Quota smoke probe exited before durable identity and parity acknowledgement",
+      );
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: "Exact quota smoke probe exited before durable identity and parity acknowledgement",
+      };
+    }
+    if (
+      identity.status !== "OWNED"
+      || identity.identity.processGroupId !== processId
+      || identity.identity.ownershipNonce !== ownershipNonce
+    ) {
+      this.supervisor.blockUnverifiedPiLaunch(
+        request.taskId,
+        unverifiedRun,
+        `Quota smoke probe PID ${processId}: ${identity.status === "AMBIGUOUS"
+          ? identity.summary
+          : "fresh process-group identity could not be proven"}`,
+      );
+      abandonDetachedChild(child);
+      throw new Error("Quota smoke probe ownership proof failed");
+    }
+    const activeRun: OpsWorkerActiveRun = {
+      attemptId,
+      supervisorInstanceId: this.supervisor.supervisorInstanceId,
+      pid: processId,
+      processGroupId: identity.identity.processGroupId,
+      processStartedAt: this.now().toISOString(),
+      processStartToken: identity.identity.processStartToken,
+    };
+    try {
+      this.supervisor.markRunning(request.taskId, activeRun);
+    } catch (error) {
+      const stopped = await stopOwnedProcessGroup(activeRun, {
+        inspect: this.inspectActiveRun,
+        inspectGroup: this.inspectProcessGroup,
+        signal: this.signalProcessGroup,
+        sleep: this.sleep,
+        termGraceMs: this.termGraceMs,
+        killGraceMs: this.killGraceMs,
+      });
+      if (stopped.status === "AMBIGUOUS") {
+        abandonDetachedChild(child);
+        const current = this.requireTask(request.taskId);
+        if (current.state === "RUNNING") {
+          this.supervisor.blockAmbiguousActiveRun(
+            request.taskId,
+            stopped.summary ?? errorMessage(error),
+          );
+        } else {
+          this.supervisor.blockUnverifiedPiLaunch(
+            request.taskId,
+            unverifiedRun,
+            stopped.summary ?? errorMessage(error),
+          );
+        }
+        throw error;
+      }
+      await boundedExitWait(exitPromise, this.sleep);
+      if (this.requireTask(request.taskId).state === "BLOCKED") {
+        this.supervisor.clearResolvedPiLaunchFence(
+          request.taskId,
+          attemptId,
+          "Quota smoke probe stopped after RUNNING identity persistence failed",
+        );
+      }
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: `Exact quota smoke probe identity persistence failed: ${errorMessage(error)}`,
+      };
+    }
+    const stopProbe = async (): Promise<OpsWorkerStartupRunResult> =>
+      stopOwnedProcessGroup(activeRun, {
+        inspect: this.inspectActiveRun,
+        inspectGroup: this.inspectProcessGroup,
+        signal: this.signalProcessGroup,
+        sleep: this.sleep,
+        termGraceMs: this.termGraceMs,
+        killGraceMs: this.killGraceMs,
+      });
+    const fenceAmbiguousProbe = (summary: string): never => {
+      abandonDetachedChild(child);
+      this.supervisor.blockAmbiguousActiveRun(request.taskId, summary);
+      throw new Error(summary);
+    };
     let parity: OpsWorkerParityAttestationReport | null;
     try {
       parity = await this.awaitParityReport(request.parityLaunch, () => exited);
       if (parity?.status !== "PASS") {
-        await this.cleanupQuotaProbeProcessGroup(child.pid as number, exitPromise, true);
+        const stopped = await stopProbe();
+        if (stopped.status === "AMBIGUOUS") {
+          fenceAmbiguousProbe(
+            stopped.summary ?? "Quota smoke probe parity failure left ambiguous ownership",
+          );
+        }
+        await boundedExitWait(exitPromise, this.sleep);
         return {
           status: "INFRASTRUCTURE_ERROR",
           summary: parity === null
@@ -1310,7 +1482,14 @@ export class OpsWorkerPiAttemptRunner {
       }
       acknowledgeOpsWorkerParityPass(request.parityLaunch);
     } catch (error) {
-      await this.cleanupQuotaProbeProcessGroup(child.pid as number, exitPromise, true);
+      if (this.requireTask(request.taskId).state === "BLOCKED") throw error;
+      const stopped = await stopProbe();
+      if (stopped.status === "AMBIGUOUS") {
+        fenceAmbiguousProbe(
+          stopped.summary ?? "Quota smoke probe parity acknowledgement left ambiguous ownership",
+        );
+      }
+      await boundedExitWait(exitPromise, this.sleep);
       return {
         status: "INFRASTRUCTURE_ERROR",
         summary: `Exact quota smoke probe parity failed: ${errorMessage(error)}`,
@@ -1332,35 +1511,26 @@ export class OpsWorkerPiAttemptRunner {
     if (timeout) clearTimeout(timeout);
     shutdownTrigger.close();
     if (trigger.kind !== "EXIT") {
-      const cleanup = await this.cleanupQuotaProbeProcessGroup(
-        child.pid as number,
-        exitPromise,
-        true,
-      );
+      const cleanup = await stopProbe();
+      if (cleanup.status === "AMBIGUOUS") {
+        fenceAmbiguousProbe(
+          cleanup.summary ?? "Quota smoke probe cleanup left ambiguous ownership",
+        );
+      }
+      await boundedExitWait(exitPromise, this.sleep);
       return {
         status: "INFRASTRUCTURE_ERROR",
-        summary: cleanup.status !== "GONE"
-          ? `Exact quota smoke probe process group could not be proven gone: ${
-            cleanup.status === "AMBIGUOUS" ? cleanup.summary : "still present"
-          }`
-          : trigger.kind === "SHUTDOWN"
+        summary: trigger.kind === "SHUTDOWN"
           ? "Exact quota smoke probe was interrupted by worker shutdown"
           : "Exact quota smoke probe exceeded its bounded deadline",
       };
     }
     const { exit } = trigger;
-    const cleanup = await this.cleanupQuotaProbeProcessGroup(
-      child.pid as number,
-      exitPromise,
-      false,
-    );
-    if (cleanup.status !== "GONE") {
-      return {
-        status: "INFRASTRUCTURE_ERROR",
-        summary: `Exact quota smoke probe descendants could not be proven gone: ${
-          cleanup.status === "AMBIGUOUS" ? cleanup.summary : "process group still present"
-        }`,
-      };
+    const cleanup = await stopProbe();
+    if (cleanup.status === "AMBIGUOUS") {
+      fenceAmbiguousProbe(
+        cleanup.summary ?? "Quota smoke probe descendants could not be proven gone",
+      );
     }
     const read = new CodexQuotaFileReader(request.attemptFile).read();
     safeUnlink(request.attemptFile);
@@ -1380,33 +1550,6 @@ export class OpsWorkerPiAttemptRunner {
         ? "Exact quota smoke probe unexpectedly reported session corruption"
         : `Exact quota smoke probe failed: ${infrastructureSummary(classification, exit)}`,
     };
-  }
-
-  private async cleanupQuotaProbeProcessGroup(
-    processGroupId: number,
-    exitPromise: Promise<OpsWorkerPiExit>,
-    stopLeader: boolean,
-  ): Promise<OpsWorkerProcessGroupInspection> {
-    const signal = (value: NodeJS.Signals): void => {
-      try {
-        this.signalProcessGroup(processGroupId, value);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-    };
-    if (stopLeader) {
-      signal("SIGTERM");
-      await boundedExitWait(exitPromise, this.sleep);
-    }
-    let inspection = await this.awaitProcessGroupGone(processGroupId);
-    if (inspection.status !== "PRESENT") return inspection;
-    signal(stopLeader ? "SIGKILL" : "SIGTERM");
-    await boundedExitWait(exitPromise, this.sleep);
-    inspection = await this.awaitProcessGroupGone(processGroupId);
-    if (inspection.status !== "PRESENT" || stopLeader) return inspection;
-    signal("SIGKILL");
-    await boundedExitWait(exitPromise, this.sleep);
-    return this.awaitProcessGroupGone(processGroupId);
   }
 
   private prepareSessionDirectory(task: OpsWorkerTask): string {

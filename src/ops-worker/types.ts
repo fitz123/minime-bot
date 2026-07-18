@@ -415,6 +415,14 @@ export interface OpsWorkerReport {
   lastError: string | null;
 }
 
+/**
+ * Provenance for a terminal snapshot that predates composite verification.
+ * This preserves a legacy DONE state without fabricating a current-schema PASS.
+ */
+export interface OpsWorkerLegacyCompletion {
+  sourceSchemaVersion: 1 | 2 | 3;
+}
+
 export interface OpsWorkerTask {
   schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
   id: string;
@@ -432,6 +440,7 @@ export interface OpsWorkerTask {
   authorization: OpsWorkerAuthorization;
   authorizationVerification: OpsWorkerAuthorizationVerification | null;
   verification: OpsWorkerVerificationRecord | null;
+  legacyCompletion: OpsWorkerLegacyCompletion | null;
   state: OpsWorkerTaskState;
   rounds: OpsWorkerRounds;
   schedule: OpsWorkerSchedule;
@@ -583,6 +592,7 @@ export type OpsWorkerTaskV1 = Omit<
   | "submissionFingerprint"
   | "authorizationVerification"
   | "verification"
+  | "legacyCompletion"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
@@ -594,6 +604,7 @@ export type OpsWorkerTaskV2 = Omit<
   | "lifecycle"
   | "authorizationVerification"
   | "verification"
+  | "legacyCompletion"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V2_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
@@ -601,7 +612,7 @@ export type OpsWorkerTaskV2 = Omit<
 
 export type OpsWorkerTaskV3 = Omit<
   OpsWorkerTask,
-  "schemaVersion" | "lifecycle" | "verification"
+  "schemaVersion" | "lifecycle" | "verification" | "legacyCompletion"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V3_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
@@ -715,6 +726,7 @@ const V3_TASK_KEYS = [
 const TASK_KEYS = [
   ...V3_TASK_KEYS.slice(0, V3_TASK_KEYS.indexOf("state")),
   "verification",
+  "legacyCompletion",
   ...V3_TASK_KEYS.slice(V3_TASK_KEYS.indexOf("state")),
 ] as const;
 
@@ -2158,6 +2170,21 @@ function parseReport(value: unknown): OpsWorkerReport {
   };
 }
 
+function parseLegacyCompletion(value: unknown): OpsWorkerLegacyCompletion | null {
+  if (value === null) return null;
+  const legacy = expectObject(value, "task.legacyCompletion");
+  expectExactKeys(legacy, ["sourceSchemaVersion"], "task.legacyCompletion");
+  if (legacy.sourceSchemaVersion !== 1
+      && legacy.sourceSchemaVersion !== 2
+      && legacy.sourceSchemaVersion !== 3) {
+    fail(
+      "task.legacyCompletion.sourceSchemaVersion",
+      "must identify supported legacy schema 1, 2, or 3",
+    );
+  }
+  return { sourceSchemaVersion: legacy.sourceSchemaVersion };
+}
+
 export function assertOpsWorkerTaskId(id: unknown): asserts id is string {
   if (typeof id !== "string" || !TASK_ID_PATTERN.test(id)) {
     fail("task.id", "must be a traversal-safe lowercase task identifier");
@@ -2183,6 +2210,7 @@ type OpsWorkerTaskCommon = Omit<
   | "submissionFingerprint"
   | "authorizationVerification"
   | "verification"
+  | "legacyCompletion"
 >;
 
 function parseTaskCommon(
@@ -2384,6 +2412,7 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     authorization: copy.authorization,
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: copy.state === "DONE" ? { sourceSchemaVersion: 1 } : null,
     state: copy.state,
     rounds: copy.rounds,
     schedule: copy.schedule,
@@ -2425,6 +2454,7 @@ export function migrateOpsWorkerTaskV2(task: OpsWorkerTaskV2): OpsWorkerTask {
     submissionFingerprint,
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 2 } : null,
     ...common,
   };
 }
@@ -2441,6 +2471,7 @@ export function migrateOpsWorkerTaskV3(task: OpsWorkerTaskV3): OpsWorkerTask {
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     lifecycle: migrateLifecycleV1(lifecycle),
     verification: null,
+    legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 3 } : null,
     ...common,
   };
 }
@@ -2603,6 +2634,7 @@ function parseOpsWorkerTaskV4(
       task.authorizationVerification,
     ),
     verification: parseVerification(task.verification),
+    legacyCompletion: parseLegacyCompletion(task.legacyCompletion),
     ...parseTaskCommon(task, id, source, registry),
   };
   const verifier = parsed.verification;
@@ -2620,10 +2652,28 @@ function parseOpsWorkerTaskV4(
     fail("task.verification.subjectHash", "is stale for current task/checkpoint/authorization state");
   }
   if (
+    parsed.legacyCompletion !== null
+    && (
+      parsed.state !== "DONE"
+      || verifier !== null
+      || parsed.lifecycle.verifier !== null
+      || parsed.lifecycle.verifierVersion !== null
+      || parsed.lifecycle.verifierContractHash !== null
+    )
+  ) {
+    fail(
+      "task.legacyCompletion",
+      "may preserve only an unverified legacy DONE snapshot",
+    );
+  }
+  if (
     parsed.state === "DONE"
     && (
-      verifier?.outcome !== "PASS"
-      || verifier.completedAt !== parsed.updatedAt
+      parsed.legacyCompletion === null
+      && (
+        verifier?.outcome !== "PASS"
+        || verifier.completedAt !== parsed.updatedAt
+      )
     )
   ) {
     fail(

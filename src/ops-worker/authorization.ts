@@ -458,7 +458,10 @@ export interface OpsWorkerAuthorizationDecision {
 
 export interface OpsWorkerAuthorizationRevalidationOptions {
   /** Runs in the same task-store mutation as a fresh PASS record. */
-  onPass?: (task: OpsWorkerTask) => void;
+  onPass?: (
+    task: OpsWorkerTask,
+    verification: OpsWorkerAuthorizationVerification,
+  ) => void;
   audit?: OpsWorkerAuditInput;
 }
 
@@ -477,6 +480,18 @@ function authorizationEvidence(
     summary: verification.summary,
     artifact: null,
   };
+}
+
+function sameVerificationSubjectAuthorization(
+  previous: OpsWorkerAuthorizationVerification | null,
+  next: OpsWorkerAuthorizationVerification,
+): boolean {
+  return previous !== null
+    && previous.validatorIdentity === next.validatorIdentity
+    && previous.validatorVersion === next.validatorVersion
+    && previous.checkedSnapshotHash === next.checkedSnapshotHash
+    && previous.status === next.status
+    && previous.evidenceHash === next.evidenceHash;
 }
 
 /** Persists a fresh decision and applies every closed outcome atomically. */
@@ -541,19 +556,35 @@ export class OpsWorkerAuthorizationCoordinator {
             return;
           }
           const previousVerification = task.authorizationVerification;
+          const sameSubjectAuthorization = sameVerificationSubjectAuthorization(
+            previousVerification,
+            verification,
+          );
+          if (isOpsWorkerTerminalState(task.state)) {
+            // Reporting is authorized by this fresh decision in the same mutation,
+            // but the authorization fields covered by the immutable DONE proof may
+            // not be rewritten. A refresh that changes no covered field may advance
+            // checkedAt safely; otherwise retain the terminal proof and audit the
+            // fresh observation separately.
+            if (sameSubjectAuthorization) {
+              task.authorizationVerification = verification;
+            } else {
+              task.evidence = [...task.evidence, authorizationEvidence(verification)].slice(
+                -OPS_WORKER_LIMITS.maxEvidenceEntries,
+              );
+            }
+            options.onPass?.(task, verification);
+            return;
+          }
           task.authorizationVerification = verification;
           if (
             task.verification !== null
-            && (
-              previousVerification?.checkedSnapshotHash
-                !== verification.checkedSnapshotHash
-              || previousVerification.status !== verification.status
-            )
+            && !sameSubjectAuthorization
           ) {
             task.verification = null;
           }
           if (verification.status === "PASS") {
-            options.onPass?.(task);
+            options.onPass?.(task, verification);
             return;
           }
           if (task.activeRun !== null || task.unverifiedRun !== null || task.state === "RUNNING") {

@@ -525,6 +525,7 @@ function createTask(
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -795,7 +796,25 @@ export async function runOpsWorkerCliCommand(
     }
     if (action === "receipt-claim") {
       const taskId = requiredValue(parsed, "id");
-      const decision = await authorization.revalidate(taskId);
+      const operation = {
+        boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
+        operationId: requiredValue(parsed, "operation-id"),
+        intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
+      };
+      let claimed = false;
+      const decision = await authorization.revalidate(taskId, {
+        audit: {
+          event: "UPDATED",
+          summary: `Revalidated authorization and claimed ${operation.boundary} mutation boundary`,
+        },
+        onPass: (task, verification) => {
+          claimed = lifecycle.claimMutationReceiptAfterFreshAuthorization(
+            task,
+            operation,
+            verification,
+          );
+        },
+      });
       if (!decision.authorized) {
         printMutationClaim(
           { task: decision.task, claimed: false },
@@ -804,12 +823,7 @@ export async function runOpsWorkerCliCommand(
         );
         return 0;
       }
-      const result = lifecycle.claimMutationReceipt(taskId, {
-        boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
-        operationId: requiredValue(parsed, "operation-id"),
-        intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
-      });
-      printMutationClaim(result, json, cliOptions.stdout);
+      printMutationClaim({ task: decision.task, claimed }, json, cliOptions.stdout);
       return 0;
     }
     if (action === "receipt-finish") {

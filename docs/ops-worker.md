@@ -109,7 +109,10 @@ version, checked authorization snapshot hash, checked time, closed status, and
 bounded redacted evidence hash/summary. V4 adds the immutable composite verifier
 identity/version/contract hash to the lifecycle manifest and fresh aggregate
 component evidence to the task. Older snapshots migrate with these records
-unset, never with an implied PASS.
+unset, never with an implied PASS. A migrated legacy `DONE` snapshot carries
+fixed source-schema provenance so its report evidence can be updated in v4
+without fabricating aggregate PASS evidence; current-schema completion still
+requires a fresh aggregate PASS.
 
 The v1 migration derives a task-unique legacy delivery key and non-shareable
 legacy host resource. It also derives custody conservatively: active, checking,
@@ -216,8 +219,10 @@ become current. Checkpoint snapshot updates count as attempt liveness and are
 allowed while the supervisor owns the task.
 
 `--lifecycle` accepts only `canonicalTask`, `repository`, `base`, `head`,
-`branch`, `pullRequest`, `merge`, `tag`, `release`, `deploy`, `verifier`,
-`report`, and `tailAudit`. For example:
+`branch`, `pullRequest`, `merge`, `tag`, `release`, `deploy`, `report`, and
+`tailAudit`. Verifier identity, version, and contract hash are reserved for the
+package-owned composite verifier and cannot be supplied through lifecycle or
+checkpoint input. For example:
 
 ```json
 {"repository":"github:example/project","pullRequest":"pr:58","merge":"commit:abc123"}

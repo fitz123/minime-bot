@@ -6,15 +6,18 @@ import {
 import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_MUTATION_BOUNDARIES,
+  isOpsWorkerTerminalState,
   type OpsWorkerLifecycleManifest,
   type OpsWorkerMutationBoundary,
   type OpsWorkerMutationOutcomeResult,
   type OpsWorkerMutationReceipt,
   type OpsWorkerAuthorizationScope,
+  type OpsWorkerAuthorizationVerification,
   type OpsWorkerMutationReceiptReplay,
   type OpsWorkerMutationReceipts,
   type OpsWorkerTask,
 } from "./types.js";
+import { hashOpsWorkerAuthorizationSnapshot } from "./authorization.js";
 
 const MUTATION_BOUNDARY_REQUIRED_SCOPE: Readonly<
   Record<OpsWorkerMutationBoundary, OpsWorkerAuthorizationScope | null>
@@ -46,9 +49,6 @@ export const OPS_WORKER_LIFECYCLE_IDENTITY_SLOTS = [
   "tag",
   "release",
   "deploy",
-  "verifier",
-  "verifierVersion",
-  "verifierContractHash",
   "report",
   "tailAudit",
 ] as const;
@@ -572,46 +572,75 @@ export class OpsWorkerLifecycle {
     taskId: string,
     input: OpsWorkerMutationOperationInput,
   ): OpsWorkerMutationClaimResult {
-    const slot = receiptSlot(input.boundary);
-    const intentHash = hashOpsWorkerCanonicalPayload(input.intent);
     let claimed = false;
     const result = this.store.mutate(
       taskId,
       { event: "UPDATED", summary: `Claimed ${input.boundary} mutation boundary` },
       (task) => {
-        const receipt = task.mutationReceipts[slot];
-        if (receipt === null) {
-          throw new OpsWorkerLifecycleError(
-            `${input.boundary} mutation requires a query observation before it can be claimed`,
-          );
-        }
-        const historical = findReceiptReplay(receipt, input.operationId);
-        if (historical !== undefined) {
-          assertMatchingReceiptReplay(historical, input.operationId, intentHash);
-          return OPS_WORKER_TASK_STORE_NO_CHANGE;
-        }
-        assertMatchingOperation(receipt, input.operationId, intentHash);
-        if (receipt.outcome !== null || receipt.mutationStartedAt !== null) {
-          return OPS_WORKER_TASK_STORE_NO_CHANGE;
-        }
-        if (!this.authorizeMutationClaim(task, receipt)) {
-          throw new OpsWorkerLifecycleError(
-            `${input.boundary} mutation requires a fresh package-owned authorization PASS`,
-          );
-        }
-        if (!hasOpsWorkerMutationBoundaryScope(task, input.boundary)) {
-          throw new OpsWorkerLifecycleError(
-            `${input.boundary} mutation is outside the task's registered authorization scopes`,
-          );
-        }
-        receipt.mutationStartedAt = timestampAtOrAfter(
-          this.now(),
-          receipt.queryObservedAt,
+        claimed = this.applyMutationReceiptClaim(
+          task,
+          input,
+          (receipt) => this.authorizeMutationClaim(task, receipt),
         );
-        claimed = true;
+        if (!claimed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
       },
     );
     return { task: result.task, claimed };
+  }
+
+  /**
+   * Applies a receipt claim inside the authorization coordinator's atomic
+   * mutation. This is required for terminal reporting because immutable DONE
+   * proof fields cannot be replaced by a later authorization observation.
+   */
+  claimMutationReceiptAfterFreshAuthorization(
+    task: OpsWorkerTask,
+    input: OpsWorkerMutationOperationInput,
+    verification: OpsWorkerAuthorizationVerification,
+  ): boolean {
+    return this.applyMutationReceiptClaim(task, input, (receipt) =>
+      verification.status === "PASS"
+      && verification.checkedSnapshotHash === hashOpsWorkerAuthorizationSnapshot(task)
+      && Date.parse(verification.checkedAt) >= Date.parse(receipt.queryObservedAt));
+  }
+
+  private applyMutationReceiptClaim(
+    task: OpsWorkerTask,
+    input: OpsWorkerMutationOperationInput,
+    authorize: (receipt: OpsWorkerMutationReceipt) => boolean,
+  ): boolean {
+    const slot = receiptSlot(input.boundary);
+    const intentHash = hashOpsWorkerCanonicalPayload(input.intent);
+    const receipt = task.mutationReceipts[slot];
+    if (receipt === null) {
+      throw new OpsWorkerLifecycleError(
+        `${input.boundary} mutation requires a query observation before it can be claimed`,
+      );
+    }
+    const historical = findReceiptReplay(receipt, input.operationId);
+    if (historical !== undefined) {
+      assertMatchingReceiptReplay(historical, input.operationId, intentHash);
+      return false;
+    }
+    assertMatchingOperation(receipt, input.operationId, intentHash);
+    if (receipt.outcome !== null || receipt.mutationStartedAt !== null) return false;
+    if (!authorize(receipt)) {
+      throw new OpsWorkerLifecycleError(
+        `${input.boundary} mutation requires a fresh package-owned authorization PASS`,
+      );
+    }
+    if (!hasOpsWorkerMutationBoundaryScope(task, input.boundary)) {
+      throw new OpsWorkerLifecycleError(
+        `${input.boundary} mutation is outside the task's registered authorization scopes`,
+      );
+    }
+    if (isOpsWorkerTerminalState(task.state) && input.boundary !== "report") {
+      throw new OpsWorkerLifecycleError(
+        "terminal tasks may claim only the report bookkeeping boundary",
+      );
+    }
+    receipt.mutationStartedAt = timestampAtOrAfter(this.now(), receipt.queryObservedAt);
+    return true;
   }
 
   finishMutationReceipt(

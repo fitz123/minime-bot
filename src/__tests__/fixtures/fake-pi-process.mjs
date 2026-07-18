@@ -226,6 +226,9 @@ switch (scenario) {
     process.stderr.write("HTTP 429 quota smoke probe rate limit\n");
     process.exitCode = 1;
     break;
+  case "quota-probe-wait":
+    setInterval(() => undefined, 1_000);
+    break;
   case "network":
     process.stderr.write("fetch failed: ECONNRESET network error\n");
     process.exitCode = 1;

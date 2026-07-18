@@ -102,7 +102,7 @@ export interface OpsWorkerStartupRunResult {
 export interface OpsWorkerStartupReconciliation {
   taskId: string;
   state: "RESUMABLE" | "BLOCKED";
-  result: "CRASH" | "AMBIGUOUS_ORPHAN";
+  result: "CRASH" | "QUOTA_PROBE_ERROR" | "AMBIGUOUS_ORPHAN";
 }
 
 export interface OpsWorkerSupervisorOptions {
@@ -1232,9 +1232,33 @@ export class OpsWorkerSupervisor {
   recordQuotaProbeSuccess(taskId: string, summary: string): OpsWorkerTask {
     this.assertStarted();
     const existing = this.requireTask(taskId);
-    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+    if (
+      existing.state !== "QUEUED"
+      && existing.state !== "RESUMABLE"
+      && existing.state !== "RUNNING"
+    ) {
       throw new OpsWorkerSupervisorStateError(
-        `Quota probe success requires QUEUED or RESUMABLE, found ${existing.state}`,
+        `Quota probe success requires QUEUED, RESUMABLE, or RUNNING, found ${existing.state}`,
+      );
+    }
+    const applySuccess = (task: OpsWorkerTask, at: string): void => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_PROBE_PASS",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    };
+    if (existing.state === "RUNNING") {
+      return this.transition(
+        taskId,
+        "RESUMABLE",
+        applySuccess,
+        "Quota smoke probe restored runnable state",
       );
     }
     return this.store.mutate(
@@ -1243,14 +1267,7 @@ export class OpsWorkerSupervisor {
       (task) => {
         const at = this.nextUpdatedAt(task);
         task.updatedAt = at;
-        task.schedule.nextRunAt = null;
-        task.schedule.nextCheckAt = null;
-        task.lastOutcome = {
-          at,
-          kind: "INFRASTRUCTURE",
-          result: "QUOTA_PROBE_PASS",
-          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
-        };
+        applySuccess(task, at);
       },
     ).task;
   }
@@ -1258,9 +1275,35 @@ export class OpsWorkerSupervisor {
   recordQuotaProbeError(taskId: string, summary: string): OpsWorkerTask {
     this.assertStarted();
     const existing = this.requireTask(taskId);
-    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+    if (
+      existing.state !== "QUEUED"
+      && existing.state !== "RESUMABLE"
+      && existing.state !== "RUNNING"
+    ) {
       throw new OpsWorkerSupervisorStateError(
-        `Quota probe error requires QUEUED or RESUMABLE, found ${existing.state}`,
+        `Quota probe error requires QUEUED, RESUMABLE, or RUNNING, found ${existing.state}`,
+      );
+    }
+    const applyError = (task: OpsWorkerTask, at: string): void => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.quotaRecheckMs,
+      ).toISOString();
+      task.schedule.nextCheckAt = null;
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_PROBE_ERROR",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    };
+    if (existing.state === "RUNNING") {
+      return this.transition(
+        taskId,
+        "RESUMABLE",
+        applyError,
+        "Recorded bounded quota probe error",
       );
     }
     return this.store.mutate(
@@ -1269,16 +1312,7 @@ export class OpsWorkerSupervisor {
       (task) => {
         const at = this.nextUpdatedAt(task);
         task.updatedAt = at;
-        task.schedule.nextRunAt = new Date(
-          this.now().getTime() + this.quotaRecheckMs,
-        ).toISOString();
-        task.schedule.nextCheckAt = null;
-        task.lastOutcome = {
-          at,
-          kind: "INFRASTRUCTURE",
-          result: "QUOTA_PROBE_ERROR",
-          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
-        };
+        applyError(task, at);
       },
     ).task;
   }
@@ -1286,9 +1320,35 @@ export class OpsWorkerSupervisor {
   recordQuotaProbeTelemetryError(taskId: string, summary: string): OpsWorkerTask {
     this.assertStarted();
     const existing = this.requireTask(taskId);
-    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
+    if (
+      existing.state !== "QUEUED"
+      && existing.state !== "RESUMABLE"
+      && existing.state !== "RUNNING"
+    ) {
       throw new OpsWorkerSupervisorStateError(
-        `Quota probe telemetry error requires QUEUED or RESUMABLE, found ${existing.state}`,
+        `Quota probe telemetry error requires QUEUED, RESUMABLE, or RUNNING, found ${existing.state}`,
+      );
+    }
+    const applyError = (task: OpsWorkerTask, at: string): void => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.quotaRecheckMs,
+      ).toISOString();
+      task.schedule.nextCheckAt = null;
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_TELEMETRY_ERROR",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    };
+    if (existing.state === "RUNNING") {
+      return this.transition(
+        taskId,
+        "RESUMABLE",
+        applyError,
+        "Recorded quota probe telemetry error",
       );
     }
     return this.store.mutate(
@@ -1297,16 +1357,7 @@ export class OpsWorkerSupervisor {
       (task) => {
         const at = this.nextUpdatedAt(task);
         task.updatedAt = at;
-        task.schedule.nextRunAt = new Date(
-          this.now().getTime() + this.quotaRecheckMs,
-        ).toISOString();
-        task.schedule.nextCheckAt = null;
-        task.lastOutcome = {
-          at,
-          kind: "INFRASTRUCTURE",
-          result: "QUOTA_TELEMETRY_ERROR",
-          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
-        };
+        applyError(task, at);
       },
     ).task;
   }
@@ -1432,7 +1483,7 @@ export class OpsWorkerSupervisor {
     return this.transition(taskId, "CHECKING", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
-      task.session.resume = true;
+      task.session.resume = task.session.sessionId !== null;
       task.rounds.consecutiveInfrastructureFailures = 0;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
@@ -1466,7 +1517,7 @@ export class OpsWorkerSupervisor {
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
-      task.session.resume = true;
+      task.session.resume = task.session.sessionId !== null;
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
@@ -1497,7 +1548,7 @@ export class OpsWorkerSupervisor {
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
-      task.session.resume = true;
+      task.session.resume = task.session.sessionId !== null;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.report.state = "NONE";
@@ -1838,10 +1889,22 @@ export class OpsWorkerSupervisor {
         lastError: task.report.lastError,
       },
     });
-    const authorization = await this.authorization.revalidate(taskId);
+    let claimed = false;
+    const authorization = await this.authorization.revalidate(taskId, {
+      audit: {
+        event: "UPDATED",
+        summary: "Revalidated authorization and claimed report mutation boundary",
+      },
+      onPass: (replacement, verification) => {
+        claimed = this.lifecycle.claimMutationReceiptAfterFreshAuthorization(
+          replacement,
+          operation,
+          verification,
+        );
+      },
+    });
     if (!authorization.authorized) return authorization.task;
-    const claim = this.lifecycle.claimMutationReceipt(taskId, operation);
-    if (!claim.claimed) {
+    if (!claimed) {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
       );
@@ -1929,6 +1992,11 @@ export class OpsWorkerSupervisor {
       ));
     const reconciled: OpsWorkerStartupReconciliation[] = [];
     for (const task of running) {
+      const interruptedQuotaProbe = (
+        task.activeRun?.attemptId
+        ?? task.unverifiedRun?.attemptId
+        ?? ""
+      ).startsWith("quota-probe-");
       let result: OpsWorkerStartupRunResult = { status: "AMBIGUOUS" };
       try {
         result = this.reconcileActiveRun
@@ -1941,23 +2009,29 @@ export class OpsWorkerSupervisor {
         this.transition(task.id, "RESUMABLE", (replacement, at) => {
           replacement.activeRun = null;
           replacement.unverifiedRun = null;
-          this.incrementInfrastructureFailures(replacement);
-          replacement.schedule.nextRunAt = null;
+          if (!interruptedQuotaProbe) this.incrementInfrastructureFailures(replacement);
+          replacement.schedule.nextRunAt = interruptedQuotaProbe
+            ? new Date(this.now().getTime() + this.quotaRecheckMs).toISOString()
+            : null;
           replacement.schedule.nextCheckAt = null;
           replacement.lastOutcome = {
             at,
-            kind: "RECONCILIATION",
-            result: "CRASH",
+            kind: interruptedQuotaProbe ? "INFRASTRUCTURE" : "RECONCILIATION",
+            result: interruptedQuotaProbe ? "QUOTA_PROBE_ERROR" : "CRASH",
             summary: truncateUtf8(
-              result.summary ?? "Prior owned attempt is no longer running",
+              result.summary ?? (interruptedQuotaProbe
+                ? "Prior owned quota smoke probe is no longer running"
+                : "Prior owned attempt is no longer running"),
               OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
             ),
           };
-        }, "Reconciled interrupted attempt as resumable");
+        }, interruptedQuotaProbe
+          ? "Reconciled interrupted quota smoke probe as resumable"
+          : "Reconciled interrupted attempt as resumable");
         reconciled.push({
           taskId: task.id,
           state: "RESUMABLE",
-          result: "CRASH",
+          result: interruptedQuotaProbe ? "QUOTA_PROBE_ERROR" : "CRASH",
         });
       } else {
         if (task.state === "RUNNING") {

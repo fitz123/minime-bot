@@ -86,6 +86,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,

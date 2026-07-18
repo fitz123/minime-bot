@@ -160,6 +160,7 @@ function makeTask(
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -1176,7 +1177,7 @@ describe("ops worker supervisor", () => {
       faultInjector: (point) => {
         if (!armed || point !== "after-snapshot-rename") return;
         renamedSnapshots += 1;
-        if (renamedSnapshots === 5) {
+        if (renamedSnapshots === 4) {
           throw new Error("Synthetic crash after atomic report snapshot rename");
         }
       },
@@ -1190,7 +1191,7 @@ describe("ops worker supervisor", () => {
       harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
       /Synthetic crash after atomic report snapshot rename/,
     );
-    assert.equal(renamedSnapshots, 5);
+    assert.equal(renamedSnapshots, 4);
     const persisted = harness.store.get("task-report-crash");
     assert.equal(persisted?.report.state, "SENT");
     assert.equal(persisted?.report.attempts, 1);
@@ -1239,6 +1240,70 @@ describe("ops worker supervisor", () => {
       null,
     );
     assert.equal(done.mutationReceipts.report?.outcome, null);
+  });
+
+  it("invalidates nonterminal composite evidence and preserves DONE proof across changed authorization evidence", async (t) => {
+    let checks = 0;
+    const changingVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: "changing-authorization-evidence",
+      version: "1",
+      verify: () => {
+        checks += 1;
+        return {
+          status: "PASS",
+          evidenceHash: `sha256:${(checks % 2 === 1 ? "1" : "2").repeat(64)}`,
+          summary: "Fresh authorization remains valid with new observation evidence.",
+        };
+      },
+    };
+    const deferred = await makeHarness(t, {
+      authorizationVerifiers: { "operator-cli": changingVerifier },
+      implementation: () => ({
+        result: "DEFER",
+        summary: "Passive convergence needs another observation.",
+        nextCheckAt: LATER,
+      }),
+    });
+    deferred.store.create(makeTask("task-changing-auth-check"));
+    await deferred.supervisor.requestDoneCheck("task-changing-auth-check");
+    const firstCheck = await deferred.supervisor.runDoneCheck("task-changing-auth-check");
+    assert.equal(firstCheck.verification?.outcome, "DEFER");
+    const reauthorized = await deferred.supervisor.ensureTaskCustody(
+      "task-changing-auth-check",
+      "CHECK",
+    );
+    assert.equal(reauthorized.state, "CHECKING");
+    assert.equal(reauthorized.verification, null);
+
+    let terminalChecks = 0;
+    const terminalVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: "terminal-authorization-evidence",
+      version: "1",
+      verify: () => {
+        terminalChecks += 1;
+        return {
+          status: "PASS",
+          evidenceHash: `sha256:${(terminalChecks === 1 ? "3" : "4").repeat(64)}`,
+          summary: "Terminal report remains freshly authorized.",
+        };
+      },
+    };
+    const terminal = await makeHarness(t, {
+      authorizationVerifiers: { "operator-cli": terminalVerifier },
+    });
+    terminal.store.create(makeTask("task-changing-auth-report"));
+    await terminal.supervisor.requestDoneCheck("task-changing-auth-report");
+    const done = await terminal.supervisor.runDoneCheck("task-changing-auth-report");
+    const immutableProof = structuredClone(done.verification);
+    const sent = await terminal.supervisor.recordReportAttempt(
+      "task-changing-auth-report",
+      { sent: true },
+    );
+    assert.equal(sent.state, "DONE");
+    assert.deepEqual(sent.verification, immutableProof);
+    assert.equal(sent.report.state, "SENT");
+    assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+    assert.equal(terminalChecks, 2);
   });
 
   it("requires claimed report reconciliation before retrying a blocked task", async (t) => {
@@ -1791,6 +1856,40 @@ describe("ops worker supervisor", () => {
     );
   });
 
+  it("reconciles a quota probe fence without spending infrastructure budget", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-quota-probe-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "quota-probe-first",
+    });
+    const task = makeTask("task-quota-probe-restart");
+    task.rounds.consecutiveInfrastructureFailures = 7;
+    first.store.create(task);
+    first.supervisor.markRunning(task.id, {
+      ...activeRun("quota-probe-first"),
+      attemptId: "quota-probe-restart-fence",
+    });
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "quota-probe-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Owned quota probe process group is proven gone.",
+      }),
+    });
+    const recovered = restarted.store.get(task.id);
+    assert.equal(recovered?.state, "RESUMABLE");
+    assert.equal(recovered?.activeRun, null);
+    assert.equal(recovered?.unverifiedRun, null);
+    assert.equal(recovered?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(recovered?.rounds.consecutiveInfrastructureFailures, 7);
+    assert.ok(recovered?.schedule.nextRunAt);
+    assert.equal(recovered?.custody.status, "HELD");
+  });
+
   it("fails startup closed when multiple v1 snapshots migrate to held custody", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-multi-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -1819,6 +1918,7 @@ describe("ops worker supervisor", () => {
         submissionFingerprint: _submissionFingerprint,
         authorizationVerification: _authorizationVerification,
         verification: _verification,
+        legacyCompletion: _legacyCompletion,
         source,
         schemaVersion: _schemaVersion,
         ...common

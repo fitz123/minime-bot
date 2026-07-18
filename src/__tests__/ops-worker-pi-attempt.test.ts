@@ -211,6 +211,7 @@ function makeTask(
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -840,6 +841,46 @@ describe("ops worker Pi standard-session attempts", () => {
         .some((name) => name === "quota-smoke-telemetry.json"),
       false,
     );
+  });
+
+  it("durably fences and safely stops an owned quota probe process group", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("owned-quota-probe-fence");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait for durable probe ownership.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-wait");
+    const controller = new AbortController();
+    const running = harness.runner({ abortSignal: controller.signal }).runNext();
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    const active = harness.supervisor.getTask(task.id)?.activeRun;
+    assert.ok(active);
+    assert.match(active.attemptId, /^quota-probe-/);
+    assert.equal(active.pid, active.processGroupId);
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "OWNED");
+
+    controller.abort();
+    const result = await running;
+
+    assert.equal(result?.state, "RESUMABLE", JSON.stringify(result?.lastOutcome));
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(result?.lastOutcome?.summary ?? "", /worker shutdown/);
+    assert.equal(result?.activeRun, null);
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(result?.custody.status, "HELD");
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {

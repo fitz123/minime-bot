@@ -80,6 +80,7 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -246,6 +247,19 @@ describe("ops worker package-owned lifecycle evidence", () => {
         arbitraryPhase: "command:run",
       } as never),
       /unknown lifecycle identity slot arbitraryPhase/,
+    );
+    assert.throws(
+      () => harness.lifecycle.recordCheckpoint(task.id, {
+        checkpointId: "checkpoint-verifier-poison",
+        payload: { phase: "verify" },
+        summary: "Untrusted checkpoint must not pin a verifier contract.",
+        lifecycle: {
+          verifier: "payload-selected-verifier",
+          verifierVersion: "99",
+          verifierContractHash: `sha256:${"f".repeat(64)}`,
+        } as never,
+      }),
+      /unknown lifecycle identity slot verifier/,
     );
     assert.throws(
       () => harness.lifecycle.updateLifecycleIdentity(task.id, {

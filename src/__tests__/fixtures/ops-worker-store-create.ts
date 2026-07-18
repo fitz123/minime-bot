@@ -84,8 +84,9 @@ const task: OpsWorkerTask = withOpsWorkerSubmissionFingerprint({
     scope: ["inspect"],
     snapshotHash: null,
   },
-  authorizationVerification: null,
-  verification: null,
+    authorizationVerification: null,
+    verification: null,
+    legacyCompletion: null,
   state: "QUEUED",
   rounds: {
     remediation: 0,

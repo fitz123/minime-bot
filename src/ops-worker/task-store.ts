@@ -801,6 +801,8 @@ export class OpsWorkerTaskStore {
       || existing.objective !== replacement.objective
       || JSON.stringify(existing.doneCheck) !== JSON.stringify(replacement.doneCheck)
       || JSON.stringify(existing.authorization) !== JSON.stringify(replacement.authorization)
+      || JSON.stringify(existing.legacyCompletion)
+        !== JSON.stringify(replacement.legacyCompletion)
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,

@@ -165,6 +165,7 @@ function makeTask(
     },
     authorizationVerification: null,
     verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -207,6 +208,7 @@ function makeV1Task(
     submissionFingerprint: _submissionFingerprint,
     authorizationVerification: _authorizationVerification,
     verification: _verification,
+    legacyCompletion: _legacyCompletion,
     ...legacy
   } = current;
   const { deliveryKey: _deliveryKey, ...source } = legacy.source;
@@ -225,6 +227,7 @@ function makeV2Task(
   const {
     authorizationVerification: _authorizationVerification,
     verification: _verification,
+    legacyCompletion: _legacyCompletion,
     lifecycle,
     ...previous
   } = current;
@@ -245,7 +248,12 @@ function makeV3Task(
   correlationKey = "operator:health:v3",
 ): OpsWorkerTaskV3 {
   const current = makeTask(id, correlationKey);
-  const { verification: _verification, lifecycle, ...previous } = current;
+  const {
+    verification: _verification,
+    legacyCompletion: _legacyCompletion,
+    lifecycle,
+    ...previous
+  } = current;
   const {
     verifierVersion: _verifierVersion,
     verifierContractHash: _verifierContractHash,
@@ -1169,6 +1177,56 @@ describe("ops worker durable task store", () => {
     assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
     assert.deepEqual(store.get(previous.id), loaded);
     assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
+  });
+
+  it("persists report evidence on migrated legacy DONE snapshots without inventing PASS", (t) => {
+    const store = makeStore(t);
+    const previousTasks = [
+      makeV1Task("legacy-done-v1", "legacy:done:v1"),
+      makeV2Task("legacy-done-v2", "legacy:done:v2"),
+      makeV3Task("legacy-done-v3", "legacy:done:v3"),
+    ];
+    for (const previous of previousTasks) {
+      previous.state = "DONE";
+      previous.lastOutcome = {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PASS",
+        summary: "Legacy completion predates composite verification.",
+      };
+      previous.report = { state: "PENDING", attempts: 0, lastError: null };
+      if (previous.schemaVersion !== 1) {
+        previous.custody = {
+          status: "RELEASED",
+          claimedAt: null,
+          releasedAt: NOW,
+          releaseReason: "DONE",
+        };
+      }
+      const snapshotPath = join(store.tasksDirectory, `${previous.id}.json`);
+      writeFileSync(snapshotPath, `${JSON.stringify(previous)}\n`, { mode: 0o600 });
+
+      const loaded = store.get(previous.id);
+      assert.equal(loaded?.legacyCompletion?.sourceSchemaVersion, previous.schemaVersion);
+      assert.equal(loaded?.verification, null);
+      const mutated = store.mutate(
+        previous.id,
+        { event: "REPORT", summary: "Recorded legacy completion report attempt" },
+        (task) => {
+          task.report.attempts = 1;
+          task.report.lastError = "Synthetic report retry remains pending.";
+        },
+      ).task;
+
+      assert.equal(mutated.state, "DONE");
+      assert.equal(mutated.verification, null);
+      assert.equal(mutated.legacyCompletion?.sourceSchemaVersion, previous.schemaVersion);
+      assert.equal(store.get(previous.id)?.report.attempts, 1);
+      assert.equal(
+        (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
+        4,
+      );
+    }
   });
 
   it("writes a private authoritative snapshot before its bounded audit record", (t) => {
