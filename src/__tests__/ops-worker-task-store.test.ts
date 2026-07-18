@@ -26,6 +26,8 @@ import {
   type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
+  type OpsWorkerTaskState,
+  type OpsWorkerTaskV1,
 } from "../ops-worker/types.js";
 import {
   OpsWorkerDuplicateCorrelationError,
@@ -52,12 +54,12 @@ function exactObject(
 
 const registry: OpsWorkerTaskContractRegistry = {
   templates: {
-    "operator-health": { sourceKinds: ["operator-cli"] },
+    "operator-health": { sourceKinds: ["operator-cli", "operator-telegram"] },
     "issue-full-cycle": { sourceKinds: ["authorized-issue"] },
   },
   authorizationProfiles: {
     "operator.inspect.v1": {
-      sourceKinds: ["operator-cli"],
+      sourceKinds: ["operator-cli", "operator-telegram"],
       scope: ["inspect"],
       tools: ["read", "grep", "find", "ls"],
     },
@@ -90,12 +92,47 @@ function makeTask(
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id,
     source: {
       kind: "operator-cli",
       correlationKey,
+      deliveryKey: `fixture:${id}`,
       template: "operator-health",
+    },
+    resource: {
+      kind: "host",
+      key: "host:local",
+    },
+    lifecycle: {
+      schemaVersion: 1,
+      canonicalTask: null,
+      repository: null,
+      base: null,
+      head: null,
+      branch: null,
+      pullRequest: null,
+      merge: null,
+      tag: null,
+      release: null,
+      deploy: null,
+      verifier: null,
+      report: null,
+      tailAudit: null,
+    },
+    currentCheckpoint: null,
+    mutationReceipts: {
+      merge: null,
+      tagRelease: null,
+      deploy: null,
+      canonicalTask: null,
+      report: null,
+    },
+    custody: {
+      status: "UNCLAIMED",
+      claimedAt: null,
+      releasedAt: null,
+      releaseReason: null,
     },
     priority: 10,
     objective: "Verify the registered local health contract",
@@ -145,6 +182,27 @@ function makeTask(
   };
 }
 
+function makeV1Task(
+  id = "wt-20260717-ab12cd",
+  correlationKey = "operator:health:local",
+): OpsWorkerTaskV1 {
+  const current = makeTask(id, correlationKey);
+  const {
+    resource: _resource,
+    lifecycle: _lifecycle,
+    currentCheckpoint: _currentCheckpoint,
+    mutationReceipts: _mutationReceipts,
+    custody: _custody,
+    ...legacy
+  } = current;
+  const { deliveryKey: _deliveryKey, ...source } = legacy.source;
+  return {
+    ...legacy,
+    schemaVersion: 1,
+    source: source as OpsWorkerTaskV1["source"],
+  };
+}
+
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
@@ -172,7 +230,7 @@ function makeStore(
 }
 
 describe("ops worker task contract", () => {
-  it("parses a complete schema-versioned envelope into an independent value", () => {
+  it("strictly round-trips a complete v2 envelope into an independent value", () => {
     const input = makeTask();
     input.state = "RUNNING";
     input.activeRun = {
@@ -196,6 +254,48 @@ describe("ops worker task contract", () => {
       attempts: 1,
       lastError: "Fixture transport unavailable.",
     };
+    input.lifecycle = {
+      schemaVersion: 1,
+      canonicalTask: "issue:58",
+      repository: "github:example/minime-bot",
+      base: "main",
+      head: "abc123",
+      branch: "issue-58",
+      pullRequest: "pr:99",
+      merge: "merge:abc123",
+      tag: "v1.2.3",
+      release: "release:1.2.3",
+      deploy: "deploy:staging-1",
+      verifier: "check:fixture",
+      report: "sha256:report-identity",
+      tailAudit: "audit:tail-1",
+    };
+    input.currentCheckpoint = {
+      checkpointId: "checkpoint-01",
+      recordedAt: NOW,
+      payloadHash: `sha256:${"1".repeat(64)}`,
+      summary: "The bounded fixture checkpoint is durable.",
+      artifact: "artifacts/checkpoint.json",
+    };
+    input.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-01",
+      intentHash: `sha256:${"2".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"3".repeat(64)}`,
+      mutationStartedAt: NOW,
+      outcome: {
+        recordedAt: NOW,
+        result: "APPLIED",
+        evidenceHash: `sha256:${"4".repeat(64)}`,
+      },
+    };
+    input.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
 
     const parsed = parseOpsWorkerTask(input, registry);
     assert.deepEqual(parsed, input);
@@ -205,11 +305,197 @@ describe("ops worker task contract", () => {
     assert.equal(parsed.objective, "Verify the registered local health contract");
   });
 
+  it("normalizes an exact v1 snapshot deterministically without sharing input references", () => {
+    const input = makeV1Task();
+    const before = clone(input);
+
+    const first = parseOpsWorkerTask(input, registry);
+    const second = parseOpsWorkerTaskJson(JSON.stringify(input), registry);
+
+    assert.deepEqual(input, before);
+    assert.deepEqual(first, second);
+    assert.equal(first.schemaVersion, 2);
+    assert.deepEqual(first.source, {
+      ...input.source,
+      deliveryKey: `legacy:${input.id}`,
+    });
+    assert.deepEqual(first.resource, {
+      kind: "host",
+      key: `host:legacy-${input.id}`,
+    });
+    assert.equal(first.lifecycle.schemaVersion, 1);
+    assert.ok(Object.values(first.lifecycle).slice(1).every((value) => value === null));
+    assert.equal(first.currentCheckpoint, null);
+    assert.ok(Object.values(first.mutationReceipts).every((value) => value === null));
+    first.source.correlationKey = "changed:after:migration";
+    assert.equal(input.source.correlationKey, "operator:health:local");
+  });
+
+  it("accepts dormant operator Telegram submissions only at operator priority", () => {
+    const task = makeTask();
+    task.source = {
+      kind: "operator-telegram",
+      correlationKey: "operator:telegram:fixture",
+      deliveryKey: "telegram:update:fixture-1",
+      template: "operator-health",
+    };
+    assert.equal(parseOpsWorkerTask(task, registry).priority, 10);
+
+    task.priority = 20;
+    assert.throws(() => parseOpsWorkerTask(task, registry), /fixed priority 10/);
+  });
+
+  it("rejects unknown schema versions and unknown v1 or v2 fields", () => {
+    const future = { ...makeTask(), schemaVersion: 3 };
+    assert.throws(
+      () => parseOpsWorkerTask(future, registry),
+      /supported version 1 or 2/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV1Task(), resource: { kind: "host", key: "host:local" } }, registry),
+      /task\.resource: unknown field/,
+    );
+    const futureLifecycle = clone(makeTask()) as unknown as Record<string, unknown>;
+    (futureLifecycle.lifecycle as Record<string, unknown>).workflow = "arbitrary";
+    assert.throws(
+      () => parseOpsWorkerTask(futureLifecycle, registry),
+      /task\.lifecycle\.workflow: unknown field/,
+    );
+  });
+
+  it("requires normalized bounded resource and delivery identities", () => {
+    const uppercase = clone(makeTask());
+    uppercase.resource.key = "github:Example/minime-bot";
+    assert.throws(() => parseOpsWorkerTask(uppercase, registry), /normalized lowercase/);
+
+    const mismatched = clone(makeTask());
+    mismatched.resource = { kind: "repository", key: "host:local" };
+    assert.throws(() => parseOpsWorkerTask(mismatched, registry), /non-host namespace/);
+
+    const missingDelivery = clone(makeTask()) as unknown as Record<string, unknown>;
+    delete (missingDelivery.source as Record<string, unknown>).deliveryKey;
+    assert.throws(() => parseOpsWorkerTask(missingDelivery, registry), /deliveryKey: missing/);
+  });
+
+  it("strictly bounds fixed lifecycle, checkpoint, receipt, and custody records", () => {
+    const unsafeLifecycle = clone(makeTask());
+    unsafeLifecycle.lifecycle.repository = "https://example.invalid/repository";
+    assert.throws(
+      () => parseOpsWorkerTask(unsafeLifecycle, registry),
+      /not a URL or executable payload/,
+    );
+
+    const oversizedCheckpoint = clone(makeTask());
+    oversizedCheckpoint.currentCheckpoint = {
+      checkpointId: "checkpoint-oversized",
+      recordedAt: NOW,
+      payloadHash: `sha256:${"a".repeat(64)}`,
+      summary: "x".repeat(OPS_WORKER_LIMITS.maxCheckpointSummaryBytes + 1),
+      artifact: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(oversizedCheckpoint, registry),
+      /currentCheckpoint\.summary: must be at most 4096/,
+    );
+
+    const wrongBoundary = clone(makeTask());
+    wrongBoundary.mutationReceipts.merge = {
+      boundary: "report",
+      operationId: "merge-wrong-boundary",
+      intentHash: `sha256:${"b".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"c".repeat(64)}`,
+      mutationStartedAt: null,
+      outcome: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(wrongBoundary, registry),
+      /must equal fixed slot boundary merge/,
+    );
+
+    const contradictoryCustody = clone(makeTask());
+    contradictoryCustody.custody = {
+      status: "HELD",
+      claimedAt: null,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(contradictoryCustody, registry),
+      /status does not match its custody timestamps/,
+    );
+  });
+
+  it("derives fail-safe custody for every legacy state and orphan mapping", () => {
+    const legacyFor = (state: OpsWorkerTaskState): OpsWorkerTaskV1 => {
+      const task = makeV1Task(`legacy-${state.toLowerCase()}`);
+      task.state = state;
+      if (state === "RUNNING") {
+        task.activeRun = {
+          attemptId: "attempt-legacy",
+          supervisorInstanceId: "supervisor-legacy",
+          pid: 123,
+          processGroupId: 123,
+          processStartedAt: NOW,
+          processStartToken: "start-legacy",
+        };
+      }
+      if (state === "DONE") {
+        task.lastOutcome = {
+          at: NOW,
+          kind: "DONE_CHECK",
+          result: "PASS",
+          summary: "Legacy task passed.",
+        };
+      }
+      return task;
+    };
+
+    for (const state of ["RUNNING", "CHECKING", "RESUMABLE"] as const) {
+      assert.deepEqual(parseOpsWorkerTask(legacyFor(state), registry).custody, {
+        status: "HELD",
+        claimedAt: NOW,
+        releasedAt: null,
+        releaseReason: null,
+      });
+    }
+    assert.deepEqual(
+      parseOpsWorkerTask(legacyFor("QUEUED"), registry).custody,
+      { status: "UNCLAIMED", claimedAt: null, releasedAt: null, releaseReason: null },
+    );
+    for (const state of ["DONE", "CANCELLED", "BLOCKED"] as const) {
+      assert.deepEqual(parseOpsWorkerTask(legacyFor(state), registry).custody, {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: state,
+      });
+    }
+
+    const ambiguous = legacyFor("BLOCKED");
+    ambiguous.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Ownership could not be proven absent.",
+    };
+    ambiguous.unverifiedRun = {
+      attemptId: "attempt-ambiguous",
+      supervisorInstanceId: "supervisor-legacy",
+      pid: null,
+      expectedProcessGroupId: null,
+      launchedAt: NOW,
+      ownershipNonceHash: `sha256:${"5".repeat(64)}`,
+    };
+    assert.equal(parseOpsWorkerTask(ambiguous, registry).custody.status, "HELD");
+  });
+
   it("supports the deferred issue source without letting it change fixed priority or scope", () => {
     const task = makeTask("wt-20260717-issue58", "issue:example-org/minime-bot:58");
     task.source = {
       kind: "authorized-issue",
       correlationKey: "issue:example-org/minime-bot:58",
+      deliveryKey: "github:issue-delivery:58",
       template: "issue-full-cycle",
     };
     task.priority = 30;
@@ -458,6 +744,27 @@ describe("ops worker task contract", () => {
 });
 
 describe("ops worker durable task store", () => {
+  it("loads v1 without writing and persists canonical v2 on the next successful write", (t) => {
+    const store = makeStore(t);
+    const legacy = makeV1Task();
+    const snapshotPath = join(store.tasksDirectory, `${legacy.id}.json`);
+    const rawLegacy = `${JSON.stringify(legacy)}\n`;
+    writeFileSync(snapshotPath, rawLegacy, { encoding: "utf8", mode: 0o600 });
+
+    const loaded = store.get(legacy.id);
+    assert.ok(loaded);
+    assert.equal(loaded.schemaVersion, 2);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+    assert.deepEqual(store.get(legacy.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+
+    store.replace(loaded, { event: "UPDATED" });
+    const canonicalV2 = `${JSON.stringify(loaded)}\n`;
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
+    assert.deepEqual(store.get(legacy.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
+  });
+
   it("writes a private authoritative snapshot before its bounded audit record", (t) => {
     const store = makeStore(t);
     const result = store.create(makeTask(), {
@@ -502,6 +809,23 @@ describe("ops worker durable task store", () => {
       [],
     );
     assert.doesNotThrow(() => JSON.parse(readFileSync(join(store.tasksDirectory, `${original.id}.json`), "utf8")));
+  });
+
+  it("rejects changes to immutable normalized resource identity", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const changed = clone(original);
+    changed.resource = {
+      kind: "repository",
+      key: "github:example/minime-bot",
+    };
+    assert.throws(
+      () => store.replace(changed),
+      /immutable identity/,
+    );
+    assert.deepEqual(store.get(original.id), original);
   });
 
   it("recovers the old snapshot when a crash occurs after temp-file fsync", (t) => {

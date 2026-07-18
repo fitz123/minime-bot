@@ -24,6 +24,9 @@ import {
   startOpsWorkerStatusServer,
 } from "./status-server.js";
 import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
   OPS_WORKER_SOURCE_PRIORITIES,
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
@@ -348,8 +351,14 @@ function createTask(
     source: {
       kind: "operator-cli",
       correlationKey: requiredValue(options, "correlation-key"),
+      deliveryKey: `operator-cli:${id}`,
       template: requiredValue(options, "template"),
     },
+    resource: { kind: "host", key: "host:local" },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: createUnclaimedOpsWorkerCustody(),
     priority: OPS_WORKER_SOURCE_PRIORITIES["operator-cli"],
     objective: requiredValue(options, "objective"),
     evidence: [{

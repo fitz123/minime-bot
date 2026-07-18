@@ -51,12 +51,12 @@ Base source: `f419d13` (`origin/main` when this plan was prepared)
 
 ### Task 1: Add the migration-safe v2 task and lifecycle contract
 
-- [ ] Write failing cases in `src/__tests__/ops-worker-task-store.test.ts` for loading an exact v1 snapshot, deterministic v1-to-v2 normalization, strict v2 round-trip, rejection of unknown future versions/fields, and immutable normalized resource identity.
-- [ ] Update `src/ops-worker/types.ts` to make schema v2 the write format while accepting exact v1 snapshots through one explicit pure migrator; loading v1 must not mutate files, and the next successful write must persist canonical v2 exactly once.
-- [ ] Extend `OpsWorkerTaskSource` with a bounded adapter delivery key distinct from active `correlationKey`, add the dormant `operator-telegram` source kind at operator priority, and add a required normalized immutable resource identity with fixed `host`/`repository` kinds and lowercase namespaced keys such as `host:local` or `github:example/minime-bot`.
-- [ ] Add a small versioned `OpsWorkerLifecycleManifest` containing fixed optional identity slots for canonical task, repository/base/head/branch, pull request/merge, tag/release, deploy, verifier, report, and tail audit; add bounded current-checkpoint and fixed-boundary mutation-receipt records, plus explicit custody status/timestamps/release reason. Do not add arbitrary step names or executable data.
-- [ ] Define fail-safe v1 defaults: derive a unique legacy delivery key from the task id, derive a non-shareable legacy resource key, treat v1 `RUNNING`/`CHECKING`/`RESUMABLE` and ambiguous-orphan snapshots as held custody, map `QUEUED` to unclaimed custody, and map `DONE`/`CANCELLED`/genuine process-free `BLOCKED` to released custody; cover every mapping in tests.
-- [ ] Run `src/__tests__/ops-worker-task-store.test.ts` and keep all existing strict-validation tests passing before Task 2.
+- [x] Write failing cases in `src/__tests__/ops-worker-task-store.test.ts` for loading an exact v1 snapshot, deterministic v1-to-v2 normalization, strict v2 round-trip, rejection of unknown future versions/fields, and immutable normalized resource identity.
+- [x] Update `src/ops-worker/types.ts` to make schema v2 the write format while accepting exact v1 snapshots through one explicit pure migrator; loading v1 must not mutate files, and the next successful write must persist canonical v2 exactly once.
+- [x] Extend `OpsWorkerTaskSource` with a bounded adapter delivery key distinct from active `correlationKey`, add the dormant `operator-telegram` source kind at operator priority, and add a required normalized immutable resource identity with fixed `host`/`repository` kinds and lowercase namespaced keys such as `host:local` or `github:example/minime-bot`.
+- [x] Add a small versioned `OpsWorkerLifecycleManifest` containing fixed optional identity slots for canonical task, repository/base/head/branch, pull request/merge, tag/release, deploy, verifier, report, and tail audit; add bounded current-checkpoint and fixed-boundary mutation-receipt records, plus explicit custody status/timestamps/release reason. Do not add arbitrary step names or executable data.
+- [x] Define fail-safe v1 defaults: derive a unique legacy delivery key from the task id, derive a non-shareable legacy resource key, treat v1 `RUNNING`/`CHECKING`/`RESUMABLE` and ambiguous-orphan snapshots as held custody, map `QUEUED` to unclaimed custody, and map `DONE`/`CANCELLED`/genuine process-free `BLOCKED` to released custody; cover every mapping in tests.
+- [x] Run `src/__tests__/ops-worker-task-store.test.ts` and keep all existing strict-validation tests passing before Task 2.
 
 ### Task 2: Make adapter submission and task mutation atomic and idempotent
 

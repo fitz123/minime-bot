@@ -28,6 +28,9 @@ import {
   OpsWorkerSupervisorStateError,
 } from "../ops-worker/supervisor.js";
 import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
   type JsonObject,
   type OpsWorkerSourceKind,
   type OpsWorkerTask,
@@ -90,17 +93,24 @@ function makeTask(
   const priority = {
     alertmanager: 0,
     "operator-cli": 10,
+    "operator-telegram": 10,
     "registered-cron": 20,
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id,
     source: {
       kind: sourceKind,
       correlationKey: options.correlationKey ?? `fixture:${id}`,
+      deliveryKey: `fixture:${id}`,
       template: "fixture-task",
     },
+    resource: { kind: "host", key: "host:local" },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: createUnclaimedOpsWorkerCustody(),
     priority,
     objective: "Exercise the registered deterministic fixture",
     evidence: [],

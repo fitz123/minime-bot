@@ -35,6 +35,9 @@ import {
 import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
 import { OpsWorkerTaskStore } from "../ops-worker/task-store.js";
 import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
   OPS_WORKER_LIMITS,
   type JsonObject,
   type OpsWorkerSourceKind,
@@ -92,18 +95,25 @@ function makeTask(
   const priority = {
     alertmanager: 0,
     "operator-cli": 10,
+    "operator-telegram": 10,
     "registered-cron": 20,
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id,
     source: {
       kind: sourceKind,
       correlationKey: `fixture:${id}`,
+      deliveryKey: `fixture:${id}`,
       template: "fixture-task",
     },
+    resource: { kind: "host", key: "host:local" },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: createUnclaimedOpsWorkerCustody(),
     priority,
     objective: options.objective ?? "Inspect the synthetic fixture state",
     evidence: [],

@@ -1,8 +1,10 @@
-export const OPS_WORKER_TASK_SCHEMA_VERSION = 1 as const;
+export const OPS_WORKER_TASK_SCHEMA_VERSION = 2 as const;
+export const OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION = 1 as const;
 
 export const OPS_WORKER_SOURCE_KINDS = [
   "alertmanager",
   "operator-cli",
+  "operator-telegram",
   "registered-cron",
   "authorized-issue",
 ] as const;
@@ -12,6 +14,7 @@ export type OpsWorkerSourceKind = (typeof OPS_WORKER_SOURCE_KINDS)[number];
 export const OPS_WORKER_SOURCE_PRIORITIES = {
   alertmanager: 0,
   "operator-cli": 10,
+  "operator-telegram": 10,
   "registered-cron": 20,
   "authorized-issue": 30,
 } as const satisfies Record<OpsWorkerSourceKind, number>;
@@ -118,10 +121,124 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonObject = { [key: string]: JsonValue };
 
+export const OPS_WORKER_RESOURCE_KINDS = ["host", "repository"] as const;
+
+export type OpsWorkerResourceKind = (typeof OPS_WORKER_RESOURCE_KINDS)[number];
+
+export const OPS_WORKER_LIFECYCLE_SCHEMA_VERSION = 1 as const;
+
+export const OPS_WORKER_MUTATION_BOUNDARIES = [
+  "merge",
+  "tag-release",
+  "deploy",
+  "canonical-task",
+  "report",
+] as const;
+
+export type OpsWorkerMutationBoundary =
+  (typeof OPS_WORKER_MUTATION_BOUNDARIES)[number];
+
+export const OPS_WORKER_MUTATION_OUTCOMES = [
+  "APPLIED",
+  "ALREADY_APPLIED",
+  "NOT_NEEDED",
+] as const;
+
+export type OpsWorkerMutationOutcomeResult =
+  (typeof OPS_WORKER_MUTATION_OUTCOMES)[number];
+
+export const OPS_WORKER_CUSTODY_STATUSES = [
+  "UNCLAIMED",
+  "HELD",
+  "RELEASED",
+] as const;
+
+export type OpsWorkerCustodyStatus =
+  (typeof OPS_WORKER_CUSTODY_STATUSES)[number];
+
+export const OPS_WORKER_CUSTODY_RELEASE_REASONS = [
+  "DONE",
+  "CANCELLED",
+  "BLOCKED",
+] as const;
+
+export type OpsWorkerCustodyReleaseReason =
+  (typeof OPS_WORKER_CUSTODY_RELEASE_REASONS)[number];
+
+export interface OpsWorkerTaskSourceV1 {
+  kind: Exclude<OpsWorkerSourceKind, "operator-telegram">;
+  correlationKey: string;
+  template: string;
+}
+
 export interface OpsWorkerTaskSource {
   kind: OpsWorkerSourceKind;
   correlationKey: string;
+  deliveryKey: string;
   template: string;
+}
+
+export interface OpsWorkerResourceIdentity {
+  kind: OpsWorkerResourceKind;
+  key: string;
+}
+
+/** Fixed identity evidence only; no slot can select executable behavior. */
+export interface OpsWorkerLifecycleManifest {
+  schemaVersion: typeof OPS_WORKER_LIFECYCLE_SCHEMA_VERSION;
+  canonicalTask: string | null;
+  repository: string | null;
+  base: string | null;
+  head: string | null;
+  branch: string | null;
+  pullRequest: string | null;
+  merge: string | null;
+  tag: string | null;
+  release: string | null;
+  deploy: string | null;
+  verifier: string | null;
+  report: string | null;
+  tailAudit: string | null;
+}
+
+export interface OpsWorkerCheckpoint {
+  checkpointId: string;
+  recordedAt: string;
+  payloadHash: string;
+  summary: string;
+  artifact: string | null;
+}
+
+export interface OpsWorkerMutationOutcome {
+  recordedAt: string;
+  result: OpsWorkerMutationOutcomeResult;
+  evidenceHash: string;
+}
+
+export interface OpsWorkerMutationReceipt {
+  boundary: OpsWorkerMutationBoundary;
+  operationId: string;
+  intentHash: string;
+  queryObservedAt: string;
+  queryResultHash: string;
+  mutationStartedAt: string | null;
+  outcome: OpsWorkerMutationOutcome | null;
+}
+
+/** One bounded durable slot per permitted external mutation boundary. */
+export interface OpsWorkerMutationReceipts {
+  merge: OpsWorkerMutationReceipt | null;
+  tagRelease: OpsWorkerMutationReceipt | null;
+  deploy: OpsWorkerMutationReceipt | null;
+  canonicalTask: OpsWorkerMutationReceipt | null;
+  report: OpsWorkerMutationReceipt | null;
+}
+
+export interface OpsWorkerCustody {
+  status: OpsWorkerCustodyStatus;
+  claimedAt: string | null;
+  releasedAt: string | null;
+  releaseReason: OpsWorkerCustodyReleaseReason | null;
 }
 
 export interface OpsWorkerEvidence {
@@ -208,6 +325,11 @@ export interface OpsWorkerTask {
   schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
   id: string;
   source: OpsWorkerTaskSource;
+  resource: OpsWorkerResourceIdentity;
+  lifecycle: OpsWorkerLifecycleManifest;
+  currentCheckpoint: OpsWorkerCheckpoint | null;
+  mutationReceipts: OpsWorkerMutationReceipts;
+  custody: OpsWorkerCustody;
   priority: OpsWorkerPriority;
   objective: string;
   evidence: OpsWorkerEvidence[];
@@ -224,6 +346,20 @@ export interface OpsWorkerTask {
   createdAt: string;
   updatedAt: string;
 }
+
+export type OpsWorkerTaskV1 = Omit<
+  OpsWorkerTask,
+  | "schemaVersion"
+  | "source"
+  | "resource"
+  | "lifecycle"
+  | "currentCheckpoint"
+  | "mutationReceipts"
+  | "custody"
+> & {
+  schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
+  source: OpsWorkerTaskSourceV1;
+};
 
 export interface OpsWorkerTemplateContract {
   sourceKinds: readonly OpsWorkerSourceKind[];
@@ -260,6 +396,10 @@ export const OPS_WORKER_LIMITS = {
   maxEvidenceSummaryBytes: 4 * 1024,
   maxOutcomeSummaryBytes: 4 * 1024,
   maxReportErrorBytes: 2 * 1024,
+  maxDeliveryKeyBytes: 256,
+  maxResourceKeyBytes: 256,
+  maxLifecycleIdentityBytes: 512,
+  maxCheckpointSummaryBytes: 4 * 1024,
   maxDoneCheckParamsBytes: 8 * 1024,
   maxDoneCheckParamDepth: 6,
   maxDoneCheckParamItems: 128,
@@ -267,10 +407,36 @@ export const OPS_WORKER_LIMITS = {
   maxDoneCheckParamStringBytes: 2 * 1024,
 } as const;
 
+const V1_TASK_KEYS = [
+  "schemaVersion",
+  "id",
+  "source",
+  "priority",
+  "objective",
+  "evidence",
+  "doneCheck",
+  "authorization",
+  "state",
+  "rounds",
+  "schedule",
+  "session",
+  "activeRun",
+  "unverifiedRun",
+  "lastOutcome",
+  "report",
+  "createdAt",
+  "updatedAt",
+] as const;
+
 const TASK_KEYS = [
   "schemaVersion",
   "id",
   "source",
+  "resource",
+  "lifecycle",
+  "currentCheckpoint",
+  "mutationReceipts",
+  "custody",
   "priority",
   "objective",
   "evidence",
@@ -292,6 +458,9 @@ const TASK_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const REGISTERED_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9.-]{0,78}[a-z0-9])?$/;
 const INSTANCE_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const CORRELATION_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/+?-]{0,254}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
+const DELIVERY_KEY_PATTERN = CORRELATION_KEY_PATTERN;
+const RESOURCE_KEY_PATTERN = /^[a-z0-9][a-z0-9.-]{0,31}:[a-z0-9](?:[a-z0-9._/-]{0,222}[a-z0-9])?$/;
+const LIFECYCLE_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/+?-]{0,510}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const ARTIFACT_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
@@ -458,8 +627,52 @@ function parseSource(
   registry: OpsWorkerTaskContractRegistry,
 ): OpsWorkerTaskSource {
   const source = expectObject(value, "task.source");
-  expectExactKeys(source, ["kind", "correlationKey", "template"], "task.source");
+  expectExactKeys(
+    source,
+    ["kind", "correlationKey", "deliveryKey", "template"],
+    "task.source",
+  );
   const kind = expectEnum(source.kind, OPS_WORKER_SOURCE_KINDS, "task.source.kind");
+  const correlationKey = expectString(source.correlationKey, "task.source.correlationKey");
+  if (!CORRELATION_KEY_PATTERN.test(correlationKey)) {
+    fail(
+      "task.source.correlationKey",
+      "must be 1-256 characters using only registered identity punctuation",
+    );
+  }
+  const deliveryKey = expectBoundedText(
+    source.deliveryKey,
+    "task.source.deliveryKey",
+    OPS_WORKER_LIMITS.maxDeliveryKeyBytes,
+  );
+  if (!DELIVERY_KEY_PATTERN.test(deliveryKey)) {
+    fail(
+      "task.source.deliveryKey",
+      "must use only registered identity punctuation",
+    );
+  }
+  const template = expectRegisteredName(source.template, "task.source.template");
+  const templateContract = registryValue(registry.templates, template);
+  if (!templateContract) {
+    fail("task.source.template", `unregistered template ${JSON.stringify(template)}`);
+  }
+  if (!templateContract.sourceKinds.includes(kind)) {
+    fail("task.source.template", `template is not registered for source kind ${kind}`);
+  }
+  return { kind, correlationKey, deliveryKey, template };
+}
+
+function parseSourceV1(
+  value: unknown,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTaskSourceV1 {
+  const source = expectObject(value, "task.source");
+  expectExactKeys(source, ["kind", "correlationKey", "template"], "task.source");
+  const kind = expectEnum(
+    source.kind,
+    ["alertmanager", "operator-cli", "registered-cron", "authorized-issue"] as const,
+    "task.source.kind",
+  );
   const correlationKey = expectString(source.correlationKey, "task.source.correlationKey");
   if (!CORRELATION_KEY_PATTERN.test(correlationKey)) {
     fail(
@@ -476,6 +689,311 @@ function parseSource(
     fail("task.source.template", `template is not registered for source kind ${kind}`);
   }
   return { kind, correlationKey, template };
+}
+
+function parseResource(value: unknown): OpsWorkerResourceIdentity {
+  const resource = expectObject(value, "task.resource");
+  expectExactKeys(resource, ["kind", "key"], "task.resource");
+  const kind = expectEnum(resource.kind, OPS_WORKER_RESOURCE_KINDS, "task.resource.kind");
+  const key = expectBoundedText(
+    resource.key,
+    "task.resource.key",
+    OPS_WORKER_LIMITS.maxResourceKeyBytes,
+  );
+  if (
+    !RESOURCE_KEY_PATTERN.test(key)
+    || key.includes("..")
+    || key.includes("//")
+  ) {
+    fail(
+      "task.resource.key",
+      "must be a normalized lowercase namespaced resource key",
+    );
+  }
+  const separator = key.indexOf(":");
+  const identity = key.slice(separator + 1);
+  if (kind === "host" && (!key.startsWith("host:") || identity.includes("/"))) {
+    fail("task.resource.key", "host resources must use host:<name>");
+  }
+  if (kind === "repository" && (key.startsWith("host:") || !identity.includes("/"))) {
+    fail(
+      "task.resource.key",
+      "repository resources must use a non-host namespace and owner/name identity",
+    );
+  }
+  return { kind, key };
+}
+
+function parseLifecycleIdentity(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  const identity = expectBoundedText(
+    value,
+    path,
+    OPS_WORKER_LIMITS.maxLifecycleIdentityBytes,
+  );
+  if (!LIFECYCLE_IDENTITY_PATTERN.test(identity) || identity.includes("://")) {
+    fail(path, "must be bounded identity evidence, not a URL or executable payload");
+  }
+  return identity;
+}
+
+function emptyLifecycleManifest(): OpsWorkerLifecycleManifest {
+  return {
+    schemaVersion: OPS_WORKER_LIFECYCLE_SCHEMA_VERSION,
+    canonicalTask: null,
+    repository: null,
+    base: null,
+    head: null,
+    branch: null,
+    pullRequest: null,
+    merge: null,
+    tag: null,
+    release: null,
+    deploy: null,
+    verifier: null,
+    report: null,
+    tailAudit: null,
+  };
+}
+
+export function createEmptyOpsWorkerLifecycleManifest(): OpsWorkerLifecycleManifest {
+  return emptyLifecycleManifest();
+}
+
+function parseLifecycle(value: unknown): OpsWorkerLifecycleManifest {
+  const lifecycle = expectObject(value, "task.lifecycle");
+  const keys = Object.keys(emptyLifecycleManifest());
+  expectExactKeys(lifecycle, keys, "task.lifecycle");
+  if (lifecycle.schemaVersion !== OPS_WORKER_LIFECYCLE_SCHEMA_VERSION) {
+    fail(
+      "task.lifecycle.schemaVersion",
+      `must equal ${OPS_WORKER_LIFECYCLE_SCHEMA_VERSION}`,
+    );
+  }
+  return {
+    schemaVersion: OPS_WORKER_LIFECYCLE_SCHEMA_VERSION,
+    canonicalTask: parseLifecycleIdentity(
+      lifecycle.canonicalTask,
+      "task.lifecycle.canonicalTask",
+    ),
+    repository: parseLifecycleIdentity(lifecycle.repository, "task.lifecycle.repository"),
+    base: parseLifecycleIdentity(lifecycle.base, "task.lifecycle.base"),
+    head: parseLifecycleIdentity(lifecycle.head, "task.lifecycle.head"),
+    branch: parseLifecycleIdentity(lifecycle.branch, "task.lifecycle.branch"),
+    pullRequest: parseLifecycleIdentity(
+      lifecycle.pullRequest,
+      "task.lifecycle.pullRequest",
+    ),
+    merge: parseLifecycleIdentity(lifecycle.merge, "task.lifecycle.merge"),
+    tag: parseLifecycleIdentity(lifecycle.tag, "task.lifecycle.tag"),
+    release: parseLifecycleIdentity(lifecycle.release, "task.lifecycle.release"),
+    deploy: parseLifecycleIdentity(lifecycle.deploy, "task.lifecycle.deploy"),
+    verifier: parseLifecycleIdentity(lifecycle.verifier, "task.lifecycle.verifier"),
+    report: parseLifecycleIdentity(lifecycle.report, "task.lifecycle.report"),
+    tailAudit: parseLifecycleIdentity(lifecycle.tailAudit, "task.lifecycle.tailAudit"),
+  };
+}
+
+function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
+  if (value === null) return null;
+  const checkpoint = expectObject(value, "task.currentCheckpoint");
+  expectExactKeys(
+    checkpoint,
+    ["checkpointId", "recordedAt", "payloadHash", "summary", "artifact"],
+    "task.currentCheckpoint",
+  );
+  const checkpointId = expectString(
+    checkpoint.checkpointId,
+    "task.currentCheckpoint.checkpointId",
+  );
+  if (!INSTANCE_ID_PATTERN.test(checkpointId)) {
+    fail("task.currentCheckpoint.checkpointId", "contains unsafe characters");
+  }
+  const payloadHash = expectString(
+    checkpoint.payloadHash,
+    "task.currentCheckpoint.payloadHash",
+  );
+  if (!SHA256_PATTERN.test(payloadHash)) {
+    fail("task.currentCheckpoint.payloadHash", "must be a lowercase sha256:<hex> digest");
+  }
+  return {
+    checkpointId,
+    recordedAt: expectTimestamp(
+      checkpoint.recordedAt,
+      "task.currentCheckpoint.recordedAt",
+    ),
+    payloadHash,
+    summary: expectBoundedText(
+      checkpoint.summary,
+      "task.currentCheckpoint.summary",
+      OPS_WORKER_LIMITS.maxCheckpointSummaryBytes,
+    ),
+    artifact: checkpoint.artifact === null
+      ? null
+      : parseArtifactPath(checkpoint.artifact, "task.currentCheckpoint.artifact"),
+  };
+}
+
+const RECEIPT_SLOTS = {
+  merge: "merge",
+  tagRelease: "tag-release",
+  deploy: "deploy",
+  canonicalTask: "canonical-task",
+  report: "report",
+} as const satisfies Record<string, OpsWorkerMutationBoundary>;
+
+export function createEmptyOpsWorkerMutationReceipts(): OpsWorkerMutationReceipts {
+  return {
+    merge: null,
+    tagRelease: null,
+    deploy: null,
+    canonicalTask: null,
+    report: null,
+  };
+}
+
+function parseMutationReceipt(
+  value: unknown,
+  slot: keyof typeof RECEIPT_SLOTS,
+): OpsWorkerMutationReceipt | null {
+  if (value === null) return null;
+  const path = `task.mutationReceipts.${slot}`;
+  const receipt = expectObject(value, path);
+  expectExactKeys(
+    receipt,
+    [
+      "boundary",
+      "operationId",
+      "intentHash",
+      "queryObservedAt",
+      "queryResultHash",
+      "mutationStartedAt",
+      "outcome",
+    ],
+    path,
+  );
+  const boundary = expectEnum(receipt.boundary, OPS_WORKER_MUTATION_BOUNDARIES, `${path}.boundary`);
+  if (boundary !== RECEIPT_SLOTS[slot]) {
+    fail(`${path}.boundary`, `must equal fixed slot boundary ${RECEIPT_SLOTS[slot]}`);
+  }
+  const operationId = expectString(receipt.operationId, `${path}.operationId`);
+  if (!INSTANCE_ID_PATTERN.test(operationId)) {
+    fail(`${path}.operationId`, "contains unsafe characters");
+  }
+  const intentHash = expectString(receipt.intentHash, `${path}.intentHash`);
+  const queryResultHash = expectString(receipt.queryResultHash, `${path}.queryResultHash`);
+  for (const [hashPath, hash] of [
+    [`${path}.intentHash`, intentHash],
+    [`${path}.queryResultHash`, queryResultHash],
+  ] as const) {
+    if (!SHA256_PATTERN.test(hash)) {
+      fail(hashPath, "must be a lowercase sha256:<hex> digest");
+    }
+  }
+  const queryObservedAt = expectTimestamp(receipt.queryObservedAt, `${path}.queryObservedAt`);
+  const mutationStartedAt = expectOptionalTimestamp(
+    receipt.mutationStartedAt,
+    `${path}.mutationStartedAt`,
+  );
+  if (
+    mutationStartedAt !== null
+    && Date.parse(mutationStartedAt) < Date.parse(queryObservedAt)
+  ) {
+    fail(`${path}.mutationStartedAt`, "must not be earlier than its query observation");
+  }
+  let outcome: OpsWorkerMutationOutcome | null = null;
+  if (receipt.outcome !== null) {
+    const outcomeValue = expectObject(receipt.outcome, `${path}.outcome`);
+    expectExactKeys(
+      outcomeValue,
+      ["recordedAt", "result", "evidenceHash"],
+      `${path}.outcome`,
+    );
+    const recordedAt = expectTimestamp(outcomeValue.recordedAt, `${path}.outcome.recordedAt`);
+    if (Date.parse(recordedAt) < Date.parse(queryObservedAt)) {
+      fail(`${path}.outcome.recordedAt`, "must not be earlier than its query observation");
+    }
+    const evidenceHash = expectString(outcomeValue.evidenceHash, `${path}.outcome.evidenceHash`);
+    if (!SHA256_PATTERN.test(evidenceHash)) {
+      fail(`${path}.outcome.evidenceHash`, "must be a lowercase sha256:<hex> digest");
+    }
+    outcome = {
+      recordedAt,
+      result: expectEnum(
+        outcomeValue.result,
+        OPS_WORKER_MUTATION_OUTCOMES,
+        `${path}.outcome.result`,
+      ),
+      evidenceHash,
+    };
+  }
+  return {
+    boundary,
+    operationId,
+    intentHash,
+    queryObservedAt,
+    queryResultHash,
+    mutationStartedAt,
+    outcome,
+  };
+}
+
+function parseMutationReceipts(value: unknown): OpsWorkerMutationReceipts {
+  const receipts = expectObject(value, "task.mutationReceipts");
+  expectExactKeys(receipts, Object.keys(RECEIPT_SLOTS), "task.mutationReceipts");
+  return {
+    merge: parseMutationReceipt(receipts.merge, "merge"),
+    tagRelease: parseMutationReceipt(receipts.tagRelease, "tagRelease"),
+    deploy: parseMutationReceipt(receipts.deploy, "deploy"),
+    canonicalTask: parseMutationReceipt(receipts.canonicalTask, "canonicalTask"),
+    report: parseMutationReceipt(receipts.report, "report"),
+  };
+}
+
+export function createUnclaimedOpsWorkerCustody(): OpsWorkerCustody {
+  return {
+    status: "UNCLAIMED",
+    claimedAt: null,
+    releasedAt: null,
+    releaseReason: null,
+  };
+}
+
+function parseCustody(value: unknown): OpsWorkerCustody {
+  const custody = expectObject(value, "task.custody");
+  expectExactKeys(
+    custody,
+    ["status", "claimedAt", "releasedAt", "releaseReason"],
+    "task.custody",
+  );
+  const status = expectEnum(custody.status, OPS_WORKER_CUSTODY_STATUSES, "task.custody.status");
+  const claimedAt = expectOptionalTimestamp(custody.claimedAt, "task.custody.claimedAt");
+  const releasedAt = expectOptionalTimestamp(custody.releasedAt, "task.custody.releasedAt");
+  const releaseReason = custody.releaseReason === null
+    ? null
+    : expectEnum(
+      custody.releaseReason,
+      OPS_WORKER_CUSTODY_RELEASE_REASONS,
+      "task.custody.releaseReason",
+    );
+  if (
+    (status === "UNCLAIMED"
+      && (claimedAt !== null || releasedAt !== null || releaseReason !== null))
+    || (status === "HELD"
+      && (claimedAt === null || releasedAt !== null || releaseReason !== null))
+    || (status === "RELEASED"
+      && (releasedAt === null || releaseReason === null))
+  ) {
+    fail("task.custody", "status does not match its custody timestamps and release reason");
+  }
+  if (
+    claimedAt !== null
+    && releasedAt !== null
+    && Date.parse(releasedAt) < Date.parse(claimedAt)
+  ) {
+    fail("task.custody.releasedAt", "must not be earlier than claimedAt");
+  }
+  return { status, claimedAt, releasedAt, releaseReason };
 }
 
 function parseEvidence(value: unknown): OpsWorkerEvidence[] {
@@ -901,22 +1419,24 @@ export function isOpsWorkerTerminalState(
   return (OPS_WORKER_TERMINAL_STATES as readonly string[]).includes(state);
 }
 
-/** Parse and copy an unknown value. No unchecked input object is returned. */
-export function parseOpsWorkerTask(
-  value: unknown,
+type OpsWorkerTaskCommon = Omit<
+  OpsWorkerTask,
+  | "schemaVersion"
+  | "id"
+  | "source"
+  | "resource"
+  | "lifecycle"
+  | "currentCheckpoint"
+  | "mutationReceipts"
+  | "custody"
+>;
+
+function parseTaskCommon(
+  task: Record<string, unknown>,
+  id: string,
+  source: OpsWorkerTaskSource | OpsWorkerTaskSourceV1,
   registry: OpsWorkerTaskContractRegistry,
-): OpsWorkerTask {
-  const task = expectObject(value, "task");
-  expectExactKeys(task, TASK_KEYS, "task");
-  if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
-    fail(
-      "task.schemaVersion",
-      `must equal ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
-    );
-  }
-  assertOpsWorkerTaskId(task.id);
-  const id = task.id;
-  const source = parseSource(task.source, registry);
+): OpsWorkerTaskCommon {
   const priority = expectInteger(task.priority, "task.priority", 0, 30);
   if (priority !== OPS_WORKER_SOURCE_PRIORITIES[source.kind]) {
     fail(
@@ -969,10 +1489,7 @@ export function parseOpsWorkerTask(
       "DONE requires a fresh DONE_CHECK PASS recorded with the snapshot transition",
     );
   }
-  const parsed: OpsWorkerTask = {
-    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
-    id,
-    source,
+  return {
     priority: priority as OpsWorkerPriority,
     objective: expectBoundedText(
       task.objective,
@@ -993,14 +1510,163 @@ export function parseOpsWorkerTask(
     createdAt,
     updatedAt,
   };
-  const serializedBytes = Buffer.byteLength(JSON.stringify(parsed), "utf8");
+}
+
+function assertParsedSnapshotSize(task: OpsWorkerTask): void {
+  const serializedBytes = Buffer.byteLength(JSON.stringify(task), "utf8");
   if (serializedBytes > OPS_WORKER_LIMITS.maxSnapshotBytes) {
     fail(
       "task",
       `serialized snapshot exceeds ${OPS_WORKER_LIMITS.maxSnapshotBytes} UTF-8 bytes`,
     );
   }
+}
+
+function legacyCustody(task: OpsWorkerTaskV1): OpsWorkerCustody {
+  const ambiguousOrphan = task.lastOutcome?.result === "AMBIGUOUS_ORPHAN";
+  if (
+    task.state === "RUNNING"
+    || task.state === "CHECKING"
+    || task.state === "RESUMABLE"
+    || ambiguousOrphan
+  ) {
+    return {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+  }
+  if (task.state === "QUEUED") return createUnclaimedOpsWorkerCustody();
+  const releaseReason = task.state === "DONE"
+    ? "DONE"
+    : task.state === "CANCELLED"
+      ? "CANCELLED"
+      : "BLOCKED";
+  return {
+    status: "RELEASED",
+    claimedAt: null,
+    releasedAt: task.updatedAt,
+    releaseReason,
+  };
+}
+
+/**
+ * Pure migration for an already validated exact v1 snapshot. Migration never
+ * writes the source snapshot and never retains mutable references to it.
+ */
+export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
+  const copy = structuredClone(task);
+  const migrated: OpsWorkerTask = {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    id: copy.id,
+    source: {
+      kind: copy.source.kind,
+      correlationKey: copy.source.correlationKey,
+      deliveryKey: `legacy:${copy.id}`,
+      template: copy.source.template,
+    },
+    resource: {
+      kind: "host",
+      key: `host:legacy-${copy.id}`,
+    },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: legacyCustody(copy),
+    priority: copy.priority,
+    objective: copy.objective,
+    evidence: copy.evidence,
+    doneCheck: copy.doneCheck,
+    authorization: copy.authorization,
+    state: copy.state,
+    rounds: copy.rounds,
+    schedule: copy.schedule,
+    session: copy.session,
+    activeRun: copy.activeRun,
+    unverifiedRun: copy.unverifiedRun,
+    lastOutcome: copy.lastOutcome,
+    report: copy.report,
+    createdAt: copy.createdAt,
+    updatedAt: copy.updatedAt,
+  };
+  return migrated;
+}
+
+function parseOpsWorkerTaskV1(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
+  expectExactKeys(task, V1_TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSourceV1(task.source, registry);
+  const legacy: OpsWorkerTaskV1 = {
+    schemaVersion: OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION,
+    id,
+    source,
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  const migrated = migrateOpsWorkerTaskV1(legacy);
+  assertParsedSnapshotSize(migrated);
+  return migrated;
+}
+
+function parseOpsWorkerTaskV2(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
+  expectExactKeys(task, TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSource(task.source, registry);
+  const parsed: OpsWorkerTask = {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    id,
+    source,
+    resource: parseResource(task.resource),
+    lifecycle: parseLifecycle(task.lifecycle),
+    currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
+    mutationReceipts: parseMutationReceipts(task.mutationReceipts),
+    custody: parseCustody(task.custody),
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  assertParsedSnapshotSize(parsed);
   return parsed;
+}
+
+/** Parse and copy exact v1 or v2 input. Unknown schema versions fail closed. */
+export function parseOpsWorkerTask(
+  value: unknown,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
+  const task = expectObject(value, "task");
+  const descriptor = Object.getOwnPropertyDescriptor(task, "schemaVersion");
+  if (!descriptor || !("value" in descriptor)) {
+    fail("task.schemaVersion", descriptor ? "accessor fields are not allowed" : "missing required field");
+  }
+  if (descriptor.value === OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV1(task, registry);
+  }
+  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV2(task, registry);
+  }
+  fail(
+    "task.schemaVersion",
+    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION} or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+  );
 }
 
 export function parseOpsWorkerTaskJson(

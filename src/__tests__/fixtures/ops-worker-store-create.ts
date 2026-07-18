@@ -5,6 +5,11 @@ import type {
   OpsWorkerTask,
   OpsWorkerTaskContractRegistry,
 } from "../../ops-worker/types.js";
+import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
+} from "../../ops-worker/types.js";
 
 const [stateDirectory, taskId, correlationKey, readyPath, releasePath] =
   process.argv.slice(2);
@@ -35,9 +40,19 @@ const registry: OpsWorkerTaskContractRegistry = {
 
 const now = "2026-07-17T12:00:00.000Z";
 const task: OpsWorkerTask = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   id: taskId,
-  source: { kind: "operator-cli", correlationKey, template: "operator-health" },
+  source: {
+    kind: "operator-cli",
+    correlationKey,
+    deliveryKey: `fixture:${taskId}`,
+    template: "operator-health",
+  },
+  resource: { kind: "host", key: "host:local" },
+  lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+  currentCheckpoint: null,
+  mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+  custody: createUnclaimedOpsWorkerCustody(),
   priority: 10,
   objective: "Exercise serialized correlation creation",
   evidence: [],

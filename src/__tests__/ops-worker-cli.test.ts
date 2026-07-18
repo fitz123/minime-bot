@@ -177,7 +177,7 @@ describe("ops worker CLI and inactive runtime", () => {
       JSON.parse(status.stdout),
       {
         service: "minime-ops-worker",
-        schemaVersion: 1,
+        schemaVersion: 2,
         totalTasks: 1,
         activeProcessGroups: 0,
         states: {
@@ -485,7 +485,7 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 1,
+      schemaVersion: 2,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);

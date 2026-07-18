@@ -639,6 +639,7 @@ export class OpsWorkerTaskStore {
       existing.id !== replacement.id
       || existing.createdAt !== replacement.createdAt
       || JSON.stringify(existing.source) !== JSON.stringify(replacement.source)
+      || JSON.stringify(existing.resource) !== JSON.stringify(replacement.resource)
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
