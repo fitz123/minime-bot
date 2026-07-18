@@ -16,6 +16,9 @@ if (!privatePrompt.includes("Ops worker objective:")) {
   process.stderr.write("fake Pi requires its private prompt on stdin\n");
   process.exit(64);
 }
+if (process.env.MINIME_TEST_PRIVATE_PROMPT_PATH) {
+  writeFileSync(process.env.MINIME_TEST_PRIVATE_PROMPT_PATH, privatePrompt, "utf8");
+}
 
 function flagValue(flag) {
   const index = args.indexOf(flag);

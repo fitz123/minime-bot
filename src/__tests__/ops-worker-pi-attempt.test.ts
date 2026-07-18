@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
+import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
@@ -35,7 +37,11 @@ import {
 import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
 import { OpsWorkerTaskStore } from "../ops-worker/task-store.js";
 import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
   OPS_WORKER_LIMITS,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
   type OpsWorkerTask,
@@ -92,18 +98,25 @@ function makeTask(
   const priority = {
     alertmanager: 0,
     "operator-cli": 10,
+    "operator-telegram": 10,
     "registered-cron": 20,
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
-  return {
-    schemaVersion: 1,
+  return withOpsWorkerSubmissionFingerprint({
+    schemaVersion: 2,
     id,
     source: {
       kind: sourceKind,
       correlationKey: `fixture:${id}`,
+      deliveryKey: `fixture:${id}`,
       template: "fixture-task",
     },
+    resource: { kind: "host", key: "host:local" },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: createUnclaimedOpsWorkerCustody(),
     priority,
     objective: options.objective ?? "Inspect the synthetic fixture state",
     evidence: [],
@@ -134,7 +147,7 @@ function makeTask(
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,
     updatedAt: now,
-  };
+  });
 }
 
 interface Harness {
@@ -219,7 +232,6 @@ async function makeHarness(
         stallTimeoutMs: options.stallTimeoutMs,
         termGraceMs: 200,
         killGraceMs: 200,
-        preemptionPollMs: 20,
         dependencies: {
           resolveInvocation: (args) => {
             invocations.push([...args]);
@@ -317,6 +329,55 @@ describe("ops worker Pi standard-session attempts", () => {
     ]);
   });
 
+  it("includes bounded resource and lifecycle resume evidence in the private prompt", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("lifecycle-prompt");
+    harness.store.create(task);
+    const lifecycle = new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date("2026-07-18T09:05:00.000Z"),
+    });
+    lifecycle.recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-prompt",
+      payload: { inspected: true },
+      summary: "Repository inspection reached the merge boundary.",
+      artifact: "artifacts/checkpoint-prompt.json",
+      lifecycle: {
+        repository: "github:example/minime-bot",
+        branch: "refs/heads/issue-58",
+      },
+    });
+    const receipt = {
+      boundary: "merge" as const,
+      operationId: "merge-prompt",
+      intent: { base: "main", head: "issue-58" },
+    };
+    lifecycle.beginMutationReceipt(task.id, {
+      ...receipt,
+      queryObservedAt: "2026-07-18T09:05:00.000Z",
+      queryResult: { merged: false },
+    });
+    lifecycle.claimMutationReceipt(task.id, receipt);
+    const promptPath = join(harness.root, "private-prompt.txt");
+
+    await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const prompt = readFileSync(promptPath, "utf8");
+    assert.match(prompt, /Normalized resource: host:local \(host\)/);
+    assert.match(prompt, /repository=github:example\/minime-bot/);
+    assert.match(prompt, /branch=refs\/heads\/issue-58/);
+    assert.match(prompt, /checkpoint-prompt/);
+    assert.match(prompt, /Repository inspection reached the merge boundary/);
+    assert.match(prompt, /merge-prompt.*mutation-started/);
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+  });
+
   it("falls back to Pi context discovery only for a genuinely empty workspace", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("empty-context"));
@@ -388,6 +449,142 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(harness.invocations.length, 0);
   });
 
+  it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-checkpoint-check");
+    harness.store.create(task);
+    harness.supervisor.requestDoneCheck(task.id);
+
+    const pending = harness.runner().runNext();
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during deterministic verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale?.state, "CHECKING");
+    assert.equal(stale?.currentCheckpoint?.checkpointId, "checkpoint-during-check");
+    const completed = await harness.runner().runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
+  });
+
+  it("keeps scheduling when a checkpoint makes the post-attempt done check stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after post-attempt checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-post-attempt-check");
+    harness.store.create(task);
+    const runner = harness.runner();
+
+    const pending = runner.runAttempt(task.id);
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-post-attempt-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during post-attempt verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale.state, "CHECKING");
+    assert.equal(
+      stale.currentCheckpoint?.checkpointId,
+      "checkpoint-during-post-attempt-check",
+    );
+    const completed = await runner.runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
+  });
+
+  it("keeps scheduling when a checkpoint makes an early-exit done check stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after early-exit checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-early-exit-check");
+    harness.store.create(task);
+    const runner = harness.runner({
+      dependencies: {
+        spawnProcess: () => {
+          const child = new EventEmitter() as ChildProcess;
+          Object.assign(child, {
+            pid: 600_002,
+            stdin: new PassThrough(),
+            stdout: new PassThrough(),
+            stderr: new PassThrough(),
+            exitCode: null,
+            signalCode: null,
+            unref: () => child,
+          });
+          queueMicrotask(() => child.emit("close", 0, null));
+          return child;
+        },
+        readProcessIdentity: () => ({ status: "GONE" }),
+        inspectProcessGroup: () => ({ status: "GONE" }),
+      },
+    });
+
+    const pending = runner.runAttempt(task.id);
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-early-exit-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during early-exit verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale.state, "CHECKING");
+    assert.equal(
+      stale.currentCheckpoint?.checkpointId,
+      "checkpoint-during-early-exit-check",
+    );
+    const completed = await runner.runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
+  });
+
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("crash-resume"));
@@ -413,6 +610,9 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("classifies quota, network, context overflow, and bounded crash evidence as resumable", async (t) => {
     const harness = await makeHarness(t);
+    harness.store.create(makeTask("classify-successor", {
+      sourceKind: "authorized-issue",
+    }));
     const cases = [
       ["quota", "QUOTA"],
       ["network", "NETWORK"],
@@ -429,6 +629,7 @@ describe("ops worker Pi standard-session attempts", () => {
       assert.equal(result.lastOutcome?.result, expected);
       assert.equal(result.rounds.remediation, 0);
       assert.equal(result.session.resume, true);
+      assert.equal(result.custody.status, "HELD");
       const piEvidence = [...result.evidence]
         .reverse()
         .find((entry) => entry.kind === "pi");
@@ -440,6 +641,8 @@ describe("ops worker Pi standard-session attempts", () => {
       if (scenario === "large-output") {
         assert.match(piEvidence.summary, /omitted \d+ earlier byte/);
       }
+      assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
   });
 
@@ -475,71 +678,39 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(harness.invocations[1].includes("--session-id"));
   });
 
-  it("preempts only for higher priority and owns exactly one process group", async (t) => {
+  it("keeps an interrupted owner ahead of a queued higher-priority task", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("low-priority", {
       sourceKind: "authorized-issue",
     }));
     harness.setScenario("wait");
-    const runner = harness.runner();
+    const controller = new AbortController();
+    const runner = harness.runner({ abortSignal: controller.signal });
     const running = runner.runAttempt("low-priority");
     await waitFor(() => harness.supervisor.getTask("low-priority")?.state === "RUNNING");
     const active = harness.supervisor.getTask("low-priority")?.activeRun;
+    const claimedAt = harness.supervisor.getTask("low-priority")?.custody.claimedAt;
     assert.ok(active);
     assert.equal(active.pid, active.processGroupId);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "OWNED");
 
-    harness.store.create(makeTask("second-low", {
-      sourceKind: "authorized-issue",
-    }));
-    await assert.rejects(
-      harness.runner().runAttempt("second-low"),
-      /launch slot is already reserved by task low-priority/,
-    );
-    await assert.rejects(
-      runner.runAttempt("second-low"),
-      /launch slot is already reserved by task low-priority/,
-    );
-    assert.equal(harness.supervisor.getTask("low-priority")?.state, "RUNNING");
-
     harness.store.create(makeTask("urgent", { sourceKind: "alertmanager" }));
-    const preempted = await running;
-    assert.equal(preempted.state, "RESUMABLE", JSON.stringify(preempted.lastOutcome));
-    assert.equal(preempted.lastOutcome?.result, "PREEMPTED");
-    assert.equal(preempted.rounds.remediation, 0);
-    assert.equal(preempted.activeRun, null);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+    assert.equal(harness.supervisor.getTask("low-priority")?.state, "RUNNING");
+    assert.equal(await harness.runner().runNext(), undefined);
+
+    controller.abort();
+    const interrupted = await running;
+    assert.equal(interrupted.state, "RESUMABLE", JSON.stringify(interrupted.lastOutcome));
+    assert.equal(interrupted.lastOutcome?.result, "CRASH");
+    assert.match(interrupted.lastOutcome?.summary ?? "", /worker shutdown/);
+    assert.equal(interrupted.custody.status, "HELD");
+    assert.equal(interrupted.custody.claimedAt, claimedAt);
+    assert.equal(interrupted.rounds.remediation, 0);
+    assert.equal(interrupted.activeRun, null);
     assert.equal(harness.supervisor.getTask("urgent")?.state, "QUEUED");
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
-  });
-
-  it("stops the owned group when priority monitoring fails", async (t) => {
-    const harness = await makeHarness(t);
-    harness.store.create(makeTask("priority-monitor-failure"));
-    harness.setScenario("wait");
-    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
-    let failPriorityPoll = false;
-    harness.supervisor.listTasks = () => {
-      if (failPriorityPoll) throw new Error("synthetic priority store failure");
-      return originalListTasks();
-    };
-
-    const running = harness.runner().runAttempt("priority-monitor-failure");
-    await waitFor(() =>
-      harness.supervisor.getTask("priority-monitor-failure")?.state === "RUNNING"
-    );
-    const active = harness.supervisor.getTask("priority-monitor-failure")?.activeRun;
-    assert.ok(active);
-    failPriorityPoll = true;
-
-    const result = await running;
-    harness.supervisor.listTasks = originalListTasks;
-
-    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
-    assert.equal(result.lastOutcome?.result, "CRASH");
-    assert.match(result.lastOutcome?.summary ?? "", /monitor failed.*priority store failure/);
-    assert.equal(result.activeRun, null);
-    assert.equal(result.rounds.remediation, 0);
-    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, "low-priority");
   });
 
   it("stops a no-progress attempt at the stall bound without spending remediation", async (t) => {
@@ -561,6 +732,73 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result.rounds.remediation, 0);
     assert.equal(result.activeRun, null);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("counts an authoritative checkpoint snapshot write as attempt progress", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("checkpoint-progress");
+    harness.store.create(task);
+    harness.setScenario("wait");
+    let clockNow = 0;
+    interface ScheduledTimer {
+      at: number;
+      callback: () => void;
+      cancelled: boolean;
+    }
+    const timers = new Set<ScheduledTimer>();
+    const stallMonitorClock = {
+      now: (): number => clockNow,
+      setTimeout(callback: () => void, milliseconds: number): ScheduledTimer {
+        const timer = { at: clockNow + milliseconds, callback, cancelled: false };
+        timers.add(timer);
+        return timer;
+      },
+      clearTimeout(handle: unknown): void {
+        (handle as ScheduledTimer).cancelled = true;
+        timers.delete(handle as ScheduledTimer);
+      },
+    };
+    const advanceClock = async (milliseconds: number): Promise<void> => {
+      clockNow += milliseconds;
+      while (true) {
+        const due = [...timers]
+          .filter((timer) => !timer.cancelled && timer.at <= clockNow)
+          .sort((left, right) => left.at - right.at)[0];
+        if (!due) break;
+        timers.delete(due);
+        due.callback();
+        await Promise.resolve();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const running = harness.runner({
+      attemptTimeoutMs: 10_000,
+      stallTimeoutMs: 200,
+      dependencies: { stallMonitorClock },
+    }).runAttempt(task.id);
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    await waitFor(() => timers.size > 0);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-live",
+      payload: { progress: 1 },
+      summary: "A durable package-owned progress checkpoint.",
+    });
+    const taskSnapshotPath = join(
+      harness.supervisor.stateDirectory,
+      "tasks",
+      `${task.id}.json`,
+    );
+    const futureMtime = new Date(Date.now() + 10_000);
+    utimesSync(taskSnapshotPath, futureMtime, futureMtime);
+
+    await advanceClock(200);
+    await advanceClock(199);
+
+    assert.equal(harness.supervisor.getTask(task.id)?.state, "RUNNING");
+    await advanceClock(1);
+    const result = await running;
+    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
+    assert.equal(result.lastOutcome?.result, "STALL");
   });
 
   it("does not KILL a surviving group after the proven Pi leader exits", async (t) => {
@@ -611,7 +849,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
-  it("abandons child handles and priority polling after ambiguous shutdown", async (t) => {
+  it("abandons child handles after ambiguous shutdown", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("ambiguous-shutdown"));
     const controller = new AbortController();
@@ -630,12 +868,6 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     t.after(() => child.emit("close", null, null));
 
-    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
-    let priorityPolls = 0;
-    harness.supervisor.listTasks = () => {
-      priorityPolls += 1;
-      return originalListTasks();
-    };
     const running = harness.runner({
       abortSignal: controller.signal,
       dependencies: {
@@ -672,9 +904,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(unrefCalls, 1);
     assert.equal(stdout.destroyed, true);
     assert.equal(stderr.destroyed, true);
-    const pollsAfterReturn = priorityPolls;
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    assert.equal(priorityPolls, pollsAfterReturn);
+    assert.equal(result.custody.status, "HELD");
   });
 
   it("interrupts the deterministic check after a natural Pi success", async (t) => {
@@ -803,6 +1033,7 @@ describe("ops worker Pi standard-session attempts", () => {
     }).runAttempt("spawn-throws");
     assert.equal(spawnFailure.state, "RESUMABLE");
     assert.equal(spawnFailure.lastOutcome?.result, "CRASH");
+    harness.supervisor.cancelTask("spawn-throws", "Release fixture custody");
 
     harness.store.create(makeTask("identity-gone"));
     harness.setScenario("success");
@@ -1099,6 +1330,12 @@ describe("ops worker Pi standard-session attempts", () => {
     const persisted = makeTask("ambiguous-orphan");
     persisted.state = "RUNNING";
     persisted.activeRun = activeRun;
+    persisted.custody = {
+      status: "HELD",
+      claimedAt: persisted.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
     store.create(persisted);
     let signalCount = 0;
     const ambiguousInspection: OpsWorkerProcessInspection = {

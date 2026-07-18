@@ -11,7 +11,11 @@ import {
   type OpsWorkerPiAttemptDependencies,
 } from "./pi-attempt.js";
 import {
-  isOpsWorkerUnresolvedOrphan,
+  OpsWorkerLifecycle,
+  OpsWorkerLifecycleError,
+  type OpsWorkerLifecycleIdentityUpdate,
+} from "./lifecycle.js";
+import {
   OpsWorkerSupervisor,
   type OpsWorkerLockOwnerStatus,
   type OpsWorkerStartupRunResult,
@@ -21,16 +25,24 @@ import { OpsWorkerTaskStore } from "./task-store.js";
 import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
+  summarizeOpsWorkerTasks,
   startOpsWorkerStatusServer,
 } from "./status-server.js";
 import {
+  createEmptyOpsWorkerLifecycleManifest,
+  createEmptyOpsWorkerMutationReceipts,
+  createUnclaimedOpsWorkerCustody,
+  withOpsWorkerSubmissionFingerprint,
+  OPS_WORKER_MUTATION_BOUNDARIES,
+  OPS_WORKER_MUTATION_OUTCOMES,
   OPS_WORKER_SOURCE_PRIORITIES,
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
   type JsonObject,
+  type OpsWorkerMutationBoundary,
+  type OpsWorkerMutationOutcomeResult,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
-  type OpsWorkerTaskState,
   OpsWorkerTaskValidationError,
 } from "./types.js";
 
@@ -76,15 +88,29 @@ const WORKER_VALUE_OPTIONS = new Set([
   "agent-workspace",
   "authorization",
   "correlation-key",
+  "delivery-key",
   "done-check",
   "done-check-params",
+  "evidence",
   "host",
   "id",
+  "intent",
+  "lifecycle",
   "objective",
+  "operation-id",
+  "payload",
   "port",
+  "query-observed-at",
+  "query-result",
   "reason",
+  "resource-key",
+  "result",
   "state-dir",
+  "summary",
   "template",
+  "artifact",
+  "boundary",
+  "checkpoint-id",
 ]);
 
 const WORKER_BOOL_OPTIONS = new Set(["json", "once"]);
@@ -101,7 +127,48 @@ const WORKER_ACTION_OPTIONS: Readonly<Record<string, readonly string[]>> = {
     "done-check",
     "done-check-params",
     "correlation-key",
+    "delivery-key",
+    "resource-key",
     "objective",
+    "json",
+  ],
+  checkpoint: [
+    "state-dir",
+    "id",
+    "checkpoint-id",
+    "summary",
+    "payload",
+    "artifact",
+    "lifecycle",
+    "json",
+  ],
+  "receipt-query": [
+    "state-dir",
+    "id",
+    "boundary",
+    "operation-id",
+    "intent",
+    "query-observed-at",
+    "query-result",
+    "json",
+  ],
+  "receipt-claim": [
+    "state-dir",
+    "id",
+    "boundary",
+    "operation-id",
+    "intent",
+    "json",
+  ],
+  "receipt-finish": [
+    "state-dir",
+    "id",
+    "boundary",
+    "operation-id",
+    "intent",
+    "result",
+    "evidence",
+    "lifecycle",
     "json",
   ],
   retry: ["state-dir", "id", "json"],
@@ -212,25 +279,41 @@ function parseDoneCheckParams(raw: string | undefined): JsonObject {
   return value as JsonObject;
 }
 
-function taskSummary(tasks: readonly OpsWorkerTask[]): {
-  service: "minime-ops-worker";
-  schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
-  totalTasks: number;
-  activeProcessGroups: number;
-  states: Record<OpsWorkerTaskState, number>;
-} {
-  const states = Object.fromEntries(
-    OPS_WORKER_TASK_STATES.map((state) => [state, 0]),
-  ) as Record<OpsWorkerTaskState, number>;
-  for (const task of tasks) states[task.state] += 1;
-  return {
-    service: "minime-ops-worker",
-    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
-    totalTasks: tasks.length,
-    activeProcessGroups: tasks.filter((task) =>
-      task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
-    states,
-  };
+function parseJsonValue(raw: string, option: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new OpsWorkerCliUsageError(`--${option} must be valid JSON`);
+  }
+}
+
+function parseLifecycleUpdate(
+  raw: string | undefined,
+): OpsWorkerLifecycleIdentityUpdate | undefined {
+  if (raw === undefined) return undefined;
+  const value = parseJsonValue(raw, "lifecycle");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new OpsWorkerCliUsageError("--lifecycle must be a JSON object");
+  }
+  return value as OpsWorkerLifecycleIdentityUpdate;
+}
+
+function parseMutationBoundary(raw: string): OpsWorkerMutationBoundary {
+  if (!(OPS_WORKER_MUTATION_BOUNDARIES as readonly string[]).includes(raw)) {
+    throw new OpsWorkerCliUsageError(
+      `--boundary must be one of ${OPS_WORKER_MUTATION_BOUNDARIES.join(", ")}`,
+    );
+  }
+  return raw as OpsWorkerMutationBoundary;
+}
+
+function parseMutationResult(raw: string): OpsWorkerMutationOutcomeResult {
+  if (!(OPS_WORKER_MUTATION_OUTCOMES as readonly string[]).includes(raw)) {
+    throw new OpsWorkerCliUsageError(
+      `--result must be one of ${OPS_WORKER_MUTATION_OUTCOMES.join(", ")}`,
+    );
+  }
+  return raw as OpsWorkerMutationOutcomeResult;
 }
 
 function defaultProcessStartToken(): string {
@@ -342,14 +425,25 @@ function createTask(
       `authorization profile ${JSON.stringify(authorizationProfile)} is not registered`,
     );
   }
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
     source: {
       kind: "operator-cli",
       correlationKey: requiredValue(options, "correlation-key"),
+      deliveryKey: requiredValue(options, "delivery-key"),
       template: requiredValue(options, "template"),
     },
+    resource: {
+      kind: requiredValue(options, "resource-key").startsWith("host:")
+        ? "host"
+        : "repository",
+      key: requiredValue(options, "resource-key"),
+    },
+    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    currentCheckpoint: null,
+    mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
+    custody: createUnclaimedOpsWorkerCustody(),
     priority: OPS_WORKER_SOURCE_PRIORITIES["operator-cli"],
     objective: requiredValue(options, "objective"),
     evidence: [{
@@ -386,7 +480,7 @@ function createTask(
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,
     updatedAt: now,
-  };
+  });
 }
 
 function printTask(
@@ -399,6 +493,21 @@ function printTask(
     return;
   }
   writeLine(stdout, `${task.id} ${task.state} ${task.source.template} ${task.source.correlationKey}`);
+}
+
+function printMutationClaim(
+  result: { task: OpsWorkerTask; claimed: boolean },
+  json: boolean,
+  stdout: WriteFn,
+): void {
+  if (json) {
+    writeJson(stdout, result);
+    return;
+  }
+  writeLine(
+    stdout,
+    `claimed=${result.claimed} ${result.task.id} ${result.task.state}`,
+  );
 }
 
 function printTaskList(
@@ -540,11 +649,17 @@ export async function runOpsWorkerCliCommand(
     const store = createStore(stateDirectory(parsed, cliOptions.cwd), deps);
     const json = parsed.flags.has("json");
     if (action === "status") {
-      const summary = taskSummary(store.list());
+      const summary = summarizeOpsWorkerTasks(store.list());
       if (json) writeJson(cliOptions.stdout, summary);
       else {
         writeLine(cliOptions.stdout, `Tasks: ${summary.totalTasks}`);
         writeLine(cliOptions.stdout, `Active process groups: ${summary.activeProcessGroups}`);
+        writeLine(
+          cliOptions.stdout,
+          `Custody owner: ${summary.custodyOwner
+            ? `${summary.custodyOwner.id} ${summary.custodyOwner.state}`
+            : "none"}`,
+        );
         for (const state of OPS_WORKER_TASK_STATES) {
           writeLine(cliOptions.stdout, `${state}: ${summary.states[state]}`);
         }
@@ -564,7 +679,57 @@ export async function runOpsWorkerCliCommand(
     }
     if (action === "submit") {
       const task = createTask(parsed, deps);
-      store.create(task, { event: "CREATED", summary: "Submitted through local CLI" });
+      const result = store.create(task, {
+        event: "CREATED",
+        summary: "Submitted through local CLI",
+      });
+      printTask(result.task, json, cliOptions.stdout);
+      return 0;
+    }
+    const lifecycle = new OpsWorkerLifecycle(store, { now: deps.now });
+    if (action === "checkpoint") {
+      const task = lifecycle.recordCheckpoint(requiredValue(parsed, "id"), {
+        checkpointId: requiredValue(parsed, "checkpoint-id"),
+        summary: requiredValue(parsed, "summary"),
+        payload: parseJsonValue(requiredValue(parsed, "payload"), "payload"),
+        artifact: parsed.values.get("artifact"),
+        lifecycle: parseLifecycleUpdate(parsed.values.get("lifecycle")),
+      });
+      printTask(task, json, cliOptions.stdout);
+      return 0;
+    }
+    if (action === "receipt-query") {
+      const task = lifecycle.beginMutationReceipt(requiredValue(parsed, "id"), {
+        boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
+        operationId: requiredValue(parsed, "operation-id"),
+        intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
+        queryObservedAt: requiredValue(parsed, "query-observed-at"),
+        queryResult: parseJsonValue(
+          requiredValue(parsed, "query-result"),
+          "query-result",
+        ),
+      });
+      printTask(task, json, cliOptions.stdout);
+      return 0;
+    }
+    if (action === "receipt-claim") {
+      const result = lifecycle.claimMutationReceipt(requiredValue(parsed, "id"), {
+        boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
+        operationId: requiredValue(parsed, "operation-id"),
+        intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
+      });
+      printMutationClaim(result, json, cliOptions.stdout);
+      return 0;
+    }
+    if (action === "receipt-finish") {
+      const task = lifecycle.finishMutationReceipt(requiredValue(parsed, "id"), {
+        boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
+        operationId: requiredValue(parsed, "operation-id"),
+        intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
+        result: parseMutationResult(requiredValue(parsed, "result")),
+        evidence: parseJsonValue(requiredValue(parsed, "evidence"), "evidence"),
+        lifecycle: parseLifecycleUpdate(parsed.values.get("lifecycle")),
+      });
       printTask(task, json, cliOptions.stdout);
       return 0;
     }
@@ -591,6 +756,7 @@ export async function runOpsWorkerCliCommand(
     writeLine(cliOptions.stderr, `Error: ${(error as Error).message}`);
     return error instanceof OpsWorkerCliUsageError
       || error instanceof OpsWorkerTaskValidationError
+      || error instanceof OpsWorkerLifecycleError
       ? 2
       : 1;
   }

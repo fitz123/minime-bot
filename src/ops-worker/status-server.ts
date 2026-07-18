@@ -12,6 +12,7 @@ import {
 import {
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
+  type OpsWorkerTask,
   type OpsWorkerTaskState,
 } from "./types.js";
 
@@ -20,13 +21,17 @@ export const DEFAULT_OPS_WORKER_STATUS_PORT = 9465;
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 
-export interface OpsWorkerStatusSnapshot {
+export interface OpsWorkerTaskSummary {
   service: "minime-ops-worker";
   schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
-  supervisorInstanceId: string;
   totalTasks: number;
   activeProcessGroups: number;
+  custodyOwner: { id: string; state: OpsWorkerTaskState } | null;
   states: Record<OpsWorkerTaskState, number>;
+}
+
+export interface OpsWorkerStatusSnapshot extends OpsWorkerTaskSummary {
+  supervisorInstanceId: string;
 }
 
 export interface OpsWorkerStatusServerOptions {
@@ -75,22 +80,36 @@ function writeJson(
   response.end(includeBody ? body : undefined);
 }
 
-export function inspectOpsWorkerStatus(
-  supervisor: OpsWorkerSupervisor,
-): OpsWorkerStatusSnapshot {
-  const tasks = supervisor.listTasks();
+export function summarizeOpsWorkerTasks(
+  tasks: readonly OpsWorkerTask[],
+): OpsWorkerTaskSummary {
   const states = Object.fromEntries(
     OPS_WORKER_TASK_STATES.map((state) => [state, 0]),
   ) as Record<OpsWorkerTaskState, number>;
   for (const task of tasks) states[task.state] += 1;
+  const custodyOwners = tasks.filter((task) => task.custody.status === "HELD");
+  if (custodyOwners.length > 1) {
+    throw new Error("Ops-worker status found multiple held custody owners");
+  }
   return {
     service: "minime-ops-worker",
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
-    supervisorInstanceId: supervisor.supervisorInstanceId,
     totalTasks: tasks.length,
     activeProcessGroups: tasks.filter((task) =>
       task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
+    custodyOwner: custodyOwners[0]
+      ? { id: custodyOwners[0].id, state: custodyOwners[0].state }
+      : null,
     states,
+  };
+}
+
+export function inspectOpsWorkerStatus(
+  supervisor: OpsWorkerSupervisor,
+): OpsWorkerStatusSnapshot {
+  return {
+    ...summarizeOpsWorkerTasks(supervisor.listTasks()),
+    supervisorInstanceId: supervisor.supervisorInstanceId,
   };
 }
 

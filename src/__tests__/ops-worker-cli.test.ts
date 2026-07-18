@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,10 +14,13 @@ import { runCliAsync } from "../cli.js";
 import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
+import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
 import { OpsWorkerTaskStore } from "../ops-worker/task-store.js";
 import type {
   JsonObject,
+  OpsWorkerTask,
   OpsWorkerTaskContractRegistry,
+  OpsWorkerTaskV1,
 } from "../ops-worker/types.js";
 import type { OpsWorkerCliDependencies } from "../ops-worker/worker-cli.js";
 
@@ -127,6 +136,10 @@ function submitArgs(stateDirectory: string): string[] {
     '{"expected":true}',
     "--correlation-key",
     "operator:fixture:one",
+    "--delivery-key",
+    "operator-cli:fixture-delivery-one",
+    "--resource-key",
+    "github:example/minime-bot",
     "--objective",
     "Inspect the registered fixture state",
     "--json",
@@ -141,6 +154,9 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(result.code, 0);
     assert.match(result.stdout, /worker start --state-dir <path> --agent-workspace <path>/);
     assert.match(result.stdout, /worker submit --state-dir <path> --template <registered>/);
+    assert.match(result.stdout, /--delivery-key <adapter-delivery-key>/);
+    assert.match(result.stdout, /worker checkpoint --state-dir <path>/);
+    assert.match(result.stdout, /worker receipt-query --state-dir <path>/);
     assert.match(result.stdout, /inactive unless worker start is invoked/);
     assert.equal(result.stderr, "");
   });
@@ -158,11 +174,20 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(submitted.code, 0, submitted.stderr);
     const task = JSON.parse(submitted.stdout) as {
       id: string;
+      schemaVersion: number;
       state: string;
+      source: { deliveryKey: string };
+      resource: { kind: string; key: string };
       authorization: { scope: string[] };
     };
     assert.equal(task.id, "op-fixture-task-id");
+    assert.equal(task.schemaVersion, 2);
     assert.equal(task.state, "QUEUED");
+    assert.equal(task.source.deliveryKey, "operator-cli:fixture-delivery-one");
+    assert.deepEqual(task.resource, {
+      kind: "repository",
+      key: "github:example/minime-bot",
+    });
     assert.deepEqual(task.authorization.scope, ["inspect"]);
 
     const status = await runWorkerCli([
@@ -177,9 +202,10 @@ describe("ops worker CLI and inactive runtime", () => {
       JSON.parse(status.stdout),
       {
         service: "minime-ops-worker",
-        schemaVersion: 1,
+        schemaVersion: 2,
         totalTasks: 1,
         activeProcessGroups: 0,
+        custodyOwner: null,
         states: {
           QUEUED: 1,
           RUNNING: 0,
@@ -213,6 +239,310 @@ describe("ops worker CLI and inactive runtime", () => {
     ], fixture.root, deps);
     assert.equal(listed.code, 0, listed.stderr);
     assert.equal(JSON.parse(listed.stdout).length, 1);
+  });
+
+  it("inspects v1 snapshots through pure normalization without rewriting them", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const deps = dependencies(contracts);
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(submitted.code, 0, submitted.stderr);
+    const current = JSON.parse(submitted.stdout) as OpsWorkerTask;
+    const {
+      resource: _resource,
+      lifecycle: _lifecycle,
+      currentCheckpoint: _currentCheckpoint,
+      mutationReceipts: _mutationReceipts,
+      custody: _custody,
+      submissionFingerprint: _submissionFingerprint,
+      ...legacyFields
+    } = current;
+    const legacySource: OpsWorkerTaskV1["source"] = {
+      kind: "operator-cli",
+      correlationKey: current.source.correlationKey,
+      template: current.source.template,
+    };
+    const legacy: OpsWorkerTaskV1 = {
+      ...legacyFields,
+      schemaVersion: 1,
+      source: legacySource,
+    };
+    const snapshotPath = join(
+      fixture.stateDirectory,
+      "tasks",
+      `${current.id}.json`,
+    );
+    const legacyJson = `${JSON.stringify(legacy)}\n`;
+    writeFileSync(snapshotPath, legacyJson, { encoding: "utf8", mode: 0o600 });
+
+    const inspected = await runWorkerCli([
+      "worker",
+      "inspect",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      current.id,
+      "--json",
+    ], fixture.root, deps);
+
+    assert.equal(inspected.code, 0, inspected.stderr);
+    const normalized = JSON.parse(inspected.stdout) as OpsWorkerTask;
+    assert.equal(normalized.schemaVersion, 2);
+    assert.equal(normalized.source.deliveryKey, `legacy:${current.id}`);
+    assert.deepEqual(normalized.resource, {
+      kind: "host",
+      key: `host:legacy-${current.id}`,
+    });
+    assert.equal(readFileSync(snapshotPath, "utf8"), legacyJson);
+  });
+
+  it("returns identical delivery replays and rejects conflicting reuse", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const deps = dependencies(contracts);
+    const first = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(first.code, 0, first.stderr);
+
+    const replay = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(replay.code, 0, replay.stderr);
+    assert.deepEqual(JSON.parse(replay.stdout), JSON.parse(first.stdout));
+
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+    });
+    assert.equal(store.list().length, 1);
+
+    const conflictArgs = submitArgs(fixture.stateDirectory);
+    conflictArgs[conflictArgs.indexOf("Inspect the registered fixture state")] =
+      "Conflicting objective for the same delivery";
+    const conflict = await runWorkerCli(conflictArgs, fixture.root, deps);
+    assert.equal(conflict.code, 1);
+    assert.match(conflict.stderr, /Delivery key .* conflicts with existing task/);
+    assert.equal(store.list().length, 1);
+  });
+
+  it("records checkpoints and fixed receipts while the supervisor owns custody", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const deps = dependencies(contracts, {
+      now: () => new Date("2026-07-18T10:00:01.000Z"),
+    });
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(submitted.code, 0, submitted.stderr);
+    const taskId = (JSON.parse(submitted.stdout) as OpsWorkerTask).id;
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+      now: deps.now,
+    });
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: contracts.doneChecks,
+      instanceId: "fixture-cli-owner",
+      processStartToken: "fixture-cli-owner-start",
+      now: deps.now,
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+    assert.equal(supervisor.claimNextTask()?.task.id, taskId);
+
+    const checkpointArgs = [
+      "worker",
+      "checkpoint",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--checkpoint-id",
+      "checkpoint-cli-01",
+      "--summary",
+      "Repository evidence collected",
+      "--payload",
+      '{"head":"abc123","ready":true}',
+      "--artifact",
+      "artifacts/checkpoint.json",
+      "--lifecycle",
+      '{"repository":"example/minime-bot","head":"abc123"}',
+      "--json",
+    ];
+    const checkpoint = await runWorkerCli(checkpointArgs, fixture.root, deps);
+    assert.equal(checkpoint.code, 0, checkpoint.stderr);
+    const checkpointTask = JSON.parse(checkpoint.stdout) as OpsWorkerTask;
+    assert.equal(checkpointTask.custody.status, "HELD");
+    assert.equal(checkpointTask.currentCheckpoint?.checkpointId, "checkpoint-cli-01");
+    assert.match(checkpointTask.currentCheckpoint?.payloadHash ?? "", /^sha256:/);
+
+    const replay = await runWorkerCli(checkpointArgs, fixture.root, deps);
+    assert.equal(replay.code, 0, replay.stderr);
+    assert.deepEqual(JSON.parse(replay.stdout), checkpointTask);
+
+    const query = await runWorkerCli([
+      "worker",
+      "receipt-query",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--boundary",
+      "merge",
+      "--operation-id",
+      "merge-cli-01",
+      "--intent",
+      '{"pullRequest":58,"head":"abc123"}',
+      "--query-observed-at",
+      "2026-07-18T10:00:00.000Z",
+      "--query-result",
+      '{"merged":false}',
+      "--json",
+    ], fixture.root, deps);
+    assert.equal(query.code, 0, query.stderr);
+
+    const claimArgs = [
+      "worker",
+      "receipt-claim",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--boundary",
+      "merge",
+      "--operation-id",
+      "merge-cli-01",
+      "--intent",
+      '{"head":"abc123","pullRequest":58}',
+      "--json",
+    ];
+    const claim = await runWorkerCli(claimArgs, fixture.root, deps);
+    assert.equal(claim.code, 0, claim.stderr);
+    const claimed = JSON.parse(claim.stdout) as {
+      claimed: boolean;
+      task: OpsWorkerTask;
+    };
+    assert.equal(claimed.claimed, true);
+    assert.equal(
+      claimed.task.mutationReceipts.merge?.mutationStartedAt,
+      "2026-07-18T10:00:01.000Z",
+    );
+
+    const claimReplay = await runWorkerCli(claimArgs, fixture.root, deps);
+    assert.equal(claimReplay.code, 0, claimReplay.stderr);
+    const replayedClaim = JSON.parse(claimReplay.stdout) as {
+      claimed: boolean;
+      task: OpsWorkerTask;
+    };
+    assert.equal(replayedClaim.claimed, false);
+    assert.deepEqual(replayedClaim.task, claimed.task);
+
+    const finish = await runWorkerCli([
+      "worker",
+      "receipt-finish",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--boundary",
+      "merge",
+      "--operation-id",
+      "merge-cli-01",
+      "--intent",
+      '{"pullRequest":58,"head":"abc123"}',
+      "--result",
+      "APPLIED",
+      "--evidence",
+      '{"mergeCommit":"def456"}',
+      "--lifecycle",
+      '{"merge":"def456","pullRequest":"58"}',
+      "--json",
+    ], fixture.root, deps);
+    assert.equal(finish.code, 0, finish.stderr);
+    const finished = JSON.parse(finish.stdout) as OpsWorkerTask;
+    assert.equal(finished.mutationReceipts.merge?.outcome?.result, "APPLIED");
+    assert.equal(finished.lifecycle.merge, "def456");
+
+    const status = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--json",
+    ], fixture.root, deps);
+    assert.equal(status.code, 0, status.stderr);
+    const statusValue = JSON.parse(status.stdout) as Record<string, unknown>;
+    assert.deepEqual(statusValue.custodyOwner, { id: taskId, state: "QUEUED" });
+    assert.ok(!status.stdout.includes("Repository evidence collected"));
+    assert.ok(!status.stdout.includes("Inspect the registered fixture state"));
+    assert.ok(!Object.hasOwn(statusValue, "evidence"));
+  });
+
+  it("rejects malformed helper JSON, unknown receipt boundaries, and unsafe resources", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const deps = dependencies(contracts);
+    const invalidResource = submitArgs(fixture.stateDirectory);
+    invalidResource[invalidResource.indexOf("github:example/minime-bot")] =
+      "github:Example/minime-bot";
+    const resourceResult = await runWorkerCli(invalidResource, fixture.root, deps);
+    assert.equal(resourceResult.code, 2);
+    assert.match(resourceResult.stderr, /normalized lowercase namespaced resource key/);
+
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    const taskId = (JSON.parse(submitted.stdout) as OpsWorkerTask).id;
+    const malformed = await runWorkerCli([
+      "worker",
+      "checkpoint",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--checkpoint-id",
+      "checkpoint-invalid",
+      "--summary",
+      "Invalid JSON fixture",
+      "--payload",
+      "{not-json}",
+    ], fixture.root, deps);
+    assert.equal(malformed.code, 2);
+    assert.match(malformed.stderr, /--payload must be valid JSON/);
+
+    const boundary = await runWorkerCli([
+      "worker",
+      "receipt-query",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--id",
+      taskId,
+      "--boundary",
+      "publish",
+      "--operation-id",
+      "publish-invalid",
+      "--intent",
+      "{}",
+      "--query-observed-at",
+      "2026-07-18T10:00:00.000Z",
+      "--query-result",
+      "{}",
+    ], fixture.root, deps);
+    assert.equal(boundary.code, 2);
+    assert.match(boundary.stderr, /--boundary must be one of merge, tag-release, deploy, canonical-task, report/);
   });
 
   it("rejects arbitrary command and URL parameter fields and unregistered selections", async (t) => {
@@ -289,6 +619,12 @@ describe("ops worker CLI and inactive runtime", () => {
       summary: "Fixture exhausted its remediation budget",
     };
     blocked.report.state = "PENDING";
+    blocked.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: blocked.updatedAt,
+      releaseReason: "BLOCKED",
+    };
     store.replace(blocked);
 
     const retried = await runWorkerCli([
@@ -485,11 +821,14 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 1,
+      schemaVersion: 2,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);
-    assert.equal((await status.json()).totalTasks, 0);
+    const statusValue = await status.json() as Record<string, unknown>;
+    assert.equal(statusValue.totalTasks, 0);
+    assert.equal(statusValue.custodyOwner, null);
+    assert.ok(!Object.hasOwn(statusValue, "evidence"));
 
     const intake = await fetch(`${base}/submit`, {
       method: "POST",

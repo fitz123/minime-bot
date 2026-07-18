@@ -22,6 +22,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
+  hashOpsWorkerCanonicalSubmission,
   isOpsWorkerTerminalState,
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
@@ -83,6 +84,20 @@ export interface OpsWorkerTaskStoreWriteResult {
   journalAppended: boolean;
 }
 
+export interface OpsWorkerTaskStoreCreateResult extends OpsWorkerTaskStoreWriteResult {
+  task: OpsWorkerTask;
+  created: boolean;
+}
+
+export interface OpsWorkerTaskStoreMutationResult extends OpsWorkerTaskStoreWriteResult {
+  task: OpsWorkerTask;
+}
+
+/** Return from a mutation callback when the guarded read proves no write is needed. */
+export const OPS_WORKER_TASK_STORE_NO_CHANGE = Symbol(
+  "OPS_WORKER_TASK_STORE_NO_CHANGE",
+);
+
 export class OpsWorkerDuplicateCorrelationError extends Error {
   readonly existingTaskId: string;
 
@@ -102,6 +117,18 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
   }
 }
 
+export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyError {
+  readonly existingTaskId: string;
+
+  constructor(deliveryKey: string, existingTaskId: string) {
+    super(
+      `Delivery key ${JSON.stringify(deliveryKey)} conflicts with existing task ${existingTaskId}`,
+    );
+    this.name = "OpsWorkerDeliveryConflictError";
+    this.existingTaskId = existingTaskId;
+  }
+}
+
 export class OpsWorkerTaskStoreBusyError extends Error {
   constructor() {
     super("Another ops-worker task-store mutation is in progress");
@@ -113,6 +140,7 @@ const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SNAPSHOT_SUFFIX = ".json";
 const JOURNAL_FILE_NAME = "journal.jsonl";
 const MUTATION_LOCK_FILE_NAME = ".task-store.lock";
+const MUTATION_LOCK_RECOVERY_FILE_NAME = ".task-store.lock.recovery";
 const MAX_MUTATION_LOCK_BYTES = 512;
 const MAX_AUDIT_SUMMARY_BYTES = 2 * 1024;
 
@@ -302,15 +330,18 @@ function readMutationLock(path: string): {
 
 class OpsWorkerTaskStoreMutationGuard {
   private readonly path: string;
+  private readonly recoveryPath: string;
   private readonly record: MutationLockRecord;
   private readonly faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined;
   private acquiredInode: bigint | number | undefined;
+  private recoveryInode: bigint | number | undefined;
 
   constructor(
     stateDirectory: string,
     faultInjector: ((point: OpsWorkerTaskStoreFaultPoint) => void) | undefined,
   ) {
     this.path = join(stateDirectory, MUTATION_LOCK_FILE_NAME);
+    this.recoveryPath = join(stateDirectory, MUTATION_LOCK_RECOVERY_FILE_NAME);
     const owner = inspectMutationLockOwner(process.pid);
     if (owner.status !== "ACTIVE") {
       throw new OpsWorkerTaskStoreSafetyError(
@@ -328,6 +359,7 @@ class OpsWorkerTaskStoreMutationGuard {
   acquire(): void {
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
+      this.assertNoRecoveryGuard();
       if (this.publishCompleteRecord()) return;
       let existing: ReturnType<typeof readMutationLock>;
       try {
@@ -343,12 +375,30 @@ class OpsWorkerTaskStoreMutationGuard {
           && owner.processStartToken !== existing.record.processStartToken
         )
       ) {
-        const rechecked = readMutationLock(this.path);
-        if (
-          rechecked.stats.ino !== existing.stats.ino
-          || rechecked.raw !== existing.raw
-        ) throw new OpsWorkerTaskStoreBusyError();
-        unlinkSync(this.path);
+        this.acquireRecoveryGuard();
+        try {
+          const rechecked = readMutationLock(this.path);
+          if (
+            rechecked.stats.ino !== existing.stats.ino
+            || rechecked.raw !== existing.raw
+          ) throw new OpsWorkerTaskStoreBusyError();
+          const recheckedOwner = inspectMutationLockOwner(rechecked.record.pid);
+          if (
+            recheckedOwner.status !== "STALE"
+            && !(
+              recheckedOwner.status === "ACTIVE"
+              && recheckedOwner.processStartToken !== rechecked.record.processStartToken
+            )
+          ) throw new OpsWorkerTaskStoreBusyError();
+          const confirmed = readMutationLock(this.path);
+          if (
+            confirmed.stats.ino !== rechecked.stats.ino
+            || confirmed.raw !== rechecked.raw
+          ) throw new OpsWorkerTaskStoreBusyError();
+          unlinkSync(this.path);
+        } finally {
+          this.releaseRecoveryGuard();
+        }
         continue;
       }
       if (owner.status === "AMBIGUOUS") throw new OpsWorkerTaskStoreBusyError();
@@ -411,6 +461,56 @@ class OpsWorkerTaskStoreMutationGuard {
       }
     }
   }
+
+  private assertNoRecoveryGuard(): void {
+    try {
+      lstatSync(this.recoveryPath);
+    } catch (error) {
+      if (isMissingError(error)) return;
+      throw error;
+    }
+    throw new OpsWorkerTaskStoreBusyError();
+  }
+
+  private acquireRecoveryGuard(): void {
+    let descriptor: number;
+    try {
+      descriptor = openSync(
+        this.recoveryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new OpsWorkerTaskStoreBusyError();
+      }
+      throw error;
+    }
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(this.record)}\n`, "utf8");
+      fsyncSync(descriptor);
+      this.recoveryInode = fstatSync(descriptor).ino;
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  private releaseRecoveryGuard(): void {
+    if (this.recoveryInode === undefined) return;
+    const current = readMutationLock(this.recoveryPath);
+    if (
+      current.stats.ino !== this.recoveryInode
+      || current.record.pid !== this.record.pid
+      || current.record.processStartToken !== this.record.processStartToken
+      || current.record.nonce !== this.record.nonce
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Refusing to remove a task-store stale-lock recovery guard whose ownership changed",
+      );
+    }
+    unlinkSync(this.recoveryPath);
+    this.recoveryInode = undefined;
+  }
 }
 
 function readRegularFile(path: string, maxBytes: number): string {
@@ -442,6 +542,15 @@ function stableTaskJson(task: OpsWorkerTask): string {
     );
   }
   return serialized;
+}
+
+function checkpointContentHash(checkpoint: NonNullable<OpsWorkerTask["currentCheckpoint"]>): string {
+  const canonical = JSON.stringify({
+    artifact: checkpoint.artifact,
+    payloadHash: checkpoint.payloadHash,
+    summary: checkpoint.summary,
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 function assertAuditInput(input: OpsWorkerAuditInput): void {
@@ -542,11 +651,32 @@ export class OpsWorkerTaskStore {
   create(
     value: unknown,
     audit: OpsWorkerAuditInput = { event: "CREATED" },
-  ): OpsWorkerTaskStoreWriteResult {
+  ): OpsWorkerTaskStoreCreateResult {
     const task = parseOpsWorkerTask(value, this.registry);
+    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
     assertAuditInput(audit);
     return this.withMutationLock(() => {
       this.ensureSafeDirectories();
+      const currentTasks = this.list();
+      const deliveryMatches = currentTasks.filter(
+        (candidate) => candidate.source.deliveryKey === task.source.deliveryKey,
+      );
+      if (deliveryMatches.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      const replay = deliveryMatches[0];
+      if (replay) {
+        this.assertGlobalInvariants(currentTasks);
+        this.assertCanonicalSubmission(replay, task);
+        return {
+          task: replay,
+          created: false,
+          snapshotPath: this.snapshotPath(replay.id),
+          journalAppended: false,
+        };
+      }
       const snapshotPath = this.snapshotPath(task.id);
       if (assertPathMissingOrRegularFile(snapshotPath)) {
         throw new OpsWorkerTaskStoreSafetyError(
@@ -554,9 +684,13 @@ export class OpsWorkerTaskStore {
         );
       }
       this.assertJournalSafe();
-      this.assertUniqueActiveCorrelation(task);
+      this.assertGlobalInvariants([...currentTasks, task]);
       this.injectFault("after-correlation-check");
-      return this.write(task, snapshotPath, audit);
+      return {
+        task,
+        created: true,
+        ...this.write(task, snapshotPath, audit),
+      };
     });
   }
 
@@ -571,10 +705,49 @@ export class OpsWorkerTaskStore {
       const snapshotPath = this.snapshotPath(task.id);
       const existing = this.readSnapshot(snapshotPath);
       this.assertImmutableIdentity(existing, task);
+      this.assertReplaySafety(existing, task);
       this.assertJournalSafe();
-      this.assertUniqueActiveCorrelation(task);
+      this.assertGlobalInvariants(this.withReplacement(this.list(), task));
       this.injectFault("after-correlation-check");
       return this.write(task, snapshotPath, audit);
+    });
+  }
+
+  mutate(
+    taskId: string,
+    audit: OpsWorkerAuditInput,
+    callback: (
+      task: OpsWorkerTask,
+    ) => void | typeof OPS_WORKER_TASK_STORE_NO_CHANGE,
+  ): OpsWorkerTaskStoreMutationResult {
+    assertOpsWorkerTaskId(taskId);
+    assertAuditInput(audit);
+    if (typeof callback !== "function") {
+      throw new OpsWorkerTaskStoreSafetyError("Task mutation callback must be a function");
+    }
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const snapshotPath = this.snapshotPath(taskId);
+      const existing = this.readSnapshot(snapshotPath);
+      const working = structuredClone(existing);
+      const returned = callback(working);
+      if (returned === OPS_WORKER_TASK_STORE_NO_CHANGE) {
+        return {
+          task: existing,
+          snapshotPath,
+          journalAppended: false,
+        };
+      }
+      const task = parseOpsWorkerTask(working, this.registry);
+      this.assertImmutableIdentity(existing, task);
+      this.assertReplaySafety(existing, task);
+      this.assertJournalSafe();
+      this.assertGlobalInvariants(this.withReplacement(this.list(), task));
+      this.injectFault("after-correlation-check");
+      return {
+        task,
+        ...this.write(task, snapshotPath, audit),
+      };
     });
   }
 
@@ -618,30 +791,222 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertUniqueActiveCorrelation(candidate: OpsWorkerTask): void {
-    if (isOpsWorkerTerminalState(candidate.state)) return;
-    const duplicate = this.list().find(
-      (task) =>
-        task.id !== candidate.id
-        && !isOpsWorkerTerminalState(task.state)
-        && task.source.correlationKey === candidate.source.correlationKey,
-    );
-    if (duplicate) {
-      throw new OpsWorkerDuplicateCorrelationError(
-        candidate.source.correlationKey,
-        duplicate.id,
-      );
-    }
-  }
-
   private assertImmutableIdentity(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
     if (
       existing.id !== replacement.id
       || existing.createdAt !== replacement.createdAt
       || JSON.stringify(existing.source) !== JSON.stringify(replacement.source)
+      || JSON.stringify(existing.resource) !== JSON.stringify(replacement.resource)
+      || existing.submissionFingerprint !== replacement.submissionFingerprint
+      || existing.objective !== replacement.objective
+      || JSON.stringify(existing.doneCheck) !== JSON.stringify(replacement.doneCheck)
+      || JSON.stringify(existing.authorization) !== JSON.stringify(replacement.authorization)
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
+      );
+    }
+    for (const slot of Object.keys(existing.lifecycle) as Array<
+      keyof OpsWorkerTask["lifecycle"]
+    >) {
+      const current = existing.lifecycle[slot];
+      if (typeof current === "string" && replacement.lifecycle[slot] !== current) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change write-once lifecycle identity ${slot} of task ${existing.id}`,
+        );
+      }
+    }
+  }
+
+  private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+    const checkpointIdentities = (
+      task: OpsWorkerTask,
+    ): ReadonlyMap<string, string> => {
+      const identities = new Map<string, string>();
+      if (task.currentCheckpoint !== null) {
+        for (const replay of task.currentCheckpoint.replayHistory) {
+          identities.set(replay.checkpointId, replay.contentHash);
+        }
+        identities.set(
+          task.currentCheckpoint.checkpointId,
+          checkpointContentHash(task.currentCheckpoint),
+        );
+      }
+      return identities;
+    };
+    const priorCheckpoints = checkpointIdentities(existing);
+    const nextCheckpoints = checkpointIdentities(replacement);
+    const priorCurrentCheckpointId = existing.currentCheckpoint?.checkpointId;
+    const nextCurrentCheckpointId = replacement.currentCheckpoint?.checkpointId;
+    if (
+      priorCurrentCheckpointId !== undefined
+      && nextCurrentCheckpointId !== undefined
+      && nextCurrentCheckpointId !== priorCurrentCheckpointId
+      && priorCheckpoints.has(nextCurrentCheckpointId)
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing to restore historical checkpoint ${nextCurrentCheckpointId}`,
+      );
+    }
+    for (const [checkpointId, contentHash] of priorCheckpoints) {
+      if (nextCheckpoints.get(checkpointId) !== contentHash) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to forget or change checkpoint replay identity ${checkpointId}`,
+        );
+      }
+    }
+
+    for (const slot of Object.keys(existing.mutationReceipts) as Array<
+      keyof OpsWorkerTask["mutationReceipts"]
+    >) {
+      const current = existing.mutationReceipts[slot];
+      const next = replacement.mutationReceipts[slot];
+      if (current?.outcome === null) {
+        if (
+          next === null
+          || next.operationId !== current.operationId
+          || next.intentHash !== current.intentHash
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to forget unfinished ${current.boundary} operation ${current.operationId}`,
+          );
+        }
+        const currentQueryAt = Date.parse(current.queryObservedAt);
+        const nextQueryAt = Date.parse(next.queryObservedAt);
+        if (nextQueryAt < currentQueryAt) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to move ${current.boundary} query observation backwards`,
+          );
+        }
+        if (
+          nextQueryAt === currentQueryAt
+          && next.queryResultHash !== current.queryResultHash
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to change ${current.boundary} query evidence at the same observation time`,
+          );
+        }
+        if (current.mutationStartedAt !== null) {
+          if (next.mutationStartedAt === null) {
+            if (
+              next.outcome !== null
+              || nextQueryAt <= Date.parse(current.mutationStartedAt)
+            ) {
+              throw new OpsWorkerTaskStoreSafetyError(
+                `Refusing to erase claimed ${current.boundary} operation ${current.operationId} without a strictly newer unfinished query`,
+              );
+            }
+          } else if (next.mutationStartedAt !== current.mutationStartedAt) {
+            throw new OpsWorkerTaskStoreSafetyError(
+              `Refusing to change the durable claim time for ${current.boundary} operation ${current.operationId}`,
+            );
+          }
+        } else if (
+          next.mutationStartedAt !== null
+          && (
+            next.queryObservedAt !== current.queryObservedAt
+            || next.queryResultHash !== current.queryResultHash
+          )
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to claim ${current.boundary} operation ${current.operationId} against unrecorded query evidence`,
+          );
+        }
+      }
+      const completedIdentities = (
+        receipt: typeof current,
+      ): ReadonlyMap<string, string> => {
+        const identities = new Map<string, string>();
+        if (receipt === null) return identities;
+        for (const replay of receipt.replayHistory) {
+          identities.set(
+            replay.operationId,
+            JSON.stringify({
+              intentHash: replay.intentHash,
+              result: replay.result,
+              evidenceHash: replay.evidenceHash,
+            }),
+          );
+        }
+        if (receipt.outcome !== null) {
+          identities.set(
+            receipt.operationId,
+            JSON.stringify({
+              intentHash: receipt.intentHash,
+              result: receipt.outcome.result,
+              evidenceHash: receipt.outcome.evidenceHash,
+            }),
+          );
+        }
+        return identities;
+      };
+      const priorOperations = completedIdentities(current);
+      const nextOperations = completedIdentities(next);
+      for (const [operationId, fingerprint] of priorOperations) {
+        if (nextOperations.get(operationId) !== fingerprint) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to forget or change completed ${slot} operation ${operationId}`,
+          );
+        }
+      }
+    }
+  }
+
+  private assertCanonicalSubmission(existing: OpsWorkerTask, replay: OpsWorkerTask): void {
+    if (existing.submissionFingerprint !== replay.submissionFingerprint) {
+      throw new OpsWorkerDeliveryConflictError(
+        replay.source.deliveryKey,
+        existing.id,
+      );
+    }
+  }
+
+  private withReplacement(
+    tasks: readonly OpsWorkerTask[],
+    replacement: OpsWorkerTask,
+  ): OpsWorkerTask[] {
+    let found = false;
+    const prospective = tasks.map((task) => {
+      if (task.id !== replacement.id) return task;
+      found = true;
+      return replacement;
+    });
+    if (!found) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Cannot replace missing task ${replacement.id}`,
+      );
+    }
+    return prospective;
+  }
+
+  private assertGlobalInvariants(tasks: readonly OpsWorkerTask[]): void {
+    const deliveryOwners = new Map<string, string>();
+    const activeCorrelationOwners = new Map<string, string>();
+    const heldOwners: string[] = [];
+    for (const task of tasks) {
+      const deliveryOwner = deliveryOwners.get(task.source.deliveryKey);
+      if (deliveryOwner && deliveryOwner !== task.id) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      deliveryOwners.set(task.source.deliveryKey, task.id);
+
+      if (!isOpsWorkerTerminalState(task.state)) {
+        const correlationOwner = activeCorrelationOwners.get(task.source.correlationKey);
+        if (correlationOwner && correlationOwner !== task.id) {
+          throw new OpsWorkerDuplicateCorrelationError(
+            task.source.correlationKey,
+            correlationOwner,
+          );
+        }
+        activeCorrelationOwners.set(task.source.correlationKey, task.id);
+      }
+      if (task.custody.status === "HELD") heldOwners.push(task.id);
+    }
+    if (heldOwners.length > 1) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing multiple held custody owners: ${heldOwners.join(", ")}`,
       );
     }
   }

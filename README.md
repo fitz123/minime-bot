@@ -41,10 +41,10 @@ minime-bot config validate --workspace /path/to/workspace
 minime-bot workspace validate --workspace /path/to/workspace
 ```
 
-The package also includes an inactive-by-default ops-worker core. PR 1 exposes
-only a local CLI skeleton and loopback health/status; it registers no production
-task contracts and never starts automatically. See
-[Ops-worker core (PR 1)](docs/ops-worker.md).
+The package also includes an inactive-by-default ops-worker foundation. It
+exposes strict local submission and lifecycle evidence helpers plus loopback
+health/status, registers no production task contracts, and never starts
+automatically. See [Ops-worker foundation](docs/ops-worker.md).
 
 Knowledge commands operate on an agent workspace, not the control workspace:
 

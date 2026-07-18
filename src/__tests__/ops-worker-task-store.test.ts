@@ -23,11 +23,15 @@ import {
   OpsWorkerTaskValidationError,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
+  type OpsWorkerTaskState,
+  type OpsWorkerTaskV1,
 } from "../ops-worker/types.js";
 import {
+  OpsWorkerDeliveryConflictError,
   OpsWorkerDuplicateCorrelationError,
   OpsWorkerTaskStore,
   OpsWorkerTaskStoreSafetyError,
@@ -52,14 +56,19 @@ function exactObject(
 
 const registry: OpsWorkerTaskContractRegistry = {
   templates: {
-    "operator-health": { sourceKinds: ["operator-cli"] },
+    "operator-health": { sourceKinds: ["operator-cli", "operator-telegram"] },
     "issue-full-cycle": { sourceKinds: ["authorized-issue"] },
   },
   authorizationProfiles: {
     "operator.inspect.v1": {
-      sourceKinds: ["operator-cli"],
+      sourceKinds: ["operator-cli", "operator-telegram"],
       scope: ["inspect"],
       tools: ["read", "grep", "find", "ls"],
+    },
+    "operator.repair.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["local-reversible-repair"],
+      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
     "issue.full-cycle.v1": {
       sourceKinds: ["authorized-issue"],
@@ -89,13 +98,48 @@ function makeTask(
   id = "wt-20260717-ab12cd",
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
-  return {
-    schemaVersion: 1,
+  return withOpsWorkerSubmissionFingerprint({
+    schemaVersion: 2,
     id,
     source: {
       kind: "operator-cli",
       correlationKey,
+      deliveryKey: `fixture:${id}`,
       template: "operator-health",
+    },
+    resource: {
+      kind: "host",
+      key: "host:local",
+    },
+    lifecycle: {
+      schemaVersion: 1,
+      canonicalTask: null,
+      repository: null,
+      base: null,
+      head: null,
+      branch: null,
+      pullRequest: null,
+      merge: null,
+      tag: null,
+      release: null,
+      deploy: null,
+      verifier: null,
+      report: null,
+      tailAudit: null,
+    },
+    currentCheckpoint: null,
+    mutationReceipts: {
+      merge: null,
+      tagRelease: null,
+      deploy: null,
+      canonicalTask: null,
+      report: null,
+    },
+    custody: {
+      status: "UNCLAIMED",
+      claimedAt: null,
+      releasedAt: null,
+      releaseReason: null,
     },
     priority: 10,
     objective: "Verify the registered local health contract",
@@ -142,6 +186,28 @@ function makeTask(
     },
     createdAt: NOW,
     updatedAt: NOW,
+  });
+}
+
+function makeV1Task(
+  id = "wt-20260717-ab12cd",
+  correlationKey = "operator:health:local",
+): OpsWorkerTaskV1 {
+  const current = makeTask(id, correlationKey);
+  const {
+    resource: _resource,
+    lifecycle: _lifecycle,
+    currentCheckpoint: _currentCheckpoint,
+    mutationReceipts: _mutationReceipts,
+    custody: _custody,
+    submissionFingerprint: _submissionFingerprint,
+    ...legacy
+  } = current;
+  const { deliveryKey: _deliveryKey, ...source } = legacy.source;
+  return {
+    ...legacy,
+    schemaVersion: 1,
+    source: source as OpsWorkerTaskV1["source"],
   };
 }
 
@@ -172,7 +238,7 @@ function makeStore(
 }
 
 describe("ops worker task contract", () => {
-  it("parses a complete schema-versioned envelope into an independent value", () => {
+  it("strictly round-trips a complete v2 envelope into an independent value", () => {
     const input = makeTask();
     input.state = "RUNNING";
     input.activeRun = {
@@ -196,6 +262,50 @@ describe("ops worker task contract", () => {
       attempts: 1,
       lastError: "Fixture transport unavailable.",
     };
+    input.lifecycle = {
+      schemaVersion: 1,
+      canonicalTask: "issue:58",
+      repository: "github:example/minime-bot",
+      base: "main",
+      head: "abc123",
+      branch: "issue-58",
+      pullRequest: "pr:99",
+      merge: "merge:abc123",
+      tag: "v1.2.3",
+      release: "release:1.2.3",
+      deploy: "deploy:staging-1",
+      verifier: "check:fixture",
+      report: "sha256:report-identity",
+      tailAudit: "audit:tail-1",
+    };
+    input.currentCheckpoint = {
+      checkpointId: "checkpoint-01",
+      recordedAt: NOW,
+      payloadHash: `sha256:${"1".repeat(64)}`,
+      summary: "The bounded fixture checkpoint is durable.",
+      artifact: "artifacts/checkpoint.json",
+      replayHistory: [],
+    };
+    input.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-01",
+      intentHash: `sha256:${"2".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"3".repeat(64)}`,
+      mutationStartedAt: NOW,
+      outcome: {
+        recordedAt: NOW,
+        result: "APPLIED",
+        evidenceHash: `sha256:${"4".repeat(64)}`,
+      },
+      replayHistory: [],
+    };
+    input.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
 
     const parsed = parseOpsWorkerTask(input, registry);
     assert.deepEqual(parsed, input);
@@ -205,11 +315,355 @@ describe("ops worker task contract", () => {
     assert.equal(parsed.objective, "Verify the registered local health contract");
   });
 
+  it("normalizes an exact v1 snapshot deterministically without sharing input references", () => {
+    const input = makeV1Task();
+    const before = clone(input);
+
+    const first = parseOpsWorkerTask(input, registry);
+    const second = parseOpsWorkerTaskJson(JSON.stringify(input), registry);
+
+    assert.deepEqual(input, before);
+    assert.deepEqual(first, second);
+    assert.equal(first.schemaVersion, 2);
+    assert.deepEqual(first.source, {
+      ...input.source,
+      deliveryKey: `legacy:${input.id}`,
+    });
+    assert.deepEqual(first.resource, {
+      kind: "host",
+      key: `host:legacy-${input.id}`,
+    });
+    assert.equal(first.lifecycle.schemaVersion, 1);
+    assert.ok(Object.values(first.lifecycle).slice(1).every((value) => value === null));
+    assert.equal(first.currentCheckpoint, null);
+    assert.ok(Object.values(first.mutationReceipts).every((value) => value === null));
+    first.source.correlationKey = "changed:after:migration";
+    assert.equal(input.source.correlationKey, "operator:health:local");
+  });
+
+  it("keeps a valid near-limit v1 snapshot readable after deterministic expansion", () => {
+    const input = makeV1Task();
+    const evidence = {
+      at: NOW,
+      kind: "operator" as const,
+      trust: "trusted" as const,
+      summary: "",
+      artifact: null,
+    };
+    input.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      () => ({ ...evidence }),
+    );
+    const baseBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+    const sharedSummaryBytes = Math.floor(
+      (OPS_WORKER_LIMITS.maxLegacySnapshotBytes - baseBytes)
+      / input.evidence.length,
+    );
+    for (const entry of input.evidence) {
+      entry.summary = "x".repeat(sharedSummaryBytes);
+    }
+    const bytesBeforeRemainder = Buffer.byteLength(JSON.stringify(input), "utf8");
+    input.evidence[0].summary += "x".repeat(
+      OPS_WORKER_LIMITS.maxLegacySnapshotBytes - bytesBeforeRemainder,
+    );
+    const raw = JSON.stringify(input);
+    assert.equal(
+      Buffer.byteLength(raw, "utf8"),
+      OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
+    );
+
+    const migrated = parseOpsWorkerTaskJson(raw, registry);
+
+    assert.equal(migrated.schemaVersion, 2);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      > OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
+    );
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      <= OPS_WORKER_LIMITS.maxSnapshotBytes,
+    );
+  });
+
+  it("accepts dormant operator Telegram submissions only at operator priority", () => {
+    const task = makeTask();
+    task.source = {
+      kind: "operator-telegram",
+      correlationKey: "operator:telegram:fixture",
+      deliveryKey: "telegram:update:fixture-1",
+      template: "operator-health",
+    };
+    assert.equal(parseOpsWorkerTask(task, registry).priority, 10);
+
+    task.priority = 20;
+    assert.throws(() => parseOpsWorkerTask(task, registry), /fixed priority 10/);
+  });
+
+  it("rejects unknown schema versions and unknown v1 or v2 fields", () => {
+    const future = { ...makeTask(), schemaVersion: 3 };
+    assert.throws(
+      () => parseOpsWorkerTask(future, registry),
+      /supported version 1 or 2/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV1Task(), resource: { kind: "host", key: "host:local" } }, registry),
+      /task\.resource: unknown field/,
+    );
+    const futureLifecycle = clone(makeTask()) as unknown as Record<string, unknown>;
+    (futureLifecycle.lifecycle as Record<string, unknown>).workflow = "arbitrary";
+    assert.throws(
+      () => parseOpsWorkerTask(futureLifecycle, registry),
+      /task\.lifecycle\.workflow: unknown field/,
+    );
+  });
+
+  it("requires normalized bounded resource and delivery identities", () => {
+    const uppercase = clone(makeTask());
+    uppercase.resource.key = "github:Example/minime-bot";
+    assert.throws(() => parseOpsWorkerTask(uppercase, registry), /normalized lowercase/);
+
+    const mismatched = clone(makeTask());
+    mismatched.resource = { kind: "repository", key: "host:local" };
+    assert.throws(() => parseOpsWorkerTask(mismatched, registry), /non-host namespace/);
+
+    for (const key of [
+      "github:owner/repository/extra",
+      "github:owner/./repository",
+      "github:owner-/repository",
+      "github:owner/_repository",
+    ]) {
+      const aliased = clone(makeTask());
+      aliased.resource = { kind: "repository", key };
+      assert.throws(
+        () => parseOpsWorkerTask(aliased, registry),
+        /exactly one normalized owner\/name identity/,
+      );
+    }
+
+    const missingDelivery = clone(makeTask()) as unknown as Record<string, unknown>;
+    delete (missingDelivery.source as Record<string, unknown>).deliveryKey;
+    assert.throws(() => parseOpsWorkerTask(missingDelivery, registry), /deliveryKey: missing/);
+  });
+
+  it("strictly bounds fixed lifecycle, checkpoint, receipt, and custody records", () => {
+    const unsafeLifecycle = clone(makeTask());
+    unsafeLifecycle.lifecycle.repository = "https://example.invalid/repository";
+    assert.throws(
+      () => parseOpsWorkerTask(unsafeLifecycle, registry),
+      /not a URL or executable payload/,
+    );
+
+    const oversizedCheckpoint = clone(makeTask());
+    oversizedCheckpoint.currentCheckpoint = {
+      checkpointId: "checkpoint-oversized",
+      recordedAt: NOW,
+      payloadHash: `sha256:${"a".repeat(64)}`,
+      summary: "x".repeat(OPS_WORKER_LIMITS.maxCheckpointSummaryBytes + 1),
+      artifact: null,
+      replayHistory: [],
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(oversizedCheckpoint, registry),
+      /currentCheckpoint\.summary: must be at most 4096/,
+    );
+
+    const wrongBoundary = clone(makeTask());
+    wrongBoundary.mutationReceipts.merge = {
+      boundary: "report",
+      operationId: "merge-wrong-boundary",
+      intentHash: `sha256:${"b".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"c".repeat(64)}`,
+      mutationStartedAt: null,
+      outcome: null,
+      replayHistory: [],
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(wrongBoundary, registry),
+      /must equal fixed slot boundary merge/,
+    );
+
+    const appliedWithoutClaim = clone(makeTask());
+    appliedWithoutClaim.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-without-claim",
+      intentHash: `sha256:${"d".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"e".repeat(64)}`,
+      mutationStartedAt: null,
+      outcome: {
+        recordedAt: NOW,
+        result: "APPLIED",
+        evidenceHash: `sha256:${"f".repeat(64)}`,
+      },
+      replayHistory: [],
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(appliedWithoutClaim, registry),
+      /APPLIED requires a durable mutation claim/,
+    );
+
+    const outcomeBeforeClaim = clone(appliedWithoutClaim);
+    const receipt = outcomeBeforeClaim.mutationReceipts.merge;
+    assert.ok(receipt);
+    receipt.mutationStartedAt = LATER;
+    assert.throws(
+      () => parseOpsWorkerTask(outcomeBeforeClaim, registry),
+      /outcome\.recordedAt: must not be earlier than its mutation claim/,
+    );
+
+    const contradictoryCustody = clone(makeTask());
+    contradictoryCustody.custody = {
+      status: "HELD",
+      claimedAt: null,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(contradictoryCustody, registry),
+      /status does not match its custody timestamps/,
+    );
+
+    const runningReleased = clone(makeTask());
+    runningReleased.state = "RUNNING";
+    runningReleased.activeRun = {
+      attemptId: "attempt-released",
+      supervisorInstanceId: "supervisor-released",
+      pid: 123,
+      processGroupId: 123,
+      processStartedAt: NOW,
+      processStartToken: "start-released",
+    };
+    runningReleased.custody = {
+      status: "RELEASED",
+      claimedAt: NOW,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(runningReleased, registry),
+      /RUNNING tasks must retain held custody/,
+    );
+
+    const doneHeld = clone(makeTask());
+    doneHeld.state = "DONE";
+    doneHeld.lastOutcome = {
+      at: NOW,
+      kind: "DONE_CHECK",
+      result: "PASS",
+      summary: "Fixture passed.",
+    };
+    doneHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(doneHeld, registry),
+      /DONE tasks must be released with reason DONE/,
+    );
+
+    const blockedHeld = clone(makeTask());
+    blockedHeld.state = "BLOCKED";
+    blockedHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(blockedHeld, registry),
+      /process-free BLOCKED task must be released with reason BLOCKED/,
+    );
+  });
+
+  it("derives fail-safe custody for every legacy state and orphan mapping", () => {
+    const legacyFor = (state: OpsWorkerTaskState): OpsWorkerTaskV1 => {
+      const task = makeV1Task(`legacy-${state.toLowerCase()}`);
+      task.state = state;
+      if (state === "RUNNING") {
+        task.activeRun = {
+          attemptId: "attempt-legacy",
+          supervisorInstanceId: "supervisor-legacy",
+          pid: 123,
+          processGroupId: 123,
+          processStartedAt: NOW,
+          processStartToken: "start-legacy",
+        };
+      }
+      if (state === "DONE") {
+        task.lastOutcome = {
+          at: NOW,
+          kind: "DONE_CHECK",
+          result: "PASS",
+          summary: "Legacy task passed.",
+        };
+      }
+      return task;
+    };
+
+    for (const state of ["RUNNING", "CHECKING", "RESUMABLE"] as const) {
+      assert.deepEqual(parseOpsWorkerTask(legacyFor(state), registry).custody, {
+        status: "HELD",
+        claimedAt: NOW,
+        releasedAt: null,
+        releaseReason: null,
+      });
+    }
+    assert.deepEqual(
+      parseOpsWorkerTask(legacyFor("QUEUED"), registry).custody,
+      { status: "UNCLAIMED", claimedAt: null, releasedAt: null, releaseReason: null },
+    );
+    for (const state of ["DONE", "CANCELLED", "BLOCKED"] as const) {
+      assert.deepEqual(parseOpsWorkerTask(legacyFor(state), registry).custody, {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: state,
+      });
+    }
+
+    const ambiguous = legacyFor("BLOCKED");
+    ambiguous.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Ownership could not be proven absent.",
+    };
+    ambiguous.unverifiedRun = {
+      attemptId: "attempt-ambiguous",
+      supervisorInstanceId: "supervisor-legacy",
+      pid: null,
+      expectedProcessGroupId: null,
+      launchedAt: NOW,
+      ownershipNonceHash: `sha256:${"5".repeat(64)}`,
+    };
+    assert.equal(parseOpsWorkerTask(ambiguous, registry).custody.status, "HELD");
+
+    const cancelledWithStaleOutcome = legacyFor("CANCELLED");
+    cancelledWithStaleOutcome.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "A stale terminal outcome must not retain custody.",
+    };
+    const migratedCancelled = parseOpsWorkerTask(cancelledWithStaleOutcome, registry);
+    assert.deepEqual(migratedCancelled.custody, {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    });
+    assert.doesNotThrow(() => parseOpsWorkerTask(migratedCancelled, registry));
+  });
+
   it("supports the deferred issue source without letting it change fixed priority or scope", () => {
     const task = makeTask("wt-20260717-issue58", "issue:example-org/minime-bot:58");
     task.source = {
       kind: "authorized-issue",
       correlationKey: "issue:example-org/minime-bot:58",
+      deliveryKey: "github:issue-delivery:58",
       template: "issue-full-cycle",
     };
     task.priority = 30;
@@ -290,6 +744,12 @@ describe("ops worker task contract", () => {
     assert.throws(
       () => parseOpsWorkerTask(oversizedEvidence, registry),
       /must be at most 4096 UTF-8 bytes/,
+    );
+    const sparseEvidence = clone(makeTask());
+    sparseEvidence.evidence = new Array(1);
+    assert.throws(
+      () => parseOpsWorkerTask(sparseEvidence, registry),
+      /task\.evidence: must be dense/,
     );
 
     const traversal = clone(makeTask());
@@ -450,6 +910,12 @@ describe("ops worker task contract", () => {
       result: "AMBIGUOUS_ORPHAN",
       summary: "Synthetic unverified launch remains fenced.",
     };
+    unexpectedFence.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
     assert.equal(
       parseOpsWorkerTask(unexpectedFence, registry).unverifiedRun?.pid,
       456,
@@ -458,6 +924,27 @@ describe("ops worker task contract", () => {
 });
 
 describe("ops worker durable task store", () => {
+  it("loads v1 without writing and persists canonical v2 on the next successful write", (t) => {
+    const store = makeStore(t);
+    const legacy = makeV1Task();
+    const snapshotPath = join(store.tasksDirectory, `${legacy.id}.json`);
+    const rawLegacy = `${JSON.stringify(legacy)}\n`;
+    writeFileSync(snapshotPath, rawLegacy, { encoding: "utf8", mode: 0o600 });
+
+    const loaded = store.get(legacy.id);
+    assert.ok(loaded);
+    assert.equal(loaded.schemaVersion, 2);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+    assert.deepEqual(store.get(legacy.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+
+    store.replace(loaded, { event: "UPDATED" });
+    const canonicalV2 = `${JSON.stringify(loaded)}\n`;
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
+    assert.deepEqual(store.get(legacy.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
+  });
+
   it("writes a private authoritative snapshot before its bounded audit record", (t) => {
     const store = makeStore(t);
     const result = store.create(makeTask(), {
@@ -504,6 +991,126 @@ describe("ops worker durable task store", () => {
     assert.doesNotThrow(() => JSON.parse(readFileSync(join(store.tasksDirectory, `${original.id}.json`), "utf8")));
   });
 
+  it("rejects changes to immutable normalized resource identity", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const changed = clone(original);
+    changed.resource = {
+      kind: "repository",
+      key: "github:example/minime-bot",
+    };
+    assert.throws(
+      () => store.replace(changed),
+      /immutable identity/,
+    );
+    assert.deepEqual(store.get(original.id), original);
+  });
+
+  it("keeps submission, delivery, resource, and creation identity immutable", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    for (const change of [
+      (task: OpsWorkerTask) => { task.source.deliveryKey = "fixture:changed-delivery"; },
+      (task: OpsWorkerTask) => {
+        task.resource = { kind: "repository", key: "github:example/minime-bot" };
+      },
+      (task: OpsWorkerTask) => {
+        task.createdAt = LATER;
+        task.updatedAt = LATER;
+      },
+      (task: OpsWorkerTask) => {
+        task.submissionFingerprint = `sha256:${"f".repeat(64)}`;
+      },
+    ]) {
+      assert.throws(
+        () => store.mutate(original.id, { event: "UPDATED" }, (task) => change(task)),
+        /immutable identity/,
+      );
+      assert.deepEqual(store.get(original.id), original);
+    }
+  });
+
+  it("keeps the submitted execution contract immutable through replace and mutate", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const changes: Array<(task: OpsWorkerTask) => void> = [
+      (task) => {
+        task.objective = "Run a different objective with the original submission fingerprint";
+      },
+      (task) => {
+        task.doneCheck = { name: "lax-fixture", params: { sampleCount: 3 } };
+      },
+      (task) => {
+        task.authorization = {
+          profile: "operator.repair.v1",
+          scope: ["local-reversible-repair"],
+          snapshotHash: null,
+        };
+      },
+    ];
+
+    for (const change of changes) {
+      const replacement = clone(original);
+      change(replacement);
+      assert.throws(() => store.replace(replacement), /immutable identity/);
+      assert.throws(
+        () => store.mutate(original.id, { event: "UPDATED" }, change),
+        /immutable identity/,
+      );
+      assert.deepEqual(store.get(original.id), original);
+    }
+  });
+
+  it("enforces write-once lifecycle identities in every authoritative store mutation", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const identified = clone(original);
+    identified.lifecycle.repository = "github:example/minime-bot";
+    identified.updatedAt = LATER;
+    store.replace(identified);
+
+    const cleared = clone(identified);
+    cleared.lifecycle.repository = null;
+    assert.throws(
+      () => store.replace(cleared),
+      /write-once lifecycle identity repository/,
+    );
+    assert.throws(
+      () => store.mutate(original.id, { event: "UPDATED" }, (task) => {
+        task.lifecycle.repository = "github:example/other";
+      }),
+      /write-once lifecycle identity repository/,
+    );
+    assert.deepEqual(store.get(original.id), identified);
+  });
+
+  it("applies read-modify-write callbacks to the latest snapshot under one guard", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+
+    const result = store.mutate(
+      original.id,
+      { event: "UPDATED", summary: "Increment remediation round" },
+      (task) => {
+        task.rounds.remediation += 1;
+        task.updatedAt = LATER;
+      },
+    );
+
+    assert.equal(result.task.rounds.remediation, 1);
+    assert.equal(result.task.updatedAt, LATER);
+    assert.equal(result.journalAppended, true);
+    assert.deepEqual(store.get(original.id), result.task);
+  });
+
   it("recovers the old snapshot when a crash occurs after temp-file fsync", (t) => {
     const directory = testStateDirectory(t);
     const initial = makeStore(t, { directory });
@@ -511,7 +1118,7 @@ describe("ops worker durable task store", () => {
     initial.create(original);
     const replacement = clone(original);
     replacement.updatedAt = LATER;
-    replacement.objective = "Replacement that must not become visible before rename";
+    replacement.rounds.remediation = 1;
     let armed = true;
     const crashing = makeStore(t, {
       directory,
@@ -541,7 +1148,7 @@ describe("ops worker durable task store", () => {
     const oldJournal = readFileSync(initial.journalPath, "utf8");
     const replacement = clone(original);
     replacement.updatedAt = LATER;
-    replacement.objective = "Durable replacement before non-authoritative audit";
+    replacement.rounds.remediation = 1;
     let armed = true;
     const crashing = makeStore(t, {
       directory,
@@ -557,6 +1164,40 @@ describe("ops worker durable task store", () => {
     const recovered = makeStore(t, { directory });
     assert.deepEqual(recovered.get(original.id), replacement);
     assert.equal(readFileSync(recovered.journalPath, "utf8"), oldJournal);
+  });
+
+  it("keeps the old mutation before rename and the new mutation after rename", (t) => {
+    for (const crashPoint of ["after-temp-file-fsync", "after-snapshot-rename"] as const) {
+      const directory = testStateDirectory(t);
+      const initial = makeStore(t, { directory });
+      const original = makeTask(`wt-mutate-${crashPoint}`);
+      initial.create(original);
+      const oldJournal = readFileSync(initial.journalPath, "utf8");
+      let armed = true;
+      const crashing = makeStore(t, {
+        directory,
+        faultInjector(point) {
+          if (armed && point === crashPoint) {
+            armed = false;
+            throw new Error(`simulated ${crashPoint} crash`);
+          }
+        },
+      });
+
+      assert.throws(
+        () => crashing.mutate(original.id, { event: "UPDATED" }, (task) => {
+          task.rounds.remediation = 1;
+          task.updatedAt = LATER;
+        }),
+        new RegExp(`simulated ${crashPoint} crash`),
+      );
+      const recovered = makeStore(t, { directory });
+      assert.equal(
+        recovered.get(original.id)?.rounds.remediation,
+        crashPoint === "after-snapshot-rename" ? 1 : original.rounds.remediation,
+      );
+      assert.equal(readFileSync(recovered.journalPath, "utf8"), oldJournal);
+    }
   });
 
   it("loads snapshots with a missing, truncated, or contradictory journal tail", (t) => {
@@ -615,9 +1256,139 @@ describe("ops worker durable task store", () => {
       result: "PASS",
       summary: "Fresh fixture evidence passed.",
     };
+    completed.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: LATER,
+      releaseReason: "DONE",
+    };
     store.replace(completed, { event: "TRANSITION" });
     assert.doesNotThrow(() => store.create(duplicate));
     assert.equal(store.list().length, 2);
+  });
+
+  it("returns the original terminal task for an identical delivery replay", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    const created = store.create(original);
+    assert.equal(created.created, true);
+    assert.deepEqual(created.task, original);
+
+    const completed = clone(original);
+    completed.state = "DONE";
+    completed.updatedAt = LATER;
+    completed.lastOutcome = {
+      at: LATER,
+      kind: "DONE_CHECK",
+      result: "PASS",
+      summary: "Fresh fixture evidence passed.",
+    };
+    completed.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: LATER,
+      releaseReason: "DONE",
+    };
+    completed.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      (_, index) => ({
+        at: LATER,
+        kind: "system" as const,
+        trust: "trusted" as const,
+        summary: `Bounded runtime evidence ${index}`,
+        artifact: null,
+      }),
+    );
+    store.replace(completed, { event: "TRANSITION" });
+    const journalBeforeReplay = readFileSync(store.journalPath, "utf8");
+    const replay = makeTask("wt-20260717-replayed", original.source.correlationKey);
+    replay.source.deliveryKey = original.source.deliveryKey;
+    replay.createdAt = LATER;
+    replay.updatedAt = LATER;
+
+    const result = store.create(replay);
+
+    assert.equal(result.created, false);
+    assert.equal(result.journalAppended, false);
+    assert.deepEqual(result.task, completed);
+    assert.equal(store.list().length, 1);
+    assert.equal(readFileSync(store.journalPath, "utf8"), journalBeforeReplay);
+  });
+
+  it("fails closed when one delivery key is reused for a conflicting submission", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const conflict = makeTask("wt-20260717-conflict", original.source.correlationKey);
+    conflict.source.deliveryKey = original.source.deliveryKey;
+    conflict.objective = "A different canonical adapter submission";
+
+    assert.throws(
+      () => store.create(conflict),
+      (error: unknown) => {
+        assert.ok(error instanceof OpsWorkerDeliveryConflictError);
+        assert.equal(error.existingTaskId, original.id);
+        return true;
+      },
+    );
+    assert.deepEqual(store.list(), [original]);
+  });
+
+  it("fails closed when a delivery replay changes submission evidence", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const conflict = makeTask(
+      "wt-20260717-evidence-conflict",
+      original.source.correlationKey,
+    );
+    conflict.source.deliveryKey = original.source.deliveryKey;
+    conflict.evidence[0].summary = "Materially different adapter evidence";
+
+    assert.throws(
+      () => store.create(conflict),
+      (error: unknown) => {
+        assert.ok(error instanceof OpsWorkerDeliveryConflictError);
+        assert.equal(error.existingTaskId, original.id);
+        return true;
+      },
+    );
+    assert.deepEqual(store.list(), [original]);
+  });
+
+  it("enforces one held custody owner across create, replace, and mutate", (t) => {
+    const store = makeStore(t);
+    const first = makeTask("wt-held-first", "operator:held:first");
+    first.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    store.create(first);
+    const second = makeTask("wt-held-second", "operator:held:second");
+    store.create(second);
+
+    assert.throws(
+      () => store.mutate(second.id, { event: "TRANSITION" }, (task) => {
+        task.custody = {
+          status: "HELD",
+          claimedAt: NOW,
+          releasedAt: null,
+          releaseReason: null,
+        };
+      }),
+      /multiple held custody owners/,
+    );
+    const secondHeld = clone(second);
+    secondHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(() => store.replace(secondHeld), /multiple held custody owners/);
+    assert.deepEqual(store.get(second.id), second);
   });
 
   it("serializes concurrent cross-process correlation creation", async (t) => {
@@ -626,6 +1397,7 @@ describe("ops worker durable task store", () => {
     const readyPath = join(root, "first-ready");
     const releasePath = join(root, "release-first");
     const runFixture = (
+      operation: "create" | "mutate",
       taskId: string,
       barrier = false,
     ): Promise<{ code: number | null; stdout: string; stderr: string }> => {
@@ -633,6 +1405,7 @@ describe("ops worker durable task store", () => {
         "--import",
         "tsx",
         STORE_CREATE_FIXTURE,
+        operation,
         directory,
         taskId,
         "operator:shared:concurrent",
@@ -647,7 +1420,7 @@ describe("ops worker durable task store", () => {
       });
     };
 
-    const first = runFixture("concurrent-a", true);
+    const first = runFixture("create", "concurrent-a", true);
     let second:
       | Promise<{ code: number | null; stdout: string; stderr: string }>
       | undefined;
@@ -657,7 +1430,7 @@ describe("ops worker durable task store", () => {
         if (Date.now() >= deadline) throw new Error("Timed out waiting for first store writer");
         await new Promise((resolveWait) => setTimeout(resolveWait, 10));
       }
-      second = runFixture("concurrent-b");
+      second = runFixture("create", "concurrent-b");
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     } finally {
       writeFileSync(releasePath, "release\n", "utf8");
@@ -672,6 +1445,60 @@ describe("ops worker durable task store", () => {
     );
     const recovered = new OpsWorkerTaskStore(directory, { registry });
     assert.equal(recovered.list().length, 1);
+  });
+
+  it("serializes concurrent cross-process read-modify-write callbacks", async (t) => {
+    const root = testStateDirectory(t);
+    const directory = join(root, "state");
+    const readyPath = join(root, "first-ready");
+    const releasePath = join(root, "release-first");
+    const task = makeTask("concurrent-mutate", "operator:shared:mutation");
+    makeStore(t, { directory }).create(task);
+    const runFixture = (
+      barrier = false,
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> => {
+      const child = spawn(process.execPath, [
+        "--import",
+        "tsx",
+        STORE_CREATE_FIXTURE,
+        "mutate",
+        directory,
+        task.id,
+        task.source.correlationKey,
+        ...(barrier ? [readyPath, releasePath] : []),
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      return new Promise((resolveChild) => {
+        child.once("close", (code) => resolveChild({ code, stdout, stderr }));
+      });
+    };
+
+    const first = runFixture(true);
+    let second: ReturnType<typeof runFixture> | undefined;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= deadline) throw new Error("Timed out waiting for first store mutator");
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      second = runFixture();
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    } finally {
+      writeFileSync(releasePath, "release\n", "utf8");
+    }
+    assert.ok(second !== undefined);
+    const results = await Promise.all([first, second]);
+
+    assert.deepEqual(results.map((result) => result.code), [0, 0]);
+    assert.deepEqual(
+      results.map((result) => Number(result.stdout.trim())).sort(),
+      [1, 2],
+    );
+    const recovered = new OpsWorkerTaskStore(directory, { registry });
+    assert.equal(recovered.get(task.id)?.rounds.remediation, 2);
   });
 
   it("publishes complete mutation locks and reclaims a reused PID identity", (t) => {
@@ -699,6 +1526,27 @@ describe("ops worker durable task store", () => {
     const recovered = makeStore(t, { directory });
     assert.doesNotThrow(() => recovered.create(makeTask()));
     assert.equal(existsSync(canonicalLock), false);
+    assert.equal(existsSync(join(directory, ".task-store.lock.recovery")), false);
+
+    const fencedDirectory = testStateDirectory(t);
+    const fencedLock = join(fencedDirectory, ".task-store.lock");
+    const recoveryGuard = join(fencedDirectory, ".task-store.lock.recovery");
+    const staleRecord = `${JSON.stringify({
+      pid: process.pid,
+      processStartToken: `sha256:${"0".repeat(64)}`,
+      nonce: "2".repeat(32),
+    })}\n`;
+    writeFileSync(fencedLock, staleRecord, { mode: 0o600 });
+    writeFileSync(recoveryGuard, "unfinished recovery\n", { mode: 0o600 });
+
+    assert.throws(
+      () => makeStore(t, { directory: fencedDirectory }).create(
+        makeTask("wt-recovery-fenced", "operator:recovery:fenced"),
+      ),
+      /Another ops-worker task-store mutation is in progress/,
+    );
+    assert.equal(readFileSync(fencedLock, "utf8"), staleRecord);
+    assert.equal(readFileSync(recoveryGuard, "utf8"), "unfinished recovery\n");
   });
 
   it("rejects traversal identifiers and symlinked state paths", (t) => {
@@ -731,7 +1579,7 @@ describe("ops worker durable task store", () => {
     symlinkSync(outsideJournal, store.journalPath);
     const replacement = clone(task);
     replacement.updatedAt = LATER;
-    replacement.objective = "Must not be written through unsafe journal setup";
+    replacement.rounds.remediation = 1;
 
     assert.throws(() => store.replace(replacement), /path is a symlink/);
     rmSync(store.journalPath, { force: true });
