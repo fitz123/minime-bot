@@ -737,7 +737,7 @@ function parseLifecycleIdentity(value: unknown, path: string): string | null {
   return identity;
 }
 
-function emptyLifecycleManifest(): OpsWorkerLifecycleManifest {
+export function createEmptyOpsWorkerLifecycleManifest(): OpsWorkerLifecycleManifest {
   return {
     schemaVersion: OPS_WORKER_LIFECYCLE_SCHEMA_VERSION,
     canonicalTask: null,
@@ -756,13 +756,9 @@ function emptyLifecycleManifest(): OpsWorkerLifecycleManifest {
   };
 }
 
-export function createEmptyOpsWorkerLifecycleManifest(): OpsWorkerLifecycleManifest {
-  return emptyLifecycleManifest();
-}
-
 function parseLifecycle(value: unknown): OpsWorkerLifecycleManifest {
   const lifecycle = expectObject(value, "task.lifecycle");
-  const keys = Object.keys(emptyLifecycleManifest());
+  const keys = Object.keys(createEmptyOpsWorkerLifecycleManifest());
   expectExactKeys(lifecycle, keys, "task.lifecycle");
   if (lifecycle.schemaVersion !== OPS_WORKER_LIFECYCLE_SCHEMA_VERSION) {
     fail(
@@ -910,20 +906,30 @@ function parseMutationReceipt(
       `${path}.outcome`,
     );
     const recordedAt = expectTimestamp(outcomeValue.recordedAt, `${path}.outcome.recordedAt`);
-    if (Date.parse(recordedAt) < Date.parse(queryObservedAt)) {
-      fail(`${path}.outcome.recordedAt`, "must not be earlier than its query observation");
-    }
     const evidenceHash = expectString(outcomeValue.evidenceHash, `${path}.outcome.evidenceHash`);
     if (!SHA256_PATTERN.test(evidenceHash)) {
       fail(`${path}.outcome.evidenceHash`, "must be a lowercase sha256:<hex> digest");
     }
+    const result = expectEnum(
+      outcomeValue.result,
+      OPS_WORKER_MUTATION_OUTCOMES,
+      `${path}.outcome.result`,
+    );
+    if (result === "APPLIED" && mutationStartedAt === null) {
+      fail(`${path}.outcome.result`, "APPLIED requires a durable mutation claim");
+    }
+    const outcomeFloor = mutationStartedAt ?? queryObservedAt;
+    if (Date.parse(recordedAt) < Date.parse(outcomeFloor)) {
+      fail(
+        `${path}.outcome.recordedAt`,
+        mutationStartedAt === null
+          ? "must not be earlier than its query observation"
+          : "must not be earlier than its mutation claim",
+      );
+    }
     outcome = {
       recordedAt,
-      result: expectEnum(
-        outcomeValue.result,
-        OPS_WORKER_MUTATION_OUTCOMES,
-        `${path}.outcome.result`,
-      ),
+      result,
       evidenceHash,
     };
   }
@@ -1512,6 +1518,55 @@ function parseTaskCommon(
   };
 }
 
+function assertTaskCustodyMatchesState(task: OpsWorkerTask): void {
+  const held = task.custody.status === "HELD";
+  if (
+    task.state === "RUNNING"
+    || task.state === "CHECKING"
+    || task.state === "RESUMABLE"
+  ) {
+    if (!held) {
+      fail("task.custody.status", `${task.state} tasks must retain held custody`);
+    }
+    return;
+  }
+  if (task.state === "QUEUED") {
+    if (task.custody.status === "RELEASED") {
+      fail("task.custody.status", "QUEUED tasks may be unclaimed or atomically held, not released");
+    }
+    return;
+  }
+  if (task.state === "BLOCKED") {
+    const ambiguous = task.lastOutcome?.result === "AMBIGUOUS_ORPHAN";
+    if (ambiguous) {
+      if (!held) {
+        fail("task.custody.status", "an ambiguous blocked task must retain held custody");
+      }
+      return;
+    }
+    if (
+      task.custody.status !== "RELEASED"
+      || task.custody.releaseReason !== "BLOCKED"
+    ) {
+      fail(
+        "task.custody",
+        "a process-free BLOCKED task must be released with reason BLOCKED",
+      );
+    }
+    return;
+  }
+  const expectedReason = task.state === "DONE" ? "DONE" : "CANCELLED";
+  if (
+    task.custody.status !== "RELEASED"
+    || task.custody.releaseReason !== expectedReason
+  ) {
+    fail(
+      "task.custody",
+      `${task.state} tasks must be released with reason ${expectedReason}`,
+    );
+  }
+}
+
 function assertParsedSnapshotSize(task: OpsWorkerTask): void {
   const serializedBytes = Buffer.byteLength(JSON.stringify(task), "utf8");
   if (serializedBytes > OPS_WORKER_LIMITS.maxSnapshotBytes) {
@@ -1643,6 +1698,7 @@ function parseOpsWorkerTaskV2(
     custody: parseCustody(task.custody),
     ...parseTaskCommon(task, id, source, registry),
   };
+  assertTaskCustodyMatchesState(parsed);
   assertParsedSnapshotSize(parsed);
   return parsed;
 }

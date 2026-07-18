@@ -285,9 +285,11 @@ export class OpsWorkerLifecycle {
     const result = this.store.mutate(
       taskId,
       { event: "EVIDENCE", summary: "Recorded fixed lifecycle identity evidence" },
-      (task) => applyLifecycleIdentity(task.lifecycle, update)
-        ? task
-        : OPS_WORKER_TASK_STORE_NO_CHANGE,
+      (task) => {
+        if (!applyLifecycleIdentity(task.lifecycle, update)) {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+      },
     );
     return result.task;
   }
@@ -321,7 +323,7 @@ export class OpsWorkerLifecycle {
           };
           changed = true;
         }
-        return changed ? task : OPS_WORKER_TASK_STORE_NO_CHANGE;
+        if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
       },
     );
     return result.task;
@@ -366,9 +368,13 @@ export class OpsWorkerLifecycle {
             if (
               existing.mutationStartedAt === null
               && existing.queryObservedAt === queryObservedAt
-              && existing.queryResultHash === queryResultHash
             ) {
-              return OPS_WORKER_TASK_STORE_NO_CHANGE;
+              if (existing.queryResultHash === queryResultHash) {
+                return OPS_WORKER_TASK_STORE_NO_CHANGE;
+              }
+              throw new OpsWorkerLifecycleError(
+                `${input.boundary} query observation was reused with different evidence`,
+              );
             }
             if (Date.parse(queryObservedAt) < Date.parse(existing.queryObservedAt)) {
               throw new OpsWorkerLifecycleError(
@@ -386,7 +392,6 @@ export class OpsWorkerLifecycle {
           mutationStartedAt: null,
           outcome: null,
         };
-        return task;
       },
     );
     return result.task;
@@ -418,7 +423,6 @@ export class OpsWorkerLifecycle {
           receipt.queryObservedAt,
         );
         claimed = true;
-        return task;
       },
     );
     return { task: result.task, claimed };
@@ -466,7 +470,7 @@ export class OpsWorkerLifecycle {
           };
           changed = true;
         }
-        return changed ? task : OPS_WORKER_TASK_STORE_NO_CHANGE;
+        if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
       },
     );
     return result.task;

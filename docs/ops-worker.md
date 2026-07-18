@@ -59,7 +59,9 @@ priority, and source kind are not task-supplied CLI options.
 `worker start` also accepts `--host` (only `127.0.0.1` or `::1`) and `--port`
 (an integer from 0 through 65535). Omitted done-check parameters default to an
 empty object. Every command except `start` accepts `--json` for machine-readable
-output.
+output. For `receipt-claim`, JSON output is `{ "claimed": <boolean>, "task":
+<snapshot> }`; only `claimed: true` authorizes the caller to attempt the external
+mutation. A replay returns `claimed: false`.
 
 Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An
@@ -107,6 +109,18 @@ system. Identical checkpoint replay is a no-op, while reuse of the checkpoint id
 with different content fails closed. Checkpoint snapshot updates count as
 attempt liveness and are allowed while the supervisor owns the task.
 
+`--lifecycle` accepts only `canonicalTask`, `repository`, `base`, `head`,
+`branch`, `pullRequest`, `merge`, `tag`, `release`, `deploy`, `verifier`,
+`report`, and `tailAudit`. For example:
+
+```json
+{"repository":"github:example/project","pullRequest":"pr:58","merge":"commit:abc123"}
+```
+
+These slots hold bounded identity evidence only. Each non-null identity is
+write-once; an identical replay is a no-op and a conflicting update fails
+closed.
+
 Receipts are evidence records for only `merge`, `tag-release`, `deploy`,
 `canonical-task`, and `report`. `receipt-query` durably records a real external
 state observation. `receipt-claim` records that the matching mutation is about
@@ -114,7 +128,10 @@ to be attempted; it does not perform the mutation. `receipt-finish` records the
 matching outcome and evidence hash. After a crash with a claimed but unfinished
 receipt, a strictly newer query is required before reconciliation. Operation
 ids, intents, outcomes, and fixed lifecycle identities are replay-safe and fail
-closed on conflicting reuse.
+closed on conflicting reuse. The `--payload`, `--intent`, `--query-result`, and
+`--evidence` values are bounded canonical JSON and are retained only as hashes;
+callers must retain any raw external observation they will need later. Operator
+retry also fails closed while a claimed report receipt remains unfinished.
 
 An ambiguous process-group identity is a global safety fence: its task retains
 any proven identity evidence, no new Pi attempt is launched, and ordinary retry

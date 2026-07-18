@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -601,20 +602,63 @@ describe("ops worker Pi standard-session attempts", () => {
     const task = makeTask("checkpoint-progress");
     harness.store.create(task);
     harness.setScenario("wait");
+    let clockNow = 0;
+    interface ScheduledTimer {
+      at: number;
+      callback: () => void;
+      cancelled: boolean;
+    }
+    const timers = new Set<ScheduledTimer>();
+    const stallMonitorClock = {
+      now: (): number => clockNow,
+      setTimeout(callback: () => void, milliseconds: number): ScheduledTimer {
+        const timer = { at: clockNow + milliseconds, callback, cancelled: false };
+        timers.add(timer);
+        return timer;
+      },
+      clearTimeout(handle: unknown): void {
+        (handle as ScheduledTimer).cancelled = true;
+        timers.delete(handle as ScheduledTimer);
+      },
+    };
+    const advanceClock = async (milliseconds: number): Promise<void> => {
+      clockNow += milliseconds;
+      while (true) {
+        const due = [...timers]
+          .filter((timer) => !timer.cancelled && timer.at <= clockNow)
+          .sort((left, right) => left.at - right.at)[0];
+        if (!due) break;
+        timers.delete(due);
+        due.callback();
+        await Promise.resolve();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    };
     const running = harness.runner({
-      attemptTimeoutMs: 2_000,
+      attemptTimeoutMs: 10_000,
       stallTimeoutMs: 200,
+      dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => timers.size > 0);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },
       summary: "A durable package-owned progress checkpoint.",
     });
-    await new Promise((resolve) => setTimeout(resolve, 130));
+    const taskSnapshotPath = join(
+      harness.supervisor.stateDirectory,
+      "tasks",
+      `${task.id}.json`,
+    );
+    const futureMtime = new Date(Date.now() + 10_000);
+    utimesSync(taskSnapshotPath, futureMtime, futureMtime);
+
+    await advanceClock(200);
+    await advanceClock(199);
 
     assert.equal(harness.supervisor.getTask(task.id)?.state, "RUNNING");
+    await advanceClock(1);
     const result = await running;
     assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
     assert.equal(result.lastOutcome?.result, "STALL");
@@ -1149,6 +1193,12 @@ describe("ops worker Pi standard-session attempts", () => {
     const persisted = makeTask("ambiguous-orphan");
     persisted.state = "RUNNING";
     persisted.activeRun = activeRun;
+    persisted.custody = {
+      status: "HELD",
+      claimedAt: persisted.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
     store.create(persisted);
     let signalCount = 0;
     const ambiguousInspection: OpsWorkerProcessInspection = {

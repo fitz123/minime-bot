@@ -16,7 +16,6 @@ import {
   type OpsWorkerLifecycleIdentityUpdate,
 } from "./lifecycle.js";
 import {
-  isOpsWorkerUnresolvedOrphan,
   OpsWorkerSupervisor,
   type OpsWorkerLockOwnerStatus,
   type OpsWorkerStartupRunResult,
@@ -26,6 +25,7 @@ import { OpsWorkerTaskStore } from "./task-store.js";
 import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
+  summarizeOpsWorkerTasks,
   startOpsWorkerStatusServer,
 } from "./status-server.js";
 import {
@@ -42,7 +42,6 @@ import {
   type OpsWorkerMutationOutcomeResult,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
-  type OpsWorkerTaskState,
   OpsWorkerTaskValidationError,
 } from "./types.js";
 
@@ -316,35 +315,6 @@ function parseMutationResult(raw: string): OpsWorkerMutationOutcomeResult {
   return raw as OpsWorkerMutationOutcomeResult;
 }
 
-function taskSummary(tasks: readonly OpsWorkerTask[]): {
-  service: "minime-ops-worker";
-  schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
-  totalTasks: number;
-  activeProcessGroups: number;
-  custodyOwner: { id: string; state: OpsWorkerTaskState } | null;
-  states: Record<OpsWorkerTaskState, number>;
-} {
-  const states = Object.fromEntries(
-    OPS_WORKER_TASK_STATES.map((state) => [state, 0]),
-  ) as Record<OpsWorkerTaskState, number>;
-  for (const task of tasks) states[task.state] += 1;
-  const custodyOwners = tasks.filter((task) => task.custody.status === "HELD");
-  if (custodyOwners.length > 1) {
-    throw new Error("Ops-worker status found multiple held custody owners");
-  }
-  return {
-    service: "minime-ops-worker",
-    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
-    totalTasks: tasks.length,
-    activeProcessGroups: tasks.filter((task) =>
-      task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
-    custodyOwner: custodyOwners[0]
-      ? { id: custodyOwners[0].id, state: custodyOwners[0].state }
-      : null,
-    states,
-  };
-}
-
 function defaultProcessStartToken(): string {
   const inspected = readOpsWorkerProcessIdentity(process.pid);
   if (inspected.status !== "OWNED") {
@@ -524,6 +494,21 @@ function printTask(
   writeLine(stdout, `${task.id} ${task.state} ${task.source.template} ${task.source.correlationKey}`);
 }
 
+function printMutationClaim(
+  result: { task: OpsWorkerTask; claimed: boolean },
+  json: boolean,
+  stdout: WriteFn,
+): void {
+  if (json) {
+    writeJson(stdout, result);
+    return;
+  }
+  writeLine(
+    stdout,
+    `claimed=${result.claimed} ${result.task.id} ${result.task.state}`,
+  );
+}
+
 function printTaskList(
   tasks: readonly OpsWorkerTask[],
   json: boolean,
@@ -663,7 +648,7 @@ export async function runOpsWorkerCliCommand(
     const store = createStore(stateDirectory(parsed, cliOptions.cwd), deps);
     const json = parsed.flags.has("json");
     if (action === "status") {
-      const summary = taskSummary(store.list());
+      const summary = summarizeOpsWorkerTasks(store.list());
       if (json) writeJson(cliOptions.stdout, summary);
       else {
         writeLine(cliOptions.stdout, `Tasks: ${summary.totalTasks}`);
@@ -732,7 +717,7 @@ export async function runOpsWorkerCliCommand(
         operationId: requiredValue(parsed, "operation-id"),
         intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
       });
-      printTask(result.task, json, cliOptions.stdout);
+      printMutationClaim(result, json, cliOptions.stdout);
       return 0;
     }
     if (action === "receipt-finish") {

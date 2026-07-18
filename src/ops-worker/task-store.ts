@@ -631,7 +631,9 @@ export class OpsWorkerTaskStore {
   mutate(
     taskId: string,
     audit: OpsWorkerAuditInput,
-    callback: (task: OpsWorkerTask) => unknown,
+    callback: (
+      task: OpsWorkerTask,
+    ) => void | typeof OPS_WORKER_TASK_STORE_NO_CHANGE,
   ): OpsWorkerTaskStoreMutationResult {
     assertOpsWorkerTaskId(taskId);
     assertAuditInput(audit);
@@ -651,7 +653,7 @@ export class OpsWorkerTaskStore {
           journalAppended: false,
         };
       }
-      const task = parseOpsWorkerTask(returned === undefined ? working : returned, this.registry);
+      const task = parseOpsWorkerTask(working, this.registry);
       this.assertImmutableIdentity(existing, task);
       this.assertJournalSafe();
       this.assertGlobalInvariants(this.withReplacement(this.list(), task));

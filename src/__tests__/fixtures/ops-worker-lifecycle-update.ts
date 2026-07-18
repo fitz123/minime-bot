@@ -6,16 +6,25 @@ import type {
   OpsWorkerTaskContractRegistry,
 } from "../../ops-worker/types.js";
 
-const [stateDirectory, taskId, slot, value, readyPath, releasePath] =
+const [
+  stateDirectory,
+  taskId,
+  action,
+  value,
+  readyPath,
+  releasePath,
+  startedPath,
+  completedPath,
+] =
   process.argv.slice(2);
 if (
   !stateDirectory
   || !taskId
-  || (slot !== "repository" && slot !== "branch")
+  || (action !== "repository" && action !== "branch" && action !== "claim")
   || !value
 ) {
   throw new Error(
-    "lifecycle fixture requires state directory, task id, repository|branch, and value",
+    "lifecycle fixture requires state directory, task id, repository|branch|claim, and value",
   );
 }
 
@@ -31,16 +40,20 @@ const registry: OpsWorkerTaskContractRegistry = {
   doneChecks: {
     "fixture-check": {
       validateParams(input: unknown): JsonObject {
-        if (JSON.stringify(input) !== JSON.stringify({ expected: true })) {
-          throw new TypeError("fixture params must be canonical");
+        if (JSON.stringify(input) === JSON.stringify({ expected: true })) {
+          return { expected: true };
         }
-        return { expected: true };
+        if (JSON.stringify(input) === JSON.stringify({ sampleCount: 1 })) {
+          return { sampleCount: 1 };
+        }
+        throw new TypeError("fixture params must be canonical");
       },
     },
   },
 };
 
 try {
+  if (startedPath) writeFileSync(startedPath, "started\n", "utf8");
   const store = new OpsWorkerTaskStore(stateDirectory, {
     registry,
     faultInjector: readyPath && releasePath
@@ -58,9 +71,20 @@ try {
       }
       : undefined,
   });
-  new OpsWorkerLifecycle(store).updateLifecycleIdentity(taskId, {
-    [slot]: value,
-  });
+  const lifecycle = new OpsWorkerLifecycle(store);
+  if (action === "claim") {
+    const result = lifecycle.claimMutationReceipt(taskId, {
+      boundary: "merge",
+      operationId: value,
+      intent: { taskId, action: "merge" },
+    });
+    process.stdout.write(`${JSON.stringify({ claimed: result.claimed })}\n`);
+  } else {
+    lifecycle.updateLifecycleIdentity(taskId, {
+      [action]: value,
+    });
+  }
+  if (completedPath) writeFileSync(completedPath, "completed\n", "utf8");
 } catch (error) {
   process.stderr.write(`${(error as Error).name}: ${(error as Error).message}\n`);
   process.exitCode = 1;

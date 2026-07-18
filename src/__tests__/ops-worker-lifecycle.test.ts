@@ -228,6 +228,14 @@ describe("ops worker package-owned lifecycle evidence", () => {
       readFileSync(harness.store.journalPath, "utf8"),
       journalBeforeQueryReplay,
     );
+    assert.throws(
+      () => harness.lifecycle.beginMutationReceipt(task.id, {
+        ...operation,
+        queryObservedAt: NOW,
+        queryResult: { merged: true },
+      }),
+      /query observation was reused with different evidence/,
+    );
     const claimed = harness.lifecycle.claimMutationReceipt(task.id, operation);
     assert.equal(claimed.claimed, true);
     assert.equal(claimed.task.mutationReceipts.merge?.outcome, null);
@@ -271,11 +279,31 @@ describe("ops worker package-owned lifecycle evidence", () => {
       operationId: "deploy-release-01",
       intent: { release: "release-01", environment: "fixture" },
     };
+    assert.throws(
+      () => harness.lifecycle.claimMutationReceipt(task.id, operation),
+      /requires a query observation/,
+    );
+    assert.throws(
+      () => harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operation,
+        result: "NOT_NEEDED",
+        evidence: { reason: "not queried" },
+      }),
+      /requires a prior query observation/,
+    );
     harness.lifecycle.beginMutationReceipt(task.id, {
       ...operation,
       queryObservedAt: NOW,
       queryResult: { deployed: false },
     });
+    assert.throws(
+      () => harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operation,
+        result: "APPLIED",
+        evidence: { deploymentId: "deploy-01" },
+      }),
+      /APPLIED outcome requires a durable mutation claim/,
+    );
     harness.lifecycle.claimMutationReceipt(task.id, operation);
     const finished = harness.lifecycle.finishMutationReceipt(task.id, {
       ...operation,
@@ -301,6 +329,22 @@ describe("ops worker package-owned lifecycle evidence", () => {
         evidence: { deploymentId: "deploy-01" },
       }),
       /different intent/i,
+    );
+    assert.throws(
+      () => harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operation,
+        result: "APPLIED",
+        evidence: { deploymentId: "deploy-conflict" },
+      }),
+      /outcome was reused with different evidence/,
+    );
+    assert.throws(
+      () => harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operation,
+        result: "ALREADY_APPLIED",
+        evidence: { deploymentId: "deploy-01" },
+      }),
+      /outcome was reused with different evidence/,
     );
     assert.throws(
       () => harness.lifecycle.beginMutationReceipt(task.id, {
@@ -336,31 +380,34 @@ describe("ops worker package-owned lifecycle evidence", () => {
     }
   });
 
-  it("serializes concurrent helper updates without losing lifecycle slots", async (t) => {
+  it("serializes concurrent helper updates and grants only one mutation claim", async (t) => {
     const harness = makeHarness(t);
     const task = makeTask("concurrent-lifecycle");
     harness.store.create(task);
     const readyPath = join(harness.directory, "first-ready");
     const releasePath = join(harness.directory, "release-first");
     const runFixture = (
-      slot: "repository" | "branch",
+      slot: "repository" | "branch" | "claim",
       value: string,
       barrier = false,
-    ): Promise<{ code: number | null; stderr: string }> => {
+      targetTaskId = task.id,
+    ): Promise<{ code: number | null; stderr: string; stdout: string }> => {
       const child = spawn(process.execPath, [
         "--import",
         "tsx",
         LIFECYCLE_UPDATE_FIXTURE,
         harness.directory,
-        task.id,
+        targetTaskId,
         slot,
         value,
         ...(barrier ? [readyPath, releasePath] : []),
-      ], { stdio: ["ignore", "ignore", "pipe"] });
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
       let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
       child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
       return new Promise((resolve) => {
-        child.once("close", (code) => resolve({ code, stderr }));
+        child.once("close", (code) => resolve({ code, stderr, stdout }));
       });
     };
 
@@ -383,5 +430,34 @@ describe("ops worker package-owned lifecycle evidence", () => {
     const updated = harness.store.get(task.id);
     assert.equal(updated?.lifecycle.repository, "github:example/minime-bot");
     assert.equal(updated?.lifecycle.branch, "refs/heads/issue-58");
+
+    rmSync(readyPath, { force: true });
+    rmSync(releasePath, { force: true });
+    const claimTask = makeTask("concurrent-claim");
+    harness.store.create(claimTask);
+    harness.lifecycle.beginMutationReceipt(claimTask.id, {
+      boundary: "merge",
+      operationId: "merge-race",
+      intent: { taskId: claimTask.id, action: "merge" },
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    const claimResults = await Promise.all([
+      runFixture("claim", "merge-race", false, claimTask.id),
+      runFixture("claim", "merge-race", false, claimTask.id),
+    ]);
+    assert.deepEqual(
+      claimResults.map((result) => result.code),
+      [0, 0],
+      JSON.stringify(claimResults),
+    );
+    const claims = claimResults
+      .map((result) => (JSON.parse(result.stdout) as { claimed: boolean }).claimed)
+      .sort();
+    assert.deepEqual(
+      claims,
+      [false, true],
+      JSON.stringify(claimResults),
+    );
   });
 });

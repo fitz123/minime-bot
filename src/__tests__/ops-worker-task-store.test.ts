@@ -414,6 +414,34 @@ describe("ops worker task contract", () => {
       /must equal fixed slot boundary merge/,
     );
 
+    const appliedWithoutClaim = clone(makeTask());
+    appliedWithoutClaim.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-without-claim",
+      intentHash: `sha256:${"d".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"e".repeat(64)}`,
+      mutationStartedAt: null,
+      outcome: {
+        recordedAt: NOW,
+        result: "APPLIED",
+        evidenceHash: `sha256:${"f".repeat(64)}`,
+      },
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(appliedWithoutClaim, registry),
+      /APPLIED requires a durable mutation claim/,
+    );
+
+    const outcomeBeforeClaim = clone(appliedWithoutClaim);
+    const receipt = outcomeBeforeClaim.mutationReceipts.merge;
+    assert.ok(receipt);
+    receipt.mutationStartedAt = LATER;
+    assert.throws(
+      () => parseOpsWorkerTask(outcomeBeforeClaim, registry),
+      /outcome\.recordedAt: must not be earlier than its mutation claim/,
+    );
+
     const contradictoryCustody = clone(makeTask());
     contradictoryCustody.custody = {
       status: "HELD",
@@ -424,6 +452,59 @@ describe("ops worker task contract", () => {
     assert.throws(
       () => parseOpsWorkerTask(contradictoryCustody, registry),
       /status does not match its custody timestamps/,
+    );
+
+    const runningReleased = clone(makeTask());
+    runningReleased.state = "RUNNING";
+    runningReleased.activeRun = {
+      attemptId: "attempt-released",
+      supervisorInstanceId: "supervisor-released",
+      pid: 123,
+      processGroupId: 123,
+      processStartedAt: NOW,
+      processStartToken: "start-released",
+    };
+    runningReleased.custody = {
+      status: "RELEASED",
+      claimedAt: NOW,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(runningReleased, registry),
+      /RUNNING tasks must retain held custody/,
+    );
+
+    const doneHeld = clone(makeTask());
+    doneHeld.state = "DONE";
+    doneHeld.lastOutcome = {
+      at: NOW,
+      kind: "DONE_CHECK",
+      result: "PASS",
+      summary: "Fixture passed.",
+    };
+    doneHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(doneHeld, registry),
+      /DONE tasks must be released with reason DONE/,
+    );
+
+    const blockedHeld = clone(makeTask());
+    blockedHeld.state = "BLOCKED";
+    blockedHeld.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(blockedHeld, registry),
+      /process-free BLOCKED task must be released with reason BLOCKED/,
     );
   });
 
@@ -737,6 +818,12 @@ describe("ops worker task contract", () => {
       result: "AMBIGUOUS_ORPHAN",
       summary: "Synthetic unverified launch remains fenced.",
     };
+    unexpectedFence.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
     assert.equal(
       parseOpsWorkerTask(unexpectedFence, registry).unverifiedRun?.pid,
       456,
@@ -1019,6 +1106,12 @@ describe("ops worker durable task store", () => {
       result: "PASS",
       summary: "Fresh fixture evidence passed.",
     };
+    completed.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: LATER,
+      releaseReason: "DONE",
+    };
     store.replace(completed, { event: "TRANSITION" });
     assert.doesNotThrow(() => store.create(duplicate));
     assert.equal(store.list().length, 2);
@@ -1039,6 +1132,12 @@ describe("ops worker durable task store", () => {
       kind: "DONE_CHECK",
       result: "PASS",
       summary: "Fresh fixture evidence passed.",
+    };
+    completed.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: LATER,
+      releaseReason: "DONE",
     };
     store.replace(completed, { event: "TRANSITION" });
     const journalBeforeReplay = readFileSync(store.journalPath, "utf8");

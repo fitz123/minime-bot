@@ -551,23 +551,25 @@ export class OpsWorkerSupervisor {
   ): OpsWorkerTask {
     this.assertStarted();
     assertIdentifier(sessionId, "Pi session id");
-    const existing = this.requireTask(taskId);
-    if (existing.state !== "QUEUED" && existing.state !== "RESUMABLE") {
-      throw new OpsWorkerSupervisorStateError(
-        `Pi session preparation requires QUEUED or RESUMABLE, found ${existing.state}`,
-      );
-    }
-    const replacement = structuredClone(existing);
-    replacement.updatedAt = this.nextUpdatedAt(existing);
-    replacement.session.sessionId = sessionId;
-    replacement.session.resume = resume;
-    this.store.replace(replacement, {
-      event: "UPDATED",
-      summary: resume
-        ? "Prepared standard Pi session continuation"
-        : "Prepared new standard Pi session",
-    });
-    return this.requireTask(taskId);
+    return this.store.mutate(
+      taskId,
+      {
+        event: "UPDATED",
+        summary: resume
+          ? "Prepared standard Pi session continuation"
+          : "Prepared new standard Pi session",
+      },
+      (task) => {
+        if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
+          throw new OpsWorkerSupervisorStateError(
+            `Pi session preparation requires QUEUED or RESUMABLE, found ${task.state}`,
+          );
+        }
+        task.updatedAt = this.nextUpdatedAt(task);
+        task.session.sessionId = sessionId;
+        task.session.resume = resume;
+      },
+    ).task;
   }
 
   selectNextTask(): OpsWorkerScheduledTask | undefined {
@@ -750,34 +752,36 @@ export class OpsWorkerSupervisor {
     unverifiedRun: OpsWorkerUnverifiedRun,
   ): OpsWorkerTask {
     this.assertStarted();
-    const existing = this.requireTask(taskId);
-    const intent = existing.unverifiedRun;
-    if (
-      existing.state !== "BLOCKED"
-      || intent === null
-      || intent.pid !== null
-      || intent.attemptId !== unverifiedRun.attemptId
-      || intent.supervisorInstanceId !== unverifiedRun.supervisorInstanceId
-      || intent.launchedAt !== unverifiedRun.launchedAt
-      || intent.ownershipNonceHash !== unverifiedRun.ownershipNonceHash
-      || unverifiedRun.pid === null
-      || unverifiedRun.expectedProcessGroupId !== unverifiedRun.pid
-    ) {
-      throw new OpsWorkerSupervisorStateError(
-        "Detached Pi PID does not match the persisted launch intent",
-      );
-    }
-    const replacement = structuredClone(existing);
-    replacement.updatedAt = this.nextUpdatedAt(existing);
-    replacement.unverifiedRun = structuredClone(unverifiedRun);
-    if (replacement.lastOutcome) {
-      replacement.lastOutcome.summary = "Bound detached Pi PID to the durable launch fence";
-    }
-    this.store.replace(replacement, {
-      event: "RECONCILIATION",
-      summary: "Bound detached Pi PID to the durable launch fence",
-    });
-    return this.requireTask(taskId);
+    return this.store.mutate(
+      taskId,
+      {
+        event: "RECONCILIATION",
+        summary: "Bound detached Pi PID to the durable launch fence",
+      },
+      (task) => {
+        const intent = task.unverifiedRun;
+        if (
+          task.state !== "BLOCKED"
+          || intent === null
+          || intent.pid !== null
+          || intent.attemptId !== unverifiedRun.attemptId
+          || intent.supervisorInstanceId !== unverifiedRun.supervisorInstanceId
+          || intent.launchedAt !== unverifiedRun.launchedAt
+          || intent.ownershipNonceHash !== unverifiedRun.ownershipNonceHash
+          || unverifiedRun.pid === null
+          || unverifiedRun.expectedProcessGroupId !== unverifiedRun.pid
+        ) {
+          throw new OpsWorkerSupervisorStateError(
+            "Detached Pi PID does not match the persisted launch intent",
+          );
+        }
+        task.updatedAt = this.nextUpdatedAt(task);
+        task.unverifiedRun = structuredClone(unverifiedRun);
+        if (task.lastOutcome) {
+          task.lastOutcome.summary = "Bound detached Pi PID to the durable launch fence";
+        }
+      },
+    ).task;
   }
 
   markRunning(taskId: string, activeRun: OpsWorkerActiveRun): OpsWorkerTask {
@@ -1116,14 +1120,22 @@ export class OpsWorkerSupervisor {
         "Quarantined corrupt standard Pi session and prepared a fresh session",
       );
     }
-    const replacement = structuredClone(existing);
-    replacement.updatedAt = this.nextUpdatedAt(existing);
-    applyReset(replacement, replacement.updatedAt);
-    this.store.replace(replacement, {
-      event: "RECONCILIATION",
-      summary: "Quarantined corrupt standard Pi session and prepared a fresh session",
-    });
-    return this.requireTask(taskId);
+    return this.store.mutate(
+      taskId,
+      {
+        event: "RECONCILIATION",
+        summary: "Quarantined corrupt standard Pi session and prepared a fresh session",
+      },
+      (task) => {
+        if (task.state !== "QUEUED" && task.state !== "RESUMABLE") {
+          throw new OpsWorkerSupervisorStateError(
+            `Pi session reset requires QUEUED or RESUMABLE, found ${task.state}`,
+          );
+        }
+        task.updatedAt = this.nextUpdatedAt(task);
+        applyReset(task, task.updatedAt);
+      },
+    ).task;
   }
 
   blockAmbiguousActiveRun(taskId: string, summary: string): OpsWorkerTask {
@@ -1202,9 +1214,7 @@ export class OpsWorkerSupervisor {
       }, signal);
     } catch (error) {
       if (!(error instanceof OpsWorkerDoneCheckExecutionError)) throw error;
-      this.assertFreshCheckSnapshot(taskId, baseline);
-      const currentTask = this.requireTask(taskId);
-      const target = currentTask.rounds.consecutiveInfrastructureFailures + 1
+      const target = task.rounds.consecutiveInfrastructureFailures + 1
           >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
         ? "BLOCKED"
         : "CHECKING";
@@ -1230,10 +1240,9 @@ export class OpsWorkerSupervisor {
         });
       }, target === "BLOCKED"
         ? "Done check reached the bounded infrastructure-failure limit"
-        : "Done check error is resumable");
+        : "Done check error is resumable", { expectedBaseline: baseline });
     }
-    this.assertFreshCheckSnapshot(taskId, baseline);
-    return this.applyDoneCheckResult(taskId, result);
+    return this.applyDoneCheckResult(taskId, result, task, baseline);
   }
 
   retryBlockedTask(taskId: string): OpsWorkerTask {
@@ -1249,7 +1258,31 @@ export class OpsWorkerSupervisor {
         "Cannot retry a task while its prior process group remains unresolved",
       );
     }
+    if (
+      existing.mutationReceipts.report?.outcome === null
+      && existing.mutationReceipts.report.mutationStartedAt !== null
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Cannot retry while a claimed report receipt still requires reconciliation",
+      );
+    }
     return this.transition(taskId, "RESUMABLE", (task) => {
+      const reportReceipt = task.mutationReceipts.report;
+      if (reportReceipt?.outcome === null) {
+        if (reportReceipt.mutationStartedAt !== null) {
+          throw new OpsWorkerSupervisorStateError(
+            "Cannot retry while a claimed report receipt still requires reconciliation",
+          );
+        }
+        reportReceipt.outcome = {
+          recordedAt: timestampAtOrAfter(this.now(), reportReceipt.queryObservedAt),
+          result: "NOT_NEEDED",
+          evidenceHash: hashOpsWorkerCanonicalPayload({
+            taskId,
+            reason: "report episode superseded by operator retry before mutation claim",
+          }),
+        };
+      }
       task.rounds.remediation = 0;
       task.rounds.consecutiveInfrastructureFailures = 0;
       task.schedule.nextRunAt = null;
@@ -1355,7 +1388,7 @@ export class OpsWorkerSupervisor {
         `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
       );
     }
-    const recorded = this.store.mutate(
+    return this.store.mutate(
       taskId,
       {
         event: "REPORT",
@@ -1391,18 +1424,19 @@ export class OpsWorkerSupervisor {
         replacement.report.lastError = result.sent
           ? null
           : truncateUtf8(result.error, OPS_WORKER_LIMITS.maxReportErrorBytes);
+        if (result.sent) {
+          receipt.outcome = {
+            recordedAt: timestampAtOrAfter(this.now(), receipt.mutationStartedAt),
+            result: "APPLIED",
+            evidenceHash: hashOpsWorkerCanonicalPayload({
+              sent: true,
+              attempt: replacement.report.attempts,
+              state: replacement.report.state,
+            }),
+          };
+        }
       },
     ).task;
-    if (!result.sent) return recorded;
-    return this.lifecycle.finishMutationReceipt(taskId, {
-      ...operation,
-      result: "APPLIED",
-      evidence: {
-        sent: true,
-        attempt: recorded.report.attempts,
-        state: recorded.report.state,
-      },
-    });
   }
 
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {
@@ -1505,6 +1539,8 @@ export class OpsWorkerSupervisor {
   private applyDoneCheckResult(
     taskId: string,
     result: OpsWorkerDoneCheckResult,
+    checkedTask: OpsWorkerTask,
+    expectedBaseline: string,
   ): OpsWorkerTask {
     if (result.result === "PASS") {
       return this.transition(taskId, "DONE", (task, at) => {
@@ -1513,7 +1549,10 @@ export class OpsWorkerSupervisor {
         appendEvidence(task, this.checkEvidence(at, result.summary));
         task.report.state = "PENDING";
         task.report.lastError = null;
-      }, "Fresh deterministic done check passed", true);
+      }, "Fresh deterministic done check passed", {
+        freshDoneCheckPass: true,
+        expectedBaseline,
+      });
     }
     if (result.result === "DEFER") {
       return this.transition(taskId, "CHECKING", (task, at) => {
@@ -1523,12 +1562,14 @@ export class OpsWorkerSupervisor {
         task.schedule.nextCheckAt = result.nextCheckAt;
         task.lastOutcome = this.checkOutcome(at, "DEFER", result.summary);
         appendEvidence(task, this.checkEvidence(at, result.summary));
-      }, "Done check deferred without spending remediation budget");
+      }, "Done check deferred without spending remediation budget", {
+        expectedBaseline,
+      });
     }
     return this.transition(
       taskId,
-      this.requireTask(taskId).rounds.remediation + 1
-          >= this.requireTask(taskId).rounds.maxRemediation
+      checkedTask.rounds.remediation + 1
+          >= checkedTask.rounds.maxRemediation
         ? "BLOCKED"
         : "RESUMABLE",
       (task, at) => {
@@ -1549,6 +1590,7 @@ export class OpsWorkerSupervisor {
         }
       },
       "Done check requires another remediation round",
+      { expectedBaseline },
     );
   }
 
@@ -1654,37 +1696,39 @@ export class OpsWorkerSupervisor {
     to: OpsWorkerTaskState,
     mutate: (task: OpsWorkerTask, at: string) => void,
     auditSummary: string,
-    freshDoneCheckPass = false,
+    options: {
+      freshDoneCheckPass?: boolean;
+      expectedBaseline?: string;
+    } = {},
   ): OpsWorkerTask {
-    const existing = this.requireTask(taskId);
-    if (to === "DONE" && !freshDoneCheckPass) {
+    if (to === "DONE" && !options.freshDoneCheckPass) {
       throw new OpsWorkerSupervisorStateError(
         "DONE is reserved for a fresh deterministic done-check PASS",
       );
     }
-    assertStructuralStateTransition(existing.state, to);
-    const replacement = structuredClone(existing);
-    const updatedAt = this.nextUpdatedAt(existing);
-    replacement.state = to;
-    replacement.updatedAt = updatedAt;
-    mutate(replacement, updatedAt);
-    this.applyCustodyTransition(replacement, updatedAt);
-    this.store.replace(replacement, {
-      event: "TRANSITION",
-      summary: auditSummary,
-    });
-    return this.requireTask(taskId);
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary: auditSummary },
+      (task) => {
+        if (
+          options.expectedBaseline !== undefined
+          && JSON.stringify(task) !== options.expectedBaseline
+        ) {
+          throw new OpsWorkerStaleCheckResultError(taskId);
+        }
+        assertStructuralStateTransition(task.state, to);
+        const updatedAt = this.nextUpdatedAt(task);
+        task.state = to;
+        task.updatedAt = updatedAt;
+        mutate(task, updatedAt);
+        this.applyCustodyTransition(task, updatedAt);
+      },
+    ).task;
   }
 
   private nextUpdatedAt(task: OpsWorkerTask): string {
     const now = this.now().getTime();
     return new Date(Math.max(now, Date.parse(task.updatedAt) + 1)).toISOString();
-  }
-
-  private assertFreshCheckSnapshot(taskId: string, baseline: string): void {
-    if (JSON.stringify(this.requireTask(taskId)) !== baseline) {
-      throw new OpsWorkerStaleCheckResultError(taskId);
-    }
   }
 
   private requireTask(taskId: string): OpsWorkerTask {

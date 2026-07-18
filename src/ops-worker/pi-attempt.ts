@@ -130,6 +130,11 @@ export interface OpsWorkerPiAttemptDependencies {
   randomId?: () => string;
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
+  stallMonitorClock?: {
+    now(): number;
+    setTimeout(callback: () => void, milliseconds: number): unknown;
+    clearTimeout(handle: unknown): void;
+  };
   assembleContext?: (agent: AgentConfig) => PiContextArtifacts | null;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
   launchFaultInjector?: (
@@ -239,6 +244,9 @@ export class OpsWorkerPiAttemptRunner {
   private readonly randomId: () => string;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly stallMonitorClock: NonNullable<
+    OpsWorkerPiAttemptDependencies["stallMonitorClock"]
+  >;
   private readonly assembleContext: (agent: AgentConfig) => PiContextArtifacts | null;
   private readonly launchFaultInjector:
     | NonNullable<OpsWorkerPiAttemptDependencies["launchFaultInjector"]>
@@ -301,6 +309,11 @@ export class OpsWorkerPiAttemptRunner {
       ?? ((milliseconds) => new Promise((resolveSleep) => {
         setTimeout(resolveSleep, milliseconds);
       }));
+    this.stallMonitorClock = dependencies.stallMonitorClock ?? {
+      now: () => Date.now(),
+      setTimeout: (callback, milliseconds) => setTimeout(callback, milliseconds),
+      clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    };
     this.assembleContext = dependencies.assembleContext ?? assemblePiContext;
     this.launchFaultInjector = dependencies.launchFaultInjector;
   }
@@ -449,9 +462,9 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
 
-    let lastStreamProgressAt = Date.now();
+    let lastStreamProgressAt = this.stallMonitorClock.now();
     const noteStreamProgress = (): void => {
-      lastStreamProgressAt = Date.now();
+      lastStreamProgressAt = this.stallMonitorClock.now();
     };
     const stdout = new BoundedStreamCapture(
       OPS_WORKER_PI_LIMITS.maxCapturedStreamBytes,
@@ -628,6 +641,7 @@ export class OpsWorkerPiAttemptRunner {
       timeoutMs: this.stallTimeoutMs,
       isExited: () => exitSettled,
       lastStreamProgressAt: () => lastStreamProgressAt,
+      clock: this.stallMonitorClock,
     });
     const shutdownTrigger = createAbortTrigger(this.abortSignal);
     const triggerPromise = Promise.race([
@@ -1655,18 +1669,19 @@ function createStallMonitor(options: {
   timeoutMs: number;
   isExited: () => boolean;
   lastStreamProgressAt: () => number;
+  clock: NonNullable<OpsWorkerPiAttemptDependencies["stallMonitorClock"]>;
 }): {
   promise: Promise<{ kind: "STALL" }>;
   close(): void;
 } {
-  let timer: NodeJS.Timeout | undefined;
+  let timer: unknown;
   let closed = false;
   let lastObservedMtime = latestObservableMtime(
     options.task,
     options.sessionDirectory,
     options.stateDirectory,
   );
-  let lastProgressAt = Math.max(Date.now(), options.lastStreamProgressAt());
+  let lastProgressAt = Math.max(options.clock.now(), options.lastStreamProgressAt());
   const promise = new Promise<{ kind: "STALL" }>((resolveStall) => {
     const check = (): void => {
       if (closed || options.isExited()) return;
@@ -1679,22 +1694,28 @@ function createStallMonitor(options: {
       );
       if (observedMtime > lastObservedMtime) {
         lastObservedMtime = observedMtime;
-        lastProgressAt = Date.now();
+        lastProgressAt = options.clock.now();
       }
-      const remaining = options.timeoutMs - (Date.now() - lastProgressAt);
+      const remaining = options.timeoutMs - (options.clock.now() - lastProgressAt);
       if (remaining <= 0) {
         resolveStall({ kind: "STALL" });
         return;
       }
-      timer = setTimeout(check, Math.min(1_000, Math.max(10, remaining)));
+      timer = options.clock.setTimeout(
+        check,
+        Math.min(1_000, Math.max(10, remaining)),
+      );
     };
-    timer = setTimeout(check, Math.min(1_000, Math.max(10, options.timeoutMs)));
+    timer = options.clock.setTimeout(
+      check,
+      Math.min(1_000, Math.max(10, options.timeoutMs)),
+    );
   });
   return {
     promise,
     close(): void {
       closed = true;
-      if (timer) clearTimeout(timer);
+      if (timer !== undefined) options.clock.clearTimeout(timer);
     },
   };
 }

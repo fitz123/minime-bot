@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   readFileSync,
@@ -9,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import {
   OPS_WORKER_DONE_CHECK_LIMITS,
@@ -17,9 +19,11 @@ import {
   type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
+import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
 import {
   OpsWorkerDuplicateCorrelationError,
   OpsWorkerTaskStore,
+  type OpsWorkerTaskStoreFaultPoint,
 } from "../ops-worker/task-store.js";
 import {
   OpsWorkerStaleCheckResultError,
@@ -39,6 +43,12 @@ import {
 
 const NOW = "2026-07-17T12:00:00.000Z";
 const LATER = "2026-07-17T12:05:00.000Z";
+const LIFECYCLE_UPDATE_FIXTURE = fileURLToPath(
+  new URL("./fixtures/ops-worker-lifecycle-update.ts", import.meta.url),
+);
+const SUPERVISOR_TRANSITION_FIXTURE = fileURLToPath(
+  new URL("./fixtures/ops-worker-supervisor-transition.ts", import.meta.url),
+);
 
 function validateFixtureParams(value: unknown): JsonObject {
   assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
@@ -166,6 +176,7 @@ async function makeHarness(
     directory?: string;
     instanceId?: string;
     reconcileActiveRun?: ConstructorParameters<typeof OpsWorkerSupervisor>[0]["reconcileActiveRun"];
+    faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
   } = {},
 ): Promise<Harness> {
   let currentNow = NOW;
@@ -185,6 +196,7 @@ async function makeHarness(
   const store = new OpsWorkerTaskStore(directory, {
     registry: taskRegistry(doneChecks),
     now: () => new Date(currentNow),
+    faultInjector: options.faultInjector,
   });
   const supervisor = new OpsWorkerSupervisor({
     store,
@@ -418,6 +430,90 @@ describe("ops worker supervisor", () => {
     assert.deepEqual(harness.store.get("task-claim")?.custody, claimed?.task.custody);
   });
 
+  it("serializes lifecycle evidence with a supervisor transition without losing either write", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-transition-race-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const doneChecks = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        timeoutMs: 500,
+        validateParams: validateFixtureParams,
+        run: () => ({ result: "PASS", summary: "Fixture passed." }),
+      },
+    });
+    const store = new OpsWorkerTaskStore(directory, {
+      registry: taskRegistry(doneChecks),
+    });
+    const task = makeTask("task-transition-race");
+    store.create(task);
+    const readyPath = join(directory, "transition-ready");
+    const releasePath = join(directory, "transition-release");
+    const lifecycleStartedPath = join(directory, "lifecycle-started");
+    const lifecycleCompletedPath = join(directory, "lifecycle-completed");
+    const runChild = (args: string[]): Promise<{
+      code: number | null;
+      stderr: string;
+    }> => {
+      const child = spawn(process.execPath, ["--import", "tsx", ...args], {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      return new Promise((resolve) => {
+        child.once("close", (code) => resolve({ code, stderr }));
+      });
+    };
+    const waitForPath = async (path: string): Promise<void> => {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(path)) {
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${path}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    const transition = runChild([
+      SUPERVISOR_TRANSITION_FIXTURE,
+      directory,
+      task.id,
+      readyPath,
+      releasePath,
+    ]);
+    await waitForPath(readyPath);
+    const transitionHoldsStoreLock = existsSync(join(directory, ".task-store.lock"));
+    const lifecycle = runChild([
+      LIFECYCLE_UPDATE_FIXTURE,
+      directory,
+      task.id,
+      "branch",
+      "refs/heads/atomic-transition",
+      "",
+      "",
+      lifecycleStartedPath,
+      lifecycleCompletedPath,
+    ]);
+    await waitForPath(lifecycleStartedPath);
+    if (!transitionHoldsStoreLock) {
+      await waitForPath(lifecycleCompletedPath);
+    }
+    writeFileSync(releasePath, "release\n", "utf8");
+    const results = await Promise.all([transition, lifecycle]);
+    assert.equal(results[0].code, 0, JSON.stringify(results));
+    if (results[1].code !== 0) {
+      assert.match(results[1].stderr, /task-store mutation is in progress/);
+      const retry = await runChild([
+        LIFECYCLE_UPDATE_FIXTURE,
+        directory,
+        task.id,
+        "branch",
+        "refs/heads/atomic-transition",
+      ]);
+      assert.equal(retry.code, 0, JSON.stringify(retry));
+    }
+
+    const updated = store.get(task.id);
+    assert.equal(updated?.session.sessionId, "session-after-interleaving");
+    assert.equal(updated?.lifecycle.branch, "refs/heads/atomic-transition");
+  });
+
   it("retains custody through delayed checks and releases it for PASS and cancellation", async (t) => {
     let result: OpsWorkerDoneCheckResult = {
       result: "DEFER",
@@ -533,6 +629,79 @@ describe("ops worker supervisor", () => {
     assert.throws(
       () => harness.supervisor.cancelTask("task-pass", "too late"),
       /Illegal ops-worker transition DONE -> CANCELLED/,
+    );
+  });
+
+  it("commits successful report state and receipt outcome in one crash-safe snapshot", async (t) => {
+    let armed = false;
+    let renamedSnapshots = 0;
+    const harness = await makeHarness(t, {
+      faultInjector: (point) => {
+        if (!armed || point !== "after-snapshot-rename") return;
+        renamedSnapshots += 1;
+        if (renamedSnapshots === 4) {
+          throw new Error("Synthetic crash after atomic report snapshot rename");
+        }
+      },
+    });
+    harness.store.create(makeTask("task-report-crash"));
+    harness.supervisor.requestDoneCheck("task-report-crash");
+    await harness.supervisor.runDoneCheck("task-report-crash");
+
+    armed = true;
+    assert.throws(
+      () => harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
+      /Synthetic crash after atomic report snapshot rename/,
+    );
+    assert.equal(renamedSnapshots, 4);
+    const persisted = harness.store.get("task-report-crash");
+    assert.equal(persisted?.report.state, "SENT");
+    assert.equal(persisted?.report.attempts, 1);
+    assert.equal(persisted?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("requires claimed report reconciliation before retrying a blocked task", async (t) => {
+    const harness = await makeHarness(t, {
+      implementation: () => ({
+        result: "ACTION_REQUIRED",
+        summary: "Fixture remains incomplete.",
+      }),
+    });
+    harness.store.create(makeTask("task-report-retry", { maxRemediation: 1 }));
+    harness.supervisor.requestDoneCheck("task-report-retry");
+    const blocked = await harness.supervisor.runDoneCheck("task-report-retry");
+    assert.equal(blocked.state, "BLOCKED");
+
+    harness.supervisor.recordReportAttempt("task-report-retry", {
+      sent: false,
+      error: "Synthetic ambiguous report failure",
+    });
+    assert.throws(
+      () => harness.supervisor.retryBlockedTask("task-report-retry"),
+      /claimed report receipt still requires reconciliation/,
+    );
+    harness.supervisor.recordReportAttempt("task-report-retry", { sent: true });
+    const resumed = harness.supervisor.retryBlockedTask("task-report-retry");
+    assert.equal(resumed.state, "RESUMABLE");
+    assert.equal(resumed.report.state, "NONE");
+    harness.supervisor.cancelTask("task-report-retry", "Release fixture custody");
+
+    harness.store.create(makeTask("task-query-only-retry", { maxRemediation: 1 }));
+    harness.supervisor.requestDoneCheck("task-query-only-retry");
+    await harness.supervisor.runDoneCheck("task-query-only-retry");
+    new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date(LATER),
+    }).beginMutationReceipt("task-query-only-retry", {
+      boundary: "report",
+      operationId: "report-query-only",
+      intent: { taskId: "task-query-only-retry" },
+      queryObservedAt: LATER,
+      queryResult: { sent: false },
+    });
+    const queryOnlyRetried = harness.supervisor.retryBlockedTask("task-query-only-retry");
+    assert.equal(
+      queryOnlyRetried.mutationReceipts.report?.outcome?.result,
+      "NOT_NEEDED",
     );
   });
 

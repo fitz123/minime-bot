@@ -411,7 +411,7 @@ describe("ops worker CLI and inactive runtime", () => {
     ], fixture.root, deps);
     assert.equal(query.code, 0, query.stderr);
 
-    const claim = await runWorkerCli([
+    const claimArgs = [
       "worker",
       "receipt-claim",
       "--state-dir",
@@ -425,8 +425,27 @@ describe("ops worker CLI and inactive runtime", () => {
       "--intent",
       '{"head":"abc123","pullRequest":58}',
       "--json",
-    ], fixture.root, deps);
+    ];
+    const claim = await runWorkerCli(claimArgs, fixture.root, deps);
     assert.equal(claim.code, 0, claim.stderr);
+    const claimed = JSON.parse(claim.stdout) as {
+      claimed: boolean;
+      task: OpsWorkerTask;
+    };
+    assert.equal(claimed.claimed, true);
+    assert.equal(
+      claimed.task.mutationReceipts.merge?.mutationStartedAt,
+      "2026-07-18T10:00:01.000Z",
+    );
+
+    const claimReplay = await runWorkerCli(claimArgs, fixture.root, deps);
+    assert.equal(claimReplay.code, 0, claimReplay.stderr);
+    const replayedClaim = JSON.parse(claimReplay.stdout) as {
+      claimed: boolean;
+      task: OpsWorkerTask;
+    };
+    assert.equal(replayedClaim.claimed, false);
+    assert.deepEqual(replayedClaim.task, claimed.task);
 
     const finish = await runWorkerCli([
       "worker",
@@ -599,6 +618,12 @@ describe("ops worker CLI and inactive runtime", () => {
       summary: "Fixture exhausted its remediation budget",
     };
     blocked.report.state = "PENDING";
+    blocked.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: blocked.updatedAt,
+      releaseReason: "BLOCKED",
+    };
     store.replace(blocked);
 
     const retried = await runWorkerCli([
