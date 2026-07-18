@@ -274,7 +274,10 @@ async function makeHarness(
     result: "PASS",
     summary: "Fixture is deterministically complete.",
   }),
-  options: { quotaAdmission?: OpsWorkerQuotaAdmissionGate } = {},
+  options: {
+    authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+    quotaAdmission?: OpsWorkerQuotaAdmissionGate;
+  } = {},
 ): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "minime-ops-worker-pi-"));
   const workspace = join(root, "workspace");
@@ -341,7 +344,8 @@ async function makeHarness(
     instanceId: "pi-fixture-supervisor",
     processStartToken: "pi-fixture-supervisor-start",
     infrastructureRetryMs: 1,
-    authorizationVerifiers: fixtureAuthorizationVerifiers,
+    authorizationVerifiers: options.authorizationVerifiers
+      ?? fixtureAuthorizationVerifiers,
     authorizationQueryRetryMs: 1,
     quotaAdmission: options.quotaAdmission,
     quotaRecheckMs: 1,
@@ -801,6 +805,75 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(quotaResult?.schedule.nextRunAt, sampled.windows["5h"].resetAt);
     assert.equal(quotaResult?.custody.status, "HELD");
     assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
+  it("revalidates again immediately before spawning held and unclaimed quota probes", async (t) => {
+    const statuses: Array<"PASS" | "DRIFT" | "QUERY_ERROR"> = [];
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "quota-probe-runner-authorization",
+      version: "1",
+      verify: () => {
+        verificationCalls += 1;
+        const status = statuses.shift() ?? "QUERY_ERROR";
+        return {
+          status,
+          evidenceHash: `sha256:${"8".repeat(64)}`,
+          summary: `Synthetic runner quota probe authorization ${status}`,
+        };
+      },
+    };
+    let quota = admittedQuota();
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+      quotaAdmission: { check: () => quota },
+    });
+    const held = makeTask("held-quota-probe-revalidation");
+    held.state = "RESUMABLE";
+    held.custody = {
+      status: "HELD",
+      claimedAt: held.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    held.lastOutcome = {
+      at: held.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic held quota wait",
+    };
+    harness.store.create(held);
+    statuses.push("PASS", "DRIFT");
+
+    const blocked = await harness.runner().runNext();
+    assert.equal(blocked?.state, "BLOCKED");
+    assert.equal(blocked?.authorizationVerification?.status, "DRIFT");
+    assert.equal(harness.invocations.length, 0);
+    assert.equal(verificationCalls, 2);
+
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    quota = deniedQuota(dueAt);
+    const unclaimed = makeTask("unclaimed-quota-probe-revalidation");
+    unclaimed.schedule.nextRunAt = dueAt;
+    unclaimed.lastOutcome = {
+      at: unclaimed.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait",
+    };
+    harness.store.create(unclaimed);
+    statuses.push("PASS", "QUERY_ERROR");
+
+    const queryError = await harness.runner().runNext();
+    assert.equal(queryError?.state, "QUEUED");
+    assert.equal(queryError?.custody.status, "UNCLAIMED");
+    assert.equal(queryError?.authorizationVerification?.status, "QUERY_ERROR");
+    assert.equal(queryError?.lastOutcome?.kind, "AUTHORIZATION");
+    assert.equal(harness.invocations.length, 0);
+    assert.equal(verificationCalls, 4);
   });
 
   it("runs a due reset probe without claiming whole-cycle custody", async (t) => {

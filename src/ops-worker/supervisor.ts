@@ -778,6 +778,16 @@ export class OpsWorkerSupervisor {
     return claimed;
   }
 
+  async revalidateQuotaProbe(
+    taskId: string,
+  ): Promise<OpsWorkerScheduledTask | undefined> {
+    this.assertStarted();
+    return this.applyQuotaScheduling(
+      { action: "RUN", task: this.requireTask(taskId) },
+      false,
+    );
+  }
+
   private selectScheduledTask(
     tasks: readonly OpsWorkerTask[],
   ): OpsWorkerScheduledTask | undefined {
@@ -914,7 +924,10 @@ export class OpsWorkerSupervisor {
         if (!claimed) return undefined;
         return { action: "QUOTA_PROBE", task: claimed };
       }
-      return { action: "QUOTA_PROBE", task };
+      return this.revalidateQuotaProbeAuthorization(
+        task.id,
+        requireCurrentSelection,
+      );
     }
     if (decision.status === "NOT_ADMITTED") {
       return {
@@ -923,6 +936,46 @@ export class OpsWorkerSupervisor {
       };
     }
     return undefined;
+  }
+
+  private async revalidateQuotaProbeAuthorization(
+    taskId: string,
+    requireCurrentSelection: boolean,
+  ): Promise<OpsWorkerScheduledTask | undefined> {
+    let eligibilityChanged = false;
+    const authorization = await this.authorization.revalidate(taskId, {
+      audit: {
+        event: "TRANSITION",
+        summary: "Revalidated authorization before exact quota smoke probe",
+      },
+      onPass: (task) => {
+        const decision = this.quotaAdmission?.check();
+        const authoritativeDeadline = isOpsWorkerQuotaWait(task)
+          && isAuthoritativePersistedQuotaWait(task)
+          && task.schedule.nextRunAt !== null
+          && Date.parse(task.schedule.nextRunAt) <= this.now().getTime();
+        if (
+          (task.state !== "QUEUED" && task.state !== "RESUMABLE")
+          || !isOpsWorkerQuotaWait(task)
+          || (decision?.status !== "ADMITTED" && !authoritativeDeadline)
+        ) {
+          eligibilityChanged = true;
+          return;
+        }
+        if (requireCurrentSelection) {
+          const selected = this.selectScheduledTask(this.store.list());
+          if (selected?.task.id !== taskId || selected.action !== "RUN") {
+            eligibilityChanged = true;
+          }
+        }
+      },
+    });
+    if (eligibilityChanged) return undefined;
+    if (
+      !authorization.authorized
+      || !hasFreshOpsWorkerAuthorizationPass(authorization.task)
+    ) return { action: "WAIT", task: authorization.task };
+    return { action: "QUOTA_PROBE", task: authorization.task };
   }
 
   beginPiLaunch(

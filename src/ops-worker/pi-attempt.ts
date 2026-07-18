@@ -1169,8 +1169,15 @@ export class OpsWorkerPiAttemptRunner {
   }
 
   private async runQuotaSmokeProbe(taskId: string): Promise<OpsWorkerTask> {
+    const scheduled = await this.supervisor.revalidateQuotaProbe(taskId);
+    if (scheduled?.action !== "QUOTA_PROBE") {
+      return scheduled?.task ?? this.requireTask(taskId);
+    }
     const task = this.requireRunnableTask(taskId);
-    if (!isOpsWorkerQuotaWait(task)) return task;
+    if (
+      !isOpsWorkerQuotaWait(task)
+      || !hasFreshOpsWorkerAuthorizationPass(task)
+    ) return task;
     const context = this.assembleContext(this.primaryContextAgent, {
       artifactWorkspaceCwd: this.workspaceCwd,
       strict: true,

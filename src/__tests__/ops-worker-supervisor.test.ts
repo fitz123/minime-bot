@@ -949,6 +949,68 @@ describe("ops worker supervisor", () => {
     assert.equal(runnable?.task.custody.claimedAt, claimedAt);
   });
 
+  it("revalidates authorization before held and unclaimed quota probes", async (t) => {
+    let authorizationStatus: "PASS" | "DRIFT" | "QUERY_ERROR" = "PASS";
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "quota-probe-authorization",
+      version: "1",
+      verify: () => ({
+        status: authorizationStatus,
+        evidenceHash: `sha256:${"7".repeat(64)}`,
+        summary: `Synthetic quota probe authorization ${authorizationStatus}`,
+      }),
+    };
+    let current = quotaDecision("ADMITTED");
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+      quotaAdmission: { check: () => current },
+    });
+    const held = makeTask("task-held-quota-authorization");
+    held.state = "RESUMABLE";
+    held.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    held.lastOutcome = {
+      at: NOW,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic held quota wait",
+    };
+    harness.store.create(held);
+
+    authorizationStatus = "DRIFT";
+    const blocked = await harness.supervisor.claimNextTask();
+    assert.equal(blocked?.action, "WAIT");
+    assert.equal(blocked?.task.state, "BLOCKED");
+    assert.equal(blocked?.task.custody.status, "RELEASED");
+    assert.equal(blocked?.task.authorizationVerification?.status, "DRIFT");
+
+    const unclaimed = makeTask("task-unclaimed-quota-authorization");
+    harness.store.create(unclaimed);
+    current = quotaDecision("NOT_ADMITTED");
+    const waiting = await harness.supervisor.claimNextTask();
+    assert.equal(waiting?.action, "WAIT");
+    assert.equal(waiting?.task.custody.status, "UNCLAIMED");
+    harness.setNow(LATER);
+
+    authorizationStatus = "QUERY_ERROR";
+    const deniedProbe = await harness.supervisor.claimNextTask();
+    assert.equal(deniedProbe?.action, "WAIT");
+    assert.equal(deniedProbe?.task.state, "QUEUED");
+    assert.equal(deniedProbe?.task.custody.status, "UNCLAIMED");
+    assert.equal(
+      deniedProbe?.task.authorizationVerification?.status,
+      "QUERY_ERROR",
+    );
+    assert.equal(deniedProbe?.task.lastOutcome?.kind, "AUTHORIZATION");
+  });
+
   it("retains held custody across quota response resets, rolling resets, and restart", async (t) => {
     let current = quotaDecision("ADMITTED");
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => current };
