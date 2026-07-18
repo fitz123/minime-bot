@@ -76,11 +76,11 @@ Base source: `f419d13` (`origin/main` when this plan was prepared)
 
 ### Task 4: Enforce one exclusive custody owner through verification and waits
 
-- [ ] Add failing cases to `src/__tests__/ops-worker-supervisor.test.ts` and `src/__tests__/ops-worker-pi-attempt.test.ts` proving that delayed `CHECKING`, quota/network `RESUMABLE`, restart-reconciled `RESUMABLE`, and an interrupted owned attempt all block a queued successor; prove fresh `PASS`, `CANCELLED`, or genuine process-free `BLOCKED` releases custody, while an ambiguous orphan does not.
-- [ ] Add an atomic supervisor custody claim used by `OpsWorkerPiAttemptRunner.runNext()` before either `RUN` or `CHECK`; if a held owner exists, the scheduler may return only that task when eligible and must return no successor while the owner is waiting.
-- [ ] Preserve held custody across `RUNNING -> CHECKING`, `ACTION_REQUIRED -> RESUMABLE`, infrastructure/quota outcomes, shutdown reconciliation, and explicit owned-group interruption; release it only with the ADR-099 terminal conditions and persist every acquisition/release through the v2 snapshot.
-- [ ] Remove queue-priority-driven cross-task handoff from `src/ops-worker/pi-attempt.ts` (`createPreemptionMonitor` / `findHigherPriorityReadyTask`) for this globally serial phase. Keep proven owned-group stop/reconciliation paths; do not implement recovery nesting, lanes, or a second active process group.
-- [ ] Update startup reconciliation to fail closed on multiple migrated held owners and to resume the single proven owner before queued work; retain the unresolved-orphan global fence and run supervisor/Pi-attempt tests before Task 5.
+- [x] Add failing cases to `src/__tests__/ops-worker-supervisor.test.ts` and `src/__tests__/ops-worker-pi-attempt.test.ts` proving that delayed `CHECKING`, quota/network `RESUMABLE`, restart-reconciled `RESUMABLE`, and an interrupted owned attempt all block a queued successor; prove fresh `PASS`, `CANCELLED`, or genuine process-free `BLOCKED` releases custody, while an ambiguous orphan does not.
+- [x] Add an atomic supervisor custody claim used by `OpsWorkerPiAttemptRunner.runNext()` before either `RUN` or `CHECK`; if a held owner exists, the scheduler may return only that task when eligible and must return no successor while the owner is waiting.
+- [x] Preserve held custody across `RUNNING -> CHECKING`, `ACTION_REQUIRED -> RESUMABLE`, infrastructure/quota outcomes, shutdown reconciliation, and explicit owned-group interruption; release it only with the ADR-099 terminal conditions and persist every acquisition/release through the v2 snapshot.
+- [x] Remove queue-priority-driven cross-task handoff from `src/ops-worker/pi-attempt.ts` (`createPreemptionMonitor` / `findHigherPriorityReadyTask`) for this globally serial phase. Keep proven owned-group stop/reconciliation paths; do not implement recovery nesting, lanes, or a second active process group.
+- [x] Update startup reconciliation to fail closed on multiple migrated held owners and to resume the single proven owner before queued work; retain the unresolved-orphan global fence and run supervisor/Pi-attempt tests before Task 5.
 
 ### Task 5: Expose only the inactive helper surface and validate the package
 

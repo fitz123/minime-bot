@@ -57,7 +57,6 @@ export const OPS_WORKER_PI_LIMITS = {
   defaultStallTimeoutMs: 20 * 60 * 1_000,
   defaultTermGraceMs: 5_000,
   defaultKillGraceMs: 2_000,
-  defaultPreemptionPollMs: 250,
   processInspectionPollMs: 25,
   processInspectionTimeoutMs: 1_000,
 } as const;
@@ -151,7 +150,6 @@ export interface OpsWorkerPiAttemptOptions {
   stallTimeoutMs?: number;
   termGraceMs?: number;
   killGraceMs?: number;
-  preemptionPollMs?: number;
   dependencies?: OpsWorkerPiAttemptDependencies;
 }
 
@@ -226,7 +224,6 @@ export class OpsWorkerPiAttemptRunner {
   private readonly stallTimeoutMs: number;
   private readonly termGraceMs: number;
   private readonly killGraceMs: number;
-  private readonly preemptionPollMs: number;
   private readonly spawnProcess: SpawnProcess;
   private readonly resolveInvocation: (args: readonly string[]) => PiInvocation;
   private readonly buildEnv: (agentWorkspaceRoot: string) => Record<string, string>;
@@ -284,12 +281,6 @@ export class OpsWorkerPiAttemptRunner {
       "killGraceMs",
       60_000,
     );
-    this.preemptionPollMs = boundedDuration(
-      options.preemptionPollMs,
-      OPS_WORKER_PI_LIMITS.defaultPreemptionPollMs,
-      "preemptionPollMs",
-      60_000,
-    );
     const dependencies = options.dependencies ?? {};
     this.spawnProcess = dependencies.spawnProcess
       ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
@@ -316,7 +307,7 @@ export class OpsWorkerPiAttemptRunner {
 
   async runNext(): Promise<OpsWorkerTask | undefined> {
     if (this.abortSignal?.aborted) return undefined;
-    const scheduled = this.supervisor.selectNextTask();
+    const scheduled = this.supervisor.claimNextTask();
     if (!scheduled) return undefined;
     if (scheduled.action === "CHECK") {
       return this.supervisor.runDoneCheck(scheduled.task.id, this.abortSignal);
@@ -325,6 +316,7 @@ export class OpsWorkerPiAttemptRunner {
   }
 
   async runAttempt(taskId: string): Promise<OpsWorkerTask> {
+    this.supervisor.ensureTaskCustody(taskId, "RUN");
     this.supervisor.reservePiProcessGroupLaunch(taskId);
     try {
       if (this.abortSignal?.aborted) {
@@ -638,15 +630,10 @@ export class OpsWorkerPiAttemptRunner {
       lastStreamProgressAt: () => lastStreamProgressAt,
     });
     const shutdownTrigger = createAbortTrigger(this.abortSignal);
-    const preemptionMonitor = this.createPreemptionMonitor(
-      task,
-      () => exitSettled,
-    );
     const triggerPromise = Promise.race([
       exitPromise.then((exit) => ({ kind: "EXIT" as const, exit })),
       timeoutPromise,
       stallMonitor.promise,
-      preemptionMonitor.promise,
       shutdownTrigger.promise,
     ]).catch((error: unknown) => ({
       kind: "MONITOR_ERROR" as const,
@@ -658,7 +645,6 @@ export class OpsWorkerPiAttemptRunner {
     } finally {
       if (timeout) clearTimeout(timeout);
       stallMonitor.close();
-      preemptionMonitor.close();
       shutdownTrigger.close();
     }
 
@@ -721,16 +707,6 @@ export class OpsWorkerPiAttemptRunner {
     const exit = await boundedExitWait(exitPromise, this.sleep);
     if (exit === null) abandonDetachedChild(child);
     const evidence = exit ? formatAttemptEvidence(exit) : undefined;
-    if (trigger.kind === "PREEMPT") {
-      return {
-        classification: "CRASH",
-        task: this.supervisor.recordPreemption(
-          task.id,
-          `Preempted for higher-priority task ${trigger.taskId}`,
-          evidence,
-        ),
-      };
-    }
     if (trigger.kind === "SHUTDOWN") {
       return {
         classification: "CRASH",
@@ -892,67 +868,6 @@ export class OpsWorkerPiAttemptRunner {
       status: "AMBIGUOUS",
       summary: "Fresh Pi process did not prove the expected launch nonce before timeout",
     };
-  }
-
-  private createPreemptionMonitor(
-    activeTask: OpsWorkerTask,
-    isExited: () => boolean,
-  ): {
-    promise: Promise<{ kind: "PREEMPT"; taskId: string }>;
-    close(): void;
-  } {
-    let timer: NodeJS.Timeout | undefined;
-    let closed = false;
-    const promise = new Promise<{ kind: "PREEMPT"; taskId: string }>(
-      (resolvePreemption, rejectPreemption) => {
-        const check = (): void => {
-          if (closed || isExited()) return;
-          let next: OpsWorkerTask | undefined;
-          try {
-            next = this.findHigherPriorityReadyTask(activeTask);
-          } catch (error) {
-            rejectPreemption(error);
-            return;
-          }
-          if (next) {
-            resolvePreemption({ kind: "PREEMPT", taskId: next.id });
-            return;
-          }
-          timer = setTimeout(check, this.preemptionPollMs);
-        };
-        timer = setTimeout(check, this.preemptionPollMs);
-      },
-    );
-    return {
-      promise,
-      close(): void {
-        closed = true;
-        if (timer) clearTimeout(timer);
-      },
-    };
-  }
-
-  private findHigherPriorityReadyTask(activeTask: OpsWorkerTask): OpsWorkerTask | undefined {
-    const now = this.now().getTime();
-    return this.supervisor.listTasks()
-      .filter((candidate) => {
-        if (candidate.id === activeTask.id || candidate.priority >= activeTask.priority) {
-          return false;
-        }
-        if (candidate.state === "QUEUED" || candidate.state === "RESUMABLE") {
-          return candidate.schedule.nextRunAt === null
-            || Date.parse(candidate.schedule.nextRunAt) <= now;
-        }
-        if (candidate.state === "CHECKING") {
-          return candidate.schedule.nextCheckAt === null
-            || Date.parse(candidate.schedule.nextCheckAt) <= now;
-        }
-        return false;
-      })
-      .sort((left, right) =>
-        left.priority - right.priority
-        || Date.parse(left.createdAt) - Date.parse(right.createdAt)
-        || left.id.localeCompare(right.id))[0];
   }
 
   private prepareSessionDirectory(task: OpsWorkerTask): string {

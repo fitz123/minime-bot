@@ -230,7 +230,6 @@ async function makeHarness(
         stallTimeoutMs: options.stallTimeoutMs,
         termGraceMs: 200,
         killGraceMs: 200,
-        preemptionPollMs: 20,
         dependencies: {
           resolveInvocation: (args) => {
             invocations.push([...args]);
@@ -473,6 +472,9 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("classifies quota, network, context overflow, and bounded crash evidence as resumable", async (t) => {
     const harness = await makeHarness(t);
+    harness.store.create(makeTask("classify-successor", {
+      sourceKind: "authorized-issue",
+    }));
     const cases = [
       ["quota", "QUOTA"],
       ["network", "NETWORK"],
@@ -489,6 +491,7 @@ describe("ops worker Pi standard-session attempts", () => {
       assert.equal(result.lastOutcome?.result, expected);
       assert.equal(result.rounds.remediation, 0);
       assert.equal(result.session.resume, true);
+      assert.equal(result.custody.status, "HELD");
       const piEvidence = [...result.evidence]
         .reverse()
         .find((entry) => entry.kind === "pi");
@@ -500,6 +503,8 @@ describe("ops worker Pi standard-session attempts", () => {
       if (scenario === "large-output") {
         assert.match(piEvidence.summary, /omitted \d+ earlier byte/);
       }
+      assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
   });
 
@@ -535,71 +540,39 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(harness.invocations[1].includes("--session-id"));
   });
 
-  it("preempts only for higher priority and owns exactly one process group", async (t) => {
+  it("keeps an interrupted owner ahead of a queued higher-priority task", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("low-priority", {
       sourceKind: "authorized-issue",
     }));
     harness.setScenario("wait");
-    const runner = harness.runner();
+    const controller = new AbortController();
+    const runner = harness.runner({ abortSignal: controller.signal });
     const running = runner.runAttempt("low-priority");
     await waitFor(() => harness.supervisor.getTask("low-priority")?.state === "RUNNING");
     const active = harness.supervisor.getTask("low-priority")?.activeRun;
+    const claimedAt = harness.supervisor.getTask("low-priority")?.custody.claimedAt;
     assert.ok(active);
     assert.equal(active.pid, active.processGroupId);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "OWNED");
 
-    harness.store.create(makeTask("second-low", {
-      sourceKind: "authorized-issue",
-    }));
-    await assert.rejects(
-      harness.runner().runAttempt("second-low"),
-      /launch slot is already reserved by task low-priority/,
-    );
-    await assert.rejects(
-      runner.runAttempt("second-low"),
-      /launch slot is already reserved by task low-priority/,
-    );
-    assert.equal(harness.supervisor.getTask("low-priority")?.state, "RUNNING");
-
     harness.store.create(makeTask("urgent", { sourceKind: "alertmanager" }));
-    const preempted = await running;
-    assert.equal(preempted.state, "RESUMABLE", JSON.stringify(preempted.lastOutcome));
-    assert.equal(preempted.lastOutcome?.result, "PREEMPTED");
-    assert.equal(preempted.rounds.remediation, 0);
-    assert.equal(preempted.activeRun, null);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+    assert.equal(harness.supervisor.getTask("low-priority")?.state, "RUNNING");
+    assert.equal(await harness.runner().runNext(), undefined);
+
+    controller.abort();
+    const interrupted = await running;
+    assert.equal(interrupted.state, "RESUMABLE", JSON.stringify(interrupted.lastOutcome));
+    assert.equal(interrupted.lastOutcome?.result, "CRASH");
+    assert.match(interrupted.lastOutcome?.summary ?? "", /worker shutdown/);
+    assert.equal(interrupted.custody.status, "HELD");
+    assert.equal(interrupted.custody.claimedAt, claimedAt);
+    assert.equal(interrupted.rounds.remediation, 0);
+    assert.equal(interrupted.activeRun, null);
     assert.equal(harness.supervisor.getTask("urgent")?.state, "QUEUED");
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
-  });
-
-  it("stops the owned group when priority monitoring fails", async (t) => {
-    const harness = await makeHarness(t);
-    harness.store.create(makeTask("priority-monitor-failure"));
-    harness.setScenario("wait");
-    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
-    let failPriorityPoll = false;
-    harness.supervisor.listTasks = () => {
-      if (failPriorityPoll) throw new Error("synthetic priority store failure");
-      return originalListTasks();
-    };
-
-    const running = harness.runner().runAttempt("priority-monitor-failure");
-    await waitFor(() =>
-      harness.supervisor.getTask("priority-monitor-failure")?.state === "RUNNING"
-    );
-    const active = harness.supervisor.getTask("priority-monitor-failure")?.activeRun;
-    assert.ok(active);
-    failPriorityPoll = true;
-
-    const result = await running;
-    harness.supervisor.listTasks = originalListTasks;
-
-    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
-    assert.equal(result.lastOutcome?.result, "CRASH");
-    assert.match(result.lastOutcome?.summary ?? "", /monitor failed.*priority store failure/);
-    assert.equal(result.activeRun, null);
-    assert.equal(result.rounds.remediation, 0);
-    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, "low-priority");
   });
 
   it("stops a no-progress attempt at the stall bound without spending remediation", async (t) => {
@@ -695,7 +668,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
-  it("abandons child handles and priority polling after ambiguous shutdown", async (t) => {
+  it("abandons child handles after ambiguous shutdown", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("ambiguous-shutdown"));
     const controller = new AbortController();
@@ -714,12 +687,6 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     t.after(() => child.emit("close", null, null));
 
-    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
-    let priorityPolls = 0;
-    harness.supervisor.listTasks = () => {
-      priorityPolls += 1;
-      return originalListTasks();
-    };
     const running = harness.runner({
       abortSignal: controller.signal,
       dependencies: {
@@ -756,9 +723,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(unrefCalls, 1);
     assert.equal(stdout.destroyed, true);
     assert.equal(stderr.destroyed, true);
-    const pollsAfterReturn = priorityPolls;
-    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
-    assert.equal(priorityPolls, pollsAfterReturn);
+    assert.equal(result.custody.status, "HELD");
   });
 
   it("interrupts the deterministic check after a natural Pi success", async (t) => {
@@ -887,6 +852,7 @@ describe("ops worker Pi standard-session attempts", () => {
     }).runAttempt("spawn-throws");
     assert.equal(spawnFailure.state, "RESUMABLE");
     assert.equal(spawnFailure.lastOutcome?.result, "CRASH");
+    harness.supervisor.cancelTask("spawn-throws", "Release fixture custody");
 
     harness.store.create(makeTask("identity-gone"));
     harness.setScenario("success");

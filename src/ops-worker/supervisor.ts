@@ -22,10 +22,14 @@ import {
   hashOpsWorkerCanonicalPayload,
   OpsWorkerLifecycle,
 } from "./lifecycle.js";
-import { OpsWorkerTaskStore } from "./task-store.js";
+import {
+  OPS_WORKER_TASK_STORE_NO_CHANGE,
+  OpsWorkerTaskStore,
+} from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
   type OpsWorkerActiveRun,
+  type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
   type OpsWorkerLastOutcome,
   type OpsWorkerOutcomeResult,
@@ -505,18 +509,27 @@ export class OpsWorkerSupervisor {
 
   reservePiProcessGroupLaunch(taskId: string): void {
     this.assertStarted();
-    this.requireTask(taskId);
+    const task = this.requireTask(taskId);
+    if (task.custody.status !== "HELD") {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} must hold custody before reserving the Pi launch slot`,
+      );
+    }
     if (this.piLaunchReservation !== null) {
       throw new OpsWorkerSupervisorStateError(
         `Pi launch slot is already reserved by task ${this.piLaunchReservation}`,
       );
     }
-    if (
-      this.store.list().some((task) =>
-        task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
-    ) {
+    if (this.store.list().some((candidate) =>
+      candidate.id !== taskId
+      && (
+        candidate.custody.status === "HELD"
+        || candidate.state === "RUNNING"
+        || isOpsWorkerUnresolvedOrphan(candidate)
+      )
+    )) {
       throw new OpsWorkerSupervisorStateError(
-        "A supervisor may own at most one active or unresolved process group",
+        "A supervisor may own at most one task custody or unresolved process group",
       );
     }
     this.piLaunchReservation = taskId;
@@ -559,13 +572,49 @@ export class OpsWorkerSupervisor {
 
   selectNextTask(): OpsWorkerScheduledTask | undefined {
     this.assertStarted();
-    const tasks = this.store.list();
-    if (
-      tasks.some((task) =>
-        task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
-    ) return undefined;
+    return this.selectScheduledTask(this.store.list());
+  }
+
+  claimNextTask(): OpsWorkerScheduledTask | undefined {
+    this.assertStarted();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const scheduled = this.selectScheduledTask(this.store.list());
+      if (!scheduled) return undefined;
+      const claimed = this.claimTaskCustody(
+        scheduled.task.id,
+        scheduled.action,
+        true,
+      );
+      if (claimed) return { action: scheduled.action, task: claimed };
+    }
+    return undefined;
+  }
+
+  ensureTaskCustody(
+    taskId: string,
+    action: OpsWorkerScheduledAction,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const claimed = this.claimTaskCustody(taskId, action, false);
+    if (!claimed) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} changed while custody was being claimed`,
+      );
+    }
+    return claimed;
+  }
+
+  private selectScheduledTask(
+    tasks: readonly OpsWorkerTask[],
+  ): OpsWorkerScheduledTask | undefined {
+    const held = tasks.filter((task) => task.custody.status === "HELD");
+    if (held.length > 1) {
+      throw new OpsWorkerSupervisorStateError(
+        `Refusing multiple held custody owners: ${held.map((task) => task.id).join(", ")}`,
+      );
+    }
     const now = this.now().getTime();
-    const candidates = tasks.flatMap((task): OpsWorkerScheduledTask[] => {
+    const candidateFor = (task: OpsWorkerTask): OpsWorkerScheduledTask[] => {
       if (task.state === "CHECKING") {
         if (
           task.schedule.nextCheckAt !== null
@@ -581,12 +630,82 @@ export class OpsWorkerSupervisor {
         return [{ action: "RUN", task }];
       }
       return [];
-    });
+    };
+    if (held.length === 1) {
+      if (tasks.some((task) =>
+        task.id !== held[0].id
+        && (task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
+      )) return undefined;
+      return candidateFor(held[0])[0];
+    }
+    if (
+      tasks.some((task) =>
+        task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task))
+    ) return undefined;
+    const candidates = tasks.flatMap(candidateFor);
     candidates.sort((left, right) =>
       left.task.priority - right.task.priority
       || Date.parse(left.task.createdAt) - Date.parse(right.task.createdAt)
       || (left.task.id < right.task.id ? -1 : left.task.id > right.task.id ? 1 : 0));
     return candidates[0];
+  }
+
+  private claimTaskCustody(
+    taskId: string,
+    action: OpsWorkerScheduledAction,
+    requireCurrentSelection: boolean,
+  ): OpsWorkerTask | undefined {
+    let selectionChanged = false;
+    const result = this.store.mutate(
+      taskId,
+      {
+        event: "TRANSITION",
+        summary: "Claimed exclusive whole-cycle custody",
+      },
+      (task) => {
+        const expectedStates: readonly OpsWorkerTaskState[] = action === "RUN"
+          ? ["QUEUED", "RESUMABLE"]
+          : ["CHECKING"];
+        if (!expectedStates.includes(task.state)) {
+          selectionChanged = true;
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        const tasks = this.store.list();
+        const held = tasks.filter((candidate) => candidate.custody.status === "HELD");
+        if (held.length > 1) {
+          throw new OpsWorkerSupervisorStateError(
+            `Refusing multiple held custody owners: ${held.map((candidate) => candidate.id).join(", ")}`,
+          );
+        }
+        if (held.length === 1 && held[0].id !== taskId) {
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${held[0].id} already holds exclusive custody`,
+          );
+        }
+        if (requireCurrentSelection) {
+          const selected = this.selectScheduledTask(tasks);
+          if (
+            selected?.task.id !== taskId
+            || selected.action !== action
+          ) {
+            selectionChanged = true;
+            return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          }
+        }
+        if (task.custody.status === "HELD") {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        const claimedAt = this.nextUpdatedAt(task);
+        task.updatedAt = claimedAt;
+        task.custody = {
+          status: "HELD",
+          claimedAt,
+          releasedAt: null,
+          releaseReason: null,
+        };
+      },
+    );
+    return selectionChanged ? undefined : result.task;
   }
 
   beginPiLaunch(
@@ -943,29 +1062,6 @@ export class OpsWorkerSupervisor {
     }, "Cleared a resolved short-lived Pi launch fence");
   }
 
-  recordPreemption(
-    taskId: string,
-    summary: string,
-    evidenceSummary?: string,
-  ): OpsWorkerTask {
-    this.assertStarted();
-    return this.transition(taskId, "RESUMABLE", (task, at) => {
-      task.activeRun = null;
-      task.session.resume = true;
-      task.schedule.nextRunAt = null;
-      task.schedule.nextCheckAt = null;
-      task.lastOutcome = {
-        at,
-        kind: "PREEMPTION",
-        result: "PREEMPTED",
-        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
-      };
-      if (evidenceSummary) {
-        appendEvidence(task, this.piEvidence(at, evidenceSummary));
-      }
-    }, "Preempted owned Pi process group for higher-priority work");
-  }
-
   resetPiSession(
     taskId: string,
     newSessionId: string,
@@ -1310,7 +1406,30 @@ export class OpsWorkerSupervisor {
   }
 
   private async reconcileStartup(): Promise<OpsWorkerStartupReconciliation[]> {
-    const running = this.store.list().filter((task) =>
+    const tasks = this.store.list();
+    const heldOwners = tasks.filter((task) => task.custody.status === "HELD");
+    if (heldOwners.length > 1) {
+      throw new OpsWorkerSupervisorStateError(
+        `Refusing multiple held custody owners at startup: ${heldOwners
+          .map((task) => task.id)
+          .join(", ")}`,
+      );
+    }
+    const ownershipClaims = tasks.filter((task) =>
+      task.custody.status === "HELD"
+      || task.state === "RUNNING"
+      || (
+        isOpsWorkerUnresolvedOrphan(task)
+        && (task.activeRun !== null || task.unverifiedRun !== null)
+      ));
+    if (new Set(ownershipClaims.map((task) => task.id)).size > 1) {
+      throw new OpsWorkerSupervisorStateError(
+        `Refusing multiple persisted custody or process owners at startup: ${ownershipClaims
+          .map((task) => task.id)
+          .join(", ")}`,
+      );
+    }
+    const running = tasks.filter((task) =>
       task.state === "RUNNING"
       || (
         isOpsWorkerUnresolvedOrphan(task)
@@ -1491,6 +1610,45 @@ export class OpsWorkerSupervisor {
     };
   }
 
+  private applyCustodyTransition(task: OpsWorkerTask, at: string): void {
+    let releaseReason: OpsWorkerCustodyReleaseReason | undefined;
+    if (task.state === "DONE") {
+      releaseReason = "DONE";
+    } else if (task.state === "CANCELLED") {
+      releaseReason = "CANCELLED";
+    } else if (
+      task.state === "BLOCKED"
+      && task.activeRun === null
+      && task.unverifiedRun === null
+      && !isOpsWorkerUnresolvedOrphan(task)
+    ) {
+      releaseReason = "BLOCKED";
+    }
+    if (releaseReason) {
+      task.custody = {
+        status: "RELEASED",
+        claimedAt: task.custody.claimedAt,
+        releasedAt: at,
+        releaseReason,
+      };
+      return;
+    }
+    if (
+      task.state === "RUNNING"
+      || task.state === "CHECKING"
+      || task.state === "RESUMABLE"
+      || task.state === "BLOCKED"
+    ) {
+      if (task.custody.status === "HELD") return;
+      task.custody = {
+        status: "HELD",
+        claimedAt: at,
+        releasedAt: null,
+        releaseReason: null,
+      };
+    }
+  }
+
   private transition(
     taskId: string,
     to: OpsWorkerTaskState,
@@ -1510,6 +1668,7 @@ export class OpsWorkerSupervisor {
     replacement.state = to;
     replacement.updatedAt = updatedAt;
     mutate(replacement, updatedAt);
+    this.applyCustodyTransition(replacement, updatedAt);
     this.store.replace(replacement, {
       event: "TRANSITION",
       summary: auditSummary,
