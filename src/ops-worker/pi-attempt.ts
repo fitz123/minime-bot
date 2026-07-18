@@ -324,14 +324,18 @@ export class OpsWorkerPiAttemptRunner {
     const scheduled = this.supervisor.claimNextTask();
     if (!scheduled) return undefined;
     if (scheduled.action === "CHECK") {
-      try {
-        return await this.supervisor.runDoneCheck(scheduled.task.id, this.abortSignal);
-      } catch (error) {
-        if (!(error instanceof OpsWorkerStaleCheckResultError)) throw error;
-        return this.supervisor.getTask(scheduled.task.id);
-      }
+      return this.runDoneCheckOrCurrent(scheduled.task.id);
     }
     return this.runAttempt(scheduled.task.id);
+  }
+
+  private async runDoneCheckOrCurrent(taskId: string): Promise<OpsWorkerTask> {
+    try {
+      return await this.supervisor.runDoneCheck(taskId, this.abortSignal);
+    } catch (error) {
+      if (!(error instanceof OpsWorkerStaleCheckResultError)) throw error;
+      return this.requireTask(taskId);
+    }
   }
 
   async runAttempt(taskId: string): Promise<OpsWorkerTask> {
@@ -782,7 +786,7 @@ export class OpsWorkerPiAttemptRunner {
       );
       return {
         classification,
-        task: await this.supervisor.runDoneCheck(taskId, this.abortSignal),
+        task: await this.runDoneCheckOrCurrent(taskId),
       };
     }
     if (classification === "SESSION_CORRUPT") {
@@ -820,7 +824,7 @@ export class OpsWorkerPiAttemptRunner {
       );
       return {
         classification,
-        task: await this.supervisor.runDoneCheck(taskId, this.abortSignal),
+        task: await this.runDoneCheckOrCurrent(taskId),
       };
     }
     if (classification === "SESSION_CORRUPT") {

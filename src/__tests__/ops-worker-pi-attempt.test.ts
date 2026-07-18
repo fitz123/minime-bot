@@ -486,6 +486,105 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(checkCalls, 2);
   });
 
+  it("keeps scheduling when a checkpoint makes the post-attempt done check stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after post-attempt checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-post-attempt-check");
+    harness.store.create(task);
+    const runner = harness.runner();
+
+    const pending = runner.runAttempt(task.id);
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-post-attempt-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during post-attempt verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale.state, "CHECKING");
+    assert.equal(
+      stale.currentCheckpoint?.checkpointId,
+      "checkpoint-during-post-attempt-check",
+    );
+    const completed = await runner.runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
+  });
+
+  it("keeps scheduling when a checkpoint makes an early-exit done check stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after early-exit checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-early-exit-check");
+    harness.store.create(task);
+    const runner = harness.runner({
+      dependencies: {
+        spawnProcess: () => {
+          const child = new EventEmitter() as ChildProcess;
+          Object.assign(child, {
+            pid: 600_002,
+            stdin: new PassThrough(),
+            stdout: new PassThrough(),
+            stderr: new PassThrough(),
+            exitCode: null,
+            signalCode: null,
+            unref: () => child,
+          });
+          queueMicrotask(() => child.emit("close", 0, null));
+          return child;
+        },
+        readProcessIdentity: () => ({ status: "GONE" }),
+        inspectProcessGroup: () => ({ status: "GONE" }),
+      },
+    });
+
+    const pending = runner.runAttempt(task.id);
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-early-exit-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during early-exit verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale.state, "CHECKING");
+    assert.equal(
+      stale.currentCheckpoint?.checkpointId,
+      "checkpoint-during-early-exit-check",
+    );
+    const completed = await runner.runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
+  });
+
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("crash-resume"));
