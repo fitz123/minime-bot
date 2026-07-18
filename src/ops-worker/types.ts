@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-export const OPS_WORKER_TASK_SCHEMA_VERSION = 3 as const;
+export const OPS_WORKER_TASK_SCHEMA_VERSION = 4 as const;
+export const OPS_WORKER_TASK_V3_SCHEMA_VERSION = 3 as const;
 export const OPS_WORKER_TASK_V2_SCHEMA_VERSION = 2 as const;
 export const OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION = 1 as const;
 
@@ -101,7 +102,12 @@ export const OPS_WORKER_OUTCOME_RESULTS = [
   "SUCCESS_CLAIM",
   "PASS",
   "ACTION_REQUIRED",
+  "NOT_READY",
+  "PRODUCT_FAILURE",
   "DEFER",
+  "VERIFIER_INVALID",
+  "QUERY_ERROR",
+  "TIMEOUT",
   "ERROR",
   "QUOTA",
   "QUOTA_ADMISSION_WAIT",
@@ -133,7 +139,8 @@ export const OPS_WORKER_RESOURCE_KINDS = ["host", "repository"] as const;
 
 export type OpsWorkerResourceKind = (typeof OPS_WORKER_RESOURCE_KINDS)[number];
 
-export const OPS_WORKER_LIFECYCLE_SCHEMA_VERSION = 1 as const;
+export const OPS_WORKER_LIFECYCLE_SCHEMA_VERSION = 2 as const;
+export const OPS_WORKER_LIFECYCLE_V1_SCHEMA_VERSION = 1 as const;
 
 export const OPS_WORKER_MUTATION_BOUNDARIES = [
   "merge",
@@ -205,9 +212,18 @@ export interface OpsWorkerLifecycleManifest {
   release: string | null;
   deploy: string | null;
   verifier: string | null;
+  verifierVersion: string | null;
+  verifierContractHash: string | null;
   report: string | null;
   tailAudit: string | null;
 }
+
+export type OpsWorkerLifecycleManifestV1 = Omit<
+  OpsWorkerLifecycleManifest,
+  "schemaVersion" | "verifierVersion" | "verifierContractHash"
+> & {
+  schemaVersion: typeof OPS_WORKER_LIFECYCLE_V1_SCHEMA_VERSION;
+};
 
 export interface OpsWorkerCheckpoint {
   checkpointId: string;
@@ -303,6 +319,54 @@ export interface OpsWorkerAuthorizationVerification {
   summary: string;
 }
 
+export const OPS_WORKER_VERIFICATION_OUTCOMES = [
+  "PASS",
+  "NOT_READY",
+  "PRODUCT_FAILURE",
+  "DEFER",
+  "VERIFIER_INVALID",
+  "QUERY_ERROR",
+  "TIMEOUT",
+] as const;
+
+export type OpsWorkerVerificationOutcome =
+  (typeof OPS_WORKER_VERIFICATION_OUTCOMES)[number];
+
+export const OPS_WORKER_VERIFICATION_CONVERGENCE_KINDS = [
+  "PRODUCT",
+  "PASSIVE",
+] as const;
+
+export type OpsWorkerVerificationConvergenceKind =
+  (typeof OPS_WORKER_VERIFICATION_CONVERGENCE_KINDS)[number];
+
+/** Bounded evidence from one trusted, package-registered verifier component. */
+export interface OpsWorkerVerificationComponentEvidence {
+  identity: string;
+  version: string;
+  required: boolean;
+  convergence: OpsWorkerVerificationConvergenceKind;
+  outcome: OpsWorkerVerificationOutcome;
+  observedAt: string;
+  evidenceHash: string;
+  summary: string;
+  nextCheckAt: string | null;
+}
+
+/** One immutable composite contract result bound to the task snapshot. */
+export interface OpsWorkerVerificationRecord {
+  verifierIdentity: string;
+  verifierVersion: string;
+  contractHash: string;
+  subjectHash: string;
+  checkedAt: string;
+  completedAt: string;
+  outcome: OpsWorkerVerificationOutcome;
+  summary: string;
+  nextCheckAt: string | null;
+  components: OpsWorkerVerificationComponentEvidence[];
+}
+
 export interface OpsWorkerRounds {
   remediation: number;
   maxRemediation: number;
@@ -380,6 +444,7 @@ export interface OpsWorkerTask {
   doneCheck: OpsWorkerDoneCheck;
   authorization: OpsWorkerAuthorization;
   authorizationVerification: OpsWorkerAuthorizationVerification | null;
+  verification: OpsWorkerVerificationRecord | null;
   state: OpsWorkerTaskState;
   rounds: OpsWorkerRounds;
   schedule: OpsWorkerSchedule;
@@ -468,6 +533,57 @@ export function withOpsWorkerSubmissionFingerprint(
   };
 }
 
+/** Semantic task/checkpoint/authorization state covered by composite evidence. */
+export function hashOpsWorkerVerificationSubject(
+  task: Pick<
+    OpsWorkerTask,
+    | "source"
+    | "resource"
+    | "lifecycle"
+    | "currentCheckpoint"
+    | "mutationReceipts"
+    | "submissionFingerprint"
+    | "authorization"
+    | "authorizationVerification"
+  >,
+): string {
+  const canonical = stableJson({
+    source: task.source,
+    resource: task.resource,
+    lifecycle: {
+      canonicalTask: task.lifecycle.canonicalTask,
+      repository: task.lifecycle.repository,
+      base: task.lifecycle.base,
+      head: task.lifecycle.head,
+      branch: task.lifecycle.branch,
+      pullRequest: task.lifecycle.pullRequest,
+      merge: task.lifecycle.merge,
+      tag: task.lifecycle.tag,
+      release: task.lifecycle.release,
+      deploy: task.lifecycle.deploy,
+    },
+    currentCheckpoint: task.currentCheckpoint,
+    mutationReceipts: {
+      merge: task.mutationReceipts.merge,
+      tagRelease: task.mutationReceipts.tagRelease,
+      deploy: task.mutationReceipts.deploy,
+      canonicalTask: task.mutationReceipts.canonicalTask,
+    },
+    submissionFingerprint: task.submissionFingerprint,
+    authorization: task.authorization,
+    authorizationVerification: task.authorizationVerification === null
+      ? null
+      : {
+        validatorIdentity: task.authorizationVerification.validatorIdentity,
+        validatorVersion: task.authorizationVerification.validatorVersion,
+        checkedSnapshotHash: task.authorizationVerification.checkedSnapshotHash,
+        status: task.authorizationVerification.status,
+        evidenceHash: task.authorizationVerification.evidenceHash,
+      },
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 export type OpsWorkerTaskV1 = Omit<
   OpsWorkerTask,
   | "schemaVersion"
@@ -479,6 +595,7 @@ export type OpsWorkerTaskV1 = Omit<
   | "custody"
   | "submissionFingerprint"
   | "authorizationVerification"
+  | "verification"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
@@ -486,9 +603,21 @@ export type OpsWorkerTaskV1 = Omit<
 
 export type OpsWorkerTaskV2 = Omit<
   OpsWorkerTask,
-  "schemaVersion" | "authorizationVerification"
+  | "schemaVersion"
+  | "lifecycle"
+  | "authorizationVerification"
+  | "verification"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V2_SCHEMA_VERSION;
+  lifecycle: OpsWorkerLifecycleManifestV1;
+};
+
+export type OpsWorkerTaskV3 = Omit<
+  OpsWorkerTask,
+  "schemaVersion" | "lifecycle" | "verification"
+> & {
+  schemaVersion: typeof OPS_WORKER_TASK_V3_SCHEMA_VERSION;
+  lifecycle: OpsWorkerLifecycleManifestV1;
 };
 
 export interface OpsWorkerTemplateContract {
@@ -539,6 +668,9 @@ export const OPS_WORKER_LIMITS = {
   maxDoneCheckParamArrayLength: 64,
   maxDoneCheckParamStringBytes: 2 * 1024,
   maxAuthorizationVerificationSummaryBytes: 1024,
+  maxVerificationComponents: 32,
+  maxVerificationComponentSummaryBytes: 1024,
+  maxVerificationSummaryBytes: 4 * 1024,
 } as const;
 
 const V1_TASK_KEYS = [
@@ -589,10 +721,16 @@ const V2_TASK_KEYS = [
   "updatedAt",
 ] as const;
 
-const TASK_KEYS = [
+const V3_TASK_KEYS = [
   ...V2_TASK_KEYS.slice(0, V2_TASK_KEYS.indexOf("state")),
   "authorizationVerification",
   ...V2_TASK_KEYS.slice(V2_TASK_KEYS.indexOf("state")),
+] as const;
+
+const TASK_KEYS = [
+  ...V3_TASK_KEYS.slice(0, V3_TASK_KEYS.indexOf("state")),
+  "verification",
+  ...V3_TASK_KEYS.slice(V3_TASK_KEYS.indexOf("state")),
 ] as const;
 
 const TASK_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -613,8 +751,12 @@ const FORBIDDEN_PARAM_KEYS = new Set([
   "cmd",
   "command",
   "commands",
+  "component",
+  "components",
   "executable",
   "profile",
+  "selector",
+  "selectors",
   "shell",
   "uri",
   "url",
@@ -920,8 +1062,63 @@ export function createEmptyOpsWorkerLifecycleManifest(): OpsWorkerLifecycleManif
     release: null,
     deploy: null,
     verifier: null,
+    verifierVersion: null,
+    verifierContractHash: null,
     report: null,
     tailAudit: null,
+  };
+}
+
+function parseLifecycleV1(value: unknown): OpsWorkerLifecycleManifestV1 {
+  const lifecycle = expectObject(value, "task.lifecycle");
+  const keys = Object.keys(createEmptyOpsWorkerLifecycleManifest()).filter(
+    (key) => key !== "verifierVersion" && key !== "verifierContractHash",
+  );
+  expectExactKeys(lifecycle, keys, "task.lifecycle");
+  if (lifecycle.schemaVersion !== OPS_WORKER_LIFECYCLE_V1_SCHEMA_VERSION) {
+    fail(
+      "task.lifecycle.schemaVersion",
+      `must equal ${OPS_WORKER_LIFECYCLE_V1_SCHEMA_VERSION}`,
+    );
+  }
+  return {
+    schemaVersion: OPS_WORKER_LIFECYCLE_V1_SCHEMA_VERSION,
+    canonicalTask: parseLifecycleIdentity(lifecycle.canonicalTask, "task.lifecycle.canonicalTask"),
+    repository: parseLifecycleIdentity(lifecycle.repository, "task.lifecycle.repository"),
+    base: parseLifecycleIdentity(lifecycle.base, "task.lifecycle.base"),
+    head: parseLifecycleIdentity(lifecycle.head, "task.lifecycle.head"),
+    branch: parseLifecycleIdentity(lifecycle.branch, "task.lifecycle.branch"),
+    pullRequest: parseLifecycleIdentity(lifecycle.pullRequest, "task.lifecycle.pullRequest"),
+    merge: parseLifecycleIdentity(lifecycle.merge, "task.lifecycle.merge"),
+    tag: parseLifecycleIdentity(lifecycle.tag, "task.lifecycle.tag"),
+    release: parseLifecycleIdentity(lifecycle.release, "task.lifecycle.release"),
+    deploy: parseLifecycleIdentity(lifecycle.deploy, "task.lifecycle.deploy"),
+    verifier: parseLifecycleIdentity(lifecycle.verifier, "task.lifecycle.verifier"),
+    report: parseLifecycleIdentity(lifecycle.report, "task.lifecycle.report"),
+    tailAudit: parseLifecycleIdentity(lifecycle.tailAudit, "task.lifecycle.tailAudit"),
+  };
+}
+
+function migrateLifecycleV1(
+  lifecycle: OpsWorkerLifecycleManifestV1,
+): OpsWorkerLifecycleManifest {
+  return {
+    schemaVersion: OPS_WORKER_LIFECYCLE_SCHEMA_VERSION,
+    canonicalTask: lifecycle.canonicalTask,
+    repository: lifecycle.repository,
+    base: lifecycle.base,
+    head: lifecycle.head,
+    branch: lifecycle.branch,
+    pullRequest: lifecycle.pullRequest,
+    merge: lifecycle.merge,
+    tag: lifecycle.tag,
+    release: lifecycle.release,
+    deploy: lifecycle.deploy,
+    verifier: null,
+    verifierVersion: null,
+    verifierContractHash: null,
+    report: lifecycle.report,
+    tailAudit: lifecycle.tailAudit,
   };
 }
 
@@ -935,7 +1132,7 @@ function parseLifecycle(value: unknown): OpsWorkerLifecycleManifest {
       `must equal ${OPS_WORKER_LIFECYCLE_SCHEMA_VERSION}`,
     );
   }
-  return {
+  const parsed = {
     schemaVersion: OPS_WORKER_LIFECYCLE_SCHEMA_VERSION,
     canonicalTask: parseLifecycleIdentity(
       lifecycle.canonicalTask,
@@ -954,9 +1151,39 @@ function parseLifecycle(value: unknown): OpsWorkerLifecycleManifest {
     release: parseLifecycleIdentity(lifecycle.release, "task.lifecycle.release"),
     deploy: parseLifecycleIdentity(lifecycle.deploy, "task.lifecycle.deploy"),
     verifier: parseLifecycleIdentity(lifecycle.verifier, "task.lifecycle.verifier"),
+    verifierVersion: parseLifecycleIdentity(
+      lifecycle.verifierVersion,
+      "task.lifecycle.verifierVersion",
+    ),
+    verifierContractHash: parseLifecycleIdentity(
+      lifecycle.verifierContractHash,
+      "task.lifecycle.verifierContractHash",
+    ),
     report: parseLifecycleIdentity(lifecycle.report, "task.lifecycle.report"),
     tailAudit: parseLifecycleIdentity(lifecycle.tailAudit, "task.lifecycle.tailAudit"),
   };
+  const verifierFields = [
+    parsed.verifier,
+    parsed.verifierVersion,
+    parsed.verifierContractHash,
+  ];
+  if (verifierFields.some((entry) => entry === null)
+      && verifierFields.some((entry) => entry !== null)) {
+    fail(
+      "task.lifecycle.verifier",
+      "verifier identity, version, and contract hash must be all null or all present",
+    );
+  }
+  if (
+    parsed.verifierContractHash !== null
+    && !SHA256_PATTERN.test(parsed.verifierContractHash)
+  ) {
+    fail(
+      "task.lifecycle.verifierContractHash",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  return parsed;
 }
 
 function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
@@ -1369,7 +1596,10 @@ function parseSafeJson(
       fail(`${path}.${key}`, "unsafe parameter field name");
     }
     if (FORBIDDEN_PARAM_KEYS.has(key.toLowerCase())) {
-      fail(`${path}.${key}`, "task data cannot select commands, executables, URLs, or authorization");
+      fail(
+        `${path}.${key}`,
+        "task data cannot select components, commands, executables, URLs, or authorization",
+      );
     }
     const descriptor = Object.getOwnPropertyDescriptor(object, key);
     if (!descriptor || !("value" in descriptor)) {
@@ -1543,6 +1773,209 @@ function parseAuthorizationVerification(
       "task.authorizationVerification.summary",
       OPS_WORKER_LIMITS.maxAuthorizationVerificationSummaryBytes,
     ),
+  };
+}
+
+export function aggregateOpsWorkerVerificationOutcome(
+  components: readonly Pick<
+    OpsWorkerVerificationComponentEvidence,
+    "required" | "outcome"
+  >[],
+): OpsWorkerVerificationOutcome {
+  const required = components.filter((component) => component.required);
+  if (required.length === 0) return "VERIFIER_INVALID";
+  const precedence: readonly OpsWorkerVerificationOutcome[] = [
+    "VERIFIER_INVALID",
+    "TIMEOUT",
+    "QUERY_ERROR",
+    "PRODUCT_FAILURE",
+    "NOT_READY",
+    "DEFER",
+  ];
+  for (const outcome of precedence) {
+    if (required.some((component) => component.outcome === outcome)) return outcome;
+  }
+  return required.every((component) => component.outcome === "PASS")
+    ? "PASS"
+    : "VERIFIER_INVALID";
+}
+
+function parseVerificationComponent(
+  value: unknown,
+  index: number,
+  checkedAt: string,
+  completedAt: string,
+): OpsWorkerVerificationComponentEvidence {
+  const path = `task.verification.components[${index}]`;
+  const component = expectObject(value, path);
+  expectExactKeys(
+    component,
+    [
+      "identity",
+      "version",
+      "required",
+      "convergence",
+      "outcome",
+      "observedAt",
+      "evidenceHash",
+      "summary",
+      "nextCheckAt",
+    ],
+    path,
+  );
+  const outcome = expectEnum(
+    component.outcome,
+    OPS_WORKER_VERIFICATION_OUTCOMES,
+    `${path}.outcome`,
+  );
+  const convergence = expectEnum(
+    component.convergence,
+    OPS_WORKER_VERIFICATION_CONVERGENCE_KINDS,
+    `${path}.convergence`,
+  );
+  if (outcome === "DEFER" && convergence !== "PASSIVE") {
+    fail(`${path}.outcome`, "DEFER is allowed only for passive convergence");
+  }
+  const observedAt = expectTimestamp(component.observedAt, `${path}.observedAt`);
+  if (
+    Date.parse(observedAt) < Date.parse(checkedAt)
+    || Date.parse(observedAt) > Date.parse(completedAt)
+  ) {
+    fail(`${path}.observedAt`, "must be fresh within the composite query interval");
+  }
+  const evidenceHash = expectString(component.evidenceHash, `${path}.evidenceHash`);
+  if (!SHA256_PATTERN.test(evidenceHash)) {
+    fail(`${path}.evidenceHash`, "must be a lowercase sha256:<hex> digest");
+  }
+  const nextCheckAt = expectOptionalTimestamp(
+    component.nextCheckAt,
+    `${path}.nextCheckAt`,
+  );
+  if (outcome === "DEFER") {
+    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(observedAt)) {
+      fail(`${path}.nextCheckAt`, "DEFER requires a later query timestamp");
+    }
+  } else if (nextCheckAt !== null) {
+    fail(`${path}.nextCheckAt`, "must be null unless the outcome is DEFER");
+  }
+  return {
+    identity: expectRegisteredName(component.identity, `${path}.identity`),
+    version: expectRegisteredName(component.version, `${path}.version`),
+    required: expectBoolean(component.required, `${path}.required`),
+    convergence,
+    outcome,
+    observedAt,
+    evidenceHash,
+    summary: expectBoundedText(
+      component.summary,
+      `${path}.summary`,
+      OPS_WORKER_LIMITS.maxVerificationComponentSummaryBytes,
+    ),
+    nextCheckAt,
+  };
+}
+
+function parseVerification(value: unknown): OpsWorkerVerificationRecord | null {
+  if (value === null) return null;
+  const verification = expectObject(value, "task.verification");
+  expectExactKeys(
+    verification,
+    [
+      "verifierIdentity",
+      "verifierVersion",
+      "contractHash",
+      "subjectHash",
+      "checkedAt",
+      "completedAt",
+      "outcome",
+      "summary",
+      "nextCheckAt",
+      "components",
+    ],
+    "task.verification",
+  );
+  const checkedAt = expectTimestamp(verification.checkedAt, "task.verification.checkedAt");
+  const completedAt = expectTimestamp(
+    verification.completedAt,
+    "task.verification.completedAt",
+  );
+  if (Date.parse(completedAt) < Date.parse(checkedAt)) {
+    fail("task.verification.completedAt", "must not be earlier than checkedAt");
+  }
+  const contractHash = expectString(
+    verification.contractHash,
+    "task.verification.contractHash",
+  );
+  if (!SHA256_PATTERN.test(contractHash)) {
+    fail("task.verification.contractHash", "must be a lowercase sha256:<hex> digest");
+  }
+  const subjectHash = expectString(
+    verification.subjectHash,
+    "task.verification.subjectHash",
+  );
+  if (!SHA256_PATTERN.test(subjectHash)) {
+    fail("task.verification.subjectHash", "must be a lowercase sha256:<hex> digest");
+  }
+  const outcome = expectEnum(
+    verification.outcome,
+    OPS_WORKER_VERIFICATION_OUTCOMES,
+    "task.verification.outcome",
+  );
+  const componentValues = expectDensePlainArray(
+    verification.components,
+    "task.verification.components",
+  );
+  if (componentValues.length > OPS_WORKER_LIMITS.maxVerificationComponents) {
+    fail(
+      "task.verification.components",
+      `must contain at most ${OPS_WORKER_LIMITS.maxVerificationComponents} components`,
+    );
+  }
+  const components = componentValues.map((component, index) =>
+    parseVerificationComponent(component, index, checkedAt, completedAt));
+  const identities = components.map((component) => component.identity);
+  if (new Set(identities).size !== identities.length) {
+    fail("task.verification.components", "must not contain duplicate component identities");
+  }
+  if (components.length === 0) {
+    if (outcome !== "VERIFIER_INVALID") {
+      fail("task.verification.outcome", "empty component evidence is verifier-invalid");
+    }
+  } else if (aggregateOpsWorkerVerificationOutcome(components) !== outcome) {
+    fail("task.verification.outcome", "does not match the required component outcomes");
+  }
+  const nextCheckAt = expectOptionalTimestamp(
+    verification.nextCheckAt,
+    "task.verification.nextCheckAt",
+  );
+  if (outcome === "DEFER") {
+    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(completedAt)) {
+      fail("task.verification.nextCheckAt", "DEFER requires a later query timestamp");
+    }
+  } else if (nextCheckAt !== null) {
+    fail("task.verification.nextCheckAt", "must be null unless the outcome is DEFER");
+  }
+  return {
+    verifierIdentity: expectRegisteredName(
+      verification.verifierIdentity,
+      "task.verification.verifierIdentity",
+    ),
+    verifierVersion: expectRegisteredName(
+      verification.verifierVersion,
+      "task.verification.verifierVersion",
+    ),
+    contractHash,
+    subjectHash,
+    checkedAt,
+    completedAt,
+    outcome,
+    summary: expectBoundedText(
+      verification.summary,
+      "task.verification.summary",
+      OPS_WORKER_LIMITS.maxVerificationSummaryBytes,
+    ),
+    nextCheckAt,
+    components,
   };
 }
 
@@ -1784,6 +2217,7 @@ type OpsWorkerTaskCommon = Omit<
   | "custody"
   | "submissionFingerprint"
   | "authorizationVerification"
+  | "verification"
 >;
 
 function parseTaskCommon(
@@ -1984,6 +2418,7 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     doneCheck: copy.doneCheck,
     authorization: copy.authorization,
     authorizationVerification: null,
+    verification: null,
     state: copy.state,
     rounds: copy.rounds,
     schedule: copy.schedule,
@@ -2018,12 +2453,29 @@ export function migrateOpsWorkerTaskV2(task: OpsWorkerTaskV2): OpsWorkerTask {
     id,
     source,
     resource,
-    lifecycle,
+    lifecycle: migrateLifecycleV1(lifecycle),
     currentCheckpoint,
     mutationReceipts,
     custody,
     submissionFingerprint,
     authorizationVerification: null,
+    verification: null,
+    ...common,
+  };
+}
+
+/** Pure migration for an already validated exact v3 snapshot. */
+export function migrateOpsWorkerTaskV3(task: OpsWorkerTaskV3): OpsWorkerTask {
+  const copy = structuredClone(task);
+  const {
+    schemaVersion: _schemaVersion,
+    lifecycle,
+    ...common
+  } = copy;
+  return {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    lifecycle: migrateLifecycleV1(lifecycle),
+    verification: null,
     ...common,
   };
 }
@@ -2090,7 +2542,7 @@ function parseOpsWorkerTaskV2(
     id,
     source,
     resource: parseResource(task.resource),
-    lifecycle: parseLifecycle(task.lifecycle),
+    lifecycle: parseLifecycleV1(task.lifecycle),
     currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
     mutationReceipts: parseMutationReceipts(task.mutationReceipts),
     custody: parseCustody(task.custody),
@@ -2104,6 +2556,51 @@ function parseOpsWorkerTaskV2(
 }
 
 function parseOpsWorkerTaskV3(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
+  expectExactKeys(task, V3_TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_V3_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSource(task.source, registry);
+  const submissionFingerprint = expectString(
+    task.submissionFingerprint,
+    "task.submissionFingerprint",
+  );
+  if (!SHA256_PATTERN.test(submissionFingerprint)) {
+    fail(
+      "task.submissionFingerprint",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  const previous: OpsWorkerTaskV3 = {
+    schemaVersion: OPS_WORKER_TASK_V3_SCHEMA_VERSION,
+    id,
+    source,
+    resource: parseResource(task.resource),
+    lifecycle: parseLifecycleV1(task.lifecycle),
+    currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
+    mutationReceipts: parseMutationReceipts(task.mutationReceipts),
+    custody: parseCustody(task.custody),
+    submissionFingerprint,
+    authorizationVerification: parseAuthorizationVerification(
+      task.authorizationVerification,
+    ),
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  const parsed = migrateOpsWorkerTaskV3(previous);
+  assertTaskCustodyMatchesState(parsed);
+  assertParsedSnapshotSize(parsed);
+  return parsed;
+}
+
+function parseOpsWorkerTaskV4(
   task: Record<string, unknown>,
   registry: OpsWorkerTaskContractRegistry,
 ): OpsWorkerTask {
@@ -2140,14 +2637,41 @@ function parseOpsWorkerTaskV3(
     authorizationVerification: parseAuthorizationVerification(
       task.authorizationVerification,
     ),
+    verification: parseVerification(task.verification),
     ...parseTaskCommon(task, id, source, registry),
   };
+  const verifier = parsed.verification;
+  if (verifier !== null && (
+    parsed.lifecycle.verifier !== verifier.verifierIdentity
+    || parsed.lifecycle.verifierVersion !== verifier.verifierVersion
+    || parsed.lifecycle.verifierContractHash !== verifier.contractHash
+  )) {
+    fail("task.verification", "must match the immutable lifecycle verifier contract");
+  }
+  if (
+    verifier !== null
+    && verifier.subjectHash !== hashOpsWorkerVerificationSubject(parsed)
+  ) {
+    fail("task.verification.subjectHash", "is stale for current task/checkpoint/authorization state");
+  }
+  if (
+    parsed.state === "DONE"
+    && (
+      verifier?.outcome !== "PASS"
+      || verifier.completedAt !== parsed.updatedAt
+    )
+  ) {
+    fail(
+      "task.verification",
+      "DONE requires fresh aggregate PASS evidence from the terminal transition",
+    );
+  }
   assertTaskCustodyMatchesState(parsed);
   assertParsedSnapshotSize(parsed);
   return parsed;
 }
 
-/** Parse and copy exact v1, v2, or v3 input. Unknown versions fail closed. */
+/** Parse and copy exact v1-v4 input. Unknown versions fail closed. */
 export function parseOpsWorkerTask(
   value: unknown,
   registry: OpsWorkerTaskContractRegistry,
@@ -2163,12 +2687,15 @@ export function parseOpsWorkerTask(
   if (descriptor.value === OPS_WORKER_TASK_V2_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV2(task, registry);
   }
-  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+  if (descriptor.value === OPS_WORKER_TASK_V3_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV3(task, registry);
+  }
+  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV4(task, registry);
   }
   fail(
     "task.schemaVersion",
-    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
   );
 }
 

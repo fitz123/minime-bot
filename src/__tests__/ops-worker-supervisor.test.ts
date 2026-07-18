@@ -21,7 +21,6 @@ import {
   OpsWorkerDoneCheckExecutionError,
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
-  type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
 import type {
@@ -135,7 +134,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id,
     source: {
       kind: sourceKind,
@@ -161,6 +160,7 @@ function makeTask(
       snapshotHash: AUTHORIZATION_CLAIM_HASH,
     },
     authorizationVerification: null,
+    verification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -207,6 +207,8 @@ async function makeHarness(
     faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
     authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
     quotaAdmission?: OpsWorkerQuotaAdmissionGate;
+    verifierIdentity?: string;
+    verifierVersion?: string;
   } = {},
 ): Promise<Harness> {
   let currentNow = NOW;
@@ -215,6 +217,8 @@ async function makeHarness(
   const ownsDirectory = options.directory === undefined;
   const doneChecks = new OpsWorkerDoneCheckRegistry({
     "fixture-check": {
+      identity: options.verifierIdentity,
+      version: options.verifierVersion,
       timeoutMs: 100,
       validateParams: validateFixtureParams,
       run: options.implementation ?? (() => ({
@@ -300,62 +304,126 @@ function quotaDecision(
 }
 
 describe("ops worker done-check registry", () => {
-  it("enforces strict parameters and the closed tri-state output", async () => {
+  it("runs only fixed composite components and computes the closed aggregate", async () => {
     const registry = new OpsWorkerDoneCheckRegistry({
       "fixture-check": {
-        timeoutMs: 100,
+        identity: "fixture-composite",
+        version: "2",
         validateParams: validateFixtureParams,
-        run: () => ({ result: "PASS", summary: "All fixture samples passed." }),
+        components: [
+          {
+            identity: "required-product",
+            version: "1",
+            required: true,
+            convergence: "PRODUCT",
+            timeoutMs: 100,
+            run: () => ({
+              result: "PASS",
+              summary: "Required product evidence passed.",
+              observedAt: NOW,
+              evidenceHash: `sha256:${"1".repeat(64)}`,
+            }),
+          },
+          {
+            identity: "optional-query",
+            version: "1",
+            required: false,
+            convergence: "PASSIVE",
+            timeoutMs: 100,
+            run: () => {
+              throw new Error("Synthetic optional query failure");
+            },
+          },
+        ],
       },
     });
 
-    await assert.rejects(
-      registry.run(
-        { name: "missing-check", params: { sampleCount: 1 } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "UNKNOWN_CHECK",
+    const missing = await registry.run(
+      { name: "missing-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
     );
-    await assert.rejects(
-      registry.run(
-        { name: "fixture-check", params: { sampleCount: 1, extra: true } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "INVALID_PARAMS",
+    assert.equal(missing.result, "VERIFIER_INVALID");
+    assert.deepEqual(missing.components, []);
+
+    const invalidParams = await registry.run(
+      { name: "fixture-check", params: { sampleCount: 1, extra: true } },
+      { taskId: "task-a", checkedAt: NOW },
     );
+    assert.equal(invalidParams.result, "VERIFIER_INVALID");
 
     const result = await registry.run(
       { name: "fixture-check", params: { sampleCount: 1 } },
       { taskId: "task-a", checkedAt: NOW },
     );
-    assert.deepEqual(result, {
-      result: "PASS",
-      summary: "All fixture samples passed.",
-    });
+    assert.equal(result.result, "PASS");
+    assert.equal(result.verifierIdentity, "fixture-composite");
+    assert.equal(result.verifierVersion, "2");
+    assert.match(result.contractHash, /^sha256:[a-f0-9]{64}$/);
+    assert.deepEqual(
+      result.components.map(({ identity, outcome }) => ({ identity, outcome })),
+      [
+        { identity: "required-product", outcome: "PASS" },
+        { identity: "optional-query", outcome: "QUERY_ERROR" },
+      ],
+    );
 
     const invalid = new OpsWorkerDoneCheckRegistry({
       "fixture-check": {
-        timeoutMs: 100,
+        identity: "strict-composite",
+        version: "1",
         validateParams: validateFixtureParams,
-        run: () => ({ result: "PASS", summary: "passed", extra: true }),
+        components: [{
+          identity: "strict-component",
+          version: "1",
+          required: true,
+          convergence: "PRODUCT",
+          timeoutMs: 100,
+          run: () => ({
+            result: "PASS",
+            summary: "passed",
+            observedAt: NOW,
+            evidenceHash: `sha256:${"2".repeat(64)}`,
+            component: "payload-selected-component",
+          }),
+        }],
       },
     });
-    await assert.rejects(
-      invalid.run(
-        { name: "fixture-check", params: { sampleCount: 1 } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "INVALID_RESULT",
+    const invalidResult = await invalid.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
+    );
+    assert.equal(invalidResult.result, "VERIFIER_INVALID");
+    assert.equal(invalidResult.components[0].outcome, "VERIFIER_INVALID");
+
+    assert.throws(
+      () => new OpsWorkerDoneCheckRegistry({
+        "duplicate-check": {
+          validateParams: validateFixtureParams,
+          components: [
+            {
+              identity: "duplicate-component",
+              version: "1",
+              required: true,
+              convergence: "PRODUCT",
+              timeoutMs: 100,
+              run: () => undefined,
+            },
+            {
+              identity: "duplicate-component",
+              version: "2",
+              required: true,
+              convergence: "PRODUCT",
+              timeoutMs: 100,
+              run: () => undefined,
+            },
+          ],
+        },
+      }),
+      /duplicate component identity/,
     );
   });
 
-  it("bounds fixture execution time and output", async () => {
+  it("types timeout, invalid output, and non-passive DEFER without throwing", async () => {
     let observedAbort = false;
     const timeoutRegistry = new OpsWorkerDoneCheckRegistry({
       "fixture-check": {
@@ -368,15 +436,11 @@ describe("ops worker done-check registry", () => {
         }),
       },
     });
-    await assert.rejects(
-      timeoutRegistry.run(
-        { name: "fixture-check", params: { sampleCount: 1 } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "TIMEOUT",
+    const timeout = await timeoutRegistry.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
     );
+    assert.equal(timeout.result, "TIMEOUT");
     assert.equal(observedAbort, true);
 
     const outputRegistry = new OpsWorkerDoneCheckRegistry({
@@ -384,20 +448,16 @@ describe("ops worker done-check registry", () => {
         timeoutMs: 100,
         validateParams: validateFixtureParams,
         run: () => ({
-          result: "ACTION_REQUIRED",
+          result: "PRODUCT_FAILURE",
           summary: "x".repeat(OPS_WORKER_DONE_CHECK_LIMITS.maxSummaryBytes + 1),
         }),
       },
     });
-    await assert.rejects(
-      outputRegistry.run(
-        { name: "fixture-check", params: { sampleCount: 1 } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "INVALID_RESULT",
+    const oversized = await outputRegistry.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
     );
+    assert.equal(oversized.result, "VERIFIER_INVALID");
 
     const unserializableRegistry = new OpsWorkerDoneCheckRegistry({
       "fixture-check": {
@@ -410,15 +470,11 @@ describe("ops worker done-check registry", () => {
         }),
       },
     });
-    await assert.rejects(
-      unserializableRegistry.run(
-        { name: "fixture-check", params: { sampleCount: 1 } },
-        { taskId: "task-a", checkedAt: NOW },
-      ),
-      (error: unknown) =>
-        error instanceof OpsWorkerDoneCheckExecutionError
-        && error.code === "INVALID_RESULT",
+    const invalidDefer = await unserializableRegistry.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-a", checkedAt: NOW },
     );
+    assert.equal(invalidDefer.result, "VERIFIER_INVALID");
   });
 
   it("aborts an active check when worker shutdown is requested", async () => {
@@ -724,7 +780,7 @@ describe("ops worker supervisor", () => {
   });
 
   it("retains custody through delayed checks and releases it for PASS and cancellation", async (t) => {
-    let result: OpsWorkerDoneCheckResult = {
+    let result: unknown = {
       result: "DEFER",
       summary: "The fixture needs a later observation window.",
       nextCheckAt: LATER,
@@ -1102,7 +1158,7 @@ describe("ops worker supervisor", () => {
   it("requires claimed report reconciliation before retrying a blocked task", async (t) => {
     const harness = await makeHarness(t, {
       implementation: () => ({
-        result: "ACTION_REQUIRED",
+        result: "PRODUCT_FAILURE",
         summary: "Fixture remains incomplete.",
       }),
     });
@@ -1145,9 +1201,9 @@ describe("ops worker supervisor", () => {
   });
 
   it("discards a stale PASS when the task changes during the check", async (t) => {
-    let resolveCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    let resolveCheck: ((result: unknown) => void) | undefined;
     const harness = await makeHarness(t, {
-      implementation: () => new Promise<OpsWorkerDoneCheckResult>((resolve) => {
+      implementation: () => new Promise<unknown>((resolve) => {
         resolveCheck = resolve;
       }),
     });
@@ -1163,10 +1219,10 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.store.get("task-stale")?.state, "CANCELLED");
   });
 
-  it("returns ACTION_REQUIRED evidence to the same task and blocks at budget exhaustion", async (t) => {
+  it("returns PRODUCT_FAILURE evidence to the same task and blocks at budget exhaustion", async (t) => {
     const harness = await makeHarness(t, {
       implementation: () => ({
-        result: "ACTION_REQUIRED",
+        result: "PRODUCT_FAILURE",
         summary: "A registered fixture still needs remediation.",
       }),
     });
@@ -1184,6 +1240,9 @@ describe("ops worker supervisor", () => {
     assert.equal(first.state, "RESUMABLE");
     assert.equal(first.rounds.remediation, 1);
     assert.equal(first.custody.status, "HELD");
+    assert.equal(first.verification?.outcome, "PRODUCT_FAILURE");
+    assert.equal(first.verification?.components[0].required, true);
+    assert.equal(first.verification?.components[0].outcome, "PRODUCT_FAILURE");
     assert.equal(first.evidence.at(-1)?.kind, "check");
     assert.match(first.evidence.at(-1)?.summary ?? "", /still needs remediation/);
 
@@ -1225,7 +1284,7 @@ describe("ops worker supervisor", () => {
     assert.equal(retryingCheck.state, "CHECKING");
     assert.equal(retryingCheck.rounds.remediation, 0);
     assert.equal(retryingCheck.rounds.consecutiveInfrastructureFailures, 1);
-    assert.equal(retryingCheck.lastOutcome?.result, "ERROR");
+    assert.equal(retryingCheck.lastOutcome?.result, "VERIFIER_INVALID");
     assert.equal(retryingCheck.schedule.nextRunAt, null);
     assert.ok(retryingCheck.schedule.nextCheckAt);
     assert.equal(harness.supervisor.selectNextTask(), undefined);
@@ -1239,12 +1298,100 @@ describe("ops worker supervisor", () => {
     bounded.rounds.consecutiveInfrastructureFailures = 999;
     harness.store.create(bounded);
     await harness.supervisor.requestDoneCheck(bounded.id);
-    const blocked = await harness.supervisor.runDoneCheck(bounded.id);
-    assert.equal(blocked.state, "BLOCKED");
-    assert.equal(blocked.rounds.consecutiveInfrastructureFailures, 1_000);
-    assert.equal(blocked.schedule.nextRunAt, null);
-    assert.equal(blocked.custody.status, "RELEASED");
-    assert.equal(blocked.custody.releaseReason, "BLOCKED");
+    const retained = await harness.supervisor.runDoneCheck(bounded.id);
+    assert.equal(retained.state, "CHECKING");
+    assert.equal(retained.rounds.consecutiveInfrastructureFailures, 1_000);
+    assert.equal(retained.schedule.nextRunAt, null);
+    assert.ok(retained.schedule.nextCheckAt);
+    assert.equal(retained.custody.status, "HELD");
+    assert.equal(retained.custody.releaseReason, null);
+  });
+
+  it("retries query errors and timeouts as typed verification faults with custody held", async (t) => {
+    const query = await makeHarness(t, {
+      implementation: () => {
+        throw new Error("Synthetic read-only query failure");
+      },
+    });
+    query.store.create(makeTask("task-query-error"));
+    await query.supervisor.requestDoneCheck("task-query-error");
+    const queryError = await query.supervisor.runDoneCheck("task-query-error");
+    assert.equal(queryError.state, "CHECKING");
+    assert.equal(queryError.lastOutcome?.result, "QUERY_ERROR");
+    assert.equal(queryError.verification?.outcome, "QUERY_ERROR");
+    assert.equal(queryError.verification?.components[0].outcome, "QUERY_ERROR");
+    assert.equal(queryError.rounds.remediation, 0);
+    assert.equal(queryError.custody.status, "HELD");
+
+    const timeout = await makeHarness(t, {
+      implementation: () => new Promise(() => undefined),
+    });
+    timeout.store.create(makeTask("task-verifier-timeout"));
+    await timeout.supervisor.requestDoneCheck("task-verifier-timeout");
+    const timedOut = await timeout.supervisor.runDoneCheck("task-verifier-timeout");
+    assert.equal(timedOut.state, "CHECKING");
+    assert.equal(timedOut.lastOutcome?.result, "TIMEOUT");
+    assert.equal(timedOut.verification?.outcome, "TIMEOUT");
+    assert.equal(timedOut.rounds.remediation, 0);
+    assert.equal(timedOut.custody.status, "HELD");
+  });
+
+  it("restarts a persisted CHECKING task under the same immutable verifier contract", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-check-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, { directory, instanceId: "check-first" });
+    first.store.create(makeTask("task-check-restart"));
+    const checking = await first.supervisor.requestDoneCheck("task-check-restart");
+    assert.equal(checking.state, "CHECKING");
+    assert.equal(checking.custody.status, "HELD");
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "check-restarted",
+    });
+    assert.equal(restarted.supervisor.selectNextTask()?.action, "CHECK");
+    const done = await restarted.supervisor.runDoneCheck("task-check-restart");
+    assert.equal(done.state, "DONE");
+    assert.equal(done.verification?.outcome, "PASS");
+    assert.equal(done.lifecycle.verifier, "fixture-check");
+    assert.equal(done.lifecycle.verifierVersion, "1");
+    assert.equal(done.lifecycle.verifierContractHash, done.verification?.contractHash);
+  });
+
+  it("fails a changed package verifier contract closed after immutable pinning", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-contract-pin-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "contract-pin-first",
+      verifierVersion: "1",
+      implementation: () => ({
+        result: "DEFER",
+        summary: "Passive fixture convergence needs another observation.",
+        nextCheckAt: LATER,
+      }),
+    });
+    first.store.create(makeTask("task-contract-pin"));
+    await first.supervisor.requestDoneCheck("task-contract-pin");
+    const pinned = await first.supervisor.runDoneCheck("task-contract-pin");
+    const pinnedHash = pinned.lifecycle.verifierContractHash;
+    assert.equal(pinned.lifecycle.verifierVersion, "1");
+    first.close();
+
+    const changed = await makeHarness(t, {
+      directory,
+      instanceId: "contract-pin-changed",
+      verifierVersion: "2",
+    });
+    const invalid = await changed.supervisor.runDoneCheck("task-contract-pin");
+    assert.equal(invalid.state, "CHECKING");
+    assert.equal(invalid.lastOutcome?.result, "VERIFIER_INVALID");
+    assert.equal(invalid.verification?.outcome, "VERIFIER_INVALID");
+    assert.deepEqual(invalid.verification?.components, []);
+    assert.equal(invalid.lifecycle.verifierVersion, "1");
+    assert.equal(invalid.lifecycle.verifierContractHash, pinnedHash);
+    assert.equal(invalid.custody.status, "HELD");
   });
 
   it("keeps infrastructure failures resumable without spending remediation budget", async (t) => {
@@ -1571,6 +1718,7 @@ describe("ops worker supervisor", () => {
         custody: _custody,
         submissionFingerprint: _submissionFingerprint,
         authorizationVerification: _authorizationVerification,
+        verification: _verification,
         source,
         schemaVersion: _schemaVersion,
         ...common

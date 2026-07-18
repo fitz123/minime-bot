@@ -61,7 +61,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
   lifecycle.canonicalTask = remote.canonicalTask;
   lifecycle.repository = remote.repository.identity;
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "authorized-issue-58",
     source: {
       kind: "authorized-issue",
@@ -84,6 +84,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
       snapshotHash: hashAdr091AuthorizedIssueClaim(remote),
     },
     authorizationVerification: null,
+    verification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,

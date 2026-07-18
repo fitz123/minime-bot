@@ -524,7 +524,18 @@ export class OpsWorkerAuthorizationCoordinator {
             stale = true;
             return OPS_WORKER_TASK_STORE_NO_CHANGE;
           }
+          const previousVerification = task.authorizationVerification;
           task.authorizationVerification = verification;
+          if (
+            task.verification !== null
+            && (
+              previousVerification?.checkedSnapshotHash
+                !== verification.checkedSnapshotHash
+              || previousVerification.status !== verification.status
+            )
+          ) {
+            task.verification = null;
+          }
           if (verification.status === "PASS") {
             options.onPass?.(task);
             return;

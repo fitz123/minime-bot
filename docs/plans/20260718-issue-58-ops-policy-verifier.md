@@ -70,11 +70,11 @@ Base source: `03e912f` (`origin/main` when this plan was prepared)
 
 ### Task 4: Add typed goal-appropriate composite verification
 
-- [ ] Extend the done-check result model with closed component/aggregate outcomes that distinguish `PASS`, `NOT_READY`, `PRODUCT_FAILURE`, `DEFER`, `VERIFIER_INVALID`, `QUERY_ERROR`, and `TIMEOUT`. Preserve strict bounded parsing and reject arbitrary component names, commands, URLs, executable selectors, sparse arrays, and duplicate identities.
-- [ ] Add a package-owned composite verifier that runs only trusted registered components with one immutable contract hash/version and fresh query timestamps. All required components must PASS for aggregate PASS; `DEFER` is only passive external convergence; missing work/product failure resumes remediation; verifier invalidity/query/timeout retries verification without consuming remediation.
-- [ ] Persist verifier identity/version/contract hash in the fixed lifecycle manifest and record fresh bounded component evidence atomically with the terminal transition. A stale aggregate result after any task/checkpoint/authorization change must be discarded.
-- [ ] Add named regressions for partial progress followed by child `rc=1`, restart during verification, stale PASS, query failure, timeout, passive DEFER, and a composite with one failed required component. None may release custody or produce DONE except a fresh aggregate PASS.
-- [ ] Keep production component registrations minimal/empty until the final Telegram/Alertmanager/fake-lab phase supplies goal-specific host/service checks. Do not add a generic shell check or encode a domain workflow.
+- [x] Extend the done-check result model with closed component/aggregate outcomes that distinguish `PASS`, `NOT_READY`, `PRODUCT_FAILURE`, `DEFER`, `VERIFIER_INVALID`, `QUERY_ERROR`, and `TIMEOUT`. Preserve strict bounded parsing and reject arbitrary component names, commands, URLs, executable selectors, sparse arrays, and duplicate identities.
+- [x] Add a package-owned composite verifier that runs only trusted registered components with one immutable contract hash/version and fresh query timestamps. All required components must PASS for aggregate PASS; `DEFER` is only passive external convergence; missing work/product failure resumes remediation; verifier invalidity/query/timeout retries verification without consuming remediation.
+- [x] Persist verifier identity/version/contract hash in the fixed lifecycle manifest and record fresh bounded component evidence atomically with the terminal transition. A stale aggregate result after any task/checkpoint/authorization change must be discarded.
+- [x] Add named regressions for partial progress followed by child `rc=1`, restart during verification, stale PASS, query failure, timeout, passive DEFER, and a composite with one failed required component. None may release custody or produce DONE except a fresh aggregate PASS.
+- [x] Keep production component registrations minimal/empty until the final Telegram/Alertmanager/fake-lab phase supplies goal-specific host/service checks. Do not add a generic shell check or encode a domain workflow.
 
 ### Task 5: Expose the inactive policy surface and validate the package
 

@@ -40,6 +40,7 @@ import {
 } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
+  hashOpsWorkerVerificationSubject,
   type OpsWorkerActiveRun,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
@@ -48,6 +49,7 @@ import {
   type OpsWorkerTask,
   type OpsWorkerTaskState,
   type OpsWorkerUnverifiedRun,
+  type OpsWorkerVerificationRecord,
 } from "./types.js";
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
@@ -1019,6 +1021,7 @@ export class OpsWorkerSupervisor {
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.lastOutcome = null;
+      task.verification = null;
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
@@ -1084,6 +1087,7 @@ export class OpsWorkerSupervisor {
         replacement.activeRun = null;
         replacement.schedule.nextRunAt = null;
         replacement.schedule.nextCheckAt = null;
+        replacement.verification = null;
         this.applyCustodyTransition(replacement, updatedAt);
       },
     });
@@ -1660,41 +1664,50 @@ export class OpsWorkerSupervisor {
     }
     const checkedAt = this.now().toISOString();
     const baseline = JSON.stringify(task);
+    const expectedContract = task.lifecycle.verifier === null
+      ? undefined
+      : {
+        verifierIdentity: task.lifecycle.verifier,
+        verifierVersion: task.lifecycle.verifierVersion as string,
+        contractHash: task.lifecycle.verifierContractHash as string,
+      };
     let result: OpsWorkerDoneCheckResult;
     try {
       result = await this.doneChecks.run(task.doneCheck, {
         taskId: task.id,
         checkedAt,
+        expectedContract,
+        now: this.now,
       }, signal);
     } catch (error) {
-      if (!(error instanceof OpsWorkerDoneCheckExecutionError)) throw error;
-      const target = task.rounds.consecutiveInfrastructureFailures + 1
-          >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
-        ? "BLOCKED"
-        : "CHECKING";
-      return this.transition(taskId, target, (current, at) => {
-        current.activeRun = null;
-        this.incrementInfrastructureFailures(current);
-        current.schedule.nextCheckAt = target === "CHECKING"
-          ? new Date(this.now().getTime() + this.infrastructureRetryMs).toISOString()
-          : null;
-        current.schedule.nextRunAt = null;
-        current.lastOutcome = {
-          at,
-          kind: "DONE_CHECK",
-          result: "ERROR",
-          summary: `Done check could not establish an outcome (${error.code})`,
-        };
-        appendEvidence(current, {
-          at,
-          kind: "infrastructure",
-          trust: "trusted",
-          summary: `Done check deferred by infrastructure (${error.code})`,
-          artifact: null,
+      if (
+        error instanceof OpsWorkerDoneCheckExecutionError
+        && error.code === "ABORTED"
+      ) {
+        return this.transition(taskId, "CHECKING", (current, at) => {
+          current.activeRun = null;
+          current.schedule.nextRunAt = null;
+          current.schedule.nextCheckAt = new Date(
+            this.now().getTime() + this.infrastructureRetryMs,
+          ).toISOString();
+          current.lastOutcome = {
+            at,
+            kind: "DONE_CHECK",
+            result: "ERROR",
+            summary: "Composite verification was interrupted by worker shutdown (ABORTED)",
+          };
+          appendEvidence(current, {
+            at,
+            kind: "infrastructure",
+            trust: "trusted",
+            summary: "Composite verification was interrupted by worker shutdown (ABORTED)",
+            artifact: null,
+          });
+        }, "Interrupted composite verification remains resumable", {
+          expectedBaseline: baseline,
         });
-      }, target === "BLOCKED"
-        ? "Done check reached the bounded infrastructure-failure limit"
-        : "Done check error is resumable", { expectedBaseline: baseline });
+      }
+      throw error;
     }
     return this.applyDoneCheckResult(taskId, result, task, baseline);
   }
@@ -1745,6 +1758,7 @@ export class OpsWorkerSupervisor {
       task.report.attempts = 0;
       task.report.lastError = null;
       task.lastOutcome = null;
+      task.verification = null;
     }, "Operator retried blocked task");
   }
 
@@ -1771,6 +1785,7 @@ export class OpsWorkerSupervisor {
         result: "CANCELLED",
         summary,
       };
+      task.verification = null;
       task.report.state = "PENDING";
       task.report.lastError = null;
     }, "Task cancelled");
@@ -1998,9 +2013,43 @@ export class OpsWorkerSupervisor {
     checkedTask: OpsWorkerTask,
     expectedBaseline: string,
   ): OpsWorkerTask {
+    const persistVerification = (task: OpsWorkerTask, at: string): void => {
+      const existingContract = task.lifecycle.verifier === null
+        ? null
+        : {
+          verifierIdentity: task.lifecycle.verifier,
+          verifierVersion: task.lifecycle.verifierVersion,
+          contractHash: task.lifecycle.verifierContractHash,
+        };
+      if (existingContract !== null && (
+        existingContract.verifierIdentity !== result.verifierIdentity
+        || existingContract.verifierVersion !== result.verifierVersion
+        || existingContract.contractHash !== result.contractHash
+      )) {
+        throw new OpsWorkerSupervisorStateError(
+          `Task ${taskId} verifier contract changed after immutable pinning`,
+        );
+      }
+      task.lifecycle.verifier = result.verifierIdentity;
+      task.lifecycle.verifierVersion = result.verifierVersion;
+      task.lifecycle.verifierContractHash = result.contractHash;
+      task.verification = {
+        verifierIdentity: result.verifierIdentity,
+        verifierVersion: result.verifierVersion,
+        contractHash: result.contractHash,
+        subjectHash: hashOpsWorkerVerificationSubject(task),
+        checkedAt: result.checkedAt,
+        completedAt: at,
+        outcome: result.result,
+        summary: result.summary,
+        nextCheckAt: result.nextCheckAt,
+        components: structuredClone(result.components),
+      } satisfies OpsWorkerVerificationRecord;
+    };
     if (result.result === "PASS") {
       return this.transition(taskId, "DONE", (task, at) => {
         this.resetAfterCheck(task);
+        persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(at, "PASS", result.summary);
         appendEvidence(task, this.checkEvidence(at, result.summary));
         task.report.state = "PENDING";
@@ -2016,12 +2065,52 @@ export class OpsWorkerSupervisor {
         task.rounds.consecutiveInfrastructureFailures = 0;
         task.schedule.nextRunAt = null;
         task.schedule.nextCheckAt = result.nextCheckAt;
+        persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(at, "DEFER", result.summary);
         appendEvidence(task, this.checkEvidence(at, result.summary));
       }, "Done check deferred without spending remediation budget", {
         expectedBaseline,
       });
     }
+    if (
+      result.result === "VERIFIER_INVALID"
+      || result.result === "QUERY_ERROR"
+      || result.result === "TIMEOUT"
+    ) {
+      return this.transition(taskId, "CHECKING", (task, at) => {
+        task.activeRun = null;
+        task.rounds.consecutiveInfrastructureFailures = Math.min(
+          MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES,
+          task.rounds.consecutiveInfrastructureFailures + 1,
+        );
+        task.schedule.nextRunAt = null;
+        task.schedule.nextCheckAt = new Date(
+          this.now().getTime() + this.infrastructureRetryMs,
+        ).toISOString();
+        persistVerification(task, at);
+        task.lastOutcome = {
+          at,
+          kind: "DONE_CHECK",
+          result: result.result,
+          summary: result.summary,
+        };
+        appendEvidence(task, {
+          at,
+          kind: "infrastructure",
+          trust: "trusted",
+          summary: result.summary,
+          artifact: null,
+        });
+      }, `Composite verification will retry after ${result.result}`, {
+        expectedBaseline,
+      });
+    }
+    if (result.result !== "NOT_READY" && result.result !== "PRODUCT_FAILURE") {
+      throw new OpsWorkerSupervisorStateError(
+        `Unsupported composite verification outcome ${result.result}`,
+      );
+    }
+    const remediationResult = result.result;
     return this.transition(
       taskId,
       checkedTask.rounds.remediation + 1
@@ -2034,9 +2123,10 @@ export class OpsWorkerSupervisor {
         task.rounds.consecutiveInfrastructureFailures = 0;
         task.schedule.nextRunAt = null;
         task.schedule.nextCheckAt = null;
+        persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(
           at,
-          "ACTION_REQUIRED",
+          remediationResult,
           result.summary,
         );
         appendEvidence(task, this.checkEvidence(at, result.summary));
@@ -2045,7 +2135,7 @@ export class OpsWorkerSupervisor {
           task.report.lastError = null;
         }
       },
-      "Done check requires another remediation round",
+      `Composite verification requires remediation (${remediationResult})`,
       { expectedBaseline },
     );
   }
@@ -2082,7 +2172,10 @@ export class OpsWorkerSupervisor {
 
   private checkOutcome(
     at: string,
-    result: Extract<OpsWorkerOutcomeResult, "PASS" | "ACTION_REQUIRED" | "DEFER">,
+    result: Extract<
+      OpsWorkerOutcomeResult,
+      "PASS" | "NOT_READY" | "PRODUCT_FAILURE" | "DEFER"
+    >,
     summary: string,
   ): OpsWorkerLastOutcome {
     return { at, kind: "DONE_CHECK", result, summary };

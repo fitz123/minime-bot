@@ -227,7 +227,7 @@ describe("ops worker CLI and inactive runtime", () => {
       authorization: { scope: string[] };
     };
     assert.equal(task.id, "op-fixture-task-id");
-    assert.equal(task.schemaVersion, 3);
+    assert.equal(task.schemaVersion, 4);
     assert.equal(task.state, "QUEUED");
     assert.equal(task.source.deliveryKey, "operator-cli:fixture-delivery-one");
     assert.deepEqual(task.resource, {
@@ -248,7 +248,7 @@ describe("ops worker CLI and inactive runtime", () => {
       JSON.parse(status.stdout),
       {
         service: "minime-ops-worker",
-        schemaVersion: 3,
+        schemaVersion: 4,
         totalTasks: 1,
         activeProcessGroups: 0,
         custodyOwner: null,
@@ -306,6 +306,7 @@ describe("ops worker CLI and inactive runtime", () => {
       custody: _custody,
       submissionFingerprint: _submissionFingerprint,
       authorizationVerification: _authorizationVerification,
+      verification: _verification,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {
@@ -338,7 +339,7 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(inspected.code, 0, inspected.stderr);
     const normalized = JSON.parse(inspected.stdout) as OpsWorkerTask;
-    assert.equal(normalized.schemaVersion, 3);
+    assert.equal(normalized.schemaVersion, 4);
     assert.equal(normalized.source.deliveryKey, `legacy:${current.id}`);
     assert.deepEqual(normalized.resource, {
       kind: "host",
@@ -618,7 +619,10 @@ describe("ops worker CLI and inactive runtime", () => {
     urlParams[paramsIndex] = '{"url":"https://example.invalid"}';
     const urlField = await runWorkerCli(urlParams, fixture.root, deps);
     assert.equal(urlField.code, 2);
-    assert.match(urlField.stderr, /cannot select commands, executables, URLs, or authorization/);
+    assert.match(
+      urlField.stderr,
+      /cannot select components, commands, executables, URLs, or authorization/,
+    );
 
     const noProductionCheck = await runWorkerCli(
       submitArgs(fixture.stateDirectory),
@@ -874,7 +878,7 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 3,
+      schemaVersion: 4,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);

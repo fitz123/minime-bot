@@ -33,7 +33,6 @@ import type {
 import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
-  type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
 import type {
@@ -185,7 +184,7 @@ function makeTask(
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id,
     source: {
       kind: sourceKind,
@@ -211,6 +210,7 @@ function makeTask(
       snapshotHash: AUTHORIZATION_CLAIM_HASH,
     },
     authorizationVerification: null,
+    verification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -625,7 +625,7 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {
     const harness = await makeHarness(t, () => ({
-      result: "ACTION_REQUIRED",
+      result: "PRODUCT_FAILURE",
       summary: "Synthetic state still requires repair.",
     }));
     harness.store.create(makeTask("success-failed-check", {
@@ -636,7 +636,7 @@ describe("ops worker Pi standard-session attempts", () => {
 
     assert.equal(result.state, "RESUMABLE");
     assert.equal(result.rounds.remediation, 1);
-    assert.equal(result.lastOutcome?.result, "ACTION_REQUIRED");
+    assert.equal(result.lastOutcome?.result, "PRODUCT_FAILURE");
     assert.equal(result.session.resume, true);
     assert.equal(harness.invocations.length, 1);
     const args = harness.invocations[0];
@@ -811,11 +811,11 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    let resolveFirstCheck: ((result: unknown) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
       if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+        return new Promise<unknown>((resolveCheck) => {
           resolveFirstCheck = resolveCheck;
         });
       }
@@ -848,11 +848,11 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("keeps scheduling when a checkpoint makes the post-attempt done check stale", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    let resolveFirstCheck: ((result: unknown) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
       if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+        return new Promise<unknown>((resolveCheck) => {
           resolveFirstCheck = resolveCheck;
         });
       }
@@ -1022,6 +1022,28 @@ describe("ops worker Pi standard-session attempts", () => {
       }
       harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
+  });
+
+  it("retains custody and durable progress after a child rc=1", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("rc-one-after-progress");
+    harness.store.create(task);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "durable-progress-before-rc-one",
+      payload: { phase: "repair-applied", generation: 1 },
+      summary: "A safe remediation checkpoint was durable before child exit.",
+    });
+    harness.setScenario("network");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "NETWORK");
+    assert.equal(result.currentCheckpoint?.checkpointId, "durable-progress-before-rc-one");
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
+    assert.equal(result.custody.releasedAt, null);
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, task.id);
   });
 
   it("quarantines a corrupt session and continues in one fresh standard session", async (t) => {
@@ -1292,7 +1314,7 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const harness = await makeHarness(t, () => {
       markCheckStarted?.();
-      return new Promise<OpsWorkerDoneCheckResult>(() => undefined);
+      return new Promise<unknown>(() => undefined);
     });
     harness.store.create(makeTask("shutdown-success-check"));
     harness.setScenario("success");

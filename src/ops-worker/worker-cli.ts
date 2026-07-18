@@ -483,6 +483,7 @@ function createTask(
       snapshotHash: authorizationSnapshotHash,
     },
     authorizationVerification: null,
+    verification: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,

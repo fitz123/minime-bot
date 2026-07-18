@@ -63,7 +63,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 
 const now = "2026-07-17T12:00:00.000Z";
 const task: OpsWorkerTask = withOpsWorkerSubmissionFingerprint({
-  schemaVersion: 3,
+  schemaVersion: 4,
   id: taskId,
   source: {
     kind: "operator-cli",
@@ -86,6 +86,7 @@ const task: OpsWorkerTask = withOpsWorkerSubmissionFingerprint({
     snapshotHash: null,
   },
   authorizationVerification: null,
+  verification: null,
   state: "QUEUED",
   rounds: {
     remediation: 0,

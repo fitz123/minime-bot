@@ -27,6 +27,8 @@ export const OPS_WORKER_LIFECYCLE_IDENTITY_SLOTS = [
   "release",
   "deploy",
   "verifier",
+  "verifierVersion",
+  "verifierContractHash",
   "report",
   "tailAudit",
 ] as const;
@@ -448,6 +450,7 @@ export class OpsWorkerLifecycle {
           changed = true;
         }
         if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        task.verification = null;
       },
     );
     return result.task;
