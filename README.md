@@ -499,7 +499,8 @@ same cron's next scheduled invocation; there is no background sweeper or
 receipt-based deduplication. Pending records for crons that are disabled or
 removed remain inert, inspectable files until an operator handles them.
 
-More detail is in `docs/launchd-operations.md`.
+See [Cron delivery outbox](docs/launchd-operations.md#cron-delivery-outbox) for
+the record location and safe handling guidance.
 
 ### Host-native monitoring
 

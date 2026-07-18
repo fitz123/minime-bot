@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -71,9 +72,13 @@ export function writeCronOutboxRecord(record: CronOutboxRecord): void {
     `.${fileName}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
   );
 
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
   try {
-    writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
     renameSync(tmpPath, filePath);
   } catch (err) {
     try {
@@ -88,13 +93,20 @@ export function writeCronOutboxRecord(record: CronOutboxRecord): void {
 export function readCronOutboxRecord(
   cronName: string,
 ): CronOutboxRecord | "corrupt" | undefined {
+  let contents: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(resolveCronOutboxRecordPath(cronName), "utf8"));
-    return isCronOutboxRecord(parsed, cronName) ? parsed : "corrupt";
+    contents = readFileSync(resolveCronOutboxRecordPath(cronName), "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return undefined;
     }
+    throw err;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(contents);
+    return isCronOutboxRecord(parsed, cronName) ? parsed : "corrupt";
+  } catch {
     return "corrupt";
   }
 }

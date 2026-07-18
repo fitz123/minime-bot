@@ -9,6 +9,7 @@ import {
   CRON_DELIVERY_RETRY_DELAYS_MS,
   CRON_OUTBOX_EXPIRY_MS,
   CRON_OUTBOX_MAX_ATTEMPTS,
+  deliver,
   DeliveryError,
   getAgentWorkspace,
   handleDeliveryFailure,
@@ -85,6 +86,60 @@ describe("cron-runner", () => {
       assert.strictEqual(err.status, 7);
       assert.strictEqual(err.code, "ETIMEDOUT");
       assert.strictEqual(err.stderrExcerpt, "sanitized stderr");
+    });
+
+    it("extracts, sanitizes, and bounds subprocess failure evidence", () => {
+      const subprocessError = Object.assign(new Error("command failed"), {
+        status: 1,
+        code: "ERR_CHILD_PROCESS",
+        stderr: `\u001b[31m[deliver] Error: invalid chat_id\u001b[0m ${"x".repeat(500)}`,
+      });
+      let caught: unknown;
+
+      try {
+        deliver(111111111, "message", undefined, {
+          loadTelegramToken: () => "synthetic-test-token",
+          execFileSync: () => {
+            throw subprocessError;
+          },
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught instanceof DeliveryError);
+      assert.strictEqual(caught.message, "Delivery failed: command failed");
+      assert.strictEqual(caught.status, 1);
+      assert.strictEqual(caught.code, "ERR_CHILD_PROCESS");
+      assert.strictEqual(caught.stderrExcerpt?.length, 400);
+      assert.doesNotMatch(caught.stderrExcerpt ?? "", /\u001b/);
+      assert.strictEqual(isQueueableDeliveryFailure(caught), false);
+    });
+
+    it("retries token resolution after a transient load failure", () => {
+      let tokenLoads = 0;
+      let subprocessCalls = 0;
+      const deliveryDeps = {
+        loadTelegramToken: () => {
+          tokenLoads += 1;
+          if (tokenLoads === 1) {
+            throw new Error("temporary token source failure");
+          }
+          return "synthetic-test-token";
+        },
+        execFileSync: () => {
+          subprocessCalls += 1;
+          return "";
+        },
+      };
+
+      assert.throws(
+        () => deliver(111111111, "message", undefined, deliveryDeps),
+        /Delivery failed: temporary token source failure/,
+      );
+      assert.doesNotThrow(() => deliver(111111111, "message", undefined, deliveryDeps));
+      assert.strictEqual(tokenLoads, 2);
+      assert.strictEqual(subprocessCalls, 1);
     });
 
     it("queues every failure except proven deliver.sh pre-send validation errors", () => {
@@ -2172,6 +2227,50 @@ bindings: []
       assert.deepStrictEqual(calls.sleeps, []);
     });
 
+    it("does not resurrect a delivered record when success logging fails", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron);
+      state.pending = pending;
+      const captureLog = deps.log;
+      deps.log = (taskName: string, message: string) => {
+        captureLog(taskName, message);
+        if (message.startsWith("OUTBOX REDELIVERED")) {
+          throw new Error("log unavailable");
+        }
+      };
+
+      await assert.rejects(() => main(deps), /log unavailable/);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, []);
+    });
+
+    it("fails closed without rewriting when a delivered record cannot be cleared", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron);
+      state.pending = pending;
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        throw new Error("clear unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, pending);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX CLEAR-FAILED runId=${pending.runId}: clear unavailable`));
+    });
+
     it("fails closed before generation when outbox state cannot be read", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
@@ -2220,6 +2319,60 @@ bindings: []
       assert.deepStrictEqual(calls.outboxReads, [cron.name, cron.name]);
       assert.ok(calls.logs.some((entry) =>
         entry.message === "OUTBOX QUEUE-SKIPPED pending-existing"));
+    });
+
+    it("does not overwrite unknown state when the queue-time read fails", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      let reads = 0;
+      deps.readCronOutboxRecord = (cronName: string) => {
+        calls.outboxReads.push(cronName);
+        reads += 1;
+        if (reads === 2) {
+          throw new Error("queue-time read unavailable");
+        }
+        return undefined;
+      };
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("network unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.outboxReads, [cron.name, cron.name]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "OUTBOX QUEUE-SKIPPED pending-existing"));
+      assert.strictEqual(calls.deliveryFailures.length, 1);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("reports a queue write failure and preserves the empty slot", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("network unavailable");
+      };
+      deps.writeCronOutboxRecord = (record: CronOutboxRecord) => {
+        calls.outboxWrites.push(record);
+        throw new Error("queue write unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "OUTBOX QUEUE-WRITE-FAILED: queue write unavailable"));
+      assert.strictEqual(calls.deliveryFailures.length, 1);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
     it("uses the admin fallback when cron FAIL notification delivery fails", async () => {

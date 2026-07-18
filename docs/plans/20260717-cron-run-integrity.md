@@ -165,11 +165,13 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 - [x] Define and export `CronOutboxRecord` (see Technical Details): `version: 1`,
   `cron`, `runId`, `kind: "output" | "failure-notice"`, `payload`, `chatId`,
   `threadId?`, `createdAt` (ISO), `attempts`.
-- [x] Implement `writeCronOutboxRecord(record)` (mkdir recursive + tmp+rename atomic
-  write with the same dot-prefixed tmp naming as `writeAtomicTextFile`),
+- [x] Implement `writeCronOutboxRecord(record)` (owner-only `0700` directory plus
+  `0600` tmp+rename atomic write with the same dot-prefixed tmp naming as
+  `writeAtomicTextFile`),
   `readCronOutboxRecord(cronName): CronOutboxRecord | "corrupt" | undefined` (missing
   file → `undefined`; unparseable JSON, wrong `version`, or non-string `payload` →
-  `"corrupt"`; never throws), and `clearCronOutboxRecord(cronName)` (idempotent unlink).
+  `"corrupt"`; filesystem read failures rethrow for fail-closed handling), and
+  `clearCronOutboxRecord(cronName)` (idempotent unlink).
 - [x] Write tests `src/__tests__/cron-outbox.test.ts` (success): round-trip
   write/read/clear under a temp `MINIME_CONTROL_WORKSPACE_ROOT` (via
   `installCronTestEnv()`); no stray tmp files after write; stem collision-safety for
@@ -250,7 +252,7 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   `/^\s*pid = \d+/m` → `active`; exit 0 without a pid → `idle`; non-zero with the
   known launchctl not-found signature (`Could not find service`) → `not-loaded`; every
   other non-zero result, runner `error`, or missing output → `unknown`.
-- [x] In `syncLaunchdCrons()`, before any mutation of an `update` or `delete` item,
+- [x] In `syncLaunchdCrons()`, before any mutation of a `create`, `update`, or `delete` item,
   check activity. For `active` or `unknown`, skip all mutations for that item (no plist
   write, bootout, or unlink), set `deferredReason` accordingly, and continue with the
   remaining items. Only `idle` and `not-loaded` are safe to mutate. `unchanged` items
@@ -270,9 +272,9 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   `Atomics.wait` on a throwaway `SharedArrayBuffer`; `syncLaunchdCrons` stays sync).
 - [x] Extend the `captureRunner()` fixture in
   `src/__tests__/launchd-cron-sync.test.ts` to script `print` responses; write the
-  deferral tests first against current behavior to prove they fail: update/delete while
-  active defer with no mutation; exit-0 without pid and known not-found proceed; unknown
-  non-zero, runner error, and missing output defer fail-safe.
+  deferral tests first against current behavior to prove they fail: create/update/delete
+  while active defer with no mutation; exit-0 without pid and known not-found proceed;
+  unknown non-zero, runner error, and missing output defer fail-safe.
 - [x] Write bootstrap tests: transient replacement failure retries then succeeds;
   replacement failure followed by transient rollback failure retries rollback then
   succeeds; persistent rollback failure preserves the previous plist contents and
@@ -308,15 +310,16 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   pickup-first order, single slot per cron, 10 attempts / 48h expiry, `OUTBOX` log
   evidence in `cron-<name>.log`, at-least-once semantics, and the honest limits from
   Technical Details.
-- [x] `docs/launchd-operations.md` ("Cron launchd sync"): active-job deferral semantics,
-  convergence by re-running sync after the job finishes, bounded bootstrap retry.
+- [x] `docs/launchd-operations.md`: owner-only outbox location and manual handling;
+  create/update/delete active-job deferral semantics, convergence by re-running sync after
+  the job finishes, and bounded bootstrap retry.
 - [x] `CHANGELOG.md` `## Unreleased`: one entry per issue (#76 test isolation, #65
   durable cron delivery, #62 safe sync deferral).
 
 ## Technical Details
 
-**Outbox record** (`<dataDir>/cron-outbox/<stem>.json`, atomic tmp+rename, single slot
-per cron):
+**Outbox record** (`<dataDir>/cron-outbox/<stem>.json`, owner-only `0700` directory and
+`0600` atomic tmp+rename record, single slot per cron):
 
 ```json
 {

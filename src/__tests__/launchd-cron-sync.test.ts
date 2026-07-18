@@ -1261,6 +1261,44 @@ fi
     });
   }
 
+  it("defers safely when the activity runner throws", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: (command, args) => {
+          calls.push({ command, args: [...args] });
+          if (args[0] === "print") {
+            throw new Error("launchctl spawn failed");
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.equal(result.items[0].deferredReason, "unknown");
+      assert.deepEqual(calls.map((call) => call.args), [
+        ["print", "gui/501/ai.minime.cron.active"],
+      ]);
+      assert.deepEqual(result.commands, [{
+        command: fixture.env.LAUNCHCTL_BIN ?? "/bin/launchctl",
+        args: ["print", "gui/501/ai.minime.cron.active"],
+        status: null,
+      }]);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("writes changed active plists, rebootstraps them, and prunes stale or disabled cron plists", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];

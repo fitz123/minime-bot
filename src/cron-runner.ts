@@ -13,6 +13,7 @@ import {
   execFileSync,
   execSync,
   spawnSync,
+  type ExecFileSyncOptionsWithStringEncoding,
   type SpawnSyncOptionsWithStringEncoding,
   type SpawnSyncReturns,
 } from "node:child_process";
@@ -457,23 +458,31 @@ function buildDeliverArgs(
   return threadId ? [String(chatId), "--thread", String(threadId)] : [String(chatId)];
 }
 
-let cachedDeliveryTelegramToken: string | undefined;
-let cachedDeliveryTelegramTokenError: Error | undefined;
+export interface CronDeliveryDeps {
+  loadTelegramToken: () => string;
+  execFileSync: (
+    file: string,
+    args: string[],
+    options: ExecFileSyncOptionsWithStringEncoding,
+  ) => string;
+}
 
-function loadDeliveryTelegramToken(): string {
-  if (cachedDeliveryTelegramToken !== undefined) {
-    return cachedDeliveryTelegramToken;
+const defaultCronDeliveryDeps: CronDeliveryDeps = {
+  loadTelegramToken,
+  execFileSync,
+};
+
+let cachedDeliveryTelegramToken:
+  | { source: () => string; token: string }
+  | undefined;
+
+function loadDeliveryTelegramToken(source: () => string): string {
+  if (cachedDeliveryTelegramToken?.source === source) {
+    return cachedDeliveryTelegramToken.token;
   }
-  if (cachedDeliveryTelegramTokenError !== undefined) {
-    throw cachedDeliveryTelegramTokenError;
-  }
-  try {
-    cachedDeliveryTelegramToken = loadTelegramToken();
-    return cachedDeliveryTelegramToken;
-  } catch (err) {
-    cachedDeliveryTelegramTokenError = err instanceof Error ? err : new Error(String(err));
-    throw cachedDeliveryTelegramTokenError;
-  }
+  const token = source();
+  cachedDeliveryTelegramToken = { source, token };
+  return token;
 }
 
 export class DeliveryError extends Error {
@@ -506,10 +515,12 @@ function deliver(
   chatId: number,
   message: string,
   threadId?: number,
+  overrides: Partial<CronDeliveryDeps> = {},
 ): void {
+  const deps = { ...defaultCronDeliveryDeps, ...overrides };
   try {
-    const telegramToken = loadDeliveryTelegramToken();
-    execFileSync(DELIVER_SCRIPT, buildDeliverArgs(chatId, threadId), {
+    const telegramToken = loadDeliveryTelegramToken(deps.loadTelegramToken);
+    deps.execFileSync(DELIVER_SCRIPT, buildDeliverArgs(chatId, threadId), {
       input: message,
       encoding: "utf8",
       timeout: 30000,
@@ -1006,14 +1017,17 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       );
       notifyAdminOfTerminalOutbox(pendingRecord, "gave-up");
     } else {
-      try {
-        deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
-        deps.clearCronOutboxRecord(taskName);
-        deps.log(
-          taskName,
-          `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
-        );
-      } catch (err) {
+      const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = (() => {
+        try {
+          deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, error };
+        }
+      })();
+
+      if (!deliveryAttempt.ok) {
+        const err = deliveryAttempt.error;
         if (isQueueableDeliveryFailure(err)) {
           const updatedRecord = {
             ...pendingRecord,
@@ -1033,6 +1047,21 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
         );
         notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
+      } else {
+        try {
+          deps.clearCronOutboxRecord(taskName);
+        } catch (err) {
+          deps.log(
+            taskName,
+            `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
+          );
+          deps.writeCronHealthMetric(taskName, 1, false);
+          deps.exit(1);
+        }
+        deps.log(
+          taskName,
+          `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+        );
       }
     }
   }

@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import {
@@ -48,9 +56,31 @@ describe("cron outbox", () => {
       readdirSync(outboxDir).filter((fileName) => fileName.endsWith(".tmp")),
       [],
     );
+    assert.strictEqual(statSync(outboxDir).mode & 0o777, 0o700);
+    assert.strictEqual(statSync(recordPath(record.cron)).mode & 0o777, 0o600);
 
     clearCronOutboxRecord(record.cron);
     assert.strictEqual(readCronOutboxRecord(record.cron), undefined);
+  });
+
+  it("removes its temporary file when the atomic rename fails", () => {
+    const record = makeRecord();
+    mkdirSync(recordPath(record.cron), { recursive: true });
+
+    assert.throws(() => writeCronOutboxRecord(record));
+    assert.deepStrictEqual(
+      readdirSync(outboxDir).filter((fileName) => fileName.endsWith(".tmp")),
+      [],
+    );
+  });
+
+  it("round-trips a valid record without a thread ID", () => {
+    const record = makeRecord();
+    delete record.threadId;
+
+    writeCronOutboxRecord(record);
+
+    assert.deepStrictEqual(readCronOutboxRecord(record.cron), record);
   });
 
   it("creates a missing outbox directory when writing", () => {
@@ -104,6 +134,53 @@ describe("cron outbox", () => {
     );
 
     assert.strictEqual(readCronOutboxRecord("daily-report"), "corrupt");
+  });
+
+  it("rejects every malformed record field", () => {
+    const malformedRecords: Array<{ name: string; value: unknown }> = [
+      { name: "null record", value: null },
+      { name: "array record", value: [] },
+      { name: "mismatched cron", value: { ...makeRecord(), cron: "other-cron" } },
+      { name: "missing run ID", value: { ...makeRecord(), runId: undefined } },
+      { name: "invalid kind", value: { ...makeRecord(), kind: "other" } },
+      { name: "non-finite chat ID", value: { ...makeRecord(), chatId: Number.POSITIVE_INFINITY } },
+      { name: "invalid thread ID", value: { ...makeRecord(), threadId: "42" } },
+      { name: "invalid creation time", value: { ...makeRecord(), createdAt: "not-a-date" } },
+      { name: "fractional attempts", value: { ...makeRecord(), attempts: 1.5 } },
+      { name: "negative attempts", value: { ...makeRecord(), attempts: -1 } },
+    ];
+    mkdirSync(outboxDir, { recursive: true });
+
+    for (const malformed of malformedRecords) {
+      writeFileSync(
+        recordPath("daily-report"),
+        JSON.stringify(malformed.value),
+        "utf8",
+      );
+      assert.strictEqual(
+        readCronOutboxRecord("daily-report"),
+        "corrupt",
+        malformed.name,
+      );
+    }
+  });
+
+  it("rethrows filesystem read failures without deleting valid state", () => {
+    const record = makeRecord();
+    writeCronOutboxRecord(record);
+    const path = recordPath(record.cron);
+    chmodSync(path, 0o000);
+
+    try {
+      assert.throws(
+        () => readCronOutboxRecord(record.cron),
+        (err: unknown) => (err as NodeJS.ErrnoException).code === "EACCES",
+      );
+    } finally {
+      chmodSync(path, 0o600);
+    }
+
+    assert.deepStrictEqual(readCronOutboxRecord(record.cron), record);
   });
 
   it("clears a nonexistent record without creating the outbox directory", () => {
