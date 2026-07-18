@@ -47,7 +47,7 @@ const ALLOWED_STATE_TRANSITIONS: Readonly<
   RUNNING: ["CHECKING", "RESUMABLE", "BLOCKED"],
   CHECKING: ["CHECKING", "RESUMABLE", "BLOCKED", "DONE", "CANCELLED"],
   RESUMABLE: ["RUNNING", "CHECKING", "RESUMABLE", "BLOCKED", "CANCELLED"],
-  BLOCKED: ["RUNNING", "BLOCKED", "RESUMABLE", "CANCELLED"],
+  BLOCKED: ["RUNNING", "CHECKING", "BLOCKED", "RESUMABLE", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -815,16 +815,7 @@ export class OpsWorkerSupervisor {
     summary: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    const existing = this.requireTask(taskId);
-    if (
-      existing.state !== "BLOCKED"
-      || existing.unverifiedRun?.attemptId !== attemptId
-      || existing.unverifiedRun.supervisorInstanceId !== this.instanceId
-    ) {
-      throw new OpsWorkerSupervisorStateError(
-        "Resolved Pi launch failure must match this supervisor's durable launch fence",
-      );
-    }
+    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
     const target = this.infrastructureFailureTarget(existing);
     return this.transition(taskId, target, (task, at) => {
       task.activeRun = null;
@@ -846,6 +837,100 @@ export class OpsWorkerSupervisor {
     }, target === "BLOCKED"
       ? "Blocked after bounded resolved Pi launch failures"
       : "Cleared resolved Pi launch fence after launch failure");
+  }
+
+  recordResolvedPiLaunchSuccessClaim(
+    taskId: string,
+    attemptId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    this.requireMatchingLaunchFence(taskId, attemptId);
+    return this.transition(taskId, "CHECKING", (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = true;
+      task.rounds.consecutiveInfrastructureFailures = 0;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.report.state = "NONE";
+      task.report.attempts = 0;
+      task.report.lastError = null;
+      task.lastOutcome = {
+        at,
+        kind: "PI_EXIT",
+        result: "SUCCESS_CLAIM",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (evidenceSummary) {
+        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, "Resolved short-lived Pi success claim and queued deterministic done check");
+  }
+
+  recordResolvedPiLaunchOutcome(
+    taskId: string,
+    attemptId: string,
+    result: Extract<
+      OpsWorkerOutcomeResult,
+      "QUOTA" | "NETWORK" | "CONTEXT_OVERFLOW" | "CRASH"
+    >,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
+    const target = this.infrastructureFailureTarget(existing);
+    return this.transition(taskId, target, (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = true;
+      task.report.state = "NONE";
+      task.report.attempts = 0;
+      task.report.lastError = null;
+      this.incrementInfrastructureFailures(task);
+      task.schedule.nextCheckAt = null;
+      task.schedule.nextRunAt = new Date(
+        this.now().getTime() + this.infrastructureRetryMs,
+      ).toISOString();
+      task.lastOutcome = {
+        at,
+        kind: "INFRASTRUCTURE",
+        result,
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (evidenceSummary) {
+        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, target === "BLOCKED"
+      ? `Blocked after bounded resolved Pi outcomes (${result})`
+      : `Recorded resolved short-lived Pi outcome ${result}`);
+  }
+
+  clearResolvedPiLaunchFence(
+    taskId: string,
+    attemptId: string,
+    summary: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    this.requireMatchingLaunchFence(taskId, attemptId);
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = true;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.report.state = "NONE";
+      task.report.attempts = 0;
+      task.report.lastError = null;
+      task.lastOutcome = {
+        at,
+        kind: "RECONCILIATION",
+        result: "CRASH",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+    }, "Cleared a resolved short-lived Pi launch fence");
   }
 
   recordPreemption(
@@ -1353,6 +1438,23 @@ export class OpsWorkerSupervisor {
     const task = this.store.get(taskId);
     if (!task) {
       throw new OpsWorkerSupervisorStateError(`Unknown ops-worker task ${taskId}`);
+    }
+    return task;
+  }
+
+  private requireMatchingLaunchFence(
+    taskId: string,
+    attemptId: string,
+  ): OpsWorkerTask {
+    const task = this.requireTask(taskId);
+    if (
+      task.state !== "BLOCKED"
+      || task.unverifiedRun?.attemptId !== attemptId
+      || task.unverifiedRun.supervisorInstanceId !== this.instanceId
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Resolved Pi launch outcome must match this supervisor's durable launch fence",
+      );
     }
     return task;
   }

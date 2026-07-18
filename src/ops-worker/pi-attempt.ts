@@ -467,6 +467,17 @@ export class OpsWorkerPiAttemptRunner {
     const pid = child.pid;
     if (pid === undefined) {
       const exit = await exitPromise;
+      if (exit.error !== null) {
+        abandonDetachedChild(child);
+        return {
+          classification: "CRASH",
+          task: this.supervisor.recordResolvedPiLaunchFailure(
+            task.id,
+            attemptId,
+            `Pi process spawn failed: ${formatAttemptEvidence(exit)}`,
+          ),
+        };
+      }
       const blocked = this.supervisor.blockUnverifiedPiLaunch(
         task.id,
         launchIntent,
@@ -486,11 +497,12 @@ export class OpsWorkerPiAttemptRunner {
       try {
         this.supervisor.bindUnverifiedPiLaunch(task.id, unverifiedRun);
       } catch (error) {
-        abandonUnverifiedChild(child);
+        abandonDetachedChild(child);
         throw error;
       }
       this.launchFaultInjector?.("after-unverified-run-persisted");
     };
+    persistUnverifiedRun();
     const identity = await this.readFreshIdentity(
       pid,
       ownershipNonce,
@@ -500,7 +512,6 @@ export class OpsWorkerPiAttemptRunner {
       const exit = await boundedExitWait(exitPromise, this.sleep);
       const group = this.inspectProcessGroup(pid);
       if (exit === null || group.status !== "GONE") {
-        persistUnverifiedRun();
         const blocked = this.supervisor.blockUnverifiedPiLaunch(
           task.id,
           unverifiedRun,
@@ -510,24 +521,16 @@ export class OpsWorkerPiAttemptRunner {
             ? group.summary
             : `Pi PID ${pid} exited before identity proof while detached process group ${pid} remains present`,
         );
-        abandonUnverifiedChild(child);
+        abandonDetachedChild(child);
         return { classification: "CRASH", task: blocked };
       }
-      return {
-        classification: "CRASH",
-        task: this.supervisor.recordResolvedPiLaunchFailure(
-          task.id,
-          attemptId,
-          `Pi exited before its process-group identity was durably recorded: ${formatAttemptEvidence(exit)}`,
-        ),
-      };
+      return this.finishResolvedEarlyExit(task.id, attemptId, exit);
     }
     if (
       identity.status !== "OWNED"
       || identity.identity.processGroupId !== pid
       || identity.identity.ownershipNonce !== ownershipNonce
     ) {
-      persistUnverifiedRun();
       const blocked = this.supervisor.blockUnverifiedPiLaunch(
         task.id,
         unverifiedRun,
@@ -535,7 +538,7 @@ export class OpsWorkerPiAttemptRunner {
           ? identity.summary
           : "fresh process-group identity could not be proven"}`,
       );
-      abandonUnverifiedChild(child);
+      abandonDetachedChild(child);
       return {
         classification: "CRASH",
         task: blocked,
@@ -549,7 +552,6 @@ export class OpsWorkerPiAttemptRunner {
       processStartedAt: this.now().toISOString(),
       processStartToken: identity.identity.processStartToken,
     };
-    persistUnverifiedRun();
     try {
       this.supervisor.markRunning(task.id, activeRun);
     } catch (error) {
@@ -562,6 +564,7 @@ export class OpsWorkerPiAttemptRunner {
         killGraceMs: this.killGraceMs,
       });
       if (stopped.status === "AMBIGUOUS") {
+        abandonDetachedChild(child);
         const current = this.requireTask(task.id);
         return {
           classification: "CRASH",
@@ -608,16 +611,26 @@ export class OpsWorkerPiAttemptRunner {
       lastStreamProgressAt: () => lastStreamProgressAt,
     });
     const shutdownTrigger = createAbortTrigger(this.abortSignal);
-    const trigger = await Promise.race([
+    const preemptionMonitor = this.createPreemptionMonitor(
+      task,
+      () => exitSettled,
+    );
+    const triggerPromise = Promise.race([
       exitPromise.then((exit) => ({ kind: "EXIT" as const, exit })),
       timeoutPromise,
       stallMonitor.promise,
-      this.waitForHigherPriority(task, () => exitSettled),
+      preemptionMonitor.promise,
       shutdownTrigger.promise,
     ]);
-    if (timeout) clearTimeout(timeout);
-    stallMonitor.close();
-    shutdownTrigger.close();
+    let trigger: Awaited<typeof triggerPromise>;
+    try {
+      trigger = await triggerPromise;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      stallMonitor.close();
+      preemptionMonitor.close();
+      shutdownTrigger.close();
+    }
 
     if (trigger.kind === "EXIT") {
       const group = this.inspectProcessGroup(activeRun.processGroupId);
@@ -666,6 +679,7 @@ export class OpsWorkerPiAttemptRunner {
       killGraceMs: this.killGraceMs,
     });
     if (stopped.status === "AMBIGUOUS") {
+      abandonDetachedChild(child);
       return {
         classification: "CRASH",
         task: this.supervisor.blockAmbiguousActiveRun(
@@ -675,6 +689,7 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
     const exit = await boundedExitWait(exitPromise, this.sleep);
+    if (exit === null) abandonDetachedChild(child);
     const evidence = exit ? formatAttemptEvidence(exit) : undefined;
     if (trigger.kind === "PREEMPT") {
       return {
@@ -748,6 +763,50 @@ export class OpsWorkerPiAttemptRunner {
     };
   }
 
+  private async finishResolvedEarlyExit(
+    taskId: string,
+    attemptId: string,
+    exit: OpsWorkerPiExit,
+  ): Promise<{
+      classification: OpsWorkerPiExitClassification;
+      task: OpsWorkerTask;
+    }> {
+    const classification = classifyOpsWorkerPiExit(exit);
+    const evidence = formatAttemptEvidence(exit);
+    if (classification === "SUCCESS_CLAIM") {
+      this.supervisor.recordResolvedPiLaunchSuccessClaim(
+        taskId,
+        attemptId,
+        "Pi exited successfully before identity inspection and claimed the remediation attempt completed",
+        evidence,
+      );
+      return {
+        classification,
+        task: await this.supervisor.runDoneCheck(taskId, this.abortSignal),
+      };
+    }
+    if (classification === "SESSION_CORRUPT") {
+      return {
+        classification,
+        task: this.supervisor.clearResolvedPiLaunchFence(
+          taskId,
+          attemptId,
+          "Pi exited with a corrupt standard session before identity inspection; its process group is proven gone",
+        ),
+      };
+    }
+    return {
+      classification,
+      task: this.supervisor.recordResolvedPiLaunchOutcome(
+        taskId,
+        attemptId,
+        classification,
+        infrastructureSummary(classification, exit),
+        evidence,
+      ),
+    };
+  }
+
   private async readFreshIdentity(
     pid: number,
     expectedOwnershipNonce: string,
@@ -793,17 +852,42 @@ export class OpsWorkerPiAttemptRunner {
     };
   }
 
-  private async waitForHigherPriority(
+  private createPreemptionMonitor(
     activeTask: OpsWorkerTask,
     isExited: () => boolean,
-  ): Promise<{ kind: "PREEMPT"; taskId: string }> {
-    while (!isExited()) {
-      await this.sleep(this.preemptionPollMs);
-      if (isExited()) break;
-      const next = this.findHigherPriorityReadyTask(activeTask);
-      if (next) return { kind: "PREEMPT", taskId: next.id };
-    }
-    return new Promise(() => undefined);
+  ): {
+    promise: Promise<{ kind: "PREEMPT"; taskId: string }>;
+    close(): void;
+  } {
+    let timer: NodeJS.Timeout | undefined;
+    let closed = false;
+    const promise = new Promise<{ kind: "PREEMPT"; taskId: string }>(
+      (resolvePreemption, rejectPreemption) => {
+        const check = (): void => {
+          if (closed || isExited()) return;
+          let next: OpsWorkerTask | undefined;
+          try {
+            next = this.findHigherPriorityReadyTask(activeTask);
+          } catch (error) {
+            rejectPreemption(error);
+            return;
+          }
+          if (next) {
+            resolvePreemption({ kind: "PREEMPT", taskId: next.id });
+            return;
+          }
+          timer = setTimeout(check, this.preemptionPollMs);
+        };
+        timer = setTimeout(check, this.preemptionPollMs);
+      },
+    );
+    return {
+      promise,
+      close(): void {
+        closed = true;
+        if (timer) clearTimeout(timer);
+      },
+    };
   }
 
   private findHigherPriorityReadyTask(activeTask: OpsWorkerTask): OpsWorkerTask | undefined {
@@ -1452,7 +1536,7 @@ function waitForChildExit(
   });
 }
 
-function abandonUnverifiedChild(child: ChildProcess): void {
+function abandonDetachedChild(child: ChildProcess): void {
   child.stdout?.destroy();
   child.stderr?.destroy();
   child.unref();

@@ -23,6 +23,7 @@ import {
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
+  OPS_WORKER_ATTEMPT_TOKEN_ENV,
   OPS_WORKER_PI_LIMITS,
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
@@ -521,6 +522,72 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
+  it("abandons child handles and priority polling after ambiguous shutdown", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("ambiguous-shutdown"));
+    const controller = new AbortController();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = new EventEmitter() as ChildProcess;
+    let ownershipNonce = "";
+    let unrefCalls = 0;
+    Object.assign(child, {
+      pid: 600_001,
+      stdout,
+      stderr,
+      exitCode: null,
+      signalCode: null,
+      unref: () => { unrefCalls += 1; },
+    });
+    t.after(() => child.emit("close", null, null));
+
+    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
+    let priorityPolls = 0;
+    harness.supervisor.listTasks = () => {
+      priorityPolls += 1;
+      return originalListTasks();
+    };
+    const running = harness.runner({
+      abortSignal: controller.signal,
+      dependencies: {
+        spawnProcess: (_command, _args, options) => {
+          const token = options.env?.[OPS_WORKER_ATTEMPT_TOKEN_ENV];
+          if (typeof token !== "string") {
+            throw new TypeError("Expected the trusted ownership token in the Pi environment");
+          }
+          ownershipNonce = token;
+          return child;
+        },
+        readProcessIdentity: (pid) => ({
+          status: "OWNED",
+          identity: {
+            pid,
+            processGroupId: pid,
+            processStartToken: "ambiguous-shutdown-start",
+            ownershipNonce,
+          },
+        }),
+        inspectActiveRun: () => ({
+          status: "AMBIGUOUS",
+          summary: "Synthetic ownership inspection ambiguity",
+        }),
+      },
+    }).runAttempt("ambiguous-shutdown");
+    await waitFor(() => harness.supervisor.getTask("ambiguous-shutdown")?.state === "RUNNING");
+
+    controller.abort();
+    const result = await running;
+
+    assert.equal(result.state, "BLOCKED");
+    assert.equal(result.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(unrefCalls, 1);
+    assert.equal(stdout.destroyed, true);
+    assert.equal(stderr.destroyed, true);
+    const pollsAfterReturn = priorityPolls;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 75));
+    assert.equal(priorityPolls, pollsAfterReturn);
+  });
+
   it("interrupts the deterministic check after a natural Pi success", async (t) => {
     let markCheckStarted: (() => void) | undefined;
     const checkStarted = new Promise<void>((resolveStarted) => {
@@ -564,6 +631,59 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(intentSpawnFailure.state, "RESUMABLE");
     assert.equal(intentSpawnFailure.unverifiedRun, null);
 
+    const asynchronousSpawnFailure = await makeHarness(t);
+    asynchronousSpawnFailure.store.create(makeTask("async-spawn-error"));
+    const missingExecutable = join(
+      asynchronousSpawnFailure.root,
+      "missing-package-owned-pi",
+    );
+    const asynchronousFailure = await asynchronousSpawnFailure.runner({
+      dependencies: {
+        spawnProcess: (_command, _args, options) =>
+          spawn(missingExecutable, [], options),
+      },
+    }).runAttempt("async-spawn-error");
+    assert.equal(asynchronousFailure.state, "RESUMABLE");
+    assert.equal(asynchronousFailure.unverifiedRun, null);
+    assert.match(asynchronousFailure.lastOutcome?.summary ?? "", /ENOENT/);
+
+    const identityPollingCrash = await makeHarness(t);
+    identityPollingCrash.store.create(makeTask("crash-during-identity-poll"));
+    identityPollingCrash.setScenario("wait");
+    await assert.rejects(
+      identityPollingCrash.runner({
+        dependencies: {
+          readProcessIdentity: (pid) => ({
+            status: "OWNED",
+            identity: {
+              pid,
+              processGroupId: pid,
+              processStartToken: "identity-not-yet-bound",
+            },
+          }),
+          sleep: async () => {
+            const persisted = identityPollingCrash.store.get(
+              "crash-during-identity-poll",
+            );
+            assert.equal(
+              persisted?.unverifiedRun?.pid,
+              identityPollingCrash.children.at(-1)?.pid,
+            );
+            throw new Error("synthetic supervisor crash during identity polling");
+          },
+        },
+      }).runAttempt("crash-during-identity-poll"),
+      /synthetic supervisor crash during identity polling/,
+    );
+    const pollingFence = identityPollingCrash.store.get(
+      "crash-during-identity-poll",
+    );
+    assert.equal(pollingFence?.state, "BLOCKED");
+    assert.equal(
+      pollingFence?.unverifiedRun?.pid,
+      identityPollingCrash.children.at(-1)?.pid,
+    );
+
     const crashBoundary = await makeHarness(t);
     crashBoundary.store.create(makeTask("crash-after-pid-fence"));
     crashBoundary.setScenario("wait");
@@ -600,8 +720,9 @@ describe("ops worker Pi standard-session attempts", () => {
     const identityGone = await harness.runner({
       dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
     }).runAttempt("identity-gone");
-    assert.equal(identityGone.state, "RESUMABLE");
+    assert.equal(identityGone.state, "DONE");
     assert.equal(identityGone.activeRun, null);
+    assert.equal(identityGone.unverifiedRun, null);
 
     const missingPidHarness = await makeHarness(t);
     missingPidHarness.store.create(makeTask("missing-pid"));
