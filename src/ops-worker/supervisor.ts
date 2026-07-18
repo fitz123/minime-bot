@@ -935,6 +935,39 @@ export class OpsWorkerSupervisor {
     }, "Started one supervisor-owned attempt");
   }
 
+  recordPiParityPass(taskId: string, summary: string): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "RUNNING" || existing.activeRun === null) {
+      throw new OpsWorkerSupervisorStateError(
+        `Pi parity attestation requires RUNNING, found ${existing.state}`,
+      );
+    }
+    return this.store.mutate(
+      taskId,
+      {
+        event: "TRANSITION",
+        summary: "Persisted pre-provider Pi context/capability parity",
+      },
+      (task) => {
+        if (task.state !== "RUNNING" || task.activeRun === null) {
+          throw new OpsWorkerSupervisorStateError(
+            "Pi parity attestation lost its active process fence",
+          );
+        }
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        appendEvidence(task, {
+          at,
+          kind: "system",
+          trust: "trusted",
+          summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxEvidenceSummaryBytes),
+          artifact: null,
+        });
+      },
+    ).task;
+  }
+
   async requestDoneCheck(taskId: string): Promise<OpsWorkerTask> {
     this.assertStarted();
     const task = this.requireTask(taskId);

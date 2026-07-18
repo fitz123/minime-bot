@@ -52,6 +52,40 @@ export interface PiContextArtifacts {
   systemPromptPath?: string;
   /** Context-bundle file for `--append-system-prompt`. Always present on success. */
   appendSystemPromptPath: string;
+  /** Redacted deterministic identity of the accepted sources and assembled bytes. */
+  manifest: PiContextManifest;
+}
+
+export const PI_CONTEXT_MANIFEST_VERSION = 1 as const;
+
+export type PiContextSourceKind =
+  | "workspace"
+  | "knowledge"
+  | "platform-rule"
+  | "custom-rule"
+  | "output-style"
+  | "agent-config"
+  | "package-directive";
+
+/** A content-redacted source identity. No absolute path or source body is retained. */
+export interface PiContextSourceManifest {
+  kind: PiContextSourceKind;
+  identity: string;
+  contentHash: string;
+}
+
+/** Hash-only context evidence safe to persist or expose in bounded status output. */
+export interface PiContextManifest {
+  version: typeof PI_CONTEXT_MANIFEST_VERSION;
+  sources: readonly PiContextSourceManifest[];
+  bundleHash: string;
+  personaHash: string | null;
+  digest: string;
+}
+
+export interface PiContextAssemblyOptions {
+  /** Private artifact destination. The context source workspace remains read-only. */
+  artifactWorkspaceCwd?: string;
 }
 
 /** A `## <relpath>` bundle section: a header + the file's content. */
@@ -433,6 +467,7 @@ function collectKnowledgeSections(workspaceCwd: string): ContextSection[] {
 
 interface BundleResult {
   bundle: string;
+  sources: PiContextSourceManifest[];
   /**
    * True when delivering the bundle (with `--no-context-files`) beats a bare Pi
    * spawn — i.e. at least one REAL source contributed (a CLAUDE.md body, an
@@ -470,20 +505,36 @@ function assembleBundle(workspaceCwd: string): BundleResult {
   const rules = collectRules(workspaceCwd);
 
   const parts: string[] = [];
+  const sources: PiContextSourceManifest[] = [];
+  if (rawBody !== null) {
+    sources.push(contextSource("workspace", "workspace:CLAUDE.md", rawBody));
+  }
   const trimmedBody = bodyWithoutImports.trim();
   if (trimmedBody) {
     parts.push(trimmedBody);
   }
   for (const section of sections) {
     parts.push(sectionMarkdown(section.relpath, section.content));
+    sources.push(contextSource("workspace", workspaceSourceIdentity(section.relpath), section.content));
   }
   for (const section of knowledgeSections) {
     parts.push(sectionMarkdown(section.relpath, section.content));
+    sources.push(contextSource("knowledge", workspaceSourceIdentity(section.relpath), section.content));
   }
   for (const rule of rules) {
     parts.push(sectionMarkdown(rule.relpath, rule.content));
+    sources.push(contextSource(
+      rule.relpath.startsWith(".claude/rules/platform/") ? "platform-rule" : "custom-rule",
+      workspaceSourceIdentity(rule.relpath),
+      rule.content,
+    ));
   }
   parts.push(`## Knowledge access\n\n${KNOWLEDGE_ACCESS_DIRECTIVE}`);
+  sources.push(contextSource(
+    "package-directive",
+    "package:knowledge-access-v1",
+    KNOWLEDGE_ACCESS_DIRECTIVE,
+  ));
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
@@ -495,7 +546,49 @@ function assembleBundle(workspaceCwd: string): BundleResult {
     rules.length > 0 ||
     importLineCount > 0 ||
     escaped;
-  return { bundle: `${parts.join("\n\n")}\n`, hasContent };
+  return { bundle: `${parts.join("\n\n")}\n`, sources, hasContent };
+}
+
+function sha256(value: string | Buffer): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function workspaceSourceIdentity(relpath: string): string {
+  return `workspace:${relpath.replaceAll("\\", "/")}`;
+}
+
+function contextSource(
+  kind: PiContextSourceKind,
+  identity: string,
+  content: string,
+): PiContextSourceManifest {
+  return { kind, identity, contentHash: sha256(content) };
+}
+
+function canonicalManifestJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalManifestJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalManifestJson(entry)}`)
+    .join(",")}}`;
+}
+
+function buildContextManifest(
+  bundle: string,
+  persona: string | null,
+  sources: readonly PiContextSourceManifest[],
+): PiContextManifest {
+  const unsigned = {
+    version: PI_CONTEXT_MANIFEST_VERSION,
+    sources,
+    bundleHash: sha256(bundle),
+    personaHash: persona === null ? null : sha256(persona),
+  };
+  return {
+    ...unsigned,
+    digest: sha256(`minime-pi-context-manifest-v1\0${canonicalManifestJson(unsigned)}`),
+  };
 }
 
 /** Build the context bundle markdown string for a workspace (order 1-6 above). */
@@ -512,17 +605,34 @@ export function buildBundle(workspaceCwd: string): string {
  *  - If neither resolves → null → the caller passes NO `--system-prompt` (ride Pi base).
  */
 export function resolvePersona(agent: AgentConfig): string | null {
-  const parts: string[] = [];
+  return resolvePersonaWithSources(agent).persona;
+}
 
-  const outputStyle = readOutputStyleContent(agent.workspaceCwd);
-  if (outputStyle && outputStyle.trim()) {
-    parts.push(outputStyle.trim());
+function resolvePersonaWithSources(agent: AgentConfig): {
+  persona: string | null;
+  sources: PiContextSourceManifest[];
+} {
+  const parts: string[] = [];
+  const sources: PiContextSourceManifest[] = [];
+
+  const outputStyle = readOutputStyleSource(agent.workspaceCwd);
+  if (outputStyle && outputStyle.content.trim()) {
+    parts.push(outputStyle.content.trim());
+    sources.push(contextSource(
+      "output-style",
+      outputStyle.identity,
+      outputStyle.content,
+    ));
   }
   if (agent.systemPrompt && agent.systemPrompt.trim()) {
     parts.push(agent.systemPrompt.trim());
+    sources.push(contextSource("agent-config", "agent:system-prompt", agent.systemPrompt));
   }
 
-  return parts.length > 0 ? parts.join("\n\n") : null;
+  return {
+    persona: parts.length > 0 ? parts.join("\n\n") : null,
+    sources,
+  };
 }
 
 /**
@@ -535,8 +645,10 @@ function isSafeOutputStyleSlug(slug: string): boolean {
   return !slug.includes("/") && !slug.includes("\\");
 }
 
-/** Read the output-style markdown referenced by settings.local.json, or null. */
-function readOutputStyleContent(workspaceCwd: string): string | null {
+/** Read the output-style markdown and its exact redacted workspace identity. */
+function readOutputStyleSource(
+  workspaceCwd: string,
+): { content: string; identity: string } | null {
   const settingsPath = join(workspaceCwd, ".claude", "settings.local.json");
   const { content: raw, escaped: settingsEscaped } = safeReadContainedFile(settingsPath, workspaceCwd);
   if (settingsEscaped) {
@@ -570,7 +682,10 @@ function readOutputStyleContent(workspaceCwd: string): string | null {
     log.warn("pi-context", `output-style "${slug}" not found at ${stylePath}`);
     return null;
   }
-  return content;
+  return {
+    content,
+    identity: workspaceSourceIdentity(`.claude/output-styles/${slug}.md`),
+  };
 }
 
 /**
@@ -605,6 +720,7 @@ interface CacheEntry {
   bundle: string;
   /** The resolved persona (the `--system-prompt` artifact body), or null when none. */
   persona: string | null;
+  manifest: PiContextManifest;
 }
 
 /**
@@ -699,12 +815,17 @@ function computeManifestSignature(agent: AgentConfig): string {
  * writing fails after content was assembled, this throws; Pi callers must catch
  * and add `--no-context-files` so Pi does not fall back to flat context loading.
  */
-export function assemblePiContext(agent: AgentConfig): PiContextArtifacts | null {
+export function assemblePiContext(
+  agent: AgentConfig,
+  options: PiContextAssemblyOptions = {},
+): PiContextArtifacts | null {
   const signature = computeManifestSignature(agent);
-  const cached = cache.get(agent.id);
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}`;
+  const cached = cache.get(cacheKey);
 
   let bundle: string;
   let persona: string | null;
+  let manifest: PiContextManifest;
   if (cached && cached.signature === signature) {
     // Source manifest unchanged: reuse the assembled content (skip the expensive
     // re-read + re-parse of every source file) but fall through to RE-WRITE the
@@ -712,33 +833,40 @@ export function assemblePiContext(agent: AgentConfig): PiContextArtifacts | null
     // content here is guaranteed meaningful — no empty-workspace re-check needed.
     bundle = cached.bundle;
     persona = cached.persona;
+    manifest = cached.manifest;
   } else {
     const assembled = assembleBundle(agent.workspaceCwd);
-    const resolvedPersona = resolvePersona(agent);
-    if (!assembled.hasContent && resolvedPersona === null) {
+    const resolvedPersona = resolvePersonaWithSources(agent);
+    if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
       // instead of forcing an empty bundle + --no-context-files.
-      cache.delete(agent.id);
+      cache.delete(cacheKey);
       return null;
     }
     bundle = assembled.bundle;
-    persona = resolvedPersona;
+    persona = resolvedPersona.persona;
+    manifest = buildContextManifest(
+      bundle,
+      persona,
+      [...assembled.sources, ...resolvedPersona.sources],
+    );
   }
 
   // Always (re-)write the artifacts — on a cache hit too. This keeps the on-disk
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
-  const appendSystemPromptPath = writeTempArtifact(agent.workspaceCwd, agent.id, "bundle", bundle);
+  const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
+  const appendSystemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "bundle", bundle);
   let systemPromptPath: string | undefined;
   if (persona !== null) {
-    systemPromptPath = writeTempArtifact(agent.workspaceCwd, agent.id, "persona", persona);
+    systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
   }
 
   const result: PiContextArtifacts =
     systemPromptPath !== undefined
-      ? { systemPromptPath, appendSystemPromptPath }
-      : { appendSystemPromptPath };
-  cache.set(agent.id, { signature, bundle, persona });
+      ? { systemPromptPath, appendSystemPromptPath, manifest }
+      : { appendSystemPromptPath, manifest };
+  cache.set(cacheKey, { signature, bundle, persona, manifest });
   return result;
 }
 

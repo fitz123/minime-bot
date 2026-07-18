@@ -22,13 +22,28 @@ import {
   renameSync,
   statSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { assemblePiContext, type PiContextArtifacts } from "../pi-context-assembler.js";
+import {
+  assemblePiContext,
+  type PiContextArtifacts,
+  type PiContextAssemblyOptions,
+} from "../pi-context-assembler.js";
 import {
   buildPiSpawnEnv,
   DEFAULT_PI_MODEL,
 } from "../pi-rpc-protocol.js";
+import {
+  OPS_WORKER_PARITY_ACK_PATH_ENV,
+  OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
+  OPS_WORKER_PARITY_REPORT_PATH_ENV,
+  type OpsWorkerParityAttestationReport,
+} from "../pi-extensions/ops-worker-parity-attestation.js";
+import {
+  resolveOpsWorkerParityExtensionPath,
+  type PiPrimaryResourceContract,
+  validatePiPrimaryResourceContract,
+} from "../pi-primary-resources.js";
 import { sanitizePiProcessOutput } from "../pi-process-utils.js";
 import {
   resolvePackageOwnedPiInvocation,
@@ -42,10 +57,15 @@ import {
   type OpsWorkerStartupRunResult,
 } from "./supervisor.js";
 import {
+  acknowledgeOpsWorkerParityPass,
+  formatOpsWorkerParityEvidence,
+  prepareOpsWorkerParityLaunch,
+  tryReadOpsWorkerParityReport,
+  type OpsWorkerParityLaunch,
+} from "./parity.js";
+import {
   OPS_WORKER_LIMITS,
   type OpsWorkerActiveRun,
-  type OpsWorkerAuthorizationProfileContract,
-  type OpsWorkerAuthorizationTool,
   type OpsWorkerOutcomeResult,
   type OpsWorkerTask,
   type OpsWorkerUnverifiedRun,
@@ -59,6 +79,7 @@ export const OPS_WORKER_PI_LIMITS = {
   defaultStallTimeoutMs: 20 * 60 * 1_000,
   defaultTermGraceMs: 5_000,
   defaultKillGraceMs: 2_000,
+  defaultParityTimeoutMs: 30_000,
   processInspectionPollMs: 25,
   processInspectionTimeoutMs: 1_000,
 } as const;
@@ -137,7 +158,11 @@ export interface OpsWorkerPiAttemptDependencies {
     setTimeout(callback: () => void, milliseconds: number): unknown;
     clearTimeout(handle: unknown): void;
   };
-  assembleContext?: (agent: AgentConfig) => PiContextArtifacts | null;
+  assembleContext?: (
+    agent: AgentConfig,
+    options?: PiContextAssemblyOptions,
+  ) => PiContextArtifacts | null;
+  resolveParityExtensionPath?: () => string;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
   launchFaultInjector?: (
     point: "after-launch-intent-persisted" | "after-unverified-run-persisted",
@@ -146,10 +171,12 @@ export interface OpsWorkerPiAttemptDependencies {
 
 export interface OpsWorkerPiAttemptOptions {
   supervisor: OpsWorkerSupervisor;
+  /** Mutable task execution root; never used as the primary context source. */
   workspaceCwd: string;
-  authorizationProfiles: Readonly<
-    Record<string, OpsWorkerAuthorizationProfileContract>
-  >;
+  /** Trusted canonical primary agent whose context is assembled read-only. */
+  primaryContextAgent: AgentConfig;
+  /** Explicit extension, skill, and full selected-tool contract from the primary session. */
+  primaryResources: PiPrimaryResourceContract;
   abortSignal?: AbortSignal;
   model?: string;
   thinking?: PiThinkingLevel;
@@ -157,6 +184,7 @@ export interface OpsWorkerPiAttemptOptions {
   stallTimeoutMs?: number;
   termGraceMs?: number;
   killGraceMs?: number;
+  parityTimeoutMs?: number;
   dependencies?: OpsWorkerPiAttemptDependencies;
 }
 
@@ -221,9 +249,8 @@ class BoundedStreamCapture {
 export class OpsWorkerPiAttemptRunner {
   private readonly supervisor: OpsWorkerSupervisor;
   private readonly workspaceCwd: string;
-  private readonly authorizationProfiles: Readonly<
-    Record<string, OpsWorkerAuthorizationProfileContract>
-  >;
+  private readonly primaryContextAgent: AgentConfig;
+  private readonly primaryResources: PiPrimaryResourceContract;
   private readonly abortSignal: AbortSignal | undefined;
   private readonly model: string;
   private readonly thinking: PiThinkingLevel;
@@ -231,6 +258,7 @@ export class OpsWorkerPiAttemptRunner {
   private readonly stallTimeoutMs: number;
   private readonly termGraceMs: number;
   private readonly killGraceMs: number;
+  private readonly parityTimeoutMs: number;
   private readonly spawnProcess: SpawnProcess;
   private readonly resolveInvocation: (args: readonly string[]) => PiInvocation;
   private readonly buildEnv: (agentWorkspaceRoot: string) => Record<string, string>;
@@ -249,15 +277,25 @@ export class OpsWorkerPiAttemptRunner {
   private readonly stallMonitorClock: NonNullable<
     OpsWorkerPiAttemptDependencies["stallMonitorClock"]
   >;
-  private readonly assembleContext: (agent: AgentConfig) => PiContextArtifacts | null;
+  private readonly assembleContext: NonNullable<OpsWorkerPiAttemptDependencies["assembleContext"]>;
+  private readonly resolveParityExtensionPath: () => string;
   private readonly launchFaultInjector:
     | NonNullable<OpsWorkerPiAttemptDependencies["launchFaultInjector"]>
     | undefined;
 
   constructor(options: OpsWorkerPiAttemptOptions) {
     this.supervisor = options.supervisor;
-    this.workspaceCwd = validateWorkspace(options.workspaceCwd);
-    this.authorizationProfiles = options.authorizationProfiles;
+    this.workspaceCwd = validateWorkspace(options.workspaceCwd, "Ops-worker execution workspace");
+    this.primaryContextAgent = validatePrimaryContextAgent(options.primaryContextAgent);
+    if (
+      pathContains(this.primaryContextAgent.workspaceCwd, this.workspaceCwd)
+      || pathContains(this.workspaceCwd, this.primaryContextAgent.workspaceCwd)
+    ) {
+      throw new TypeError(
+        "Ops-worker execution workspace must not equal or overlap the primary context workspace",
+      );
+    }
+    this.primaryResources = validatePiPrimaryResourceContract(options.primaryResources);
     this.abortSignal = options.abortSignal;
     this.model = options.model ?? DEFAULT_PI_MODEL;
     this.thinking = options.thinking ?? "medium";
@@ -291,6 +329,12 @@ export class OpsWorkerPiAttemptRunner {
       "killGraceMs",
       60_000,
     );
+    this.parityTimeoutMs = boundedDuration(
+      options.parityTimeoutMs,
+      OPS_WORKER_PI_LIMITS.defaultParityTimeoutMs,
+      "parityTimeoutMs",
+      5 * 60_000,
+    );
     const dependencies = options.dependencies ?? {};
     this.spawnProcess = dependencies.spawnProcess
       ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
@@ -317,6 +361,8 @@ export class OpsWorkerPiAttemptRunner {
       clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
     };
     this.assembleContext = dependencies.assembleContext ?? assemblePiContext;
+    this.resolveParityExtensionPath = dependencies.resolveParityExtensionPath
+      ?? resolveOpsWorkerParityExtensionPath;
     this.launchFaultInjector = dependencies.launchFaultInjector;
   }
 
@@ -427,19 +473,27 @@ export class OpsWorkerPiAttemptRunner {
       task: OpsWorkerTask;
     }> {
     const prompt = buildOpsWorkerAttemptPrompt(task);
-    const context = this.assembleContext({
-      id: `ops-worker-${createHash("sha256").update(this.workspaceCwd).digest("hex").slice(0, 16)}`,
-      workspaceCwd: this.workspaceCwd,
-      model: this.model,
-      thinking: this.thinking,
+    const context = this.assembleContext(this.primaryContextAgent, {
+      artifactWorkspaceCwd: this.workspaceCwd,
+    });
+    if (context === null) {
+      throw new Error("Canonical primary context assembly returned no context; refusing a smaller fallback");
+    }
+    const parityLaunch = prepareOpsWorkerParityLaunch({
+      context,
+      resources: this.primaryResources,
+      parityExtensionPath: this.resolveParityExtensionPath(),
+      sessionDirectory,
+      opsPolicy: OPS_WORKER_SYSTEM_POLICY,
     });
     const args = buildPiAttemptArgs(
       task,
       sessionDirectory,
       this.model,
       this.thinking,
-      this.authorizationTools(task),
       context,
+      this.primaryResources,
+      parityLaunch.parityExtensionPath,
     );
     const invocation = this.resolveInvocation(args);
     const attemptId = `attempt-${this.randomId()}`;
@@ -457,8 +511,11 @@ export class OpsWorkerPiAttemptRunner {
     this.launchFaultInjector?.("after-launch-intent-persisted");
     let child: ChildProcess;
     try {
-      const env = this.buildEnv(this.workspaceCwd);
+      const env = this.buildEnv(this.primaryContextAgent.workspaceCwd);
       env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
+      env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = parityLaunch.expectedPath;
+      env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = parityLaunch.reportPath;
+      env[OPS_WORKER_PARITY_ACK_PATH_ENV] = parityLaunch.ackPath;
       child = this.spawnProcess(invocation.command, invocation.args, {
         cwd: this.workspaceCwd,
         env,
@@ -571,7 +628,7 @@ export class OpsWorkerPiAttemptRunner {
         abandonDetachedChild(child);
         return { classification: "CRASH", task: blocked };
       }
-      return this.finishResolvedEarlyExit(task.id, attemptId, exit);
+      return this.finishResolvedEarlyExit(task.id, attemptId, exit, parityLaunch);
     }
     if (
       identity.status !== "OWNED"
@@ -639,6 +696,85 @@ export class OpsWorkerPiAttemptRunner {
             attemptId,
             `Pi RUNNING persistence failed after the owned group was proven stopped: ${errorMessage(error)}`,
           ),
+      };
+    }
+
+    let parity: OpsWorkerParityAttestationReport | null = null;
+    let parityReadError: string | null = null;
+    try {
+      parity = await this.awaitParityReport(parityLaunch, () => exitSettled);
+    } catch (error) {
+      parityReadError = errorMessage(error);
+    }
+    if (parity === null || parity.status !== "PASS") {
+      const stopped = await stopOwnedProcessGroup(activeRun, {
+        inspect: this.inspectActiveRun,
+        inspectGroup: this.inspectProcessGroup,
+        signal: this.signalProcessGroup,
+        sleep: this.sleep,
+        termGraceMs: this.termGraceMs,
+        killGraceMs: this.killGraceMs,
+      });
+      if (stopped.status === "AMBIGUOUS") {
+        abandonDetachedChild(child);
+        return {
+          classification: "CRASH",
+          task: this.supervisor.blockAmbiguousActiveRun(
+            task.id,
+            stopped.summary ?? "Pi parity failure left an ambiguous process group",
+          ),
+        };
+      }
+      const exit = await boundedExitWait(exitPromise, this.sleep);
+      if (exit === null) abandonDetachedChild(child);
+      const summary = parity === null
+        ? parityReadError === null
+          ? "Pi did not produce a valid context/capability attestation before the bounded deadline"
+          : `Pi produced invalid context/capability attestation: ${parityReadError}`
+        : `Pi context/capability parity failed: ${parity.mismatch.join(", ")}`;
+      return {
+        classification: "CRASH",
+        task: this.supervisor.recordResumableInfrastructureOutcome(
+          task.id,
+          "CRASH",
+          summary,
+          undefined,
+          parity === null ? undefined : formatOpsWorkerParityEvidence(parity),
+        ),
+      };
+    }
+    this.supervisor.recordPiParityPass(task.id, formatOpsWorkerParityEvidence(parity));
+    try {
+      acknowledgeOpsWorkerParityPass(parityLaunch);
+    } catch (error) {
+      const stopped = await stopOwnedProcessGroup(activeRun, {
+        inspect: this.inspectActiveRun,
+        inspectGroup: this.inspectProcessGroup,
+        signal: this.signalProcessGroup,
+        sleep: this.sleep,
+        termGraceMs: this.termGraceMs,
+        killGraceMs: this.killGraceMs,
+      });
+      if (stopped.status === "AMBIGUOUS") {
+        abandonDetachedChild(child);
+        return {
+          classification: "CRASH",
+          task: this.supervisor.blockAmbiguousActiveRun(
+            task.id,
+            stopped.summary ?? "Pi parity acknowledgement left an ambiguous process group",
+          ),
+        };
+      }
+      await boundedExitWait(exitPromise, this.sleep);
+      return {
+        classification: "CRASH",
+        task: this.supervisor.recordResumableInfrastructureOutcome(
+          task.id,
+          "CRASH",
+          `Pi parity acknowledgement failed: ${errorMessage(error)}`,
+          undefined,
+          formatOpsWorkerParityEvidence(parity),
+        ),
       };
     }
 
@@ -814,27 +950,23 @@ export class OpsWorkerPiAttemptRunner {
     taskId: string,
     attemptId: string,
     exit: OpsWorkerPiExit,
+    parityLaunch: OpsWorkerParityLaunch,
   ): Promise<{
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
-    const classification = classifyOpsWorkerPiExit(exit);
-    const evidence = formatAttemptEvidence(exit);
-    if (classification === "SUCCESS_CLAIM") {
-      this.supervisor.recordResolvedPiLaunchSuccessClaim(
-        taskId,
-        attemptId,
-        "Pi exited successfully before identity inspection and claimed the remediation attempt completed",
-        evidence,
-      );
-      return {
-        classification,
-        task: await this.runDoneCheckOrCurrent(taskId),
-      };
+    let parity: OpsWorkerParityAttestationReport | null = null;
+    let parityReadError: string | null = null;
+    try {
+      parity = tryReadOpsWorkerParityReport(parityLaunch);
+    } catch (error) {
+      parityReadError = errorMessage(error);
     }
-    if (classification === "SESSION_CORRUPT") {
+    const observedClassification = classifyOpsWorkerPiExit(exit);
+    const evidence = formatAttemptEvidence(exit);
+    if (observedClassification === "SESSION_CORRUPT") {
       return {
-        classification,
+        classification: observedClassification,
         task: this.supervisor.clearResolvedPiLaunchFence(
           taskId,
           attemptId,
@@ -842,16 +974,41 @@ export class OpsWorkerPiAttemptRunner {
         ),
       };
     }
+    // A valid PASS extension waits for the parent to persist the hashes and
+    // acknowledge them before provider work. A child that exits before process
+    // identity is proven cannot have completed that handshake, even if it left
+    // a syntactically valid report behind.
+    const classification = "CRASH" as const;
     return {
       classification,
       task: this.supervisor.recordResolvedPiLaunchOutcome(
         taskId,
         attemptId,
         classification,
-        infrastructureSummary(classification, exit),
-        evidence,
+        parity === null
+          ? parityReadError === null
+            ? "Pi exited before producing context/capability parity evidence"
+            : `Pi exited after invalid context/capability parity evidence: ${parityReadError}`
+          : parity.status === "MISMATCH"
+          ? `Pi context/capability parity failed: ${parity.mismatch.join(", ")}`
+          : "Pi exited after reporting parity PASS but before parent persistence and acknowledgement",
+        parity === null ? evidence : `${formatOpsWorkerParityEvidence(parity)}; ${evidence}`,
       ),
     };
+  }
+
+  private async awaitParityReport(
+    launch: OpsWorkerParityLaunch,
+    isExited: () => boolean,
+  ): Promise<OpsWorkerParityAttestationReport | null> {
+    const deadline = Date.now() + this.parityTimeoutMs;
+    do {
+      const report = tryReadOpsWorkerParityReport(launch);
+      if (report !== null) return report;
+      if (isExited()) return tryReadOpsWorkerParityReport(launch);
+      await this.sleep(OPS_WORKER_PI_LIMITS.processInspectionPollMs);
+    } while (Date.now() < deadline);
+    return null;
   }
 
   private async readFreshIdentity(
@@ -915,22 +1072,6 @@ export class OpsWorkerPiAttemptRunner {
     return `ops-${taskId}-${this.randomId()}`;
   }
 
-  private authorizationTools(task: OpsWorkerTask): readonly OpsWorkerAuthorizationTool[] {
-    const contract = this.authorizationProfiles[task.authorization.profile];
-    if (!contract) {
-      throw new Error(
-        `Authorization profile ${JSON.stringify(task.authorization.profile)} is not registered for execution`,
-      );
-    }
-    if (
-      contract.scope.length !== task.authorization.scope.length
-      || contract.scope.some((scope, index) => scope !== task.authorization.scope[index])
-    ) {
-      throw new Error("Persisted authorization scope no longer matches its trusted profile");
-    }
-    return contract.tools;
-  }
-
   private requireTask(taskId: string): OpsWorkerTask {
     const task = this.supervisor.getTask(taskId);
     if (!task) throw new Error(`Unknown ops-worker task ${taskId}`);
@@ -953,8 +1094,9 @@ export function buildPiAttemptArgs(
   sessionDirectory: string,
   model: string,
   thinking: string,
-  tools: readonly OpsWorkerAuthorizationTool[],
-  context: PiContextArtifacts | null = null,
+  context: PiContextArtifacts,
+  resources: PiPrimaryResourceContract,
+  parityExtensionPath: string,
 ): string[] {
   if (!task.session.sessionId) {
     throw new Error("Standard Pi session id must be prepared before launch");
@@ -966,26 +1108,26 @@ export function buildPiAttemptArgs(
     task.session.resume ? "--session" : "--session-id",
     task.session.sessionId,
     "--no-extensions",
+    "--no-skills",
   ];
-  if (context) {
-    if (context.systemPromptPath) {
-      args.push("--system-prompt", context.systemPromptPath);
-    }
-    args.push(
-      "--append-system-prompt",
-      context.appendSystemPromptPath,
-      "--no-context-files",
-    );
+  if (context.systemPromptPath) {
+    args.push("--system-prompt", context.systemPromptPath);
   }
   args.push(
     "--append-system-prompt",
+    context.appendSystemPromptPath,
+    "--no-context-files",
+    "--append-system-prompt",
     OPS_WORKER_SYSTEM_POLICY,
-    "--tools",
-    tools.join(","),
-    "--model",
-    model,
-    "--thinking",
-    thinking,
+  );
+  for (const extensionPath of [...resources.extensionPaths, parityExtensionPath]) {
+    args.push("--extension", extensionPath);
+  }
+  for (const skillPath of resources.skillPaths) args.push("--skill", skillPath);
+  args.push(
+    "--tools", resources.toolNames.join(","),
+    "--model", model,
+    "--thinking", thinking,
   );
   return args;
 }
@@ -1399,13 +1541,34 @@ export function buildOpsWorkerAttemptPrompt(task: OpsWorkerTask): string {
   return truncateUtf8(prompt, OPS_WORKER_PI_LIMITS.maxPromptBytes);
 }
 
-function validateWorkspace(path: string): string {
-  if (!isAbsolute(path)) throw new TypeError("Ops-worker workspace must be absolute");
-  const normalized = realpathSync(resolve(path));
+function validateWorkspace(path: string, label: string): string {
+  if (!isAbsolute(path)) throw new TypeError(`${label} must be absolute`);
+  const requested = resolve(path);
+  const direct = lstatSync(requested);
+  if (direct.isSymbolicLink()) throw new TypeError(`${label} must not be a symlink`);
+  const normalized = realpathSync(requested);
   if (!statSync(normalized).isDirectory()) {
-    throw new TypeError("Ops-worker workspace must be a directory");
+    throw new TypeError(`${label} must be a directory`);
+  }
+  if (typeof process.getuid === "function" && direct.uid !== process.getuid()) {
+    throw new TypeError(`${label} must be owned by the current user`);
   }
   return normalized;
+}
+
+function pathContains(parent: string, candidate: string): boolean {
+  const rel = relative(parent, candidate);
+  return rel === "" || !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+}
+
+function validatePrimaryContextAgent(agent: AgentConfig): AgentConfig {
+  if (!agent || agent.id !== "main") {
+    throw new TypeError("Ops-worker primary context agent must be the canonical main agent");
+  }
+  return {
+    ...agent,
+    workspaceCwd: validateWorkspace(agent.workspaceCwd, "Primary context workspace"),
+  };
 }
 
 function boundedDuration(

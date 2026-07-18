@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -17,6 +18,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { assemblePiContext } from "../pi-context-assembler.js";
+import {
+  PI_BUILTIN_TOOL_NAMES,
+  resolvePiPrimaryResourceContract,
+  type PiPrimaryResourceContract,
+} from "../pi-primary-resources.js";
+import type { AgentConfig } from "../types.js";
 import type {
   OpsWorkerAuthorizationVerifier,
   OpsWorkerAuthorizationVerifierRegistry,
@@ -55,6 +63,18 @@ import {
 const FAKE_PI_PROCESS = fileURLToPath(
   new URL("./fixtures/fake-pi-process.mjs", import.meta.url),
 );
+const TSX_IMPORT = import.meta.resolve("tsx");
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const PRIMARY_TOOL_NAMES = [
+  ...PI_BUILTIN_TOOL_NAMES,
+  "web_search",
+  "knowledge_search",
+  "knowledge_get",
+  "knowledge_update",
+  "subagent",
+  "ask_agent",
+  "configured_extra",
+] as const;
 const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
 const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
   identity: "fixture-authorization",
@@ -175,6 +195,9 @@ function makeTask(
 interface Harness {
   root: string;
   workspace: string;
+  primaryWorkspace: string;
+  primaryContextAgent: AgentConfig;
+  primaryResources: PiPrimaryResourceContract;
   store: OpsWorkerTaskStore;
   supervisor: OpsWorkerSupervisor;
   children: ChildProcess[];
@@ -197,9 +220,53 @@ async function makeHarness(
 ): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "minime-ops-worker-pi-"));
   const workspace = join(root, "workspace");
+  const primaryWorkspace = join(root, "primary");
   const stateDirectory = join(root, "state");
   writeFileSync(join(root, ".keep"), "fixture\n", "utf8");
   mkdirSync(workspace, { mode: 0o700 });
+  mkdirSync(join(primaryWorkspace, ".claude", "rules", "platform"), { recursive: true });
+  mkdirSync(join(primaryWorkspace, ".claude", "rules", "custom"), { recursive: true });
+  mkdirSync(join(primaryWorkspace, ".claude", "skills", "fixture-skill"), { recursive: true });
+  writeFileSync(
+    join(primaryWorkspace, "CLAUDE.md"),
+    "# Primary fixture\n\n@USER.md\n@MEMORY.md\n",
+    "utf8",
+  );
+  writeFileSync(join(primaryWorkspace, "USER.md"), "PRIMARY_USER_CONTEXT\n", "utf8");
+  writeFileSync(join(primaryWorkspace, "MEMORY.md"), "PRIMARY_KNOWLEDGE_CONTEXT\n", "utf8");
+  writeFileSync(
+    join(primaryWorkspace, ".claude", "rules", "platform", "platform.md"),
+    "PRIMARY_PLATFORM_RULE\n",
+    "utf8",
+  );
+  writeFileSync(
+    join(primaryWorkspace, ".claude", "rules", "custom", "custom.md"),
+    "PRIMARY_CUSTOM_RULE\n",
+    "utf8",
+  );
+  const skillPath = join(primaryWorkspace, ".claude", "skills", "fixture-skill", "SKILL.md");
+  writeFileSync(
+    skillPath,
+    "---\nname: fixture-skill\ndescription: Synthetic parity skill.\n---\n\nFIXTURE_SKILL_BODY\n",
+    "utf8",
+  );
+  const extraExtension = join(root, "configured-extra.ts");
+  writeFileSync(extraExtension, "export default function () {}\n", "utf8");
+  const primaryContextAgent: AgentConfig = {
+    id: "main",
+    workspaceCwd: primaryWorkspace,
+    model: "openai-codex/gpt-5.5",
+    thinking: "medium",
+    systemPrompt: "PRIMARY_PERSONA_CONTEXT",
+  };
+  const primaryResources = resolvePiPrimaryResourceContract({
+    extensionOptions: {
+      extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+      extraExtensions: [extraExtension],
+    },
+    skillPaths: [skillPath],
+    toolNames: PRIMARY_TOOL_NAMES,
+  });
   const doneChecks = new OpsWorkerDoneCheckRegistry({
     "fixture-check": {
       timeoutMs: 500,
@@ -239,6 +306,9 @@ async function makeHarness(
   return {
     root,
     workspace,
+    primaryWorkspace,
+    primaryContextAgent,
+    primaryResources,
     store,
     supervisor,
     children,
@@ -250,7 +320,8 @@ async function makeHarness(
       return new OpsWorkerPiAttemptRunner({
         supervisor,
         workspaceCwd: workspace,
-        authorizationProfiles: registry(doneChecks).authorizationProfiles,
+        primaryContextAgent,
+        primaryResources,
         abortSignal: options.abortSignal,
         attemptTimeoutMs: options.attemptTimeoutMs ?? 5_000,
         stallTimeoutMs: options.stallTimeoutMs,
@@ -261,7 +332,7 @@ async function makeHarness(
             invocations.push([...args]);
             return {
               command: process.execPath,
-              args: [FAKE_PI_PROCESS, scenario, ...args],
+              args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, scenario, ...args],
             };
           },
           spawnProcess: (command, args, options) => {
@@ -273,7 +344,6 @@ async function makeHarness(
             ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
               process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
           ),
-          assembleContext: () => null,
           ...options.dependencies,
         },
       });
@@ -326,31 +396,99 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(makeTask("assembled-context"));
     let assembledWorkspace: string | undefined;
 
-    await harness.runner({
+    const completed = await harness.runner({
       dependencies: {
-        assembleContext: (agent) => {
+        assembleContext: (agent, options) => {
           assembledWorkspace = agent.workspaceCwd;
-          return {
-            systemPromptPath: "/fixture/ops-worker-persona.md",
-            appendSystemPromptPath: "/fixture/ops-worker-context.md",
-          };
+          return assemblePiContext(agent, options);
         },
       },
     }).runAttempt("assembled-context");
 
-    assert.equal(assembledWorkspace, realpathSync(harness.workspace));
+    assert.equal(assembledWorkspace, realpathSync(harness.primaryWorkspace));
     const args = harness.invocations[0];
+    assert.ok(args.includes("--no-extensions"));
+    assert.ok(args.includes("--no-skills"));
     assert.ok(args.includes("--no-context-files"));
+    const executionWorkspace = realpathSync(harness.workspace);
     assert.equal(
       args[args.indexOf("--system-prompt") + 1],
-      "/fixture/ops-worker-persona.md",
+      join(executionWorkspace, ".tmp", "pi-context-main.persona.md"),
     );
     const appended = args.flatMap((arg, index) =>
       arg === "--append-system-prompt" ? [args[index + 1]] : []);
     assert.deepEqual(appended, [
       "/fixture/ops-worker-context.md",
       OPS_WORKER_SYSTEM_POLICY,
-    ]);
+    ].map((value, index) => index === 0
+      ? join(executionWorkspace, ".tmp", "pi-context-main.bundle.md")
+      : value));
+    assert.equal(appended[1], OPS_WORKER_SYSTEM_POLICY);
+    const bundle = readFileSync(appended[0], "utf8");
+    for (const acceptedContext of [
+      "PRIMARY_USER_CONTEXT",
+      "PRIMARY_KNOWLEDGE_CONTEXT",
+      "PRIMARY_PLATFORM_RULE",
+      "PRIMARY_CUSTOM_RULE",
+    ]) assert.ok(bundle.includes(acceptedContext));
+    assert.equal(
+      readFileSync(args[args.indexOf("--system-prompt") + 1], "utf8"),
+      "PRIMARY_PERSONA_CONTEXT",
+    );
+    assert.equal(bundle.includes(OPS_WORKER_SYSTEM_POLICY), false);
+
+    const extensions = args.flatMap((arg, index) =>
+      arg === "--extension" ? [args[index + 1]] : []);
+    assert.deepEqual(extensions.slice(0, -1), harness.primaryResources.extensionPaths);
+    assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
+    assert.equal(new Set(extensions).size, extensions.length);
+    const skills = args.flatMap((arg, index) =>
+      arg === "--skill" ? [args[index + 1]] : []);
+    assert.deepEqual(skills, harness.primaryResources.skillPaths);
+    assert.equal(args[args.indexOf("--tools") + 1], PRIMARY_TOOL_NAMES.join(","));
+    const parityEvidence = completed.evidence.find((entry) =>
+      entry.summary.includes("Pi parity v1 PASS"));
+    assert.ok(parityEvidence);
+    assert.match(parityEvidence.summary, /primary-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /actual-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /capabilities=sha256:[a-f0-9]{64}/);
+    assert.equal(parityEvidence.summary.includes(harness.primaryWorkspace), false);
+    assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
+  });
+
+  it("rejects equal, overlapping, and symlinked context workspaces at construction", async (t) => {
+    const harness = await makeHarness(t);
+    const common = {
+      supervisor: harness.supervisor,
+      primaryResources: harness.primaryResources,
+    };
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: harness.workspace,
+      primaryContextAgent: {
+        ...harness.primaryContextAgent,
+        workspaceCwd: harness.workspace,
+      },
+    }), /must not equal or overlap/);
+
+    const nestedExecution = join(harness.primaryWorkspace, "nested-execution");
+    mkdirSync(nestedExecution);
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: nestedExecution,
+      primaryContextAgent: harness.primaryContextAgent,
+    }), /must not equal or overlap/);
+
+    const linkedPrimary = join(harness.root, "linked-primary");
+    symlinkSync(harness.primaryWorkspace, linkedPrimary);
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: harness.workspace,
+      primaryContextAgent: {
+        ...harness.primaryContextAgent,
+        workspaceCwd: linkedPrimary,
+      },
+    }), /must not be a symlink/);
   });
 
   it("includes bounded resource and lifecycle resume evidence in the private prompt", async (t) => {
@@ -403,20 +541,43 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
   });
 
-  it("falls back to Pi context discovery only for a genuinely empty workspace", async (t) => {
+  it("fails closed instead of falling back after primary context assembly failure", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("empty-context"));
 
-    await harness.runner({
+    const result = await harness.runner({
       dependencies: { assembleContext: () => null },
     }).runAttempt("empty-context");
 
-    const args = harness.invocations[0];
-    assert.ok(!args.includes("--no-context-files"));
-    assert.equal(
-      args[args.indexOf("--append-system-prompt") + 1],
-      OPS_WORKER_SYSTEM_POLICY,
-    );
+    assert.equal(result.state, "RESUMABLE");
+    assert.match(result.lastOutcome?.summary ?? "", /refusing a smaller fallback/);
+    assert.equal(harness.invocations.length, 0);
+  });
+
+  it("stops before provider work when the loaded capability manifest mismatches", async (t) => {
+    let checkCalls = 0;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      return { result: "PASS", summary: "Should not run after parity failure." };
+    });
+    harness.store.create(makeTask("parity-mismatch"));
+    harness.setScenario("parity-mismatch");
+
+    const result = await harness.runner().runAttempt("parity-mismatch");
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /parity failed: TOOLS/);
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(checkCalls, 0);
+    assert.equal(harness.invocations.length, 1);
+    const parityEvidence = result.evidence.find((entry) =>
+      entry.summary.includes("Pi parity v1 MISMATCH"));
+    assert.ok(parityEvidence);
+    assert.match(parityEvidence.summary, /primary-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /capabilities=sha256:[a-f0-9]{64}/);
+    assert.equal(parityEvidence.summary.includes(harness.primaryWorkspace), false);
+    assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
   });
 
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {
@@ -443,11 +604,10 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(args[0], "-p");
     assert.equal(args[1], "--session-dir");
     assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
-    assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
-    assert.match(
-      args[args.indexOf("--append-system-prompt") + 1],
-      /Do not use sudo or perform irreversible deletion/,
-    );
+    assert.equal(args[args.indexOf("--tools") + 1], PRIMARY_TOOL_NAMES.join(","));
+    const appended = args.flatMap((arg, index) =>
+      arg === "--append-system-prompt" ? [args[index + 1]] : []);
+    assert.match(appended[1], /Do not use sudo or perform irreversible deletion/);
     assert.equal(result.evidence.some((entry) => /success claim/.test(entry.summary)), true);
   });
 
@@ -551,26 +711,49 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(checkCalls, 2);
   });
 
-  it("keeps scheduling when a checkpoint makes an early-exit done check stale", async (t) => {
+  it("rejects an early parity PASS that exits before parent persistence and acknowledgement", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
-      if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
-          resolveFirstCheck = resolveCheck;
-        });
-      }
       return {
         result: "PASS",
-        summary: "Fresh fixture pass after early-exit checkpoint liveness.",
+        summary: "Must not run for an unacknowledged parity report.",
       };
     });
     const task = makeTask("stale-early-exit-check");
     harness.store.create(task);
     const runner = harness.runner({
       dependencies: {
-        spawnProcess: () => {
+        spawnProcess: (_command, _args, options) => {
+          const env = options.env as Record<string, string>;
+          const expected = JSON.parse(readFileSync(
+            env.MINIME_OPS_WORKER_PARITY_EXPECTED_PATH,
+            "utf8",
+          )) as {
+            version: 1;
+            digest: string;
+            primaryContextDigest: string;
+            capabilityDigest: string;
+            extensionsDigest: string;
+            skillsDigest: string;
+            toolsDigest: string;
+          };
+          writeFileSync(
+            env.MINIME_OPS_WORKER_PARITY_REPORT_PATH,
+            `${JSON.stringify({
+              version: expected.version,
+              status: "PASS",
+              expectedDigest: expected.digest,
+              primaryContextDigest: expected.primaryContextDigest,
+              actualContextDigest: `sha256:${"c".repeat(64)}`,
+              actualCapabilityDigest: expected.capabilityDigest,
+              actualExtensionsDigest: expected.extensionsDigest,
+              actualSkillsDigest: expected.skillsDigest,
+              actualToolsDigest: expected.toolsDigest,
+              mismatch: [],
+            })}\n`,
+            "utf8",
+          );
           const child = new EventEmitter() as ChildProcess;
           Object.assign(child, {
             pid: 600_002,
@@ -589,25 +772,14 @@ describe("ops worker Pi standard-session attempts", () => {
       },
     });
 
-    const pending = runner.runAttempt(task.id);
-    await waitFor(() => resolveFirstCheck !== undefined);
-    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
-      checkpointId: "checkpoint-during-early-exit-check",
-      payload: { progress: "still-live" },
-      summary: "Lifecycle progress arrived during early-exit verification.",
-    });
-    assert.ok(resolveFirstCheck);
-    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
-
-    const stale = await pending;
-    assert.equal(stale.state, "CHECKING");
-    assert.equal(
-      stale.currentCheckpoint?.checkpointId,
-      "checkpoint-during-early-exit-check",
+    const result = await runner.runAttempt(task.id);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(
+      result.lastOutcome?.summary ?? "",
+      /before parent persistence and acknowledgement/,
     );
-    const completed = await runner.runNext();
-    assert.equal(completed?.state, "DONE");
-    assert.equal(checkCalls, 2);
+    assert.equal(checkCalls, 0);
   });
 
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {

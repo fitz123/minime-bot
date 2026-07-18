@@ -15,6 +15,8 @@ import {
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
 } from "./pi-attempt.js";
+import type { PiPrimaryResourceContract } from "../pi-primary-resources.js";
+import type { AgentConfig } from "../types.js";
 import {
   hashOpsWorkerCanonicalPayload,
   OpsWorkerLifecycle,
@@ -74,6 +76,8 @@ export interface OpsWorkerCliDependencies {
     task: OpsWorkerTask,
   ) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>;
   piAttemptDependencies?: OpsWorkerPiAttemptDependencies;
+  primaryContextAgent?: AgentConfig;
+  primaryPiResources?: PiPrimaryResourceContract;
   authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
   abortSignal?: AbortSignal;
   schedulerPollMs?: number;
@@ -602,6 +606,11 @@ async function runStart(
 ): Promise<number> {
   const directory = stateDirectory(parsed, cliOptions.cwd);
   const workspace = resolveCliPath(requiredValue(parsed, "agent-workspace"), cliOptions.cwd);
+  if (!deps.primaryContextAgent || !deps.primaryPiResources) {
+    throw new TypeError(
+      "Ops-worker start requires trusted primaryContextAgent and primaryPiResources dependencies",
+    );
+  }
   const host = parsed.values.get("host") ?? DEFAULT_OPS_WORKER_STATUS_HOST;
   const port = parsePort(parsed.values.get("port"));
   const store = createStore(directory, deps);
@@ -619,7 +628,8 @@ async function runStart(
     const runner = new OpsWorkerPiAttemptRunner({
       supervisor,
       workspaceCwd: workspace,
-      authorizationProfiles: deps.taskRegistry.authorizationProfiles,
+      primaryContextAgent: deps.primaryContextAgent,
+      primaryResources: deps.primaryPiResources,
       abortSignal: signal,
       dependencies: deps.piAttemptDependencies,
     });

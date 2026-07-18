@@ -274,6 +274,13 @@ describe("cron-runner runPi", () => {
       assembleContext: () => ({
         systemPromptPath: "/tmp/pi-persona.md",
         appendSystemPromptPath: "/tmp/pi-bundle.md",
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: `sha256:${"a".repeat(64)}`,
+          personaHash: `sha256:${"b".repeat(64)}`,
+          digest: `sha256:${"c".repeat(64)}`,
+        },
       }),
     });
 

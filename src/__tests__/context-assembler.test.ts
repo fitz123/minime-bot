@@ -1,5 +1,6 @@
 import { describe, it, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -1101,5 +1102,90 @@ describe("assemblePiContext", () => {
       () => assemblePiContext(agentFor(ws, { id: "throwcase" })),
       /Refusing to use .*\.tmp: not a directory/,
     );
+  });
+});
+
+describe("assemblePiContext — redacted parity manifest", () => {
+  it("hashes the exact accepted primary context sources and assembled bytes", () => {
+    const sourceWorkspace = makeWorkspace({
+      claudeMd: "# Primary\n\n@USER.md\n@MEMORY.md\n",
+      files: {
+        "USER.md": "GENERIC_USER_CONTROL_TOKEN\n",
+        "MEMORY.md": "GENERIC_KNOWLEDGE_CONTROL_TOKEN\n",
+        ".claude/rules/platform/platform.md": "GENERIC_PLATFORM_RULE_TOKEN\n",
+        ".claude/rules/custom/custom.md": "GENERIC_CUSTOM_RULE_TOKEN\n",
+        ".claude/settings.local.json": JSON.stringify({ outputStyle: "ops-persona" }),
+        ".claude/output-styles/ops-persona.md": "GENERIC_OUTPUT_STYLE_TOKEN\n",
+      },
+    });
+    const executionWorkspace = makeWorkspace({});
+    const artifacts = assemblePiContext(
+      agentFor(sourceWorkspace, { systemPrompt: "GENERIC_CONFIG_PERSONA_TOKEN" }),
+      { artifactWorkspaceCwd: executionWorkspace },
+    );
+    assert.ok(artifacts?.systemPromptPath);
+
+    const identities = artifacts.manifest.sources.map(({ kind, identity }) =>
+      `${kind}:${identity}`);
+    assert.deepEqual(identities, [
+      "workspace:workspace:CLAUDE.md",
+      "workspace:workspace:USER.md",
+      "workspace:workspace:MEMORY.md",
+      "platform-rule:workspace:.claude/rules/platform/platform.md",
+      "custom-rule:workspace:.claude/rules/custom/custom.md",
+      "package-directive:package:knowledge-access-v1",
+      "output-style:workspace:.claude/output-styles/ops-persona.md",
+      "agent-config:agent:system-prompt",
+    ]);
+
+    const hash = (body: string): string =>
+      `sha256:${createHash("sha256").update(body).digest("hex")}`;
+    assert.equal(
+      artifacts.manifest.bundleHash,
+      hash(readFileSync(artifacts.appendSystemPromptPath, "utf8")),
+    );
+    assert.equal(
+      artifacts.manifest.personaHash,
+      hash(readFileSync(artifacts.systemPromptPath, "utf8")),
+    );
+    assert.match(artifacts.manifest.digest, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(artifacts.appendSystemPromptPath.startsWith(executionWorkspace), true);
+    assert.equal(artifacts.systemPromptPath.startsWith(executionWorkspace), true);
+    assert.equal(existsSync(join(sourceWorkspace, ".tmp")), false);
+
+    const persistedEvidence = JSON.stringify(artifacts.manifest);
+    for (const privateValue of [
+      sourceWorkspace,
+      executionWorkspace,
+      "GENERIC_USER_CONTROL_TOKEN",
+      "GENERIC_KNOWLEDGE_CONTROL_TOKEN",
+      "GENERIC_PLATFORM_RULE_TOKEN",
+      "GENERIC_CUSTOM_RULE_TOKEN",
+      "GENERIC_OUTPUT_STYLE_TOKEN",
+      "GENERIC_CONFIG_PERSONA_TOKEN",
+    ]) assert.equal(persistedEvidence.includes(privateValue), false);
+  });
+
+  it("is independent of artifact destination and changes with accepted source bytes", () => {
+    const sourceWorkspace = makeWorkspace({
+      claudeMd: "# Primary\n\n@USER.md\n",
+      files: { "USER.md": "CONTEXT_VERSION_ONE\n" },
+    });
+    const firstDestination = makeWorkspace({});
+    const secondDestination = makeWorkspace({});
+    const agent = agentFor(sourceWorkspace, { id: "manifest-determinism" });
+    const first = assemblePiContext(agent, { artifactWorkspaceCwd: firstDestination });
+    const second = assemblePiContext(agent, { artifactWorkspaceCwd: secondDestination });
+    assert.ok(first);
+    assert.ok(second);
+    assert.deepEqual(second.manifest, first.manifest);
+    assert.notEqual(second.appendSystemPromptPath, first.appendSystemPromptPath);
+
+    writeFileSync(join(sourceWorkspace, "USER.md"), "CONTEXT_VERSION_TWO\n", "utf8");
+    _resetPiContextCache();
+    const changed = assemblePiContext(agent, { artifactWorkspaceCwd: secondDestination });
+    assert.ok(changed);
+    assert.notEqual(changed.manifest.digest, first.manifest.digest);
+    assert.notEqual(changed.manifest.bundleHash, first.manifest.bundleHash);
   });
 });

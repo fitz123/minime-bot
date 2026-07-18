@@ -6,7 +6,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import type {
@@ -27,10 +27,36 @@ import type {
   OpsWorkerTaskV1,
 } from "../ops-worker/types.js";
 import type { OpsWorkerCliDependencies } from "../ops-worker/worker-cli.js";
+import {
+  PI_BUILTIN_TOOL_NAMES,
+  resolvePiPrimaryResourceContract,
+} from "../pi-primary-resources.js";
 
 const FAKE_PI_PROCESS = fileURLToPath(
   new URL("./fixtures/fake-pi-process.mjs", import.meta.url),
 );
+const TSX_IMPORT = import.meta.resolve("tsx");
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const CLI_PRIMARY_CONTEXT_AGENT = {
+  id: "main",
+  workspaceCwd: join(PACKAGE_ROOT, "test-fixtures", "minimal-workspace", "agent-workspace"),
+  model: "openai-codex/gpt-5.5",
+  thinking: "medium" as const,
+  systemPrompt: "Generic primary CLI fixture persona.",
+};
+const CLI_PRIMARY_RESOURCES = resolvePiPrimaryResourceContract({
+  extensionOptions: { extensionsDir: join(PACKAGE_ROOT, "extensions", "pi") },
+  skillPaths: [join(PACKAGE_ROOT, "src", "__tests__", "fixtures", "primary-skill", "SKILL.md")],
+  toolNames: [
+    ...PI_BUILTIN_TOOL_NAMES,
+    "web_search",
+    "knowledge_search",
+    "knowledge_get",
+    "knowledge_update",
+    "subagent",
+    "ask_agent",
+  ],
+});
 
 interface FixtureContracts {
   doneChecks: OpsWorkerDoneCheckRegistry;
@@ -134,6 +160,8 @@ function dependencies(
     processStartToken: "ops-worker-cli-fixture-start",
     randomId: () => "fixture-task-id",
     authorizationVerifiers: fixtureAuthorizationVerifiers,
+    primaryContextAgent: CLI_PRIMARY_CONTEXT_AGENT,
+    primaryPiResources: CLI_PRIMARY_RESOURCES,
     ...overrides,
   };
 }
@@ -679,7 +707,7 @@ describe("ops worker CLI and inactive runtime", () => {
           invocations.push([...args]);
           return {
             command: process.execPath,
-            args: [FAKE_PI_PROCESS, "success", ...args],
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "success", ...args],
           };
         },
         buildEnv: () => Object.fromEntries(
@@ -688,7 +716,6 @@ describe("ops worker CLI and inactive runtime", () => {
               ? []
               : [[key, process.env[key] as string]]),
         ),
-        assembleContext: () => null,
       },
     });
     const submitted = await runWorkerCli(
@@ -734,7 +761,7 @@ describe("ops worker CLI and inactive runtime", () => {
       piAttemptDependencies: {
         resolveInvocation: (args) => ({
           command: process.execPath,
-          args: [FAKE_PI_PROCESS, "wait", ...args],
+          args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "wait", ...args],
         }),
         buildEnv: () => Object.fromEntries(
           ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
@@ -742,7 +769,6 @@ describe("ops worker CLI and inactive runtime", () => {
               ? []
               : [[key, process.env[key] as string]]),
         ),
-        assembleContext: () => null,
       },
     });
     const submitted = await runWorkerCli(

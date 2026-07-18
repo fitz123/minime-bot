@@ -8,6 +8,11 @@ import {
 } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import {
+  attestOpsWorkerPiParity,
+  readExpectedOpsWorkerParityContract,
+  writeOpsWorkerParityReport,
+} from "../../pi-extensions/ops-worker-parity-attestation.js";
 
 const [scenario, ...args] = process.argv.slice(2);
 let privatePrompt = "";
@@ -23,6 +28,14 @@ if (process.env.MINIME_TEST_PRIVATE_PROMPT_PATH) {
 function flagValue(flag) {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function flagValues(flag) {
+  return args.flatMap((arg, index) => arg === flag ? [args[index + 1]] : []);
+}
+
+function promptInput(value) {
+  return value && existsSync(value) ? readFileSync(value, "utf8") : value;
 }
 
 const sessionDirectory = flagValue("--session-dir");
@@ -82,6 +95,66 @@ if (existsSync(sessionFile)) {
     timestamp: new Date().toISOString(),
     message: { role: "user", content: "fixture attempt" },
   })}\n`, "utf8");
+}
+
+const parityExpectedPath = process.env.MINIME_OPS_WORKER_PARITY_EXPECTED_PATH;
+const parityReportPath = process.env.MINIME_OPS_WORKER_PARITY_REPORT_PATH;
+const parityAckPath = process.env.MINIME_OPS_WORKER_PARITY_ACK_PATH;
+if (!parityExpectedPath || !parityReportPath || !parityAckPath) {
+  process.stderr.write("fake Pi requires the parity handshake contract\n");
+  process.exit(64);
+}
+const parityExpected = readExpectedOpsWorkerParityContract(parityExpectedPath);
+const customPromptValue = flagValue("--system-prompt");
+const selectedTools = (flagValue("--tools") ?? "").split(",").filter(Boolean);
+if (scenario === "parity-mismatch") selectedTools.pop();
+const sourceInfo = (path) => ({
+  path,
+  source: "temporary",
+  scope: "temporary",
+  origin: "top-level",
+});
+const parityReport = attestOpsWorkerPiParity(parityExpected, {
+  systemPromptOptions: {
+    cwd: process.cwd(),
+    customPrompt: customPromptValue === undefined
+      ? undefined
+      : promptInput(customPromptValue),
+    appendSystemPrompt: flagValues("--append-system-prompt")
+      .map(promptInput)
+      .join("\n\n"),
+    contextFiles: args.includes("--no-context-files")
+      ? []
+      : [{ path: "AGENTS.md", content: "fake ambient duplicate" }],
+    skills: flagValues("--skill").map((filePath) => ({ filePath })),
+  },
+  activeToolNames: selectedTools,
+  allTools: selectedTools.map((name) => ({
+    name,
+    sourceInfo: sourceInfo(`<builtin:${name}>`),
+  })),
+  commands: flagValues("--extension").map((path, index) => ({
+    name: `fake-extension-marker-${index}`,
+    source: "extension",
+    sourceInfo: sourceInfo(path),
+  })),
+});
+writeOpsWorkerParityReport(parityReportPath, parityReport);
+if (parityReport.status !== "PASS") process.exit(78);
+const parityDeadline = Date.now() + 5_000;
+while (Date.now() < parityDeadline) {
+  if (
+    existsSync(parityAckPath)
+    && readFileSync(parityAckPath, "utf8").trim() === parityExpected.digest
+  ) break;
+  await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+}
+if (
+  !existsSync(parityAckPath)
+  || readFileSync(parityAckPath, "utf8").trim() !== parityExpected.digest
+) {
+  process.stderr.write("fake Pi parity acknowledgement timed out\n");
+  process.exit(78);
 }
 
 switch (scenario) {
