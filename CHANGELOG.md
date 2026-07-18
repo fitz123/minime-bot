@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Isolate cron-runner tests from ambient production log, health-metric, and control-workspace paths by resolving their environment at call time (#76).
+- Preserve failed cron output and generation-failure notices in a durable single-slot-per-cron outbox with bounded retries, pickup-first redelivery, and explicit terminal evidence (#65).
+- Defer launchd cron creates, updates, and deletes while jobs are active or their activity is unknown, and retry transient replacement and rollback bootstrap races (#62).
+
 ## 2026.7.17
 
 - Treat semantically identical launchd cron plists as unchanged despite XML formatting or dictionary-key order differences, while failing safely on malformed parser output and preserving scalar types and array order.

@@ -482,7 +482,25 @@ best-effort redaction of common credential shapes. Full diagnostics remain in
 the local `FAIL diagnostics: ...` cron log, and admin delivery-failure fallback
 uses the same concise failure context.
 
-More detail is in `docs/launchd-operations.md`.
+Cron delivery is pickup-first. At the start of each scheduled invocation, the
+runner tries to deliver any result owed by that cron before generating new
+output. After bounded in-process delivery retries fail, it stores the exact
+generated output (or generation-failure notice) in one atomic, durable outbox
+slot per cron. A queueable pickup failure stops the invocation before
+generation, so a newer result cannot overwrite the pending one. Redelivery is
+limited to 10 later attempts and a 48-hour lifetime. Queue, redelivery,
+deferral, and terminal decisions are recorded as `OUTBOX` lines in
+`cron-<name>.log`.
+
+Delivery has at-least-once, not exactly-once, semantics: a process crash after
+the chat accepts a message but before the outbox record is cleared can produce
+a duplicate, including for multi-chunk messages. Recovery occurs only on the
+same cron's next scheduled invocation; there is no background sweeper or
+receipt-based deduplication. Pending records for crons that are disabled or
+removed remain inert, inspectable files until an operator handles them.
+
+See [Cron delivery outbox](docs/launchd-operations.md#cron-delivery-outbox) for
+the record location and safe handling guidance.
 
 ### Host-native monitoring
 

@@ -648,14 +648,21 @@ describe("ops worker durable task store", () => {
     };
 
     const first = runFixture("concurrent-a", true);
-    const deadline = Date.now() + 2_000;
-    while (!existsSync(readyPath)) {
-      if (Date.now() >= deadline) throw new Error("Timed out waiting for first store writer");
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    let second:
+      | Promise<{ code: number | null; stdout: string; stderr: string }>
+      | undefined;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= deadline) throw new Error("Timed out waiting for first store writer");
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      second = runFixture("concurrent-b");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    } finally {
+      writeFileSync(releasePath, "release\n", "utf8");
     }
-    const second = runFixture("concurrent-b");
-    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-    writeFileSync(releasePath, "release\n", "utf8");
+    assert.ok(second !== undefined);
     const results = await Promise.all([first, second]);
 
     assert.deepEqual(results.map((result) => result.code).sort(), [0, 1]);

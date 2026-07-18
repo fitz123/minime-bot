@@ -71,7 +71,13 @@ try {
         if (point !== "after-correlation-check") return;
         writeFileSync(readyPath, "ready\n", "utf8");
         const waiter = new Int32Array(new SharedArrayBuffer(4));
-        while (!existsSync(releasePath)) Atomics.wait(waiter, 0, 0, 10);
+        const deadline = Date.now() + 15_000;
+        while (!existsSync(releasePath)) {
+          if (Date.now() >= deadline) {
+            throw new Error("Timed out waiting for store-create fixture release");
+          }
+          Atomics.wait(waiter, 0, 0, 10);
+        }
       }
       : undefined,
   });

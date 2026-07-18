@@ -80,6 +80,19 @@ foreground worker mode refuses to run unless
 `MINIME_RESTART_UNSAFE_FOREGROUND=1` is also set. In-bot restart actions should
 call `scripts/restart-bot.sh --plist` without `--worker`.
 
+## Cron delivery outbox
+
+When delivery retries are exhausted, the cron runner stores the exact owed
+message under `<control-workspace>/data/cron-outbox/`. The directory and its
+hashed per-cron JSON records are owner-only. An enabled cron normally consumes
+only its own record at the start of its next invocation; no background process
+redelivers or garbage-collects records.
+
+Records for disabled or removed crons remain inert. Inspect a record before
+manually removing it so the owed payload, target, run identity, age, and attempt
+count are understood. Removing a record discards that pending delivery; retain
+it if the cron will be re-enabled and should perform the normal pickup.
+
 ## Cron launchd sync
 
 Cron launchd sync is a package CLI operation:
@@ -111,6 +124,21 @@ output. Dry-run still performs no writes, plist lint, launchctl calls, or other
 state mutation. The default non-dry-run mode writes active cron plists,
 lint-checks changed plists, bootouts changed active cron labels, and bootstraps
 them into the current user launchd domain.
+
+Before mutating a created, updated, or deleted cron, sync checks its launchd activity.
+A loaded job with a reported PID is active; an exit-zero result without a PID
+is idle, and launchd's known service-not-found response means not loaded. Active
+jobs are deferred without writing or deleting their plist and without calling
+`bootout`. Any unrecognized response, command error, or missing output is also
+deferred as activity unknown. The command reports the deferral and continues
+with other items. Re-run sync after the job finishes to converge the deferred
+item; sync does not schedule that follow-up automatically, so the previous
+schedule remains live until then.
+
+After a safe update is booted out, replacement bootstrap retries transient
+launchd removal/registration races up to five total attempts, waiting 500 ms
+between attempts. The same bounded retry applies when a failed replacement
+requires the previous plist to be restored and bootstrapped.
 
 Prune is enabled by default for the package-owned `ai.minime.cron.*` namespace.
 Pruning means a stale or disabled owned cron label is booted out, its plist is
