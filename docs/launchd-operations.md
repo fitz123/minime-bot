@@ -112,6 +112,21 @@ state mutation. The default non-dry-run mode writes active cron plists,
 lint-checks changed plists, bootouts changed active cron labels, and bootstraps
 them into the current user launchd domain.
 
+Before mutating an updated or deleted cron, sync checks its launchd activity.
+A loaded job with a reported PID is active; an exit-zero result without a PID
+is idle, and launchd's known service-not-found response means not loaded. Active
+jobs are deferred without writing or deleting their plist and without calling
+`bootout`. Any unrecognized response, command error, or missing output is also
+deferred as activity unknown. The command reports the deferral and continues
+with other items. Re-run sync after the job finishes to converge the deferred
+item; sync does not schedule that follow-up automatically, so the previous
+schedule remains live until then.
+
+After a safe update is booted out, replacement bootstrap retries transient
+launchd removal/registration races up to five total attempts, waiting 500 ms
+between attempts. The same bounded retry applies when a failed replacement
+requires the previous plist to be restored and bootstrapped.
+
 Prune is enabled by default for the package-owned `ai.minime.cron.*` namespace.
 Pruning means a stale or disabled owned cron label is booted out, its plist is
 deleted, and it is not bootstrapped again. `--no-prune` is an escape hatch for

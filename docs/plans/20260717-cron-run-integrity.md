@@ -304,13 +304,13 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 6: Update documentation
 
-- [ ] `README.md` (`## Launchd Operations` cron parts): durable delivery behavior —
+- [x] `README.md` (`## Launchd Operations` cron parts): durable delivery behavior —
   pickup-first order, single slot per cron, 10 attempts / 48h expiry, `OUTBOX` log
   evidence in `cron-<name>.log`, at-least-once semantics, and the honest limits from
   Technical Details.
-- [ ] `docs/launchd-operations.md` ("Cron launchd sync"): active-job deferral semantics,
+- [x] `docs/launchd-operations.md` ("Cron launchd sync"): active-job deferral semantics,
   convergence by re-running sync after the job finishes, bounded bootstrap retry.
-- [ ] `CHANGELOG.md` `## Unreleased`: one entry per issue (#76 test isolation, #65
+- [x] `CHANGELOG.md` `## Unreleased`: one entry per issue (#76 test isolation, #65
   durable cron delivery, #62 safe sync deferral).
 
 ## Technical Details
