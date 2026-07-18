@@ -2,10 +2,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -14,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  formatLaunchdCronSyncResult,
   generateLaunchdCronPlists,
   syncLaunchdCrons,
   type LaunchdCommandRunner,
@@ -93,6 +96,52 @@ function writeRunner(directory: string, mode = 0o700): string {
   writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
   chmodSync(runner, mode);
   return runner;
+}
+
+function writeFixturePlutil(fixture: Fixture): string {
+  const plutil = join(fixture.root, "fixture-plutil");
+  copyFileSync(new URL("./fixtures/plutil-convert.py", import.meta.url), plutil);
+  chmodSync(plutil, 0o700);
+  return plutil;
+}
+
+function renderReorderedPlistFixture(
+  fixture: Fixture,
+  runner: string,
+  cronName: string,
+  hour: number,
+  minute = 0,
+): string {
+  const replacements: Record<string, string> = {
+    CRON_NAME: cronName,
+    HOME: fixture.home,
+    HOUR: String(hour),
+    LABEL: `ai.minime.cron.${cronName}`,
+    LOG_DIR: fixture.logDir,
+    MINUTE: String(minute),
+    RUNNER: runner,
+    STANDARD_ERROR_PATH: join(fixture.logDir, `cron-${cronName}.stderr.log`),
+    STANDARD_OUT_PATH: join(fixture.logDir, `cron-${cronName}.stdout.log`),
+    WORKSPACE: fixture.workspace,
+  };
+  let content = readFileSync(
+    new URL("./fixtures/launchd-cron-reordered.plist", import.meta.url),
+    "utf8",
+  );
+  for (const [name, value] of Object.entries(replacements)) {
+    content = content.replaceAll(`{{${name}}}`, xmlEscapeFixture(value));
+  }
+  assert.doesNotMatch(content, /{{[^}]+}}/);
+  return content;
+}
+
+function xmlEscapeFixture(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function generateWithRunner(fixture: Fixture, runCronScript?: string) {
@@ -534,6 +583,333 @@ describe("launchd cron runner selection", () => {
 });
 
 describe("launchd cron plist sync", () => {
+  it("keeps a PlistBuddy-shaped matching explicit-runner plist unchanged", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const existingContent = renderReorderedPlistFixture(fixture, runner, "active", 8);
+      assert.notEqual(existingContent, generated.plists[0].content);
+      writeFileSync(generated.plists[0].plistPath, existingContent, "utf8");
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
+        "unchanged:ai.minime.cron.active",
+      ]);
+      assert.equal(result.context.plutilBin, plutil);
+      assert.equal(readFileSync(generated.plists[0].plistPath, "utf8"), existingContent);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("fails closed when malformed plist bytes collide after UTF-8 decoding", () => {
+    const fixture = createFixture("minime-launchd-crons-\uFFFD-");
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const plist = generated.plists[0];
+      const desiredBytes = Buffer.from(plist.content, "utf8");
+      const replacementBytes = Buffer.from("\uFFFD", "utf8");
+      const replacementOffset = desiredBytes.indexOf(replacementBytes);
+      assert.notEqual(replacementOffset, -1);
+      const existingBytes = Buffer.concat([
+        desiredBytes.subarray(0, replacementOffset),
+        Buffer.from([0xff]),
+        desiredBytes.subarray(replacementOffset + replacementBytes.length),
+      ]);
+      assert.equal(existingBytes.toString("utf8"), plist.content);
+      assert.equal(existingBytes.equals(desiredBytes), false);
+      writeFileSync(plist.plistPath, existingBytes);
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.equal(result.items[0].action, "update");
+      assert.deepEqual(readFileSync(plist.plistPath), existingBytes);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("keeps a large supported semantically equal plist unchanged", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("large", "0-59 0-23 * 1-6 0"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const plist = generated.plists[0];
+      assert.ok(Buffer.byteLength(plist.content, "utf8") > 1024 * 1024);
+      const existingContent = plist.content.replace(
+        '<plist version="1.0">\n  <dict>',
+        '<plist version="1.0"><dict>',
+      );
+      assert.notEqual(existingContent, plist.content);
+      writeFileSync(plist.plistPath, existingContent, "utf8");
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.equal(result.items[0].action, "unchanged");
+      assert.equal(readFileSync(plist.plistPath, "utf8"), existingContent);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("keeps scalar, array-order, runner, and schedule differences as updates", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const desired = generated.plists[0].content;
+      const otherRunner = join(fixture.root, "previous-release", "scripts", "run-cron.sh");
+      const differences = new Map<string, string>([
+        ["scalar value", desired.replace("<false/>", "<true/>")],
+        ["scalar type", desired.replace("<integer>8</integer>", "<real>8.0</real>")],
+        [
+          "array order",
+          desired.replace(
+            `      <string>${xmlEscapeFixture(runner)}</string>\n      <string>active</string>`,
+            `      <string>active</string>\n      <string>${xmlEscapeFixture(runner)}</string>`,
+          ),
+        ],
+        [
+          "runner",
+          desired.replace(
+            `<string>${xmlEscapeFixture(runner)}</string>`,
+            `<string>${xmlEscapeFixture(otherRunner)}</string>`,
+          ),
+        ],
+        ["schedule", desired.replace("<integer>8</integer>", "<integer>9</integer>")],
+      ]);
+      const plutil = writeFixturePlutil(fixture);
+
+      for (const [difference, existingContent] of differences) {
+        assert.notEqual(existingContent, desired, `${difference} fixture must differ from desired`);
+        writeFileSync(generated.plists[0].plistPath, existingContent, "utf8");
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          runCronScript: runner,
+          dryRun: true,
+          env: { ...fixture.env, PLUTIL_BIN: plutil },
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls),
+        });
+
+        assert.equal(result.items[0].action, "update", difference);
+        assert.equal(readFileSync(generated.plists[0].plistPath, "utf8"), existingContent);
+      }
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("fails malformed plist parsing safely without writes or leaked diagnostics", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      const malformedContent = "<plist><dict><key>private-file-marker</key>";
+      writeFileSync(activePath, malformedContent, "utf8");
+      const beforeEntries = readdirSync(fixture.launchAgentsDir).sort();
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+      const output = formatLaunchdCronSyncResult(result);
+
+      assert.equal(result.items[0].action, "update");
+      assert.equal(readFileSync(activePath, "utf8"), malformedContent);
+      assert.deepEqual(readdirSync(fixture.launchAgentsDir).sort(), beforeEntries);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+      assert.doesNotMatch(output, /private-(?:file|parser)-marker/);
+      assert.equal(output.includes(activePath), false);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("fails returned, thrown, and malformed conversion errors without writes or leaks", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      const existingContent = renderReorderedPlistFixture(fixture, runner, "active", 8).replace(
+        "<integer>8</integer>",
+        "<real>8.0</real>",
+      );
+      writeFileSync(activePath, existingContent, "utf8");
+      const beforeEntries = readdirSync(fixture.launchAgentsDir).sort();
+      const malformedJsonPlutil = join(fixture.root, "malformed-json-plutil");
+      writeFileSync(malformedJsonPlutil, `#!/bin/sh
+if [ "$5" = "-" ]; then
+  printf '%s\\n' 'private-parser-invalid-json'
+else
+  printf '%s\\n' '{}'
+fi
+`, "utf8");
+      chmodSync(malformedJsonPlutil, 0o700);
+      const fixturePlutil = writeFixturePlutil(fixture);
+      const xmlFailurePlutil = join(fixture.root, "xml-failure-plutil");
+      writeFileSync(xmlFailurePlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%s\\n' 'private-parser-xml-failure' >&2
+  exit 1
+fi
+exec "${fixturePlutil}" "$@"
+`, "utf8");
+      chmodSync(xmlFailurePlutil, 0o700);
+      const malformedXmlPlutil = join(fixture.root, "malformed-xml-plutil");
+      writeFileSync(malformedXmlPlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%s\\n' '<plist><dict></plist>'
+  exit 0
+fi
+exec "${fixturePlutil}" "$@"
+`, "utf8");
+      chmodSync(malformedXmlPlutil, 0o700);
+      const invalidUtf8JsonPlutil = join(fixture.root, "invalid-utf8-json-plutil");
+      writeFileSync(invalidUtf8JsonPlutil, `#!/bin/sh
+if [ "$2" = "json" ]; then
+  printf '%b\\n' '{"marker":"\\377"}'
+else
+  printf '%s\\n' '<plist version="1.0"><dict/></plist>'
+fi
+`, "utf8");
+      chmodSync(invalidUtf8JsonPlutil, 0o700);
+      const invalidUtf8XmlPlutil = join(fixture.root, "invalid-utf8-xml-plutil");
+      writeFileSync(invalidUtf8XmlPlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%b\\n' '<plist version="1.0"><dict><key>marker</key><string>\\377</string></dict></plist>'
+else
+  printf '%s\\n' '{}'
+fi
+`, "utf8");
+      chmodSync(invalidUtf8XmlPlutil, 0o700);
+      const invalidPlutils = [
+        join(fixture.root, "private-parser-path-must-not-leak"),
+        "private-parser\0command-must-not-leak",
+        malformedJsonPlutil,
+        xmlFailurePlutil,
+        malformedXmlPlutil,
+        invalidUtf8JsonPlutil,
+        invalidUtf8XmlPlutil,
+      ];
+
+      for (const plutil of invalidPlutils) {
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          runCronScript: runner,
+          dryRun: true,
+          env: { ...fixture.env, PLUTIL_BIN: plutil },
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls),
+        });
+        const output = formatLaunchdCronSyncResult(result);
+
+        assert.equal(result.items[0].action, "update");
+        assert.equal(readFileSync(activePath, "utf8"), existingContent);
+        assert.deepEqual(readdirSync(fixture.launchAgentsDir).sort(), beforeEntries);
+        assert.equal(existsSync(fixture.logDir), false);
+        assert.equal(calls.length, 0);
+        assert.doesNotMatch(output, /private-parser/);
+        assert.equal(output.includes(plutil), false);
+      }
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("uses crons.local.yaml overrides when rendering StartCalendarInterval", () => {
     const fixture = createFixture();
     try {
@@ -857,7 +1233,7 @@ describe("launchd cron plist sync", () => {
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
         runCronScript: runner,
-        env: fixture.env,
+        env: { ...fixture.env, PLUTIL_BIN: "private-parser\0must-not-run" },
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls),
@@ -872,10 +1248,14 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("plans only one create when adding a cron with matching explicit-runner plists", () => {
+  it("plans only one create when reordered explicit-runner plists already exist", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     const runner = writeRunner(join(fixture.root, "release", "scripts"));
+    const existingHours = new Map([
+      ["existing-morning", 8],
+      ["existing-evening", 18],
+    ]);
     const cronsYaml = (includeNew: boolean): string => [
       "crons:",
       "  - name: existing-morning",
@@ -909,16 +1289,30 @@ describe("launchd cron plist sync", () => {
         uid: 501,
       });
       for (const plist of initial.plists) {
-        writeFileSync(plist.plistPath, plist.content, "utf8");
+        const hour = existingHours.get(plist.cron.name);
+        assert.ok(hour !== undefined);
+        const existingContent = renderReorderedPlistFixture(
+          fixture,
+          runner,
+          plist.cron.name,
+          hour,
+        );
+        assert.notEqual(existingContent, plist.content);
+        writeFileSync(plist.plistPath, existingContent, "utf8");
       }
+      const beforeEntries = readdirSync(fixture.launchAgentsDir).sort();
+      const beforeContents = new Map(
+        initial.plists.map((plist) => [plist.plistPath, readFileSync(plist.plistPath, "utf8")]),
+      );
       writeCrons(fixture.workspace, cronsYaml(true));
+      const plutil = writeFixturePlutil(fixture);
 
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
         runCronScript: runner,
         dryRun: true,
-        env: fixture.env,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls),
@@ -931,6 +1325,11 @@ describe("launchd cron plist sync", () => {
       ]);
       assert.equal(calls.length, 0);
       assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.new-midday.plist")), false);
+      assert.deepEqual(readdirSync(fixture.launchAgentsDir).sort(), beforeEntries);
+      for (const [plistPath, existingContent] of beforeContents) {
+        assert.equal(readFileSync(plistPath, "utf8"), existingContent);
+      }
+      assert.equal(existsSync(fixture.logDir), false);
     } finally {
       cleanup(fixture);
     }

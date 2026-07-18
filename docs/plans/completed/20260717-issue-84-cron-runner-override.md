@@ -23,7 +23,7 @@ Public scope is package code/tests/docs only. Private deployment-wrapper wiring 
 - An explicit value must be a normalized absolute path whose basename is `run-cron.sh`; it must resolve to an existing regular file that is readable and executable by its owner.
 - Preserve the caller's validated lexical path in rendered plists so an atomic `current` symlink remains stable across slot switches; use canonical paths only for validation.
 - Symlink policy: allow at most one current-user-owned directory symlink component (the atomic slot selector), never a final-file symlink. Its resolved target must remain beneath the symlink's parent trust directory. The trust directory, resolved directories, and file must be owned by the current user and not group/world writable; POSIX symlink mode bits are not enforced because replacement safety comes from the parent trust directory. Ancestors of a direct containing directory or selector trust directory must be root/current-user owned and not group/world writable, except for writable sticky ancestors whose protected child entry is root/current-user owned. Reject escaping, dangling, multi-symlink, wrong-owner, or writable components. Regular non-symlink fixtures are allowed when their containing directory and file meet the same owner/mode rules.
-- Validate the explicit override while resolving context, before cron loading, directory creation, plist writes, pruning, or launchctl/plutil commands. Dry-run remains zero-write/zero-command.
+- Validate the explicit override while resolving context, before cron loading, directory creation, plist writes, pruning, or launchctl/plutil commands. Invalid overrides therefore remain zero-write/zero-command. Valid dry-runs remain zero-write; the later [semantic plist follow-up](../20260718-issue-84-semantic-plist.md) permits only read-only `plutil` conversion when existing plist bytes differ.
 - Use the validated value consistently in rendering, plan comparison, writes, rollback, and rebootstrap because those phases consume the same generated context.
 - Error messages identify the failed invariant but do not echo the supplied path.
 
@@ -54,7 +54,7 @@ git diff --check origin/main...HEAD
 - [x] Parse `--run-cron-script <path>` and `--run-cron-script=<path>`, reject missing/duplicate/unknown forms, and forward it to `syncLaunchdCrons()`.
 - [x] Update help text and CLI tests without private or deployment-specific paths.
 - [x] Add regressions proving a matching existing plist is `unchanged`, and that adding one cron with a matching override plans only one `create` while all existing jobs remain `unchanged`.
-- [x] Prove invalid overrides fail before filesystem writes or command execution and dry-run with an override remains zero-write/zero-command.
+- [x] Prove invalid overrides fail before filesystem writes or command execution and dry-run with an override remains zero-write. At this implementation point dry-run was also zero-command; the later [semantic plist follow-up](../20260718-issue-84-semantic-plist.md) permits read-only `plutil` conversion for byte-different existing plists.
 
 ### Task 3: Documentation and final validation
 

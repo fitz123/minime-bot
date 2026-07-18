@@ -25,6 +25,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 import { loadMergedCrons } from "./cron-loader.js";
 import {
   expandCronField,
@@ -46,6 +47,7 @@ export const BOT_LAUNCHD_LABEL = "ai.minime.telegram-bot";
 export const DEFAULT_LAUNCHCTL_BIN = "/bin/launchctl";
 export const DEFAULT_PLUTIL_BIN = "/usr/bin/plutil";
 const DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const PLIST_CONVERSION_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
 export interface CalendarInterval {
   Minute?: number;
@@ -338,9 +340,14 @@ export function planLaunchdCronSync(
   const items: LaunchdCronPlanItem[] = [];
 
   for (const plist of generated.plists) {
-    const existing = existsSync(plist.plistPath) ? readFileSync(plist.plistPath, "utf8") : undefined;
+    const existing = existsSync(plist.plistPath) ? readFileSync(plist.plistPath) : undefined;
     const action: LaunchdCronPlanAction =
-      existing === undefined ? "create" : existing === plist.content ? "unchanged" : "update";
+      existing === undefined
+        ? "create"
+        : existing.equals(Buffer.from(plist.content, "utf8"))
+          || plistsSemanticallyEqual(generated.context, plist.plistPath, plist.content)
+          ? "unchanged"
+          : "update";
     items.push({
       action,
       label: plist.label,
@@ -713,6 +720,73 @@ function defaultCommandRunner(command: string, args: readonly string[]): Launchd
     stderr: result.stderr ?? "",
     error: result.error,
   };
+}
+
+function plistsSemanticallyEqual(
+  context: LaunchdCronContext,
+  existingPath: string,
+  desiredContent: string,
+): boolean {
+  const existing = parsePlistJson(context.plutilBin, existingPath);
+  if (!existing.ok) {
+    return false;
+  }
+  const desired = parsePlistJson(context.plutilBin, "-", desiredContent);
+  if (!desired.ok || !isDeepStrictEqual(existing.value, desired.value)) {
+    return false;
+  }
+
+  // JSON represents both plist integers and reals as JavaScript numbers. Cron
+  // plists render only integer numeric scalars, so reject any existing real
+  // after the value comparison rather than silently accepting type drift.
+  const existingXml = convertPlist(context.plutilBin, "xml1", existingPath);
+  if (!existingXml.ok) {
+    return false;
+  }
+  const reparsedExisting = parsePlistJson(context.plutilBin, "-", existingXml.output);
+  return reparsedExisting.ok
+    && isDeepStrictEqual(existing.value, reparsedExisting.value)
+    && !/<real(?:\s*\/)?\s*>/.test(existingXml.output);
+}
+
+function parsePlistJson(
+  plutilBin: string,
+  inputPath: string,
+  input?: string,
+): { ok: true; value: unknown } | { ok: false } {
+  const result = convertPlist(plutilBin, "json", inputPath, input);
+  if (!result.ok) {
+    return result;
+  }
+  try {
+    return { ok: true, value: JSON.parse(result.output) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function convertPlist(
+  plutilBin: string,
+  format: "json" | "xml1",
+  inputPath: string,
+  input?: string,
+): { ok: true; output: string } | { ok: false } {
+  try {
+    const result = spawnSync(
+      plutilBin,
+      ["-convert", format, "-o", "-", inputPath],
+      { input, maxBuffer: PLIST_CONVERSION_MAX_BUFFER_BYTES },
+    );
+    if (result.error || result.status !== 0) {
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      output: new TextDecoder("utf-8", { fatal: true }).decode(result.stdout),
+    };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function runPlutilLint(
