@@ -155,7 +155,45 @@ function canonicalPayload(value: unknown): string {
     seen.add(entry);
     try {
       if (Array.isArray(entry)) {
-        return `[${entry.map((item) => visit(item, depth + 1)).join(",")}]`;
+        if (Object.getPrototypeOf(entry) !== Array.prototype) {
+          throw new OpsWorkerLifecycleError(
+            "canonical payload arrays must be plain JSON arrays",
+          );
+        }
+        if (
+          entry.length
+          > OPS_WORKER_LIFECYCLE_HELPER_LIMITS.maxCanonicalPayloadItems
+        ) {
+          throw new OpsWorkerLifecycleError(
+            `canonical payload arrays must contain at most ${OPS_WORKER_LIFECYCLE_HELPER_LIMITS.maxCanonicalPayloadItems} items`,
+          );
+        }
+        if (Object.getOwnPropertySymbols(entry).length > 0) {
+          throw new OpsWorkerLifecycleError(
+            "canonical payload arrays must not contain symbol keys",
+          );
+        }
+        const propertyNames = Object.getOwnPropertyNames(entry);
+        if (propertyNames.length !== entry.length + 1) {
+          throw new OpsWorkerLifecycleError(
+            "canonical payload arrays must be dense and contain no extra properties",
+          );
+        }
+        const values: string[] = [];
+        for (let index = 0; index < entry.length; index += 1) {
+          const descriptor = Object.getOwnPropertyDescriptor(entry, String(index));
+          if (
+            !descriptor
+            || !("value" in descriptor)
+            || !descriptor.enumerable
+          ) {
+            throw new OpsWorkerLifecycleError(
+              "canonical payload arrays must contain only dense enumerable values",
+            );
+          }
+          values.push(visit(descriptor.value, depth + 1));
+        }
+        return `[${values.join(",")}]`;
       }
       const prototype = Object.getPrototypeOf(entry);
       if (prototype !== Object.prototype && prototype !== null) {

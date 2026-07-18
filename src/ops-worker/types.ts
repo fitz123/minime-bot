@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const OPS_WORKER_TASK_SCHEMA_VERSION = 2 as const;
 export const OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION = 1 as const;
 
@@ -344,6 +346,7 @@ export interface OpsWorkerTask {
   currentCheckpoint: OpsWorkerCheckpoint | null;
   mutationReceipts: OpsWorkerMutationReceipts;
   custody: OpsWorkerCustody;
+  submissionFingerprint: string;
   priority: OpsWorkerPriority;
   objective: string;
   evidence: OpsWorkerEvidence[];
@@ -361,6 +364,82 @@ export interface OpsWorkerTask {
   updatedAt: string;
 }
 
+export type OpsWorkerTaskWithoutSubmissionFingerprint = Omit<
+  OpsWorkerTask,
+  "submissionFingerprint"
+>;
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    const array = expectDensePlainArray(value, "canonical submission");
+    return `[${array.map((entry) => stableJson(entry)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) =>
+      `${JSON.stringify(key)}:${stableJson(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+/** Immutable fingerprint of the adapter-supplied semantic task envelope. */
+export function hashOpsWorkerCanonicalSubmission(
+  task: Pick<
+    OpsWorkerTask,
+    | "source"
+    | "resource"
+    | "priority"
+    | "objective"
+    | "evidence"
+    | "doneCheck"
+    | "authorization"
+  >,
+): string {
+  const canonical = stableJson({
+    source: task.source,
+    resource: task.resource,
+    priority: task.priority,
+    objective: task.objective,
+    evidence: task.evidence.map(({ kind, trust, summary, artifact }) => ({
+      kind,
+      trust,
+      summary,
+      artifact,
+    })),
+    doneCheck: task.doneCheck,
+    authorization: task.authorization,
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+export function withOpsWorkerSubmissionFingerprint(
+  task: OpsWorkerTaskWithoutSubmissionFingerprint,
+): OpsWorkerTask {
+  const {
+    schemaVersion,
+    id,
+    source,
+    resource,
+    lifecycle,
+    currentCheckpoint,
+    mutationReceipts,
+    custody,
+    ...common
+  } = task;
+  return {
+    schemaVersion,
+    id,
+    source,
+    resource,
+    lifecycle,
+    currentCheckpoint,
+    mutationReceipts,
+    custody,
+    submissionFingerprint: hashOpsWorkerCanonicalSubmission(task),
+    ...common,
+  };
+}
+
 export type OpsWorkerTaskV1 = Omit<
   OpsWorkerTask,
   | "schemaVersion"
@@ -370,6 +449,7 @@ export type OpsWorkerTaskV1 = Omit<
   | "currentCheckpoint"
   | "mutationReceipts"
   | "custody"
+  | "submissionFingerprint"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
@@ -454,6 +534,7 @@ const TASK_KEYS = [
   "currentCheckpoint",
   "mutationReceipts",
   "custody",
+  "submissionFingerprint",
   "priority",
   "objective",
   "evidence",
@@ -506,6 +587,26 @@ export class OpsWorkerTaskValidationError extends Error {
 
 function fail(path: string, message: string): never {
   throw new OpsWorkerTaskValidationError(`${path}: ${message}`);
+}
+
+function expectDensePlainArray(value: unknown, path: string): unknown[] {
+  if (!Array.isArray(value)) return fail(path, "must be an array");
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    return fail(path, "must be a plain array");
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    return fail(path, "must not contain symbol keys");
+  }
+  if (Object.getOwnPropertyNames(value).length !== value.length + 1) {
+    return fail(path, "must be dense and contain no extra properties");
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      return fail(path, "must contain only dense enumerable values");
+    }
+  }
+  return value;
 }
 
 function hasOwn(value: object, key: string): boolean {
@@ -844,11 +945,12 @@ function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
   if (!SHA256_PATTERN.test(payloadHash)) {
     fail("task.currentCheckpoint.payloadHash", "must be a lowercase sha256:<hex> digest");
   }
-  if (!Array.isArray(checkpoint.replayHistory)) {
-    fail("task.currentCheckpoint.replayHistory", "must be an array");
-  }
+  const checkpointReplayHistory = expectDensePlainArray(
+    checkpoint.replayHistory,
+    "task.currentCheckpoint.replayHistory",
+  );
   if (
-    checkpoint.replayHistory.length
+    checkpointReplayHistory.length
     > OPS_WORKER_LIMITS.maxCheckpointReplayEntries
   ) {
     fail(
@@ -857,7 +959,7 @@ function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
     );
   }
   const replayIds = new Set<string>([checkpointId]);
-  const replayHistory = checkpoint.replayHistory.map((entry, index) => {
+  const replayHistory = checkpointReplayHistory.map((entry, index) => {
     const path = `task.currentCheckpoint.replayHistory[${index}]`;
     const replay = expectObject(entry, path);
     expectExactKeys(replay, ["checkpointId", "contentHash"], path);
@@ -998,11 +1100,12 @@ function parseMutationReceipt(
       evidenceHash,
     };
   }
-  if (!Array.isArray(receipt.replayHistory)) {
-    fail(`${path}.replayHistory`, "must be an array");
-  }
+  const receiptReplayHistory = expectDensePlainArray(
+    receipt.replayHistory,
+    `${path}.replayHistory`,
+  );
   if (
-    receipt.replayHistory.length
+    receiptReplayHistory.length
     > OPS_WORKER_LIMITS.maxMutationReceiptReplayEntries
   ) {
     fail(
@@ -1011,7 +1114,7 @@ function parseMutationReceipt(
     );
   }
   const replayIds = new Set<string>([operationId]);
-  const replayHistory = receipt.replayHistory.map((entry, index) => {
+  const replayHistory = receiptReplayHistory.map((entry, index) => {
     const replayPath = `${path}.replayHistory[${index}]`;
     const replay = expectObject(entry, replayPath);
     expectExactKeys(
@@ -1131,16 +1234,14 @@ function parseCustody(value: unknown): OpsWorkerCustody {
 }
 
 function parseEvidence(value: unknown): OpsWorkerEvidence[] {
-  if (!Array.isArray(value)) {
-    return fail("task.evidence", "must be an array");
-  }
-  if (value.length > OPS_WORKER_LIMITS.maxEvidenceEntries) {
+  const evidenceEntries = expectDensePlainArray(value, "task.evidence");
+  if (evidenceEntries.length > OPS_WORKER_LIMITS.maxEvidenceEntries) {
     fail(
       "task.evidence",
       `must contain at most ${OPS_WORKER_LIMITS.maxEvidenceEntries} entries`,
     );
   }
-  return value.map((item, index) => {
+  return evidenceEntries.map((item, index) => {
     const path = `task.evidence[${index}]`;
     const evidence = expectObject(item, path);
     expectExactKeys(evidence, ["at", "kind", "trust", "summary", "artifact"], path);
@@ -1211,10 +1312,12 @@ function parseSafeJson(
     return value;
   }
   if (Array.isArray(value)) {
-    if (value.length > OPS_WORKER_LIMITS.maxDoneCheckParamArrayLength) {
+    const array = expectDensePlainArray(value, path);
+    if (array.length > OPS_WORKER_LIMITS.maxDoneCheckParamArrayLength) {
       return fail(path, "array is too large");
     }
-    return value.map((item, index) => parseSafeJson(item, `${path}[${index}]`, depth + 1, budget));
+    return array.map((item, index) =>
+      parseSafeJson(item, `${path}[${index}]`, depth + 1, budget));
   }
   const object = expectObject(value, path);
   const result: JsonObject = {};
@@ -1290,15 +1393,24 @@ function parseAuthorization(
   if (!contract.sourceKinds.includes(sourceKind)) {
     fail("task.authorization.profile", `profile is not registered for source kind ${sourceKind}`);
   }
-  if (!Array.isArray(contract.tools) || contract.tools.length === 0) {
+  const contractTools = expectDensePlainArray(
+    contract.tools,
+    "registry.authorization.tools",
+  );
+  if (contractTools.length === 0) {
     fail("task.authorization.profile", "registered profile must provide a fixed tool allowlist");
   }
-  const tools = contract.tools.map((tool, index) =>
+  const tools = contractTools.map((tool, index) =>
     expectEnum(tool, OPS_WORKER_AUTHORIZATION_TOOLS, `registry.authorization.tools[${index}]`));
   if (new Set(tools).size !== tools.length) {
     fail("task.authorization.profile", "registered profile tool allowlist must not contain duplicates");
   }
-  const readOnlyScope = contract.scope.every((scope) =>
+  const contractScope = expectDensePlainArray(
+    contract.scope,
+    "registry.authorization.scope",
+  ).map((scope, index) =>
+    expectEnum(scope, OPS_WORKER_AUTHORIZATION_SCOPES, `registry.authorization.scope[${index}]`));
+  const readOnlyScope = contractScope.every((scope) =>
     scope === "inspect" || scope === "repository-read");
   if (readOnlyScope && tools.some((tool) => tool === "bash" || tool === "edit" || tool === "write")) {
     fail(
@@ -1306,14 +1418,14 @@ function parseAuthorization(
       "read-only profiles cannot enable mutation or shell tools",
     );
   }
-  if (!Array.isArray(authorization.scope)) {
-    fail("task.authorization.scope", "must be an array");
-  }
-  const suppliedScope = authorization.scope.map((scope, index) =>
+  const suppliedScope = expectDensePlainArray(
+    authorization.scope,
+    "task.authorization.scope",
+  ).map((scope, index) =>
     expectEnum(scope, OPS_WORKER_AUTHORIZATION_SCOPES, `task.authorization.scope[${index}]`));
   if (
-    suppliedScope.length !== contract.scope.length
-    || suppliedScope.some((scope, index) => scope !== contract.scope[index])
+    suppliedScope.length !== contractScope.length
+    || suppliedScope.some((scope, index) => scope !== contractScope[index])
   ) {
     fail("task.authorization.scope", "must exactly match the registered authorization profile");
   }
@@ -1563,6 +1675,7 @@ type OpsWorkerTaskCommon = Omit<
   | "currentCheckpoint"
   | "mutationReceipts"
   | "custody"
+  | "submissionFingerprint"
 >;
 
 function parseTaskCommon(
@@ -1740,7 +1853,7 @@ function legacyCustody(task: OpsWorkerTaskV1): OpsWorkerCustody {
  */
 export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
   const copy = structuredClone(task);
-  const migrated: OpsWorkerTask = {
+  const migrated = withOpsWorkerSubmissionFingerprint({
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id: copy.id,
     source: {
@@ -1772,7 +1885,7 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     report: copy.report,
     createdAt: copy.createdAt,
     updatedAt: copy.updatedAt,
-  };
+  });
   return migrated;
 }
 
@@ -1823,6 +1936,16 @@ function parseOpsWorkerTaskV2(
   assertOpsWorkerTaskId(task.id);
   const id = task.id;
   const source = parseSource(task.source, registry);
+  const submissionFingerprint = expectString(
+    task.submissionFingerprint,
+    "task.submissionFingerprint",
+  );
+  if (!SHA256_PATTERN.test(submissionFingerprint)) {
+    fail(
+      "task.submissionFingerprint",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
   const parsed: OpsWorkerTask = {
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
@@ -1832,6 +1955,7 @@ function parseOpsWorkerTaskV2(
     currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
     mutationReceipts: parseMutationReceipts(task.mutationReceipts),
     custody: parseCustody(task.custody),
+    submissionFingerprint,
     ...parseTaskCommon(task, id, source, registry),
   };
   assertTaskCustodyMatchesState(parsed);

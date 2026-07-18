@@ -20,6 +20,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
@@ -51,7 +52,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 };
 
 function makeTask(id = "lifecycle-task"): OpsWorkerTask {
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: 2,
     id,
     source: {
@@ -88,7 +89,7 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: NOW,
     updatedAt: NOW,
-  };
+  });
 }
 
 function makeHarness(t: TestContext): {
@@ -199,6 +200,16 @@ describe("ops worker package-owned lifecycle evidence", () => {
     assert.throws(
       () => hashOpsWorkerCanonicalPayload({ evidence: "x".repeat(20_000) }),
       /canonical payload must be at most/,
+    );
+    const sparse = new Array<unknown>(1);
+    assert.throws(
+      () => hashOpsWorkerCanonicalPayload(sparse),
+      /arrays must be dense/,
+    );
+    const oversizedSparse = new Array<unknown>(257);
+    assert.throws(
+      () => hashOpsWorkerCanonicalPayload(oversizedSparse),
+      /arrays must contain at most 256 items/,
     );
   });
 
@@ -314,6 +325,38 @@ describe("ops worker package-owned lifecycle evidence", () => {
     assert.equal(reconciled.mutationReceipts.merge?.mutationStartedAt, null);
     assert.equal(reconciled.mutationReceipts.merge?.outcome?.result, "ALREADY_APPLIED");
     assert.equal(reconciled.lifecycle.merge, "commit:abc123");
+  });
+
+  it("rejects a stale replace that would erase a durable mutation claim", (t) => {
+    const harness = makeHarness(t);
+    const task = makeTask("receipt-stale-replace");
+    harness.store.create(task);
+    const operation = {
+      boundary: "merge" as const,
+      operationId: "merge-stale-replace",
+      intent: { base: "main", head: "issue-58" },
+    };
+    harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operation,
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    const staleQueryOnly = harness.store.get(task.id);
+    assert.ok(staleQueryOnly);
+    assert.equal(
+      harness.lifecycle.claimMutationReceipt(task.id, operation).claimed,
+      true,
+    );
+
+    assert.throws(
+      () => harness.store.replace(staleQueryOnly),
+      /erase claimed merge operation.*strictly newer unfinished query/,
+    );
+    assert.equal(
+      harness.lifecycle.claimMutationReceipt(task.id, operation).claimed,
+      false,
+      "the durable claim must remain authoritative after the stale replace",
+    );
   });
 
   it("accepts only fixed boundaries and matching operation intent and outcome evidence", (t) => {

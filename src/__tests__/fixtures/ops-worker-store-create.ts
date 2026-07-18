@@ -9,6 +9,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  withOpsWorkerSubmissionFingerprint,
 } from "../../ops-worker/types.js";
 
 const [operation, stateDirectory, taskId, correlationKey, readyPath, releasePath] =
@@ -61,7 +62,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 };
 
 const now = "2026-07-17T12:00:00.000Z";
-const task: OpsWorkerTask = {
+const task: OpsWorkerTask = withOpsWorkerSubmissionFingerprint({
   schemaVersion: 2,
   id: taskId,
   source: {
@@ -98,7 +99,7 @@ const task: OpsWorkerTask = {
   report: { state: "NONE", attempts: 0, lastError: null },
   createdAt: now,
   updatedAt: now,
-};
+});
 
 try {
   const store = new OpsWorkerTaskStore(stateDirectory, {

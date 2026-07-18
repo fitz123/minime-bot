@@ -67,7 +67,10 @@ Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An
 identical replay returns the existing task, including after completion, without
 adding a snapshot or audit transition. Reusing that key with a different
-canonical submission fails closed. The correlation key has a different role:
+canonical submission fails closed. Each v2 snapshot retains a store-owned
+immutable submission fingerprint, so later runtime evidence updates or bounded
+evidence eviction cannot make a conflicting delivery look identical. The
+correlation key has a different role:
 it prevents duplicate active work for one episode and may be reused after the
 earlier task becomes terminal.
 

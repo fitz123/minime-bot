@@ -36,6 +36,7 @@ import {
 } from "../pi-runtime.js";
 import type { AgentConfig, PiThinkingLevel } from "../types.js";
 import {
+  OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
   type OpsWorkerStartupRunResult,
 } from "./supervisor.js";
@@ -323,7 +324,12 @@ export class OpsWorkerPiAttemptRunner {
     const scheduled = this.supervisor.claimNextTask();
     if (!scheduled) return undefined;
     if (scheduled.action === "CHECK") {
-      return this.supervisor.runDoneCheck(scheduled.task.id, this.abortSignal);
+      try {
+        return await this.supervisor.runDoneCheck(scheduled.task.id, this.abortSignal);
+      } catch (error) {
+        if (!(error instanceof OpsWorkerStaleCheckResultError)) throw error;
+        return this.supervisor.getTask(scheduled.task.id);
+      }
     }
     return this.runAttempt(scheduled.task.id);
   }

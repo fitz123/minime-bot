@@ -23,6 +23,7 @@ import {
   OpsWorkerTaskValidationError,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
@@ -92,7 +93,7 @@ function makeTask(
   id = "wt-20260717-ab12cd",
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: 2,
     id,
     source: {
@@ -180,7 +181,7 @@ function makeTask(
     },
     createdAt: NOW,
     updatedAt: NOW,
-  };
+  });
 }
 
 function makeV1Task(
@@ -194,6 +195,7 @@ function makeV1Task(
     currentCheckpoint: _currentCheckpoint,
     mutationReceipts: _mutationReceipts,
     custody: _custody,
+    submissionFingerprint: _submissionFingerprint,
     ...legacy
   } = current;
   const { deliveryKey: _deliveryKey, ...source } = legacy.source;
@@ -738,6 +740,12 @@ describe("ops worker task contract", () => {
       () => parseOpsWorkerTask(oversizedEvidence, registry),
       /must be at most 4096 UTF-8 bytes/,
     );
+    const sparseEvidence = clone(makeTask());
+    sparseEvidence.evidence = new Array(1);
+    assert.throws(
+      () => parseOpsWorkerTask(sparseEvidence, registry),
+      /task\.evidence: must be dense/,
+    );
 
     const traversal = clone(makeTask());
     traversal.evidence[0].artifact = "artifacts/../outside";
@@ -995,7 +1003,7 @@ describe("ops worker durable task store", () => {
     assert.deepEqual(store.get(original.id), original);
   });
 
-  it("keeps source delivery identity, resource identity, and creation time immutable", (t) => {
+  it("keeps submission, delivery, resource, and creation identity immutable", (t) => {
     const store = makeStore(t);
     const original = makeTask();
     store.create(original);
@@ -1008,6 +1016,9 @@ describe("ops worker durable task store", () => {
       (task: OpsWorkerTask) => {
         task.createdAt = LATER;
         task.updatedAt = LATER;
+      },
+      (task: OpsWorkerTask) => {
+        task.submissionFingerprint = `sha256:${"f".repeat(64)}`;
       },
     ]) {
       assert.throws(
@@ -1242,6 +1253,16 @@ describe("ops worker durable task store", () => {
       releasedAt: LATER,
       releaseReason: "DONE",
     };
+    completed.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      (_, index) => ({
+        at: LATER,
+        kind: "system" as const,
+        trust: "trusted" as const,
+        summary: `Bounded runtime evidence ${index}`,
+        artifact: null,
+      }),
+    );
     store.replace(completed, { event: "TRANSITION" });
     const journalBeforeReplay = readFileSync(store.journalPath, "utf8");
     const replay = makeTask("wt-20260717-replayed", original.source.correlationKey);
@@ -1265,6 +1286,28 @@ describe("ops worker durable task store", () => {
     const conflict = makeTask("wt-20260717-conflict", original.source.correlationKey);
     conflict.source.deliveryKey = original.source.deliveryKey;
     conflict.objective = "A different canonical adapter submission";
+
+    assert.throws(
+      () => store.create(conflict),
+      (error: unknown) => {
+        assert.ok(error instanceof OpsWorkerDeliveryConflictError);
+        assert.equal(error.existingTaskId, original.id);
+        return true;
+      },
+    );
+    assert.deepEqual(store.list(), [original]);
+  });
+
+  it("fails closed when a delivery replay changes submission evidence", (t) => {
+    const store = makeStore(t);
+    const original = makeTask();
+    store.create(original);
+    const conflict = makeTask(
+      "wt-20260717-evidence-conflict",
+      original.source.correlationKey,
+    );
+    conflict.source.deliveryKey = original.source.deliveryKey;
+    conflict.evidence[0].summary = "Materially different adapter evidence";
 
     assert.throws(
       () => store.create(conflict),

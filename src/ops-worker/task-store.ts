@@ -22,6 +22,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
+  hashOpsWorkerCanonicalSubmission,
   isOpsWorkerTerminalState,
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
@@ -652,6 +653,7 @@ export class OpsWorkerTaskStore {
     audit: OpsWorkerAuditInput = { event: "CREATED" },
   ): OpsWorkerTaskStoreCreateResult {
     const task = parseOpsWorkerTask(value, this.registry);
+    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
     assertAuditInput(audit);
     return this.withMutationLock(() => {
       this.ensureSafeDirectories();
@@ -795,6 +797,7 @@ export class OpsWorkerTaskStore {
       || existing.createdAt !== replacement.createdAt
       || JSON.stringify(existing.source) !== JSON.stringify(replacement.source)
       || JSON.stringify(existing.resource) !== JSON.stringify(replacement.resource)
+      || existing.submissionFingerprint !== replacement.submissionFingerprint
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
@@ -853,6 +856,47 @@ export class OpsWorkerTaskStore {
             `Refusing to forget unfinished ${current.boundary} operation ${current.operationId}`,
           );
         }
+        const currentQueryAt = Date.parse(current.queryObservedAt);
+        const nextQueryAt = Date.parse(next.queryObservedAt);
+        if (nextQueryAt < currentQueryAt) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to move ${current.boundary} query observation backwards`,
+          );
+        }
+        if (
+          nextQueryAt === currentQueryAt
+          && next.queryResultHash !== current.queryResultHash
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to change ${current.boundary} query evidence at the same observation time`,
+          );
+        }
+        if (current.mutationStartedAt !== null) {
+          if (next.mutationStartedAt === null) {
+            if (
+              next.outcome !== null
+              || nextQueryAt <= Date.parse(current.mutationStartedAt)
+            ) {
+              throw new OpsWorkerTaskStoreSafetyError(
+                `Refusing to erase claimed ${current.boundary} operation ${current.operationId} without a strictly newer unfinished query`,
+              );
+            }
+          } else if (next.mutationStartedAt !== current.mutationStartedAt) {
+            throw new OpsWorkerTaskStoreSafetyError(
+              `Refusing to change the durable claim time for ${current.boundary} operation ${current.operationId}`,
+            );
+          }
+        } else if (
+          next.mutationStartedAt !== null
+          && (
+            next.queryObservedAt !== current.queryObservedAt
+            || next.queryResultHash !== current.queryResultHash
+          )
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to claim ${current.boundary} operation ${current.operationId} against unrecorded query evidence`,
+          );
+        }
       }
       const completedIdentities = (
         receipt: typeof current,
@@ -894,15 +938,7 @@ export class OpsWorkerTaskStore {
   }
 
   private assertCanonicalSubmission(existing: OpsWorkerTask, replay: OpsWorkerTask): void {
-    const canonical = (task: OpsWorkerTask): unknown => ({
-      source: task.source,
-      resource: task.resource,
-      priority: task.priority,
-      objective: task.objective,
-      doneCheck: task.doneCheck,
-      authorization: task.authorization,
-    });
-    if (JSON.stringify(canonical(existing)) !== JSON.stringify(canonical(replay))) {
+    if (existing.submissionFingerprint !== replay.submissionFingerprint) {
       throw new OpsWorkerDeliveryConflictError(
         replay.source.deliveryKey,
         existing.id,

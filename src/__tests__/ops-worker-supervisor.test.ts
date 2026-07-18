@@ -35,6 +35,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
   type OpsWorkerTask,
@@ -107,7 +108,7 @@ function makeTask(
     "registered-cron": 20,
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: 2,
     id,
     source: {
@@ -158,7 +159,7 @@ function makeTask(
     },
     createdAt: options.createdAt ?? NOW,
     updatedAt: options.createdAt ?? NOW,
-  };
+  });
 }
 
 interface Harness {
@@ -1130,6 +1131,7 @@ describe("ops worker supervisor", () => {
         currentCheckpoint: _currentCheckpoint,
         mutationReceipts: _mutationReceipts,
         custody: _custody,
+        submissionFingerprint: _submissionFingerprint,
         source,
         schemaVersion: _schemaVersion,
         ...common

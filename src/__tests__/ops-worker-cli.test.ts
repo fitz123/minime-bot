@@ -258,6 +258,7 @@ describe("ops worker CLI and inactive runtime", () => {
       currentCheckpoint: _currentCheckpoint,
       mutationReceipts: _mutationReceipts,
       custody: _custody,
+      submissionFingerprint: _submissionFingerprint,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {

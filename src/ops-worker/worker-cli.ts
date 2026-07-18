@@ -32,6 +32,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  withOpsWorkerSubmissionFingerprint,
   OPS_WORKER_MUTATION_BOUNDARIES,
   OPS_WORKER_MUTATION_OUTCOMES,
   OPS_WORKER_SOURCE_PRIORITIES,
@@ -424,7 +425,7 @@ function createTask(
       `authorization profile ${JSON.stringify(authorizationProfile)} is not registered`,
     );
   }
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
     source: {
@@ -479,7 +480,7 @@ function createTask(
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,
     updatedAt: now,
-  };
+  });
 }
 
 function printTask(

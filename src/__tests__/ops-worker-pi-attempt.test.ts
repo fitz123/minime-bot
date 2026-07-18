@@ -41,6 +41,7 @@ import {
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
   OPS_WORKER_LIMITS,
+  withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
   type OpsWorkerTask,
@@ -102,7 +103,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
-  return {
+  return withOpsWorkerSubmissionFingerprint({
     schemaVersion: 2,
     id,
     source: {
@@ -146,7 +147,7 @@ function makeTask(
     report: { state: "NONE", attempts: 0, lastError: null },
     createdAt: now,
     updatedAt: now,
-  };
+  });
 }
 
 interface Harness {
@@ -446,6 +447,43 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result?.state, "DONE");
     assert.equal(result?.lastOutcome?.result, "PASS");
     assert.equal(harness.invocations.length, 0);
+  });
+
+  it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
+    let checkCalls = 0;
+    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+          resolveFirstCheck = resolveCheck;
+        });
+      }
+      return {
+        result: "PASS",
+        summary: "Fresh fixture pass after checkpoint liveness.",
+      };
+    });
+    const task = makeTask("stale-checkpoint-check");
+    harness.store.create(task);
+    harness.supervisor.requestDoneCheck(task.id);
+
+    const pending = harness.runner().runNext();
+    await waitFor(() => resolveFirstCheck !== undefined);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-during-check",
+      payload: { progress: "still-live" },
+      summary: "Lifecycle progress arrived during deterministic verification.",
+    });
+    assert.ok(resolveFirstCheck);
+    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
+
+    const stale = await pending;
+    assert.equal(stale?.state, "CHECKING");
+    assert.equal(stale?.currentCheckpoint?.checkpointId, "checkpoint-during-check");
+    const completed = await harness.runner().runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(checkCalls, 2);
   });
 
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {
