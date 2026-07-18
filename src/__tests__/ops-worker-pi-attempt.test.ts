@@ -453,6 +453,36 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
+  it("stops the owned group when priority monitoring fails", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("priority-monitor-failure"));
+    harness.setScenario("wait");
+    const originalListTasks = harness.supervisor.listTasks.bind(harness.supervisor);
+    let failPriorityPoll = false;
+    harness.supervisor.listTasks = () => {
+      if (failPriorityPoll) throw new Error("synthetic priority store failure");
+      return originalListTasks();
+    };
+
+    const running = harness.runner().runAttempt("priority-monitor-failure");
+    await waitFor(() =>
+      harness.supervisor.getTask("priority-monitor-failure")?.state === "RUNNING"
+    );
+    const active = harness.supervisor.getTask("priority-monitor-failure")?.activeRun;
+    assert.ok(active);
+    failPriorityPoll = true;
+
+    const result = await running;
+    harness.supervisor.listTasks = originalListTasks;
+
+    assert.equal(result.state, "RESUMABLE", JSON.stringify(result.lastOutcome));
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /monitor failed.*priority store failure/);
+    assert.equal(result.activeRun, null);
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
   it("stops a no-progress attempt at the stall bound without spending remediation", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("stall-timeout"));

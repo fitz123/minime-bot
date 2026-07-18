@@ -621,7 +621,10 @@ export class OpsWorkerPiAttemptRunner {
       stallMonitor.promise,
       preemptionMonitor.promise,
       shutdownTrigger.promise,
-    ]);
+    ]).catch((error: unknown) => ({
+      kind: "MONITOR_ERROR" as const,
+      error,
+    }));
     let trigger: Awaited<typeof triggerPromise>;
     try {
       trigger = await triggerPromise;
@@ -708,6 +711,18 @@ export class OpsWorkerPiAttemptRunner {
           task.id,
           "CRASH",
           "Pi attempt was interrupted by worker shutdown",
+          undefined,
+          evidence,
+        ),
+      };
+    }
+    if (trigger.kind === "MONITOR_ERROR") {
+      return {
+        classification: "CRASH",
+        task: this.supervisor.recordResumableInfrastructureOutcome(
+          task.id,
+          "CRASH",
+          `Pi attempt monitor failed: ${errorMessage(trigger.error)}`,
           undefined,
           evidence,
         ),
