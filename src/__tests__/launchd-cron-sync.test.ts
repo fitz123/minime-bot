@@ -19,6 +19,7 @@ import {
   formatLaunchdCronSyncResult,
   generateLaunchdCronPlists,
   syncLaunchdCrons,
+  type LaunchdCommandResult,
   type LaunchdCommandRunner,
 } from "../launchd-cron-plists.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
@@ -76,9 +77,21 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function captureRunner(calls: CommandCall[], bootoutStatus = 0): LaunchdCommandRunner {
+function captureRunner(
+  calls: CommandCall[],
+  bootoutStatus = 0,
+  printResponses: readonly LaunchdCommandResult[] = [],
+): LaunchdCommandRunner {
+  let printIndex = 0;
   return (command, args) => {
     calls.push({ command, args: [...args] });
+    if (args[0] === "print") {
+      return printResponses[printIndex++] ?? {
+        status: 3,
+        stdout: "",
+        stderr: "Could not find service",
+      };
+    }
     if (args[0] === "bootout") {
       return { status: bootoutStatus, stderr: bootoutStatus === 0 ? "" : "not loaded" };
     }
@@ -1084,6 +1097,131 @@ fi
     }
   });
 
+  it("defers active updates and deletes without mutating their plists or services", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      const previousActive = "old active plist";
+      const previousStale = "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n";
+      writeFileSync(activePath, previousActive, "utf8");
+      writeFileSync(stalePath, previousStale, "utf8");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls, 0, [
+          { status: 0, stdout: "state = running\n    pid = 4242\n", stderr: "" },
+          { status: 0, stdout: "    pid = 4343\n", stderr: "" },
+        ]),
+      });
+
+      assert.equal(readFileSync(activePath, "utf8"), previousActive);
+      assert.equal(readFileSync(stalePath, "utf8"), previousStale);
+      assert.deepEqual(
+        result.items.map((item) => `${item.action}:${item.label}:${item.deferredReason ?? "none"}`),
+        [
+          "update:ai.minime.cron.active:active",
+          "delete:ai.minime.cron.stale:active",
+        ],
+      );
+      assert.deepEqual(calls.map((call) => call.args), [
+        ["print", "gui/501/ai.minime.cron.active"],
+        ["print", "gui/501/ai.minime.cron.stale"],
+      ]);
+      assert.equal(calls.some((call) => ["-lint", "bootout", "bootstrap"].includes(call.args[0])), false);
+
+      const output = formatLaunchdCronSyncResult(result);
+      assert.match(output, /deferred ai\.minime\.cron\.active \(active job running\)/);
+      assert.match(output, /deferred ai\.minime\.cron\.stale \(active job running\)/);
+      assert.match(output, /Summary: create 0, update 1, unchanged 0, delete 1, deferred 2/);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("proceeds with updates and deletes when jobs are idle or known not loaded", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      writeFileSync(
+        stalePath,
+        "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n",
+        "utf8",
+      );
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls, 0, [
+          { status: 0, stdout: "state = waiting\n", stderr: "" },
+          { status: 3, stdout: "", stderr: "Could not find service in domain" },
+        ]),
+      });
+
+      assert.match(readFileSync(activePath, "utf8"), /<string>ai\.minime\.cron\.active<\/string>/);
+      assert.equal(existsSync(stalePath), false);
+      assert.equal(result.items.some((item) => item.deferredReason !== undefined), false);
+      assert.deepEqual(
+        calls.filter((call) => call.args[0] === "print").map((call) => call.args[1]),
+        ["gui/501/ai.minime.cron.active", "gui/501/ai.minime.cron.stale"],
+      );
+      assert.equal(calls.filter((call) => call.args[0] === "bootout").length, 2);
+      assert.equal(calls.filter((call) => call.args[0] === "bootstrap").length, 1);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  for (const [activityCase, printResponse] of [
+    ["unknown non-zero status", { status: 5, stdout: "", stderr: "Operation not permitted" }],
+    ["runner error", { status: null, stdout: "", stderr: "", error: new Error("spawn failed") }],
+    ["missing output", { status: 0, stderr: "" }],
+  ] satisfies Array<[string, LaunchdCommandResult]>) {
+    it(`defers an update when activity is unsafe: ${activityCase}`, () => {
+      const fixture = createFixture();
+      const calls: CommandCall[] = [];
+      try {
+        writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+        const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+        writeFileSync(activePath, "old active plist", "utf8");
+
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls, 0, [printResponse]),
+        });
+
+        assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+        assert.equal(result.items[0].deferredReason, "unknown");
+        assert.deepEqual(calls.map((call) => call.args), [
+          ["print", "gui/501/ai.minime.cron.active"],
+        ]);
+        assert.match(
+          formatLaunchdCronSyncResult(result),
+          /deferred ai\.minime\.cron\.active \(activity unknown\)/,
+        );
+      } finally {
+        cleanup(fixture);
+      }
+    });
+  }
+
   it("writes changed active plists, rebootstraps them, and prunes stale or disabled cron plists", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
@@ -1330,6 +1468,157 @@ fi
         assert.equal(readFileSync(plistPath, "utf8"), existingContent);
       }
       assert.equal(existsSync(fixture.logDir), false);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("retries transient replacement bootstrap failures and then succeeds", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    const sleepDelays: number[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      let bootstrapCount = 0;
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
+        if (args[0] === "bootstrap") {
+          bootstrapCount += 1;
+          if (bootstrapCount === 1) {
+            return { status: 5, stdout: "", stderr: "Bootstrap in progress" };
+          }
+          if (bootstrapCount === 2) {
+            return { status: 5, stdout: "Input/output error", stderr: "" };
+          }
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: runner,
+        sleep: (ms) => sleepDelays.push(ms),
+      });
+
+      assert.match(readFileSync(activePath, "utf8"), /<string>ai\.minime\.cron\.active<\/string>/);
+      assert.equal(bootstrapCount, 3);
+      assert.deepEqual(sleepDelays, [500, 500]);
+      assert.equal(
+        result.commands.filter((command) => command.args[0] === "bootstrap").length,
+        3,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("retries a transient rollback bootstrap after replacement bootstrap fails", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    const sleepDelays: number[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      let bootstrapCount = 0;
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
+        if (args[0] === "bootstrap") {
+          bootstrapCount += 1;
+          if (bootstrapCount === 1) {
+            return { status: 5, stdout: "", stderr: "replacement rejected" };
+          }
+          if (bootstrapCount === 2) {
+            return { status: 5, stdout: "", stderr: "service already loaded" };
+          }
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: runner,
+          sleep: (ms) => sleepDelays.push(ms),
+        }),
+        /launchctl bootstrap .* failed: replacement rejected/,
+      );
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.equal(bootstrapCount, 3);
+      assert.deepEqual(sleepDelays, [500]);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("bounds persistent rollback bootstrap retries and preserves combined evidence", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    const sleepDelays: number[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const activePath = join(fixture.launchAgentsDir, "ai.minime.cron.active.plist");
+      writeFileSync(activePath, "old active plist", "utf8");
+      let bootstrapCount = 0;
+      const runner: LaunchdCommandRunner = (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
+        if (args[0] === "bootstrap") {
+          bootstrapCount += 1;
+          if (bootstrapCount === 1) {
+            return { status: 5, stdout: "", stderr: "replacement exhausted" };
+          }
+          return {
+            status: 5,
+            stdout: "",
+            stderr: `Input/output error rollback attempt ${bootstrapCount - 1}`,
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+
+      let thrown: unknown;
+      try {
+        syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: fixture.env,
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: runner,
+          sleep: (ms) => sleepDelays.push(ms),
+        });
+        assert.fail("sync should fail after rollback bootstrap retries are exhausted");
+      } catch (err) {
+        thrown = err;
+      }
+
+      assert.ok(thrown instanceof Error);
+      assert.match(thrown.message, /replacement exhausted/);
+      assert.match(thrown.message, /rollback bootstrap of previous plist failed/);
+      assert.match(thrown.message, /Input\/output error rollback attempt 5/);
+      assert.equal(readFileSync(activePath, "utf8"), "old active plist");
+      assert.equal(bootstrapCount, 6);
+      assert.deepEqual(sleepDelays, [500, 500, 500, 500]);
+      assert.equal(calls.filter((call) => call.args[0] === "bootstrap").length, 6);
     } finally {
       cleanup(fixture);
     }

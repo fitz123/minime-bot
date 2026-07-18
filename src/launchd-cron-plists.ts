@@ -48,6 +48,12 @@ export const DEFAULT_LAUNCHCTL_BIN = "/bin/launchctl";
 export const DEFAULT_PLUTIL_BIN = "/usr/bin/plutil";
 const DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const PLIST_CONVERSION_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const BOOTSTRAP_MAX_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_DELAY_MS = 500;
+const TRANSIENT_BOOTSTRAP_FAILURE =
+  /in progress|already loaded|already bootstrapped|input\/output error/i;
+
+type CronJobActivity = "active" | "idle" | "not-loaded" | "unknown";
 
 export interface CalendarInterval {
   Minute?: number;
@@ -105,6 +111,7 @@ export interface LaunchdCronPlanItem {
   label: string;
   plistPath: string;
   reason?: "active" | "disabled" | "stale";
+  deferredReason?: "active" | "unknown";
   scheduleSummary?: string;
 }
 
@@ -131,6 +138,7 @@ export interface SyncLaunchdCronsOptions extends GenerateLaunchdCronPlistsOption
   dryRun?: boolean;
   prune?: boolean;
   commandRunner?: LaunchdCommandRunner;
+  sleep?: (ms: number) => void;
 }
 
 export interface SyncLaunchdCronsResult {
@@ -393,11 +401,19 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
   mkdirSync(planned.context.launchAgentsDir, { recursive: true });
   mkdirSync(planned.context.logDir, { recursive: true });
   const runner = options.commandRunner ?? defaultCommandRunner;
+  const sleep = options.sleep ?? defaultSynchronousSleep;
   const desiredByLabel = new Map(planned.plists.map((plist) => [plist.label, plist]));
 
   for (const item of planned.items) {
     if (item.action === "unchanged") {
       continue;
+    }
+    if (item.action === "update" || item.action === "delete") {
+      const activity = getCronJobActivity(planned.context, runner, commands, item.label);
+      if (activity === "active" || activity === "unknown") {
+        item.deferredReason = activity;
+        continue;
+      }
     }
     if (item.action === "delete") {
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
@@ -421,12 +437,12 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
         ["bootout", `${planned.context.launchdDomain}/${item.label}`],
         true,
       );
-      runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
+      bootstrapWithRetry(planned.context, runner, commands, plist.plistPath, sleep);
     } catch (err) {
       restorePreviousPlist(plist.plistPath, previousContent);
       if (bootoutUnloaded && previousContent !== undefined) {
         try {
-          runLaunchctl(planned.context, runner, commands, ["bootstrap", planned.context.launchdDomain, plist.plistPath], false);
+          bootstrapWithRetry(planned.context, runner, commands, plist.plistPath, sleep);
         } catch (rollbackErr) {
           throw new Error(
             `${errorMessage(err)}; rollback bootstrap of previous plist failed: ${errorMessage(rollbackErr)}`,
@@ -448,7 +464,11 @@ export function formatLaunchdCronSyncResult(result: SyncLaunchdCronsResult): str
   ];
 
   for (const item of result.items) {
-    if (item.action === "unchanged") {
+    if (item.deferredReason === "active") {
+      lines.push(`${prefix}deferred ${item.label} (active job running)`);
+    } else if (item.deferredReason === "unknown") {
+      lines.push(`${prefix}deferred ${item.label} (activity unknown)`);
+    } else if (item.action === "unchanged") {
       lines.push(`${prefix}unchanged ${item.label} ${item.scheduleSummary ?? ""}`.trimEnd());
     } else if (item.action === "delete") {
       lines.push(`${prefix}delete ${item.label} (${item.reason ?? "stale"})`);
@@ -459,8 +479,9 @@ export function formatLaunchdCronSyncResult(result: SyncLaunchdCronsResult): str
   }
 
   const counts = countPlanItems(result.items);
+  const deferred = result.items.filter((item) => item.deferredReason !== undefined).length;
   lines.push(
-    `${prefix}Summary: create ${counts.create}, update ${counts.update}, unchanged ${counts.unchanged}, delete ${counts.delete}`,
+    `${prefix}Summary: create ${counts.create}, update ${counts.update}, unchanged ${counts.unchanged}, delete ${counts.delete}, deferred ${deferred}`,
   );
   return `${lines.join("\n")}\n`;
 }
@@ -806,6 +827,104 @@ function runLaunchctl(
   ignoreFailure: boolean,
 ): boolean {
   return runCommand(context.launchctlBin, args, runner, commands, ignoreFailure);
+}
+
+function getCronJobActivity(
+  context: LaunchdCronContext,
+  runner: LaunchdCommandRunner,
+  commands: LaunchdCommandRecord[],
+  label: string,
+): CronJobActivity {
+  const args = ["print", `${context.launchdDomain}/${label}`];
+  let result: LaunchdCommandResult;
+  try {
+    result = runner(context.launchctlBin, args);
+  } catch (err) {
+    result = {
+      status: null,
+      error: err instanceof Error ? err : new Error(String(err)),
+    };
+  }
+  commands.push({
+    command: context.launchctlBin,
+    args,
+    status: result.status,
+  });
+
+  if (result.error !== undefined) {
+    return "unknown";
+  }
+  if (result.status === 0) {
+    if (result.stdout === undefined) {
+      return "unknown";
+    }
+    return /^\s*pid = \d+/m.test(result.stdout) ? "active" : "idle";
+  }
+  if (result.stdout === undefined && result.stderr === undefined) {
+    return "unknown";
+  }
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  if (typeof result.status === "number" && /Could not find service/i.test(output)) {
+    return "not-loaded";
+  }
+  return "unknown";
+}
+
+function bootstrapWithRetry(
+  context: LaunchdCronContext,
+  runner: LaunchdCommandRunner,
+  commands: LaunchdCommandRecord[],
+  plistPath: string,
+  sleep: (ms: number) => void,
+): void {
+  const args = ["bootstrap", context.launchdDomain, plistPath];
+  for (let attempt = 1; attempt <= BOOTSTRAP_MAX_ATTEMPTS; attempt += 1) {
+    let result: LaunchdCommandResult;
+    try {
+      result = runner(context.launchctlBin, args);
+    } catch (err) {
+      result = {
+        status: null,
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    commands.push({
+      command: context.launchctlBin,
+      args: [...args],
+      status: result.status,
+    });
+
+    if (result.error === undefined && result.status === 0) {
+      return;
+    }
+    if (attempt < BOOTSTRAP_MAX_ATTEMPTS && isTransientBootstrapFailure(result)) {
+      sleep(BOOTSTRAP_RETRY_DELAY_MS);
+      continue;
+    }
+    throw commandFailureError(context.launchctlBin, args, result);
+  }
+}
+
+function isTransientBootstrapFailure(result: LaunchdCommandResult): boolean {
+  return TRANSIENT_BOOTSTRAP_FAILURE.test(`${result.stderr ?? ""}\n${result.stdout ?? ""}`);
+}
+
+function commandFailureError(
+  command: string,
+  args: readonly string[],
+  result: LaunchdCommandResult,
+): Error {
+  const stderr = result.stderr?.trim();
+  const stdout = result.stdout?.trim();
+  const evidence = stderr || stdout || (result.error ? errorMessage(result.error) : "");
+  return new Error(
+    `${basename(command)} ${args.join(" ")} failed${evidence ? `: ${evidence}` : ""}`,
+  );
+}
+
+function defaultSynchronousSleep(ms: number): void {
+  const waitState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  Atomics.wait(waitState, 0, 0, ms);
 }
 
 function runCommand(

@@ -243,23 +243,23 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 4: Safe launchd cron sync around active jobs (#62)
 
-- [ ] In `src/launchd-cron-plists.ts`, add `getCronJobActivity()` returning
+- [x] In `src/launchd-cron-plists.ts`, add `getCronJobActivity()` returning
   `"active" | "idle" | "not-loaded" | "unknown"`. Call the injected runner directly
   (bypassing `runCommand`'s throw-on-failure) with
   `["print", "<domain>/<label>"]` and record the call in `commands`: exit 0 plus
   `/^\s*pid = \d+/m` → `active`; exit 0 without a pid → `idle`; non-zero with the
   known launchctl not-found signature (`Could not find service`) → `not-loaded`; every
   other non-zero result, runner `error`, or missing output → `unknown`.
-- [ ] In `syncLaunchdCrons()`, before any mutation of an `update` or `delete` item,
+- [x] In `syncLaunchdCrons()`, before any mutation of an `update` or `delete` item,
   check activity. For `active` or `unknown`, skip all mutations for that item (no plist
   write, bootout, or unlink), set `deferredReason` accordingly, and continue with the
   remaining items. Only `idle` and `not-loaded` are safe to mutate. `unchanged` items
   keep skipping everything (zero commands); dry-run keeps its existing early return.
-- [ ] Add `deferredReason?: "active" | "unknown"` to `LaunchdCronPlanItem`; in
+- [x] Add `deferredReason?: "active" | "unknown"` to `LaunchdCronPlanItem`; in
   `formatLaunchdCronSyncResult()`, print `deferred <label> (active job running)` or
   `deferred <label> (activity unknown)` and append `, deferred N` to the summary. Exit
   behavior remains 0 because deferral is a reported convergent state; no CLI changes.
-- [ ] Handle the bootout→bootstrap removal race with one `bootstrapWithRetry()` helper
+- [x] Handle the bootout→bootstrap removal race with one `bootstrapWithRetry()` helper
   reused for both the replacement plist and `restorePreviousPlist` rollback bootstrap.
   Record every attempt in `commands`; on failure whose stderr/stdout matches
   `/in progress|already loaded|already bootstrapped|input\/output error/i`, retry after
@@ -268,18 +268,18 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
   one actionable error containing both the replacement and rollback evidence. Add
   `SyncLaunchdCronsOptions.sleep?: (ms: number) => void` (default synchronous
   `Atomics.wait` on a throwaway `SharedArrayBuffer`; `syncLaunchdCrons` stays sync).
-- [ ] Extend the `captureRunner()` fixture in
+- [x] Extend the `captureRunner()` fixture in
   `src/__tests__/launchd-cron-sync.test.ts` to script `print` responses; write the
   deferral tests first against current behavior to prove they fail: update/delete while
   active defer with no mutation; exit-0 without pid and known not-found proceed; unknown
   non-zero, runner error, and missing output defer fail-safe.
-- [ ] Write bootstrap tests: transient replacement failure retries then succeeds;
+- [x] Write bootstrap tests: transient replacement failure retries then succeeds;
   replacement failure followed by transient rollback failure retries rollback then
   succeeds; persistent rollback failure preserves the previous plist contents and
   reports combined replacement+rollback evidence with bounded attempt/sleep counts.
-- [ ] Preserve regressions: dry-run and unchanged items run zero commands; deferred
+- [x] Preserve regressions: dry-run and unchanged items run zero commands; deferred
   items appear in formatted output with reason/count; idle jobs sync as before.
-- [ ] Run focused tests (`launchd-cron-sync.test.ts`) — must pass before Task 5.
+- [x] Run focused tests (`launchd-cron-sync.test.ts`) — must pass before Task 5.
 
 ### Task 5: Verify acceptance criteria
 
