@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.17
+
+- Treat semantically identical launchd cron plists as unchanged despite XML formatting or dictionary-key order differences, while failing safely on malformed parser output and preserving scalar types and array order.
+
 ## 2026.7.16
 
 - Preserve an explicit validated cron runner during launchd cron generation and sync, including atomic release-slot selectors, narrow unchanged/create planning, and fail-closed zero-write validation.
