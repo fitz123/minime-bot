@@ -325,6 +325,7 @@ describe("ops worker CLI and inactive runtime", () => {
               ? []
               : [[key, process.env[key] as string]]),
         ),
+        assembleContext: () => null,
       },
     });
     const submitted = await runWorkerCli(
@@ -378,6 +379,7 @@ describe("ops worker CLI and inactive runtime", () => {
               ? []
               : [[key, process.env[key] as string]]),
         ),
+        assembleContext: () => null,
       },
     });
     const submitted = await runWorkerCli(

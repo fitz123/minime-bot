@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -25,6 +26,7 @@ import {
   inspectOpsWorkerActiveRun,
   OPS_WORKER_ATTEMPT_TOKEN_ENV,
   OPS_WORKER_PI_LIMITS,
+  OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
   type OpsWorkerProcessGroupInspection,
@@ -235,6 +237,7 @@ async function makeHarness(
             ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
               process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
           ),
+          assembleContext: () => null,
           ...options.dependencies,
         },
       });
@@ -274,6 +277,54 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(mainSource, /if \(parsed\.session\)/);
     assert.match(mainSource, /openSessionOrExit\(resolved\.path, sessionDir\)/);
     assert.match(sessionSource, /Session file is not a valid pi session/);
+  });
+
+  it("injects the assembled agent context before the fixed ops-worker policy", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("assembled-context"));
+    let assembledWorkspace: string | undefined;
+
+    await harness.runner({
+      dependencies: {
+        assembleContext: (agent) => {
+          assembledWorkspace = agent.workspaceCwd;
+          return {
+            systemPromptPath: "/fixture/ops-worker-persona.md",
+            appendSystemPromptPath: "/fixture/ops-worker-context.md",
+          };
+        },
+      },
+    }).runAttempt("assembled-context");
+
+    assert.equal(assembledWorkspace, realpathSync(harness.workspace));
+    const args = harness.invocations[0];
+    assert.ok(args.includes("--no-context-files"));
+    assert.equal(
+      args[args.indexOf("--system-prompt") + 1],
+      "/fixture/ops-worker-persona.md",
+    );
+    const appended = args.flatMap((arg, index) =>
+      arg === "--append-system-prompt" ? [args[index + 1]] : []);
+    assert.deepEqual(appended, [
+      "/fixture/ops-worker-context.md",
+      OPS_WORKER_SYSTEM_POLICY,
+    ]);
+  });
+
+  it("falls back to Pi context discovery only for a genuinely empty workspace", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("empty-context"));
+
+    await harness.runner({
+      dependencies: { assembleContext: () => null },
+    }).runAttempt("empty-context");
+
+    const args = harness.invocations[0];
+    assert.ok(!args.includes("--no-context-files"));
+    assert.equal(
+      args[args.indexOf("--append-system-prompt") + 1],
+      OPS_WORKER_SYSTEM_POLICY,
+    );
   });
 
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {

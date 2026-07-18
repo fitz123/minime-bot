@@ -24,6 +24,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { assemblePiContext, type PiContextArtifacts } from "../pi-context-assembler.js";
 import {
   buildPiSpawnEnv,
   DEFAULT_PI_MODEL,
@@ -33,6 +34,7 @@ import {
   resolvePackageOwnedPiInvocation,
   type PiInvocation,
 } from "../pi-runtime.js";
+import type { AgentConfig, PiThinkingLevel } from "../types.js";
 import {
   OpsWorkerSupervisor,
   type OpsWorkerStartupRunResult,
@@ -129,6 +131,7 @@ export interface OpsWorkerPiAttemptDependencies {
   randomId?: () => string;
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
+  assembleContext?: (agent: AgentConfig) => PiContextArtifacts | null;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
   launchFaultInjector?: (
     point: "after-launch-intent-persisted" | "after-unverified-run-persisted",
@@ -143,7 +146,7 @@ export interface OpsWorkerPiAttemptOptions {
   >;
   abortSignal?: AbortSignal;
   model?: string;
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinking?: PiThinkingLevel;
   attemptTimeoutMs?: number;
   stallTimeoutMs?: number;
   termGraceMs?: number;
@@ -218,7 +221,7 @@ export class OpsWorkerPiAttemptRunner {
   >;
   private readonly abortSignal: AbortSignal | undefined;
   private readonly model: string;
-  private readonly thinking: string;
+  private readonly thinking: PiThinkingLevel;
   private readonly attemptTimeoutMs: number;
   private readonly stallTimeoutMs: number;
   private readonly termGraceMs: number;
@@ -239,6 +242,7 @@ export class OpsWorkerPiAttemptRunner {
   private readonly randomId: () => string;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly assembleContext: (agent: AgentConfig) => PiContextArtifacts | null;
   private readonly launchFaultInjector:
     | NonNullable<OpsWorkerPiAttemptDependencies["launchFaultInjector"]>
     | undefined;
@@ -306,6 +310,7 @@ export class OpsWorkerPiAttemptRunner {
       ?? ((milliseconds) => new Promise((resolveSleep) => {
         setTimeout(resolveSleep, milliseconds);
       }));
+    this.assembleContext = dependencies.assembleContext ?? assemblePiContext;
     this.launchFaultInjector = dependencies.launchFaultInjector;
   }
 
@@ -401,12 +406,19 @@ export class OpsWorkerPiAttemptRunner {
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
+    const context = this.assembleContext({
+      id: `ops-worker-${createHash("sha256").update(this.workspaceCwd).digest("hex").slice(0, 16)}`,
+      workspaceCwd: this.workspaceCwd,
+      model: this.model,
+      thinking: this.thinking,
+    });
     const args = buildPiAttemptArgs(
       task,
       sessionDirectory,
       this.model,
       this.thinking,
       this.authorizationTools(task),
+      context,
     );
     const invocation = this.resolveInvocation(args);
     const attemptId = `attempt-${this.randomId()}`;
@@ -983,6 +995,7 @@ export function buildPiAttemptArgs(
   model: string,
   thinking: string,
   tools: readonly OpsWorkerAuthorizationTool[],
+  context: PiContextArtifacts | null = null,
 ): string[] {
   if (!task.session.sessionId) {
     throw new Error("Standard Pi session id must be prepared before launch");
@@ -995,7 +1008,18 @@ export function buildPiAttemptArgs(
     task.session.resume ? "--session" : "--session-id",
     task.session.sessionId,
     "--no-extensions",
-    "--no-context-files",
+  ];
+  if (context) {
+    if (context.systemPromptPath) {
+      args.push("--system-prompt", context.systemPromptPath);
+    }
+    args.push(
+      "--append-system-prompt",
+      context.appendSystemPromptPath,
+      "--no-context-files",
+    );
+  }
+  args.push(
     "--append-system-prompt",
     OPS_WORKER_SYSTEM_POLICY,
     "--tools",
@@ -1004,7 +1028,7 @@ export function buildPiAttemptArgs(
     model,
     "--thinking",
     thinking,
-  ];
+  );
   return args;
 }
 

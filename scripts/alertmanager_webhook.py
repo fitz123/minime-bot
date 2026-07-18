@@ -189,7 +189,6 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
         def setup(self) -> None:
             super().setup()
             self.connection.settimeout(app.body_timeout)
-            self._input_started_at = time.monotonic()
             self._input_deadline = threading.Timer(app.body_timeout, self._expire_input)
             self._input_deadline.daemon = True
             self._input_deadline.start()
@@ -213,7 +212,7 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
         def _read_body(self, length: int) -> bytes:
             chunks: list[bytes] = []
             remaining = length
-            deadline = self._input_started_at + app.body_timeout
+            deadline = time.monotonic() + app.body_timeout
             while remaining:
                 timeout = deadline - time.monotonic()
                 if timeout <= 0:
@@ -245,11 +244,8 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
                 self._reply(404, "not found")
 
         def do_POST(self) -> None:  # noqa: N802
-            # Header parsing is complete. Stop the shutdown timer so it cannot
-            # race the 408 response; _read_body enforces the same absolute
-            # connection deadline through bounded socket reads.
-            self._cancel_input_deadline()
             if self.path != app.path:
+                self._cancel_input_deadline()
                 self._reply(404, "not found")
                 return
             raw_length = self.headers.get("Content-Length")
@@ -258,16 +254,20 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 length = -1
             if length < 0:
+                self._cancel_input_deadline()
                 self._reply(411, "length required")
                 return
             if length > app.max_body:
+                self._cancel_input_deadline()
                 self._reply(413, "payload too large")
                 return
             try:
                 body = self._read_body(length)
             except (TimeoutError, OSError):
+                self._cancel_input_deadline()
                 self._reply(408, "request timed out")
                 return
+            self._cancel_input_deadline()
             try:
                 key, message = parse_alertmanager_payload(body)
             except ValueError:

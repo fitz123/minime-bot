@@ -3,7 +3,10 @@
 The ops worker is an opt-in, inactive-by-default core. Installing or starting
 `minime-bot` does not start it. PR 1 provides durable task snapshots, one
 single-instance supervisor, ordinary Pi session continuation, deterministic
-done checks, a local CLI skeleton, and read-only loopback health/status.
+done checks, a local CLI skeleton, and read-only loopback health/status. Each
+attempt receives the agent workspace's assembled context bundle plus the fixed
+ops-worker policy; Pi's flat context loading is disabled only after assembly
+succeeds, avoiding both missing rules and duplicate context.
 
 The installed PR-1 binary registers no task templates, authorization profiles,
 or done checks. Submission and start define the adapter-facing contract but
