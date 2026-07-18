@@ -25,7 +25,7 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 import { loadMergedCrons } from "./cron-loader.js";
 import {
   expandCronField,
@@ -775,12 +775,15 @@ function convertPlist(
     const result = spawnSync(
       plutilBin,
       ["-convert", format, "-o", "-", inputPath],
-      { encoding: "utf8", input, maxBuffer: PLIST_CONVERSION_MAX_BUFFER_BYTES },
+      { input, maxBuffer: PLIST_CONVERSION_MAX_BUFFER_BYTES },
     );
     if (result.error || result.status !== 0) {
       return { ok: false };
     }
-    return { ok: true, output: result.stdout };
+    return {
+      ok: true,
+      output: new TextDecoder("utf-8", { fatal: true }).decode(result.stdout),
+    };
   } catch {
     return { ok: false };
   }

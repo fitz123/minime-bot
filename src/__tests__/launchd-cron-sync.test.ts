@@ -856,12 +856,32 @@ fi
 exec "${fixturePlutil}" "$@"
 `, "utf8");
       chmodSync(malformedXmlPlutil, 0o700);
+      const invalidUtf8JsonPlutil = join(fixture.root, "invalid-utf8-json-plutil");
+      writeFileSync(invalidUtf8JsonPlutil, `#!/bin/sh
+if [ "$2" = "json" ]; then
+  printf '%b\\n' '{"marker":"\\377"}'
+else
+  printf '%s\\n' '<plist version="1.0"><dict/></plist>'
+fi
+`, "utf8");
+      chmodSync(invalidUtf8JsonPlutil, 0o700);
+      const invalidUtf8XmlPlutil = join(fixture.root, "invalid-utf8-xml-plutil");
+      writeFileSync(invalidUtf8XmlPlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%b\\n' '<plist version="1.0"><dict><key>marker</key><string>\\377</string></dict></plist>'
+else
+  printf '%s\\n' '{}'
+fi
+`, "utf8");
+      chmodSync(invalidUtf8XmlPlutil, 0o700);
       const invalidPlutils = [
         join(fixture.root, "private-parser-path-must-not-leak"),
         "private-parser\0command-must-not-leak",
         malformedJsonPlutil,
         xmlFailurePlutil,
         malformedXmlPlutil,
+        invalidUtf8JsonPlutil,
+        invalidUtf8XmlPlutil,
       ];
 
       for (const plutil of invalidPlutils) {
