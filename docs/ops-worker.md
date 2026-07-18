@@ -6,7 +6,8 @@ single-instance supervisor, ordinary Pi session continuation, deterministic
 done checks, a local CLI skeleton, and read-only loopback health/status. Each
 attempt receives the agent workspace's assembled context bundle plus the fixed
 ops-worker policy; Pi's flat context loading is disabled only after assembly
-succeeds, avoiding both missing rules and duplicate context.
+succeeds, avoiding both missing rules and duplicate context. The task prompt is
+written to Pi over stdin rather than exposed in the child process arguments.
 
 The installed PR-1 binary registers no task templates, authorization profiles,
 or done checks. Submission and start define the adapter-facing contract but

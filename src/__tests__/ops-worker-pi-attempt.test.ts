@@ -270,12 +270,18 @@ describe("ops worker Pi standard-session attempts", () => {
       join(packageRoot, "dist/core/session-manager.js"),
       "utf8",
     );
+    const initialMessageSource = readFileSync(
+      join(packageRoot, "dist/cli/initial-message.js"),
+      "utf8",
+    );
 
     assert.equal(manifest.version, "0.80.6");
     assert.match(mainSource, /if \(parsed\.sessionId\)/);
     assert.match(mainSource, /SessionManager\.create\(cwd, sessionDir/);
     assert.match(mainSource, /if \(parsed\.session\)/);
     assert.match(mainSource, /openSessionOrExit\(resolved\.path, sessionDir\)/);
+    assert.match(mainSource, /stdinContent = await readPipedStdin\(\)/);
+    assert.match(initialMessageSource, /parts\.push\(stdinContent\)/);
     assert.match(sessionSource, /Session file is not a valid pi session/);
   });
 
@@ -348,6 +354,8 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(args.includes("--session-id"));
     assert.ok(!args.includes("--no-session"));
     assert.ok(!args.includes("payload-selected-model"));
+    assert.equal(args[0], "-p");
+    assert.equal(args[1], "--session-dir");
     assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
     assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
     assert.match(
@@ -813,10 +821,12 @@ describe("ops worker Pi standard-session attempts", () => {
           const child = new EventEmitter() as ChildProcess;
           Object.assign(child, {
             pid: undefined,
+            stdin: new PassThrough(),
             stdout: new PassThrough(),
             stderr: new PassThrough(),
             exitCode: null,
             signalCode: null,
+            unref: () => child,
           });
           queueMicrotask(() => child.emit("close", 1, null));
           return child;

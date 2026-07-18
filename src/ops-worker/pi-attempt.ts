@@ -406,6 +406,7 @@ export class OpsWorkerPiAttemptRunner {
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
+    const prompt = buildAttemptPrompt(task);
     const context = this.assembleContext({
       id: `ops-worker-${createHash("sha256").update(this.workspaceCwd).digest("hex").slice(0, 16)}`,
       workspaceCwd: this.workspaceCwd,
@@ -441,7 +442,7 @@ export class OpsWorkerPiAttemptRunner {
       child = this.spawnProcess(invocation.command, invocation.args, {
         cwd: this.workspaceCwd,
         env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         detached: true,
         shell: false,
       });
@@ -470,8 +471,22 @@ export class OpsWorkerPiAttemptRunner {
     );
     child.stdout?.on("data", (chunk: Buffer | string) => stdout.add(chunk));
     child.stderr?.on("data", (chunk: Buffer | string) => stderr.add(chunk));
+    let inputError: Error | null = null;
+    if (!child.stdin) {
+      inputError = new Error("Pi process did not expose piped stdin for its private prompt");
+    } else {
+      child.stdin.on("error", (error) => {
+        inputError = error;
+      });
+      child.stdin.end(prompt, "utf8");
+    }
     let exitSettled = false;
-    const exitPromise = waitForChildExit(child, stdout, stderr).then((exit) => {
+    const exitPromise = waitForChildExit(
+      child,
+      stdout,
+      stderr,
+      () => inputError,
+    ).then((exit) => {
       exitSettled = true;
       return exit;
     });
@@ -1002,7 +1017,6 @@ export function buildPiAttemptArgs(
   }
   const args = [
     "-p",
-    buildAttemptPrompt(task),
     "--session-dir",
     sessionDirectory,
     task.session.resume ? "--session" : "--session-id",
@@ -1545,6 +1559,7 @@ function waitForChildExit(
   child: ChildProcess,
   stdout: BoundedStreamCapture,
   stderr: BoundedStreamCapture,
+  inputError: () => Error | null,
 ): Promise<OpsWorkerPiExit> {
   return new Promise((resolveExit) => {
     let settled = false;
@@ -1557,7 +1572,7 @@ function waitForChildExit(
       resolveExit({
         code,
         signal,
-        error: spawnError,
+        error: spawnError ?? inputError(),
         stdout: stdoutResult.value,
         stderr: stderrResult.value,
         stdoutTruncatedBytes: stdoutResult.truncatedBytes,
@@ -1593,7 +1608,7 @@ function formatAttemptEvidence(exit: OpsWorkerPiExit): string {
   }
   if (stderr) parts.push(`stderr: ${stderr}`);
   if (stdout) parts.push(`stdout: ${stdout}`);
-  if (exit.error) parts.push(`spawn error: ${exit.error.message}`);
+  if (exit.error) parts.push(`process I/O error: ${exit.error.message}`);
   if (parts.length === 0) {
     parts.push(`Pi exit code=${String(exit.code)} signal=${String(exit.signal)}`);
   }

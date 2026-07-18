@@ -10,6 +10,12 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 const [scenario, ...args] = process.argv.slice(2);
+let privatePrompt = "";
+for await (const chunk of process.stdin) privatePrompt += chunk.toString();
+if (!privatePrompt.includes("Ops worker objective:")) {
+  process.stderr.write("fake Pi requires its private prompt on stdin\n");
+  process.exit(64);
+}
 
 function flagValue(flag) {
   const index = args.indexOf(flag);
