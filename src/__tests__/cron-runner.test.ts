@@ -2480,6 +2480,28 @@ bindings: []
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
     });
+
+    it("does not queue delivered output when success logging fails", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const captureLog = deps.log;
+      deps.log = (taskName: string, message: string) => {
+        captureLog(taskName, message);
+        if (message.startsWith("Delivered to chat")) {
+          throw new Error("log unavailable");
+        }
+      };
+
+      await assert.rejects(() => main(deps), /log unavailable/);
+
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: 111111111, message: "llm output", threadId: 42 },
+      ]);
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.deliveryFailures, []);
+      assert.deepStrictEqual(calls.metrics, []);
+    });
   });
 
   describe("runScript", () => {

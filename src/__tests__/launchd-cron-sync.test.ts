@@ -1228,6 +1228,7 @@ fi
     ["unknown non-zero status", { status: 5, stdout: "", stderr: "Operation not permitted" }],
     ["runner error", { status: null, stdout: "", stderr: "", error: new Error("spawn failed") }],
     ["missing output", { status: 0, stderr: "" }],
+    ["blank output", { status: 0, stdout: "", stderr: "" }],
   ] satisfies Array<[string, LaunchdCommandResult]>) {
     it(`defers an update when activity is unsafe: ${activityCase}`, () => {
       const fixture = createFixture();
@@ -1711,6 +1712,9 @@ fi
       writeFileSync(activePath, "old active plist", "utf8");
       const runner: LaunchdCommandRunner = (command, args) => {
         calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
         if (command.endsWith("plutil")) {
           return { status: 1, stderr: "lint failed" };
         }
@@ -1745,6 +1749,9 @@ fi
       let bootstrapCount = 0;
       const runner: LaunchdCommandRunner = (command, args) => {
         calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
         if (args[0] === "bootout") {
           return { status: 0, stdout: "", stderr: "" };
         }
@@ -1785,6 +1792,9 @@ fi
       writeFileSync(activePath, "old active plist", "utf8");
       const runner: LaunchdCommandRunner = (command, args) => {
         calls.push({ command, args: [...args] });
+        if (args[0] === "print") {
+          return { status: 0, stdout: "state = waiting\n", stderr: "" };
+        }
         if (args[0] === "bootout") {
           return { status: 1, stderr: "not loaded" };
         }

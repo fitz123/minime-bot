@@ -1140,7 +1140,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   // Deliver output to target chat
   try {
     await deliverWithRetry(cron.deliveryChatId, output, cron.deliveryThreadId);
-    deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
   } catch (err) {
     if (isQueueableDeliveryFailure(err)) {
       queueDeliveryIfEmpty("output", output, cron.deliveryChatId, cron.deliveryThreadId);
@@ -1149,6 +1148,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     deps.writeCronHealthMetric(taskName, 1, false);
     deps.exit(1);
   }
+  deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
 
   deps.writeCronHealthMetric(taskName, 0, true);
   deps.log(taskName, "DONE");

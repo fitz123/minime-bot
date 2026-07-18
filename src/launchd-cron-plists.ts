@@ -853,7 +853,7 @@ function getCronJobActivity(
     return "unknown";
   }
   if (result.status === 0) {
-    if (result.stdout === undefined) {
+    if (result.stdout === undefined || result.stdout.trim() === "") {
       return "unknown";
     }
     return /^\s*pid = \d+/m.test(result.stdout) ? "active" : "idle";

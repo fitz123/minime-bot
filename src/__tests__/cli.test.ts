@@ -138,6 +138,9 @@ interface CommandCall {
 function captureRunner(calls: CommandCall[]): LaunchdCommandRunner {
   return (command, args) => {
     calls.push({ command, args: [...args] });
+    if (args[0] === "print") {
+      return { status: 3, stdout: "", stderr: "Could not find service" };
+    }
     return { status: 0, stdout: "", stderr: "" };
   };
 }
@@ -525,6 +528,9 @@ describe("minime-bot CLI", () => {
     mkdirSync(launchAgentsDir, { recursive: true });
     try {
       const failingRunner: LaunchdCommandRunner = (command, args) => {
+        if (args[0] === "print") {
+          return { status: 3, stdout: "", stderr: "Could not find service" };
+        }
         if (command.endsWith("plutil") && args[0] === "-lint") {
           return { status: 1, stderr: "lint failed" };
         }
