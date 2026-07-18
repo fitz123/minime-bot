@@ -47,6 +47,7 @@ export const BOT_LAUNCHD_LABEL = "ai.minime.telegram-bot";
 export const DEFAULT_LAUNCHCTL_BIN = "/bin/launchctl";
 export const DEFAULT_PLUTIL_BIN = "/usr/bin/plutil";
 const DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const PLIST_CONVERSION_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
 export interface CalendarInterval {
   Minute?: number;
@@ -339,11 +340,12 @@ export function planLaunchdCronSync(
   const items: LaunchdCronPlanItem[] = [];
 
   for (const plist of generated.plists) {
-    const existing = existsSync(plist.plistPath) ? readFileSync(plist.plistPath, "utf8") : undefined;
+    const existing = existsSync(plist.plistPath) ? readFileSync(plist.plistPath) : undefined;
     const action: LaunchdCronPlanAction =
       existing === undefined
         ? "create"
-        : existing === plist.content || plistsSemanticallyEqual(generated.context, plist.plistPath, plist.content)
+        : existing.equals(Buffer.from(plist.content, "utf8"))
+          || plistsSemanticallyEqual(generated.context, plist.plistPath, plist.content)
           ? "unchanged"
           : "update";
     items.push({
@@ -773,7 +775,7 @@ function convertPlist(
     const result = spawnSync(
       plutilBin,
       ["-convert", format, "-o", "-", inputPath],
-      { encoding: "utf8", input },
+      { encoding: "utf8", input, maxBuffer: PLIST_CONVERSION_MAX_BUFFER_BYTES },
     );
     if (result.error || result.status !== 0) {
       return { ok: false };

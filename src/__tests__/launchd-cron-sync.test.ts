@@ -625,6 +625,99 @@ describe("launchd cron plist sync", () => {
     }
   });
 
+  it("fails closed when malformed plist bytes collide after UTF-8 decoding", () => {
+    const fixture = createFixture("minime-launchd-crons-\uFFFD-");
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const plist = generated.plists[0];
+      const desiredBytes = Buffer.from(plist.content, "utf8");
+      const replacementBytes = Buffer.from("\uFFFD", "utf8");
+      const replacementOffset = desiredBytes.indexOf(replacementBytes);
+      assert.notEqual(replacementOffset, -1);
+      const existingBytes = Buffer.concat([
+        desiredBytes.subarray(0, replacementOffset),
+        Buffer.from([0xff]),
+        desiredBytes.subarray(replacementOffset + replacementBytes.length),
+      ]);
+      assert.equal(existingBytes.toString("utf8"), plist.content);
+      assert.equal(existingBytes.equals(desiredBytes), false);
+      writeFileSync(plist.plistPath, existingBytes);
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.equal(result.items[0].action, "update");
+      assert.deepEqual(readFileSync(plist.plistPath), existingBytes);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("keeps a large supported semantically equal plist unchanged", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("large", "0-59 0-23 * 1-6 0"));
+      const runner = writeRunner(join(fixture.root, "release", "scripts"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        env: fixture.env,
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      const plist = generated.plists[0];
+      assert.ok(Buffer.byteLength(plist.content, "utf8") > 1024 * 1024);
+      const existingContent = plist.content.replace(
+        '<plist version="1.0">\n  <dict>',
+        '<plist version="1.0"><dict>',
+      );
+      assert.notEqual(existingContent, plist.content);
+      writeFileSync(plist.plistPath, existingContent, "utf8");
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        runCronScript: runner,
+        dryRun: true,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls),
+      });
+
+      assert.equal(result.items[0].action, "unchanged");
+      assert.equal(readFileSync(plist.plistPath, "utf8"), existingContent);
+      assert.equal(existsSync(fixture.logDir), false);
+      assert.equal(calls.length, 0);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("keeps scalar, array-order, runner, and schedule differences as updates", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
