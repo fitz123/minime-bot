@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  ASK_AGENT_CHILD_TIMEOUT_MS,
   ASK_AGENT_TOOL,
   ASK_AGENT_TRUNCATED_MARKER,
   MAX_ASK_AGENT_CONTEXT_BYTES,
@@ -143,6 +144,10 @@ function setupRunner() {
 }
 
 describe("ask-agent helper", () => {
+  it("allows target children to run for 30 minutes by default", () => {
+    assert.equal(ASK_AGENT_CHILD_TIMEOUT_MS, 30 * 60 * 1000);
+  });
+
   it("defines the first-party ask-agent tool contract", () => {
     assert.equal(ASK_AGENT_TOOL.name, "ask_agent");
     assert.deepEqual(ASK_AGENT_TOOL.parameters.required, ["agent", "question"]);
