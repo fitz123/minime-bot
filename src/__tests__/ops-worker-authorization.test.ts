@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   createAdr091AuthorizedIssueVerifier,
   hashAdr091AuthorizedIssueClaim,
+  verifyOpsWorkerAuthorization,
   type Adr091AuthorizedIssueSnapshot,
 } from "../ops-worker/authorization.js";
 import {
@@ -185,6 +186,84 @@ describe("ADR-091 authorized issue verifier", () => {
       (await verifier(ambiguous).verify(task(snapshot()))).status,
       "QUERY_ERROR",
     );
+
+    const canonicalMismatch = snapshot();
+    canonicalMismatch.canonicalTask = "github-issue:other";
+    assert.equal(
+      (await verifier(canonicalMismatch).verify(task(snapshot()))).status,
+      "QUERY_ERROR",
+    );
+
+    const missingReadyTimeline = snapshot();
+    missingReadyTimeline.timeline.events = missingReadyTimeline.timeline.events.filter((event) =>
+      event.kind !== "LABEL_APPLIED");
+    assert.equal(
+      (await verifier(missingReadyTimeline).verify(task(snapshot()))).status,
+      "QUERY_ERROR",
+    );
+
+    const contradictedReadyState = snapshot();
+    contradictedReadyState.timeline.events.push({
+      id: "label-remove-1",
+      kind: "LABEL_REMOVED",
+      label: "autonomous-ready",
+      actorIdentity: "automation-owner-node-id",
+      at: "2026-07-18T10:07:00.000Z",
+    });
+    assert.equal(
+      (await verifier(contradictedReadyState).verify(task(snapshot()))).status,
+      "QUERY_ERROR",
+    );
+  });
+
+  it("types resolver failures and malformed trusted verifier results as query errors", async () => {
+    const remote = snapshot();
+    const resolverFailure = createAdr091AuthorizedIssueVerifier({
+      policy: {
+        repository: remote.repository,
+        allowedIssueAuthorIdentities: ["maintainer-node-id"],
+        allowedReadyActorIdentities: ["automation-owner-node-id"],
+      },
+      resolver: { resolve: () => { throw new Error("fixture resolver failure"); } },
+    });
+    assert.equal((await resolverFailure.verify(task(remote))).status, "QUERY_ERROR");
+
+    for (const candidate of [
+      { status: "UNKNOWN", evidenceHash: `sha256:${"a".repeat(64)}`, summary: "bad" },
+      { status: "PASS", evidenceHash: "not-a-hash", summary: "bad" },
+      { status: "PASS", evidenceHash: `sha256:${"a".repeat(64)}`, summary: "" },
+    ]) {
+      const result = await verifyOpsWorkerAuthorization(
+        task(remote),
+        {
+          "authorized-issue": {
+            identity: "fixture-verifier",
+            version: "1",
+            verify: () => candidate as never,
+          },
+        },
+        NOW,
+      );
+      assert.equal(result.status, "QUERY_ERROR");
+    }
+
+    const invalidIdentity = await verifyOpsWorkerAuthorization(
+      task(remote),
+      {
+        "authorized-issue": {
+          identity: "bad identity",
+          version: "1",
+          verify: () => ({
+            status: "PASS",
+            evidenceHash: `sha256:${"a".repeat(64)}`,
+            summary: "would otherwise pass",
+          }),
+        },
+      },
+      NOW,
+    );
+    assert.equal(invalidIdentity.status, "QUERY_ERROR");
+    assert.equal(invalidIdentity.validatorIdentity, "missing-verifier");
   });
 
   it("rejects a missing or inexact canonical claim", async () => {

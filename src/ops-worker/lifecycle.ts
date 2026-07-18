@@ -10,10 +10,30 @@ import {
   type OpsWorkerMutationBoundary,
   type OpsWorkerMutationOutcomeResult,
   type OpsWorkerMutationReceipt,
+  type OpsWorkerAuthorizationScope,
   type OpsWorkerMutationReceiptReplay,
   type OpsWorkerMutationReceipts,
   type OpsWorkerTask,
 } from "./types.js";
+
+const MUTATION_BOUNDARY_REQUIRED_SCOPE: Readonly<
+  Record<OpsWorkerMutationBoundary, OpsWorkerAuthorizationScope | null>
+> = Object.freeze({
+  merge: "pull-request",
+  "tag-release": "release",
+  deploy: "deploy",
+  "canonical-task": "issue-lifecycle",
+  // Reporting is bounded bookkeeping for every authorized task, not a domain mutation.
+  report: null,
+});
+
+export function hasOpsWorkerMutationBoundaryScope(
+  task: Pick<OpsWorkerTask, "authorization">,
+  boundary: OpsWorkerMutationBoundary,
+): boolean {
+  const required = MUTATION_BOUNDARY_REQUIRED_SCOPE[boundary];
+  return required === null || task.authorization.scope.includes(required);
+}
 
 export const OPS_WORKER_LIFECYCLE_IDENTITY_SLOTS = [
   "canonicalTask",
@@ -577,6 +597,11 @@ export class OpsWorkerLifecycle {
         if (!this.authorizeMutationClaim(task, receipt)) {
           throw new OpsWorkerLifecycleError(
             `${input.boundary} mutation requires a fresh package-owned authorization PASS`,
+          );
+        }
+        if (!hasOpsWorkerMutationBoundaryScope(task, input.boundary)) {
+          throw new OpsWorkerLifecycleError(
+            `${input.boundary} mutation is outside the task's registered authorization scopes`,
           );
         }
         receipt.mutationStartedAt = timestampAtOrAfter(

@@ -20,6 +20,7 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { assemblePiContext } from "../pi-context-assembler.js";
 import type { CodexQuotaSnapshot } from "../pi-extensions/codex-usage.js";
+import { opsWorkerEffectiveContextDigest } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   resolvePiPrimaryResourceContract,
@@ -160,7 +161,6 @@ function registry(
           "authorized-issue",
         ],
         scope: ["inspect"],
-        tools: ["read", "grep", "find", "ls"],
       },
     },
     doneChecks: doneChecks.contracts,
@@ -438,17 +438,32 @@ describe("ops worker Pi standard-session attempts", () => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("assembled-context"));
     let assembledWorkspace: string | undefined;
+    let strictAssembly: boolean | undefined;
+    let environmentWorkspace: string | undefined;
+    let callerAgentId: string | undefined;
 
     const completed = await harness.runner({
       dependencies: {
         assembleContext: (agent, options) => {
           assembledWorkspace = agent.workspaceCwd;
+          strictAssembly = options?.strict;
           return assemblePiContext(agent, options);
+        },
+        buildEnv: (workspace, runtime) => {
+          environmentWorkspace = workspace;
+          callerAgentId = runtime?.askCallerAgentId;
+          return Object.fromEntries(
+            ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+              process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
+          );
         },
       },
     }).runAttempt("assembled-context");
 
     assert.equal(assembledWorkspace, realpathSync(harness.primaryWorkspace));
+    assert.equal(strictAssembly, true);
+    assert.equal(environmentWorkspace, realpathSync(harness.workspace));
+    assert.equal(callerAgentId, harness.primaryContextAgent.id);
     const args = harness.invocations[0];
     assert.ok(args.includes("--no-extensions"));
     assert.ok(args.includes("--no-skills"));
@@ -482,7 +497,10 @@ describe("ops worker Pi standard-session attempts", () => {
 
     const extensions = args.flatMap((arg, index) =>
       arg === "--extension" ? [args[index + 1]] : []);
-    assert.deepEqual(extensions.slice(0, -1), harness.primaryResources.extensionPaths);
+    assert.equal(extensions.slice(0, -1).length, harness.primaryResources.extensionPaths.length);
+    for (const extension of extensions.slice(0, -1)) {
+      assert.match(extension, /parity-extension-\d+\.mjs$/);
+    }
     assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
     assert.equal(new Set(extensions).size, extensions.length);
     const skills = args.flatMap((arg, index) =>
@@ -553,7 +571,7 @@ describe("ops worker Pi standard-session attempts", () => {
       },
     });
     const receipt = {
-      boundary: "merge" as const,
+      boundary: "report" as const,
       operationId: "merge-prompt",
       intent: { base: "main", head: "issue-58" },
     };
@@ -730,10 +748,10 @@ describe("ops worker Pi standard-session attempts", () => {
     );
     const extensions = probeRequest.args.flatMap((arg, index) =>
       arg === "--extension" ? [probeRequest.args[index + 1]] : []);
-    assert.deepEqual(
-      extensions.slice(0, -1),
-      harness.primaryResources.extensionPaths,
-    );
+    assert.equal(extensions.slice(0, -1).length, harness.primaryResources.extensionPaths.length);
+    for (const extension of extensions.slice(0, -1)) {
+      assert.match(extension, /parity-extension-\d+\.mjs$/);
+    }
     assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
     assert.deepEqual(
       probeRequest.args.flatMap((arg, index) =>
@@ -787,13 +805,28 @@ describe("ops worker Pi standard-session attempts", () => {
     };
     harness.store.create(task);
     harness.setScenario("quota-probe-success");
+    let probeSpawnOptions: Parameters<NonNullable<OpsWorkerPiAttemptDependencies["spawnProcess"]>>[2]
+      | undefined;
 
-    const result = await harness.runner().runNext();
+    const result = await harness.runner({
+      dependencies: {
+        spawnProcess: (command, args, options) => {
+          probeSpawnOptions = options;
+          return spawn(command, args, options);
+        },
+      },
+    }).runNext();
 
     assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
     assert.equal(result?.custody.status, "HELD");
     assert.equal(harness.invocations.length, 1);
     assert.ok(harness.invocations[0].includes("--no-session"));
+    assert.equal(probeSpawnOptions?.detached, true);
+    assert.equal(
+      (probeSpawnOptions?.env as Record<string, string> | undefined)
+        ?.MINIME_OPS_WORKER_QUOTA_PROBE,
+      "1",
+    );
     assert.equal(
       harness.invocations[0][harness.invocations[0].indexOf("--model") + 1],
       "openai-codex/gpt-5.5",
@@ -912,6 +945,9 @@ describe("ops worker Pi standard-session attempts", () => {
             extensionsDigest: string;
             skillsDigest: string;
             toolsDigest: string;
+            customPromptHash: string | null;
+            appendSystemPromptHash: string;
+            contextFilesDigest: string;
           };
           writeFileSync(
             env.MINIME_OPS_WORKER_PARITY_REPORT_PATH,
@@ -920,7 +956,8 @@ describe("ops worker Pi standard-session attempts", () => {
               status: "PASS",
               expectedDigest: expected.digest,
               primaryContextDigest: expected.primaryContextDigest,
-              actualContextDigest: `sha256:${"c".repeat(64)}`,
+              actualContextDigest: opsWorkerEffectiveContextDigest(expected),
+              actualSystemPromptHash: `sha256:${"c".repeat(64)}`,
               actualCapabilityDigest: expected.capabilityDigest,
               actualExtensionsDigest: expected.extensionsDigest,
               actualSkillsDigest: expected.skillsDigest,

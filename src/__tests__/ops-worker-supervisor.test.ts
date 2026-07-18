@@ -109,7 +109,6 @@ function taskRegistry(
           "authorized-issue",
         ],
         scope: ["inspect"],
-        tools: ["read", "grep", "find", "ls"],
       },
     },
     doneChecks: checks.contracts,
@@ -421,6 +420,57 @@ describe("ops worker done-check registry", () => {
       }),
       /duplicate component identity/,
     );
+
+    const mixedRequired = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        validateParams: validateFixtureParams,
+        components: [
+          {
+            identity: "required-pass",
+            version: "1",
+            required: true,
+            convergence: "PRODUCT",
+            timeoutMs: 100,
+            run: () => ({
+              result: "PASS",
+              summary: "First required component passed.",
+              observedAt: NOW,
+              evidenceHash: `sha256:${"3".repeat(64)}`,
+            }),
+          },
+          {
+            identity: "required-failure",
+            version: "1",
+            required: true,
+            convergence: "PRODUCT",
+            timeoutMs: 100,
+            run: () => ({
+              result: "PRODUCT_FAILURE",
+              summary: "Second required component failed.",
+              observedAt: NOW,
+              evidenceHash: `sha256:${"4".repeat(64)}`,
+            }),
+          },
+          {
+            identity: "optional-invalid",
+            version: "1",
+            required: false,
+            convergence: "PASSIVE",
+            timeoutMs: 100,
+            run: () => ({ result: "UNKNOWN" }),
+          },
+        ],
+      },
+    });
+    const mixed = await mixedRequired.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "task-mixed", checkedAt: NOW },
+    );
+    assert.equal(mixed.result, "PRODUCT_FAILURE");
+    assert.deepEqual(
+      mixed.components.map((component) => component.outcome),
+      ["PASS", "PRODUCT_FAILURE", "VERIFIER_INVALID"],
+    );
   });
 
   it("types timeout, invalid output, and non-passive DEFER without throwing", async () => {
@@ -506,9 +556,43 @@ describe("ops worker done-check registry", () => {
     );
     assert.equal(observedAbort, true);
   });
+
+  it("does not invalidate fresh evidence when the wall clock moves backward", async () => {
+    const registry = new OpsWorkerDoneCheckRegistry({
+      "fixture-check": {
+        timeoutMs: 100,
+        validateParams: validateFixtureParams,
+        run: () => ({ result: "PASS", summary: "Fresh fixture evidence." }),
+      },
+    });
+    const result = await registry.run(
+      { name: "fixture-check", params: { sampleCount: 1 } },
+      { taskId: "clock-backward", checkedAt: LATER, now: () => new Date(NOW) },
+    );
+    assert.equal(result.result, "PASS");
+    assert.equal(result.components[0].observedAt, LATER);
+  });
 });
 
 describe("ops worker supervisor", () => {
+  it("clamps persisted verification timestamps when the wall clock moves backward", async (t) => {
+    let harness!: Harness;
+    harness = await makeHarness(t, {
+      implementation: () => {
+        harness.setNow(NOW);
+        return { result: "PASS", summary: "Clock-safe fixture evidence." };
+      },
+    });
+    harness.store.create(makeTask("task-clock-backward"));
+    harness.setNow(LATER);
+    await harness.supervisor.requestDoneCheck("task-clock-backward");
+    const done = await harness.supervisor.runDoneCheck("task-clock-backward");
+    assert.equal(done.state, "DONE");
+    assert.ok(done.verification);
+    assert.ok(Date.parse(done.updatedAt) >= Date.parse(done.verification.checkedAt));
+    assert.equal(done.verification.completedAt, done.updatedAt);
+  });
+
   it("selects ready tasks deterministically by fixed source priority", async (t) => {
     const harness = await makeHarness(t);
     const later = makeTask("task-later", {
@@ -1140,19 +1224,21 @@ describe("ops worker supervisor", () => {
     await harness.supervisor.requestDoneCheck("task-mutation-authorization");
     await harness.supervisor.runDoneCheck("task-mutation-authorization");
 
-    const blocked = await harness.supervisor.recordReportAttempt(
+    const done = await harness.supervisor.recordReportAttempt(
       "task-mutation-authorization",
       { sent: true },
     );
     assert.equal(checks, 2);
-    assert.equal(blocked.state, "BLOCKED");
-    assert.equal(blocked.authorizationVerification?.status, "DRIFT");
-    assert.equal(blocked.report.state, "PENDING");
+    assert.equal(done.state, "DONE");
+    assert.equal(done.authorizationVerification?.status, "PASS");
+    assert.equal(done.custody.releaseReason, "DONE");
+    assert.equal(done.report.state, "PENDING");
+    assert.match(done.evidence.at(-1)?.summary ?? "", /drifted before mutation/);
     assert.equal(
-      blocked.mutationReceipts.report?.mutationStartedAt,
+      done.mutationReceipts.report?.mutationStartedAt,
       null,
     );
-    assert.equal(blocked.mutationReceipts.report?.outcome, null);
+    assert.equal(done.mutationReceipts.report?.outcome, null);
   });
 
   it("requires claimed report reconciliation before retrying a blocked task", async (t) => {
@@ -1258,6 +1344,20 @@ describe("ops worker supervisor", () => {
     assert.equal(exhausted.state, "BLOCKED");
     assert.equal(exhausted.rounds.remediation, 2);
     assert.equal(exhausted.report.state, "PENDING");
+
+    const notReadyHarness = await makeHarness(t, {
+      implementation: () => ({
+        result: "NOT_READY",
+        summary: "Required fixture state is not ready yet.",
+      }),
+    });
+    notReadyHarness.store.create(makeTask("task-not-ready"));
+    await notReadyHarness.supervisor.requestDoneCheck("task-not-ready");
+    const notReady = await notReadyHarness.supervisor.runDoneCheck("task-not-ready");
+    assert.equal(notReady.state, "RESUMABLE");
+    assert.equal(notReady.rounds.remediation, 1);
+    assert.equal(notReady.verification?.outcome, "NOT_READY");
+    assert.equal(notReady.custody.status, "HELD");
   });
 
   it("schedules DEFER and retries check errors without rerunning Pi", async (t) => {
@@ -1421,7 +1521,7 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask(), undefined);
   });
 
-  it("blocks at the bounded infrastructure-failure limit and retries only BLOCKED tasks", async (t) => {
+  it("retains custody at the bounded infrastructure-failure counter", async (t) => {
     const harness = await makeHarness(t);
     const task = makeTask("task-infrastructure-bound");
     task.rounds.consecutiveInfrastructureFailures = 999;
@@ -1432,22 +1532,22 @@ describe("ops worker supervisor", () => {
     );
     harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
 
-    const blocked = harness.supervisor.recordResumableInfrastructureOutcome(
+    const resumable = harness.supervisor.recordResumableInfrastructureOutcome(
       task.id,
       "NETWORK",
       "Persistent synthetic network failure",
     );
 
-    assert.equal(blocked.state, "BLOCKED");
-    assert.equal(blocked.rounds.consecutiveInfrastructureFailures, 1_000);
-    assert.equal(blocked.rounds.remediation, 0);
-    assert.equal(blocked.report.state, "PENDING");
-    assert.equal(blocked.custody.status, "RELEASED");
-    assert.equal(blocked.custody.releaseReason, "BLOCKED");
-    const retried = harness.supervisor.retryBlockedTask(task.id);
-    assert.equal(retried.state, "RESUMABLE");
-    assert.equal(retried.rounds.consecutiveInfrastructureFailures, 0);
-    assert.equal(retried.custody.status, "HELD");
+    assert.equal(resumable.state, "RESUMABLE");
+    assert.equal(resumable.rounds.consecutiveInfrastructureFailures, 1_000);
+    assert.equal(resumable.rounds.remediation, 0);
+    assert.equal(resumable.report.state, "NONE");
+    assert.equal(resumable.custody.status, "HELD");
+    assert.equal(resumable.custody.releaseReason, null);
+    assert.throws(
+      () => harness.supervisor.retryBlockedTask(task.id),
+      /Operator retry requires BLOCKED, found RESUMABLE/,
+    );
   });
 
   it("enforces one supervisor instance and at most one active process group", async (t) => {

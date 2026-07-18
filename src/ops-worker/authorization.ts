@@ -7,6 +7,7 @@ import {
 import {
   OPS_WORKER_AUTHORIZATION_VERIFICATION_STATUSES,
   OPS_WORKER_LIMITS,
+  isOpsWorkerTerminalState,
   type OpsWorkerAuthorizationVerification,
   type OpsWorkerAuthorizationVerificationStatus,
   type OpsWorkerEvidence,
@@ -413,10 +414,13 @@ export async function verifyOpsWorkerAuthorization(
 ): Promise<OpsWorkerAuthorizationVerification> {
   const checkedSnapshotHash = hashOpsWorkerAuthorizationSnapshot(task);
   const verifier = verifiers[task.source.kind];
-  const validatorIdentity = verifier?.identity ?? "missing-verifier";
-  const validatorVersion = verifier?.version ?? "1";
+  const validVerifierMetadata = verifier !== undefined
+    && validIdentity(verifier.identity)
+    && validIdentity(verifier.version);
+  const validatorIdentity = validVerifierMetadata ? verifier.identity : "missing-verifier";
+  const validatorVersion = validVerifierMetadata ? verifier.version : "1";
   let result: OpsWorkerAuthorizationVerifierResult;
-  if (!verifier) {
+  if (!verifier || !validVerifierMetadata) {
     result = closedResult("QUERY_ERROR", "missing-verifier", checkedSnapshotHash);
   } else if (task.authorization.snapshotHash === null) {
     result = closedResult("INVALID_CLAIM", "null-claim", checkedSnapshotHash);
@@ -523,6 +527,18 @@ export class OpsWorkerAuthorizationCoordinator {
           ) {
             stale = true;
             return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          }
+          if (
+            verification.status !== "PASS"
+            && isOpsWorkerTerminalState(task.state)
+          ) {
+            // A fresh denial fences the requested mutation, but terminal task state is
+            // immutable. Retain the successful composite evidence that established the
+            // terminal state and append the denial as an audit-only observation.
+            task.evidence = [...task.evidence, authorizationEvidence(verification)].slice(
+              -OPS_WORKER_LIMITS.maxEvidenceEntries,
+            );
+            return;
           }
           const previousVerification = task.authorizationVerification;
           task.authorizationVerification = verification;

@@ -11,9 +11,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
   createExpectedOpsWorkerParityContract,
+  OPS_WORKER_EXTENSION_MARKER_PREFIX,
+  opsWorkerEffectiveContextDigest,
   parseOpsWorkerParityAttestationReport,
   type OpsWorkerExpectedParityContract,
   type OpsWorkerParityAttestationReport,
@@ -32,6 +35,8 @@ export interface OpsWorkerParityLaunch {
   reportPath: string;
   ackPath: string;
   parityExtensionPath: string;
+  /** Generated identity wrappers followed by the package parity gate. */
+  extensionPaths: readonly string[];
 }
 
 function sha256(value: string | Buffer): string {
@@ -54,6 +59,30 @@ function writePrivateJson(path: string, value: unknown): void {
   assertSafeSessionFile(path);
   const staging = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   writeFileSync(staging, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: "wx" });
+  renameSync(staging, path);
+}
+
+function writePrivateExtensionWrapper(
+  path: string,
+  targetPath: string,
+  identity: string,
+): void {
+  assertSafeSessionFile(path);
+  const digest = identity.startsWith("sha256:") ? identity.slice("sha256:".length) : "";
+  if (!/^[a-f0-9]{64}$/.test(digest)) {
+    throw new TypeError("Primary extension identity is not a sha256 digest");
+  }
+  const marker = `${OPS_WORKER_EXTENSION_MARKER_PREFIX}${digest}`;
+  const source = [
+    `import targetExtension from ${JSON.stringify(pathToFileURL(targetPath).href)};`,
+    "export default function minimeOpsExtensionWrapper(pi) {",
+    `  pi.registerCommand(${JSON.stringify(marker)}, { handler: async () => {} });`,
+    "  return targetExtension(pi);",
+    "}",
+    "",
+  ].join("\n");
+  const staging = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  writeFileSync(staging, source, { mode: 0o600, flag: "wx" });
   renameSync(staging, path);
 }
 
@@ -91,6 +120,15 @@ export function prepareOpsWorkerParityLaunch(input: {
   const reportPath = join(input.sessionDirectory, "parity-report-v1.json");
   const ackPath = join(input.sessionDirectory, "parity-ack-v1.txt");
   writePrivateJson(expectedPath, expected);
+  const wrappedExtensionPaths = input.resources.extensionPaths.map((extensionPath, index) => {
+    const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
+    writePrivateExtensionWrapper(
+      wrapperPath,
+      extensionPath,
+      input.resources.extensionIdentities[index],
+    );
+    return wrapperPath;
+  });
   assertSafeSessionFile(reportPath);
   assertSafeSessionFile(ackPath);
   return {
@@ -99,6 +137,7 @@ export function prepareOpsWorkerParityLaunch(input: {
     reportPath,
     ackPath,
     parityExtensionPath: input.parityExtensionPath,
+    extensionPaths: [...wrappedExtensionPaths, input.parityExtensionPath],
   };
 }
 
@@ -128,6 +167,30 @@ export function tryReadOpsWorkerParityReport(
       parsed.expectedDigest !== launch.expected.digest
       || parsed.primaryContextDigest !== launch.expected.primaryContextDigest
     ) throw new Error("Ops-worker parity report does not match the prepared contract");
+    const expectedContextDigest = opsWorkerEffectiveContextDigest({
+      customPromptHash: launch.expected.customPromptHash,
+      appendSystemPromptHash: launch.expected.appendSystemPromptHash,
+      contextFilesDigest: launch.expected.contextFilesDigest,
+    });
+    const contextCodes = ["CUSTOM_PROMPT", "APPEND_SYSTEM_PROMPT", "CONTEXT_FILES"] as const;
+    const hasContextCode = contextCodes.some((code) => parsed.mismatch.includes(code));
+    const hasCapabilityDigestMismatch =
+      parsed.actualExtensionsDigest !== launch.expected.extensionsDigest
+      || parsed.actualSkillsDigest !== launch.expected.skillsDigest
+      || parsed.actualToolsDigest !== launch.expected.toolsDigest;
+    const inconsistent =
+      (parsed.actualContextDigest !== expectedContextDigest) !== hasContextCode
+      || (parsed.actualExtensionsDigest !== launch.expected.extensionsDigest)
+        !== parsed.mismatch.includes("EXTENSIONS")
+      || (parsed.actualSkillsDigest !== launch.expected.skillsDigest)
+        !== parsed.mismatch.includes("SKILLS")
+      || (parsed.actualToolsDigest !== launch.expected.toolsDigest)
+        !== parsed.mismatch.includes("TOOLS")
+      || (parsed.actualCapabilityDigest !== launch.expected.capabilityDigest)
+        !== hasCapabilityDigestMismatch;
+    if (inconsistent) {
+      throw new Error("Ops-worker parity report contradicts the prepared contract digests");
+    }
     return parsed;
   } finally {
     closeSync(descriptor);

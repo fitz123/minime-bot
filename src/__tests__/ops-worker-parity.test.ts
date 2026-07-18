@@ -4,6 +4,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,15 +16,21 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   attestOpsWorkerPiParity,
   createExpectedOpsWorkerParityContract,
+  parseOpsWorkerParityAttestationReport,
   type OpsWorkerParityRuntimeSnapshot,
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   piResourceIdentity,
+  resolveOpsWorkerParityExtensionPath,
   resolvePiPrimaryResourceContract,
   validatePiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
 import { resolvePiSpawnExtensionArgs } from "../pi-rpc-protocol.js";
+import {
+  prepareOpsWorkerParityLaunch,
+  tryReadOpsWorkerParityReport,
+} from "../ops-worker/parity.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const created: string[] = [];
@@ -150,6 +157,8 @@ describe("ops-worker before-provider parity attestation", () => {
       origin: "top-level" as const,
     });
     const snapshot = {
+      systemPrompt: "GENERIC_EFFECTIVE_SYSTEM_PROMPT",
+      baselineSystemPrompt: "GENERIC_EFFECTIVE_SYSTEM_PROMPT",
       systemPromptOptions: {
         cwd: root,
         customPrompt,
@@ -203,6 +212,10 @@ describe("ops-worker before-provider parity attestation", () => {
           contextFiles: [{ path: "AGENTS.md", content: "duplicate" }],
         },
       })],
+      ["SYSTEM_PROMPT", (snapshot: OpsWorkerParityRuntimeSnapshot) => ({
+        ...snapshot,
+        systemPrompt: `${snapshot.systemPrompt}\nchanged by an earlier extension`,
+      })],
       ["EXTENSIONS", (snapshot: OpsWorkerParityRuntimeSnapshot) => ({
         ...snapshot,
         commands: [],
@@ -225,6 +238,122 @@ describe("ops-worker before-provider parity attestation", () => {
     }
   });
 
+  it("rejects malformed, contradictory, and digest-inconsistent reports", () => {
+    const { expected, snapshot } = fixture();
+    const valid = attestOpsWorkerPiParity(expected, snapshot);
+    assert.throws(
+      () => parseOpsWorkerParityAttestationReport({ ...valid, extra: true }),
+      /fixed schema/,
+    );
+    assert.throws(
+      () => parseOpsWorkerParityAttestationReport({
+        ...valid,
+        status: "MISMATCH",
+        mismatch: ["TOOLS", "TOOLS"],
+      }),
+      /duplicates/,
+    );
+    assert.throws(
+      () => parseOpsWorkerParityAttestationReport({
+        ...valid,
+        actualToolsDigest: `sha256:${"f".repeat(64)}`,
+      }),
+      /capability digests are inconsistent/,
+    );
+    assert.throws(
+      () => parseOpsWorkerParityAttestationReport({
+        ...valid,
+        status: "PASS",
+        mismatch: ["TOOLS"],
+      }),
+      /contradicts/,
+    );
+  });
+
+  it("wraps handler-only extensions with attestable identities and rejects a forged PASS", async () => {
+    const root = tempDirectory();
+    const handlerOnly = join(root, "handler-only.mjs");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(
+      handlerOnly,
+      "export default function (pi) { pi.on('session_start', () => undefined); }\n",
+      "utf8",
+    );
+    writeFileSync(skill, "# Parity fixture skill\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        extraExtensions: [handlerOnly],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath: resolveOpsWorkerParityExtensionPath(),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const wrapperIndex = resources.extensionPaths.indexOf(realpathSync(handlerOnly));
+    assert.ok(wrapperIndex >= 0);
+    const commands: string[] = [];
+    const events: string[] = [];
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[wrapperIndex]).href}?wrapper=${Date.now()}`
+    )).default;
+    wrapper({
+      registerCommand: (name: string) => commands.push(name),
+      on: (event: string) => events.push(event),
+    });
+    assert.deepEqual(events, ["session_start"]);
+    assert.deepEqual(commands, [
+      `minime-ops-extension-${resources.extensionIdentities[wrapperIndex].slice("sha256:".length)}`,
+    ]);
+
+    writeFileSync(launch.reportPath, `${JSON.stringify({
+      version: 1,
+      status: "PASS",
+      expectedDigest: launch.expected.digest,
+      primaryContextDigest: launch.expected.primaryContextDigest,
+      actualContextDigest: `sha256:${"0".repeat(64)}`,
+      actualSystemPromptHash: `sha256:${"1".repeat(64)}`,
+      actualCapabilityDigest: launch.expected.capabilityDigest,
+      actualExtensionsDigest: launch.expected.extensionsDigest,
+      actualSkillsDigest: launch.expected.skillsDigest,
+      actualToolsDigest: launch.expected.toolsDigest,
+      mismatch: [],
+    })}\n`, "utf8");
+    assert.throws(
+      () => tryReadOpsWorkerParityReport(launch),
+      /contradicts the prepared contract digests/,
+    );
+
+    unlinkSync(launch.reportPath);
+    symlinkSync(handlerOnly, launch.reportPath);
+    assert.throws(
+      () => tryReadOpsWorkerParityReport(launch),
+      /not a bounded regular file/,
+    );
+    unlinkSync(launch.reportPath);
+    writeFileSync(launch.reportPath, "x".repeat(32 * 1024 + 1), "utf8");
+    assert.throws(
+      () => tryReadOpsWorkerParityReport(launch),
+      /not a bounded regular file/,
+    );
+  });
+
   it("ships a package-owned marker, parity gate, and attempt quota capture", async () => {
     const commands: string[] = [];
     const events: string[] = [];
@@ -236,6 +365,11 @@ describe("ops-worker before-provider parity attestation", () => {
       on: (event: string) => events.push(event),
     } as unknown as ExtensionAPI);
     assert.deepEqual(commands, ["minime-ops-parity-resource"]);
-    assert.deepEqual(events, ["before_agent_start", "after_provider_response"]);
+    assert.deepEqual(events, [
+      "session_start",
+      "before_agent_start",
+      "tool_call",
+      "after_provider_response",
+    ]);
   });
 });

@@ -9,15 +9,19 @@ Most helpers here back the live Pi extensions:
   and scoped protection for managed Knowledge v2 wiki files.
 - `subagent` for delegated child Pi runs.
 - `ask-agent` for configured full-agent inter-agent questions.
+- `codex-usage` for bounded Codex quota capture and persistence.
+- `ops-worker-parity-attestation` for the ops-only, before-provider context and
+  capability handshake.
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
 Knowledge v2 wiki files consistent with `knowledge_update`.
 
-`codex-usage.ts` is different:
-it is used only by the out-of-band Codex quota sampler via
-`extensions/pi/codex-usage.ts`, and must not be added to the normal
-`PI_EXTENSION_WRAPPER_RELPATHS` list. See
+The standalone `extensions/pi/codex-usage.ts` wrapper is different: it is used
+only by the out-of-band Codex quota sampler and must not be added to the normal
+`PI_EXTENSION_WRAPPER_RELPATHS` list. The helper is also called by the
+ops-worker-only parity wrapper to persist attempt-scoped response telemetry.
+See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
 
 `PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
@@ -71,27 +75,24 @@ There are TWO kinds of files in this feature, deliberately split:
    resources. Built and installed package runs load wrappers from this artifact
    directory.
 
-## Lint-coverage decision for the wrappers (Task 0)
+## Type-check coverage for wrappers
 
-**Decision: the source `extensions/pi/` wrappers are intentionally
-EXCLUDED from `tsc --noEmit` and from the `npm test` glob. No second tsconfig or
-test glob is added for them; package builds transpile them into generated runtime
-artifacts.**
+The source `extensions/pi/` wrappers are checked by
+`tsc -p tsconfig.extensions.json --noEmit` during `npm run build`. They remain
+outside the `npm test` file glob; tests load important wrappers through their
+public registration surface, while package builds transpile them into generated
+runtime artifacts.
 
 Rationale:
-- They live OUTSIDE `bot/src/`, so the existing tsconfig `include`
-  (`src/**/*.ts`) and the test glob (`src/__tests__/*.test.ts`) do not reach
-  them — and we are not extending either to cover them.
+- They live outside `src/`, so the main tsconfig and test glob do not reach them;
+  `tsconfig.extensions.json` supplies their separate type-check boundary.
 - They are intentionally thin: all branching/parsing/error-handling that is worth
   type-checking and unit-testing is factored into the `src/pi-extensions/*.ts`
   helpers, which ARE covered. A wrapper should contain no logic a test would want
   to assert on.
-- Adding a second tsconfig/glob to type-check the source wrappers would pull Pi's
-  runtime extension API types into the bot's `tsc` graph and couple the bot
-  build to the `@earendil-works/pi-coding-agent` extension surface. jiti loads
-  and validates them at source-checkout spawn time instead; built/package mode
-  loads the generated JS wrappers from `dist/extensions/pi`. A broken wrapper
-  fails loudly at load (fail-closed loading is handled by `resolvePiExtensionArgs`).
+- Source-checkout mode jiti-loads the checked wrappers; built/package mode loads
+  generated JS from `dist/extensions/pi`. A broken wrapper fails loudly at load
+  (fail-closed loading is handled by `resolvePiExtensionArgs`).
 
 If a wrapper ever grows logic worth testing, move that logic into a
 `src/pi-extensions/*.ts` helper rather than adding a tsconfig for the wrapper.
@@ -152,18 +153,27 @@ The fixed directive tells agents to use `knowledge_search`, `knowledge_get`, and
 unavailable, agents should fall back to the visible index or direct reads and
 report that limitation.
 
-### Fail-safe & cache
+### Fail-safe, strict mode, manifest, and cache
 
 - **Fail-safe:** every file read is wrapped — a missing/unreadable source is
   `log.warn`-ed and skipped, NEVER thrown. A total failure returns `null` so the
   caller degrades to a bare Pi spawn. The assembler must never break a spawn.
-- **Cache:** artifacts are cached per agent, keyed on a manifest of every source
-  file's `{path, mtime, size}`. On a cache HIT (unchanged source set) the assembler
-  SKIPS re-reading and re-assembling the sources, but STILL re-writes the `.tmp/`
+- **Strict ops-worker mode:** `assemblePiContext(..., { strict: true })` rejects
+  unsafe, missing, or unreadable declared sources. Ops workers use this mode and
+  write the artifacts into their separate execution workspace; they never fall
+  back to a smaller prompt after a canonical primary-context failure.
+- **Manifest:** every accepted source and the assembled persona/bundle contribute
+  redacted SHA-256 identities to the returned manifest; no source body or private
+  absolute path is persisted in parity evidence.
+- **Cache:** artifacts are cached per agent and strictness mode, keyed on source
+  content hashes (plus directory membership metadata). On a cache HIT the assembler
+  skips re-parsing and re-assembling the sources, but still reads source bytes to
+  prove freshness and STILL re-writes the `.tmp/`
   artifact files from the cached content — it never trusts a possibly-stale or
   tampered on-disk bundle (a gitignored `.tmp/` file a prior Pi session or external
   process could overwrite), and this also transparently recreates a deleted
   artifact. A touched source re-assembles (freshness parity).
-- **Artifacts:** written atomically (staging file → `renameSync`) to STABLE
-  per-agent paths under `<workspaceCwd>/.tmp/pi-context-<agentId>.{bundle,persona}.md`
+- **Artifacts:** written atomically (staging file → `renameSync`) to stable
+  per-agent paths under the selected artifact workspace's
+  `.tmp/pi-context-<agentId>.{bundle,persona}.md`
   — stable path ⇒ no accumulation, no cleanup job.

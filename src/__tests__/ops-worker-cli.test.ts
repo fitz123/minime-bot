@@ -93,7 +93,10 @@ function fixtureContracts(): FixtureContracts {
         "fixture.inspect.v1": {
           sourceKinds: ["operator-cli"],
           scope: ["inspect"],
-          tools: ["read", "grep", "find", "ls"],
+        },
+        "fixture.mutate.v1": {
+          sourceKinds: ["operator-cli"],
+          scope: ["pull-request"],
         },
       },
       doneChecks: doneChecks.contracts,
@@ -186,7 +189,10 @@ function dependencies(
   };
 }
 
-function submitArgs(stateDirectory: string): string[] {
+function submitArgs(
+  stateDirectory: string,
+  authorization = "fixture.inspect.v1",
+): string[] {
   return [
     "worker",
     "submit",
@@ -195,7 +201,7 @@ function submitArgs(stateDirectory: string): string[] {
     "--template",
     "fixture-task",
     "--authorization",
-    "fixture.inspect.v1",
+    authorization,
     "--done-check",
     "fixture-check",
     "--done-check-params",
@@ -437,7 +443,7 @@ describe("ops worker CLI and inactive runtime", () => {
       now: () => new Date("2026-07-18T10:00:01.000Z"),
     });
     const submitted = await runWorkerCli(
-      submitArgs(fixture.stateDirectory),
+      submitArgs(fixture.stateDirectory, "fixture.mutate.v1"),
       fixture.root,
       deps,
     );

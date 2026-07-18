@@ -945,7 +945,7 @@ describe("assemblePiContext", () => {
     assert.ok(!restored.includes("TAMPERED"), "the tampered content was overwritten");
   });
 
-  it("caches by the source manifest: a cache hit reuses artifacts; a touched source re-assembles", () => {
+  it("hashes source content so same-size same-mtime edits still re-assemble", () => {
     _resetPiContextCache();
     const ws = makeWorkspace({
       claudeMd: "# x\n\nBODY",
@@ -962,16 +962,15 @@ describe("assemblePiContext", () => {
     assert.ok(first);
     assert.ok(readFileSync(first.appendSystemPromptPath, "utf8").includes("RULE_AAA"));
 
-    // Mutate content to the SAME byte length and restore the pinned mtime →
-    // identical manifest signature → cache hit → the stale bundle is returned
-    // (proves no re-read).
+    // Mutate content to the SAME byte length and restore the pinned mtime. A
+    // metadata-only cache would return stale instructions here.
     writeFileSync(rulePath, "RULE_BBB", "utf8");
     utimesSync(rulePath, pinned, pinned);
     const second = assemblePiContext(agent);
     assert.ok(second);
-    const cachedBundle = readFileSync(second.appendSystemPromptPath, "utf8");
-    assert.ok(cachedBundle.includes("RULE_AAA"), "cache hit reused the prior bundle (no re-read)");
-    assert.ok(!cachedBundle.includes("RULE_BBB"));
+    const refreshedBundle = readFileSync(second.appendSystemPromptPath, "utf8");
+    assert.ok(refreshedBundle.includes("RULE_BBB"));
+    assert.ok(!refreshedBundle.includes("RULE_AAA"));
 
     // Bump the mtime → signature changes → re-assemble → fresh content.
     const later = new Date(1_700_000_005_000);
@@ -981,6 +980,16 @@ describe("assemblePiContext", () => {
     assert.ok(
       readFileSync(third.appendSystemPromptPath, "utf8").includes("RULE_BBB"),
       "a touched source re-assembles the bundle",
+    );
+  });
+
+  it("fails closed in strict mode when a declared context source is unavailable", () => {
+    const ws = makeWorkspace({
+      claudeMd: "# Strict context\n\n@missing.md\n",
+    });
+    assert.throws(
+      () => assemblePiContext(agentFor(ws, { id: "strictmissing" }), { strict: true }),
+      /@-import is not a readable regular source/,
     );
   });
 

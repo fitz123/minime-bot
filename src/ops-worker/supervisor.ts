@@ -1347,9 +1347,8 @@ export class OpsWorkerSupervisor {
     evidenceSummary?: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    const existing = this.requireTask(taskId);
-    const target = this.infrastructureFailureTarget(existing);
-    return this.transition(taskId, target, (task, at) => {
+    this.requireTask(taskId);
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.session.resume = true;
       this.incrementInfrastructureFailures(task);
@@ -1365,9 +1364,7 @@ export class OpsWorkerSupervisor {
       if (evidenceSummary) {
         appendEvidence(task, this.piEvidence(at, evidenceSummary));
       }
-    }, target === "BLOCKED"
-      ? `Blocked after bounded infrastructure failures (${result})`
-      : `Recorded resumable infrastructure outcome ${result}`);
+    }, `Recorded resumable infrastructure outcome ${result}`);
   }
 
   recordPreLaunchInfrastructureOutcome(
@@ -1381,8 +1378,7 @@ export class OpsWorkerSupervisor {
         `Pre-launch failure requires QUEUED or RESUMABLE, found ${existing.state}`,
       );
     }
-    const target = this.infrastructureFailureTarget(existing);
-    return this.transition(taskId, target, (task, at) => {
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       this.incrementInfrastructureFailures(task);
       task.schedule.nextCheckAt = null;
@@ -1395,9 +1391,7 @@ export class OpsWorkerSupervisor {
         result: "CRASH",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
-    }, target === "BLOCKED"
-      ? "Blocked after bounded Pi launch failures"
-      : "Recorded Pi attempt launch failure");
+    }, "Recorded Pi attempt launch failure");
   }
 
   recordResolvedPiLaunchFailure(
@@ -1406,9 +1400,8 @@ export class OpsWorkerSupervisor {
     summary: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
-    const target = this.infrastructureFailureTarget(existing);
-    return this.transition(taskId, target, (task, at) => {
+    this.requireMatchingLaunchFence(taskId, attemptId);
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
       task.report.state = "NONE";
@@ -1425,9 +1418,7 @@ export class OpsWorkerSupervisor {
         result: "CRASH",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
-    }, target === "BLOCKED"
-      ? "Blocked after bounded resolved Pi launch failures"
-      : "Cleared resolved Pi launch fence after launch failure");
+    }, "Cleared resolved Pi launch fence after launch failure");
   }
 
   recordResolvedPiLaunchSuccessClaim(
@@ -1471,9 +1462,8 @@ export class OpsWorkerSupervisor {
     evidenceSummary?: string,
   ): OpsWorkerTask {
     this.assertStarted();
-    const existing = this.requireMatchingLaunchFence(taskId, attemptId);
-    const target = this.infrastructureFailureTarget(existing);
-    return this.transition(taskId, target, (task, at) => {
+    this.requireMatchingLaunchFence(taskId, attemptId);
+    return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
       task.unverifiedRun = null;
       task.session.resume = true;
@@ -1494,9 +1484,7 @@ export class OpsWorkerSupervisor {
       if (evidenceSummary) {
         appendEvidence(task, this.piEvidence(at, evidenceSummary));
       }
-    }, target === "BLOCKED"
-      ? `Blocked after bounded resolved Pi outcomes (${result})`
-      : `Recorded resolved short-lived Pi outcome ${result}`);
+    }, `Recorded resolved short-lived Pi outcome ${result}`);
   }
 
   clearResolvedPiLaunchFence(
@@ -1569,11 +1557,10 @@ export class OpsWorkerSupervisor {
         artifact: null,
       });
     };
-    const target = this.infrastructureFailureTarget(existing);
-    if (existing.state === "RUNNING" || target === "BLOCKED") {
+    if (existing.state === "RUNNING") {
       return this.transition(
         taskId,
-        target,
+        "RESUMABLE",
         applyReset,
         "Quarantined corrupt standard Pi session and prepared a fresh session",
       );
@@ -1951,8 +1938,7 @@ export class OpsWorkerSupervisor {
         result = { status: "AMBIGUOUS" };
       }
       if (result.status === "GONE" || result.status === "STOPPED") {
-        const target = this.infrastructureFailureTarget(task);
-        this.transition(task.id, target, (replacement, at) => {
+        this.transition(task.id, "RESUMABLE", (replacement, at) => {
           replacement.activeRun = null;
           replacement.unverifiedRun = null;
           this.incrementInfrastructureFailures(replacement);
@@ -1970,7 +1956,7 @@ export class OpsWorkerSupervisor {
         }, "Reconciled interrupted attempt as resumable");
         reconciled.push({
           taskId: task.id,
-          state: target,
+          state: "RESUMABLE",
           result: "CRASH",
         });
       } else {
@@ -2057,6 +2043,7 @@ export class OpsWorkerSupervisor {
       }, "Fresh deterministic done check passed", {
         freshDoneCheckPass: true,
         expectedBaseline,
+        notBefore: result.checkedAt,
       });
     }
     if (result.result === "DEFER") {
@@ -2070,6 +2057,7 @@ export class OpsWorkerSupervisor {
         appendEvidence(task, this.checkEvidence(at, result.summary));
       }, "Done check deferred without spending remediation budget", {
         expectedBaseline,
+        notBefore: result.checkedAt,
       });
     }
     if (
@@ -2103,6 +2091,7 @@ export class OpsWorkerSupervisor {
         });
       }, `Composite verification will retry after ${result.result}`, {
         expectedBaseline,
+        notBefore: result.checkedAt,
       });
     }
     if (result.result !== "NOT_READY" && result.result !== "PRODUCT_FAILURE") {
@@ -2136,7 +2125,7 @@ export class OpsWorkerSupervisor {
         }
       },
       `Composite verification requires remediation (${remediationResult})`,
-      { expectedBaseline },
+      { expectedBaseline, notBefore: result.checkedAt },
     );
   }
 
@@ -2147,27 +2136,13 @@ export class OpsWorkerSupervisor {
     task.schedule.nextCheckAt = null;
   }
 
-  private infrastructureFailureTarget(
-    task: OpsWorkerTask,
-  ): "RESUMABLE" | "BLOCKED" {
-    return task.rounds.consecutiveInfrastructureFailures + 1
-        >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
-      ? "BLOCKED"
-      : "RESUMABLE";
-  }
-
   private incrementInfrastructureFailures(task: OpsWorkerTask): void {
+    // Saturate bounded diagnostics without converting them into product failure.
+    // The surrounding transitions retain custody in RESUMABLE or CHECKING.
     task.rounds.consecutiveInfrastructureFailures = Math.min(
       MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES,
       task.rounds.consecutiveInfrastructureFailures + 1,
     );
-    if (
-      task.rounds.consecutiveInfrastructureFailures
-        >= MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES
-    ) {
-      task.report.state = "PENDING";
-      task.report.lastError = null;
-    }
   }
 
   private checkOutcome(
@@ -2248,6 +2223,7 @@ export class OpsWorkerSupervisor {
     options: {
       freshDoneCheckPass?: boolean;
       expectedBaseline?: string;
+      notBefore?: string;
     } = {},
   ): OpsWorkerTask {
     if (to === "DONE" && !options.freshDoneCheckPass) {
@@ -2266,7 +2242,7 @@ export class OpsWorkerSupervisor {
           throw new OpsWorkerStaleCheckResultError(taskId);
         }
         assertStructuralStateTransition(task.state, to);
-        const updatedAt = this.nextUpdatedAt(task);
+        const updatedAt = this.nextUpdatedAt(task, options.notBefore);
         task.state = to;
         task.updatedAt = updatedAt;
         mutate(task, updatedAt);
@@ -2275,9 +2251,13 @@ export class OpsWorkerSupervisor {
     ).task;
   }
 
-  private nextUpdatedAt(task: OpsWorkerTask): string {
+  private nextUpdatedAt(task: OpsWorkerTask, notBefore?: string): string {
     const now = this.now().getTime();
-    return new Date(Math.max(now, Date.parse(task.updatedAt) + 1)).toISOString();
+    return new Date(Math.max(
+      now,
+      Date.parse(task.updatedAt) + 1,
+      notBefore === undefined ? 0 : Date.parse(notBefore),
+    )).toISOString();
   }
 
   private requireTask(taskId: string): OpsWorkerTask {

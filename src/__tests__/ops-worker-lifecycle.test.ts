@@ -38,7 +38,10 @@ const registry: OpsWorkerTaskContractRegistry = {
     "fixture.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
+    },
+    "fixture.mutate.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
     },
   },
   doneChecks: {
@@ -71,8 +74,8 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
     evidence: [],
     doneCheck: { name: "fixture-check", params: { expected: true } },
     authorization: {
-      profile: "fixture.inspect.v1",
-      scope: ["inspect"],
+      profile: "fixture.mutate.v1",
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
       snapshotHash: null,
     },
     authorizationVerification: null,
@@ -147,6 +150,34 @@ describe("ops worker package-owned lifecycle evidence", () => {
     assert.equal(
       harness.store.get(task.id)?.mutationReceipts.merge?.mutationStartedAt,
       null,
+    );
+  });
+
+  it("requires the registered domain scope for each mutation boundary", (t) => {
+    const harness = makeHarness(t);
+    const base = makeTask("scope-fence");
+    const task = withOpsWorkerSubmissionFingerprint({
+      ...base,
+      authorization: {
+        profile: "fixture.inspect.v1",
+        scope: ["inspect"],
+        snapshotHash: null,
+      },
+    });
+    harness.store.create(task);
+    const operation = {
+      boundary: "merge" as const,
+      operationId: "scope-fence-merge",
+      intent: { base: "main", head: "scope-fence" },
+    };
+    harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operation,
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    assert.throws(
+      () => harness.lifecycle.claimMutationReceipt(task.id, operation),
+      /outside the task's registered authorization scopes/,
     );
   });
 

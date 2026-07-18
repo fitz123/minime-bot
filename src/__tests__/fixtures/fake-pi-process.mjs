@@ -8,11 +8,8 @@ import {
 } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import {
-  attestOpsWorkerPiParity,
-  readExpectedOpsWorkerParityContract,
-  writeOpsWorkerParityReport,
-} from "../../pi-extensions/ops-worker-parity-attestation.js";
+import { pathToFileURL } from "node:url";
+import { readExpectedOpsWorkerParityContract } from "../../pi-extensions/ops-worker-parity-attestation.js";
 import { captureCodexQuotaFromHeaders } from "../../pi-extensions/codex-usage.js";
 
 const [scenario, ...args] = process.argv.slice(2);
@@ -124,7 +121,44 @@ const sourceInfo = (path) => ({
   scope: "temporary",
   origin: "top-level",
 });
-const parityReport = attestOpsWorkerPiParity(parityExpected, {
+const extensionPaths = flagValues("--extension");
+const parityExtensionPath = extensionPaths.at(-1);
+if (!parityExtensionPath) process.exit(64);
+const commands = [];
+for (const path of extensionPaths.slice(0, -1)) {
+  const wrapperSource = readFileSync(path, "utf8");
+  const marker = /minime-ops-extension-[a-f0-9]{64}/.exec(wrapperSource)?.[0];
+  if (!marker) process.exit(64);
+  commands.push({ name: marker, source: "extension", sourceInfo: sourceInfo(path) });
+}
+const handlers = new Map();
+const allTools = selectedTools.map((name) => ({
+  name,
+  sourceInfo: sourceInfo(`<builtin:${name}>`),
+}));
+const pi = {
+  registerCommand(name) {
+    commands.push({ name, source: "extension", sourceInfo: sourceInfo(parityExtensionPath) });
+  },
+  on(event, handler) {
+    const current = handlers.get(event) ?? [];
+    current.push(handler);
+    handlers.set(event, current);
+  },
+  getActiveTools: () => selectedTools,
+  getAllTools: () => allTools,
+  getCommands: () => commands,
+};
+const parityExtension = (await import(
+  `${pathToFileURL(parityExtensionPath).href}?fake=${Date.now()}`
+)).default;
+parityExtension(pi);
+const effectiveSystemPrompt = "fake effective system prompt";
+for (const handler of handlers.get("session_start") ?? []) {
+  await handler({}, { getSystemPrompt: () => effectiveSystemPrompt });
+}
+const beforeEvent = {
+  systemPrompt: effectiveSystemPrompt,
   systemPromptOptions: {
     cwd: process.cwd(),
     customPrompt: customPromptValue === undefined
@@ -138,19 +172,10 @@ const parityReport = attestOpsWorkerPiParity(parityExpected, {
       : [{ path: "AGENTS.md", content: "fake ambient duplicate" }],
     skills: flagValues("--skill").map((filePath) => ({ filePath })),
   },
-  activeToolNames: selectedTools,
-  allTools: selectedTools.map((name) => ({
-    name,
-    sourceInfo: sourceInfo(`<builtin:${name}>`),
-  })),
-  commands: flagValues("--extension").map((path, index) => ({
-    name: `fake-extension-marker-${index}`,
-    source: "extension",
-    sourceInfo: sourceInfo(path),
-  })),
-});
-writeOpsWorkerParityReport(parityReportPath, parityReport);
-if (parityReport.status !== "PASS") process.exit(78);
+};
+for (const handler of handlers.get("before_agent_start") ?? []) {
+  await handler(beforeEvent, {});
+}
 const parityDeadline = Date.now() + 5_000;
 while (Date.now() < parityDeadline) {
   if (

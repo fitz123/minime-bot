@@ -271,7 +271,7 @@ export function evaluateOpsWorkerQuotaAdmission(
     }
     const elapsedWindowPercent = Math.max(
       0,
-      Math.min(100, ((now.getTime() - startMs) / durationMs) * 100),
+      Math.min(100, ((sampledAtMs - startMs) / durationMs) * 100),
     );
     if (
       window.usedPercent
@@ -337,10 +337,27 @@ export function evaluateOpsWorkerQuotaResponse(
       summary: `Quota response telemetry is unusable: ${admission.reason}`,
     };
   }
-  const resetValues = Object.entries(read.snapshot.windows)
-    .filter(([, window]) => Object.keys(window).length > 0)
-    .flatMap(([, window]) => window.resetAt === undefined ? [] : [window.resetAt]);
-  if (resetValues.length === 0) {
+  const activeWindows = (Object.entries(read.snapshot.windows) as Array<
+    [CodexQuotaWindowName, CodexQuotaWindow]
+  >).filter(([, window]) => Object.keys(window).length > 0);
+  let activeWindow: CodexQuotaWindowName | undefined;
+  if (read.snapshot.activeLimit === undefined && activeWindows.length === 1) {
+    activeWindow = activeWindows[0][0];
+  } else if (read.snapshot.activeLimit === "primary") {
+    activeWindow = "5h";
+  } else if (read.snapshot.activeLimit === "secondary") {
+    activeWindow = "week";
+  }
+  if (activeWindow === undefined || Object.keys(read.snapshot.windows[activeWindow]).length === 0) {
+    return {
+      status: "TELEMETRY_ERROR",
+      reason: "INVALID",
+      evidenceHash: admission.evidenceHash,
+      summary: "Quota response telemetry does not identify one active authoritative limit",
+    };
+  }
+  const resetAt = read.snapshot.windows[activeWindow].resetAt;
+  if (resetAt === undefined) {
     return {
       status: "TELEMETRY_ERROR",
       reason: "RESETLESS",
@@ -348,9 +365,6 @@ export function evaluateOpsWorkerQuotaResponse(
       summary: "Quota response telemetry is unusable: RESETLESS",
     };
   }
-  const resetAt = new Date(
-    Math.min(...resetValues.map((value) => Date.parse(value))),
-  ).toISOString();
   return {
     status: "WAIT",
     resetAt,

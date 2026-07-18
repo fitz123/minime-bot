@@ -66,17 +66,14 @@ const registry: OpsWorkerTaskContractRegistry = {
     "operator.inspect.v1": {
       sourceKinds: ["operator-cli", "operator-telegram"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
     },
     "operator.repair.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["local-reversible-repair"],
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
     "issue.full-cycle.v1": {
       sourceKinds: ["authorized-issue"],
       scope: ["repository-read", "repository-write", "pull-request", "issue-lifecycle"],
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
   },
   doneChecks: {

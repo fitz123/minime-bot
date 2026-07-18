@@ -56,19 +56,6 @@ export const OPS_WORKER_AUTHORIZATION_SCOPES = [
 export type OpsWorkerAuthorizationScope =
   (typeof OPS_WORKER_AUTHORIZATION_SCOPES)[number];
 
-export const OPS_WORKER_AUTHORIZATION_TOOLS = [
-  "read",
-  "bash",
-  "edit",
-  "write",
-  "grep",
-  "find",
-  "ls",
-] as const;
-
-export type OpsWorkerAuthorizationTool =
-  (typeof OPS_WORKER_AUTHORIZATION_TOOLS)[number];
-
 export const OPS_WORKER_EVIDENCE_KINDS = [
   "alert",
   "operator",
@@ -627,8 +614,6 @@ export interface OpsWorkerTemplateContract {
 export interface OpsWorkerAuthorizationProfileContract {
   sourceKinds: readonly OpsWorkerSourceKind[];
   scope: readonly OpsWorkerAuthorizationScope[];
-  /** Fixed Pi tool allowlist selected by trusted package code, never task data. */
-  tools: readonly OpsWorkerAuthorizationTool[];
 }
 
 export interface OpsWorkerDoneCheckContract {
@@ -1666,31 +1651,11 @@ function parseAuthorization(
   if (!contract.sourceKinds.includes(sourceKind)) {
     fail("task.authorization.profile", `profile is not registered for source kind ${sourceKind}`);
   }
-  const contractTools = expectDensePlainArray(
-    contract.tools,
-    "registry.authorization.tools",
-  );
-  if (contractTools.length === 0) {
-    fail("task.authorization.profile", "registered profile must provide a fixed tool allowlist");
-  }
-  const tools = contractTools.map((tool, index) =>
-    expectEnum(tool, OPS_WORKER_AUTHORIZATION_TOOLS, `registry.authorization.tools[${index}]`));
-  if (new Set(tools).size !== tools.length) {
-    fail("task.authorization.profile", "registered profile tool allowlist must not contain duplicates");
-  }
   const contractScope = expectDensePlainArray(
     contract.scope,
     "registry.authorization.scope",
   ).map((scope, index) =>
     expectEnum(scope, OPS_WORKER_AUTHORIZATION_SCOPES, `registry.authorization.scope[${index}]`));
-  const readOnlyScope = contractScope.every((scope) =>
-    scope === "inspect" || scope === "repository-read");
-  if (readOnlyScope && tools.some((tool) => tool === "bash" || tool === "edit" || tool === "write")) {
-    fail(
-      "task.authorization.profile",
-      "read-only profiles cannot enable mutation or shell tools",
-    );
-  }
   const suppliedScope = expectDensePlainArray(
     authorization.scope,
     "task.authorization.scope",

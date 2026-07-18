@@ -38,7 +38,6 @@ const registry: OpsWorkerTaskContractRegistry = {
     "fixture.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
     },
   },
   doneChecks: doneChecks.contracts,

@@ -15,8 +15,8 @@ import {
   OPS_WORKER_PARITY_ACK_PATH_ENV,
   OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
   OPS_WORKER_PARITY_FAILURE_EXIT_CODE,
-  OPS_WORKER_PARITY_PROBE_ENV,
   OPS_WORKER_PARITY_REPORT_PATH_ENV,
+  OPS_WORKER_QUOTA_PROBE_ENV,
   attestOpsWorkerPiParity,
   readExpectedOpsWorkerParityContract,
   waitForOpsWorkerParityAck,
@@ -30,6 +30,11 @@ export default function (pi: ExtensionAPI): void {
   // this handler-only extension attestable without exposing its host path.
   pi.registerCommand(RESOURCE_MARKER_COMMAND, { handler: async () => {} });
 
+  let baselineSystemPrompt: string | null = null;
+  pi.on("session_start", (_event, ctx) => {
+    baselineSystemPrompt = ctx.getSystemPrompt();
+  });
+
   pi.on("before_agent_start", async (event) => {
     const expectedPath = process.env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV];
     const reportPath = process.env[OPS_WORKER_PARITY_REPORT_PATH_ENV];
@@ -40,15 +45,14 @@ export default function (pi: ExtensionAPI): void {
     try {
       const expected = readExpectedOpsWorkerParityContract(expectedPath);
       const report = attestOpsWorkerPiParity(expected, {
+        systemPrompt: event.systemPrompt,
+        baselineSystemPrompt,
         systemPromptOptions: event.systemPromptOptions,
         activeToolNames: pi.getActiveTools(),
         allTools: pi.getAllTools(),
         commands: pi.getCommands(),
       });
       writeOpsWorkerParityReport(reportPath, report);
-      if (process.env[OPS_WORKER_PARITY_PROBE_ENV] === "1") {
-        process.exit(report.status === "PASS" ? 0 : OPS_WORKER_PARITY_FAILURE_EXIT_CODE);
-      }
       if (
         report.status !== "PASS"
         || !(await waitForOpsWorkerParityAck(ackPath, expected.digest))
@@ -58,6 +62,14 @@ export default function (pi: ExtensionAPI): void {
       // provider. This gate must terminate on every malformed or I/O failure.
       process.exit(OPS_WORKER_PARITY_FAILURE_EXIT_CODE);
     }
+  });
+
+  pi.on("tool_call", () => {
+    if (process.env[OPS_WORKER_QUOTA_PROBE_ENV] !== "1") return undefined;
+    return {
+      block: true,
+      reason: "Quota smoke probes cannot execute tools",
+    };
   });
 
   pi.on("after_provider_response", (...args: unknown[]) => {

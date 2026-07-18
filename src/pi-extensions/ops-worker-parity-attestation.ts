@@ -23,7 +23,8 @@ export const OPS_WORKER_PARITY_PROTOCOL_VERSION = 1 as const;
 export const OPS_WORKER_PARITY_EXPECTED_PATH_ENV = "MINIME_OPS_WORKER_PARITY_EXPECTED_PATH";
 export const OPS_WORKER_PARITY_REPORT_PATH_ENV = "MINIME_OPS_WORKER_PARITY_REPORT_PATH";
 export const OPS_WORKER_PARITY_ACK_PATH_ENV = "MINIME_OPS_WORKER_PARITY_ACK_PATH";
-export const OPS_WORKER_PARITY_PROBE_ENV = "MINIME_OPS_WORKER_PARITY_PROBE";
+export const OPS_WORKER_QUOTA_PROBE_ENV = "MINIME_OPS_WORKER_QUOTA_PROBE";
+export const OPS_WORKER_EXTENSION_MARKER_PREFIX = "minime-ops-extension-";
 export const OPS_WORKER_PARITY_FAILURE_EXIT_CODE = 78;
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -56,6 +57,7 @@ export interface OpsWorkerParityAttestationReport {
   expectedDigest: string;
   primaryContextDigest: string;
   actualContextDigest: string;
+  actualSystemPromptHash: string;
   actualCapabilityDigest: string;
   actualExtensionsDigest: string;
   actualSkillsDigest: string;
@@ -67,11 +69,14 @@ export type OpsWorkerParityMismatch =
   | "CUSTOM_PROMPT"
   | "APPEND_SYSTEM_PROMPT"
   | "CONTEXT_FILES"
+  | "SYSTEM_PROMPT"
   | "EXTENSIONS"
   | "SKILLS"
   | "TOOLS";
 
 export interface OpsWorkerParityRuntimeSnapshot {
+  systemPrompt: string;
+  baselineSystemPrompt: string | null;
   systemPromptOptions: BuildSystemPromptOptions;
   activeToolNames: readonly string[];
   allTools: readonly ToolInfo[];
@@ -98,6 +103,19 @@ function contextFilesDigest(
 }
 
 export const EMPTY_PI_CONTEXT_FILES_DIGEST = contextFilesDigest([]);
+
+export function opsWorkerEffectiveContextDigest(input: {
+  customPromptHash: string | null;
+  appendSystemPromptHash: string;
+  contextFilesDigest: string;
+}): string {
+  return sha256([
+    "minime-ops-worker-effective-context-v1",
+    input.customPromptHash ?? "none",
+    input.appendSystemPromptHash,
+    input.contextFilesDigest,
+  ].join("\0"));
+}
 
 function requireSha256(value: unknown, path: string): string {
   if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
@@ -236,6 +254,19 @@ export function createExpectedOpsWorkerParityContract(input: {
 }
 
 function activeExtensionIdentities(snapshot: OpsWorkerParityRuntimeSnapshot): string[] {
+  const markerIdentities = new Map<string, Set<string>>();
+  for (const command of snapshot.commands) {
+    if (command.source !== "extension") continue;
+    const path = command.sourceInfo.path;
+    const marker = command.name.startsWith(OPS_WORKER_EXTENSION_MARKER_PREFIX)
+      ? command.name.slice(OPS_WORKER_EXTENSION_MARKER_PREFIX.length)
+      : "";
+    if (!isAbsolute(path) || !/^[a-f0-9]{64}$/.test(marker)) continue;
+    const normalized = normalize(resolve(path));
+    const identities = markerIdentities.get(normalized) ?? new Set<string>();
+    identities.add(`sha256:${marker}`);
+    markerIdentities.set(normalized, identities);
+  }
   const paths = new Set<string>();
   for (const tool of snapshot.allTools) {
     const path = tool.sourceInfo.path;
@@ -246,7 +277,16 @@ function activeExtensionIdentities(snapshot: OpsWorkerParityRuntimeSnapshot): st
     const path = command.sourceInfo.path;
     if (isAbsolute(path)) paths.add(normalize(resolve(path)));
   }
-  return [...paths].map((path) => piResourceIdentity("extension", path)).sort();
+  const identities = new Set<string>();
+  for (const path of paths) {
+    const markers = markerIdentities.get(path);
+    if (markers) {
+      for (const marker of markers) identities.add(marker);
+    } else {
+      identities.add(piResourceIdentity("extension", path));
+    }
+  }
+  return [...identities].sort();
 }
 
 function activeSkillIdentities(options: BuildSystemPromptOptions): string[] {
@@ -276,16 +316,20 @@ export function attestOpsWorkerPiParity(
     actualSkillsDigest,
     actualToolsDigest,
   ].join("\0"));
-  const actualContextDigest = sha256([
-    "minime-ops-worker-effective-context-v1",
-    customPromptHash ?? "none",
+  const actualContextDigest = opsWorkerEffectiveContextDigest({
+    customPromptHash,
     appendSystemPromptHash,
-    actualContextFilesDigest,
-  ].join("\0"));
+    contextFilesDigest: actualContextFilesDigest,
+  });
+  const actualSystemPromptHash = sha256(snapshot.systemPrompt);
   const mismatch: OpsWorkerParityMismatch[] = [];
   if (customPromptHash !== expected.customPromptHash) mismatch.push("CUSTOM_PROMPT");
   if (appendSystemPromptHash !== expected.appendSystemPromptHash) mismatch.push("APPEND_SYSTEM_PROMPT");
   if (actualContextFilesDigest !== expected.contextFilesDigest) mismatch.push("CONTEXT_FILES");
+  if (
+    snapshot.baselineSystemPrompt === null
+    || snapshot.systemPrompt !== snapshot.baselineSystemPrompt
+  ) mismatch.push("SYSTEM_PROMPT");
   if (actualExtensionsDigest !== expected.extensionsDigest) mismatch.push("EXTENSIONS");
   if (actualSkillsDigest !== expected.skillsDigest) mismatch.push("SKILLS");
   if (actualToolsDigest !== expected.toolsDigest) mismatch.push("TOOLS");
@@ -295,6 +339,7 @@ export function attestOpsWorkerPiParity(
     expectedDigest: expected.digest,
     primaryContextDigest: expected.primaryContextDigest,
     actualContextDigest,
+    actualSystemPromptHash,
     actualCapabilityDigest,
     actualExtensionsDigest,
     actualSkillsDigest,
@@ -316,6 +361,7 @@ export function parseOpsWorkerParityAttestationReport(
     "expectedDigest",
     "primaryContextDigest",
     "actualContextDigest",
+    "actualSystemPromptHash",
     "actualCapabilityDigest",
     "actualExtensionsDigest",
     "actualSkillsDigest",
@@ -337,6 +383,7 @@ export function parseOpsWorkerParityAttestationReport(
     "CUSTOM_PROMPT",
     "APPEND_SYSTEM_PROMPT",
     "CONTEXT_FILES",
+    "SYSTEM_PROMPT",
     "EXTENSIONS",
     "SKILLS",
     "TOOLS",
@@ -356,16 +403,45 @@ export function parseOpsWorkerParityAttestationReport(
   if ((obj.status === "PASS") !== (mismatch.length === 0)) {
     throw new TypeError("parity report status contradicts mismatch evidence");
   }
+  const actualExtensionsDigest = requireSha256(
+    obj.actualExtensionsDigest,
+    "parity report actualExtensionsDigest",
+  );
+  const actualSkillsDigest = requireSha256(
+    obj.actualSkillsDigest,
+    "parity report actualSkillsDigest",
+  );
+  const actualToolsDigest = requireSha256(
+    obj.actualToolsDigest,
+    "parity report actualToolsDigest",
+  );
+  const actualCapabilityDigest = requireSha256(
+    obj.actualCapabilityDigest,
+    "parity report actualCapabilityDigest",
+  );
+  const recomputedCapabilityDigest = sha256([
+    "minime-ops-worker-capabilities-v1",
+    actualExtensionsDigest,
+    actualSkillsDigest,
+    actualToolsDigest,
+  ].join("\0"));
+  if (actualCapabilityDigest !== recomputedCapabilityDigest) {
+    throw new TypeError("parity report capability digests are inconsistent");
+  }
   return {
     version: OPS_WORKER_PARITY_PROTOCOL_VERSION,
     status: obj.status,
     expectedDigest: requireSha256(obj.expectedDigest, "parity report expectedDigest"),
     primaryContextDigest: requireSha256(obj.primaryContextDigest, "parity report primaryContextDigest"),
     actualContextDigest: requireSha256(obj.actualContextDigest, "parity report actualContextDigest"),
-    actualCapabilityDigest: requireSha256(obj.actualCapabilityDigest, "parity report actualCapabilityDigest"),
-    actualExtensionsDigest: requireSha256(obj.actualExtensionsDigest, "parity report actualExtensionsDigest"),
-    actualSkillsDigest: requireSha256(obj.actualSkillsDigest, "parity report actualSkillsDigest"),
-    actualToolsDigest: requireSha256(obj.actualToolsDigest, "parity report actualToolsDigest"),
+    actualSystemPromptHash: requireSha256(
+      obj.actualSystemPromptHash,
+      "parity report actualSystemPromptHash",
+    ),
+    actualCapabilityDigest,
+    actualExtensionsDigest,
+    actualSkillsDigest,
+    actualToolsDigest,
     mismatch,
   };
 }

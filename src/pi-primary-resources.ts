@@ -15,9 +15,6 @@ export const PI_BUILTIN_TOOL_NAMES = [
   "bash",
   "edit",
   "write",
-  "grep",
-  "find",
-  "ls",
 ] as const;
 
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;

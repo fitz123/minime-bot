@@ -31,7 +31,6 @@ const registry: OpsWorkerTaskContractRegistry = {
     "operator.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
     },
   },
   doneChecks: {

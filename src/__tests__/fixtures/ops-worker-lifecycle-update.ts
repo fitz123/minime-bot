@@ -37,7 +37,10 @@ const registry: OpsWorkerTaskContractRegistry = {
     "fixture.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
+    },
+    "fixture.mutate.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
     },
   },
   doneChecks: {

@@ -114,6 +114,7 @@ function isLoopbackRemoteAddress(address: string | undefined): boolean {
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const POLICY_IDENTITY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/+-]{0,254}[A-Za-z0-9])?$/;
+const REGISTERED_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9.-]{0,78}[a-z0-9])?$/;
 const QUOTA_REASONS = new Set([
   "HEADROOM",
   "MISSING",
@@ -134,6 +135,12 @@ function policyHash(value: unknown): string {
 function assertPolicyIdentity(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string" || !POLICY_IDENTITY_PATTERN.test(value)) {
     throw new TypeError(`${label} must be a bounded package identity`);
+  }
+}
+
+function assertRegisteredName(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !REGISTERED_NAME_PATTERN.test(value)) {
+    throw new TypeError(`${label} is not a registered name`);
   }
 }
 
@@ -196,8 +203,8 @@ export function inspectOpsWorkerPolicy(
     if (!contract || !SHA256_PATTERN.test(contract.contractHash)) {
       throw new TypeError("Done-check registry returned an invalid contract identity");
     }
-    assertPolicyIdentity(contract.verifierIdentity, "done-check verifier identity");
-    assertPolicyIdentity(contract.verifierVersion, "done-check verifier version");
+    assertRegisteredName(contract.verifierIdentity, "done-check verifier identity");
+    assertRegisteredName(contract.verifierVersion, "done-check verifier version");
     return { name, ...contract };
   });
 

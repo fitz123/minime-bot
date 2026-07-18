@@ -20,6 +20,7 @@ const NOW = new Date("2026-07-18T12:00:00.000Z");
 
 function snapshot(input: {
   sampledAt?: string;
+  activeLimit?: string;
   fiveHour?: { used: number; resetAt: string } | null;
   week?: { used: number; resetAt: string } | null;
 } = {}): CodexQuotaSnapshot {
@@ -41,12 +42,15 @@ function snapshot(input: {
     sampledAt,
     lastSuccess: sampledAt,
     lastSuccessTimestamp: Date.parse(sampledAt) / 1_000,
+    ...(input.activeLimit === undefined ? {} : { activeLimit: input.activeLimit }),
     windows: {
       "5h": window(input.fiveHour),
-      week: window(input.week ?? {
-        used: 45,
-        resetAt: "2026-07-21T00:00:00.000Z",
-      }),
+      week: window(input.week === undefined
+        ? {
+          used: 45,
+          resetAt: "2026-07-21T00:00:00.000Z",
+        }
+        : input.week),
     },
   };
 }
@@ -80,6 +84,29 @@ describe("ops worker Codex quota admission", () => {
     assert.equal(paceExceeded.status, "NOT_ADMITTED");
     assert.equal(paceExceeded.reason, "PACE_EXCEEDED");
     assert.equal(paceExceeded.nextResetAt, "2026-07-18T16:00:00.000Z");
+  });
+
+  it("uses inclusive headroom and pacing boundaries at the sample timestamp", () => {
+    const exactHeadroom = evaluateOpsWorkerQuotaAdmission(readOk(snapshot({
+      sampledAt: "2026-07-18T13:00:00.000Z",
+      fiveHour: { used: 50, resetAt: "2026-07-18T15:00:00.000Z" },
+      week: null,
+    })), { now: new Date("2026-07-18T13:00:01.000Z") });
+    assert.equal(exactHeadroom.status, "ADMITTED");
+
+    const exactPace = evaluateOpsWorkerQuotaAdmission(readOk(snapshot({
+      sampledAt: "2026-07-18T11:30:00.000Z",
+      fiveHour: { used: 40, resetAt: "2026-07-18T15:00:00.000Z" },
+      week: null,
+    })), { now: new Date("2026-07-18T11:31:00.000Z") });
+    assert.equal(exactPace.status, "ADMITTED");
+
+    const justOverPace = evaluateOpsWorkerQuotaAdmission(readOk(snapshot({
+      sampledAt: "2026-07-18T11:30:00.000Z",
+      fiveHour: { used: 40.001, resetAt: "2026-07-18T15:00:00.000Z" },
+      week: null,
+    })), { now: new Date("2026-07-18T14:00:00.000Z"), staleMs: 24 * 60 * 60_000 });
+    assert.equal(justOverPace.reason, "PACE_EXCEEDED");
   });
 
   it("returns typed closed evidence for missing, stale, resetless, durationless, and contradictory telemetry", () => {
@@ -157,13 +184,14 @@ describe("ops worker Codex quota admission", () => {
     }
   });
 
-  it("uses a real response's earliest authoritative reset and refreshes a rolling reset", () => {
+  it("uses the response's named authoritative reset and refreshes a rolling reset", () => {
     const first = evaluateOpsWorkerQuotaResponse(readOk(snapshot({
+      activeLimit: "secondary",
       fiveHour: { used: 100, resetAt: "2026-07-18T13:00:00.000Z" },
       week: { used: 80, resetAt: "2026-07-20T00:00:00.000Z" },
     })), { now: NOW });
     assert.equal(first.status, "WAIT");
-    assert.equal(first.resetAt, "2026-07-18T13:00:00.000Z");
+    assert.equal(first.resetAt, "2026-07-20T00:00:00.000Z");
 
     const rolled = evaluateOpsWorkerQuotaResponse(readOk(snapshot({
       sampledAt: "2026-07-18T12:59:59.000Z",
@@ -180,5 +208,11 @@ describe("ops worker Codex quota admission", () => {
       evaluateOpsWorkerQuotaResponse(readOk(invalid), { now: NOW }).status,
       "TELEMETRY_ERROR",
     );
+
+    const ambiguous = evaluateOpsWorkerQuotaResponse(readOk(snapshot({
+      fiveHour: { used: 100, resetAt: "2026-07-18T13:00:00.000Z" },
+      week: { used: 80, resetAt: "2026-07-20T00:00:00.000Z" },
+    })), { now: NOW });
+    assert.equal(ambiguous.status, "TELEMETRY_ERROR");
   });
 });

@@ -542,7 +542,10 @@ export class OpsWorkerDoneCheckRegistry {
     }
     const queriedComponents = await Promise.all(definition.components.map((component) =>
       runComponent(component, params, context, externalSignal)));
-    const completedAt = (context.now ?? (() => new Date()))().toISOString();
+    const completedAt = new Date(Math.max(
+      (context.now ?? (() => new Date()))().getTime(),
+      Date.parse(context.checkedAt),
+    )).toISOString();
     const components = queriedComponents.map((component, index) =>
       Date.parse(component.observedAt) > Date.parse(completedAt)
         || (

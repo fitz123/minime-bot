@@ -129,7 +129,14 @@ The closed results are `PASS`, `DRIFT`, `QUERY_ERROR`, and `INVALID_CLAIM`.
 releases custody with durable evidence. `QUERY_ERROR` retains existing custody,
 schedules a bounded recheck, and does not spend remediation budget. A persisted
 old PASS cannot authorize a changed task, resumed attempt, or later mutation
-claim.
+claim. A denial observed while attempting post-completion reporting fences that
+mutation and appends audit evidence; it never rewrites immutable `DONE` or
+`CANCELLED` task state.
+
+Mutation receipts also enforce a package-owned scope map: `merge` requires
+`pull-request`, `tag-release` requires `release`, `deploy` requires `deploy`, and
+`canonical-task` requires `issue-lifecycle`. Reporting is bounded lifecycle
+bookkeeping available to every otherwise-authorized task.
 
 ## Primary context and capability parity
 
@@ -142,25 +149,33 @@ host paths.
 
 Worker Pi launches keep ambient discovery disabled and explicitly load the same
 package-owned/configured extensions, effective skills, and complete selected
-tool names as the primary session. The ops policy is the sole intentional
-additive context delta. Before provider work, a package-owned extension reports
-the effective context-file, extension, skill, and tool metadata through a
-parent/child acknowledgement handshake. Any missing or mismatched digest fails
-closed; persisted evidence contains versioned results and hashes only.
+tool names as the primary session. Generated private wrappers give even
+handler-only extensions a deterministic one-way identity. The ops policy is the
+sole intentional additive context delta. Before provider work, a package-owned
+extension compares the effective system prompt with its session baseline and
+reports structured context-file, extension, skill, and tool metadata through a
+parent/child acknowledgement handshake. The parent recomputes every prepared
+digest before acknowledging. Any missing, internally inconsistent, or
+mismatched evidence fails closed; persisted evidence contains versioned results
+and hashes only.
 
 ## Quota admission and waits
 
 Initial admission evaluates every active window in the existing server-reported
 Codex quota snapshot. Each window must have at least 50 percent remaining and
-usage no more than elapsed-window percentage plus 10 points. Missing, stale,
+usage no more than the window percentage elapsed at `sampledAt` plus 10 points. Missing, stale,
 contradictory, durationless, resetless, unreadable, or malformed telemetry is a
 typed not-admitted result. Admission runs before an unheld task is claimed.
 
 After custody, quota never displaces the task or increments its terminal
-infrastructure-failure count. A real quota response records the attempt's
-authoritative reset timestamp and creates a durable host-native wait. At fresh
-headroom or the reset deadline, one bounded smoke probe uses the exact worker
-model, thinking level, context, extensions, skills, and tools. Success resumes;
+infrastructure-failure count. A real quota response selects the reset named by
+the server's active-limit header (`primary` for five-hour, `secondary` for
+weekly); an unnamed multi-window response is invalid rather than guessed. It
+records that authoritative reset timestamp and creates a durable host-native
+wait. At fresh headroom or the reset deadline, one bounded smoke probe uses the
+exact worker model, thinking level, context, extensions, skills, and tools. The
+probe runs in a detached owned process group and its parity gate blocks every
+tool call. Success resumes;
 another quota response refreshes the reset; invalid telemetry and probe
 infrastructure errors remain distinct bounded outcomes. No LLM is parked and no
 blind polling or guessed reset deadline is used.
@@ -180,7 +195,9 @@ failure, and timeout retry verification without consuming remediation. The
 aggregate subject hash includes the current task, checkpoint, and authorization
 state, so stale or partial PASS evidence is discarded. Only a fresh aggregate
 PASS recorded atomically with the terminal transition can produce `DONE` and
-release custody. This phase intentionally registers no production components.
+release custody. Repeated diagnostic failures remain retryable with custody
+held; only product evidence can exhaust remediation and block the task. This
+phase intentionally registers no production components.
 
 ## Custody, checkpoints, and receipts
 

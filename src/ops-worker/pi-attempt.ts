@@ -33,6 +33,7 @@ import {
 import {
   buildPiSpawnEnv,
   DEFAULT_PI_MODEL,
+  type PiSpawnRuntimeEnvOptions,
 } from "../pi-rpc-protocol.js";
 import {
   CODEX_QUOTA_ATTEMPT_FILE_ENV,
@@ -42,6 +43,7 @@ import {
   OPS_WORKER_PARITY_ACK_PATH_ENV,
   OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
   OPS_WORKER_PARITY_REPORT_PATH_ENV,
+  OPS_WORKER_QUOTA_PROBE_ENV,
   type OpsWorkerParityAttestationReport,
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
@@ -154,7 +156,10 @@ type SpawnProcess = (
 export interface OpsWorkerPiAttemptDependencies {
   spawnProcess?: SpawnProcess;
   resolveInvocation?: (args: readonly string[]) => PiInvocation;
-  buildEnv?: (agentWorkspaceRoot: string) => Record<string, string>;
+  buildEnv?: (
+    agentWorkspaceRoot: string,
+    runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+  ) => Record<string, string>;
   readProcessIdentity?: (pid: number) => OpsWorkerProcessInspection;
   inspectActiveRun?: (run: OpsWorkerActiveRun) => OpsWorkerProcessInspection;
   inspectProcessGroup?: (processGroupId: number) => OpsWorkerProcessGroupInspection;
@@ -294,7 +299,7 @@ export class OpsWorkerPiAttemptRunner {
   private readonly quotaProbeTimeoutMs: number;
   private readonly spawnProcess: SpawnProcess;
   private readonly resolveInvocation: (args: readonly string[]) => PiInvocation;
-  private readonly buildEnv: (agentWorkspaceRoot: string) => Record<string, string>;
+  private readonly buildEnv: NonNullable<OpsWorkerPiAttemptDependencies["buildEnv"]>;
   private readonly readProcessIdentity: (pid: number) => OpsWorkerProcessInspection;
   private readonly inspectActiveRun: (run: OpsWorkerActiveRun) => OpsWorkerProcessInspection;
   private readonly inspectProcessGroup: (
@@ -524,6 +529,7 @@ export class OpsWorkerPiAttemptRunner {
     const prompt = buildOpsWorkerAttemptPrompt(task);
     const context = this.assembleContext(this.primaryContextAgent, {
       artifactWorkspaceCwd: this.workspaceCwd,
+      strict: true,
     });
     if (context === null) {
       throw new Error("Canonical primary context assembly returned no context; refusing a smaller fallback");
@@ -542,7 +548,7 @@ export class OpsWorkerPiAttemptRunner {
       this.thinking,
       context,
       this.primaryResources,
-      parityLaunch.parityExtensionPath,
+      parityLaunch.extensionPaths,
     );
     const invocation = this.resolveInvocation(args);
     const attemptId = `attempt-${this.randomId()}`;
@@ -562,7 +568,9 @@ export class OpsWorkerPiAttemptRunner {
     this.launchFaultInjector?.("after-launch-intent-persisted");
     let child: ChildProcess;
     try {
-      const env = this.buildEnv(this.primaryContextAgent.workspaceCwd);
+      const env = this.buildEnv(this.workspaceCwd, {
+        askCallerAgentId: this.primaryContextAgent.id,
+      });
       env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
       env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = parityLaunch.expectedPath;
       env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = parityLaunch.reportPath;
@@ -1164,6 +1172,7 @@ export class OpsWorkerPiAttemptRunner {
     if (!isOpsWorkerQuotaWait(task)) return task;
     const context = this.assembleContext(this.primaryContextAgent, {
       artifactWorkspaceCwd: this.workspaceCwd,
+      strict: true,
     });
     if (context === null) {
       return this.supervisor.recordQuotaProbeError(
@@ -1184,7 +1193,7 @@ export class OpsWorkerPiAttemptRunner {
       this.thinking,
       context,
       this.primaryResources,
-      parityLaunch.parityExtensionPath,
+      parityLaunch.extensionPaths,
     );
     const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
     safeUnlink(attemptFile);
@@ -1231,24 +1240,34 @@ export class OpsWorkerPiAttemptRunner {
     request: OpsWorkerQuotaProbeRequest,
   ): Promise<OpsWorkerQuotaProbeResult> {
     const invocation = this.resolveInvocation(request.args);
-    const env = this.buildEnv(this.primaryContextAgent.workspaceCwd);
+    const env = this.buildEnv(this.workspaceCwd, {
+      askCallerAgentId: this.primaryContextAgent.id,
+    });
     env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = request.parityLaunch.expectedPath;
     env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = request.parityLaunch.reportPath;
     env[OPS_WORKER_PARITY_ACK_PATH_ENV] = request.parityLaunch.ackPath;
     env[CODEX_QUOTA_ATTEMPT_FILE_ENV] = request.attemptFile;
+    env[OPS_WORKER_QUOTA_PROBE_ENV] = "1";
     let child: ChildProcess;
     try {
       child = this.spawnProcess(invocation.command, invocation.args, {
         cwd: this.workspaceCwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
-        detached: false,
+        detached: true,
         shell: false,
       });
     } catch (error) {
       return {
         status: "INFRASTRUCTURE_ERROR",
         summary: `Exact quota smoke probe spawn failed: ${errorMessage(error)}`,
+      };
+    }
+    if (!Number.isSafeInteger(child.pid) || (child.pid ?? 0) < 1) {
+      child.kill("SIGKILL");
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: "Exact quota smoke probe did not expose a detached process-group leader PID",
       };
     }
     const stdout = new BoundedStreamCapture(OPS_WORKER_PI_LIMITS.maxCapturedStreamBytes);
@@ -1281,7 +1300,7 @@ export class OpsWorkerPiAttemptRunner {
     try {
       parity = await this.awaitParityReport(request.parityLaunch, () => exited);
       if (parity?.status !== "PASS") {
-        await stopQuotaProbeChild(child, exitPromise, this.sleep);
+        await this.cleanupQuotaProbeProcessGroup(child.pid as number, exitPromise, true);
         return {
           status: "INFRASTRUCTURE_ERROR",
           summary: parity === null
@@ -1291,7 +1310,7 @@ export class OpsWorkerPiAttemptRunner {
       }
       acknowledgeOpsWorkerParityPass(request.parityLaunch);
     } catch (error) {
-      await stopQuotaProbeChild(child, exitPromise, this.sleep);
+      await this.cleanupQuotaProbeProcessGroup(child.pid as number, exitPromise, true);
       return {
         status: "INFRASTRUCTURE_ERROR",
         summary: `Exact quota smoke probe parity failed: ${errorMessage(error)}`,
@@ -1313,15 +1332,36 @@ export class OpsWorkerPiAttemptRunner {
     if (timeout) clearTimeout(timeout);
     shutdownTrigger.close();
     if (trigger.kind !== "EXIT") {
-      await stopQuotaProbeChild(child, exitPromise, this.sleep);
+      const cleanup = await this.cleanupQuotaProbeProcessGroup(
+        child.pid as number,
+        exitPromise,
+        true,
+      );
       return {
         status: "INFRASTRUCTURE_ERROR",
-        summary: trigger.kind === "SHUTDOWN"
+        summary: cleanup.status !== "GONE"
+          ? `Exact quota smoke probe process group could not be proven gone: ${
+            cleanup.status === "AMBIGUOUS" ? cleanup.summary : "still present"
+          }`
+          : trigger.kind === "SHUTDOWN"
           ? "Exact quota smoke probe was interrupted by worker shutdown"
           : "Exact quota smoke probe exceeded its bounded deadline",
       };
     }
     const { exit } = trigger;
+    const cleanup = await this.cleanupQuotaProbeProcessGroup(
+      child.pid as number,
+      exitPromise,
+      false,
+    );
+    if (cleanup.status !== "GONE") {
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: `Exact quota smoke probe descendants could not be proven gone: ${
+          cleanup.status === "AMBIGUOUS" ? cleanup.summary : "process group still present"
+        }`,
+      };
+    }
     const read = new CodexQuotaFileReader(request.attemptFile).read();
     safeUnlink(request.attemptFile);
     if (read.status !== "OK") {
@@ -1340,6 +1380,33 @@ export class OpsWorkerPiAttemptRunner {
         ? "Exact quota smoke probe unexpectedly reported session corruption"
         : `Exact quota smoke probe failed: ${infrastructureSummary(classification, exit)}`,
     };
+  }
+
+  private async cleanupQuotaProbeProcessGroup(
+    processGroupId: number,
+    exitPromise: Promise<OpsWorkerPiExit>,
+    stopLeader: boolean,
+  ): Promise<OpsWorkerProcessGroupInspection> {
+    const signal = (value: NodeJS.Signals): void => {
+      try {
+        this.signalProcessGroup(processGroupId, value);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    };
+    if (stopLeader) {
+      signal("SIGTERM");
+      await boundedExitWait(exitPromise, this.sleep);
+    }
+    let inspection = await this.awaitProcessGroupGone(processGroupId);
+    if (inspection.status !== "PRESENT") return inspection;
+    signal(stopLeader ? "SIGKILL" : "SIGTERM");
+    await boundedExitWait(exitPromise, this.sleep);
+    inspection = await this.awaitProcessGroupGone(processGroupId);
+    if (inspection.status !== "PRESENT" || stopLeader) return inspection;
+    signal("SIGKILL");
+    await boundedExitWait(exitPromise, this.sleep);
+    return this.awaitProcessGroupGone(processGroupId);
   }
 
   private prepareSessionDirectory(task: OpsWorkerTask): string {
@@ -1382,7 +1449,7 @@ export function buildPiAttemptArgs(
   thinking: string,
   context: PiContextArtifacts,
   resources: PiPrimaryResourceContract,
-  parityExtensionPath: string,
+  extensionPaths: readonly string[],
 ): string[] {
   if (!task.session.sessionId) {
     throw new Error("Standard Pi session id must be prepared before launch");
@@ -1396,25 +1463,7 @@ export function buildPiAttemptArgs(
     "--no-extensions",
     "--no-skills",
   ];
-  if (context.systemPromptPath) {
-    args.push("--system-prompt", context.systemPromptPath);
-  }
-  args.push(
-    "--append-system-prompt",
-    context.appendSystemPromptPath,
-    "--no-context-files",
-    "--append-system-prompt",
-    OPS_WORKER_SYSTEM_POLICY,
-  );
-  for (const extensionPath of [...resources.extensionPaths, parityExtensionPath]) {
-    args.push("--extension", extensionPath);
-  }
-  for (const skillPath of resources.skillPaths) args.push("--skill", skillPath);
-  args.push(
-    "--tools", resources.toolNames.join(","),
-    "--model", model,
-    "--thinking", thinking,
-  );
+  args.push(...buildPiParityResourceArgs(model, thinking, context, resources, extensionPaths));
   return args;
 }
 
@@ -1423,7 +1472,7 @@ export function buildPiQuotaProbeArgs(
   thinking: string,
   context: PiContextArtifacts,
   resources: PiPrimaryResourceContract,
-  parityExtensionPath: string,
+  extensionPaths: readonly string[],
 ): string[] {
   const args = [
     "-p",
@@ -1431,6 +1480,18 @@ export function buildPiQuotaProbeArgs(
     "--no-extensions",
     "--no-skills",
   ];
+  args.push(...buildPiParityResourceArgs(model, thinking, context, resources, extensionPaths));
+  return args;
+}
+
+function buildPiParityResourceArgs(
+  model: string,
+  thinking: string,
+  context: PiContextArtifacts,
+  resources: PiPrimaryResourceContract,
+  extensionPaths: readonly string[],
+): string[] {
+  const args: string[] = [];
   if (context.systemPromptPath) {
     args.push("--system-prompt", context.systemPromptPath);
   }
@@ -1441,7 +1502,7 @@ export function buildPiQuotaProbeArgs(
     "--append-system-prompt",
     OPS_WORKER_SYSTEM_POLICY,
   );
-  for (const extensionPath of [...resources.extensionPaths, parityExtensionPath]) {
+  for (const extensionPath of extensionPaths) {
     args.push("--extension", extensionPath);
   }
   for (const skillPath of resources.skillPaths) args.push("--skill", skillPath);
@@ -2316,17 +2377,6 @@ async function boundedExitWait(
     exit,
     sleep(1_000).then(() => null),
   ]);
-}
-
-async function stopQuotaProbeChild(
-  child: ChildProcess,
-  exit: Promise<OpsWorkerPiExit>,
-  sleep: (milliseconds: number) => Promise<void>,
-): Promise<void> {
-  child.kill("SIGTERM");
-  if (await boundedExitWait(exit, sleep)) return;
-  child.kill("SIGKILL");
-  await boundedExitWait(exit, sleep);
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
