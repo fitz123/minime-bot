@@ -1,19 +1,24 @@
-# Ops-worker foundation
+# Ops-worker policy and foundation
 
 The ops worker is an opt-in, inactive-by-default core. Installing or starting
 `minime-bot` does not start it. The foundation provides durable task snapshots,
 one single-instance supervisor, ordinary Pi session continuation, deterministic
-done checks, a strict local CLI, and read-only loopback health/status. Each
-attempt receives the agent workspace's assembled context bundle plus the fixed
-ops-worker policy; Pi's flat context loading is disabled only after assembly
-succeeds, avoiding both missing rules and duplicate context. The task prompt is
-written to Pi over stdin rather than exposed in the child process arguments.
+composite verification, continuous authorization checks, reset-aware quota
+waits, a strict local CLI, and read-only loopback health/status. Each attempt
+assembles the canonical primary agent's exact accepted context in a trusted
+source workspace, adds only the fixed ops-worker policy, and executes in a
+separate worker workspace. Pi's flat context loading is disabled only after
+assembly succeeds, avoiding both missing rules and duplicate context. The task
+prompt is written to Pi over stdin rather than exposed in child arguments.
 
 The installed binary registers no task templates, authorization profiles,
-or done checks. Submission and start define the adapter-facing contract but
-cannot execute production work until trusted package code registers all three.
-Each trusted authorization profile fixes both its scopes and Pi tool allowlist;
-task input cannot select commands, executables, URLs, models, tools, or scopes.
+authorization verifiers, composite verifier components, quota reader, primary
+Pi resource contract, listener, or production configuration. Submission and
+start define the adapter-facing contract but cannot execute production work
+until trusted package code supplies the complete dependency set. Authorization
+profiles fix declarative mutation scopes; they do not narrow Pi's primary tool
+surface. Task input cannot select commands, executables, URLs, models, tools,
+resource paths, verifier components, actors, or scopes.
 
 ## Commands
 
@@ -56,6 +61,12 @@ Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
 invocation, model/tool flags, authorization scope, remediation budget, task
 priority, and source kind are not task-supplied CLI options.
 
+A trusted embedding of `worker start` must supply the canonical primary context
+agent, explicit primary extension/skill/tool contract, authorization verifiers
+for every registered source kind, a matching composite verifier registry, and a
+quota admission gate. Missing dependencies fail before the supervisor can claim
+work.
+
 `worker start` also accepts `--host` (only `127.0.0.1` or `::1`) and `--port`
 (an integer from 0 through 65535). Omitted done-check parameters default to an
 empty object. Every command except `start` accepts `--json` for machine-readable
@@ -67,7 +78,7 @@ Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An
 identical replay returns the existing task, including after completion, without
 adding a snapshot or audit transition. Reusing that key with a different
-canonical submission fails closed. Each v2 snapshot retains a store-owned
+canonical submission fails closed. Each v4 snapshot retains a store-owned
 immutable submission fingerprint, so later runtime evidence updates or bounded
 evidence eviction cannot make a conflicting delivery look identical. The
 correlation key has a different role:
@@ -87,15 +98,89 @@ process group.
 
 ## Schema and migration
 
-Schema v2 is the only write format. Exact schema v1 snapshots remain readable
-through a deterministic pure migration. Reading, listing, or inspecting v1 does
-not rewrite it; its first successful store mutation writes one canonical v2
-snapshot. Unknown fields and future schema versions are rejected.
+Schema v4 is the only write format. Exact schema v1, v2, and v3 snapshots remain
+readable through deterministic pure migrations. Reading, listing, or inspecting
+an older snapshot does not rewrite it; its first successful store mutation
+writes one canonical v4 snapshot. Unknown fields, fields from a later schema,
+and future schema versions are rejected.
+
+V3 added one fixed authorization-verification record: validator identity and
+version, checked authorization snapshot hash, checked time, closed status, and
+bounded redacted evidence hash/summary. V4 adds the immutable composite verifier
+identity/version/contract hash to the lifecycle manifest and fresh aggregate
+component evidence to the task. Older snapshots migrate with these records
+unset, never with an implied PASS.
 
 The v1 migration derives a task-unique legacy delivery key and non-shareable
 legacy host resource. It also derives custody conservatively: active, checking,
 resumable, and ambiguously orphaned work remains held, while queued work is
 unclaimed and genuinely process-free terminal or blocked work is released.
+
+## Continuous authorization
+
+Authorization is revalidated atomically before initial custody, before every
+resumed Pi attempt, and before a fixed external mutation receipt can be claimed.
+The registered verifier, repository/principal policy, and canonical-task
+resolver come only from trusted package code. Task content and remote comments
+are evidence, not authority.
+
+The closed results are `PASS`, `DRIFT`, `QUERY_ERROR`, and `INVALID_CLAIM`.
+`DRIFT` or `INVALID_CLAIM` blocks only after process absence is proven and
+releases custody with durable evidence. `QUERY_ERROR` retains existing custody,
+schedules a bounded recheck, and does not spend remediation budget. A persisted
+old PASS cannot authorize a changed task, resumed attempt, or later mutation
+claim.
+
+## Primary context and capability parity
+
+The execution workspace must be a distinct, non-overlapping canonical directory
+from the primary context workspace. Context assembly fails closed on unsafe
+paths, symlinks, or missing required material and never falls back to a smaller
+bundle. Its redacted manifest hashes the accepted source identities, exact
+assembled bundle bytes, and persona bytes without persisting their contents or
+host paths.
+
+Worker Pi launches keep ambient discovery disabled and explicitly load the same
+package-owned/configured extensions, effective skills, and complete selected
+tool names as the primary session. The ops policy is the sole intentional
+additive context delta. Before provider work, a package-owned extension reports
+the effective context-file, extension, skill, and tool metadata through a
+parent/child acknowledgement handshake. Any missing or mismatched digest fails
+closed; persisted evidence contains versioned results and hashes only.
+
+## Quota admission and waits
+
+Initial admission evaluates every active window in the existing server-reported
+Codex quota snapshot. Each window must have at least 50 percent remaining and
+usage no more than elapsed-window percentage plus 10 points. Missing, stale,
+contradictory, durationless, resetless, unreadable, or malformed telemetry is a
+typed not-admitted result. Admission runs before an unheld task is claimed.
+
+After custody, quota never displaces the task or increments its terminal
+infrastructure-failure count. A real quota response records the attempt's
+authoritative reset timestamp and creates a durable host-native wait. At fresh
+headroom or the reset deadline, one bounded smoke probe uses the exact worker
+model, thinking level, context, extensions, skills, and tools. Success resumes;
+another quota response refreshes the reset; invalid telemetry and probe
+infrastructure errors remain distinct bounded outcomes. No LLM is parked and no
+blind polling or guessed reset deadline is used.
+
+## Typed composite verification
+
+Trusted package code registers an immutable composite identity, version,
+contract hash, required components, convergence kind, and timeout. Task data may
+only select a registered check name and its bounded canonical parameters; it
+cannot select components, commands, URLs, or executable selectors.
+
+Component and aggregate outcomes are `PASS`, `NOT_READY`, `PRODUCT_FAILURE`,
+`DEFER`, `VERIFIER_INVALID`, `QUERY_ERROR`, and `TIMEOUT`. Every required
+component must PASS for aggregate PASS. `DEFER` is reserved for passive external
+convergence. Product work resumes remediation; verifier invalidity, query
+failure, and timeout retry verification without consuming remediation. The
+aggregate subject hash includes the current task, checkpoint, and authorization
+state, so stale or partial PASS evidence is discarded. Only a fresh aggregate
+PASS recorded atomically with the terminal transition can produce `DONE` and
+release custody. This phase intentionally registers no production components.
 
 ## Custody, checkpoints, and receipts
 
@@ -152,8 +237,12 @@ are accepted bind addresses. The surface is read-only:
 
 - `GET /healthz` returns process health.
 - `GET /status` returns bounded task-state counts and the number of active
-  process groups. It exposes at most one custody owner as task id and state and
-  never includes objectives, lifecycle evidence, checkpoints, or receipts.
+  process groups. It exposes at most one custody owner as task id and state. Its
+  `policy` section contains only authorization/composite contract hashes and
+  counts, current typed quota metadata/evidence hash, and primary resource
+  digests for parity. It never includes objectives, canonical task bodies,
+  context contents, personas, resource paths, lifecycle evidence, checkpoints,
+  receipts, quota summaries, or credentials.
 
 There is no HTTP task intake, retry, cancellation, command, or arbitrary proxy
 route in this foundation. CLI submission and lifecycle evidence recording write
@@ -162,7 +251,8 @@ through the strict local task store.
 ## Deferred work
 
 Alertmanager intake, authenticated HTTP intake, Telegram reporting, report
-transport retries, production telemetry, production task templates and done
-checks, the full fault lab, deployment configuration, launch activation,
-release workflows, and production drills are later phases. Existing recovery
+transport retries, production task templates and composite components, the full
+fault lab, deployment configuration, launch activation, release workflows, and
+production drills are later phases. Install, build, pack, help, and workspace
+validation do not start a worker process or listener. Existing recovery
 components remain in place during coexistence.

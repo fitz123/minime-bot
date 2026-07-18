@@ -33,9 +33,11 @@ import { OpsWorkerTaskStore } from "./task-store.js";
 import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
+  inspectOpsWorkerPolicy,
   summarizeOpsWorkerTasks,
   startOpsWorkerStatusServer,
 } from "./status-server.js";
+import type { OpsWorkerQuotaAdmissionGate } from "./quota.js";
 import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
@@ -79,6 +81,7 @@ export interface OpsWorkerCliDependencies {
   primaryContextAgent?: AgentConfig;
   primaryPiResources?: PiPrimaryResourceContract;
   authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+  quotaAdmission?: OpsWorkerQuotaAdmissionGate;
   abortSignal?: AbortSignal;
   schedulerPollMs?: number;
 }
@@ -409,7 +412,45 @@ function createSupervisor(
     reconcileActiveRun: deps.reconcileActiveRun
       ?? createOpsWorkerPiStartupReconciler(),
     authorizationVerifiers: deps.authorizationVerifiers,
+    quotaAdmission: deps.quotaAdmission,
   });
+}
+
+function inspectPolicy(deps: ReturnType<typeof dependencies>) {
+  return inspectOpsWorkerPolicy({
+    authorizationVerifiers: deps.authorizationVerifiers,
+    doneChecks: deps.doneChecks,
+    quotaAdmission: deps.quotaAdmission,
+    primaryPiResources: deps.primaryPiResources,
+  });
+}
+
+function assertStartPolicyDependencies(
+  deps: ReturnType<typeof dependencies>,
+): asserts deps is ReturnType<typeof dependencies> & {
+  primaryContextAgent: AgentConfig;
+  primaryPiResources: PiPrimaryResourceContract;
+  quotaAdmission: OpsWorkerQuotaAdmissionGate;
+} {
+  if (!deps.primaryContextAgent || !deps.primaryPiResources || !deps.quotaAdmission) {
+    throw new TypeError(
+      "Ops-worker start requires trusted primaryContextAgent, primaryPiResources, and quotaAdmission dependencies",
+    );
+  }
+  const sourceKinds = new Set([
+    ...Object.values(deps.taskRegistry.templates)
+      .flatMap((template) => template.sourceKinds),
+    ...Object.values(deps.taskRegistry.authorizationProfiles)
+      .flatMap((profile) => profile.sourceKinds),
+  ]);
+  for (const sourceKind of sourceKinds) {
+    if (!deps.authorizationVerifiers?.[sourceKind]) {
+      throw new TypeError(
+        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
+      );
+    }
+  }
+  inspectPolicy(deps);
 }
 
 function createTask(
@@ -607,11 +648,7 @@ async function runStart(
 ): Promise<number> {
   const directory = stateDirectory(parsed, cliOptions.cwd);
   const workspace = resolveCliPath(requiredValue(parsed, "agent-workspace"), cliOptions.cwd);
-  if (!deps.primaryContextAgent || !deps.primaryPiResources) {
-    throw new TypeError(
-      "Ops-worker start requires trusted primaryContextAgent and primaryPiResources dependencies",
-    );
-  }
+  assertStartPolicyDependencies(deps);
   const host = parsed.values.get("host") ?? DEFAULT_OPS_WORKER_STATUS_HOST;
   const port = parsePort(parsed.values.get("port"));
   const store = createStore(directory, deps);
@@ -622,7 +659,12 @@ async function runStart(
   try {
     await supervisor.start();
     started = true;
-    statusServer = await startOpsWorkerStatusServer({ supervisor, host, port });
+    statusServer = await startOpsWorkerStatusServer({
+      supervisor,
+      host,
+      port,
+      inspectPolicy: () => inspectPolicy(deps),
+    });
     processAbort = deps.abortSignal ? undefined : installProcessAbortSignal();
     const signal = deps.abortSignal ?? processAbort?.signal;
     if (!signal) throw new Error("Ops-worker abort signal was not initialized");
@@ -677,7 +719,10 @@ export async function runOpsWorkerCliCommand(
     const store = createStore(stateDirectory(parsed, cliOptions.cwd), deps);
     const json = parsed.flags.has("json");
     if (action === "status") {
-      const summary = summarizeOpsWorkerTasks(store.list());
+      const summary = {
+        ...summarizeOpsWorkerTasks(store.list()),
+        policy: inspectPolicy(deps),
+      };
       if (json) writeJson(cliOptions.stdout, summary);
       else {
         writeLine(cliOptions.stdout, `Tasks: ${summary.totalTasks}`);

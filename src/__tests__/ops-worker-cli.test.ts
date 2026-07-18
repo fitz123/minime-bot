@@ -18,6 +18,10 @@ import { runCliAsync } from "../cli.js";
 import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
+import type {
+  OpsWorkerQuotaAdmissionDecision,
+  OpsWorkerQuotaAdmissionGate,
+} from "../ops-worker/quota.js";
 import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
 import { OpsWorkerTaskStore } from "../ops-worker/task-store.js";
 import type {
@@ -109,6 +113,21 @@ const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
 const fixtureAuthorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry = {
   "operator-cli": fixtureAuthorizationVerifier,
 };
+const fixtureQuotaAdmissionDecision: OpsWorkerQuotaAdmissionDecision = {
+  version: 1,
+  status: "ADMITTED",
+  reason: "HEADROOM",
+  observedAt: "2026-07-18T12:00:00.000Z",
+  sampledAt: "2026-07-18T11:59:00.000Z",
+  activeWindows: ["5h", "week"],
+  nextResetAt: null,
+  nextProbeAt: null,
+  evidenceHash: `sha256:${"c".repeat(64)}`,
+  summary: "Fixture quota has sufficient headroom.",
+};
+const fixtureQuotaAdmission: OpsWorkerQuotaAdmissionGate = {
+  check: () => structuredClone(fixtureQuotaAdmissionDecision),
+};
 
 interface CliResult {
   code: number;
@@ -160,6 +179,7 @@ function dependencies(
     processStartToken: "ops-worker-cli-fixture-start",
     randomId: () => "fixture-task-id",
     authorizationVerifiers: fixtureAuthorizationVerifiers,
+    quotaAdmission: fixtureQuotaAdmission,
     primaryContextAgent: CLI_PRIMARY_CONTEXT_AGENT,
     primaryPiResources: CLI_PRIMARY_RESOURCES,
     ...overrides,
@@ -205,6 +225,23 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.match(result.stdout, /worker receipt-query --state-dir <path>/);
     assert.match(result.stdout, /inactive unless worker start is invoked/);
     assert.equal(result.stderr, "");
+
+    const inactiveStatus = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--json",
+    ], fixture.root);
+    assert.equal(inactiveStatus.code, 0, inactiveStatus.stderr);
+    const policy = (JSON.parse(inactiveStatus.stdout) as {
+      policy: Record<string, Record<string, unknown>>;
+    }).policy;
+    assert.deepEqual(policy.authorization.configuredSources, []);
+    assert.equal(policy.authorization.verifierCount, 0);
+    assert.equal(policy.verification.verifierCount, 0);
+    assert.deepEqual(policy.quota, { configured: false });
+    assert.deepEqual(policy.parity, { configured: false });
   });
 
   it("submits and inspects only tasks selected from trusted registries", async (t) => {
@@ -244,9 +281,10 @@ describe("ops worker CLI and inactive runtime", () => {
       "--json",
     ], fixture.root, deps);
     assert.equal(status.code, 0, status.stderr);
-    assert.deepEqual(
-      JSON.parse(status.stdout),
-      {
+    const statusValue = JSON.parse(status.stdout) as Record<string, unknown>;
+    const policy = statusValue.policy as Record<string, Record<string, unknown>>;
+    delete statusValue.policy;
+    assert.deepEqual(statusValue, {
         service: "minime-ops-worker",
         schemaVersion: 4,
         totalTasks: 1,
@@ -261,8 +299,19 @@ describe("ops worker CLI and inactive runtime", () => {
           DONE: 0,
           CANCELLED: 0,
         },
-      },
-    );
+      });
+    assert.deepEqual(policy.authorization.configuredSources, ["operator-cli"]);
+    assert.equal(policy.authorization.verifierCount, 1);
+    assert.match(String(policy.authorization.contractsHash), /^sha256:[a-f0-9]{64}$/);
+    assert.equal(policy.verification.verifierCount, 1);
+    assert.match(String(policy.verification.contractsHash), /^sha256:[a-f0-9]{64}$/);
+    assert.equal(policy.quota.status, "ADMITTED");
+    assert.equal(policy.quota.reason, "HEADROOM");
+    assert.equal(policy.quota.evidenceHash, fixtureQuotaAdmissionDecision.evidenceHash);
+    assert.equal(policy.parity.resourcesDigest, CLI_PRIMARY_RESOURCES.digest);
+    assert.equal(policy.parity.extensionsDigest, CLI_PRIMARY_RESOURCES.extensionsDigest);
+    assert.equal(policy.parity.skillsDigest, CLI_PRIMARY_RESOURCES.skillsDigest);
+    assert.equal(policy.parity.toolsDigest, CLI_PRIMARY_RESOURCES.toolsDigest);
 
     const inspected = await runWorkerCli([
       "worker",
@@ -755,6 +804,87 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(completed?.lastOutcome?.result, "PASS");
   });
 
+  it("requires and applies the strict quota dependency before a CLI-started claim", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const missing = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], fixture.root, dependencies(contracts, { quotaAdmission: undefined }));
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /quotaAdmission/);
+
+    const missingVerifier = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], fixture.root, dependencies(contracts, { authorizationVerifiers: {} }));
+    assert.equal(missingVerifier.code, 1);
+    assert.match(missingVerifier.stderr, /authorization verifier for operator-cli/);
+
+    let piLaunched = false;
+    const notAdmitted: OpsWorkerQuotaAdmissionGate = {
+      check: () => ({
+        ...structuredClone(fixtureQuotaAdmissionDecision),
+        status: "NOT_ADMITTED",
+        reason: "LOW_REMAINING",
+        nextResetAt: "2026-07-18T15:00:00.000Z",
+        nextProbeAt: "2026-07-18T15:00:00.000Z",
+        summary: "Fixture quota is below admission headroom.",
+      }),
+    };
+    const deps = dependencies(contracts, {
+      quotaAdmission: notAdmitted,
+      piAttemptDependencies: {
+        resolveInvocation: () => {
+          piLaunched = true;
+          throw new Error("Pi must not launch without quota admission");
+        },
+      },
+    });
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(submitted.code, 0, submitted.stderr);
+    const taskId = (JSON.parse(submitted.stdout) as OpsWorkerTask).id;
+
+    const started = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], fixture.root, deps);
+    assert.equal(started.code, 0, started.stderr);
+    assert.equal(piLaunched, false);
+    assert.match(started.stdout, new RegExp(`Processed ${taskId}: QUEUED`));
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+    });
+    const waiting = store.get(taskId);
+    assert.equal(waiting?.custody.status, "UNCLAIMED");
+    assert.equal(waiting?.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+  });
+
   it("stops active Pi work before worker shutdown releases the supervisor", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();
@@ -835,6 +965,31 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.match(result.stderr, /registries must match exactly/);
   });
 
+  it("fails closed on malformed policy status without exposing quota summaries", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const privateSummary = "credential=must-not-appear";
+    const result = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--json",
+    ], fixture.root, dependencies(contracts, {
+      quotaAdmission: {
+        check: () => ({
+          ...structuredClone(fixtureQuotaAdmissionDecision),
+          evidenceHash: "invalid-evidence-hash",
+          summary: privateSummary,
+        }),
+      },
+    }));
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /invalid bounded status evidence/);
+    assert.equal(`${result.stdout}${result.stderr}`.includes(privateSummary), false);
+  });
+
   it("serves loopback health/status only and exposes no HTTP task intake", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();
@@ -885,7 +1040,13 @@ describe("ops worker CLI and inactive runtime", () => {
     const statusValue = await status.json() as Record<string, unknown>;
     assert.equal(statusValue.totalTasks, 0);
     assert.equal(statusValue.custodyOwner, null);
+    const policy = statusValue.policy as Record<string, Record<string, unknown>>;
+    assert.equal(policy.quota.status, "ADMITTED");
+    assert.equal(Object.hasOwn(policy.quota, "summary"), false);
+    assert.equal(policy.parity.resourcesDigest, CLI_PRIMARY_RESOURCES.digest);
     assert.ok(!Object.hasOwn(statusValue, "evidence"));
+    assert.equal(JSON.stringify(statusValue).includes(CLI_PRIMARY_CONTEXT_AGENT.workspaceCwd), false);
+    assert.equal(JSON.stringify(statusValue).includes(CLI_PRIMARY_CONTEXT_AGENT.systemPrompt), false);
 
     const intake = await fetch(`${base}/submit`, {
       method: "POST",

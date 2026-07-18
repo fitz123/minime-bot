@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -5,14 +6,27 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { OpsWorkerAuthorizationVerifierRegistry } from "./authorization.js";
+import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
+import {
+  OPS_WORKER_QUOTA_POLICY_VERSION,
+  type OpsWorkerQuotaAdmissionDecision,
+  type OpsWorkerQuotaAdmissionGate,
+} from "./quota.js";
+import {
+  validatePiPrimaryResourceContract,
+  type PiPrimaryResourceContract,
+} from "../pi-primary-resources.js";
 import {
   isOpsWorkerUnresolvedOrphan,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
 import {
+  OPS_WORKER_SOURCE_KINDS,
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
   type OpsWorkerTask,
+  type OpsWorkerSourceKind,
   type OpsWorkerTaskState,
 } from "./types.js";
 
@@ -30,12 +44,46 @@ export interface OpsWorkerTaskSummary {
   states: Record<OpsWorkerTaskState, number>;
 }
 
+export interface OpsWorkerPolicySnapshot {
+  authorization: {
+    configuredSources: string[];
+    verifierCount: number;
+    contractsHash: string;
+  };
+  verification: {
+    verifierCount: number;
+    contractsHash: string;
+  };
+  quota: {
+    configured: false;
+  } | ({ configured: true } & Omit<OpsWorkerQuotaAdmissionDecision, "summary">);
+  parity: {
+    configured: false;
+  } | {
+    configured: true;
+    version: number;
+    resourcesDigest: string;
+    extensionsDigest: string;
+    skillsDigest: string;
+    toolsDigest: string;
+  };
+}
+
+export interface OpsWorkerPolicyDependencies {
+  authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+  doneChecks: OpsWorkerDoneCheckRegistry;
+  quotaAdmission?: OpsWorkerQuotaAdmissionGate;
+  primaryPiResources?: PiPrimaryResourceContract;
+}
+
 export interface OpsWorkerStatusSnapshot extends OpsWorkerTaskSummary {
   supervisorInstanceId: string;
+  policy: OpsWorkerPolicySnapshot;
 }
 
 export interface OpsWorkerStatusServerOptions {
   supervisor: OpsWorkerSupervisor;
+  inspectPolicy: () => OpsWorkerPolicySnapshot;
   host?: string;
   port?: number;
 }
@@ -62,6 +110,122 @@ function isLoopbackRemoteAddress(address: string | undefined): boolean {
   return address === "127.0.0.1"
     || address === "::1"
     || address === "::ffff:127.0.0.1";
+}
+
+const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const POLICY_IDENTITY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/+-]{0,254}[A-Za-z0-9])?$/;
+const QUOTA_REASONS = new Set([
+  "HEADROOM",
+  "MISSING",
+  "READ_ERROR",
+  "INVALID",
+  "STALE",
+  "CONTRADICTORY",
+  "DURATIONLESS",
+  "RESETLESS",
+  "LOW_REMAINING",
+  "PACE_EXCEEDED",
+]);
+
+function policyHash(value: unknown): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function assertPolicyIdentity(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !POLICY_IDENTITY_PATTERN.test(value)) {
+    throw new TypeError(`${label} must be a bounded package identity`);
+  }
+}
+
+function assertTimestamp(value: unknown, label: string): asserts value is string {
+  if (
+    typeof value !== "string"
+    || Number.isNaN(Date.parse(value))
+    || new Date(value).toISOString() !== value
+  ) throw new TypeError(`${label} must be a canonical UTC timestamp`);
+}
+
+function inspectQuotaPolicy(
+  admission: OpsWorkerQuotaAdmissionGate | undefined,
+): OpsWorkerPolicySnapshot["quota"] {
+  if (!admission) return { configured: false };
+  const decision = admission.check();
+  if (
+    decision.version !== OPS_WORKER_QUOTA_POLICY_VERSION
+    || !["ADMITTED", "NOT_ADMITTED"].includes(decision.status)
+    || !QUOTA_REASONS.has(decision.reason)
+    || !Array.isArray(decision.activeWindows)
+    || decision.activeWindows.length > 2
+    || new Set(decision.activeWindows).size !== decision.activeWindows.length
+    || decision.activeWindows.some((name) => name !== "5h" && name !== "week")
+    || !SHA256_PATTERN.test(decision.evidenceHash)
+  ) throw new TypeError("Quota admission returned invalid bounded status evidence");
+  assertTimestamp(decision.observedAt, "quota observedAt");
+  if (decision.sampledAt !== null) assertTimestamp(decision.sampledAt, "quota sampledAt");
+  if (decision.nextResetAt !== null) assertTimestamp(decision.nextResetAt, "quota nextResetAt");
+  if (decision.nextProbeAt !== null) assertTimestamp(decision.nextProbeAt, "quota nextProbeAt");
+  const { summary: _summary, ...bounded } = decision;
+  return { configured: true, ...bounded };
+}
+
+export function inspectOpsWorkerPolicy(
+  dependencies: OpsWorkerPolicyDependencies,
+): OpsWorkerPolicySnapshot {
+  const verifiers: OpsWorkerAuthorizationVerifierRegistry =
+    dependencies.authorizationVerifiers ?? Object.freeze({});
+  const configuredSources = Object.keys(verifiers).sort();
+  if (
+    configuredSources.length > OPS_WORKER_SOURCE_KINDS.length
+    || configuredSources.some((source) =>
+      !(OPS_WORKER_SOURCE_KINDS as readonly string[]).includes(source))
+  ) throw new TypeError("Authorization verifier registry contains an unknown source kind");
+  const authorizationContracts = configuredSources.map((source) => {
+    const verifier = verifiers[source as OpsWorkerSourceKind];
+    if (!verifier) throw new TypeError("Authorization verifier registry is sparse");
+    assertPolicyIdentity(verifier.identity, "authorization verifier identity");
+    assertPolicyIdentity(verifier.version, "authorization verifier version");
+    return { source, identity: verifier.identity, version: verifier.version };
+  });
+
+  const checkNames = Object.keys(dependencies.doneChecks.contracts).sort();
+  if (checkNames.length > 64) {
+    throw new TypeError("Ops-worker status supports at most 64 verifier contracts");
+  }
+  const verificationContracts = checkNames.map((name) => {
+    const contract = dependencies.doneChecks.describe(name);
+    if (!contract || !SHA256_PATTERN.test(contract.contractHash)) {
+      throw new TypeError("Done-check registry returned an invalid contract identity");
+    }
+    assertPolicyIdentity(contract.verifierIdentity, "done-check verifier identity");
+    assertPolicyIdentity(contract.verifierVersion, "done-check verifier version");
+    return { name, ...contract };
+  });
+
+  const resources = dependencies.primaryPiResources === undefined
+    ? undefined
+    : validatePiPrimaryResourceContract(dependencies.primaryPiResources);
+  return {
+    authorization: {
+      configuredSources,
+      verifierCount: authorizationContracts.length,
+      contractsHash: policyHash(authorizationContracts),
+    },
+    verification: {
+      verifierCount: verificationContracts.length,
+      contractsHash: policyHash(verificationContracts),
+    },
+    quota: inspectQuotaPolicy(dependencies.quotaAdmission),
+    parity: resources === undefined
+      ? { configured: false }
+      : {
+          configured: true,
+          version: resources.version,
+          resourcesDigest: resources.digest,
+          extensionsDigest: resources.extensionsDigest,
+          skillsDigest: resources.skillsDigest,
+          toolsDigest: resources.toolsDigest,
+        },
+  };
 }
 
 function writeJson(
@@ -106,15 +270,18 @@ export function summarizeOpsWorkerTasks(
 
 export function inspectOpsWorkerStatus(
   supervisor: OpsWorkerSupervisor,
+  policy: OpsWorkerPolicySnapshot,
 ): OpsWorkerStatusSnapshot {
   return {
     ...summarizeOpsWorkerTasks(supervisor.listTasks()),
     supervisorInstanceId: supervisor.supervisorInstanceId,
+    policy,
   };
 }
 
 function createRequestHandler(
   supervisor: OpsWorkerSupervisor,
+  inspectPolicy: () => OpsWorkerPolicySnapshot,
 ): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response) => {
     if (!isLoopbackRemoteAddress(request.socket.remoteAddress)) {
@@ -146,7 +313,7 @@ function createRequestHandler(
             service: "minime-ops-worker",
             schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
           }
-        : { ok: true, ...inspectOpsWorkerStatus(supervisor) };
+        : { ok: true, ...inspectOpsWorkerStatus(supervisor, inspectPolicy()) };
       writeJson(response, 200, value, method !== "HEAD");
     } catch {
       writeJson(response, 503, {
@@ -195,7 +362,10 @@ export async function startOpsWorkerStatusServer(
   const port = options.port ?? DEFAULT_OPS_WORKER_STATUS_PORT;
   assertLoopbackHost(host);
   assertPort(port);
-  const server = createServer(createRequestHandler(options.supervisor));
+  const server = createServer(createRequestHandler(
+    options.supervisor,
+    options.inspectPolicy,
+  ));
   const address = await listen(server, host, port);
   let closed = false;
   return {

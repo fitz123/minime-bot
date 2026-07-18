@@ -43,8 +43,11 @@ minime-bot workspace validate --workspace /path/to/workspace
 
 The package also includes an inactive-by-default ops-worker foundation. It
 exposes strict local submission and lifecycle evidence helpers plus loopback
-health/status, registers no production task contracts, and never starts
-automatically. See [Ops-worker foundation](docs/ops-worker.md).
+health/status. The current policy surface adds continuous authorization,
+primary context/capability attestation, authoritative quota admission and
+reset-aware waits, and typed composite verification. It registers no production
+task/verifier contracts, listener, or launch configuration and never starts
+automatically. See [Ops-worker policy and foundation](docs/ops-worker.md).
 
 Knowledge commands operate on an agent workspace, not the control workspace:
 

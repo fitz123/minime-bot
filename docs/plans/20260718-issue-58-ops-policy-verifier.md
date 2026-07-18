@@ -78,11 +78,11 @@ Base source: `03e912f` (`origin/main` when this plan was prepared)
 
 ### Task 5: Expose the inactive policy surface and validate the package
 
-- [ ] Wire strict package-owned registries/dependencies through `worker start`, status, and tests without enabling a listener or installing production config. Status may expose bounded verifier/quota/parity state and hashes, never objectives, context bodies, canonical task bodies, or credentials.
-- [ ] Update `docs/ops-worker.md` and the README pointer for schema migration, continuous authorization revalidation, primary context/capability parity, quota admission/waits, typed composite outcomes, and inactive-by-default boundaries.
-- [ ] Run focused tests for task store, authorization, context assembler/parity extension, quota, done checks/composite verifier, supervisor, Pi attempts, CLI, and Codex usage parsing.
-- [ ] Run final validation sequentially: `npm ci`, `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `git diff --check`.
-- [ ] Verify no ops-worker process/listener starts during install, build, pack, help, or workspace validation; run the public-repo leak/private-identifier checks and leave a clean worktree.
+- [x] Wire strict package-owned registries/dependencies through `worker start`, status, and tests without enabling a listener or installing production config. Status may expose bounded verifier/quota/parity state and hashes, never objectives, context bodies, canonical task bodies, or credentials.
+- [x] Update `docs/ops-worker.md` and the README pointer for schema migration, continuous authorization revalidation, primary context/capability parity, quota admission/waits, typed composite outcomes, and inactive-by-default boundaries.
+- [x] Run focused tests for task store, authorization, context assembler/parity extension, quota, done checks/composite verifier, supervisor, Pi attempts, CLI, and Codex usage parsing.
+- [x] Run final validation sequentially: `npm ci`, `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `git diff --check`.
+- [x] Verify no ops-worker process/listener starts during install, build, pack, help, or workspace validation; run the public-repo leak/private-identifier checks and leave a clean worktree.
 
 ## Technical Boundaries
 
