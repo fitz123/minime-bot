@@ -45,7 +45,6 @@ export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
-const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
@@ -146,9 +145,15 @@ function formatNotificationDiagnostics(diagnostics: string | undefined): string 
   return `${redacted.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
 }
 
+export function resolveCronLogDir(): string {
+  const configuredDir = process.env.LOG_DIR;
+  return configuredDir?.trim() ? configuredDir : join(homedir(), ".minime", "logs");
+}
+
 function log(taskName: string, msg: string): void {
-  mkdirSync(LOG_DIR, { recursive: true });
-  const logFile = resolve(LOG_DIR, `cron-${taskName}.log`);
+  const logDir = resolveCronLogDir();
+  mkdirSync(logDir, { recursive: true });
+  const logFile = resolve(logDir, `cron-${taskName}.log`);
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   appendFileSync(logFile, line);
   process.stderr.write(line);

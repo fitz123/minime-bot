@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { loadCronTask, getAgentWorkspace, resolveCronAgentData, buildPiCronAgentConfig, buildDeliverArgs, loadAdminChatId, handleDeliveryFailure, loadDefaultDelivery, resolveCronEngine, runOneShot, classifyPiResult, writeCronHealthMetric, runScript, main } from "../cron-runner.js";
 import type { CronAgentData, CronRunnerMainDeps, DeliveryDefaults } from "../cron-runner.js";
 import type { CronJob } from "../types.js";
+import { installCronTestEnv } from "./cron-test-env.js";
 
 // We test the pure functions. runPi and deliver require real Pi/Telegram unless stubbed.
+
+installCronTestEnv();
 
 const TEST_DIR = join("/tmp", "cron-runner-test-" + Date.now());
 
@@ -1201,7 +1204,7 @@ bindings: []
       };
     }
 
-    function makeMainHarness(cron: CronJob): { calls: MainCalls; deps: Partial<CronRunnerMainDeps> } {
+    function makeMainHarness(cron: CronJob): { calls: MainCalls; deps: CronRunnerMainDeps } {
       const calls: MainCalls = {
         consoleErrors: [],
         logs: [],
@@ -1217,7 +1220,7 @@ bindings: []
         exits: [],
       };
 
-      const deps: Partial<CronRunnerMainDeps> = {
+      const deps: CronRunnerMainDeps = {
         argv: ["node", "cron-runner.ts", "--task", cron.name],
         consoleError: (message?: unknown) => {
           calls.consoleErrors.push(String(message));

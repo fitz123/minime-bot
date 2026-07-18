@@ -25,6 +25,9 @@ import {
   MINIME_CRONS_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
 } from "../workspace-contract.js";
+import { installCronTestEnv } from "./cron-test-env.js";
+
+installCronTestEnv();
 
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");

@@ -128,31 +128,31 @@ Verified against the current worktree (`origin/main` @ `991ef54`):
 
 ### Task 1: Isolate cron-runner tests from ambient production paths (#76)
 
-- [ ] In `src/cron-runner.ts`, replace the import-time `LOG_DIR` constant with an
+- [x] In `src/cron-runner.ts`, replace the import-time `LOG_DIR` constant with an
   exported `resolveCronLogDir()` that reads `process.env.LOG_DIR` at call time, treating
   unset or blank as the unchanged fallback `join(homedir(), ".minime", "logs")`; use it
   inside `log()`. Production behavior is unchanged (cron plists always set `LOG_DIR`).
-- [ ] Add `src/__tests__/cron-test-env.ts` exporting `installCronTestEnv()`: called at
+- [x] Add `src/__tests__/cron-test-env.ts` exporting `installCronTestEnv()`: called at
   test-file top level, it eagerly creates a `mkdtempSync` root, saves and sets
   `LOG_DIR`, `CRON_HEALTH_TEXTFILE_DIR`, and `MINIME_CONTROL_WORKSPACE_ROOT` to subdirs
   of that root, registers a node:test `after()` that restores/deletes the saved env and
   removes the root, and returns `{ root, logDir, metricsDir, controlRoot }`.
-- [ ] Call `installCronTestEnv()` at the top of `src/__tests__/cron-runner.test.ts` and
+- [x] Call `installCronTestEnv()` at the top of `src/__tests__/cron-runner.test.ts` and
   `src/__tests__/cron-runner-pi.test.ts` so every existing test (including
   `handleDeliveryFailure` and real `runPi()` paths) writes only under the temp root.
-- [ ] Make the harness fail-closed: type the deps object built by `makeMainHarness()` in
+- [x] Make the harness fail-closed: type the deps object built by `makeMainHarness()` in
   `src/__tests__/cron-runner.test.ts` as a complete `CronRunnerMainDeps` (it already
   stubs every dep) so a future dep added to `main()` cannot silently fall back to a
   production-touching default in tests.
-- [ ] Write `src/__tests__/cron-runner-isolation.test.ts`; write the log-redirection
+- [x] Write `src/__tests__/cron-runner-isolation.test.ts`; write the log-redirection
   test first and confirm it fails against the import-time-captured `LOG_DIR`: (a)
   `log()` writes driven through `handleDeliveryFailure` (no-op deliver fn) land in temp
   dir A, then after changing `process.env.LOG_DIR` land in temp dir B while A gains no
   new files; (b) same A/B assertion for `writeCronHealthMetric()` and
   `CRON_HEALTH_TEXTFILE_DIR`.
-- [ ] Write error-path test: `resolveCronLogDir()` with unset and with blank `LOG_DIR`
+- [x] Write error-path test: `resolveCronLogDir()` with unset and with blank `LOG_DIR`
   returns the home fallback (pure path assertion — do not write there).
-- [ ] Run focused tests (`cron-runner.test.ts`, `cron-runner-pi.test.ts`,
+- [x] Run focused tests (`cron-runner.test.ts`, `cron-runner-pi.test.ts`,
   `cron-runner-isolation.test.ts`) — must pass before Task 2.
 
 ### Task 2: Cron outbox primitive (#65)
