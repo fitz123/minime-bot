@@ -44,11 +44,11 @@ git diff --check origin/main...HEAD
 
 ### Task 2: Production-shape regressions
 
-- [ ] Add a fixture whose existing plist is semantically identical but has PlistBuddy-like reordered top-level and nested dictionary keys/formatting; require `unchanged` with the matching explicit runner.
-- [ ] Extend the one-new-cron regression so reordered existing plists stay `unchanged` and only the new job is `create`.
-- [ ] Prove a real scalar/array/runner/schedule difference remains `update`.
-- [ ] Prove malformed existing plist and parser command failure remain `update` without writes, launchctl calls, or leaked parser/path text.
-- [ ] Prove dry-run leaves existing plist bytes and the LaunchAgents/log directories unchanged apart from pre-existing fixture content.
+- [x] Add a fixture whose existing plist is semantically identical but has PlistBuddy-like reordered top-level and nested dictionary keys/formatting; require `unchanged` with the matching explicit runner.
+- [x] Extend the one-new-cron regression so reordered existing plists stay `unchanged` and only the new job is `create`.
+- [x] Prove a real scalar/array/runner/schedule difference remains `update`.
+- [x] Prove malformed existing plist and parser command failure remain `update` without writes, launchctl calls, or leaked parser/path text.
+- [x] Prove dry-run leaves existing plist bytes and the LaunchAgents/log directories unchanged apart from pre-existing fixture content.
 
 ### Task 3: Final validation and review
 

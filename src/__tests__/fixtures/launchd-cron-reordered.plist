@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>StandardErrorPath</key><string>{{STANDARD_ERROR_PATH}}</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>LOG_DIR</key><string>{{LOG_DIR}}</string>
+		<key>MINIME_CONTROL_WORKSPACE_ROOT</key><string>{{WORKSPACE}}</string>
+		<key>HOME</key><string>{{HOME}}</string>
+	</dict>
+	<key>WorkingDirectory</key><string>{{WORKSPACE}}</string>
+	<key>RunAtLoad</key><false/>
+	<key>StartCalendarInterval</key>
+	<dict><key>Minute</key><integer>{{MINUTE}}</integer><key>Hour</key><integer>{{HOUR}}</integer></dict>
+	<key>ProgramArguments</key>
+	<array><string>/bin/bash</string><string>{{RUNNER}}</string><string>{{CRON_NAME}}</string></array>
+	<key>StandardOutPath</key><string>{{STANDARD_OUT_PATH}}</string>
+	<key>Label</key><string>{{LABEL}}</string>
+</dict></plist>
