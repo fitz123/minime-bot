@@ -277,6 +277,7 @@ describe("ops worker task contract", () => {
       payloadHash: `sha256:${"1".repeat(64)}`,
       summary: "The bounded fixture checkpoint is durable.",
       artifact: "artifacts/checkpoint.json",
+      replayHistory: [],
     };
     input.mutationReceipts.merge = {
       boundary: "merge",
@@ -290,6 +291,7 @@ describe("ops worker task contract", () => {
         result: "APPLIED",
         evidenceHash: `sha256:${"4".repeat(64)}`,
       },
+      replayHistory: [],
     };
     input.custody = {
       status: "HELD",
@@ -393,6 +395,7 @@ describe("ops worker task contract", () => {
       payloadHash: `sha256:${"a".repeat(64)}`,
       summary: "x".repeat(OPS_WORKER_LIMITS.maxCheckpointSummaryBytes + 1),
       artifact: null,
+      replayHistory: [],
     };
     assert.throws(
       () => parseOpsWorkerTask(oversizedCheckpoint, registry),
@@ -408,6 +411,7 @@ describe("ops worker task contract", () => {
       queryResultHash: `sha256:${"c".repeat(64)}`,
       mutationStartedAt: null,
       outcome: null,
+      replayHistory: [],
     };
     assert.throws(
       () => parseOpsWorkerTask(wrongBoundary, registry),
@@ -427,6 +431,7 @@ describe("ops worker task contract", () => {
         result: "APPLIED",
         evidenceHash: `sha256:${"f".repeat(64)}`,
       },
+      replayHistory: [],
     };
     assert.throws(
       () => parseOpsWorkerTask(appliedWithoutClaim, registry),

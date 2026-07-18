@@ -470,6 +470,15 @@ function stableTaskJson(task: OpsWorkerTask): string {
   return serialized;
 }
 
+function checkpointContentHash(checkpoint: NonNullable<OpsWorkerTask["currentCheckpoint"]>): string {
+  const canonical = JSON.stringify({
+    artifact: checkpoint.artifact,
+    payloadHash: checkpoint.payloadHash,
+    summary: checkpoint.summary,
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 function assertAuditInput(input: OpsWorkerAuditInput): void {
   if (!(OPS_WORKER_AUDIT_EVENTS as readonly string[]).includes(input.event)) {
     throw new OpsWorkerTaskStoreSafetyError(
@@ -621,6 +630,7 @@ export class OpsWorkerTaskStore {
       const snapshotPath = this.snapshotPath(task.id);
       const existing = this.readSnapshot(snapshotPath);
       this.assertImmutableIdentity(existing, task);
+      this.assertReplaySafety(existing, task);
       this.assertJournalSafe();
       this.assertGlobalInvariants(this.withReplacement(this.list(), task));
       this.injectFault("after-correlation-check");
@@ -655,6 +665,7 @@ export class OpsWorkerTaskStore {
       }
       const task = parseOpsWorkerTask(working, this.registry);
       this.assertImmutableIdentity(existing, task);
+      this.assertReplaySafety(existing, task);
       this.assertJournalSafe();
       this.assertGlobalInvariants(this.withReplacement(this.list(), task));
       this.injectFault("after-correlation-check");
@@ -715,6 +726,87 @@ export class OpsWorkerTaskStore {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
       );
+    }
+  }
+
+  private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+    const checkpointIdentities = (
+      task: OpsWorkerTask,
+    ): ReadonlyMap<string, string> => {
+      const identities = new Map<string, string>();
+      if (task.currentCheckpoint !== null) {
+        for (const replay of task.currentCheckpoint.replayHistory) {
+          identities.set(replay.checkpointId, replay.contentHash);
+        }
+        identities.set(
+          task.currentCheckpoint.checkpointId,
+          checkpointContentHash(task.currentCheckpoint),
+        );
+      }
+      return identities;
+    };
+    const priorCheckpoints = checkpointIdentities(existing);
+    const nextCheckpoints = checkpointIdentities(replacement);
+    for (const [checkpointId, contentHash] of priorCheckpoints) {
+      if (nextCheckpoints.get(checkpointId) !== contentHash) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to forget or change checkpoint replay identity ${checkpointId}`,
+        );
+      }
+    }
+
+    for (const slot of Object.keys(existing.mutationReceipts) as Array<
+      keyof OpsWorkerTask["mutationReceipts"]
+    >) {
+      const current = existing.mutationReceipts[slot];
+      const next = replacement.mutationReceipts[slot];
+      if (current?.outcome === null) {
+        if (
+          next === null
+          || next.operationId !== current.operationId
+          || next.intentHash !== current.intentHash
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to forget unfinished ${current.boundary} operation ${current.operationId}`,
+          );
+        }
+      }
+      const completedIdentities = (
+        receipt: typeof current,
+      ): ReadonlyMap<string, string> => {
+        const identities = new Map<string, string>();
+        if (receipt === null) return identities;
+        for (const replay of receipt.replayHistory) {
+          identities.set(
+            replay.operationId,
+            JSON.stringify({
+              intentHash: replay.intentHash,
+              result: replay.result,
+              evidenceHash: replay.evidenceHash,
+            }),
+          );
+        }
+        if (receipt.outcome !== null) {
+          identities.set(
+            receipt.operationId,
+            JSON.stringify({
+              intentHash: receipt.intentHash,
+              result: receipt.outcome.result,
+              evidenceHash: receipt.outcome.evidenceHash,
+            }),
+          );
+        }
+        return identities;
+      };
+      const priorOperations = completedIdentities(current);
+      const nextOperations = completedIdentities(next);
+      for (const [operationId, fingerprint] of priorOperations) {
+        if (nextOperations.get(operationId) !== fingerprint) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to forget or change completed ${slot} operation ${operationId}`,
+          );
+        }
+      }
     }
   }
 

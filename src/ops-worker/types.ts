@@ -207,6 +207,12 @@ export interface OpsWorkerCheckpoint {
   payloadHash: string;
   summary: string;
   artifact: string | null;
+  replayHistory: OpsWorkerCheckpointReplay[];
+}
+
+export interface OpsWorkerCheckpointReplay {
+  checkpointId: string;
+  contentHash: string;
 }
 
 export interface OpsWorkerMutationOutcome {
@@ -223,6 +229,14 @@ export interface OpsWorkerMutationReceipt {
   queryResultHash: string;
   mutationStartedAt: string | null;
   outcome: OpsWorkerMutationOutcome | null;
+  replayHistory: OpsWorkerMutationReceiptReplay[];
+}
+
+export interface OpsWorkerMutationReceiptReplay {
+  operationId: string;
+  intentHash: string;
+  result: OpsWorkerMutationOutcomeResult;
+  evidenceHash: string;
 }
 
 /** One bounded durable slot per permitted external mutation boundary. */
@@ -400,6 +414,8 @@ export const OPS_WORKER_LIMITS = {
   maxResourceKeyBytes: 256,
   maxLifecycleIdentityBytes: 512,
   maxCheckpointSummaryBytes: 4 * 1024,
+  maxCheckpointReplayEntries: 128,
+  maxMutationReceiptReplayEntries: 32,
   maxDoneCheckParamsBytes: 8 * 1024,
   maxDoneCheckParamDepth: 6,
   maxDoneCheckParamItems: 128,
@@ -795,7 +811,14 @@ function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
   const checkpoint = expectObject(value, "task.currentCheckpoint");
   expectExactKeys(
     checkpoint,
-    ["checkpointId", "recordedAt", "payloadHash", "summary", "artifact"],
+    [
+      "checkpointId",
+      "recordedAt",
+      "payloadHash",
+      "summary",
+      "artifact",
+      "replayHistory",
+    ],
     "task.currentCheckpoint",
   );
   const checkpointId = expectString(
@@ -812,6 +835,37 @@ function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
   if (!SHA256_PATTERN.test(payloadHash)) {
     fail("task.currentCheckpoint.payloadHash", "must be a lowercase sha256:<hex> digest");
   }
+  if (!Array.isArray(checkpoint.replayHistory)) {
+    fail("task.currentCheckpoint.replayHistory", "must be an array");
+  }
+  if (
+    checkpoint.replayHistory.length
+    > OPS_WORKER_LIMITS.maxCheckpointReplayEntries
+  ) {
+    fail(
+      "task.currentCheckpoint.replayHistory",
+      `must contain at most ${OPS_WORKER_LIMITS.maxCheckpointReplayEntries} entries`,
+    );
+  }
+  const replayIds = new Set<string>([checkpointId]);
+  const replayHistory = checkpoint.replayHistory.map((entry, index) => {
+    const path = `task.currentCheckpoint.replayHistory[${index}]`;
+    const replay = expectObject(entry, path);
+    expectExactKeys(replay, ["checkpointId", "contentHash"], path);
+    const replayId = expectString(replay.checkpointId, `${path}.checkpointId`);
+    if (!INSTANCE_ID_PATTERN.test(replayId)) {
+      fail(`${path}.checkpointId`, "contains unsafe characters");
+    }
+    if (replayIds.has(replayId)) {
+      fail(`${path}.checkpointId`, "must be unique and differ from the current checkpoint");
+    }
+    replayIds.add(replayId);
+    const contentHash = expectString(replay.contentHash, `${path}.contentHash`);
+    if (!SHA256_PATTERN.test(contentHash)) {
+      fail(`${path}.contentHash`, "must be a lowercase sha256:<hex> digest");
+    }
+    return { checkpointId: replayId, contentHash };
+  });
   return {
     checkpointId,
     recordedAt: expectTimestamp(
@@ -827,6 +881,7 @@ function parseCheckpoint(value: unknown): OpsWorkerCheckpoint | null {
     artifact: checkpoint.artifact === null
       ? null
       : parseArtifactPath(checkpoint.artifact, "task.currentCheckpoint.artifact"),
+    replayHistory,
   };
 }
 
@@ -865,6 +920,7 @@ function parseMutationReceipt(
       "queryResultHash",
       "mutationStartedAt",
       "outcome",
+      "replayHistory",
     ],
     path,
   );
@@ -933,6 +989,68 @@ function parseMutationReceipt(
       evidenceHash,
     };
   }
+  if (!Array.isArray(receipt.replayHistory)) {
+    fail(`${path}.replayHistory`, "must be an array");
+  }
+  if (
+    receipt.replayHistory.length
+    > OPS_WORKER_LIMITS.maxMutationReceiptReplayEntries
+  ) {
+    fail(
+      `${path}.replayHistory`,
+      `must contain at most ${OPS_WORKER_LIMITS.maxMutationReceiptReplayEntries} entries`,
+    );
+  }
+  const replayIds = new Set<string>([operationId]);
+  const replayHistory = receipt.replayHistory.map((entry, index) => {
+    const replayPath = `${path}.replayHistory[${index}]`;
+    const replay = expectObject(entry, replayPath);
+    expectExactKeys(
+      replay,
+      ["operationId", "intentHash", "result", "evidenceHash"],
+      replayPath,
+    );
+    const replayOperationId = expectString(
+      replay.operationId,
+      `${replayPath}.operationId`,
+    );
+    if (!INSTANCE_ID_PATTERN.test(replayOperationId)) {
+      fail(`${replayPath}.operationId`, "contains unsafe characters");
+    }
+    if (replayIds.has(replayOperationId)) {
+      fail(
+        `${replayPath}.operationId`,
+        "must be unique and differ from the current operation",
+      );
+    }
+    replayIds.add(replayOperationId);
+    const replayIntentHash = expectString(
+      replay.intentHash,
+      `${replayPath}.intentHash`,
+    );
+    const replayEvidenceHash = expectString(
+      replay.evidenceHash,
+      `${replayPath}.evidenceHash`,
+    );
+    for (const [hashPath, hash] of [
+      [`${replayPath}.intentHash`, replayIntentHash],
+      [`${replayPath}.evidenceHash`, replayEvidenceHash],
+    ] as const) {
+      if (!SHA256_PATTERN.test(hash)) {
+        fail(hashPath, "must be a lowercase sha256:<hex> digest");
+      }
+    }
+    return {
+      operationId: replayOperationId,
+      intentHash: replayIntentHash,
+      result: expectEnum(
+        replay.result,
+        OPS_WORKER_MUTATION_OUTCOMES,
+        `${replayPath}.result`,
+      ),
+      evidenceHash: replayEvidenceHash,
+    };
+  });
   return {
     boundary,
     operationId,
@@ -941,6 +1059,7 @@ function parseMutationReceipt(
     queryResultHash,
     mutationStartedAt,
     outcome,
+    replayHistory,
   };
 }
 

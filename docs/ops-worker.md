@@ -106,8 +106,9 @@ does not hand work to another task during the claimed cycle.
 optional fixed lifecycle identities. The payload is canonicalized and stored
 only as a SHA-256 hash; the helper never runs a command or contacts an external
 system. Identical checkpoint replay is a no-op, while reuse of the checkpoint id
-with different content fails closed. Checkpoint snapshot updates count as
-attempt liveness and are allowed while the supervisor owns the task.
+with different content fails closed, including after a newer checkpoint has
+become current. Checkpoint snapshot updates count as attempt liveness and are
+allowed while the supervisor owns the task.
 
 `--lifecycle` accepts only `canonicalTask`, `repository`, `base`, `head`,
 `branch`, `pullRequest`, `merge`, `tag`, `release`, `deploy`, `verifier`,
@@ -132,6 +133,10 @@ closed on conflicting reuse. The `--payload`, `--intent`, `--query-result`, and
 `--evidence` values are bounded canonical JSON and are retained only as hashes;
 callers must retain any raw external observation they will need later. Operator
 retry also fails closed while a claimed report receipt remains unfinished.
+Snapshots keep non-evicting replay fingerprints for up to 128 displaced
+checkpoints and 32 displaced completed operations per receipt boundary. A new
+identity fails closed when its ledger is full; old identities are never
+forgotten or made claimable again.
 
 An ambiguous process-group identity is a global safety fence: its task retains
 any proven identity evidence, no new Pi attempt is launched, and ordinary retry

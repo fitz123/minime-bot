@@ -202,6 +202,52 @@ describe("ops worker package-owned lifecycle evidence", () => {
     );
   });
 
+  it("keeps displaced checkpoint ids replay-safe without rolling progress back", (t) => {
+    const harness = makeHarness(t);
+    const task = makeTask("checkpoint-history");
+    harness.store.create(task);
+    const checkpointA = {
+      checkpointId: "checkpoint-a",
+      payload: { phase: "inspect" },
+      summary: "Inspection finished.",
+    };
+    harness.lifecycle.recordCheckpoint(task.id, checkpointA);
+    harness.setNow(LATER);
+    const checkpointB = harness.lifecycle.recordCheckpoint(task.id, {
+      checkpointId: "checkpoint-b",
+      payload: { phase: "verify" },
+      summary: "Verification finished.",
+    });
+    assert.equal(checkpointB.currentCheckpoint?.checkpointId, "checkpoint-b");
+    assert.deepEqual(
+      checkpointB.currentCheckpoint?.replayHistory.map((entry) => entry.checkpointId),
+      ["checkpoint-a"],
+    );
+    const snapshotPath = join(harness.store.tasksDirectory, `${task.id}.json`);
+    const snapshotBeforeReplay = readFileSync(snapshotPath, "utf8");
+    const journalBeforeReplay = readFileSync(harness.store.journalPath, "utf8");
+
+    const replay = harness.lifecycle.recordCheckpoint(task.id, checkpointA);
+    assert.deepEqual(replay, checkpointB);
+    assert.equal(replay.currentCheckpoint?.checkpointId, "checkpoint-b");
+    assert.equal(readFileSync(snapshotPath, "utf8"), snapshotBeforeReplay);
+    assert.equal(readFileSync(harness.store.journalPath, "utf8"), journalBeforeReplay);
+    assert.throws(
+      () => harness.lifecycle.recordCheckpoint(task.id, {
+        ...checkpointA,
+        payload: { phase: "conflicting-replay" },
+      }),
+      /checkpoint-a.*different canonical payload/i,
+    );
+    const erasedHistory = structuredClone(checkpointB);
+    assert.ok(erasedHistory.currentCheckpoint);
+    erasedHistory.currentCheckpoint.replayHistory = [];
+    assert.throws(
+      () => harness.store.replace(erasedHistory),
+      /refusing to forget or change checkpoint replay identity checkpoint-a/i,
+    );
+  });
+
   it("requires a fresh query before a crashed mutation can be claimed again", (t) => {
     const harness = makeHarness(t);
     const task = makeTask("receipt-reconcile");
@@ -378,6 +424,99 @@ describe("ops worker package-owned lifecycle evidence", () => {
         boundary,
       );
     }
+  });
+
+  it("keeps displaced completed receipts permanently unclaimable", (t) => {
+    const harness = makeHarness(t);
+    const task = makeTask("receipt-history");
+    harness.store.create(task);
+    const operationA = {
+      boundary: "deploy" as const,
+      operationId: "deploy-a",
+      intent: { release: "release-a" },
+    };
+    harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operationA,
+      queryObservedAt: NOW,
+      queryResult: { deployed: false },
+    });
+    harness.lifecycle.claimMutationReceipt(task.id, operationA);
+    harness.lifecycle.finishMutationReceipt(task.id, {
+      ...operationA,
+      result: "APPLIED",
+      evidence: { deployment: "deployment-a" },
+    });
+
+    harness.setNow(LATER);
+    const operationB = {
+      boundary: "deploy" as const,
+      operationId: "deploy-b",
+      intent: { release: "release-b" },
+    };
+    harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operationB,
+      queryObservedAt: LATER,
+      queryResult: { deployed: false },
+    });
+    harness.lifecycle.claimMutationReceipt(task.id, operationB);
+    const completedB = harness.lifecycle.finishMutationReceipt(task.id, {
+      ...operationB,
+      result: "APPLIED",
+      evidence: { deployment: "deployment-b" },
+    });
+    assert.equal(completedB.mutationReceipts.deploy?.operationId, "deploy-b");
+    assert.deepEqual(
+      completedB.mutationReceipts.deploy?.replayHistory.map((entry) => entry.operationId),
+      ["deploy-a"],
+    );
+    const snapshotPath = join(harness.store.tasksDirectory, `${task.id}.json`);
+    const snapshotBeforeReplay = readFileSync(snapshotPath, "utf8");
+    const journalBeforeReplay = readFileSync(harness.store.journalPath, "utf8");
+
+    const queryReplay = harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operationA,
+      queryObservedAt: LATER,
+      queryResult: { deployed: false },
+    });
+    assert.deepEqual(queryReplay, completedB);
+    assert.equal(
+      harness.lifecycle.claimMutationReceipt(task.id, operationA).claimed,
+      false,
+    );
+    assert.deepEqual(
+      harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operationA,
+        result: "APPLIED",
+        evidence: { deployment: "deployment-a" },
+      }),
+      completedB,
+    );
+    assert.equal(readFileSync(snapshotPath, "utf8"), snapshotBeforeReplay);
+    assert.equal(readFileSync(harness.store.journalPath, "utf8"), journalBeforeReplay);
+    assert.throws(
+      () => harness.lifecycle.beginMutationReceipt(task.id, {
+        ...operationA,
+        intent: { release: "conflicting-release" },
+        queryObservedAt: LATER,
+        queryResult: { deployed: false },
+      }),
+      /deploy-a.*different intent/i,
+    );
+    assert.throws(
+      () => harness.lifecycle.finishMutationReceipt(task.id, {
+        ...operationA,
+        result: "APPLIED",
+        evidence: { deployment: "conflicting-deployment" },
+      }),
+      /deploy-a.*different evidence/i,
+    );
+    const erasedHistory = structuredClone(completedB);
+    assert.ok(erasedHistory.mutationReceipts.deploy);
+    erasedHistory.mutationReceipts.deploy.replayHistory = [];
+    assert.throws(
+      () => harness.store.replace(erasedHistory),
+      /refusing to forget or change completed deploy operation deploy-a/i,
+    );
   });
 
   it("serializes concurrent helper updates and grants only one mutation claim", async (t) => {

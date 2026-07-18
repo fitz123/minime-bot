@@ -4,11 +4,13 @@ import {
   OpsWorkerTaskStore,
 } from "./task-store.js";
 import {
+  OPS_WORKER_LIMITS,
   OPS_WORKER_MUTATION_BOUNDARIES,
   type OpsWorkerLifecycleManifest,
   type OpsWorkerMutationBoundary,
   type OpsWorkerMutationOutcomeResult,
   type OpsWorkerMutationReceipt,
+  type OpsWorkerMutationReceiptReplay,
   type OpsWorkerMutationReceipts,
   type OpsWorkerTask,
 } from "./types.js";
@@ -256,6 +258,53 @@ function assertMatchingOperation(
   }
 }
 
+function checkpointContentHash(input: {
+  payloadHash: string;
+  summary: string;
+  artifact: string | null;
+}): string {
+  return hashOpsWorkerCanonicalPayload({
+    payloadHash: input.payloadHash,
+    summary: input.summary,
+    artifact: input.artifact,
+  });
+}
+
+function findReceiptReplay(
+  receipt: OpsWorkerMutationReceipt,
+  operationId: string,
+): OpsWorkerMutationReceiptReplay | undefined {
+  return receipt.replayHistory.find((entry) => entry.operationId === operationId);
+}
+
+function assertMatchingReceiptReplay(
+  replay: OpsWorkerMutationReceiptReplay,
+  operationId: string,
+  intentHash: string,
+): void {
+  if (replay.intentHash !== intentHash) {
+    throw new OpsWorkerLifecycleError(
+      `operation ${operationId} was reused with a different intent`,
+    );
+  }
+}
+
+function archiveCompletedReceipt(
+  receipt: OpsWorkerMutationReceipt,
+): OpsWorkerMutationReceiptReplay {
+  if (receipt.outcome === null) {
+    throw new OpsWorkerLifecycleError(
+      `unfinished ${receipt.boundary} receipt cannot be archived`,
+    );
+  }
+  return {
+    operationId: receipt.operationId,
+    intentHash: receipt.intentHash,
+    result: receipt.outcome.result,
+    evidenceHash: receipt.outcome.evidenceHash,
+  };
+}
+
 function timestampAtOrAfter(now: Date, floor: string): string {
   const milliseconds = now.getTime();
   if (!Number.isFinite(milliseconds)) {
@@ -297,29 +346,57 @@ export class OpsWorkerLifecycle {
   recordCheckpoint(taskId: string, input: OpsWorkerCheckpointInput): OpsWorkerTask {
     const payloadHash = hashOpsWorkerCanonicalPayload(input.payload);
     const artifact = input.artifact ?? null;
+    const contentHash = checkpointContentHash({
+      payloadHash,
+      summary: input.summary,
+      artifact,
+    });
     const result = this.store.mutate(
       taskId,
       { event: "EVIDENCE", summary: "Recorded package-owned lifecycle checkpoint" },
       (task) => {
         let changed = applyLifecycleIdentity(task.lifecycle, input.lifecycle);
         const existing = task.currentCheckpoint;
-        if (existing?.checkpointId === input.checkpointId) {
-          if (
-            existing.payloadHash !== payloadHash
-            || existing.summary !== input.summary
-            || existing.artifact !== artifact
-          ) {
+        const historical = existing?.replayHistory.find(
+          (entry) => entry.checkpointId === input.checkpointId,
+        );
+        if (historical !== undefined) {
+          if (historical.contentHash !== contentHash) {
+            throw new OpsWorkerLifecycleError(
+              `checkpoint ${input.checkpointId} was reused with a different canonical payload`,
+            );
+          }
+        } else if (existing?.checkpointId === input.checkpointId) {
+          if (checkpointContentHash(existing) !== contentHash) {
             throw new OpsWorkerLifecycleError(
               `checkpoint ${input.checkpointId} was reused with a different canonical payload`,
             );
           }
         } else {
+          const replayHistory = existing === null
+            ? []
+            : [
+              ...existing.replayHistory,
+              {
+                checkpointId: existing.checkpointId,
+                contentHash: checkpointContentHash(existing),
+              },
+            ];
+          if (
+            replayHistory.length
+            > OPS_WORKER_LIMITS.maxCheckpointReplayEntries
+          ) {
+            throw new OpsWorkerLifecycleError(
+              `checkpoint replay history is full at ${OPS_WORKER_LIMITS.maxCheckpointReplayEntries} entries`,
+            );
+          }
           task.currentCheckpoint = {
             checkpointId: input.checkpointId,
             recordedAt: this.now().toISOString(),
             payloadHash,
             summary: input.summary,
             artifact,
+            replayHistory,
           };
           changed = true;
         }
@@ -345,14 +422,37 @@ export class OpsWorkerLifecycle {
       { event: "UPDATED", summary: `Recorded ${input.boundary} query observation` },
       (task) => {
         const existing = task.mutationReceipts[slot];
+        let replayHistory: OpsWorkerMutationReceiptReplay[] = [];
         if (existing !== null) {
+          const historical = findReceiptReplay(existing, input.operationId);
+          if (historical !== undefined) {
+            assertMatchingReceiptReplay(
+              historical,
+              input.operationId,
+              intentHash,
+            );
+            return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          }
           if (existing.operationId !== input.operationId) {
             if (existing.outcome === null) {
               throw new OpsWorkerLifecycleError(
                 `unfinished ${input.boundary} receipt must be reconciled before operation ${input.operationId}`,
               );
             }
+            replayHistory = [
+              ...existing.replayHistory,
+              archiveCompletedReceipt(existing),
+            ];
+            if (
+              replayHistory.length
+              > OPS_WORKER_LIMITS.maxMutationReceiptReplayEntries
+            ) {
+              throw new OpsWorkerLifecycleError(
+                `${input.boundary} receipt replay history is full at ${OPS_WORKER_LIMITS.maxMutationReceiptReplayEntries} entries`,
+              );
+            }
           } else {
+            replayHistory = existing.replayHistory;
             assertMatchingOperation(existing, input.operationId, intentHash);
             if (existing.outcome !== null) {
               return OPS_WORKER_TASK_STORE_NO_CHANGE;
@@ -391,6 +491,7 @@ export class OpsWorkerLifecycle {
           queryResultHash,
           mutationStartedAt: null,
           outcome: null,
+          replayHistory,
         };
       },
     );
@@ -413,6 +514,11 @@ export class OpsWorkerLifecycle {
           throw new OpsWorkerLifecycleError(
             `${input.boundary} mutation requires a query observation before it can be claimed`,
           );
+        }
+        const historical = findReceiptReplay(receipt, input.operationId);
+        if (historical !== undefined) {
+          assertMatchingReceiptReplay(historical, input.operationId, intentHash);
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
         assertMatchingOperation(receipt, input.operationId, intentHash);
         if (receipt.outcome !== null || receipt.mutationStartedAt !== null) {
@@ -444,6 +550,21 @@ export class OpsWorkerLifecycle {
           throw new OpsWorkerLifecycleError(
             `${input.boundary} outcome requires a prior query observation`,
           );
+        }
+        const historical = findReceiptReplay(receipt, input.operationId);
+        if (historical !== undefined) {
+          assertMatchingReceiptReplay(historical, input.operationId, intentHash);
+          const changed = applyLifecycleIdentity(task.lifecycle, input.lifecycle);
+          if (
+            historical.result !== input.result
+            || historical.evidenceHash !== evidenceHash
+          ) {
+            throw new OpsWorkerLifecycleError(
+              `operation ${input.operationId} outcome was reused with different evidence`,
+            );
+          }
+          if (!changed) return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          return;
         }
         assertMatchingOperation(receipt, input.operationId, intentHash);
         if (input.result === "APPLIED" && receipt.mutationStartedAt === null) {
