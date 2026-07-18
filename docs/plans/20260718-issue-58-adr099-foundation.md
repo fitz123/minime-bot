@@ -84,11 +84,11 @@ Base source: `f419d13` (`origin/main` when this plan was prepared)
 
 ### Task 5: Expose only the inactive helper surface and validate the package
 
-- [ ] Extend `src/ops-worker/worker-cli.ts` and `src/cli.ts` with strict adapter-facing `--delivery-key` / `--resource-key` submission fields and package-owned checkpoint/receipt recording commands that mutate through the new atomic helpers; do not add Telegram, Alertmanager, arbitrary command, URL, or live-control routes.
-- [ ] Extend `src/__tests__/ops-worker-cli.test.ts` for v1 inspection, v2 creation, idempotent submission replay, conflicting replay, checkpoint/receipt validation, and helper use while the supervisor owns the task; extend status assertions to expose at most one custody owner without leaking task evidence.
-- [ ] Update `docs/ops-worker.md` and the existing README pointer to document schema migration, delivery-vs-correlation identity, custody, checkpoints, and receipt semantics while preserving the explicit opt-in/inactive-by-default contract.
-- [ ] Run focused validation: `node --experimental-test-module-mocks --import tsx --test src/__tests__/ops-worker-task-store.test.ts src/__tests__/ops-worker-lifecycle.test.ts src/__tests__/ops-worker-supervisor.test.ts src/__tests__/ops-worker-pi-attempt.test.ts src/__tests__/ops-worker-cli.test.ts`.
-- [ ] Run final repository validation: `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `git diff --check`; verify the package remains inactive unless `worker start` is explicitly invoked.
+- [x] Extend `src/ops-worker/worker-cli.ts` and `src/cli.ts` with strict adapter-facing `--delivery-key` / `--resource-key` submission fields and package-owned checkpoint/receipt recording commands that mutate through the new atomic helpers; do not add Telegram, Alertmanager, arbitrary command, URL, or live-control routes.
+- [x] Extend `src/__tests__/ops-worker-cli.test.ts` for v1 inspection, v2 creation, idempotent submission replay, conflicting replay, checkpoint/receipt validation, and helper use while the supervisor owns the task; extend status assertions to expose at most one custody owner without leaking task evidence.
+- [x] Update `docs/ops-worker.md` and the existing README pointer to document schema migration, delivery-vs-correlation identity, custody, checkpoints, and receipt semantics while preserving the explicit opt-in/inactive-by-default contract.
+- [x] Run focused validation: `node --experimental-test-module-mocks --import tsx --test src/__tests__/ops-worker-task-store.test.ts src/__tests__/ops-worker-lifecycle.test.ts src/__tests__/ops-worker-supervisor.test.ts src/__tests__/ops-worker-pi-attempt.test.ts src/__tests__/ops-worker-cli.test.ts`.
+- [x] Run final repository validation: `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `git diff --check`; verify the package remains inactive unless `worker start` is explicitly invoked.
 
 ## Technical Details
 
