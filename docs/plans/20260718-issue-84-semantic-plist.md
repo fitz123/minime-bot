@@ -13,9 +13,9 @@ Base: `3ccfc7a`. Public package code/tests/docs only. No private paths, deployme
 ## Contract decisions
 
 - Add a side-effect-free semantic equality helper used only when an existing plist file is present.
-- Parse both existing plist and desired in-memory content through the already configured `plutil` binary using read-only JSON conversion (`-convert json -o -`), sending desired content on stdin. Compare parsed JavaScript values with deep strict equality so dictionary order and XML formatting do not matter while arrays and scalar types remain significant.
+- Parse both existing plist and desired in-memory content through the already configured `plutil` binary using read-only JSON conversion (`-convert json -o -`), sending desired content on stdin. Compare parsed JavaScript values with deep strict equality so dictionary order and XML formatting do not matter. Because JSON erases the integer/real distinction, require a read-only XML conversion of a JSON-equal existing plist to confirm that its numeric scalars retain the generated plist's integer type; arrays and all scalar types remain significant.
 - Do not create temporary files. Dry-run may execute read-only plist parsing but must not write files, create directories, call launchctl, or mutate plist state.
-- If either parse command fails, returns malformed JSON, or cannot start, treat the existing plist as drifted (`update`) rather than unchanged; later normal write/lint/rollback behavior remains authoritative.
+- If any conversion fails, returns malformed output, or cannot start, treat the existing plist as drifted (`update`) rather than unchanged; later normal write/lint/rollback behavior remains authoritative.
 - Do not emit parser stderr, file contents, or paths through planning output/errors.
 - Raw byte identity may remain a fast path before semantic parsing.
 
@@ -38,8 +38,8 @@ git diff --check origin/main...HEAD
 ### Task 1: Semantic equality in planning
 
 - [x] Add the raw-equal fast path plus read-only semantic plist comparison for differing bytes.
-- [x] Use the resolved `context.plutilBin`; parse desired content via stdin and existing content from its file path; compare parsed values with deep strict equality.
-- [x] Fail safely to `update` on command/exit/JSON failure without exposing parser output.
+- [x] Use the resolved `context.plutilBin`; parse desired content via stdin and existing content from its file path; compare parsed values with deep strict equality and preserve integer/real scalar types.
+- [x] Fail safely to `update` on command, exit, or malformed conversion output without exposing parser output.
 - [x] Keep create/delete/write/rebootstrap/rollback behavior unchanged.
 
 ### Task 2: Production-shape regressions

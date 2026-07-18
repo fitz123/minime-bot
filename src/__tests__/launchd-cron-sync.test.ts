@@ -100,7 +100,7 @@ function writeRunner(directory: string, mode = 0o700): string {
 
 function writeFixturePlutil(fixture: Fixture): string {
   const plutil = join(fixture.root, "fixture-plutil");
-  copyFileSync(new URL("./fixtures/plutil-json.mjs", import.meta.url), plutil);
+  copyFileSync(new URL("./fixtures/plutil-convert.py", import.meta.url), plutil);
   chmodSync(plutil, 0o700);
   return plutil;
 }
@@ -625,7 +625,7 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("keeps real scalar, array, runner, and schedule differences as updates", () => {
+  it("keeps scalar, array-order, runner, and schedule differences as updates", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
@@ -642,12 +642,13 @@ describe("launchd cron plist sync", () => {
       const desired = generated.plists[0].content;
       const otherRunner = join(fixture.root, "previous-release", "scripts", "run-cron.sh");
       const differences = new Map<string, string>([
-        ["scalar", desired.replace("<false/>", "<true/>")],
+        ["scalar value", desired.replace("<false/>", "<true/>")],
+        ["scalar type", desired.replace("<integer>8</integer>", "<real>8.0</real>")],
         [
-          "array",
+          "array order",
           desired.replace(
-            "      <string>active</string>\n    </array>",
-            "      <string>active</string>\n      <string>unexpected-argument</string>\n    </array>",
+            `      <string>${xmlEscapeFixture(runner)}</string>\n      <string>active</string>`,
+            `      <string>active</string>\n      <string>${xmlEscapeFixture(runner)}</string>`,
           ),
         ],
         [
@@ -721,7 +722,7 @@ describe("launchd cron plist sync", () => {
     }
   });
 
-  it("fails returned, thrown, and malformed-JSON parser errors without writes or leaks", () => {
+  it("fails returned, thrown, and malformed conversion errors without writes or leaks", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
     try {
@@ -740,10 +741,21 @@ else
 fi
 `, "utf8");
       chmodSync(malformedJsonPlutil, 0o700);
+      const fixturePlutil = writeFixturePlutil(fixture);
+      const xmlFailurePlutil = join(fixture.root, "xml-failure-plutil");
+      writeFileSync(xmlFailurePlutil, `#!/bin/sh
+if [ "$2" = "xml1" ]; then
+  printf '%s\\n' 'private-parser-xml-failure' >&2
+  exit 1
+fi
+exec "${fixturePlutil}" "$@"
+`, "utf8");
+      chmodSync(xmlFailurePlutil, 0o700);
       const invalidPlutils = [
         join(fixture.root, "private-parser-path-must-not-leak"),
         "private-parser\0command-must-not-leak",
         malformedJsonPlutil,
+        xmlFailurePlutil,
       ];
 
       for (const plutil of invalidPlutils) {
@@ -1095,7 +1107,7 @@ fi
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
         runCronScript: runner,
-        env: fixture.env,
+        env: { ...fixture.env, PLUTIL_BIN: "private-parser\0must-not-run" },
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls),

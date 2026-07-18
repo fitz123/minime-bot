@@ -730,7 +730,18 @@ function plistsSemanticallyEqual(
     return false;
   }
   const desired = parsePlistJson(context.plutilBin, "-", desiredContent);
-  return desired.ok && isDeepStrictEqual(existing.value, desired.value);
+  if (!desired.ok || !isDeepStrictEqual(existing.value, desired.value)) {
+    return false;
+  }
+
+  // JSON represents both plist integers and reals as JavaScript numbers. Cron
+  // plists render only integer numeric scalars, so reject any existing real
+  // after the value comparison rather than silently accepting type drift.
+  const existingXml = convertPlist(context.plutilBin, "xml1", existingPath);
+  return existingXml.ok
+    && /<plist(?:\s[^>]*)?>/.test(existingXml.output)
+    && existingXml.output.includes("</plist>")
+    && !/<real(?:\s*\/)?\s*>/.test(existingXml.output);
 }
 
 function parsePlistJson(
@@ -738,16 +749,33 @@ function parsePlistJson(
   inputPath: string,
   input?: string,
 ): { ok: true; value: unknown } | { ok: false } {
+  const result = convertPlist(plutilBin, "json", inputPath, input);
+  if (!result.ok) {
+    return result;
+  }
+  try {
+    return { ok: true, value: JSON.parse(result.output) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function convertPlist(
+  plutilBin: string,
+  format: "json" | "xml1",
+  inputPath: string,
+  input?: string,
+): { ok: true; output: string } | { ok: false } {
   try {
     const result = spawnSync(
       plutilBin,
-      ["-convert", "json", "-o", "-", inputPath],
+      ["-convert", format, "-o", "-", inputPath],
       { encoding: "utf8", input },
     );
     if (result.error || result.status !== 0) {
       return { ok: false };
     }
-    return { ok: true, value: JSON.parse(result.stdout) as unknown };
+    return { ok: true, output: result.stdout };
   } catch {
     return { ok: false };
   }

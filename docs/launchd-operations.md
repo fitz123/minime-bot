@@ -96,18 +96,21 @@ writing plists or calling launchctl. Planning first treats byte-identical
 existing and desired plists as unchanged. When their bytes differ, it converts
 both plists to JSON with the configured `plutil` and compares their parsed
 values. The existing plist is read from its path, while the desired in-memory
-plist is sent on standard input. Dictionary key order and XML formatting are
-therefore ignored, but array order, scalar types, runner paths, and schedules
-remain significant.
+plist is sent on standard input. After equal JSON values, a read-only XML
+conversion of the existing plist preserves the integer/real distinction that
+JSON numbers erase. Dictionary key order and XML formatting are therefore
+ignored, but array order, scalar types, runner paths, and schedules remain
+significant.
 
 This semantic comparison is the only command boundary used by dry-run. It uses
-`plutil -convert json -o -` for read-only output and creates no temporary files
-or directories. A parser startup, exit, or JSON failure conservatively plans
-the plist as `update`; parser output, plist contents, and paths are not included
-in planning output. Dry-run still performs no writes, plist lint, launchctl
-calls, or other state mutation. The default non-dry-run mode writes active cron
-plists, lint-checks changed plists, bootouts changed active cron labels, and
-bootstraps them into the current user launchd domain.
+`plutil -convert json -o -` and, after equal values, `-convert xml1 -o -` for
+read-only output and creates no temporary files or directories. A parser
+startup, exit, or malformed-output failure conservatively plans the plist as
+`update`; parser output, plist contents, and paths are not included in planning
+output. Dry-run still performs no writes, plist lint, launchctl calls, or other
+state mutation. The default non-dry-run mode writes active cron plists,
+lint-checks changed plists, bootouts changed active cron labels, and bootstraps
+them into the current user launchd domain.
 
 Prune is enabled by default for the package-owned `ai.minime.cron.*` namespace.
 Pruning means a stale or disabled owned cron label is booted out, its plist is

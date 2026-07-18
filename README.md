@@ -464,10 +464,12 @@ or otherwise restart `ai.minime.telegram-bot`.
 
 Planning uses byte identity as a fast path. If an existing plist has different
 bytes, the configured `plutil` converts the existing file and desired in-memory
-content to JSON for a deep value comparison. Formatting and dictionary key
-order do not cause updates; array order and scalar, runner, or schedule changes
-do. Parsing is fail-closed: startup, exit, or JSON failures plan `update`
-without exposing parser output, plist contents, or paths.
+content to JSON for a deep value comparison, then checks the existing plist's
+read-only XML conversion so integer/real type drift is not erased by JSON.
+Formatting and dictionary key order do not cause updates; array order and
+scalar, runner, or schedule changes do. Parsing is fail-closed: startup, exit,
+or malformed conversion output plans `update` without exposing parser output,
+plist contents, or paths.
 
 Dry-run may perform that read-only parser comparison, with desired content sent
 on standard input, but creates no temporary files or directories and performs
