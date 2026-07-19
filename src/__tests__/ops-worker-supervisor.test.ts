@@ -38,6 +38,7 @@ import {
   OpsWorkerSupervisor,
   OpsWorkerSupervisorAlreadyRunningError,
   OpsWorkerSupervisorStateError,
+  type OpsWorkerStartupRunResult,
 } from "../ops-worker/supervisor.js";
 import {
   OPS_WORKER_LIMITS,
@@ -2386,6 +2387,45 @@ describe("ops worker supervisor", () => {
     assert.equal(cancelled?.lastOutcome?.result, "CANCELLED");
     assert.equal(cancelled?.control.interrupt, null);
     assert.equal(cancelled?.custody.status, "RELEASED");
+  });
+
+  it("keeps public interrupt resolution fenced until the supervisor proves the group stopped", async (t) => {
+    let resolution: OpsWorkerStartupRunResult = {
+      status: "AMBIGUOUS",
+      summary: "Synthetic live process group remains ambiguous.",
+    };
+    const harness = await makeHarness(t, {
+      reconcileActiveRun: () => resolution,
+    });
+    const task = makeTask("task-interrupt-resolution-proof");
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const requested = harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Cancellation requires a supervisor-owned stop proof.",
+    );
+    const interrupt = requested.control.interrupt;
+    assert.ok(interrupt);
+    assert.equal("completeOperatorInterrupt" in harness.supervisor, false);
+
+    const fenced = await harness.supervisor.resolveOperatorInterrupt(task.id, interrupt);
+    assert.equal(fenced.state, "BLOCKED");
+    assert.equal(fenced.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(fenced.control.interrupt?.mode, "cancel");
+    assert.ok(fenced.activeRun);
+    assert.equal(fenced.custody.status, "HELD");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    resolution = {
+      status: "STOPPED",
+      summary: "Synthetic process group is now proven stopped.",
+    };
+    const cancelled = await harness.supervisor.resolveOperatorInterrupt(task.id, interrupt);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.activeRun, null);
+    assert.equal(cancelled.custody.status, "RELEASED");
   });
 
   it("gates and reconciles an idle cancel persisted before its safe-boundary transition", async (t) => {

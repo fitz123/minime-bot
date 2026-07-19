@@ -877,7 +877,7 @@ export class OpsWorkerPiAttemptRunner {
         classification: "CRASH",
         task: pendingInterrupt === null
           ? resolved
-          : this.supervisor.completeOperatorInterrupt(task.id, pendingInterrupt),
+          : await this.supervisor.resolveOperatorInterrupt(task.id, pendingInterrupt),
       };
     }
 
@@ -948,7 +948,7 @@ export class OpsWorkerPiAttemptRunner {
       }
       const exit = await boundedExitWait(exitPromise, this.sleep);
       if (exit === null) abandonDetachedChild(child);
-      const pendingInterrupt = this.completePendingOperatorInterrupt(task.id);
+      const pendingInterrupt = await this.completePendingOperatorInterrupt(task.id);
       if (pendingInterrupt !== null) return pendingInterrupt;
       const summary = parity === null
         ? parityReadError === null
@@ -989,7 +989,7 @@ export class OpsWorkerPiAttemptRunner {
         };
       }
       await boundedExitWait(exitPromise, this.sleep);
-      const pendingInterrupt = this.completePendingOperatorInterrupt(task.id);
+      const pendingInterrupt = await this.completePendingOperatorInterrupt(task.id);
       if (pendingInterrupt !== null) return pendingInterrupt;
       return {
         classification: "CRASH",
@@ -1046,7 +1046,7 @@ export class OpsWorkerPiAttemptRunner {
         if (interrupt !== null && interrupt !== undefined) {
           return {
             classification: "CRASH",
-            task: this.supervisor.completeOperatorInterrupt(task.id, interrupt),
+            task: await this.supervisor.resolveOperatorInterrupt(task.id, interrupt),
           };
         }
         return this.finishNaturalExit(task.id, trigger.exit, attemptQuotaFile);
@@ -1078,7 +1078,7 @@ export class OpsWorkerPiAttemptRunner {
       if (interrupt !== null && interrupt !== undefined) {
         return {
           classification: "CRASH",
-          task: this.supervisor.completeOperatorInterrupt(task.id, interrupt),
+          task: await this.supervisor.resolveOperatorInterrupt(task.id, interrupt),
         };
       }
       return {
@@ -1114,7 +1114,7 @@ export class OpsWorkerPiAttemptRunner {
     const exit = await boundedExitWait(exitPromise, this.sleep);
     if (exit === null) abandonDetachedChild(child);
     const evidence = exit ? formatAttemptEvidence(exit) : undefined;
-    const pendingInterrupt = this.completePendingOperatorInterrupt(
+    const pendingInterrupt = await this.completePendingOperatorInterrupt(
       task.id,
       trigger.kind === "OPERATOR" ? trigger.interrupt : undefined,
     );
@@ -1200,22 +1200,22 @@ export class OpsWorkerPiAttemptRunner {
     if (exit === null) abandonDetachedChild(child);
     return {
       classification: "CRASH",
-      task: this.supervisor.completeOperatorInterrupt(taskId, interrupt),
+      task: await this.supervisor.resolveOperatorInterrupt(taskId, interrupt),
     };
   }
 
-  private completePendingOperatorInterrupt(
+  private async completePendingOperatorInterrupt(
     taskId: string,
     fallback?: OpsWorkerInterrupt,
-  ): {
+  ): Promise<{
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
-    } | null {
+    } | null> {
     const interrupt = this.supervisor.getTask(taskId)?.control.interrupt ?? fallback;
     if (interrupt === undefined || interrupt === null) return null;
     return {
       classification: "CRASH",
-      task: this.supervisor.completeOperatorInterrupt(taskId, interrupt),
+      task: await this.supervisor.resolveOperatorInterrupt(taskId, interrupt),
     };
   }
 
@@ -1497,10 +1497,10 @@ export class OpsWorkerPiAttemptRunner {
     }
     const pendingInterrupt = this.supervisor.getTask(taskId)?.control.interrupt;
     if (pendingInterrupt !== null && pendingInterrupt !== undefined) {
-      return this.supervisor.completeOperatorInterrupt(taskId, pendingInterrupt);
+      return await this.supervisor.resolveOperatorInterrupt(taskId, pendingInterrupt);
     }
     if (result.status === "OPERATOR_INTERRUPT") {
-      return this.supervisor.completeOperatorInterrupt(taskId, result.interrupt);
+      return await this.supervisor.resolveOperatorInterrupt(taskId, result.interrupt);
     }
     if (result.status === "SUCCESS") {
       if (proofSubjectHash === undefined) {

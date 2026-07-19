@@ -361,6 +361,10 @@ async function makeHarness(
     authorizationQueryRetryMs: 1,
     quotaAdmission: options.quotaAdmission,
     quotaRecheckMs: 1,
+    reconcileActiveRun: createOpsWorkerPiStartupReconciler({
+      termGraceMs: 200,
+      killGraceMs: 200,
+    }),
   });
   await supervisor.start();
   const children: ChildProcess[] = [];

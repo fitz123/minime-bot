@@ -47,6 +47,7 @@ import {
 import {
   OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
+  type OpsWorkerStartupRunResult,
   type OpsWorkerSupervisorOptions,
 } from "../../ops-worker/supervisor.js";
 import {
@@ -1055,7 +1056,13 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
     name: "cancel-interrupt-proven-process-group",
     summary: "Proven cancellation stops its group; ambiguous ownership retains the global fence.",
     async run(context) {
-      const { store, supervisor } = await createSupervisor(context);
+      const resolutions = new Map<string, OpsWorkerStartupRunResult>();
+      const { store, supervisor } = await createSupervisor(context, {
+        reconcileActiveRun: (task) => resolutions.get(task.id) ?? {
+          status: "AMBIGUOUS",
+          summary: "Synthetic process-group resolution is unavailable.",
+        },
+      });
       const provenTask = makeTask("interrupt-proven");
       store.create(provenTask);
       const run = activeRun(supervisor, "attempt-proven-stop");
@@ -1088,7 +1095,8 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       });
       assert.equal(stopped.status, "STOPPED");
       assert.deepEqual(signals, ["SIGTERM"]);
-      const cancelled = supervisor.completeOperatorInterrupt(
+      resolutions.set(provenTask.id, { status: "STOPPED" });
+      const cancelled = await supervisor.resolveOperatorInterrupt(
         provenTask.id,
         requested.control.interrupt as NonNullable<OpsWorkerTask["control"]["interrupt"]>,
       );
@@ -1114,9 +1122,17 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       });
       assert.equal(ambiguous.status, "AMBIGUOUS");
       assert.equal(ambiguousSignals, 0);
-      const fenced = supervisor.blockAmbiguousActiveRun(
+      resolutions.set(ambiguousTask.id, {
+        status: "AMBIGUOUS",
+        summary: ambiguous.summary ?? "Synthetic process-group stop ambiguity.",
+      });
+      const pendingAmbiguousInterrupt = supervisor.getTask(
         ambiguousTask.id,
-        ambiguous.summary ?? "Synthetic process-group stop ambiguity.",
+      )?.control.interrupt;
+      assert.ok(pendingAmbiguousInterrupt);
+      const fenced = await supervisor.resolveOperatorInterrupt(
+        ambiguousTask.id,
+        pendingAmbiguousInterrupt,
       );
       assert.equal(fenced.state, "BLOCKED");
       assert.equal(fenced.custody.status, "HELD");

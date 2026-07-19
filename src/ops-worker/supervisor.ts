@@ -714,13 +714,64 @@ export class OpsWorkerSupervisor {
     if (requested.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(requested)) {
       return requested;
     }
-    return this.completeOperatorInterrupt(
+    return this.#completeOperatorInterrupt(
       taskId,
       requested.control.interrupt as OpsWorkerInterrupt,
     );
   }
 
-  completeOperatorInterrupt(
+  async resolveOperatorInterrupt(
+    taskId: string,
+    interrupt: OpsWorkerInterrupt,
+  ): Promise<OpsWorkerTask> {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (JSON.stringify(existing.control.interrupt) !== JSON.stringify(interrupt)) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} operator interrupt changed before its stop was resolved`,
+      );
+    }
+    if (existing.state !== "RUNNING" && !isOpsWorkerUnresolvedOrphan(existing)) {
+      return this.#completeOperatorInterrupt(taskId, interrupt);
+    }
+
+    let resolution: OpsWorkerStartupRunResult = {
+      status: "AMBIGUOUS",
+      summary: "No trusted process-group reconciler is configured",
+    };
+    try {
+      if (this.reconcileActiveRun !== undefined) {
+        resolution = await this.reconcileActiveRun(existing);
+      }
+    } catch {
+      resolution = {
+        status: "AMBIGUOUS",
+        summary: "Trusted process-group reconciliation failed",
+      };
+    }
+    if (resolution.status === "GONE" || resolution.status === "STOPPED") {
+      return this.#completeOperatorInterrupt(taskId, interrupt);
+    }
+
+    const current = this.requireTask(taskId);
+    if (JSON.stringify(current.control.interrupt) !== JSON.stringify(interrupt)) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} operator interrupt changed during stop reconciliation`,
+      );
+    }
+    if (current.state === "RUNNING") {
+      return this.blockAmbiguousRun(
+        taskId,
+        resolution.summary ?? "Operator interrupt could not prove the process group stopped",
+      );
+    }
+    if (isOpsWorkerUnresolvedOrphan(current)) return current;
+    throw new OpsWorkerSupervisorStateError(
+      `Task ${taskId} operator interrupt did not reach a proven safe boundary`,
+    );
+  }
+
+  #completeOperatorInterrupt(
     taskId: string,
     interrupt: OpsWorkerInterrupt,
   ): OpsWorkerTask {
@@ -2027,7 +2078,7 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     const existing = this.requireMatchingLaunchFence(taskId, attemptId);
     if (existing.control.interrupt !== null) {
-      return this.completeOperatorInterrupt(taskId, existing.control.interrupt);
+      return this.#completeOperatorInterrupt(taskId, existing.control.interrupt);
     }
     if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
       return this.returnUnclaimedQuotaProbeToQueue(
@@ -2079,7 +2130,7 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     const existing = this.requireMatchingLaunchFence(taskId, attemptId);
     if (existing.control.interrupt !== null) {
-      return this.completeOperatorInterrupt(taskId, existing.control.interrupt);
+      return this.#completeOperatorInterrupt(taskId, existing.control.interrupt);
     }
     const target = hasPendingPromptSteering(existing) ? "RESUMABLE" : "CHECKING";
     return this.transition(taskId, target, (task, at) => {
@@ -2120,7 +2171,7 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     const existing = this.requireMatchingLaunchFence(taskId, attemptId);
     if (existing.control.interrupt !== null) {
-      return this.completeOperatorInterrupt(taskId, existing.control.interrupt);
+      return this.#completeOperatorInterrupt(taskId, existing.control.interrupt);
     }
     return this.transition(taskId, "RESUMABLE", (task, at) => {
       task.activeRun = null;
@@ -2154,7 +2205,7 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     const existing = this.requireMatchingLaunchFence(taskId, attemptId);
     if (existing.control.interrupt !== null) {
-      return this.completeOperatorInterrupt(taskId, existing.control.interrupt);
+      return this.#completeOperatorInterrupt(taskId, existing.control.interrupt);
     }
     if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {
       return this.returnUnclaimedQuotaProbeToQueue(
@@ -2656,7 +2707,7 @@ export class OpsWorkerSupervisor {
       }
       if (result.status === "GONE" || result.status === "STOPPED") {
         if (task.control.interrupt !== null) {
-          const applied = this.completeOperatorInterrupt(
+          const applied = this.#completeOperatorInterrupt(
             task.id,
             task.control.interrupt,
           );
@@ -2744,7 +2795,7 @@ export class OpsWorkerSupervisor {
         && task.state !== "RUNNING"
         && !isOpsWorkerUnresolvedOrphan(task)
       ) {
-        this.completeOperatorInterrupt(task.id, task.control.interrupt);
+        this.#completeOperatorInterrupt(task.id, task.control.interrupt);
       }
     }
     return reconciled;
