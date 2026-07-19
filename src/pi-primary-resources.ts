@@ -262,50 +262,43 @@ function requireUnique(values: readonly string[], label: string): string[] {
   return result;
 }
 
-export function resolvePiPrimaryResourceContract(
-  options: ResolvePiPrimaryResourceContractOptions,
-): PiPrimaryResourceContract {
-  const resolvedExtensionArgs = resolvePiSpawnExtensionArgs(options.extensionOptions);
-  const extensionPaths = extensionPathsFromArgs(resolvedExtensionArgs)
-    .map((path, index) => strictTrustedFile(path, `primary extension[${index}]`));
+function buildPiPrimaryResourceContract(input: {
+  extensionPaths: readonly string[];
+  skillPaths: readonly string[];
+  toolNames: readonly string[];
+}): PiPrimaryResourceContract {
+  const extensionPaths = requireUnique(input.extensionPaths.map((path, index) =>
+    strictTrustedFile(path, `primary extension[${index}]`)), "Primary Pi extensions");
   if (extensionPaths.length === 0) {
-    throw new TypeError("Primary Pi resources must include the explicit first-party extensions");
+    throw new TypeError("Primary Pi resources must include explicit extensions");
   }
-  const uniqueExtensionPaths = requireUnique(extensionPaths, "Primary Pi extensions");
-
-  const skillPaths = options.skillPaths.map((path, index) => {
+  const skillPaths = requireUnique(input.skillPaths.map((path, index) => {
     const resolved = strictTrustedFile(path, `primary skill[${index}]`);
     if (!resolved.endsWith(".md")) {
       throw new TypeError(`primary skill[${index}] must be a direct markdown skill file`);
     }
     return resolved;
-  });
-  const uniqueSkillPaths = requireUnique(skillPaths, "Primary Pi skills");
-
-  const tools = options.toolNames.map((tool, index) => {
+  }), "Primary Pi skills");
+  const toolNames = requireUnique(input.toolNames.map((tool, index) => {
     if (typeof tool !== "string" || !TOOL_NAME_PATTERN.test(tool)) {
       throw new TypeError(`primary tool[${index}] has an invalid name`);
     }
     return tool;
-  });
-  const toolNames = requireUnique(tools, "Primary Pi tools");
+  }), "Primary Pi tools");
   for (const builtIn of PI_BUILTIN_TOOL_NAMES) {
     if (!toolNames.includes(builtIn)) {
       throw new TypeError(`Primary Pi tools are incomplete: missing built-in ${builtIn}`);
     }
   }
-
-  const extensionIdentities = uniqueExtensionPaths.map((path) =>
-    piResourceIdentity("extension", path));
-  const skillIdentities = uniqueSkillPaths.map((path) =>
-    piResourceIdentity("skill", path));
+  const extensionIdentities = extensionPaths.map((path) => piResourceIdentity("extension", path));
+  const skillIdentities = skillPaths.map((path) => piResourceIdentity("skill", path));
   const extensionsDigest = canonicalListDigest("minime-pi-extensions-v1", extensionIdentities);
   const skillsDigest = canonicalListDigest("minime-pi-skills-v1", skillIdentities);
   const toolsDigest = canonicalListDigest("minime-pi-tools-v1", toolNames);
   return {
     version: PI_PRIMARY_RESOURCE_CONTRACT_VERSION,
-    extensionPaths: uniqueExtensionPaths,
-    skillPaths: uniqueSkillPaths,
+    extensionPaths,
+    skillPaths,
     toolNames,
     extensionIdentities,
     skillIdentities,
@@ -321,66 +314,33 @@ export function resolvePiPrimaryResourceContract(
   };
 }
 
+export function resolvePiPrimaryResourceContract(
+  options: ResolvePiPrimaryResourceContractOptions,
+): PiPrimaryResourceContract {
+  const resolvedExtensionArgs = resolvePiSpawnExtensionArgs(options.extensionOptions);
+  return buildPiPrimaryResourceContract({
+    extensionPaths: extensionPathsFromArgs(resolvedExtensionArgs),
+    skillPaths: options.skillPaths,
+    toolNames: options.toolNames,
+  });
+}
+
 export function validatePiPrimaryResourceContract(
   value: PiPrimaryResourceContract,
 ): PiPrimaryResourceContract {
   if (value.version !== PI_PRIMARY_RESOURCE_CONTRACT_VERSION) {
     throw new TypeError("Primary Pi resource contract version is unsupported");
   }
-  const extensionPaths = requireUnique(value.extensionPaths.map((path, index) =>
-    strictTrustedFile(path, `primary extension[${index}]`)), "Primary Pi extensions");
-  if (extensionPaths.length === 0) {
-    throw new TypeError("Primary Pi resources must include explicit extensions");
-  }
-  const skillPaths = requireUnique(value.skillPaths.map((path, index) => {
-    const resolved = strictTrustedFile(path, `primary skill[${index}]`);
-    if (!resolved.endsWith(".md")) {
-      throw new TypeError(`primary skill[${index}] must be a direct markdown skill file`);
-    }
-    return resolved;
-  }), "Primary Pi skills");
-  const toolNames = requireUnique(value.toolNames.map((tool, index) => {
-    if (!TOOL_NAME_PATTERN.test(tool)) {
-      throw new TypeError(`primary tool[${index}] has an invalid name`);
-    }
-    return tool;
-  }), "Primary Pi tools");
-  for (const builtIn of PI_BUILTIN_TOOL_NAMES) {
-    if (!toolNames.includes(builtIn)) {
-      throw new TypeError(`Primary Pi tools are incomplete: missing built-in ${builtIn}`);
-    }
-  }
-  const extensionIdentities = extensionPaths.map((path) => piResourceIdentity("extension", path));
-  const skillIdentities = skillPaths.map((path) => piResourceIdentity("skill", path));
-  const extensionsDigest = canonicalListDigest("minime-pi-extensions-v1", extensionIdentities);
-  const skillsDigest = canonicalListDigest("minime-pi-skills-v1", skillIdentities);
-  const toolsDigest = canonicalListDigest("minime-pi-tools-v1", toolNames);
-  const digest = sha256([
-    "minime-pi-primary-resources-v1",
-    extensionsDigest,
-    skillsDigest,
-    toolsDigest,
-  ].join("\0"));
+  const rebuilt = buildPiPrimaryResourceContract(value);
   if (
-    JSON.stringify(value.extensionIdentities) !== JSON.stringify(extensionIdentities)
-    || JSON.stringify(value.skillIdentities) !== JSON.stringify(skillIdentities)
-    || value.extensionsDigest !== extensionsDigest
-    || value.skillsDigest !== skillsDigest
-    || value.toolsDigest !== toolsDigest
-    || value.digest !== digest
+    JSON.stringify(value.extensionIdentities) !== JSON.stringify(rebuilt.extensionIdentities)
+    || JSON.stringify(value.skillIdentities) !== JSON.stringify(rebuilt.skillIdentities)
+    || value.extensionsDigest !== rebuilt.extensionsDigest
+    || value.skillsDigest !== rebuilt.skillsDigest
+    || value.toolsDigest !== rebuilt.toolsDigest
+    || value.digest !== rebuilt.digest
   ) throw new TypeError("Primary Pi resource contract hashes are inconsistent");
-  return {
-    version: PI_PRIMARY_RESOURCE_CONTRACT_VERSION,
-    extensionPaths,
-    skillPaths,
-    toolNames,
-    extensionIdentities,
-    skillIdentities,
-    extensionsDigest,
-    skillsDigest,
-    toolsDigest,
-    digest,
-  };
+  return rebuilt;
 }
 
 export function resolveOpsWorkerParityExtensionPath(): string {

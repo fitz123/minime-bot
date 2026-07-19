@@ -1019,6 +1019,30 @@ describe("ops worker Pi standard-session attempts", () => {
         .some((name) => name === "quota-smoke-telemetry.json"),
       false,
     );
+
+    harness.supervisor.cancelTask(task.id, "Exercise a typed quota probe response");
+    const quotaAgain = makeTask("bounded-quota-probe-child-quota");
+    quotaAgain.state = "RESUMABLE";
+    quotaAgain.custody = {
+      status: "HELD",
+      claimedAt: quotaAgain.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    quotaAgain.lastOutcome = {
+      at: quotaAgain.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic rolling quota wait for the package-owned probe child.",
+    };
+    harness.store.create(quotaAgain);
+    harness.setScenario("quota-probe-quota");
+
+    const refreshed = await harness.runner().runNext();
+    assert.equal(refreshed?.lastOutcome?.result, "QUOTA");
+    assert.equal(refreshed?.custody.status, "HELD");
+    assert.equal(refreshed?.rounds.consecutiveInfrastructureFailures, 0);
+    assert.ok(refreshed?.schedule.nextRunAt);
   });
 
   it("durably fences and safely stops an owned quota probe process group", async (t) => {

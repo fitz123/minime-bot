@@ -669,14 +669,6 @@ async function runStart(
   let statusServer: Awaited<ReturnType<typeof startOpsWorkerStatusServer>> | undefined;
   let processAbort: ReturnType<typeof installProcessAbortSignal> | undefined;
   try {
-    await supervisor.start();
-    started = true;
-    statusServer = await startOpsWorkerStatusServer({
-      supervisor,
-      host,
-      port,
-      inspectPolicy: () => inspectPolicy(deps),
-    });
     processAbort = deps.abortSignal ? undefined : installProcessAbortSignal();
     const signal = deps.abortSignal ?? processAbort?.signal;
     if (!signal) throw new Error("Ops-worker abort signal was not initialized");
@@ -687,6 +679,14 @@ async function runStart(
       primaryResources: deps.primaryPiResources,
       abortSignal: signal,
       dependencies: deps.piAttemptDependencies,
+    });
+    await supervisor.start();
+    started = true;
+    statusServer = await startOpsWorkerStatusServer({
+      supervisor,
+      host,
+      port,
+      inspectPolicy: () => inspectPolicy(deps),
     });
     writeLine(
       cliOptions.stdout,

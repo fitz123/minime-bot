@@ -38,6 +38,8 @@ export interface OpsWorkerParityLaunch {
   reportPath: string;
   ackPath: string;
   parityExtensionPath: string;
+  parityExtensionIdentity: string;
+  primaryResources: PiPrimaryResourceContract;
   /** Generated identity wrappers followed by the package parity gate. */
   extensionPaths: readonly string[];
 }
@@ -81,7 +83,7 @@ function writePrivateExtensionWrapper(
     "import { createHash } from 'node:crypto';",
     "import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';",
     "import { normalize, resolve } from 'node:path';",
-    `import targetExtension from ${JSON.stringify(pathToFileURL(targetPath).href)};`,
+    `const targetExtensionUrl = ${JSON.stringify(pathToFileURL(targetPath).href)};`,
     `const expectedFiles = ${JSON.stringify(resourceFiles)};`,
     "function sha256(value) { return `sha256:${createHash('sha256').update(value).digest('hex')}`; }",
     "function verifyPinnedResources() {",
@@ -102,6 +104,10 @@ function writePrivateExtensionWrapper(
     "}",
     "export default async function minimeOpsExtensionWrapper(pi) {",
     "  verifyPinnedResources();",
+    "  const imported = await import(targetExtensionUrl);",
+    "  verifyPinnedResources();",
+    "  const targetExtension = imported.default;",
+    "  if (typeof targetExtension !== 'function') throw new TypeError('Pinned Pi extension has no default factory');",
     "  await targetExtension(pi);",
     "  verifyPinnedResources();",
     `  pi.registerCommand(${JSON.stringify(marker)}, { handler: async () => {} });`,
@@ -175,6 +181,8 @@ export function prepareOpsWorkerParityLaunch(input: {
     reportPath,
     ackPath,
     parityExtensionPath: input.parityExtensionPath,
+    parityExtensionIdentity,
+    primaryResources: resources,
     extensionPaths: [...wrappedExtensionPaths, input.parityExtensionPath],
   };
 }
@@ -238,6 +246,11 @@ export function tryReadOpsWorkerParityReport(
 export function acknowledgeOpsWorkerParityPass(launch: OpsWorkerParityLaunch): void {
   if (tryReadOpsWorkerParityReport(launch)?.status !== "PASS") {
     throw new Error("Cannot acknowledge a missing or failed Pi parity report");
+  }
+  validatePiPrimaryResourceContract(launch.primaryResources);
+  if (piResourceIdentity("extension", launch.parityExtensionPath)
+    !== launch.parityExtensionIdentity) {
+    throw new Error("Ops-worker parity extension changed before acknowledgement");
   }
   const staging = `${launch.ackPath}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   writeFileSync(staging, `${launch.expected.digest}\n`, { mode: 0o600, flag: "wx" });

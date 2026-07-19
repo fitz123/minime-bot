@@ -7,10 +7,12 @@ import {
   openSync,
   readFileSync,
 } from "node:fs";
-import type {
-  CodexQuotaSnapshot,
-  CodexQuotaWindow,
-  CodexQuotaWindowName,
+import {
+  CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION,
+  type CodexQuotaAttemptCapture,
+  type CodexQuotaSnapshot,
+  type CodexQuotaWindow,
+  type CodexQuotaWindowName,
 } from "../pi-extensions/codex-usage.js";
 
 export const OPS_WORKER_QUOTA_POLICY_VERSION = 1 as const;
@@ -43,6 +45,7 @@ const WINDOW_KEYS = new Set([
   "resetAt",
   "resetTimestamp",
 ]);
+const ATTEMPT_CAPTURE_KEYS = new Set(["version", "responseStatus", "snapshot"]);
 
 export type OpsWorkerQuotaReadStatus =
   | "OK"
@@ -53,6 +56,10 @@ export type OpsWorkerQuotaReadStatus =
 
 export type OpsWorkerQuotaReadResult =
   | { status: "OK"; snapshot: CodexQuotaSnapshot }
+  | { status: Exclude<OpsWorkerQuotaReadStatus, "OK"> };
+
+export type OpsWorkerQuotaAttemptReadResult =
+  | { status: "OK"; responseStatus: number; snapshot: CodexQuotaSnapshot | null }
   | { status: Exclude<OpsWorkerQuotaReadStatus, "OK"> };
 
 export interface OpsWorkerQuotaReader {
@@ -116,36 +123,36 @@ export class CodexQuotaFileReader implements OpsWorkerQuotaReader {
   }
 
   read(): OpsWorkerQuotaReadResult {
-    let raw: string;
+    const file = readBoundedQuotaFile(this.stateFile);
+    if (file.status !== "OK") return file;
     try {
-      const stats = lstatSync(this.stateFile);
-      if (!stats.isFile() || stats.isSymbolicLink()) return { status: "INVALID" };
-      if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
-        return { status: "INVALID" };
-      }
-      if (stats.size < 2 || stats.size > MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES) {
-        return { status: "INVALID" };
-      }
-      const fd = openSync(this.stateFile, constants.O_RDONLY | constants.O_NOFOLLOW);
-      try {
-        const openedStats = fstatSync(fd);
-        if (
-          !openedStats.isFile()
-          || (typeof process.getuid === "function" && openedStats.uid !== process.getuid())
-          || openedStats.size < 2
-          || openedStats.size > MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES
-        ) return { status: "INVALID" };
-        raw = readFileSync(fd, "utf8");
-      } finally {
-        closeSync(fd);
-      }
+      return { status: "OK", snapshot: parseStrictCodexQuotaSnapshot(JSON.parse(file.raw)) };
     } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "ENOENT"
-        ? { status: "MISSING" }
-        : { status: "READ_ERROR" };
+      if (error instanceof QuotaShapeError && error.reason === "DURATIONLESS") {
+        return { status: "DURATIONLESS" };
+      }
+      return { status: "INVALID" };
     }
+  }
+}
+
+export class CodexQuotaAttemptFileReader {
+  constructor(private readonly attemptFile: string) {
+    if (typeof attemptFile !== "string" || attemptFile.trim() === "") {
+      throw new TypeError("Codex quota attempt file must be a non-empty path");
+    }
+  }
+
+  read(): OpsWorkerQuotaAttemptReadResult {
+    const file = readBoundedQuotaFile(this.attemptFile);
+    if (file.status !== "OK") return file;
     try {
-      return { status: "OK", snapshot: parseStrictCodexQuotaSnapshot(JSON.parse(raw)) };
+      const captured = parseStrictCodexQuotaAttemptCapture(JSON.parse(file.raw));
+      return {
+        status: "OK",
+        responseStatus: captured.responseStatus,
+        snapshot: captured.snapshot,
+      };
     } catch (error) {
       if (error instanceof QuotaShapeError && error.reason === "DURATIONLESS") {
         return { status: "DURATIONLESS" };
@@ -388,6 +395,57 @@ class QuotaShapeError extends Error {
   }
 }
 
+function readBoundedQuotaFile(path: string):
+  | { status: "OK"; raw: string }
+  | { status: Exclude<OpsWorkerQuotaReadStatus, "OK" | "DURATIONLESS"> } {
+  try {
+    const stats = lstatSync(path);
+    if (!stats.isFile() || stats.isSymbolicLink()) return { status: "INVALID" };
+    if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+      return { status: "INVALID" };
+    }
+    if (stats.size < 2 || stats.size > MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES) {
+      return { status: "INVALID" };
+    }
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const openedStats = fstatSync(fd);
+      if (
+        !openedStats.isFile()
+        || (typeof process.getuid === "function" && openedStats.uid !== process.getuid())
+        || openedStats.size < 2
+        || openedStats.size > MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES
+      ) return { status: "INVALID" };
+      return { status: "OK", raw: readFileSync(fd, "utf8") };
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { status: "MISSING" }
+      : { status: "READ_ERROR" };
+  }
+}
+
+function parseStrictCodexQuotaAttemptCapture(value: unknown): CodexQuotaAttemptCapture {
+  const captured = plainObject(value);
+  if (
+    Object.keys(captured).length !== ATTEMPT_CAPTURE_KEYS.size
+    || Object.keys(captured).some((key) => !ATTEMPT_CAPTURE_KEYS.has(key))
+    || captured.version !== CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION
+    || !Number.isSafeInteger(captured.responseStatus)
+    || (captured.responseStatus as number) < 100
+    || (captured.responseStatus as number) > 599
+  ) throw new QuotaShapeError("INVALID");
+  return {
+    version: CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION,
+    responseStatus: captured.responseStatus as number,
+    snapshot: captured.snapshot === null
+      ? null
+      : parseStrictCodexQuotaSnapshot(captured.snapshot),
+  };
+}
+
 function parseStrictCodexQuotaSnapshot(value: unknown): CodexQuotaSnapshot {
   const snapshot = plainObject(value);
   if (Object.keys(snapshot).some((key) => !SNAPSHOT_KEYS.has(key))) {
@@ -410,9 +468,25 @@ function parseStrictCodexQuotaSnapshot(value: unknown): CodexQuotaSnapshot {
     || !timestamp(snapshot.lastSuccess)
     || !nonNegativeInteger(snapshot.lastSuccessTimestamp)
   ) throw new QuotaShapeError("INVALID");
+  const attemptFields = [
+    snapshot.lastAttempt,
+    snapshot.lastAttemptTimestamp,
+    snapshot.probeSuccess,
+  ];
+  const attemptFieldsPresent = attemptFields.filter((field) => field !== undefined).length;
+  if (attemptFieldsPresent !== 0 && attemptFieldsPresent !== attemptFields.length) {
+    throw new QuotaShapeError("INVALID");
+  }
   optionalTimestamp(snapshot.lastAttempt);
   optionalNonNegativeInteger(snapshot.lastAttemptTimestamp);
-  if (snapshot.probeSuccess !== undefined && typeof snapshot.probeSuccess !== "boolean") {
+  if (
+    snapshot.probeSuccess !== undefined
+    && (
+      typeof snapshot.probeSuccess !== "boolean"
+      || Math.floor(Date.parse(snapshot.lastAttempt as string) / 1_000)
+        !== snapshot.lastAttemptTimestamp
+    )
+  ) {
     throw new QuotaShapeError("INVALID");
   }
   optionalBoundedText(snapshot.planType);

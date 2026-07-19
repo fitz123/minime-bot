@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -890,6 +891,38 @@ describe("ops worker CLI and inactive runtime", () => {
     const waiting = store.get(taskId);
     assert.equal(waiting?.custody.status, "UNCLAIMED");
     assert.equal(waiting?.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+  });
+
+  it("validates Pi runner inputs before acquiring the supervisor lock or serving status", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    let lockPresentDuringValidation: boolean | undefined;
+    const result = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], fixture.root, dependencies(contracts, {
+      piAttemptDependencies: {
+        resolveParityExtensionPath: () => {
+          lockPresentDuringValidation = existsSync(
+            join(fixture.stateDirectory, "supervisor.lock"),
+          );
+          throw new Error("synthetic start-time parity resource validation failure");
+        },
+      },
+    }));
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /start-time parity resource validation failure/);
+    assert.equal(lockPresentDuringValidation, false);
+    assert.equal(result.stdout.includes("Ops worker started"), false);
+    assert.equal(existsSync(join(fixture.stateDirectory, "supervisor.lock")), false);
   });
 
   it("stops active Pi work before worker shutdown releases the supervisor", async (t) => {

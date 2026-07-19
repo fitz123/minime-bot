@@ -60,7 +60,7 @@ import {
 import type { AgentConfig, PiThinkingLevel } from "../types.js";
 import { hasFreshOpsWorkerAuthorizationPass } from "./authorization.js";
 import {
-  CodexQuotaFileReader,
+  CodexQuotaAttemptFileReader,
   evaluateOpsWorkerQuotaResponse,
   type OpsWorkerQuotaReadStatus,
 } from "./quota.js";
@@ -1015,7 +1015,12 @@ export class OpsWorkerPiAttemptRunner {
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
-    const classification = classifyOpsWorkerPiExit(exit);
+    const attemptQuota = new CodexQuotaAttemptFileReader(attemptQuotaFile).read();
+    const classification = classifyOpsWorkerPiExit(exit, {
+      quotaResponse: attemptQuota.status === "OK"
+        ? attemptQuota.responseStatus === 429
+        : undefined,
+    });
     const evidence = formatAttemptEvidence(exit);
     if (classification === "SUCCESS_CLAIM") {
       safeUnlink(attemptQuotaFile);
@@ -1035,7 +1040,9 @@ export class OpsWorkerPiAttemptRunner {
     }
     if (classification === "QUOTA") {
       const response = evaluateOpsWorkerQuotaResponse(
-        new CodexQuotaFileReader(attemptQuotaFile).read(),
+        attemptQuota.status === "OK" && attemptQuota.snapshot !== null
+          ? { status: "OK", snapshot: attemptQuota.snapshot }
+          : { status: attemptQuota.status === "OK" ? "MISSING" : attemptQuota.status },
         { now: this.now() },
       );
       safeUnlink(attemptQuotaFile);
@@ -1555,12 +1562,17 @@ export class OpsWorkerPiAttemptRunner {
         cleanup.summary ?? "Quota smoke probe descendants could not be proven gone",
       );
     }
-    const read = new CodexQuotaFileReader(request.attemptFile).read();
+    const read = new CodexQuotaAttemptFileReader(request.attemptFile).read();
     safeUnlink(request.attemptFile);
     if (read.status !== "OK") {
       return { status: "TELEMETRY_ERROR", readStatus: read.status };
     }
-    const classification = classifyOpsWorkerPiExit(exit);
+    const classification = classifyOpsWorkerPiExit(exit, {
+      quotaResponse: read.responseStatus === 429,
+    });
+    if (read.snapshot === null) {
+      return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
+    }
     if (classification === "SUCCESS_CLAIM") {
       return { status: "SUCCESS", snapshot: read.snapshot };
     }
@@ -1692,6 +1704,7 @@ export const OPS_WORKER_SYSTEM_POLICY = [
 
 export function classifyOpsWorkerPiExit(
   exit: Pick<OpsWorkerPiExit, "code" | "signal" | "error" | "stdout" | "stderr">,
+  options: { quotaResponse?: boolean } = {},
 ): OpsWorkerPiExitClassification {
   if (exit.error === null && exit.signal === null && exit.code === 0) {
     return "SUCCESS_CLAIM";
@@ -1699,6 +1712,7 @@ export function classifyOpsWorkerPiExit(
   const combined = sanitizePiProcessOutput(
     [exit.error?.message, exit.stderr, exit.stdout].filter(Boolean).join("\n"),
   );
+  if (options.quotaResponse === true) return "QUOTA";
   if (
     /session file is not a valid pi session|no session found matching|session.*(?:corrupt|malformed)/i
       .test(combined)
@@ -1708,6 +1722,8 @@ export function classifyOpsWorkerPiExit(
       .test(combined)
   ) return "CONTEXT_OVERFLOW";
   if (
+    options.quotaResponse === undefined
+    &&
     /\b(?:quota|rate[ _-]?limit|too many requests|usage limit|http 429|status 429)\b/i
       .test(combined)
   ) return "QUOTA";

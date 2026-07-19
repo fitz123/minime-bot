@@ -174,6 +174,26 @@ describe("ops worker Codex quota admission", () => {
       writeFileSync(stateFile, `${JSON.stringify(durationless)}\n`, "utf8");
       assert.equal(reader.read().status, "DURATIONLESS");
 
+      const validAttempt = {
+        ...snapshot(),
+        lastAttempt: "2026-07-18T11:58:30.000Z",
+        lastAttemptTimestamp: Date.parse("2026-07-18T11:58:30.000Z") / 1_000,
+        probeSuccess: true,
+      };
+      writeFileSync(stateFile, `${JSON.stringify(validAttempt)}\n`, "utf8");
+      assert.equal(reader.read().status, "OK");
+
+      writeFileSync(
+        stateFile,
+        `${JSON.stringify({ ...validAttempt, lastAttemptTimestamp: 1 })}\n`,
+        "utf8",
+      );
+      assert.equal(reader.read().status, "INVALID");
+
+      const partialAttempt = { ...snapshot(), probeSuccess: false };
+      writeFileSync(stateFile, `${JSON.stringify(partialAttempt)}\n`, "utf8");
+      assert.equal(reader.read().status, "INVALID");
+
       const target = join(root, "target.json");
       writeFileSync(target, `${JSON.stringify(snapshot())}\n`, "utf8");
       rmSync(stateFile);

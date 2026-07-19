@@ -14,6 +14,7 @@ export const CODEX_QUOTA_STATE_FILE_ENV = "CODEX_QUOTA_STATE_FILE";
 export const CODEX_QUOTA_TEXTFILE_DIR_ENV = "CODEX_QUOTA_TEXTFILE_DIR";
 export const NODE_EXPORTER_TEXTFILE_DIR_ENV = "NODE_EXPORTER_TEXTFILE_DIR";
 export const CODEX_QUOTA_ATTEMPT_FILE_ENV = "CODEX_QUOTA_ATTEMPT_FILE";
+export const CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION = 1 as const;
 export const DEFAULT_NODE_EXPORTER_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
 export const DEFAULT_CODEX_QUOTA_STATE_FILENAME = "codex-quota-state.json";
 export const DEFAULT_CODEX_QUOTA_STATE_RELPATH = join(".tmp", DEFAULT_CODEX_QUOTA_STATE_FILENAME);
@@ -75,6 +76,14 @@ export interface CodexQuotaCaptureOptions {
   cwd?: string;
   attemptFile?: string;
   now?: Date;
+  /** Include the provider HTTP status for exact-attempt ops-worker classification. */
+  captureResponseStatus?: boolean;
+}
+
+export interface CodexQuotaAttemptCapture {
+  version: typeof CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION;
+  responseStatus: number;
+  snapshot: CodexQuotaSnapshot | null;
 }
 
 export interface CodexQuotaWriteResult {
@@ -88,9 +97,19 @@ export type CodexQuotaRecordResult =
   | { status: "write_error"; snapshot: CodexQuotaSnapshot; error: unknown };
 
 export type CodexQuotaCaptureResult =
-  | { status: "no_quota_headers" }
-  | { status: "captured"; snapshot: CodexQuotaSnapshot; attemptFile: string }
-  | { status: "write_error"; snapshot: CodexQuotaSnapshot; error: unknown };
+  | {
+    status: "no_quota_headers";
+    attemptFile?: string;
+    responseStatus?: number;
+  }
+  | { status: "invalid_response_status" }
+  | {
+    status: "captured";
+    snapshot: CodexQuotaSnapshot;
+    attemptFile: string;
+    responseStatus?: number;
+  }
+  | { status: "write_error"; snapshot?: CodexQuotaSnapshot; error: unknown };
 
 interface HeaderGetter {
   get: (name: string) => unknown;
@@ -162,6 +181,15 @@ export function extractCodexResponseHeaders(input: unknown): unknown | undefined
   return findHeaderSource(input, 0, new Set<object>());
 }
 
+export function extractCodexResponseStatus(input: unknown): number | undefined {
+  const event = Array.isArray(input) ? input[0] : input;
+  if (!event || typeof event !== "object") return undefined;
+  const status = (event as Record<string, unknown>).status;
+  return Number.isSafeInteger(status) && (status as number) >= 100 && (status as number) <= 599
+    ? status as number
+    : undefined;
+}
+
 export function recordCodexQuotaFromProviderResponse(
   input: unknown,
   options: CodexQuotaWriteOptions & { now?: Date } = {},
@@ -197,26 +225,67 @@ export function captureCodexQuotaFromProviderResponse(
   input: unknown,
   options: CodexQuotaCaptureOptions = {},
 ): CodexQuotaCaptureResult {
+  const responseStatus = options.captureResponseStatus
+    ? extractCodexResponseStatus(input)
+    : undefined;
+  if (options.captureResponseStatus && responseStatus === undefined) {
+    return { status: "invalid_response_status" };
+  }
   const headers = extractCodexResponseHeaders(input);
   if (!headers) {
-    return { status: "no_quota_headers" };
+    return responseStatus === undefined
+      ? { status: "no_quota_headers" }
+      : captureCodexQuotaFromHeadersInternal(undefined, options, responseStatus);
   }
-  return captureCodexQuotaFromHeaders(headers, options);
+  return captureCodexQuotaFromHeadersInternal(headers, options, responseStatus);
 }
 
 export function captureCodexQuotaFromHeaders(
   headers: unknown,
   options: CodexQuotaCaptureOptions = {},
 ): CodexQuotaCaptureResult {
+  if (options.captureResponseStatus) return { status: "invalid_response_status" };
+  return captureCodexQuotaFromHeadersInternal(headers, options);
+}
+
+function captureCodexQuotaFromHeadersInternal(
+  headers: unknown,
+  options: CodexQuotaCaptureOptions,
+  responseStatus?: number,
+): CodexQuotaCaptureResult {
   const snapshot = parseCodexQuotaHeaders(headers, options.now ?? new Date());
   if (!snapshot) {
-    return { status: "no_quota_headers" };
+    if (responseStatus === undefined) return { status: "no_quota_headers" };
+    try {
+      const attemptFile = resolveCodexQuotaAttemptFile(options);
+      const captured: CodexQuotaAttemptCapture = {
+        version: CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION,
+        responseStatus,
+        snapshot: null,
+      };
+      atomicWriteFile(attemptFile, `${JSON.stringify(captured, null, 2)}\n`);
+      return { status: "no_quota_headers", attemptFile, responseStatus };
+    } catch (error) {
+      return { status: "write_error", error };
+    }
   }
 
   try {
     const attemptFile = resolveCodexQuotaAttemptFile(options);
-    atomicWriteFile(attemptFile, `${JSON.stringify(snapshot, null, 2)}\n`);
-    return { status: "captured", snapshot, attemptFile };
+    const captured: CodexQuotaSnapshot | CodexQuotaAttemptCapture = responseStatus === undefined
+      ? snapshot
+      : {
+        version: CODEX_QUOTA_ATTEMPT_CAPTURE_VERSION,
+        responseStatus,
+        snapshot,
+      };
+    atomicWriteFile(attemptFile, `${JSON.stringify(captured, null, 2)}\n`);
+    return {
+      status: "captured",
+      snapshot,
+      attemptFile,
+      ...(responseStatus === undefined ? {} : { responseStatus }),
+    };
   } catch (error) {
     return { status: "write_error", snapshot, error };
   }

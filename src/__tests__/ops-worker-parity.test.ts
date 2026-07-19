@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -16,9 +18,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   attestOpsWorkerPiParity,
   createExpectedOpsWorkerParityContract,
+  opsWorkerEffectiveContextDigest,
   parseOpsWorkerParityAttestationReport,
   type OpsWorkerParityRuntimeSnapshot,
 } from "../pi-extensions/ops-worker-parity-attestation.js";
+import { CODEX_QUOTA_ATTEMPT_FILE_ENV } from "../pi-extensions/codex-usage.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   piResourceIdentity,
@@ -28,6 +32,7 @@ import {
 } from "../pi-primary-resources.js";
 import { resolvePiSpawnExtensionArgs } from "../pi-rpc-protocol.js";
 import {
+  acknowledgeOpsWorkerParityPass,
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
 } from "../ops-worker/parity.js";
@@ -466,9 +471,11 @@ describe("ops-worker before-provider parity attestation", () => {
     const wrapperIndex = resources.extensionPaths.indexOf(realpathSync(extension));
     assert.ok(wrapperIndex >= 0);
 
+    const sideEffectKey = `__minimeParitySideEffect${Date.now()}`;
     writeFileSync(
       implementation,
-      "export function register(pi) { pi.on('changed', () => undefined); }\n",
+      `globalThis[${JSON.stringify(sideEffectKey)}] = true;\n`
+        + "export function register(pi) { pi.on('changed', () => undefined); }\n",
       "utf8",
     );
     const wrapper = (await import(
@@ -476,6 +483,7 @@ describe("ops-worker before-provider parity attestation", () => {
     )).default;
     const commands: string[] = [];
     const events: string[] = [];
+    assert.equal((globalThis as Record<string, unknown>)[sideEffectKey], undefined);
     await assert.rejects(
       wrapper({
         registerCommand: (name: string) => commands.push(name),
@@ -483,19 +491,86 @@ describe("ops-worker before-provider parity attestation", () => {
       }),
       /resource changed after parity preparation/,
     );
+    assert.equal((globalThis as Record<string, unknown>)[sideEffectKey], undefined);
     assert.deepEqual(commands, []);
     assert.deepEqual(events, []);
+  });
+
+  it("revalidates pinned resources immediately before parity acknowledgement", () => {
+    const root = tempDirectory();
+    const implementation = join(root, "ack-implementation.mjs");
+    const extension = join(root, "ack-extension.mjs");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(implementation, "export default function ackImplementation() {}\n", "utf8");
+    writeFileSync(extension, "export { default } from './ack-implementation.mjs';\n", "utf8");
+    writeFileSync(skill, "# ACK parity fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        extraExtensions: [extension],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    writeFileSync(launch.reportPath, `${JSON.stringify({
+      version: 1,
+      status: "PASS",
+      expectedDigest: launch.expected.digest,
+      primaryContextDigest: launch.expected.primaryContextDigest,
+      actualContextDigest: opsWorkerEffectiveContextDigest({
+        customPromptHash: launch.expected.customPromptHash,
+        appendSystemPromptHash: launch.expected.appendSystemPromptHash,
+        contextFilesDigest: launch.expected.contextFilesDigest,
+      }),
+      actualSystemPromptHash: sha256("GENERIC_EFFECTIVE_SYSTEM_PROMPT"),
+      actualCapabilityDigest: launch.expected.capabilityDigest,
+      actualExtensionsDigest: launch.expected.extensionsDigest,
+      actualSkillsDigest: launch.expected.skillsDigest,
+      actualToolsDigest: launch.expected.toolsDigest,
+      mismatch: [],
+    })}\n`, "utf8");
+
+    writeFileSync(implementation, "export default function changedAfterReport() {}\n", "utf8");
+    assert.throws(
+      () => acknowledgeOpsWorkerParityPass(launch),
+      /hashes are inconsistent/,
+    );
+    assert.equal(existsSync(launch.ackPath), false);
   });
 
   it("ships a package-owned marker, parity gate, and attempt quota capture", async () => {
     const commands: string[] = [];
     const events: string[] = [];
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
     const wrapper = (await import(
       `${pathToFileURL(resolve(PACKAGE_ROOT, "extensions", "pi", "ops-worker-parity-attestation.ts")).href}?test=${Date.now()}`
     )).default;
     wrapper({
       registerCommand: (name: string) => commands.push(name),
-      on: (event: string) => events.push(event),
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        events.push(event);
+        handlers.set(event, handler);
+      },
     } as unknown as ExtensionAPI);
     assert.deepEqual(commands, ["minime-ops-parity-resource"]);
     assert.deepEqual(events, [
@@ -504,5 +579,48 @@ describe("ops-worker before-provider parity attestation", () => {
       "tool_call",
       "after_provider_response",
     ]);
+    const toolCall = handlers.get("tool_call");
+    const afterProviderResponse = handlers.get("after_provider_response");
+    assert.ok(toolCall);
+    assert.ok(afterProviderResponse);
+    const attemptFile = join(tempDirectory(), "attempt-quota.json");
+    const originalProbe = process.env.MINIME_OPS_WORKER_QUOTA_PROBE;
+    const originalAttemptFile = process.env[CODEX_QUOTA_ATTEMPT_FILE_ENV];
+    try {
+      delete process.env.MINIME_OPS_WORKER_QUOTA_PROBE;
+      assert.equal(await toolCall({ name: "read" }), undefined);
+      process.env.MINIME_OPS_WORKER_QUOTA_PROBE = "1";
+      assert.deepEqual(await toolCall({ name: "read" }), {
+        block: true,
+        reason: "Quota smoke probes cannot execute tools",
+      });
+      process.env[CODEX_QUOTA_ATTEMPT_FILE_ENV] = attemptFile;
+      await afterProviderResponse({
+        status: 429,
+        headers: {
+          "x-codex-primary-used-percent": "100",
+          "x-codex-primary-reset-at": "1784476800",
+        },
+      });
+      const capture = JSON.parse(readFileSync(attemptFile, "utf8")) as Record<string, unknown>;
+      assert.equal(capture.version, 1);
+      assert.equal(capture.responseStatus, 429);
+      assert.equal(
+        ((capture.snapshot as { windows: { "5h": { usedPercent: number } } })
+          .windows["5h"].usedPercent),
+        100,
+      );
+      await afterProviderResponse({ status: 429, headers: {} });
+      const missingTelemetry = JSON.parse(
+        readFileSync(attemptFile, "utf8"),
+      ) as Record<string, unknown>;
+      assert.equal(missingTelemetry.responseStatus, 429);
+      assert.equal(missingTelemetry.snapshot, null);
+    } finally {
+      if (originalProbe === undefined) delete process.env.MINIME_OPS_WORKER_QUOTA_PROBE;
+      else process.env.MINIME_OPS_WORKER_QUOTA_PROBE = originalProbe;
+      if (originalAttemptFile === undefined) delete process.env[CODEX_QUOTA_ATTEMPT_FILE_ENV];
+      else process.env[CODEX_QUOTA_ATTEMPT_FILE_ENV] = originalAttemptFile;
+    }
   });
 });

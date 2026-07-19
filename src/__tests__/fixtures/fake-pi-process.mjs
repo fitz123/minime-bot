@@ -10,7 +10,6 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readExpectedOpsWorkerParityContract } from "../../pi-extensions/ops-worker-parity-attestation.js";
-import { captureCodexQuotaFromHeaders } from "../../pi-extensions/codex-usage.js";
 
 const [scenario, ...args] = process.argv.slice(2);
 const quotaProbe = scenario.startsWith("quota-probe-");
@@ -192,6 +191,20 @@ if (
   process.exit(78);
 }
 
+for (const handler of handlers.get("tool_call") ?? []) {
+  const decision = await handler({ name: "fixture-tool" }, {});
+  if (quotaProbe ? decision?.block !== true : decision !== undefined) {
+    process.stderr.write("fake Pi quota probe tool gate mismatch\n");
+    process.exit(78);
+  }
+}
+
+async function emitProviderResponse(status, headers) {
+  for (const handler of handlers.get("after_provider_response") ?? []) {
+    await handler({ status, headers }, {});
+  }
+}
+
 switch (scenario) {
   case "success":
     process.stdout.write("fake Pi success claim\n");
@@ -204,26 +217,26 @@ switch (scenario) {
     process.exitCode = 2;
     break;
   case "quota":
-    captureCodexQuotaFromHeaders({
+    await emitProviderResponse(429, {
       "x-codex-primary-used-percent": "100",
       "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
     });
-    process.stderr.write("HTTP 429 rate limit quota exhausted\n");
+    process.stderr.write("fake Pi provider request rejected\n");
     process.exitCode = 1;
     break;
   case "quota-probe-success":
-    captureCodexQuotaFromHeaders({
+    await emitProviderResponse(200, {
       "x-codex-primary-used-percent": "10",
       "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 18_000),
     });
     process.stdout.write("OK\n");
     break;
   case "quota-probe-quota":
-    captureCodexQuotaFromHeaders({
+    await emitProviderResponse(429, {
       "x-codex-primary-used-percent": "100",
       "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
     });
-    process.stderr.write("HTTP 429 quota smoke probe rate limit\n");
+    process.stderr.write("fake Pi quota probe provider request rejected\n");
     process.exitCode = 1;
     break;
   case "quota-probe-wait":

@@ -72,9 +72,10 @@ export default function (pi: ExtensionAPI): void {
     };
   });
 
-  pi.on("after_provider_response", (...args: unknown[]) => {
-    const event = args.length === 1 ? args[0] : args;
-    const result = captureCodexQuotaFromProviderResponse(event);
+  pi.on("after_provider_response", (event: unknown) => {
+    const result = captureCodexQuotaFromProviderResponse(event, {
+      captureResponseStatus: true,
+    });
     if (result.status === "write_error") {
       // eslint-disable-next-line no-console -- bounded package-owned capture failure
       console.warn(formatCodexQuotaWriteError(result.error));
