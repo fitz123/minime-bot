@@ -341,11 +341,12 @@ function makeStore(
     directory?: string;
     maxJournalBytes?: number;
     faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
+    now?: () => Date;
   } = {},
 ): OpsWorkerTaskStore {
   return new OpsWorkerTaskStore(options.directory ?? testStateDirectory(t), {
     registry,
-    now: () => new Date(NOW),
+    now: options.now ?? (() => new Date(NOW)),
     maxJournalBytes: options.maxJournalBytes,
     faultInjector: options.faultInjector,
   });
@@ -505,6 +506,67 @@ describe("ops worker task contract", () => {
     assert.ok(
       Buffer.byteLength(JSON.stringify(migrated), "utf8")
       <= OPS_WORKER_LIMITS.maxSnapshotBytes,
+    );
+  });
+
+  it("keeps a valid near-limit v4 snapshot readable and writable after v5 expansion", (t) => {
+    const input = makeV4Task("near-limit-v4", "near:limit:v4");
+    const evidence = {
+      at: NOW,
+      kind: "operator" as const,
+      trust: "trusted" as const,
+      summary: "x",
+      artifact: null,
+    };
+    input.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      () => ({ ...evidence }),
+    );
+    const targetBytes = OPS_WORKER_LIMITS.maxPreV5SnapshotBytes - 64;
+    let remaining = targetBytes - Buffer.byteLength(JSON.stringify(input), "utf8");
+    for (const entry of input.evidence) {
+      if (remaining === 0) break;
+      const escapedCharacters = Math.min(
+        OPS_WORKER_LIMITS.maxEvidenceSummaryBytes - 1,
+        Math.floor(remaining / 6),
+      );
+      entry.summary = `x${"\u0001".repeat(escapedCharacters)}`;
+      remaining -= escapedCharacters * 6;
+      if (remaining > 0 && remaining < 6) {
+        entry.summary += "x".repeat(remaining);
+        remaining = 0;
+      }
+    }
+    assert.equal(remaining, 0);
+    const raw = JSON.stringify(input);
+    assert.ok(
+      Buffer.byteLength(raw, "utf8") < OPS_WORKER_LIMITS.maxPreV5SnapshotBytes,
+    );
+    assert.ok(
+      Buffer.byteLength(raw, "utf8")
+      > OPS_WORKER_LIMITS.maxPreV5SnapshotBytes - 128,
+    );
+
+    const migrated = parseOpsWorkerTaskJson(raw, registry);
+
+    assert.equal(migrated.schemaVersion, 5);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      > OPS_WORKER_LIMITS.maxPreV5SnapshotBytes,
+    );
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(migrated), "utf8")
+      <= OPS_WORKER_LIMITS.maxSnapshotBytes,
+    );
+
+    const store = makeStore(t);
+    const snapshotPath = join(store.tasksDirectory, `${input.id}.json`);
+    writeFileSync(snapshotPath, `${raw}\n`, { mode: 0o600 });
+    assert.equal(store.get(input.id)?.schemaVersion, 5);
+    store.replace(migrated, { event: "UPDATED" });
+    assert.equal(
+      (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
+      5,
     );
   });
 
@@ -1445,6 +1507,54 @@ describe("ops worker durable task store", () => {
       ),
       /terminal task/,
     );
+  });
+
+  it("keeps steering and control mutation timestamps monotonic when the clock regresses", (t) => {
+    const store = makeStore(t, {
+      now: () => new Date("2020-01-01T00:00:00.000Z"),
+    });
+    const task = makeTask("steering-regressed-clock", "steering:regressed-clock");
+    store.create(task);
+    const steering = (steeringId: string, kind: "answer" | "pause" | "cancel") => ({
+      steeringId,
+      receivedAt: NOW,
+      kind,
+      operatorRef: "telegram:100000000",
+      text: kind,
+      consumedAt: null,
+    });
+    const timestamps: string[] = [];
+
+    timestamps.push(store.appendSteering(
+      task.id,
+      steering("telegram:update:regressed:1", "answer"),
+    ).task.updatedAt);
+    const paused = store.appendSteeringAndSetPaused(
+      task.id,
+      steering("telegram:update:regressed:2", "pause"),
+      true,
+    ).task;
+    timestamps.push(paused.updatedAt);
+    assert.equal(paused.control.pausedAt, paused.updatedAt);
+    timestamps.push(store.clearPaused(task.id).task.updatedAt);
+    timestamps.push(store.appendSteeringAndSetInterrupt(
+      task.id,
+      steering("telegram:update:regressed:3", "cancel"),
+      { requestedAt: NOW, mode: "cancel", reason: "bounded cancellation" },
+    ).task.updatedAt);
+    timestamps.push(store.clearInterrupt(task.id).task.updatedAt);
+    timestamps.push(store.setInterrupt(task.id, {
+      requestedAt: NOW,
+      mode: "pause",
+      reason: "bounded pause",
+    }).task.updatedAt);
+    timestamps.push(store.clearInterrupt(task.id).task.updatedAt);
+
+    assert.deepEqual(
+      timestamps.map((timestamp) => Date.parse(timestamp)),
+      timestamps.map((_timestamp, index) => Date.parse(NOW) + index + 1),
+    );
+    assert.equal(store.get(task.id)?.control.pausedAt, timestamps[5]);
   });
 
   it("persists report evidence on migrated legacy DONE snapshots without inventing PASS", (t) => {

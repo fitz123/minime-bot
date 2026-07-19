@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -33,6 +35,35 @@ function fingerprint(updateId: number, suffix = "fixture"): string {
 const ACKNOWLEDGED_AT = new Date("2026-07-19T10:00:00.000Z");
 
 describe("ops worker Telegram control ledger", () => {
+  it("rejects relative and symlinked ledger path boundaries without changing targets", (t) => {
+    assert.throws(
+      () => new OpsWorkerControlLedger("relative-state"),
+      /absolute path/,
+    );
+
+    const directory = stateDirectory(t);
+    const outsideDirectory = stateDirectory(t);
+    const sentinel = join(outsideDirectory, "sentinel.txt");
+    writeFileSync(sentinel, "outside-directory-target\n", { mode: 0o600 });
+    symlinkSync(outsideDirectory, join(directory, "control"), "dir");
+    assert.throws(
+      () => new OpsWorkerControlLedger(directory),
+      /not a real directory/,
+    );
+    assert.equal(readFileSync(sentinel, "utf8"), "outside-directory-target\n");
+
+    const fileDirectory = stateDirectory(t);
+    const controlDirectory = join(fileDirectory, "control");
+    mkdirSync(controlDirectory, { mode: 0o700 });
+    const outsideFile = join(stateDirectory(t), "outside-ledger.json");
+    writeFileSync(outsideFile, "outside-file-target\n", { mode: 0o600 });
+    symlinkSync(outsideFile, join(controlDirectory, "telegram.json"));
+    const ledger = new OpsWorkerControlLedger(fileDirectory);
+    assert.throws(() => ledger.read(), /not a regular file/);
+    assert.throws(() => ledger.record(1, fingerprint(1)), /not a regular file/);
+    assert.equal(readFileSync(outsideFile, "utf8"), "outside-file-target\n");
+  });
+
   it("starts fresh without writing and durably advances a monotonic offset", (t) => {
     const ledger = new OpsWorkerControlLedger(stateDirectory(t));
 

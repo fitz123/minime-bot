@@ -1422,8 +1422,6 @@ export class OpsWorkerSupervisor {
           result: "AMBIGUOUS_ORPHAN",
           summary: "Persisted Pi launch intent before detached spawn",
         };
-        replacement.report.state = "PENDING";
-        replacement.report.lastError = null;
         this.applyCustodyTransition(
           replacement,
           at,

@@ -883,15 +883,51 @@ describe("ops worker Pi standard-session attempts", () => {
       receivedAt: task.updatedAt,
       kind: "answer",
       operatorRef: "telegram:100000000",
-      text: "s".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      text: "\u0001".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
       consumedAt: null,
     }];
 
     const prompt = buildOpsWorkerAttemptPrompt(task);
     assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
     assert.match(prompt, /telegram:update:3030/);
-    assert.match(prompt, /"text":"s+"/);
+    assert.ok(prompt.includes('"text":"\\u0001'));
     assert.match(prompt, /Perform one bounded remediation attempt/);
+  });
+
+  it("delivers and consumes a complete maximum escape-heavy steering entry", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("maximum-escaped-steering");
+    harness.store.create(task);
+    const entry = {
+      steeringId: "telegram:update:maximum-escaped",
+      receivedAt: task.updatedAt,
+      kind: "answer" as const,
+      operatorRef: "telegram:100000000",
+      text: "\u0001".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    };
+    harness.store.appendSteering(task.id, entry);
+    const promptPath = join(harness.root, "maximum-escaped-steering.txt");
+    harness.setScenario("crash");
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const serializedEntry = JSON.stringify({
+      steeringId: entry.steeringId,
+      receivedAt: entry.receivedAt,
+      kind: entry.kind,
+      operatorRef: entry.operatorRef,
+      text: entry.text,
+    });
+    assert.ok(readFileSync(promptPath, "utf8").includes(serializedEntry));
+    assert.ok(result.steering[0]?.consumedAt);
   });
 
   it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
@@ -2642,6 +2678,7 @@ describe("ops worker Pi standard-session attempts", () => {
         spawnProcess: () => {
           const persisted = beforeSpawn.store.get("intent-before-spawn");
           assert.equal(persisted?.state, "BLOCKED");
+          assert.equal(persisted?.report.state, "NONE");
           assert.equal(persisted?.unverifiedRun?.pid, null);
           assert.equal(persisted?.unverifiedRun?.expectedProcessGroupId, null);
           throw new Error("synthetic spawn rejection");

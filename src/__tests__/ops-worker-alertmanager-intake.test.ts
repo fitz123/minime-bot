@@ -306,10 +306,7 @@ describe("Alertmanager conversion and task-store submission", () => {
       "INVALID_PAYLOAD",
     );
     const activeReuse = intake.submit(body(webhook({
-      alerts: [{
-        ...alert(),
-        annotations: { summary: "Updated evidence for the same active episode." },
-      }],
+      alerts: [alert("2026-07-19T09:59:30.000Z")],
     })), CONTENT_TYPE);
 
     assert.deepEqual(activeReuse, { ok: true, taskId: first.taskId, replayed: true });
@@ -333,6 +330,13 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(next.replayed, false);
     assert.notEqual(next.taskId, first.taskId);
     assert.equal(store.list().length, 2);
+
+    const lateFirstDelivery = intake.submit(body(webhook()), CONTENT_TYPE);
+    assert.deepEqual(lateFirstDelivery, {
+      ok: true,
+      taskId: first.taskId,
+      replayed: true,
+    });
   });
 
   it("does not create a task for a resolved-only group or any rejected payload", (t) => {

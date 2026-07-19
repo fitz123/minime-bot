@@ -777,7 +777,7 @@ export class OpsWorkerTaskStore {
       if (!this.appendSteeringEntry(task, entry)) {
         return OPS_WORKER_TASK_STORE_NO_CHANGE;
       }
-      task.updatedAt = this.now().toISOString();
+      task.updatedAt = this.nextUpdatedAt(task);
     });
   }
 
@@ -806,7 +806,7 @@ export class OpsWorkerTaskStore {
         }
         task.control.paused = paused;
       }
-      const now = this.now().toISOString();
+      const now = this.nextUpdatedAt(task);
       task.control.pausedAt = task.control.paused ? now : null;
       task.updatedAt = now;
     });
@@ -822,6 +822,7 @@ export class OpsWorkerTaskStore {
       summary: `Recorded operator steering and ${interrupt.mode} interrupt atomically`,
     }, (task) => {
       const appended = this.appendSteeringEntry(task, entry);
+      let startsPause = false;
       if (task.control.interrupt !== null) {
         if (
           task.control.interrupt.mode !== interrupt.mode
@@ -841,10 +842,12 @@ export class OpsWorkerTaskStore {
         task.control.interrupt = structuredClone(interrupt);
         if (interrupt.mode === "pause" && !task.control.paused) {
           task.control.paused = true;
-          task.control.pausedAt = interrupt.requestedAt;
+          startsPause = true;
         }
       }
-      task.updatedAt = this.now().toISOString();
+      const now = this.nextUpdatedAt(task);
+      if (startsPause) task.control.pausedAt = now;
+      task.updatedAt = now;
     });
   }
 
@@ -868,7 +871,7 @@ export class OpsWorkerTaskStore {
           `Refusing to pause terminal task ${task.id}`,
         );
       }
-      const now = this.now().toISOString();
+      const now = this.nextUpdatedAt(task);
       task.control.paused = paused;
       task.control.pausedAt = paused ? now : null;
       task.updatedAt = now;
@@ -909,12 +912,13 @@ export class OpsWorkerTaskStore {
           `Refusing an interrupt for terminal task ${task.id}`,
         );
       }
+      const now = this.nextUpdatedAt(task);
       task.control.interrupt = structuredClone(interrupt);
       if (interrupt.mode === "pause" && !task.control.paused) {
         task.control.paused = true;
-        task.control.pausedAt = interrupt.requestedAt;
+        task.control.pausedAt = now;
       }
-      task.updatedAt = this.now().toISOString();
+      task.updatedAt = now;
     });
   }
 
@@ -930,8 +934,15 @@ export class OpsWorkerTaskStore {
         return OPS_WORKER_TASK_STORE_NO_CHANGE;
       }
       task.control.interrupt = null;
-      task.updatedAt = this.now().toISOString();
+      task.updatedAt = this.nextUpdatedAt(task);
     });
+  }
+
+  private nextUpdatedAt(task: Pick<OpsWorkerTask, "updatedAt">): string {
+    return new Date(Math.max(
+      this.now().getTime(),
+      Date.parse(task.updatedAt) + 1,
+    )).toISOString();
   }
 
   private appendSteeringEntry(

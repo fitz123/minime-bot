@@ -1358,6 +1358,37 @@ reply:
         else signal?.addEventListener("abort", abort, { once: true });
       }),
     });
+
+    const incompleteFixture = fixtureRoot(t);
+    const incomplete = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      incompleteFixture.stateDirectory,
+      "--agent-workspace",
+      incompleteFixture.workspace,
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], incompleteFixture.root, dependencies({
+      taskRegistry: {
+        templates: {},
+        authorizationProfiles: {},
+        doneChecks: opsContracts.taskRegistry.doneChecks,
+      },
+      doneChecks: opsContracts.doneChecks,
+    }, {
+      controlConfigEnv: {
+        TEST_OPS_TOKEN: "TEST_OPS_TOKEN",
+        TEST_INTAKE_TOKEN: "TEST_INTAKE_TOKEN",
+      },
+    }));
+    assert.equal(incomplete.code, 1);
+    assert.match(
+      incomplete.stderr,
+      /requires the fixed ops\.availability template for alertmanager/,
+    );
+
     const running = runCliAsync([
       "worker",
       "start",

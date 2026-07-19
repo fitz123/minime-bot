@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   OPS_AVAILABILITY_DONE_CHECK_NAME,
+  OPS_AVAILABILITY_DONE_CHECK_VERSION,
   OPS_AVAILABILITY_INVARIANTS,
   OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   createOpsAvailabilityDoneCheckRegistry,
@@ -48,6 +49,50 @@ export interface OpsTaskContracts {
   doneChecks: OpsWorkerDoneCheckRegistry;
   alertmanagerAuthorizationVerifier: OpsWorkerAuthorizationVerifier;
   authorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry;
+}
+
+export function assertOpsAlertmanagerIntakeContracts(
+  taskRegistry: OpsWorkerTaskContractRegistry,
+  doneChecks: OpsWorkerDoneCheckRegistry,
+  authorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry | undefined,
+): void {
+  const template = taskRegistry.templates[OPS_AVAILABILITY_TEMPLATE_NAME];
+  if (!template?.sourceKinds.includes("alertmanager")) {
+    throw new TypeError(
+      "Alertmanager intake requires the fixed ops.availability template for alertmanager",
+    );
+  }
+  const profile = taskRegistry.authorizationProfiles[
+    OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE
+  ];
+  if (
+    !profile?.sourceKinds.includes("alertmanager")
+    || profile.scope.length !== 2
+    || profile.scope[0] !== "inspect"
+    || profile.scope[1] !== "local-reversible-repair"
+  ) {
+    throw new TypeError(
+      "Alertmanager intake requires the fixed ops.host-availability authorization profile",
+    );
+  }
+  const doneCheck = doneChecks.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
+  if (
+    doneCheck?.verifierIdentity !== OPS_AVAILABILITY_DONE_CHECK_NAME
+    || doneCheck.verifierVersion !== OPS_AVAILABILITY_DONE_CHECK_VERSION
+  ) {
+    throw new TypeError(
+      "Alertmanager intake requires the package-owned availability done check",
+    );
+  }
+  const verifier = authorizationVerifiers?.alertmanager;
+  if (
+    verifier?.identity !== OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY
+    || verifier.version !== OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION
+  ) {
+    throw new TypeError(
+      "Alertmanager intake requires the package-owned Alertmanager authorization verifier",
+    );
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

@@ -739,7 +739,8 @@ export interface OpsWorkerTaskContractRegistry {
 
 export const OPS_WORKER_LIMITS = {
   maxLegacySnapshotBytes: 256 * 1024,
-  maxSnapshotBytes: 512 * 1024,
+  maxPreV5SnapshotBytes: 512 * 1024,
+  maxSnapshotBytes: 513 * 1024,
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
@@ -3128,6 +3129,17 @@ export function parseOpsWorkerTaskJson(
     fail(
       "task",
       `legacy snapshot exceeds ${OPS_WORKER_LIMITS.maxLegacySnapshotBytes} UTF-8 bytes`,
+    );
+  }
+  if (
+    (schemaVersion === OPS_WORKER_TASK_V2_SCHEMA_VERSION
+      || schemaVersion === OPS_WORKER_TASK_V3_SCHEMA_VERSION
+      || schemaVersion === OPS_WORKER_TASK_V4_SCHEMA_VERSION)
+    && bytes > OPS_WORKER_LIMITS.maxPreV5SnapshotBytes
+  ) {
+    fail(
+      "task",
+      `pre-v5 snapshot exceeds ${OPS_WORKER_LIMITS.maxPreV5SnapshotBytes} UTF-8 bytes`,
     );
   }
   return parseOpsWorkerTask(value, registry);

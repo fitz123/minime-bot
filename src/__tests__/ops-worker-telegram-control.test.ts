@@ -132,6 +132,7 @@ class FakeTelegramTransport {
   readonly messages: Record<string, unknown>[] = [];
   readonly updates: unknown[][] = [];
   sendCalls = 0;
+  sendFailures = 0;
 
   readonly fetch: OpsWorkerTelegramFetch = async (input, init) => {
     const url = String(input);
@@ -143,6 +144,10 @@ class FakeTelegramTransport {
     if (url.endsWith("/sendMessage")) {
       this.sendCalls += 1;
       this.messages.push(body);
+      if (this.sendFailures > 0) {
+        this.sendFailures -= 1;
+        return Response.json({ ok: false }, { status: 503 });
+      }
       return Response.json({ ok: true, result: { message_id: this.sendCalls } });
     }
     throw new Error(`Unexpected Telegram fixture URL ${url}`);
@@ -635,6 +640,23 @@ describe("ops worker dedicated Telegram control", () => {
     assert.match(String(transport.messages[0].text), /^Usage:/);
   });
 
+  it("durably drops NUL-bearing commands without replaying a poison update", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    fixture.store.create(makeTask("task-nul-command"));
+    const transport = new FakeTelegramTransport();
+    const poisoned = update(30, "/answer task-nul-command bounded\0poison");
+    transport.updates.push([poisoned], [poisoned]);
+    const client = control(fixture, transport);
+
+    await client.tick();
+    await client.tick();
+
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 31);
+    assert.equal(fixture.store.get("task-nul-command")?.steering.length, 0);
+    assert.equal(transport.messages.length, 0);
+  });
+
   it("implements bounded summaries and safe-boundary pause, resume, cancel, and retry", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
@@ -735,6 +757,46 @@ describe("ops worker dedicated Telegram control", () => {
       > Date.parse(claimed.queryObservedAt),
     );
     assert.equal(sent?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("keeps a failed terminal report pending and retries it on the next tick", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const pending = makeTask("task-report-transport-retry");
+    pending.state = "CANCELLED";
+    pending.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    };
+    pending.lastOutcome = {
+      at: NOW,
+      kind: "OPERATOR",
+      result: "CANCELLED",
+      summary: "Fixture report retries after one transport failure.",
+    };
+    pending.report.state = "PENDING";
+    fixture.store.create(pending);
+    const transport = new FakeTelegramTransport();
+    transport.sendFailures = 1;
+    transport.updates.push([], []);
+    const client = control(fixture, transport);
+
+    await client.tick();
+    const failed = fixture.store.get(pending.id);
+    assert.equal(failed?.report.state, "PENDING");
+    assert.equal(failed?.report.attempts, 1);
+    assert.match(failed?.report.lastError ?? "", /HTTP 503/);
+    assert.equal(failed?.mutationReceipts.report?.outcome, null);
+
+    await client.tick();
+    const sent = fixture.store.get(pending.id);
+    assert.equal(sent?.report.state, "SENT");
+    assert.equal(sent?.report.attempts, 2);
+    assert.equal(sent?.report.lastError, null);
+    assert.equal(sent?.mutationReceipts.report?.outcome?.result, "APPLIED");
+    assert.equal(transport.sendCalls, 2);
   });
 
   it("rotates past a report denied by fresh authorization", async (t) => {

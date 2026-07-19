@@ -145,6 +145,7 @@ function parseMessage(
   if (
     typeof message.text !== "string"
     || message.text.trim() === ""
+    || message.text.includes("\0")
     || Buffer.byteLength(message.text, "utf8") > MAX_COMMAND_BYTES
   ) return null;
   if (

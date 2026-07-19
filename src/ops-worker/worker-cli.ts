@@ -34,6 +34,7 @@ import { OpsWorkerTaskStore } from "./task-store.js";
 import { loadOpsWorkerControlConfig } from "./control-config.js";
 import { OpsWorkerAlertmanagerIntake } from "./alertmanager-intake.js";
 import { OpsWorkerControlLedger } from "./control-ledger.js";
+import { assertOpsAlertmanagerIntakeContracts } from "./ops-contracts.js";
 import {
   OpsWorkerTelegramControl,
   type OpsWorkerTelegramFetch,
@@ -695,6 +696,13 @@ async function runStart(
     });
   const configuredIntake = controlConfig?.intake;
   const intakeBearerToken = configuredIntake?.bearerToken;
+  if (configuredIntake !== undefined) {
+    assertOpsAlertmanagerIntakeContracts(
+      deps.taskRegistry,
+      deps.doneChecks,
+      deps.authorizationVerifiers,
+    );
+  }
   const requestedHost = parsed.values.get("host");
   const requestedPort = parsed.values.get("port");
   if (configuredIntake !== undefined) {

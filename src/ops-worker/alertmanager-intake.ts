@@ -500,10 +500,7 @@ export class OpsWorkerAlertmanagerIntake {
     body: Uint8Array | string,
     contentType: string | undefined,
   ): OpsWorkerAlertmanagerIntakeResult {
-    return this.submitWebhook(parseOpsAlertmanagerWebhook(body, contentType));
-  }
-
-  submitWebhook(webhook: OpsAlertmanagerWebhook): OpsWorkerAlertmanagerIntakeResult {
+    const webhook = parseOpsAlertmanagerWebhook(body, contentType);
     const firingAlerts = webhook.alerts.filter((entry) => entry.status === "firing");
     if (firingAlerts.length === 0) {
       return { ok: true, taskId: null, replayed: false };
@@ -531,9 +528,6 @@ export class OpsWorkerAlertmanagerIntake {
       deliveryDigest,
       webhook.groupLabels,
     );
-    const active = this.store.findActiveByCorrelation(correlationKey);
-    if (active) return { ok: true, taskId: active.id, replayed: true };
-
     try {
       const created = this.store.create(task, {
         event: "CREATED",

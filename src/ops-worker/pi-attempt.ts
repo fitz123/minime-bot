@@ -92,8 +92,8 @@ import {
 
 export const OPS_WORKER_PI_LIMITS = {
   maxCapturedStreamBytes: 32 * 1024,
-  maxPromptBytes: 48 * 1024,
-  maxSteeringPromptBytes: 16 * 1024,
+  maxPromptBytes: 128 * 1024,
+  maxSteeringPromptBytes: 64 * 1024,
   maxSessionFiles: 64,
   defaultAttemptTimeoutMs: 30 * 60 * 1_000,
   defaultStallTimeoutMs: 20 * 60 * 1_000,

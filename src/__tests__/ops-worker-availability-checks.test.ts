@@ -380,6 +380,42 @@ describe("bounded loopback availability readers", () => {
     assert.equal(queries.some((query) => query.includes(encodeURIComponent("[315s]"))), true);
   });
 
+  it("maps Prometheus silence and zero directly without a stability query", async () => {
+    const responses = [
+      prometheusMatrix([]),
+      prometheusVector([]),
+      prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "0" }]),
+    ];
+    let calls = 0;
+    const reader = new OpsPrometheusHttpReader(
+      "http://127.0.0.1:9090",
+      async () => {
+        calls += 1;
+        return jsonResponse(responses.shift());
+      },
+    );
+
+    const monitoring = await reader.readMonitoringFreshness(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    );
+    const silent = await reader.readServiceAvailability(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    );
+    const unhealthy = await reader.readServiceAvailability(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    );
+
+    assert.equal(monitoring.latestSampleAt, null);
+    assert.equal(silent.status, "UNKNOWN");
+    assert.equal(silent.healthySince, null);
+    assert.equal(unhealthy.status, "UNHEALTHY");
+    assert.equal(unhealthy.healthySince, null);
+    assert.equal(calls, 3);
+  });
+
   it("rejects remote endpoints and strict HTTP/JSON contract violations without retrying", async () => {
     assert.throws(
       () => new OpsAlertmanagerHttpReader("https://alerts.example.invalid", async () => new Response()),
