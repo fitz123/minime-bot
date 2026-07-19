@@ -20,6 +20,7 @@ import {
 } from "./authorization.js";
 import {
   OpsWorkerDoneCheckExecutionError,
+  type OpsWorkerDoneCheckContractIdentity,
   type OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckResult,
 } from "./done-checks.js";
@@ -645,6 +646,43 @@ export class OpsWorkerSupervisor {
     return this.instanceId;
   }
 
+  private describeDoneCheckContract(task: OpsWorkerTask): OpsWorkerDoneCheckContractIdentity {
+    const contract = this.doneChecks.describe(task.doneCheck.name);
+    if (!contract) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${task.id} done check is not registered in the execution registry`,
+      );
+    }
+    return contract;
+  }
+
+  private pinDoneCheckContract(task: OpsWorkerTask): boolean {
+    if (task.lifecycle.verifier !== null) return false;
+    const contract = this.describeDoneCheckContract(task);
+    task.lifecycle.verifier = contract.verifierIdentity;
+    task.lifecycle.verifierVersion = contract.verifierVersion;
+    task.lifecycle.verifierContractHash = contract.contractHash;
+    return true;
+  }
+
+  private persistDoneCheckContract(taskId: string): OpsWorkerTask {
+    const existing = this.requireTask(taskId);
+    if (existing.lifecycle.verifier !== null) return existing;
+    return this.store.mutate(
+      taskId,
+      {
+        event: "UPDATED",
+        summary: "Pinned immutable composite verifier contract before checking",
+      },
+      (task) => {
+        if (task.lifecycle.verifier === null) {
+          task.updatedAt = this.nextUpdatedAt(task);
+          this.pinDoneCheckContract(task);
+        }
+      },
+    ).task;
+  }
+
   reservePiProcessGroupLaunch(taskId: string): void {
     this.reservePiLaunch(taskId, false);
   }
@@ -863,6 +901,7 @@ export class OpsWorkerSupervisor {
           selectionChanged = true;
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
+        const verifierPinned = this.pinDoneCheckContract(task);
         const tasks = this.store.list();
         const held = tasks.filter((candidate) => candidate.custody.status === "HELD");
         if (held.length > 1) {
@@ -886,7 +925,7 @@ export class OpsWorkerSupervisor {
           }
         }
         if (task.custody.status === "HELD") {
-          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          return verifierPinned ? undefined : OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
         const claimedAt = this.nextUpdatedAt(task);
         task.updatedAt = claimedAt;
@@ -1100,6 +1139,7 @@ export class OpsWorkerSupervisor {
       );
     }
     return this.transition(taskId, "RUNNING", (task) => {
+      this.pinDoneCheckContract(task);
       task.activeRun = structuredClone(activeRun);
       task.unverifiedRun = null;
       task.schedule.nextRunAt = null;
@@ -1172,6 +1212,7 @@ export class OpsWorkerSupervisor {
         replacement.schedule.nextRunAt = null;
         replacement.schedule.nextCheckAt = null;
         replacement.verification = null;
+        this.pinDoneCheckContract(replacement);
         this.applyCustodyTransition(replacement, updatedAt);
       },
     });
@@ -1191,6 +1232,7 @@ export class OpsWorkerSupervisor {
       );
     }
     return this.transition(taskId, "CHECKING", (replacement, at) => {
+      this.pinDoneCheckContract(replacement);
       replacement.activeRun = null;
       replacement.session.resume = true;
       replacement.rounds.consecutiveInfrastructureFailures = 0;
@@ -1654,6 +1696,7 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     this.requireMatchingLaunchFence(taskId, attemptId);
     return this.transition(taskId, "CHECKING", (task, at) => {
+      this.pinDoneCheckContract(task);
       task.activeRun = null;
       task.unverifiedRun = null;
       task.session.resume = task.session.sessionId !== null;
@@ -1892,7 +1935,7 @@ export class OpsWorkerSupervisor {
 
   async runDoneCheck(taskId: string, signal?: AbortSignal): Promise<OpsWorkerTask> {
     this.assertStarted();
-    const task = this.requireTask(taskId);
+    const task = this.persistDoneCheckContract(taskId);
     if (task.state !== "CHECKING") {
       throw new OpsWorkerSupervisorStateError(
         `Done check requires CHECKING, found ${task.state}`,

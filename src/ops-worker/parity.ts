@@ -24,6 +24,7 @@ import {
 import {
   piResourceIdentity,
   type PiPrimaryResourceContract,
+  validatePiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
 
 const MAX_REPORT_BYTES = 32 * 1024;
@@ -90,9 +91,15 @@ export function prepareOpsWorkerParityLaunch(input: {
   context: PiContextArtifacts;
   resources: PiPrimaryResourceContract;
   parityExtensionPath: string;
+  parityExtensionIdentity: string;
   sessionDirectory: string;
   opsPolicy: string;
 }): OpsWorkerParityLaunch {
+  const resources = validatePiPrimaryResourceContract(input.resources);
+  const parityExtensionIdentity = piResourceIdentity("extension", input.parityExtensionPath);
+  if (parityExtensionIdentity !== input.parityExtensionIdentity) {
+    throw new Error("Ops-worker parity extension changed after startup pinning");
+  }
   const bundle = readFileSync(input.context.appendSystemPromptPath, "utf8");
   if (sha256(bundle) !== input.context.manifest.bundleHash) {
     throw new Error("Assembled Pi context bundle changed before parity preparation");
@@ -110,22 +117,22 @@ export function prepareOpsWorkerParityLaunch(input: {
     customPromptHash: input.context.manifest.personaHash,
     appendSystemPromptHash: sha256(`${bundle}\n\n${input.opsPolicy}`),
     extensionIdentities: [
-      ...input.resources.extensionIdentities,
-      piResourceIdentity("extension", input.parityExtensionPath),
+      ...resources.extensionIdentities,
+      parityExtensionIdentity,
     ],
-    skillIdentities: input.resources.skillIdentities,
-    toolNames: input.resources.toolNames,
+    skillIdentities: resources.skillIdentities,
+    toolNames: resources.toolNames,
   });
   const expectedPath = join(input.sessionDirectory, "parity-expected-v1.json");
   const reportPath = join(input.sessionDirectory, "parity-report-v1.json");
   const ackPath = join(input.sessionDirectory, "parity-ack-v1.txt");
   writePrivateJson(expectedPath, expected);
-  const wrappedExtensionPaths = input.resources.extensionPaths.map((extensionPath, index) => {
+  const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
     const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
     writePrivateExtensionWrapper(
       wrapperPath,
       extensionPath,
-      input.resources.extensionIdentities[index],
+      resources.extensionIdentities[index],
     );
     return wrapperPath;
   });

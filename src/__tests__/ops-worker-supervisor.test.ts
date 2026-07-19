@@ -1571,6 +1571,9 @@ describe("ops worker supervisor", () => {
     const checking = await first.supervisor.requestDoneCheck("task-check-restart");
     assert.equal(checking.state, "CHECKING");
     assert.equal(checking.custody.status, "HELD");
+    assert.equal(checking.lifecycle.verifier, "fixture-check");
+    assert.equal(checking.lifecycle.verifierVersion, "1");
+    assert.match(checking.lifecycle.verifierContractHash ?? "", /^sha256:[a-f0-9]{64}$/);
     first.close();
 
     const restarted = await makeHarness(t, {
@@ -1584,6 +1587,40 @@ describe("ops worker supervisor", () => {
     assert.equal(done.lifecycle.verifier, "fixture-check");
     assert.equal(done.lifecycle.verifierVersion, "1");
     assert.equal(done.lifecycle.verifierContractHash, done.verification?.contractHash);
+  });
+
+  it("fails changed verifier code closed after restart before the first result", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-first-check-pin-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "first-check-pin-original",
+      verifierVersion: "1",
+    });
+    first.store.create(makeTask("task-first-check-pin"));
+    const checking = await first.supervisor.requestDoneCheck("task-first-check-pin");
+    const pinnedHash = checking.lifecycle.verifierContractHash;
+    assert.equal(checking.lifecycle.verifierVersion, "1");
+    first.close();
+
+    let changedComponentRuns = 0;
+    const changed = await makeHarness(t, {
+      directory,
+      instanceId: "first-check-pin-changed",
+      verifierVersion: "2",
+      implementation: () => {
+        changedComponentRuns += 1;
+        return { result: "PASS", summary: "Changed verifier must not execute." };
+      },
+    });
+    const invalid = await changed.supervisor.runDoneCheck("task-first-check-pin");
+    assert.equal(invalid.state, "CHECKING");
+    assert.equal(invalid.lastOutcome?.result, "VERIFIER_INVALID");
+    assert.equal(invalid.verification?.outcome, "VERIFIER_INVALID");
+    assert.deepEqual(invalid.verification?.components, []);
+    assert.equal(invalid.lifecycle.verifierVersion, "1");
+    assert.equal(invalid.lifecycle.verifierContractHash, pinnedHash);
+    assert.equal(changedComponentRuns, 0);
   });
 
   it("fails a changed package verifier contract closed after immutable pinning", async (t) => {

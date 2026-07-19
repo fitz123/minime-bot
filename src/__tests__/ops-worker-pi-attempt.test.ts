@@ -1271,6 +1271,54 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(harness.invocations[1].includes("--session-id"));
   });
 
+  it("revalidates authorization before a fresh launch after corrupt-session reset", async (t) => {
+    const statuses: Array<"PASS" | "DRIFT"> = [];
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "session-reset-authorization",
+      version: "1",
+      verify: () => {
+        verificationCalls += 1;
+        const status = statuses.shift() ?? "PASS";
+        return {
+          status,
+          evidenceHash: `sha256:${"7".repeat(64)}`,
+          summary: `Synthetic session-reset authorization ${status}`,
+        };
+      },
+    };
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+    });
+    harness.store.create(makeTask("corrupt-session-drift"));
+    harness.setScenario("crash");
+    const crashed = await harness.runner().runAttempt("corrupt-session-drift");
+    const oldSessionId = crashed.session.sessionId as string;
+    const sessionDirectory = join(
+      harness.supervisor.stateDirectory,
+      "sessions",
+      "corrupt-session-drift",
+    );
+    const sessionFile = readdirSync(sessionDirectory)
+      .find((file) => file.endsWith(".jsonl") && file.includes(oldSessionId));
+    assert.ok(sessionFile);
+    writeFileSync(join(sessionDirectory, sessionFile), "not-json\n", "utf8");
+    statuses.push("PASS", "DRIFT");
+
+    harness.setScenario("success");
+    const blocked = await harness.runner().runAttempt("corrupt-session-drift");
+
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.authorizationVerification?.status, "DRIFT");
+    assert.notEqual(blocked.session.sessionId, oldSessionId);
+    assert.equal(blocked.custody.status, "RELEASED");
+    assert.equal(harness.invocations.length, 1);
+    assert.equal(verificationCalls, 4);
+  });
+
   it("keeps an interrupted owner ahead of a queued higher-priority task", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("low-priority", {

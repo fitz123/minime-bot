@@ -47,6 +47,7 @@ import {
   type OpsWorkerParityAttestationReport,
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
+  piResourceIdentity,
   resolveOpsWorkerParityExtensionPath,
   type PiPrimaryResourceContract,
   validatePiPrimaryResourceContract,
@@ -317,7 +318,8 @@ export class OpsWorkerPiAttemptRunner {
     OpsWorkerPiAttemptDependencies["stallMonitorClock"]
   >;
   private readonly assembleContext: NonNullable<OpsWorkerPiAttemptDependencies["assembleContext"]>;
-  private readonly resolveParityExtensionPath: () => string;
+  private readonly parityExtensionPath: string;
+  private readonly parityExtensionIdentity: string;
   private readonly runQuotaProbeProcess: (
     request: OpsWorkerQuotaProbeRequest,
   ) => Promise<OpsWorkerQuotaProbeResult>;
@@ -409,8 +411,13 @@ export class OpsWorkerPiAttemptRunner {
       clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
     };
     this.assembleContext = dependencies.assembleContext ?? assemblePiContext;
-    this.resolveParityExtensionPath = dependencies.resolveParityExtensionPath
-      ?? resolveOpsWorkerParityExtensionPath;
+    this.parityExtensionPath = (
+      dependencies.resolveParityExtensionPath ?? resolveOpsWorkerParityExtensionPath
+    )();
+    this.parityExtensionIdentity = piResourceIdentity(
+      "extension",
+      this.parityExtensionPath,
+    );
     this.runQuotaProbeProcess = dependencies.runQuotaProbe
       ?? ((request) => this.executeQuotaProbe(request));
     this.launchFaultInjector = dependencies.launchFaultInjector;
@@ -482,6 +489,14 @@ export class OpsWorkerPiAttemptRunner {
           }
         }
 
+        const launchAuthorized = await this.supervisor.ensureTaskCustody(taskId, "RUN");
+        if (
+          launchAuthorized.custody.status !== "HELD"
+          || !hasFreshOpsWorkerAuthorizationPass(launchAuthorized)
+          || isOpsWorkerQuotaWait(launchAuthorized)
+        ) return launchAuthorized;
+        task = launchAuthorized;
+
         const result = await this.launchOnce(task, sessionDirectory);
         if (result.classification !== "SESSION_CORRUPT") return result.task;
 
@@ -538,7 +553,8 @@ export class OpsWorkerPiAttemptRunner {
     const parityLaunch = prepareOpsWorkerParityLaunch({
       context,
       resources: this.primaryResources,
-      parityExtensionPath: this.resolveParityExtensionPath(),
+      parityExtensionPath: this.parityExtensionPath,
+      parityExtensionIdentity: this.parityExtensionIdentity,
       sessionDirectory,
       opsPolicy: OPS_WORKER_SYSTEM_POLICY,
     });
@@ -1192,7 +1208,8 @@ export class OpsWorkerPiAttemptRunner {
     const parityLaunch = prepareOpsWorkerParityLaunch({
       context,
       resources: this.primaryResources,
-      parityExtensionPath: this.resolveParityExtensionPath(),
+      parityExtensionPath: this.parityExtensionPath,
+      parityExtensionIdentity: this.parityExtensionIdentity,
       sessionDirectory,
       opsPolicy: OPS_WORKER_SYSTEM_POLICY,
     });

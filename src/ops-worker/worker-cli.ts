@@ -478,6 +478,17 @@ function createTask(
       `authorization profile ${JSON.stringify(authorizationProfile)} is not registered`,
     );
   }
+  const doneCheckName = requiredValue(options, "done-check");
+  const doneCheckContract = deps.doneChecks.describe(doneCheckName);
+  if (!doneCheckContract) {
+    throw new OpsWorkerCliUsageError(
+      `done check ${JSON.stringify(doneCheckName)} is not registered`,
+    );
+  }
+  const lifecycle = createEmptyOpsWorkerLifecycleManifest();
+  lifecycle.verifier = doneCheckContract.verifierIdentity;
+  lifecycle.verifierVersion = doneCheckContract.verifierVersion;
+  lifecycle.verifierContractHash = doneCheckContract.contractHash;
   const authorizationSnapshotHash = hashOpsWorkerCanonicalPayload({
     sourceKind: "operator-cli",
     correlationKey: requiredValue(options, "correlation-key"),
@@ -501,7 +512,7 @@ function createTask(
         : "repository",
       key: requiredValue(options, "resource-key"),
     },
-    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    lifecycle,
     currentCheckpoint: null,
     mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
     custody: createUnclaimedOpsWorkerCustody(),
@@ -515,7 +526,7 @@ function createTask(
       artifact: null,
     }],
     doneCheck: {
-      name: requiredValue(options, "done-check"),
+      name: doneCheckName,
       params: parseDoneCheckParams(options.values.get("done-check-params")),
     },
     authorization: {

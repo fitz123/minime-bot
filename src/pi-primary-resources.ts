@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { isAbsolute, normalize, resolve } from "node:path";
 import {
   piExtensionRelpathForDir,
@@ -41,7 +50,7 @@ export interface ResolvePiPrimaryResourceContractOptions {
   toolNames: readonly string[];
 }
 
-function sha256(value: string): string {
+function sha256(value: string | Buffer): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
@@ -49,9 +58,44 @@ function canonicalListDigest(domain: string, values: readonly string[]): string 
   return sha256(`${domain}\0${JSON.stringify([...values].sort())}`);
 }
 
-/** Stable one-way identity: the private host path is never persisted or reported. */
+function trustedFileContentHash(path: string): string {
+  const direct = lstatSync(path);
+  if (
+    !direct.isFile()
+    || direct.isSymbolicLink()
+    || (typeof process.getuid === "function" && direct.uid !== process.getuid())
+  ) throw new TypeError("Pi resource must remain a current-user-owned regular file");
+  const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== direct.dev
+      || opened.ino !== direct.ino
+    ) throw new TypeError("Pi resource changed before its content could be hashed");
+    const content = readFileSync(descriptor);
+    const completed = fstatSync(descriptor);
+    if (
+      completed.dev !== opened.dev
+      || completed.ino !== opened.ino
+      || completed.size !== opened.size
+      || completed.mtimeMs !== opened.mtimeMs
+      || completed.ctimeMs !== opened.ctimeMs
+    ) throw new TypeError("Pi resource changed while its content was being hashed");
+    return sha256(content);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** Stable one-way identity: private path and content bytes are never persisted or reported. */
 export function piResourceIdentity(kind: "extension" | "skill", path: string): string {
-  return sha256(`minime-pi-${kind}-identity-v1\0${normalize(resolve(path))}`);
+  const trustedPath = strictTrustedFile(path, `Pi ${kind} resource`);
+  return sha256([
+    `minime-pi-${kind}-identity-v2`,
+    trustedPath,
+    trustedFileContentHash(trustedPath),
+  ].join("\0"));
 }
 
 function strictTrustedFile(path: string, label: string): string {

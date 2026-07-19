@@ -82,6 +82,14 @@ describe("primary Pi resource contract", () => {
     assert.equal(JSON.stringify(contract.extensionIdentities).includes(root), false);
     assert.equal(JSON.stringify(contract.skillIdentities).includes(root), false);
     assert.deepEqual(validatePiPrimaryResourceContract(contract), contract);
+
+    const originalSkillIdentity = contract.skillIdentities[0];
+    writeFileSync(skill, "# Changed generic parity skill\n", "utf8");
+    assert.notEqual(piResourceIdentity("skill", skill), originalSkillIdentity);
+    assert.throws(
+      () => validatePiPrimaryResourceContract(contract),
+      /hashes are inconsistent/,
+    );
   });
 
   it("rejects symlink, missing, duplicate, relative, and incomplete resources", () => {
@@ -137,6 +145,9 @@ describe("ops-worker before-provider parity attestation", () => {
     const extensionToolPath = join(root, "tool-extension.ts");
     const extensionCommandPath = join(root, "hook-extension.ts");
     const skillPath = join(root, "SKILL.md");
+    writeFileSync(extensionToolPath, "export default function () {}\n", "utf8");
+    writeFileSync(extensionCommandPath, "export default function () {}\n", "utf8");
+    writeFileSync(skillPath, "# Runtime parity skill\n", "utf8");
     const customPrompt = "GENERIC_PRIMARY_PERSONA_BODY";
     const appendSystemPrompt = "GENERIC_PRIMARY_BUNDLE_BODY\n\nGENERIC_OPS_POLICY_BODY";
     const toolNames = [...PI_BUILTIN_TOOL_NAMES, "configured_tool"];
@@ -290,6 +301,7 @@ describe("ops-worker before-provider parity attestation", () => {
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
     const launch = prepareOpsWorkerParityLaunch({
       context: {
         appendSystemPromptPath: bundlePath,
@@ -302,7 +314,8 @@ describe("ops-worker before-provider parity attestation", () => {
         },
       },
       resources,
-      parityExtensionPath: resolveOpsWorkerParityExtensionPath(),
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
       sessionDirectory: root,
       opsPolicy: "GENERIC_POLICY",
     });
@@ -351,6 +364,35 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.throws(
       () => tryReadOpsWorkerParityReport(launch),
       /not a bounded regular file/,
+    );
+
+    const changedParityExtension = join(root, "changed-parity-extension.mjs");
+    writeFileSync(changedParityExtension, "export default function () {}\n", "utf8");
+    const pinnedParityIdentity = piResourceIdentity("extension", changedParityExtension);
+    writeFileSync(
+      changedParityExtension,
+      "export default function () { throw new Error('changed'); }\n",
+      "utf8",
+    );
+    assert.throws(
+      () => prepareOpsWorkerParityLaunch({
+        context: {
+          appendSystemPromptPath: bundlePath,
+          manifest: {
+            version: 1,
+            sources: [],
+            bundleHash: sha256("GENERIC_BUNDLE\n"),
+            personaHash: null,
+            digest: sha256("GENERIC_MANIFEST"),
+          },
+        },
+        resources,
+        parityExtensionPath: changedParityExtension,
+        parityExtensionIdentity: pinnedParityIdentity,
+        sessionDirectory: root,
+        opsPolicy: "GENERIC_POLICY",
+      }),
+      /parity extension changed after startup pinning/,
     );
   });
 
