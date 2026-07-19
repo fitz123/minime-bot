@@ -32,6 +32,7 @@ import {
 } from "./supervisor.js";
 import { OpsWorkerTaskStore } from "./task-store.js";
 import { loadOpsWorkerControlConfig } from "./control-config.js";
+import { OpsWorkerAlertmanagerIntake } from "./alertmanager-intake.js";
 import { OpsWorkerControlLedger } from "./control-ledger.js";
 import {
   OpsWorkerTelegramControl,
@@ -692,9 +693,32 @@ async function runStart(
       env: deps.controlConfigEnv,
       resolveSecret: deps.controlConfigSecretResolver,
     });
-  const host = parsed.values.get("host") ?? DEFAULT_OPS_WORKER_STATUS_HOST;
-  const port = parsePort(parsed.values.get("port"));
+  const configuredIntake = controlConfig?.intake;
+  const requestedHost = parsed.values.get("host");
+  const requestedPort = parsed.values.get("port");
+  if (configuredIntake !== undefined) {
+    if (requestedHost !== undefined && requestedHost !== configuredIntake.host) {
+      throw new OpsWorkerCliUsageError(
+        "--host must match intake.host because intake extends the existing status server",
+      );
+    }
+    if (requestedPort !== undefined && parsePort(requestedPort) !== configuredIntake.port) {
+      throw new OpsWorkerCliUsageError(
+        "--port must match intake.port because intake extends the existing status server",
+      );
+    }
+  }
+  const host = configuredIntake?.host ?? requestedHost ?? DEFAULT_OPS_WORKER_STATUS_HOST;
+  const port = configuredIntake?.port ?? parsePort(requestedPort);
   const store = createStore(directory, deps);
+  const alertmanagerIntake = configuredIntake === undefined
+    ? undefined
+    : new OpsWorkerAlertmanagerIntake({
+        store,
+        doneChecks: deps.doneChecks,
+        sourceIdentity: configuredIntake.sourceIdentity,
+        now: deps.now,
+      });
   const supervisor = createSupervisor(store, deps);
   let started = false;
   let statusServer: Awaited<ReturnType<typeof startOpsWorkerStatusServer>> | undefined;
@@ -729,6 +753,14 @@ async function runStart(
       host,
       port,
       inspectPolicy: () => inspectPolicy(deps),
+      ...(alertmanagerIntake === undefined
+        ? {}
+        : {
+            alertmanagerIntake: {
+              intake: alertmanagerIntake,
+              bearerTokenProvider: () => configuredIntake.bearerToken,
+            },
+          }),
     });
     const telegramControl = controlConfig === undefined
       ? undefined

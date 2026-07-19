@@ -296,7 +296,9 @@ or cancellation is rejected until restart reconciliation proves the group gone.
 ## Loopback status
 
 The supervisor binds to `127.0.0.1:9465` by default. Only `127.0.0.1` and `::1`
-are accepted bind addresses. The surface is read-only:
+are accepted bind addresses. The surface is read-only unless an explicit
+`worker start --control-config` file registers the fixed Alertmanager intake
+route:
 
 - `GET /healthz` returns process health.
 - `GET /status` returns bounded task-state counts and the number of active
@@ -306,16 +308,24 @@ are accepted bind addresses. The surface is read-only:
   digests for parity. It never includes objectives, canonical task bodies,
   context contents, personas, resource paths, lifecycle evidence, checkpoints,
   receipts, quota summaries, or credentials.
+- `POST /intake/alertmanager`, when explicitly configured, requires the
+  configured bearer token and accepts only a bounded Alertmanager v4 webhook.
+  It can submit only the package-owned availability task contract; alert text,
+  labels, and annotations remain bounded untrusted evidence. The route is
+  absent when intake is not configured.
 
-There is no HTTP task intake, retry, cancellation, command, or arbitrary proxy
-route in this foundation. CLI submission and lifecycle evidence recording write
-through the strict local task store.
+There is no generic HTTP task intake, retry, cancellation, command, or arbitrary
+proxy route. Both the fixed adapter and CLI submission write through the strict
+local task store.
+
+Ops intake is an additional Alertmanager receiver. It never replaces or
+forwards through the independent native Alertmanager-to-Telegram delivery in
+`scripts/alertmanager_webhook.py`; that path and `scripts/monitoring_native.py`
+remain separate and unchanged.
 
 ## Deferred work
 
-Alertmanager intake, authenticated HTTP intake, Telegram reporting, report
-transport retries, production task templates and composite components, the full
-fault lab, deployment configuration, launch activation, release workflows, and
-production drills are later phases. Install, build, pack, help, and workspace
-validation do not start a worker process or listener. Existing recovery
-components remain in place during coexistence.
+The full fault lab, deployment configuration, launch activation, release
+workflows, and production drills are later phases. Install, build, pack, help,
+and workspace validation do not start a worker process or listener. Existing
+recovery components remain in place during coexistence.

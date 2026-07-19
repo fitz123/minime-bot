@@ -19,6 +19,17 @@ import { runCliAsync } from "../cli.js";
 import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
+import {
+  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+  type OpsAlertStateReading,
+  type OpsMonitoringFreshnessReading,
+  type OpsServiceAvailabilityReading,
+} from "../ops-worker/availability-checks.js";
+import {
+  OPS_AVAILABILITY_TEMPLATE_NAME,
+  OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+  createOpsTaskContracts,
+} from "../ops-worker/ops-contracts.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
   OpsWorkerQuotaAdmissionGate,
@@ -1244,11 +1255,192 @@ reply:
       headers: { "content-type": "application/json" },
     });
     assert.equal(intake.status, 404);
+    const disabledAlertmanager = await fetch(`${base}/intake/alertmanager`, {
+      method: "POST",
+      body: "{}",
+      headers: { "content-type": "application/json" },
+    });
+    assert.equal(disabledAlertmanager.status, 404);
     const mutatingStatus = await fetch(`${base}/status`, { method: "POST" });
     assert.equal(mutatingStatus.status, 405);
 
     controller.abort();
     assert.equal(await running, 0);
+  });
+
+  it("registers authenticated Alertmanager intake only from worker start control config", async (t) => {
+    const fixture = fixtureRoot(t);
+    const controller = new AbortController();
+    const opsContracts = createOpsTaskContracts({
+      alertmanagerAuthorizationSnapshotReader: {
+        read: () => ({
+          sourceIdentity: "lab-alertmanager",
+          invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+          template: OPS_AVAILABILITY_TEMPLATE_NAME,
+          profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+        }),
+      },
+      clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      monitoringFreshnessReader: {
+        read: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        } satisfies OpsMonitoringFreshnessReading),
+      },
+      alertStateReader: {
+        read: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "RESOLVED",
+        } satisfies OpsAlertStateReading),
+      },
+      serviceAvailabilityReader: {
+        read: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "HEALTHY",
+          healthySince: "2026-07-19T09:50:00.000Z",
+        } satisfies OpsServiceAvailabilityReading),
+      },
+    });
+    const controlConfig = join(fixture.root, "ops-control-with-intake.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+intake:
+  host: 127.0.0.1
+  port: 0
+  bearerTokenEnv: TEST_INTAKE_TOKEN
+  sourceIdentity: lab-alertmanager
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    let stdout = "";
+    let stderr = "";
+    let resolveListening: (() => void) | undefined;
+    const listening = new Promise<void>((resolvePromise) => {
+      resolveListening = resolvePromise;
+    });
+    const deps = dependencies({
+      taskRegistry: opsContracts.taskRegistry,
+      doneChecks: opsContracts.doneChecks,
+    }, {
+      abortSignal: controller.signal,
+      schedulerPollMs: 20,
+      authorizationVerifiers: {
+        ...opsContracts.authorizationVerifiers,
+        "operator-cli": fixtureAuthorizationVerifier,
+      },
+      quotaAdmission: {
+        check: () => ({
+          ...structuredClone(fixtureQuotaAdmissionDecision),
+          status: "NOT_ADMITTED",
+          reason: "LOW_REMAINING",
+          nextResetAt: "2027-07-19T11:00:00.000Z",
+          nextProbeAt: "2027-07-19T11:00:00.000Z",
+          summary: "Fixture quota prevents task launch during intake wiring coverage.",
+        }),
+      },
+      controlConfigEnv: {
+        TEST_OPS_TOKEN: "TEST_OPS_TOKEN",
+        TEST_INTAKE_TOKEN: "TEST_INTAKE_TOKEN",
+      },
+      telegramFetch: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        const abort = (): void => reject(new DOMException("aborted", "AbortError"));
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      }),
+    });
+    const running = runCliAsync([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--control-config",
+      controlConfig,
+    ], {
+      cwd: fixture.root,
+      env: {},
+      workerDependencies: deps,
+      stdout: (text) => {
+        stdout += text;
+        if (text.includes("/status")) resolveListening?.();
+      },
+      stderr: (text) => {
+        stderr += text;
+      },
+    });
+    t.after(() => controller.abort());
+    await listening;
+    const base = /status (http:\/\/[^/]+)\/status/.exec(stdout)?.[1];
+    assert.ok(base);
+
+    const response = await fetch(`${base}/intake/alertmanager`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer TEST_INTAKE_TOKEN",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        version: "4",
+        groupKey: "{}:{alertname=\"MinimeBotUnavailable\"}",
+        status: "firing",
+        alerts: [{
+          status: "firing",
+          labels: { alertname: "MinimeBotUnavailable" },
+          annotations: { summary: "Generic local availability alert." },
+          startsAt: "2026-07-19T09:59:00.000Z",
+        }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const submitted = await response.json() as {
+      ok: boolean;
+      taskId: string | null;
+      replayed: boolean;
+    };
+    assert.equal(submitted.ok, true);
+    assert.equal(submitted.replayed, false);
+    assert.match(submitted.taskId ?? "", /^am-[a-f0-9]{48}$/);
+
+    controller.abort();
+    assert.equal(await running, 0, stderr);
+    assert.equal(stderr, "");
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: opsContracts.taskRegistry,
+    });
+    assert.equal(store.get(submitted.taskId ?? "")?.source.kind, "alertmanager");
+
+    const mismatchFixture = fixtureRoot(t);
+    const mismatchConfig = join(mismatchFixture.root, "ops-control-with-intake.yaml");
+    writeFileSync(mismatchConfig, readFileSync(controlConfig, "utf8"));
+    const mismatch = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      mismatchFixture.stateDirectory,
+      "--agent-workspace",
+      mismatchFixture.workspace,
+      "--control-config",
+      mismatchConfig,
+      "--port",
+      "9465",
+      "--once",
+    ], mismatchFixture.root, {
+      ...deps,
+      abortSignal: undefined,
+    });
+    assert.equal(mismatch.code, 2);
+    assert.match(mismatch.stderr, /--port must match intake\.port/);
   });
 
   it("rejects non-loopback status binds", async (t) => {

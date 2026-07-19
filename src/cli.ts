@@ -134,7 +134,7 @@ Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source rep
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
 Recovery defaults: <control-workspace>/recovery.json. Recovery commands accept only bounded named operations, never SQL or shell.
 Recovery control plane: host-native intake and verification with closed observe, diagnose, and enabled mode gates. Fixer execution uses a recovery-only wrapper; capsule and bot slot commands consume only staged local runtimes.
-Ops worker: inactive unless worker start is invoked. --control-config enables the dedicated second-token Telegram poller and reporter only for that started worker. CLI submission uses trusted registries; checkpoint and receipt commands record evidence only, and the loopback HTTP surface is health/status only.
+Ops worker: inactive unless worker start is invoked. --control-config enables the dedicated second-token Telegram poller/reporter and, when configured, authenticated Alertmanager intake only for that started worker. CLI submission uses trusted registries; checkpoint and receipt commands record evidence only, and the loopback HTTP surface otherwise remains health/status only.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
