@@ -9,9 +9,16 @@ import {
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readExpectedOpsWorkerParityContract } from "../../pi-extensions/ops-worker-parity-attestation.js";
 
 const [scenario, ...args] = process.argv.slice(2);
+if (scenario === "partial-progress-rc1") {
+  process.stdout.write("fake Pi retained partial checkpoint progress\n");
+  process.stderr.write("fake Pi exited rc=1 after partial progress\n");
+  process.exit(1);
+}
+const { readExpectedOpsWorkerParityContract } = await import(
+  "../../pi-extensions/ops-worker-parity-attestation.js"
+);
 const quotaProbe = scenario.startsWith("quota-probe-");
 let privatePrompt = "";
 for await (const chunk of process.stdin) privatePrompt += chunk.toString();

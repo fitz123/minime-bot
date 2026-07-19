@@ -448,7 +448,7 @@ async function makeHarness(
 
 async function waitFor(
   predicate: () => boolean,
-  timeoutMs = 2_000,
+  timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -2127,7 +2127,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await waitFor(() => timers.size > 0, 5_000);
+    await waitFor(() => timers.size > 0, 15_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },

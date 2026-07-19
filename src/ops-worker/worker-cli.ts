@@ -694,6 +694,7 @@ async function runStart(
       resolveSecret: deps.controlConfigSecretResolver,
     });
   const configuredIntake = controlConfig?.intake;
+  const intakeBearerToken = configuredIntake?.bearerToken;
   const requestedHost = parsed.values.get("host");
   const requestedPort = parsed.values.get("port");
   if (configuredIntake !== undefined) {
@@ -753,12 +754,12 @@ async function runStart(
       host,
       port,
       inspectPolicy: () => inspectPolicy(deps),
-      ...(alertmanagerIntake === undefined
+      ...(alertmanagerIntake === undefined || intakeBearerToken === undefined
         ? {}
         : {
             alertmanagerIntake: {
               intake: alertmanagerIntake,
-              bearerTokenProvider: () => configuredIntake.bearerToken,
+              bearerTokenProvider: () => intakeBearerToken,
             },
           }),
     });
