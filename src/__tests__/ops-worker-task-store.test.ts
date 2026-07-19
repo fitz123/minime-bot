@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import {
   OPS_WORKER_LIMITS,
+  hashOpsWorkerVerificationSubject,
   OpsWorkerTaskValidationError,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
@@ -29,6 +30,8 @@ import {
   type OpsWorkerTaskContractRegistry,
   type OpsWorkerTaskState,
   type OpsWorkerTaskV1,
+  type OpsWorkerTaskV2,
+  type OpsWorkerTaskV3,
 } from "../ops-worker/types.js";
 import {
   OpsWorkerDeliveryConflictError,
@@ -63,17 +66,14 @@ const registry: OpsWorkerTaskContractRegistry = {
     "operator.inspect.v1": {
       sourceKinds: ["operator-cli", "operator-telegram"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
     },
     "operator.repair.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["local-reversible-repair"],
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
     "issue.full-cycle.v1": {
       sourceKinds: ["authorized-issue"],
       scope: ["repository-read", "repository-write", "pull-request", "issue-lifecycle"],
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     },
   },
   doneChecks: {
@@ -99,7 +99,7 @@ function makeTask(
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 4,
     id,
     source: {
       kind: "operator-cli",
@@ -112,7 +112,7 @@ function makeTask(
       key: "host:local",
     },
     lifecycle: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       canonicalTask: null,
       repository: null,
       base: null,
@@ -124,6 +124,8 @@ function makeTask(
       release: null,
       deploy: null,
       verifier: null,
+      verifierVersion: null,
+      verifierContractHash: null,
       report: null,
       tailAudit: null,
     },
@@ -161,6 +163,9 @@ function makeTask(
       scope: ["inspect"],
       snapshotHash: null,
     },
+    authorizationVerification: null,
+    verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -201,6 +206,9 @@ function makeV1Task(
     mutationReceipts: _mutationReceipts,
     custody: _custody,
     submissionFingerprint: _submissionFingerprint,
+    authorizationVerification: _authorizationVerification,
+    verification: _verification,
+    legacyCompletion: _legacyCompletion,
     ...legacy
   } = current;
   const { deliveryKey: _deliveryKey, ...source } = legacy.source;
@@ -211,8 +219,85 @@ function makeV1Task(
   };
 }
 
+function makeV2Task(
+  id = "wt-20260717-v2-ab12cd",
+  correlationKey = "operator:health:v2",
+): OpsWorkerTaskV2 {
+  const current = makeTask(id, correlationKey);
+  const {
+    authorizationVerification: _authorizationVerification,
+    verification: _verification,
+    legacyCompletion: _legacyCompletion,
+    lifecycle,
+    ...previous
+  } = current;
+  const {
+    verifierVersion: _verifierVersion,
+    verifierContractHash: _verifierContractHash,
+    ...legacyLifecycle
+  } = lifecycle;
+  return {
+    ...previous,
+    schemaVersion: 2,
+    lifecycle: { ...legacyLifecycle, schemaVersion: 1 },
+  };
+}
+
+function makeV3Task(
+  id = "wt-20260717-v3-ab12cd",
+  correlationKey = "operator:health:v3",
+): OpsWorkerTaskV3 {
+  const current = makeTask(id, correlationKey);
+  const {
+    verification: _verification,
+    legacyCompletion: _legacyCompletion,
+    lifecycle,
+    ...previous
+  } = current;
+  const {
+    verifierVersion: _verifierVersion,
+    verifierContractHash: _verifierContractHash,
+    ...legacyLifecycle
+  } = lifecycle;
+  return {
+    ...previous,
+    schemaVersion: 3,
+    lifecycle: { ...legacyLifecycle, schemaVersion: 1 },
+  };
+}
+
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function attachFreshPass(task: OpsWorkerTask, at: string): void {
+  const contractHash = `sha256:${"9".repeat(64)}`;
+  task.lifecycle.verifier = "fixture-verifier";
+  task.lifecycle.verifierVersion = "1";
+  task.lifecycle.verifierContractHash = contractHash;
+  const subjectHash = hashOpsWorkerVerificationSubject(task);
+  task.verification = {
+    verifierIdentity: "fixture-verifier",
+    verifierVersion: "1",
+    contractHash,
+    subjectHash,
+    checkedAt: at,
+    completedAt: at,
+    outcome: "PASS",
+    summary: "All required fixture components passed.",
+    nextCheckAt: null,
+    components: [{
+      identity: "fixture-component",
+      version: "1",
+      required: true,
+      convergence: "PRODUCT",
+      outcome: "PASS",
+      observedAt: at,
+      evidenceHash: `sha256:${"7".repeat(64)}`,
+      summary: "The required fixture component passed.",
+      nextCheckAt: null,
+    }],
+  };
 }
 
 function testStateDirectory(t: TestContext): string {
@@ -238,7 +323,7 @@ function makeStore(
 }
 
 describe("ops worker task contract", () => {
-  it("strictly round-trips a complete v2 envelope into an independent value", () => {
+  it("strictly round-trips a complete v4 envelope into an independent value", () => {
     const input = makeTask();
     input.state = "RUNNING";
     input.activeRun = {
@@ -263,7 +348,7 @@ describe("ops worker task contract", () => {
       lastError: "Fixture transport unavailable.",
     };
     input.lifecycle = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       canonicalTask: "issue:58",
       repository: "github:example/minime-bot",
       base: "main",
@@ -275,6 +360,8 @@ describe("ops worker task contract", () => {
       release: "release:1.2.3",
       deploy: "deploy:staging-1",
       verifier: "check:fixture",
+      verifierVersion: "2",
+      verifierContractHash: `sha256:${"8".repeat(64)}`,
       report: "sha256:report-identity",
       tailAudit: "audit:tail-1",
     };
@@ -324,7 +411,8 @@ describe("ops worker task contract", () => {
 
     assert.deepEqual(input, before);
     assert.deepEqual(first, second);
-    assert.equal(first.schemaVersion, 2);
+    assert.equal(first.schemaVersion, 4);
+    assert.equal(first.authorizationVerification, null);
     assert.deepEqual(first.source, {
       ...input.source,
       deliveryKey: `legacy:${input.id}`,
@@ -333,7 +421,7 @@ describe("ops worker task contract", () => {
       kind: "host",
       key: `host:legacy-${input.id}`,
     });
-    assert.equal(first.lifecycle.schemaVersion, 1);
+    assert.equal(first.lifecycle.schemaVersion, 2);
     assert.ok(Object.values(first.lifecycle).slice(1).every((value) => value === null));
     assert.equal(first.currentCheckpoint, null);
     assert.ok(Object.values(first.mutationReceipts).every((value) => value === null));
@@ -374,7 +462,7 @@ describe("ops worker task contract", () => {
 
     const migrated = parseOpsWorkerTaskJson(raw, registry);
 
-    assert.equal(migrated.schemaVersion, 2);
+    assert.equal(migrated.schemaVersion, 4);
     assert.ok(
       Buffer.byteLength(JSON.stringify(migrated), "utf8")
       > OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
@@ -399,21 +487,199 @@ describe("ops worker task contract", () => {
     assert.throws(() => parseOpsWorkerTask(task, registry), /fixed priority 10/);
   });
 
-  it("rejects unknown schema versions and unknown v1 or v2 fields", () => {
-    const future = { ...makeTask(), schemaVersion: 3 };
+  it("migrates an exact v2 snapshot deterministically without writing or sharing input", () => {
+    const input = makeV2Task();
+    const before = clone(input);
+
+    const first = parseOpsWorkerTask(input, registry);
+    const second = parseOpsWorkerTaskJson(JSON.stringify(input), registry);
+
+    assert.deepEqual(input, before);
+    assert.deepEqual(first, second);
+    assert.equal(first.schemaVersion, 4);
+    assert.equal(first.authorizationVerification, null);
+    first.authorization.scope[0] = "repository-read";
+    assert.deepEqual(input.authorization.scope, ["inspect"]);
+  });
+
+  it("migrates an exact v3 snapshot to an unverified v4 composite contract", () => {
+    const input = makeV3Task();
+    const before = clone(input);
+
+    const migrated = parseOpsWorkerTask(input, registry);
+
+    assert.deepEqual(input, before);
+    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.lifecycle.schemaVersion, 2);
+    assert.equal(migrated.lifecycle.verifier, null);
+    assert.equal(migrated.lifecycle.verifierVersion, null);
+    assert.equal(migrated.lifecycle.verifierContractHash, null);
+    assert.equal(migrated.verification, null);
+  });
+
+  it("rejects future versions and unknown fields in every supported schema", () => {
+    const future = { ...makeTask(), schemaVersion: 5 };
     assert.throws(
       () => parseOpsWorkerTask(future, registry),
-      /supported version 1 or 2/,
+      /supported version 1, 2, 3, or 4/,
     );
     assert.throws(
       () => parseOpsWorkerTask({ ...makeV1Task(), resource: { kind: "host", key: "host:local" } }, registry),
       /task\.resource: unknown field/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV2Task(), authorizationVerification: null }, registry),
+      /task\.authorizationVerification: unknown field/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV3Task(), verification: null }, registry),
+      /task\.verification: unknown field/,
     );
     const futureLifecycle = clone(makeTask()) as unknown as Record<string, unknown>;
     (futureLifecycle.lifecycle as Record<string, unknown>).workflow = "arbitrary";
     assert.throws(
       () => parseOpsWorkerTask(futureLifecycle, registry),
       /task\.lifecycle\.workflow: unknown field/,
+    );
+  });
+
+  it("strictly validates the fixed bounded authorization-verification record", () => {
+    const task = makeTask();
+    task.authorizationVerification = {
+      validatorIdentity: "fixture-authorization",
+      validatorVersion: "1",
+      checkedSnapshotHash: `sha256:${"1".repeat(64)}`,
+      checkedAt: NOW,
+      status: "PASS",
+      evidenceHash: `sha256:${"2".repeat(64)}`,
+      summary: "Authorization matches the registered fixture policy.",
+    };
+    assert.deepEqual(parseOpsWorkerTask(task, registry), task);
+
+    const unknown = clone(task) as unknown as Record<string, unknown>;
+    (unknown.authorizationVerification as Record<string, unknown>).actor = "untrusted";
+    assert.throws(
+      () => parseOpsWorkerTask(unknown, registry),
+      /authorizationVerification\.actor: unknown field/,
+    );
+
+    const oversized = clone(task);
+    assert.ok(oversized.authorizationVerification);
+    oversized.authorizationVerification.summary = "x".repeat(
+      OPS_WORKER_LIMITS.maxAuthorizationVerificationSummaryBytes + 1,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask(oversized, registry),
+      /authorizationVerification\.summary: must be at most 1024/,
+    );
+
+    const invalidStatus = clone(task) as unknown as Record<string, unknown>;
+    (invalidStatus.authorizationVerification as Record<string, unknown>).status = "ALLOW";
+    assert.throws(
+      () => parseOpsWorkerTask(invalidStatus, registry),
+      /must be one of PASS, DRIFT, QUERY_ERROR, INVALID_CLAIM/,
+    );
+  });
+
+  it("validates typed quota probe proofs while accepting legacy proofless outcomes", () => {
+    const task = makeTask();
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_PROBE_PASS",
+      summary: "Exact quota smoke probe succeeded.",
+      quotaProbeProof: {
+        version: 1,
+        subjectHash: `sha256:${"4".repeat(64)}`,
+      },
+    };
+    assert.deepEqual(parseOpsWorkerTask(task, registry), task);
+
+    const legacyProofless = clone(task);
+    assert.ok(legacyProofless.lastOutcome);
+    delete legacyProofless.lastOutcome.quotaProbeProof;
+    assert.deepEqual(parseOpsWorkerTask(legacyProofless, registry), legacyProofless);
+
+    const wrongOutcome = clone(task);
+    assert.ok(wrongOutcome.lastOutcome);
+    wrongOutcome.lastOutcome.result = "NETWORK";
+    assert.throws(
+      () => parseOpsWorkerTask(wrongOutcome, registry),
+      /quotaProbeProof: is allowed only for an exact quota probe PASS/,
+    );
+
+    const malformed = clone(task);
+    assert.ok(malformed.lastOutcome?.quotaProbeProof);
+    malformed.lastOutcome.quotaProbeProof.subjectHash = "sha256:not-a-proof";
+    assert.throws(
+      () => parseOpsWorkerTask(malformed, registry),
+      /quotaProbeProof\.subjectHash: must be a lowercase sha256/,
+    );
+  });
+
+  it("strictly validates bounded composite evidence and immutable verifier identity", () => {
+    const task = makeTask();
+    attachFreshPass(task, NOW);
+    assert.deepEqual(parseOpsWorkerTask(task, registry), task);
+
+    const duplicate = clone(task);
+    assert.ok(duplicate.verification);
+    duplicate.verification.components.push(
+      clone(duplicate.verification.components[0]),
+    );
+    assert.throws(
+      () => parseOpsWorkerTask(duplicate, registry),
+      /duplicate component identities/,
+    );
+
+    const sparse = clone(task);
+    assert.ok(sparse.verification);
+    const sparseComponents = new Array<
+      NonNullable<OpsWorkerTask["verification"]>["components"][number]
+    >(2);
+    sparseComponents[1] = clone(sparse.verification.components[0]);
+    sparse.verification.components = sparseComponents;
+    assert.throws(
+      () => parseOpsWorkerTask(sparse, registry),
+      /must be dense/,
+    );
+
+    const arbitraryIdentity = clone(task);
+    assert.ok(arbitraryIdentity.verification);
+    arbitraryIdentity.verification.components[0].identity = "payload/component";
+    assert.throws(
+      () => parseOpsWorkerTask(arbitraryIdentity, registry),
+      /must be a lowercase registered name/,
+    );
+
+    const stale = clone(task);
+    assert.ok(stale.verification);
+    stale.verification.components[0].observedAt = "2026-07-17T11:59:59.000Z";
+    assert.throws(
+      () => parseOpsWorkerTask(stale, registry),
+      /must be fresh within the composite query interval/,
+    );
+
+    const authorizationChanged = clone(task);
+    authorizationChanged.authorizationVerification = {
+      validatorIdentity: "fixture-authorization",
+      validatorVersion: "1",
+      checkedSnapshotHash: `sha256:${"1".repeat(64)}`,
+      checkedAt: NOW,
+      status: "PASS",
+      evidenceHash: `sha256:${"2".repeat(64)}`,
+      summary: "Fresh authorization evidence changed after verification.",
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(authorizationChanged, registry),
+      /is stale for current task\/checkpoint\/authorization state/,
+    );
+
+    const mismatch = clone(task);
+    mismatch.lifecycle.verifierContractHash = `sha256:${"6".repeat(64)}`;
+    assert.throws(
+      () => parseOpsWorkerTask(mismatch, registry),
+      /must match the immutable lifecycle verifier contract/,
     );
   });
 
@@ -553,6 +819,7 @@ describe("ops worker task contract", () => {
       result: "PASS",
       summary: "Fixture passed.",
     };
+    attachFreshPass(doneHeld, NOW);
     doneHeld.custody = {
       status: "HELD",
       claimedAt: NOW,
@@ -721,17 +988,19 @@ describe("ops worker task contract", () => {
     );
   });
 
-  it("rejects command, executable, and URL selectors even after a lax check validator", () => {
+  it("rejects component, command, executable, and URL selectors after lax validation", () => {
     for (const params of [
       { command: "restart service" },
       { nested: { executable: "/bin/tool" } },
       { url: "https://example.invalid/health" },
+      { components: ["payload-selected-check"] },
+      { selector: "payload-selected-check" },
     ] as JsonObject[]) {
       const task = clone(makeTask());
       task.doneCheck = { name: "lax-fixture", params };
       assert.throws(
         () => parseOpsWorkerTask(task, registry),
-        /cannot select commands, executables, URLs, or authorization/,
+        /cannot select components, commands, executables, URLs, or authorization/,
       );
     }
   });
@@ -863,7 +1132,7 @@ describe("ops worker task contract", () => {
     };
     assert.throws(
       () => parseParams({}, unsafeValidatorRegistry),
-      /cannot select commands, executables, URLs, or authorization/,
+      /cannot select components, commands, executables, URLs, or authorization/,
     );
   });
 
@@ -924,25 +1193,76 @@ describe("ops worker task contract", () => {
 });
 
 describe("ops worker durable task store", () => {
-  it("loads v1 without writing and persists canonical v2 on the next successful write", (t) => {
+  it("loads v2 purely on read and persists canonical v4 on the next successful write", (t) => {
     const store = makeStore(t);
-    const legacy = makeV1Task();
-    const snapshotPath = join(store.tasksDirectory, `${legacy.id}.json`);
-    const rawLegacy = `${JSON.stringify(legacy)}\n`;
-    writeFileSync(snapshotPath, rawLegacy, { encoding: "utf8", mode: 0o600 });
+    const previous = makeV2Task();
+    const snapshotPath = join(store.tasksDirectory, `${previous.id}.json`);
+    const rawV2 = `${JSON.stringify(previous)}\n`;
+    writeFileSync(snapshotPath, rawV2, { encoding: "utf8", mode: 0o600 });
 
-    const loaded = store.get(legacy.id);
+    const loaded = store.get(previous.id);
     assert.ok(loaded);
-    assert.equal(loaded.schemaVersion, 2);
-    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
-    assert.deepEqual(store.get(legacy.id), loaded);
-    assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+    assert.equal(loaded.schemaVersion, 4);
+    assert.equal(loaded.authorizationVerification, null);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawV2);
+    assert.deepEqual(store.get(previous.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), rawV2);
 
     store.replace(loaded, { event: "UPDATED" });
-    const canonicalV2 = `${JSON.stringify(loaded)}\n`;
-    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
-    assert.deepEqual(store.get(legacy.id), loaded);
-    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV2);
+    const canonicalV3 = `${JSON.stringify(loaded)}\n`;
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
+    assert.deepEqual(store.get(previous.id), loaded);
+    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
+  });
+
+  it("persists report evidence on migrated legacy DONE snapshots without inventing PASS", (t) => {
+    const store = makeStore(t);
+    const previousTasks = [
+      makeV1Task("legacy-done-v1", "legacy:done:v1"),
+      makeV2Task("legacy-done-v2", "legacy:done:v2"),
+      makeV3Task("legacy-done-v3", "legacy:done:v3"),
+    ];
+    for (const previous of previousTasks) {
+      previous.state = "DONE";
+      previous.lastOutcome = {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PASS",
+        summary: "Legacy completion predates composite verification.",
+      };
+      previous.report = { state: "PENDING", attempts: 0, lastError: null };
+      if (previous.schemaVersion !== 1) {
+        previous.custody = {
+          status: "RELEASED",
+          claimedAt: null,
+          releasedAt: NOW,
+          releaseReason: "DONE",
+        };
+      }
+      const snapshotPath = join(store.tasksDirectory, `${previous.id}.json`);
+      writeFileSync(snapshotPath, `${JSON.stringify(previous)}\n`, { mode: 0o600 });
+
+      const loaded = store.get(previous.id);
+      assert.equal(loaded?.legacyCompletion?.sourceSchemaVersion, previous.schemaVersion);
+      assert.equal(loaded?.verification, null);
+      const mutated = store.mutate(
+        previous.id,
+        { event: "REPORT", summary: "Recorded legacy completion report attempt" },
+        (task) => {
+          task.report.attempts = 1;
+          task.report.lastError = "Synthetic report retry remains pending.";
+        },
+      ).task;
+
+      assert.equal(mutated.state, "DONE");
+      assert.equal(mutated.verification, null);
+      assert.equal(mutated.legacyCompletion?.sourceSchemaVersion, previous.schemaVersion);
+      assert.equal(store.get(previous.id)?.report.attempts, 1);
+      assert.equal(
+        (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
+        4,
+      );
+    }
   });
 
   it("writes a private authoritative snapshot before its bounded audit record", (t) => {
@@ -1256,6 +1576,7 @@ describe("ops worker durable task store", () => {
       result: "PASS",
       summary: "Fresh fixture evidence passed.",
     };
+    attachFreshPass(completed, LATER);
     completed.custody = {
       status: "RELEASED",
       claimedAt: null,
@@ -1283,6 +1604,7 @@ describe("ops worker durable task store", () => {
       result: "PASS",
       summary: "Fresh fixture evidence passed.",
     };
+    attachFreshPass(completed, LATER);
     completed.custody = {
       status: "RELEASED",
       claimedAt: null,
@@ -1547,6 +1869,28 @@ describe("ops worker durable task store", () => {
     );
     assert.equal(readFileSync(fencedLock, "utf8"), staleRecord);
     assert.equal(readFileSync(recoveryGuard, "utf8"), "unfinished recovery\n");
+  });
+
+  it("retries when a mutation lock disappears after a publish conflict", (t) => {
+    const directory = testStateDirectory(t);
+    const canonicalLock = join(directory, ".task-store.lock");
+    writeFileSync(canonicalLock, "owner releases before inspection\n", { mode: 0o600 });
+    let conflictCount = 0;
+    const store = makeStore(t, {
+      directory,
+      faultInjector(point) {
+        if (point === "after-mutation-lock-publish-conflict") {
+          conflictCount += 1;
+          unlinkSync(canonicalLock);
+        }
+      },
+    });
+
+    assert.doesNotThrow(() => store.create(
+      makeTask("wt-release-race", "operator:release-race"),
+    ));
+    assert.equal(conflictCount, 1);
+    assert.equal(existsSync(canonicalLock), false);
   });
 
   it("rejects traversal identifiers and symlinked state paths", (t) => {

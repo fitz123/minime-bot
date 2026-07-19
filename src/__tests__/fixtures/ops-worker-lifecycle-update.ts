@@ -1,6 +1,9 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { OpsWorkerLifecycle } from "../../ops-worker/lifecycle.js";
-import { OpsWorkerTaskStore } from "../../ops-worker/task-store.js";
+import {
+  OpsWorkerTaskStore,
+  OpsWorkerTaskStoreBusyError,
+} from "../../ops-worker/task-store.js";
 import type {
   JsonObject,
   OpsWorkerTaskContractRegistry,
@@ -34,7 +37,10 @@ const registry: OpsWorkerTaskContractRegistry = {
     "fixture.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
+    },
+    "fixture.mutate.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
     },
   },
   doneChecks: {
@@ -71,13 +77,27 @@ try {
       }
       : undefined,
   });
-  const lifecycle = new OpsWorkerLifecycle(store);
+  const lifecycle = new OpsWorkerLifecycle(store, {
+    authorizeMutationClaim: () => true,
+  });
   if (action === "claim") {
-    const result = lifecycle.claimMutationReceipt(taskId, {
-      boundary: "merge",
-      operationId: value,
-      intent: { taskId, action: "merge" },
-    });
+    let result: ReturnType<OpsWorkerLifecycle["claimMutationReceipt"]> | undefined;
+    const deadline = Date.now() + 15_000;
+    while (result === undefined) {
+      try {
+        result = lifecycle.claimMutationReceipt(taskId, {
+          boundary: "merge",
+          operationId: value,
+          intent: { taskId, action: "merge" },
+        });
+      } catch (error) {
+        if (!(error instanceof OpsWorkerTaskStoreBusyError) || Date.now() >= deadline) {
+          throw error;
+        }
+        const waiter = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(waiter, 0, 0, 10);
+      }
+    }
     process.stdout.write(`${JSON.stringify({ claimed: result.claimed })}\n`);
   } else {
     lifecycle.updateLifecycleIdentity(taskId, {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add continuous authorization verification, primary context/capability parity
+  attestation, authoritative quota admission and reset-aware probes, typed
+  composite verification, schema v4 migration, and bounded policy status to the
+  inactive-by-default ops-worker.
+
 ## 2026.7.18
 
 - Isolate cron-runner tests from ambient production log, health-metric, and control-workspace paths by resolving their environment at call time (#76).

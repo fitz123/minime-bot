@@ -1,7 +1,11 @@
 import {
   chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -9,7 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
@@ -30,10 +34,10 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
  *   --append-system-prompt   → the context bundle (APPENDED)
  *   --no-context-files       → so Pi does not ALSO load CLAUDE.md/AGENTS.md (no double context)
  *
- * Missing/unreadable sources are warned + skipped. Artifact-write failures are
- * deliberately allowed to throw so callers can fail closed by passing
- * `--no-context-files` without artifact args. Wiring into the spawn path is in
- * pi-rpc-protocol.ts.
+ * Normal callers warn and skip missing/unreadable sources. Security-sensitive
+ * callers can select strict mode, which rejects unavailable or unsafe declared
+ * sources. Artifact-write failures always throw. Wiring into the spawn path is
+ * in pi-rpc-protocol.ts.
  *
  * Deterministic bundle order (see {@link assembleBundle}):
  *   1. CLAUDE.md body with every `@<path>` line removed.
@@ -52,6 +56,42 @@ export interface PiContextArtifacts {
   systemPromptPath?: string;
   /** Context-bundle file for `--append-system-prompt`. Always present on success. */
   appendSystemPromptPath: string;
+  /** Redacted deterministic identity of the accepted sources and assembled bytes. */
+  manifest: PiContextManifest;
+}
+
+export const PI_CONTEXT_MANIFEST_VERSION = 1 as const;
+
+export type PiContextSourceKind =
+  | "workspace"
+  | "knowledge"
+  | "platform-rule"
+  | "custom-rule"
+  | "output-style"
+  | "agent-config"
+  | "package-directive";
+
+/** A content-redacted source identity. No absolute path or source body is retained. */
+export interface PiContextSourceManifest {
+  kind: PiContextSourceKind;
+  identity: string;
+  contentHash: string;
+}
+
+/** Hash-only context evidence safe to persist or expose in bounded status output. */
+export interface PiContextManifest {
+  version: typeof PI_CONTEXT_MANIFEST_VERSION;
+  sources: readonly PiContextSourceManifest[];
+  bundleHash: string;
+  personaHash: string | null;
+  digest: string;
+}
+
+export interface PiContextAssemblyOptions {
+  /** Private artifact destination. The context source workspace remains read-only. */
+  artifactWorkspaceCwd?: string;
+  /** Reject unsafe, missing, or unreadable declared sources instead of skipping them. */
+  strict?: boolean;
 }
 
 /** A `## <relpath>` bundle section: a header + the file's content. */
@@ -110,6 +150,7 @@ function ensurePrivateArtifactDir(path: string): void {
  * the `\r` (it is whitespace), so the captured path token stays clean.
  */
 const IMPORT_LINE = /^[ \t]*@(\S+)[ \t]*\r?$/;
+const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 
 /**
  * The fixed `## Knowledge access` directive (verbatim). In v2 workspaces,
@@ -128,12 +169,56 @@ const KNOWLEDGE_ACCESS_DIRECTIVE = [
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");
 
-/** Read a file, returning null on ANY error (fail-safe: missing/unreadable → skip). */
-function safeReadFile(path: string): string | null {
+/**
+ * Read one already-resolved regular file through a stable descriptor. The
+ * realpath checks before and after the descriptor read close the final-component
+ * and intermediate-directory symlink swap windows without weakening normal
+ * fail-safe callers.
+ */
+function safeReadFileBuffer(path: string): Buffer | null {
+  let descriptor: number | undefined;
   try {
-    return readFileSync(path, "utf8");
+    const expectedPath = normalize(resolve(path));
+    const direct = lstatSync(expectedPath);
+    if (!direct.isFile() || direct.isSymbolicLink()) return null;
+    descriptor = openSync(expectedPath, constants.O_RDONLY | NO_FOLLOW);
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== direct.dev
+      || opened.ino !== direct.ino
+      || normalize(realpathSync(expectedPath)) !== expectedPath
+    ) return null;
+    const content = readFileSync(descriptor);
+    const completed = fstatSync(descriptor);
+    if (
+      completed.dev !== opened.dev
+      || completed.ino !== opened.ino
+      || completed.size !== opened.size
+      || completed.mtimeMs !== opened.mtimeMs
+      || completed.ctimeMs !== opened.ctimeMs
+      || normalize(realpathSync(expectedPath)) !== expectedPath
+    ) return null;
+    return content;
   } catch {
     return null;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+/** Read a file, returning null on ANY error (fail-safe: missing/unreadable → skip). */
+function safeReadFile(path: string): string | null {
+  return safeReadFileBuffer(path)?.toString("utf8") ?? null;
+}
+
+function rejectDirectSymlink(path: string, label: string): void {
+  try {
+    if (lstatSync(path).isSymbolicLink()) {
+      throw new Error(`${label} must not be a symlink: ${path}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
@@ -192,6 +277,12 @@ function sourceSignature(path: string, baseDir: string): string {
   }
   try {
     const st = statSync(resolved.realPath);
+    if (st.isFile()) {
+      const content = safeReadFileBuffer(resolved.realPath);
+      return content === null
+        ? `${path}:missing`
+        : `${path}->${resolved.realPath}:${sha256(content)}`;
+    }
     return `${path}->${resolved.realPath}:${st.mtimeMs}:${st.size}`;
   } catch {
     return `${path}:missing`;
@@ -243,13 +334,18 @@ function trustedPlatformRulesRealPathForDirectoryRequest(
 }
 
 /** List `*.md` files in a dir as absolute paths, sorted by name. Missing dir → []. */
-function listMarkdown(dir: string, baseDir: string): MarkdownSourceFile[] {
+function listMarkdown(
+  dir: string,
+  baseDir: string,
+  strict = false,
+): MarkdownSourceFile[] {
   const resolved = resolveContainedRealPath(dir, baseDir);
   let realPath = resolved.realPath;
   let readBaseDir = baseDir;
   if (resolved.escaped) {
     const trustedRealPath = trustedPlatformRulesRealPathForDirectoryRequest(dir, baseDir, resolved.realPath);
     if (trustedRealPath === null) {
+      if (strict) throw new Error(`Markdown directory resolves outside the workspace: ${dir}`);
       log.warn("pi-context", `markdown directory resolves outside the workspace, skipping: ${dir}`);
       return [];
     }
@@ -262,7 +358,8 @@ function listMarkdown(dir: string, baseDir: string): MarkdownSourceFile[] {
   let names: string[];
   try {
     names = readdirSync(realPath);
-  } catch {
+  } catch (error) {
+    if (strict) throw new Error(`Markdown directory is not readable: ${dir}`, { cause: error });
     return [];
   }
   return names
@@ -325,6 +422,7 @@ function isContainedImport(baseDir: string, relpath: string): boolean {
 export function expandImports(
   body: string,
   baseDir: string,
+  options: { strict?: boolean } = {},
 ): {
   bodyWithoutImports: string;
   sections: ContextSection[];
@@ -337,6 +435,7 @@ export function expandImports(
   const acceptedImportPaths: string[] = [];
   for (const relpath of importRelpaths) {
     if (!isContainedImport(baseDir, relpath)) {
+      if (options.strict) throw new Error(`@-import escapes the workspace: "${relpath}"`);
       // Containment guard: an absolute import or one escaping baseDir via `..`
       // must NOT pull an arbitrary host file into the Pi system prompt. Skip +
       // warn, fail-safe (never read it, never throw).
@@ -347,8 +446,11 @@ export function expandImports(
       continue;
     }
     const abs = resolve(baseDir, relpath);
-    const { content, escaped } = safeReadContainedFile(abs, baseDir);
+    const { content, escaped } = safeReadContainedFile(abs, baseDir, {
+      rejectSymlink: options.strict,
+    });
     if (escaped) {
+      if (options.strict) throw new Error(`@-import resolves outside the workspace: "${relpath}"`);
       log.warn(
         "pi-context",
         `@-import resolves outside the workspace, skipping: "${relpath}"`,
@@ -356,6 +458,7 @@ export function expandImports(
       continue;
     }
     if (content === null) {
+      if (options.strict) throw new Error(`@-import is not a readable regular source: ${abs}`);
       log.warn("pi-context", `@-import not readable, skipping: ${abs}`);
       continue;
     }
@@ -386,17 +489,24 @@ export function expandImports(
  * `.claude/rules/custom/*.md` (sorted by relpath). A missing dir is tolerated
  * (returns no sections for it). Relpaths are workspace-relative POSIX paths.
  */
-export function collectRules(workspaceCwd: string): ContextSection[] {
+export function collectRules(
+  workspaceCwd: string,
+  options: { strict?: boolean } = {},
+): ContextSection[] {
   const out: ContextSection[] = [];
   for (const sub of ["platform", "custom"] as const) {
     const dir = join(workspaceCwd, ".claude", "rules", sub);
-    for (const source of listMarkdown(dir, workspaceCwd)) {
-      const { content, escaped } = safeReadContainedFile(source.path, source.baseDir);
+    for (const source of listMarkdown(dir, workspaceCwd, options.strict)) {
+      const { content, escaped } = safeReadContainedFile(source.path, source.baseDir, {
+        rejectSymlink: options.strict,
+      });
       if (escaped) {
+        if (options.strict) throw new Error(`Rule file resolves outside the workspace: ${source.path}`);
         log.warn("pi-context", `rule file resolves outside the workspace, skipping: ${source.path}`);
         continue;
       }
       if (content === null) {
+        if (options.strict) throw new Error(`Rule file is not a readable regular source: ${source.path}`);
         log.warn("pi-context", `rule file not readable, skipping: ${source.path}`);
         continue;
       }
@@ -406,7 +516,7 @@ export function collectRules(workspaceCwd: string): ContextSection[] {
   return out;
 }
 
-function collectKnowledgeSections(workspaceCwd: string): ContextSection[] {
+function collectKnowledgeSections(workspaceCwd: string, strict = false): ContextSection[] {
   const layout = resolveKnowledgeLayout(workspaceCwd);
   if (layout.kind !== "v2") {
     return [];
@@ -419,10 +529,12 @@ function collectKnowledgeSections(workspaceCwd: string): ContextSection[] {
   ] as const) {
     const { content, escaped } = safeReadContainedFile(abs, workspaceCwd, { rejectSymlink: true });
     if (escaped) {
+      if (strict) throw new Error(`Knowledge file resolves outside the workspace: ${abs}`);
       log.warn("pi-context", `knowledge file resolves outside the workspace, skipping: ${abs}`);
       continue;
     }
     if (content === null) {
+      if (strict) throw new Error(`Knowledge file is not a readable regular source: ${abs}`);
       log.warn("pi-context", `knowledge file not readable, skipping: ${abs}`);
       continue;
     }
@@ -433,6 +545,7 @@ function collectKnowledgeSections(workspaceCwd: string): ContextSection[] {
 
 interface BundleResult {
   bundle: string;
+  sources: PiContextSourceManifest[];
   /**
    * True when delivering the bundle (with `--no-context-files`) beats a bare Pi
    * spawn — i.e. at least one REAL source contributed (a CLAUDE.md body, an
@@ -452,10 +565,14 @@ interface BundleResult {
 }
 
 /** Assemble the deterministic context bundle (order 1-6 above) from live files. */
-function assembleBundle(workspaceCwd: string): BundleResult {
+function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
-  const { content: rawBody, escaped } = safeReadContainedFile(claudeMdPath, workspaceCwd);
+  if (strict) rejectDirectSymlink(claudeMdPath, "CLAUDE.md");
+  const { content: rawBody, escaped } = safeReadContainedFile(claudeMdPath, workspaceCwd, {
+    rejectSymlink: strict,
+  });
   if (escaped) {
+    if (strict) throw new Error(`CLAUDE.md resolves outside the workspace: ${claudeMdPath}`);
     log.warn("pi-context", `CLAUDE.md resolves outside the workspace, skipping: ${claudeMdPath}`);
   }
   if (rawBody === null && !escaped) {
@@ -465,25 +582,42 @@ function assembleBundle(workspaceCwd: string): BundleResult {
   const { bodyWithoutImports, sections, importLineCount } = expandImports(
     rawBody ?? "",
     dirname(claudeMdPath),
+    { strict },
   );
-  const knowledgeSections = collectKnowledgeSections(workspaceCwd);
-  const rules = collectRules(workspaceCwd);
+  const knowledgeSections = collectKnowledgeSections(workspaceCwd, strict);
+  const rules = collectRules(workspaceCwd, { strict });
 
   const parts: string[] = [];
+  const sources: PiContextSourceManifest[] = [];
+  if (rawBody !== null) {
+    sources.push(contextSource("workspace", "workspace:CLAUDE.md", rawBody));
+  }
   const trimmedBody = bodyWithoutImports.trim();
   if (trimmedBody) {
     parts.push(trimmedBody);
   }
   for (const section of sections) {
     parts.push(sectionMarkdown(section.relpath, section.content));
+    sources.push(contextSource("workspace", workspaceSourceIdentity(section.relpath), section.content));
   }
   for (const section of knowledgeSections) {
     parts.push(sectionMarkdown(section.relpath, section.content));
+    sources.push(contextSource("knowledge", workspaceSourceIdentity(section.relpath), section.content));
   }
   for (const rule of rules) {
     parts.push(sectionMarkdown(rule.relpath, rule.content));
+    sources.push(contextSource(
+      rule.relpath.startsWith(".claude/rules/platform/") ? "platform-rule" : "custom-rule",
+      workspaceSourceIdentity(rule.relpath),
+      rule.content,
+    ));
   }
   parts.push(`## Knowledge access\n\n${KNOWLEDGE_ACCESS_DIRECTIVE}`);
+  sources.push(contextSource(
+    "package-directive",
+    "package:knowledge-access-v1",
+    KNOWLEDGE_ACCESS_DIRECTIVE,
+  ));
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
@@ -495,7 +629,49 @@ function assembleBundle(workspaceCwd: string): BundleResult {
     rules.length > 0 ||
     importLineCount > 0 ||
     escaped;
-  return { bundle: `${parts.join("\n\n")}\n`, hasContent };
+  return { bundle: `${parts.join("\n\n")}\n`, sources, hasContent };
+}
+
+function sha256(value: string | Buffer): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function workspaceSourceIdentity(relpath: string): string {
+  return `workspace:${relpath.replaceAll("\\", "/")}`;
+}
+
+function contextSource(
+  kind: PiContextSourceKind,
+  identity: string,
+  content: string,
+): PiContextSourceManifest {
+  return { kind, identity, contentHash: sha256(content) };
+}
+
+function canonicalManifestJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalManifestJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalManifestJson(entry)}`)
+    .join(",")}}`;
+}
+
+function buildContextManifest(
+  bundle: string,
+  persona: string | null,
+  sources: readonly PiContextSourceManifest[],
+): PiContextManifest {
+  const unsigned = {
+    version: PI_CONTEXT_MANIFEST_VERSION,
+    sources,
+    bundleHash: sha256(bundle),
+    personaHash: persona === null ? null : sha256(persona),
+  };
+  return {
+    ...unsigned,
+    digest: sha256(`minime-pi-context-manifest-v1\0${canonicalManifestJson(unsigned)}`),
+  };
 }
 
 /** Build the context bundle markdown string for a workspace (order 1-6 above). */
@@ -512,17 +688,34 @@ export function buildBundle(workspaceCwd: string): string {
  *  - If neither resolves → null → the caller passes NO `--system-prompt` (ride Pi base).
  */
 export function resolvePersona(agent: AgentConfig): string | null {
-  const parts: string[] = [];
+  return resolvePersonaWithSources(agent).persona;
+}
 
-  const outputStyle = readOutputStyleContent(agent.workspaceCwd);
-  if (outputStyle && outputStyle.trim()) {
-    parts.push(outputStyle.trim());
+function resolvePersonaWithSources(agent: AgentConfig, strict = false): {
+  persona: string | null;
+  sources: PiContextSourceManifest[];
+} {
+  const parts: string[] = [];
+  const sources: PiContextSourceManifest[] = [];
+
+  const outputStyle = readOutputStyleSource(agent.workspaceCwd, strict);
+  if (outputStyle && outputStyle.content.trim()) {
+    parts.push(outputStyle.content.trim());
+    sources.push(contextSource(
+      "output-style",
+      outputStyle.identity,
+      outputStyle.content,
+    ));
   }
   if (agent.systemPrompt && agent.systemPrompt.trim()) {
     parts.push(agent.systemPrompt.trim());
+    sources.push(contextSource("agent-config", "agent:system-prompt", agent.systemPrompt));
   }
 
-  return parts.length > 0 ? parts.join("\n\n") : null;
+  return {
+    persona: parts.length > 0 ? parts.join("\n\n") : null,
+    sources,
+  };
 }
 
 /**
@@ -535,11 +728,16 @@ function isSafeOutputStyleSlug(slug: string): boolean {
   return !slug.includes("/") && !slug.includes("\\");
 }
 
-/** Read the output-style markdown referenced by settings.local.json, or null. */
-function readOutputStyleContent(workspaceCwd: string): string | null {
+/** Read the output-style markdown and its exact redacted workspace identity. */
+function readOutputStyleSource(
+  workspaceCwd: string,
+  strict = false,
+): { content: string; identity: string } | null {
   const settingsPath = join(workspaceCwd, ".claude", "settings.local.json");
+  if (strict) rejectDirectSymlink(settingsPath, "settings.local.json");
   const { content: raw, escaped: settingsEscaped } = safeReadContainedFile(settingsPath, workspaceCwd);
   if (settingsEscaped) {
+    if (strict) throw new Error(`settings.local.json resolves outside the workspace: ${settingsPath}`);
     log.warn("pi-context", `settings.local.json resolves outside the workspace, skipping: ${settingsPath}`);
     return null;
   }
@@ -550,6 +748,7 @@ function readOutputStyleContent(workspaceCwd: string): string | null {
   try {
     slug = (JSON.parse(raw) as { outputStyle?: unknown }).outputStyle;
   } catch {
+    if (strict) throw new Error(`settings.local.json is not valid JSON: ${settingsPath}`);
     log.warn("pi-context", `settings.local.json is not valid JSON: ${settingsPath}`);
     return null;
   }
@@ -557,20 +756,28 @@ function readOutputStyleContent(workspaceCwd: string): string | null {
     return null;
   }
   if (!isSafeOutputStyleSlug(slug)) {
+    if (strict) throw new Error(`Output-style slug is not a bare filename: "${slug}"`);
     log.warn("pi-context", `output-style slug is not a bare filename, ignoring: "${slug}"`);
     return null;
   }
   const stylePath = join(workspaceCwd, ".claude", "output-styles", `${slug}.md`);
-  const { content, escaped: styleEscaped } = safeReadContainedFile(stylePath, workspaceCwd);
+  const { content, escaped: styleEscaped } = safeReadContainedFile(stylePath, workspaceCwd, {
+    rejectSymlink: strict,
+  });
   if (styleEscaped) {
+    if (strict) throw new Error(`Output-style resolves outside the workspace: ${stylePath}`);
     log.warn("pi-context", `output-style "${slug}" resolves outside the workspace, skipping: ${stylePath}`);
     return null;
   }
   if (content === null) {
+    if (strict) throw new Error(`Output-style is not a readable regular source: ${stylePath}`);
     log.warn("pi-context", `output-style "${slug}" not found at ${stylePath}`);
     return null;
   }
-  return content;
+  return {
+    content,
+    identity: workspaceSourceIdentity(`.claude/output-styles/${slug}.md`),
+  };
 }
 
 /**
@@ -605,13 +812,16 @@ interface CacheEntry {
   bundle: string;
   /** The resolved persona (the `--system-prompt` artifact body), or null when none. */
   persona: string | null;
+  manifest: PiContextManifest;
 }
 
 /**
- * Per-agent cache of the last assembled CONTENT, keyed on a manifest signature of
- * every source file's `{path, mtime, size}` (the OpenClaw `workspaceFileCache`
- * pattern). Repeat spawns with unchanged sources skip the re-read + re-assemble of
- * the source tree, while a touched source re-assembles (freshness parity).
+ * Per-agent cache of the last assembled CONTENT for non-strict callers, keyed on
+ * source content hashes plus directory membership metadata. Repeat ordinary
+ * spawns with unchanged sources skip the re-assemble of the source tree, while a
+ * touched source re-assembles (freshness parity). Strict callers always read the
+ * accepted source bytes directly so a concurrent update cannot cache bytes under
+ * the signature observed before assembly.
  *
  * The cache stores the assembled CONTENT, not just the artifact paths: a cache hit
  * still RE-WRITES the `.tmp/` artifacts from this content (see assemblePiContext).
@@ -626,7 +836,7 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 
 /**
- * A manifest signature over every source file: CLAUDE.md, each `@`-import, every
+ * A content-sensitive signature over every source file: CLAUDE.md, each `@`-import, every
  * platform + custom rule, settings.local.json, the resolved output-style file, and
  * the config-level systemPrompt. A missing file contributes a stable `missing`
  * marker, so adding/removing a source also changes the signature.
@@ -690,55 +900,71 @@ function computeManifestSignature(agent: AgentConfig): string {
  * Assemble the full Pi context for an agent and return the artifact paths, or null
  * to signal "no extra context — bare spawn".
  *
- * Caches by a source-file manifest: an unchanged source set skips the re-read +
- * re-assemble of the source tree, but STILL re-writes the `.tmp/` artifacts from
- * the cached content so the files on disk always match what the assembler produced
- * (and so a deleted artifact is transparently recreated).
+ * Non-strict callers cache by a content-sensitive source manifest: an unchanged
+ * source set skips re-parsing and re-assembly, but STILL re-writes the `.tmp/`
+ * artifacts from the cached content so the files on disk always match what the
+ * assembler produced (and so a deleted artifact is transparently recreated).
+ * Strict callers bypass the cache and assemble the accepted bytes afresh.
  *
  * Returns null only for a genuinely empty workspace with no persona. If artifact
  * writing fails after content was assembled, this throws; Pi callers must catch
  * and add `--no-context-files` so Pi does not fall back to flat context loading.
  */
-export function assemblePiContext(agent: AgentConfig): PiContextArtifacts | null {
-  const signature = computeManifestSignature(agent);
-  const cached = cache.get(agent.id);
+export function assemblePiContext(
+  agent: AgentConfig,
+  options: PiContextAssemblyOptions = {},
+): PiContextArtifacts | null {
+  const strict = options.strict === true;
+  const signature = strict ? null : computeManifestSignature(agent);
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}`;
+  const cached = strict ? undefined : cache.get(cacheKey);
 
   let bundle: string;
   let persona: string | null;
+  let manifest: PiContextManifest;
   if (cached && cached.signature === signature) {
     // Source manifest unchanged: reuse the assembled content (skip the expensive
-    // re-read + re-parse of every source file) but fall through to RE-WRITE the
+    // re-parse and assembly of every source file) but fall through to RE-WRITE the
     // artifacts below. A cache entry only exists for a non-empty assembly, so the
     // content here is guaranteed meaningful — no empty-workspace re-check needed.
     bundle = cached.bundle;
     persona = cached.persona;
+    manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd);
-    const resolvedPersona = resolvePersona(agent);
-    if (!assembled.hasContent && resolvedPersona === null) {
+    const assembled = assembleBundle(agent.workspaceCwd, strict);
+    const resolvedPersona = resolvePersonaWithSources(agent, strict);
+    if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
       // instead of forcing an empty bundle + --no-context-files.
-      cache.delete(agent.id);
+      cache.delete(cacheKey);
       return null;
     }
     bundle = assembled.bundle;
-    persona = resolvedPersona;
+    persona = resolvedPersona.persona;
+    manifest = buildContextManifest(
+      bundle,
+      persona,
+      [...assembled.sources, ...resolvedPersona.sources],
+    );
   }
 
   // Always (re-)write the artifacts — on a cache hit too. This keeps the on-disk
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
-  const appendSystemPromptPath = writeTempArtifact(agent.workspaceCwd, agent.id, "bundle", bundle);
+  const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
+  const appendSystemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "bundle", bundle);
   let systemPromptPath: string | undefined;
   if (persona !== null) {
-    systemPromptPath = writeTempArtifact(agent.workspaceCwd, agent.id, "persona", persona);
+    systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
   }
 
   const result: PiContextArtifacts =
     systemPromptPath !== undefined
-      ? { systemPromptPath, appendSystemPromptPath }
-      : { appendSystemPromptPath };
-  cache.set(agent.id, { signature, bundle, persona });
+      ? { systemPromptPath, appendSystemPromptPath, manifest }
+      : { appendSystemPromptPath, manifest };
+  if (signature !== null) {
+    cache.set(cacheKey, { signature, bundle, persona, manifest });
+  }
   return result;
 }
 

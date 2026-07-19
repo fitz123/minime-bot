@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import {
+  hasFreshOpsWorkerAuthorizationPass,
+  OpsWorkerAuthorizationCoordinator,
+  type OpsWorkerAuthorizationVerifierRegistry,
+} from "./authorization.js";
+import {
   EMPTY_OPS_WORKER_DONE_CHECK_REGISTRY,
   type OpsWorkerDoneCheckRegistry,
 } from "./done-checks.js";
@@ -10,7 +15,10 @@ import {
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
 } from "./pi-attempt.js";
+import type { PiPrimaryResourceContract } from "../pi-primary-resources.js";
+import type { AgentConfig } from "../types.js";
 import {
+  hashOpsWorkerCanonicalPayload,
   OpsWorkerLifecycle,
   OpsWorkerLifecycleError,
   type OpsWorkerLifecycleIdentityUpdate,
@@ -25,9 +33,11 @@ import { OpsWorkerTaskStore } from "./task-store.js";
 import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
+  inspectOpsWorkerPolicy,
   summarizeOpsWorkerTasks,
   startOpsWorkerStatusServer,
 } from "./status-server.js";
+import type { OpsWorkerQuotaAdmissionGate } from "./quota.js";
 import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
@@ -68,6 +78,10 @@ export interface OpsWorkerCliDependencies {
     task: OpsWorkerTask,
   ) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>;
   piAttemptDependencies?: OpsWorkerPiAttemptDependencies;
+  primaryContextAgent?: AgentConfig;
+  primaryPiResources?: PiPrimaryResourceContract;
+  authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+  quotaAdmission?: OpsWorkerQuotaAdmissionGate;
   abortSignal?: AbortSignal;
   schedulerPollMs?: number;
 }
@@ -397,7 +411,46 @@ function createSupervisor(
     inspectLockOwner: deps.inspectLockOwner ?? defaultInspectLockOwner,
     reconcileActiveRun: deps.reconcileActiveRun
       ?? createOpsWorkerPiStartupReconciler(),
+    authorizationVerifiers: deps.authorizationVerifiers,
+    quotaAdmission: deps.quotaAdmission,
   });
+}
+
+function inspectPolicy(deps: ReturnType<typeof dependencies>) {
+  return inspectOpsWorkerPolicy({
+    authorizationVerifiers: deps.authorizationVerifiers,
+    doneChecks: deps.doneChecks,
+    quotaAdmission: deps.quotaAdmission,
+    primaryPiResources: deps.primaryPiResources,
+  });
+}
+
+function assertStartPolicyDependencies(
+  deps: ReturnType<typeof dependencies>,
+): asserts deps is ReturnType<typeof dependencies> & {
+  primaryContextAgent: AgentConfig;
+  primaryPiResources: PiPrimaryResourceContract;
+  quotaAdmission: OpsWorkerQuotaAdmissionGate;
+} {
+  if (!deps.primaryContextAgent || !deps.primaryPiResources || !deps.quotaAdmission) {
+    throw new TypeError(
+      "Ops-worker start requires trusted primaryContextAgent, primaryPiResources, and quotaAdmission dependencies",
+    );
+  }
+  const sourceKinds = new Set([
+    ...Object.values(deps.taskRegistry.templates)
+      .flatMap((template) => template.sourceKinds),
+    ...Object.values(deps.taskRegistry.authorizationProfiles)
+      .flatMap((profile) => profile.sourceKinds),
+  ]);
+  for (const sourceKind of sourceKinds) {
+    if (!deps.authorizationVerifiers?.[sourceKind]) {
+      throw new TypeError(
+        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
+      );
+    }
+  }
+  inspectPolicy(deps);
 }
 
 function createTask(
@@ -425,6 +478,25 @@ function createTask(
       `authorization profile ${JSON.stringify(authorizationProfile)} is not registered`,
     );
   }
+  const doneCheckName = requiredValue(options, "done-check");
+  const doneCheckContract = deps.doneChecks.describe(doneCheckName);
+  if (!doneCheckContract) {
+    throw new OpsWorkerCliUsageError(
+      `done check ${JSON.stringify(doneCheckName)} is not registered`,
+    );
+  }
+  const lifecycle = createEmptyOpsWorkerLifecycleManifest();
+  lifecycle.verifier = doneCheckContract.verifierIdentity;
+  lifecycle.verifierVersion = doneCheckContract.verifierVersion;
+  lifecycle.verifierContractHash = doneCheckContract.contractHash;
+  const authorizationSnapshotHash = hashOpsWorkerCanonicalPayload({
+    sourceKind: "operator-cli",
+    correlationKey: requiredValue(options, "correlation-key"),
+    deliveryKey: requiredValue(options, "delivery-key"),
+    resourceKey: requiredValue(options, "resource-key"),
+    profile: authorizationProfile,
+    scope: [...authorization.scope],
+  });
   return withOpsWorkerSubmissionFingerprint({
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
     id,
@@ -440,7 +512,7 @@ function createTask(
         : "repository",
       key: requiredValue(options, "resource-key"),
     },
-    lifecycle: createEmptyOpsWorkerLifecycleManifest(),
+    lifecycle,
     currentCheckpoint: null,
     mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
     custody: createUnclaimedOpsWorkerCustody(),
@@ -454,14 +526,17 @@ function createTask(
       artifact: null,
     }],
     doneCheck: {
-      name: requiredValue(options, "done-check"),
+      name: doneCheckName,
       params: parseDoneCheckParams(options.values.get("done-check-params")),
     },
     authorization: {
       profile: authorizationProfile,
       scope: [...authorization.scope],
-      snapshotHash: null,
+      snapshotHash: authorizationSnapshotHash,
     },
+    authorizationVerification: null,
+    verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -585,6 +660,7 @@ async function runStart(
 ): Promise<number> {
   const directory = stateDirectory(parsed, cliOptions.cwd);
   const workspace = resolveCliPath(requiredValue(parsed, "agent-workspace"), cliOptions.cwd);
+  assertStartPolicyDependencies(deps);
   const host = parsed.values.get("host") ?? DEFAULT_OPS_WORKER_STATUS_HOST;
   const port = parsePort(parsed.values.get("port"));
   const store = createStore(directory, deps);
@@ -593,18 +669,24 @@ async function runStart(
   let statusServer: Awaited<ReturnType<typeof startOpsWorkerStatusServer>> | undefined;
   let processAbort: ReturnType<typeof installProcessAbortSignal> | undefined;
   try {
-    await supervisor.start();
-    started = true;
-    statusServer = await startOpsWorkerStatusServer({ supervisor, host, port });
     processAbort = deps.abortSignal ? undefined : installProcessAbortSignal();
     const signal = deps.abortSignal ?? processAbort?.signal;
     if (!signal) throw new Error("Ops-worker abort signal was not initialized");
     const runner = new OpsWorkerPiAttemptRunner({
       supervisor,
       workspaceCwd: workspace,
-      authorizationProfiles: deps.taskRegistry.authorizationProfiles,
+      primaryContextAgent: deps.primaryContextAgent,
+      primaryResources: deps.primaryPiResources,
       abortSignal: signal,
       dependencies: deps.piAttemptDependencies,
+    });
+    await supervisor.start();
+    started = true;
+    statusServer = await startOpsWorkerStatusServer({
+      supervisor,
+      host,
+      port,
+      inspectPolicy: () => inspectPolicy(deps),
     });
     writeLine(
       cliOptions.stdout,
@@ -649,7 +731,10 @@ export async function runOpsWorkerCliCommand(
     const store = createStore(stateDirectory(parsed, cliOptions.cwd), deps);
     const json = parsed.flags.has("json");
     if (action === "status") {
-      const summary = summarizeOpsWorkerTasks(store.list());
+      const summary = {
+        ...summarizeOpsWorkerTasks(store.list()),
+        policy: inspectPolicy(deps),
+      };
       if (json) writeJson(cliOptions.stdout, summary);
       else {
         writeLine(cliOptions.stdout, `Tasks: ${summary.totalTasks}`);
@@ -686,7 +771,15 @@ export async function runOpsWorkerCliCommand(
       printTask(result.task, json, cliOptions.stdout);
       return 0;
     }
-    const lifecycle = new OpsWorkerLifecycle(store, { now: deps.now });
+    const authorization = new OpsWorkerAuthorizationCoordinator(store, {
+      verifiers: deps.authorizationVerifiers,
+      now: deps.now,
+    });
+    const lifecycle = new OpsWorkerLifecycle(store, {
+      now: deps.now,
+      authorizeMutationClaim: (task, receipt) =>
+        hasFreshOpsWorkerAuthorizationPass(task, receipt.queryObservedAt),
+    });
     if (action === "checkpoint") {
       const task = lifecycle.recordCheckpoint(requiredValue(parsed, "id"), {
         checkpointId: requiredValue(parsed, "checkpoint-id"),
@@ -713,12 +806,35 @@ export async function runOpsWorkerCliCommand(
       return 0;
     }
     if (action === "receipt-claim") {
-      const result = lifecycle.claimMutationReceipt(requiredValue(parsed, "id"), {
+      const taskId = requiredValue(parsed, "id");
+      const operation = {
         boundary: parseMutationBoundary(requiredValue(parsed, "boundary")),
         operationId: requiredValue(parsed, "operation-id"),
         intent: parseJsonValue(requiredValue(parsed, "intent"), "intent"),
+      };
+      let claimed = false;
+      const decision = await authorization.revalidate(taskId, {
+        audit: {
+          event: "UPDATED",
+          summary: `Revalidated authorization and claimed ${operation.boundary} mutation boundary`,
+        },
+        onPass: (task, verification) => {
+          claimed = lifecycle.claimMutationReceiptAfterFreshAuthorization(
+            task,
+            operation,
+            verification,
+          );
+        },
       });
-      printMutationClaim(result, json, cliOptions.stdout);
+      if (!decision.authorized) {
+        printMutationClaim(
+          { task: decision.task, claimed: false },
+          json,
+          cliOptions.stdout,
+        );
+        return 0;
+      }
+      printMutationClaim({ task: decision.task, claimed }, json, cliOptions.stdout);
       return 0;
     }
     if (action === "receipt-finish") {

@@ -20,6 +20,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  hashOpsWorkerVerificationSubject,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerTask,
@@ -38,7 +39,10 @@ const registry: OpsWorkerTaskContractRegistry = {
     "fixture.inspect.v1": {
       sourceKinds: ["operator-cli"],
       scope: ["inspect"],
-      tools: ["read", "grep", "find", "ls"],
+    },
+    "fixture.mutate.v1": {
+      sourceKinds: ["operator-cli"],
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
     },
   },
   doneChecks: {
@@ -53,7 +57,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 
 function makeTask(id = "lifecycle-task"): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 4,
     id,
     source: {
       kind: "operator-cli",
@@ -71,10 +75,13 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
     evidence: [],
     doneCheck: { name: "fixture-check", params: { expected: true } },
     authorization: {
-      profile: "fixture.inspect.v1",
-      scope: ["inspect"],
+      profile: "fixture.mutate.v1",
+      scope: ["pull-request", "release", "deploy", "issue-lifecycle"],
       snapshotHash: null,
     },
+    authorizationVerification: null,
+    verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -92,6 +99,42 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
   });
 }
 
+function attachProductFailureVerification(task: OpsWorkerTask): void {
+  const contractHash = `sha256:${"8".repeat(64)}`;
+  task.state = "RESUMABLE";
+  task.custody = {
+    status: "HELD",
+    claimedAt: NOW,
+    releasedAt: null,
+    releaseReason: null,
+  };
+  task.lifecycle.verifier = "fixture-verifier";
+  task.lifecycle.verifierVersion = "1";
+  task.lifecycle.verifierContractHash = contractHash;
+  task.verification = {
+    verifierIdentity: "fixture-verifier",
+    verifierVersion: "1",
+    contractHash,
+    subjectHash: hashOpsWorkerVerificationSubject(task),
+    checkedAt: NOW,
+    completedAt: NOW,
+    outcome: "PRODUCT_FAILURE",
+    summary: "The fixture still requires product remediation.",
+    nextCheckAt: null,
+    components: [{
+      identity: "fixture-component",
+      version: "1",
+      required: true,
+      convergence: "PRODUCT",
+      outcome: "PRODUCT_FAILURE",
+      observedAt: NOW,
+      evidenceHash: `sha256:${"7".repeat(64)}`,
+      summary: "The fixture product evidence failed.",
+      nextCheckAt: null,
+    }],
+  };
+}
+
 function makeHarness(t: TestContext): {
   directory: string;
   store: OpsWorkerTaskStore;
@@ -106,6 +149,7 @@ function makeHarness(t: TestContext): {
   });
   const lifecycle = new OpsWorkerLifecycle(store, {
     now: () => new Date(currentNow),
+    authorizeMutationClaim: () => true,
   });
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return {
@@ -119,6 +163,134 @@ function makeHarness(t: TestContext): {
 }
 
 describe("ops worker package-owned lifecycle evidence", () => {
+  it("invalidates composite evidence across non-report lifecycle receipt changes", (t) => {
+    const identityHarness = makeHarness(t);
+    const identityTask = makeTask("verified-lifecycle-identity");
+    attachProductFailureVerification(identityTask);
+    identityHarness.store.create(identityTask);
+    const identity = identityHarness.lifecycle.updateLifecycleIdentity(identityTask.id, {
+      repository: "repository:example/minime-bot",
+    });
+    assert.equal(identity.verification, null);
+
+    const queryHarness = makeHarness(t);
+    const queryTask = makeTask("verified-receipt-query");
+    attachProductFailureVerification(queryTask);
+    queryHarness.store.create(queryTask);
+    const queried = queryHarness.lifecycle.beginMutationReceipt(queryTask.id, {
+      boundary: "merge",
+      operationId: "merge-query",
+      intent: { base: "main", head: "issue-58" },
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    assert.equal(queried.verification, null);
+
+    const claimHarness = makeHarness(t);
+    const claimIntent = { base: "main", head: "claim-review" };
+    const claimTask = makeTask("verified-receipt-claim");
+    claimTask.mutationReceipts.merge = {
+      boundary: "merge",
+      operationId: "merge-claim",
+      intentHash: hashOpsWorkerCanonicalPayload(claimIntent),
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ merged: false }),
+      mutationStartedAt: null,
+      outcome: null,
+      replayHistory: [],
+    };
+    attachProductFailureVerification(claimTask);
+    claimHarness.store.create(claimTask);
+    const claimed = claimHarness.lifecycle.claimMutationReceipt(claimTask.id, {
+      boundary: "merge",
+      operationId: "merge-claim",
+      intent: claimIntent,
+    });
+    assert.equal(claimed.claimed, true);
+    assert.equal(claimed.task.verification, null);
+
+    const finishHarness = makeHarness(t);
+    const finishIntent = { environment: "fixture" };
+    const finishTask = makeTask("verified-receipt-finish");
+    finishTask.mutationReceipts.deploy = {
+      boundary: "deploy",
+      operationId: "deploy-finish",
+      intentHash: hashOpsWorkerCanonicalPayload(finishIntent),
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ deployed: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    attachProductFailureVerification(finishTask);
+    finishHarness.store.create(finishTask);
+    const finished = finishHarness.lifecycle.finishMutationReceipt(finishTask.id, {
+      boundary: "deploy",
+      operationId: "deploy-finish",
+      intent: finishIntent,
+      result: "APPLIED",
+      evidence: { deployment: "fixture-deployment" },
+    });
+    assert.equal(finished.verification, null);
+    assert.equal(finished.mutationReceipts.deploy?.outcome?.result, "APPLIED");
+  });
+
+  it("fails closed when a mutation claim has no injected authorization fence", (t) => {
+    const harness = makeHarness(t);
+    const task = makeTask("receipt-missing-authorization");
+    harness.store.create(task);
+    const lifecycle = new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date(NOW),
+    });
+    const operation = {
+      boundary: "merge" as const,
+      operationId: "merge-missing-authorization",
+      intent: { base: "main", head: "issue-58" },
+    };
+    lifecycle.beginMutationReceipt(task.id, {
+      ...operation,
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+
+    assert.throws(
+      () => lifecycle.claimMutationReceipt(task.id, operation),
+      /requires a fresh package-owned authorization PASS/,
+    );
+    assert.equal(
+      harness.store.get(task.id)?.mutationReceipts.merge?.mutationStartedAt,
+      null,
+    );
+  });
+
+  it("requires the registered domain scope for each mutation boundary", (t) => {
+    const harness = makeHarness(t);
+    const base = makeTask("scope-fence");
+    const task = withOpsWorkerSubmissionFingerprint({
+      ...base,
+      authorization: {
+        profile: "fixture.inspect.v1",
+        scope: ["inspect"],
+        snapshotHash: null,
+      },
+    });
+    harness.store.create(task);
+    const operation = {
+      boundary: "merge" as const,
+      operationId: "scope-fence-merge",
+      intent: { base: "main", head: "scope-fence" },
+    };
+    harness.lifecycle.beginMutationReceipt(task.id, {
+      ...operation,
+      queryObservedAt: NOW,
+      queryResult: { merged: false },
+    });
+    assert.throws(
+      () => harness.lifecycle.claimMutationReceipt(task.id, operation),
+      /outside the task's registered authorization scopes/,
+    );
+  });
+
   it("records one checkpoint and makes identical canonical replay a true no-op", (t) => {
     const harness = makeHarness(t);
     const task = makeTask();
@@ -184,6 +356,19 @@ describe("ops worker package-owned lifecycle evidence", () => {
         arbitraryPhase: "command:run",
       } as never),
       /unknown lifecycle identity slot arbitraryPhase/,
+    );
+    assert.throws(
+      () => harness.lifecycle.recordCheckpoint(task.id, {
+        checkpointId: "checkpoint-verifier-poison",
+        payload: { phase: "verify" },
+        summary: "Untrusted checkpoint must not pin a verifier contract.",
+        lifecycle: {
+          verifier: "payload-selected-verifier",
+          verifierVersion: "99",
+          verifierContractHash: `sha256:${"f".repeat(64)}`,
+        } as never,
+      }),
+      /unknown lifecycle identity slot verifier/,
     );
     assert.throws(
       () => harness.lifecycle.updateLifecycleIdentity(task.id, {

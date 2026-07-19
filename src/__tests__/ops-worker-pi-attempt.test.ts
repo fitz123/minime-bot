@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -17,20 +19,40 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { assemblePiContext } from "../pi-context-assembler.js";
+import type { CodexQuotaSnapshot } from "../pi-extensions/codex-usage.js";
+import { opsWorkerEffectiveContextDigest } from "../pi-extensions/ops-worker-parity-attestation.js";
+import {
+  PI_BUILTIN_TOOL_NAMES,
+  resolvePiPrimaryResourceContract,
+  type PiPrimaryResourceContract,
+} from "../pi-primary-resources.js";
+import type { AgentConfig, PiThinkingLevel } from "../types.js";
+import {
+  hasFreshOpsWorkerAuthorizationPass,
+  type OpsWorkerAuthorizationVerifier,
+  type OpsWorkerAuthorizationVerifierRegistry,
+} from "../ops-worker/authorization.js";
 import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
-  type OpsWorkerDoneCheckResult,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import { cleanupOpsWorkerParitySessionSnapshots } from "../ops-worker/parity.js";
+import type {
+  OpsWorkerQuotaAdmissionDecision,
+  OpsWorkerQuotaAdmissionGate,
+} from "../ops-worker/quota.js";
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
   OPS_WORKER_ATTEMPT_TOKEN_ENV,
+  OPS_WORKER_NODE_OPTIONS,
   OPS_WORKER_PI_LIMITS,
   OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
   type OpsWorkerPiAttemptDependencies,
+  type OpsWorkerQuotaProbeRequest,
   type OpsWorkerProcessGroupInspection,
   type OpsWorkerProcessInspection,
 } from "../ops-worker/pi-attempt.js";
@@ -51,6 +73,85 @@ import {
 const FAKE_PI_PROCESS = fileURLToPath(
   new URL("./fixtures/fake-pi-process.mjs", import.meta.url),
 );
+const TSX_IMPORT = import.meta.resolve("tsx");
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const PRIMARY_TOOL_NAMES = [
+  ...PI_BUILTIN_TOOL_NAMES,
+  "web_search",
+  "knowledge_search",
+  "knowledge_get",
+  "knowledge_update",
+  "subagent",
+  "ask_agent",
+  "configured_extra",
+] as const;
+const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
+
+function admittedQuota(now = new Date()): OpsWorkerQuotaAdmissionDecision {
+  return {
+    version: 1,
+    status: "ADMITTED",
+    reason: "HEADROOM",
+    observedAt: now.toISOString(),
+    sampledAt: now.toISOString(),
+    activeWindows: ["5h"],
+    nextResetAt: null,
+    nextProbeAt: null,
+    evidenceHash: `sha256:${"c".repeat(64)}`,
+    summary: "Codex quota admission passed for 5h",
+  };
+}
+
+function deniedQuota(nextProbeAt: string): OpsWorkerQuotaAdmissionDecision {
+  const observedAt = new Date().toISOString();
+  return {
+    version: 1,
+    status: "NOT_ADMITTED",
+    reason: "LOW_REMAINING",
+    observedAt,
+    sampledAt: observedAt,
+    activeWindows: ["5h"],
+    nextResetAt: nextProbeAt,
+    nextProbeAt,
+    evidenceHash: `sha256:${"d".repeat(64)}`,
+    summary: "Codex quota admission closed: LOW_REMAINING",
+  };
+}
+
+function quotaSnapshot(now = new Date()): CodexQuotaSnapshot {
+  const reset = new Date(Math.floor(now.getTime() / 1_000) * 1_000 + 60 * 60_000);
+  return {
+    provider: "codex",
+    sampledAt: now.toISOString(),
+    lastSuccess: now.toISOString(),
+    lastSuccessTimestamp: Math.floor(now.getTime() / 1_000),
+    windows: {
+      "5h": {
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetAt: reset.toISOString(),
+        resetTimestamp: Math.floor(reset.getTime() / 1_000),
+      },
+      week: {},
+    },
+  };
+}
+const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
+  identity: "fixture-authorization",
+  version: "1",
+  verify: () => ({
+    status: "PASS",
+    evidenceHash: `sha256:${"b".repeat(64)}`,
+    summary: "Authorization matches the trusted fixture policy.",
+  }),
+};
+const fixtureAuthorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry = {
+  alertmanager: fixtureAuthorizationVerifier,
+  "operator-cli": fixtureAuthorizationVerifier,
+  "operator-telegram": fixtureAuthorizationVerifier,
+  "registered-cron": fixtureAuthorizationVerifier,
+  "authorized-issue": fixtureAuthorizationVerifier,
+};
 
 function validateFixtureParams(value: unknown): JsonObject {
   assert.deepEqual(value, { expected: true });
@@ -80,7 +181,6 @@ function registry(
           "authorized-issue",
         ],
         scope: ["inspect"],
-        tools: ["read", "grep", "find", "ls"],
       },
     },
     doneChecks: doneChecks.contracts,
@@ -104,7 +204,7 @@ function makeTask(
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 2,
+    schemaVersion: 4,
     id,
     source: {
       kind: sourceKind,
@@ -127,8 +227,11 @@ function makeTask(
     authorization: {
       profile: "fixture.inspect.v1",
       scope: ["inspect"],
-      snapshotHash: null,
+      snapshotHash: AUTHORIZATION_CLAIM_HASH,
     },
+    authorizationVerification: null,
+    verification: null,
+    legacyCompletion: null,
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -153,12 +256,17 @@ function makeTask(
 interface Harness {
   root: string;
   workspace: string;
+  primaryWorkspace: string;
+  primaryContextAgent: AgentConfig;
+  primaryResources: PiPrimaryResourceContract;
   store: OpsWorkerTaskStore;
   supervisor: OpsWorkerSupervisor;
   children: ChildProcess[];
   invocations: string[][];
   setScenario(scenario: string): void;
   runner(options?: {
+    model?: string;
+    thinking?: PiThinkingLevel;
     attemptTimeoutMs?: number;
     stallTimeoutMs?: number;
     abortSignal?: AbortSignal;
@@ -172,12 +280,62 @@ async function makeHarness(
     result: "PASS",
     summary: "Fixture is deterministically complete.",
   }),
+  options: {
+    authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+    quotaAdmission?: OpsWorkerQuotaAdmissionGate;
+  } = {},
 ): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "minime-ops-worker-pi-"));
   const workspace = join(root, "workspace");
+  const primaryWorkspace = join(root, "primary");
   const stateDirectory = join(root, "state");
   writeFileSync(join(root, ".keep"), "fixture\n", "utf8");
   mkdirSync(workspace, { mode: 0o700 });
+  mkdirSync(join(primaryWorkspace, ".claude", "rules", "platform"), { recursive: true });
+  mkdirSync(join(primaryWorkspace, ".claude", "rules", "custom"), { recursive: true });
+  mkdirSync(join(primaryWorkspace, ".claude", "skills", "fixture-skill"), { recursive: true });
+  writeFileSync(
+    join(primaryWorkspace, "CLAUDE.md"),
+    "# Primary fixture\n\n@USER.md\n@MEMORY.md\n",
+    "utf8",
+  );
+  writeFileSync(join(primaryWorkspace, "USER.md"), "PRIMARY_USER_CONTEXT\n", "utf8");
+  writeFileSync(join(primaryWorkspace, "MEMORY.md"), "PRIMARY_KNOWLEDGE_CONTEXT\n", "utf8");
+  writeFileSync(
+    join(primaryWorkspace, ".claude", "rules", "platform", "platform.md"),
+    "PRIMARY_PLATFORM_RULE\n",
+    "utf8",
+  );
+  writeFileSync(
+    join(primaryWorkspace, ".claude", "rules", "custom", "custom.md"),
+    "PRIMARY_CUSTOM_RULE\n",
+    "utf8",
+  );
+  const skillPath = join(primaryWorkspace, ".claude", "skills", "fixture-skill", "SKILL.md");
+  writeFileSync(
+    skillPath,
+    "---\nname: fixture-skill\ndescription: Synthetic parity skill.\n---\n\nFIXTURE_SKILL_BODY\n",
+    "utf8",
+  );
+  const extraExtension = join(root, "configured-extra.ts");
+  writeFileSync(extraExtension, "export default function () {}\n", "utf8");
+  const primaryContextAgent: AgentConfig = {
+    id: "main",
+    workspaceCwd: primaryWorkspace,
+    model: "openai-codex/gpt-5.5",
+    thinking: "medium",
+    systemPrompt: "PRIMARY_PERSONA_CONTEXT",
+  };
+  const primaryResources = resolvePiPrimaryResourceContract({
+    extensionOptions: {
+      extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+      relpaths: [],
+      extraExtensions: [extraExtension],
+    },
+    extraExtensionResourcePaths: [[]],
+    skillPaths: [skillPath],
+    toolNames: PRIMARY_TOOL_NAMES,
+  });
   const doneChecks = new OpsWorkerDoneCheckRegistry({
     "fixture-check": {
       timeoutMs: 500,
@@ -194,6 +352,11 @@ async function makeHarness(
     instanceId: "pi-fixture-supervisor",
     processStartToken: "pi-fixture-supervisor-start",
     infrastructureRetryMs: 1,
+    authorizationVerifiers: options.authorizationVerifiers
+      ?? fixtureAuthorizationVerifiers,
+    authorizationQueryRetryMs: 1,
+    quotaAdmission: options.quotaAdmission,
+    quotaRecheckMs: 1,
   });
   await supervisor.start();
   const children: ChildProcess[] = [];
@@ -210,11 +373,33 @@ async function makeHarness(
       }
     }
     supervisor.close();
+    const sessionsRoot = join(stateDirectory, "sessions");
+    if (existsSync(sessionsRoot)) {
+      for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const sessionDirectory = join(sessionsRoot, entry.name);
+          for (const snapshot of readdirSync(sessionDirectory, { withFileTypes: true })) {
+            if (
+              /^parity-(?:extension-[0-9]+|skill-[0-9]+|gate)-snapshot-[A-Za-z0-9]+$/.test(
+                snapshot.name,
+              )
+              && !snapshot.isDirectory()
+            ) {
+              rmSync(join(sessionDirectory, snapshot.name), { force: true });
+            }
+          }
+          cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
+        }
+      }
+    }
     rmSync(root, { recursive: true, force: true });
   });
   return {
     root,
     workspace,
+    primaryWorkspace,
+    primaryContextAgent,
+    primaryResources,
     store,
     supervisor,
     children,
@@ -226,7 +411,10 @@ async function makeHarness(
       return new OpsWorkerPiAttemptRunner({
         supervisor,
         workspaceCwd: workspace,
-        authorizationProfiles: registry(doneChecks).authorizationProfiles,
+        primaryContextAgent,
+        primaryResources,
+        model: options.model,
+        thinking: options.thinking,
         abortSignal: options.abortSignal,
         attemptTimeoutMs: options.attemptTimeoutMs ?? 5_000,
         stallTimeoutMs: options.stallTimeoutMs,
@@ -237,7 +425,7 @@ async function makeHarness(
             invocations.push([...args]);
             return {
               command: process.execPath,
-              args: [FAKE_PI_PROCESS, scenario, ...args],
+              args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, scenario, ...args],
             };
           },
           spawnProcess: (command, args, options) => {
@@ -249,7 +437,6 @@ async function makeHarness(
             ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
               process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
           ),
-          assembleContext: () => null,
           ...options.dependencies,
         },
       });
@@ -301,32 +488,122 @@ describe("ops worker Pi standard-session attempts", () => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("assembled-context"));
     let assembledWorkspace: string | undefined;
+    let strictAssembly: boolean | undefined;
+    let environmentWorkspace: string | undefined;
+    let callerAgentId: string | undefined;
 
-    await harness.runner({
+    const completed = await harness.runner({
       dependencies: {
-        assembleContext: (agent) => {
+        assembleContext: (agent, options) => {
           assembledWorkspace = agent.workspaceCwd;
-          return {
-            systemPromptPath: "/fixture/ops-worker-persona.md",
-            appendSystemPromptPath: "/fixture/ops-worker-context.md",
-          };
+          strictAssembly = options?.strict;
+          return assemblePiContext(agent, options);
+        },
+        buildEnv: (workspace, runtime) => {
+          environmentWorkspace = workspace;
+          callerAgentId = runtime?.askCallerAgentId;
+          return Object.fromEntries(
+            ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+              process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
+          );
         },
       },
     }).runAttempt("assembled-context");
 
-    assert.equal(assembledWorkspace, realpathSync(harness.workspace));
+    assert.equal(assembledWorkspace, realpathSync(harness.primaryWorkspace));
+    assert.equal(strictAssembly, true);
+    assert.equal(environmentWorkspace, realpathSync(harness.workspace));
+    assert.equal(callerAgentId, harness.primaryContextAgent.id);
     const args = harness.invocations[0];
+    assert.ok(args.includes("--no-extensions"));
+    assert.ok(args.includes("--no-skills"));
     assert.ok(args.includes("--no-context-files"));
+    const executionWorkspace = realpathSync(harness.workspace);
     assert.equal(
       args[args.indexOf("--system-prompt") + 1],
-      "/fixture/ops-worker-persona.md",
+      join(executionWorkspace, ".tmp", "pi-context-main.persona.md"),
     );
     const appended = args.flatMap((arg, index) =>
       arg === "--append-system-prompt" ? [args[index + 1]] : []);
     assert.deepEqual(appended, [
       "/fixture/ops-worker-context.md",
       OPS_WORKER_SYSTEM_POLICY,
-    ]);
+    ].map((value, index) => index === 0
+      ? join(executionWorkspace, ".tmp", "pi-context-main.bundle.md")
+      : value));
+    assert.equal(appended[1], OPS_WORKER_SYSTEM_POLICY);
+    const bundle = readFileSync(appended[0], "utf8");
+    for (const acceptedContext of [
+      "PRIMARY_USER_CONTEXT",
+      "PRIMARY_KNOWLEDGE_CONTEXT",
+      "PRIMARY_PLATFORM_RULE",
+      "PRIMARY_CUSTOM_RULE",
+    ]) assert.ok(bundle.includes(acceptedContext));
+    assert.equal(
+      readFileSync(args[args.indexOf("--system-prompt") + 1], "utf8"),
+      "PRIMARY_PERSONA_CONTEXT",
+    );
+    assert.equal(bundle.includes(OPS_WORKER_SYSTEM_POLICY), false);
+
+    const extensions = args.flatMap((arg, index) =>
+      arg === "--extension" ? [args[index + 1]] : []);
+    assert.equal(extensions.slice(0, -1).length, harness.primaryResources.extensionPaths.length);
+    for (const extension of extensions.slice(0, -1)) {
+      assert.match(extension, /parity-extension-\d+\.mjs$/);
+    }
+    assert.match(extensions.at(-1) ?? "", /parity-gate\.mjs$/);
+    assert.equal(new Set(extensions).size, extensions.length);
+    const skills = args.flatMap((arg, index) =>
+      arg === "--skill" ? [args[index + 1]] : []);
+    assert.equal(skills.length, harness.primaryResources.skillPaths.length);
+    assert.equal(skills.some((skill) => harness.primaryResources.skillPaths.includes(skill)), false);
+    for (const skill of skills) {
+      assert.match(skill, /parity-skill-\d+-snapshot-[^/]+\/SKILL\.md$/);
+    }
+    assert.equal(args[args.indexOf("--tools") + 1], PRIMARY_TOOL_NAMES.join(","));
+    const parityEvidence = completed.evidence.find((entry) =>
+      entry.summary.includes("Pi parity v1 PASS"));
+    assert.ok(parityEvidence);
+    assert.match(parityEvidence.summary, /primary-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /actual-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /capabilities=sha256:[a-f0-9]{64}/);
+    assert.equal(parityEvidence.summary.includes(harness.primaryWorkspace), false);
+    assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
+  });
+
+  it("rejects equal, overlapping, and symlinked context workspaces at construction", async (t) => {
+    const harness = await makeHarness(t);
+    const common = {
+      supervisor: harness.supervisor,
+      primaryResources: harness.primaryResources,
+    };
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: harness.workspace,
+      primaryContextAgent: {
+        ...harness.primaryContextAgent,
+        workspaceCwd: harness.workspace,
+      },
+    }), /must not equal or overlap/);
+
+    const nestedExecution = join(harness.primaryWorkspace, "nested-execution");
+    mkdirSync(nestedExecution);
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: nestedExecution,
+      primaryContextAgent: harness.primaryContextAgent,
+    }), /must not equal or overlap/);
+
+    const linkedPrimary = join(harness.root, "linked-primary");
+    symlinkSync(harness.primaryWorkspace, linkedPrimary);
+    assert.throws(() => new OpsWorkerPiAttemptRunner({
+      ...common,
+      workspaceCwd: harness.workspace,
+      primaryContextAgent: {
+        ...harness.primaryContextAgent,
+        workspaceCwd: linkedPrimary,
+      },
+    }), /must not be a symlink/);
   });
 
   it("includes bounded resource and lifecycle resume evidence in the private prompt", async (t) => {
@@ -335,6 +612,7 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(task);
     const lifecycle = new OpsWorkerLifecycle(harness.store, {
       now: () => new Date("2026-07-18T09:05:00.000Z"),
+      authorizeMutationClaim: () => true,
     });
     lifecycle.recordCheckpoint(task.id, {
       checkpointId: "checkpoint-prompt",
@@ -347,7 +625,7 @@ describe("ops worker Pi standard-session attempts", () => {
       },
     });
     const receipt = {
-      boundary: "merge" as const,
+      boundary: "report" as const,
       operationId: "merge-prompt",
       intent: { base: "main", head: "issue-58" },
     };
@@ -378,36 +656,126 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
   });
 
-  it("falls back to Pi context discovery only for a genuinely empty workspace", async (t) => {
+  it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
+    const harness = await makeHarness(t);
+    const staleTask = makeTask("launch-subject-drift");
+    harness.store.create(staleTask);
+    const lifecycle = new OpsWorkerLifecycle(harness.store);
+    let injected = false;
+    let updatedAtBeforeDrift: string | undefined;
+
+    const drifted = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "before-launch-fence" || injected) return;
+          injected = true;
+          updatedAtBeforeDrift = harness.store.get(staleTask.id)?.updatedAt;
+          lifecycle.recordCheckpoint(staleTask.id, {
+            checkpointId: "checkpoint-between-prompt-and-fence",
+            payload: { generation: 2 },
+            summary: "Prompt-relevant checkpoint raced the launch fence.",
+          });
+        },
+      },
+    }).runAttempt(staleTask.id);
+
+    assert.equal(injected, true);
+    assert.equal(drifted.updatedAt, updatedAtBeforeDrift);
+    assert.equal(
+      drifted.currentCheckpoint?.checkpointId,
+      "checkpoint-between-prompt-and-fence",
+    );
+    assert.equal(harness.invocations.length, 1);
+    assert.equal(harness.children.length, 0);
+    harness.supervisor.cancelTask(staleTask.id, "Release drifted launch fixture custody");
+
+    const fencedTask = makeTask("launch-lifecycle-freeze");
+    harness.store.create(fencedTask);
+    let rejectedAfterFence = false;
+    const completed = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "after-launch-intent-persisted") return;
+          assert.throws(
+            () => lifecycle.recordCheckpoint(fencedTask.id, {
+              checkpointId: "checkpoint-after-fence",
+              payload: { generation: 3 },
+              summary: "This checkpoint must not cross the persisted launch fence.",
+            }),
+            /atomic Pi launch fence is active/,
+          );
+          rejectedAfterFence = true;
+        },
+      },
+    }).runAttempt(fencedTask.id);
+
+    assert.equal(rejectedAfterFence, true);
+    assert.equal(completed.state, "DONE");
+    assert.equal(completed.currentCheckpoint, null);
+  });
+
+  it("fails closed instead of falling back after primary context assembly failure", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("empty-context"));
 
-    await harness.runner({
+    const result = await harness.runner({
       dependencies: { assembleContext: () => null },
     }).runAttempt("empty-context");
 
-    const args = harness.invocations[0];
-    assert.ok(!args.includes("--no-context-files"));
-    assert.equal(
-      args[args.indexOf("--append-system-prompt") + 1],
-      OPS_WORKER_SYSTEM_POLICY,
-    );
+    assert.equal(result.state, "RESUMABLE");
+    assert.match(result.lastOutcome?.summary ?? "", /refusing a smaller fallback/);
+    assert.equal(harness.invocations.length, 0);
+  });
+
+  it("stops before provider work when the loaded capability manifest mismatches", async (t) => {
+    let checkCalls = 0;
+    const harness = await makeHarness(t, () => {
+      checkCalls += 1;
+      return { result: "PASS", summary: "Should not run after parity failure." };
+    });
+    harness.store.create(makeTask("parity-mismatch"));
+    harness.setScenario("parity-mismatch");
+
+    const result = await harness.runner().runAttempt("parity-mismatch");
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /parity failed: TOOLS/);
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(checkCalls, 0);
+    assert.equal(harness.invocations.length, 1);
+    const parityEvidence = result.evidence.find((entry) =>
+      entry.summary.includes("Pi parity v1 MISMATCH"));
+    assert.ok(parityEvidence);
+    assert.match(parityEvidence.summary, /primary-context=sha256:[a-f0-9]{64}/);
+    assert.match(parityEvidence.summary, /capabilities=sha256:[a-f0-9]{64}/);
+    assert.equal(parityEvidence.summary.includes(harness.primaryWorkspace), false);
+    assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
   });
 
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {
     const harness = await makeHarness(t, () => ({
-      result: "ACTION_REQUIRED",
+      result: "PRODUCT_FAILURE",
       summary: "Synthetic state still requires repair.",
     }));
     harness.store.create(makeTask("success-failed-check", {
       objective: "--model payload-selected-model",
     }));
+    const sessionDirectory = join(
+      harness.supervisor.stateDirectory,
+      "sessions",
+      "success-failed-check",
+    );
+    mkdirSync(
+      join(sessionDirectory, "parity-extension-0-snapshot-abcdef"),
+      { recursive: true, mode: 0o700 },
+    );
 
     const result = await harness.runner().runAttempt("success-failed-check");
 
     assert.equal(result.state, "RESUMABLE");
     assert.equal(result.rounds.remediation, 1);
-    assert.equal(result.lastOutcome?.result, "ACTION_REQUIRED");
+    assert.equal(result.lastOutcome?.result, "PRODUCT_FAILURE");
     assert.equal(result.session.resume, true);
     assert.equal(harness.invocations.length, 1);
     const args = harness.invocations[0];
@@ -418,12 +786,15 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(args[0], "-p");
     assert.equal(args[1], "--session-dir");
     assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.5");
-    assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
-    assert.match(
-      args[args.indexOf("--append-system-prompt") + 1],
-      /Do not use sudo or perform irreversible deletion/,
-    );
+    assert.equal(args[args.indexOf("--tools") + 1], PRIMARY_TOOL_NAMES.join(","));
+    const appended = args.flatMap((arg, index) =>
+      arg === "--append-system-prompt" ? [args[index + 1]] : []);
+    assert.match(appended[1], /Do not use sudo or perform irreversible deletion/);
     assert.equal(result.evidence.some((entry) => /success claim/.test(entry.summary)), true);
+    assert.deepEqual(
+      readdirSync(sessionDirectory).filter((name) => /-snapshot-/.test(name)),
+      [],
+    );
   });
 
   it("treats clean exit as a claim even when successful output mentions old errors", async (t) => {
@@ -440,7 +811,7 @@ describe("ops worker Pi standard-session attempts", () => {
   it("runs a ready deterministic check without requiring a Pi success claim", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("check-without-claim"));
-    harness.supervisor.requestDoneCheck("check-without-claim");
+    await harness.supervisor.requestDoneCheck("check-without-claim");
 
     const result = await harness.runner().runNext();
 
@@ -449,13 +820,764 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(harness.invocations.length, 0);
   });
 
+  it("runs one exact-configuration quota smoke probe and refreshes quota waits", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("exact-quota-probe");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic authoritative quota wait.",
+    };
+    harness.store.create(task);
+    let request: OpsWorkerQuotaProbeRequest | undefined;
+    const sampled = quotaSnapshot();
+    const runner = harness.runner({
+      dependencies: {
+        runQuotaProbe: async (value) => {
+          request = value;
+          return { status: "SUCCESS" };
+        },
+      },
+    });
+
+    const resumed = await runner.runNext();
+    assert.equal(resumed?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(resumed?.custody.status, "HELD");
+    assert.equal(resumed?.rounds.consecutiveInfrastructureFailures, 0);
+    if (!request) throw new Error("Quota probe request was not captured");
+    const probeRequest = request as OpsWorkerQuotaProbeRequest;
+    assert.equal(probeRequest.model, "openai-codex/gpt-5.5");
+    assert.equal(probeRequest.thinking, "medium");
+    assert.equal(probeRequest.resources.digest, harness.primaryResources.digest);
+    assert.ok(probeRequest.args.includes("--no-session"));
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--model") + 1],
+      "openai-codex/gpt-5.5",
+    );
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--thinking") + 1],
+      "medium",
+    );
+    assert.equal(
+      probeRequest.args[probeRequest.args.indexOf("--tools") + 1],
+      PRIMARY_TOOL_NAMES.join(","),
+    );
+    const extensions = probeRequest.args.flatMap((arg, index) =>
+      arg === "--extension" ? [probeRequest.args[index + 1]] : []);
+    assert.equal(extensions.slice(0, -1).length, harness.primaryResources.extensionPaths.length);
+    for (const extension of extensions.slice(0, -1)) {
+      assert.match(extension, /parity-extension-\d+\.mjs$/);
+    }
+    assert.match(extensions.at(-1) ?? "", /parity-gate\.mjs$/);
+    assert.deepEqual(
+      probeRequest.args.flatMap((arg, index) =>
+        arg === "--skill" ? [probeRequest.args[index + 1]] : []),
+      probeRequest.parityLaunch.skillPaths,
+    );
+
+    harness.supervisor.cancelTask(task.id, "Exercise another probe result");
+    const quotaAgain = makeTask("exact-quota-probe-again");
+    quotaAgain.state = "RESUMABLE";
+    quotaAgain.custody = {
+      status: "HELD",
+      claimedAt: quotaAgain.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    quotaAgain.lastOutcome = {
+      at: quotaAgain.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic rolling quota wait.",
+    };
+    harness.store.create(quotaAgain);
+    const quotaResult = await harness.runner({
+      dependencies: {
+        runQuotaProbe: async () => ({ status: "QUOTA", snapshot: sampled }),
+      },
+    }).runNext();
+    assert.equal(quotaResult?.lastOutcome?.result, "QUOTA");
+    assert.equal(quotaResult?.schedule.nextRunAt, sampled.windows["5h"].resetAt);
+    assert.equal(quotaResult?.custody.status, "HELD");
+    assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
+  it("binds a fresh quota probe proof to exact launch configuration and consumes it once", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("bound-quota-probe-proof");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait requiring an exact proof.",
+    };
+    harness.store.create(task);
+    const successfulProbe = {
+      runQuotaProbe: async () => ({
+        status: "SUCCESS" as const,
+      }),
+    };
+
+    const initialProof = await harness.runner({
+      dependencies: successfulProbe,
+    }).runNext();
+    const initialSubject = initialProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(initialSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+
+    const changedModel = "openai-codex/gpt-5.5-mini";
+    const modelMismatch = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(modelMismatch?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(harness.children.length, 0);
+
+    const modelProof = await harness.runner({
+      model: changedModel,
+      dependencies: successfulProbe,
+    }).runNext();
+    const modelSubject = modelProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(modelSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+    assert.notEqual(modelSubject, initialSubject);
+
+    writeFileSync(
+      join(harness.primaryWorkspace, "USER.md"),
+      "CHANGED_PRIMARY_USER_CONTEXT\n",
+      "utf8",
+    );
+    const contextMismatch = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(contextMismatch?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(harness.children.length, 0);
+
+    const contextProof = await harness.runner({
+      model: changedModel,
+      dependencies: successfulProbe,
+    }).runNext();
+    const contextSubject = contextProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(contextSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+    assert.notEqual(contextSubject, modelSubject);
+
+    const completed = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(completed?.lastOutcome?.result, "PASS");
+    assert.equal(completed?.lastOutcome?.quotaProbeProof, undefined);
+    assert.equal(harness.children.length, 1);
+  });
+
+  it("rejects a mismatched unclaimed quota proof before taking custody", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    let quota = deniedQuota(dueAt);
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("unclaimed-bound-quota-proof");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+
+    const proof = await harness.runner().runNext();
+    assert.equal(proof?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(proof?.custody.status, "UNCLAIMED");
+    assert.equal(harness.children.length, 1);
+
+    quota = admittedQuota();
+    const rejected = await harness.runner({
+      model: "openai-codex/gpt-5.5-mini",
+    }).runNext();
+    assert.equal(rejected?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(rejected?.custody.status, "UNCLAIMED");
+    assert.equal(rejected?.custody.claimedAt, null);
+    assert.equal(harness.children.length, 1);
+  });
+
+  it("retains a caller-prepared parity snapshot across a corrupt-session retry", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    let quota = deniedQuota(dueAt);
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("prepared-snapshot-session-retry");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed quota wait before a session retry.",
+    };
+    harness.store.create(task);
+    const proof = await harness.runner({
+      dependencies: { runQuotaProbe: async () => ({ status: "SUCCESS" }) },
+    }).runNext();
+    assert.equal(proof?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(proof?.custody.status, "UNCLAIMED");
+
+    quota = admittedQuota();
+    let attemptCount = 0;
+    const recovered = await harness.runner({
+      dependencies: {
+        resolveInvocation: (args) => {
+          const scenario = attemptCount === 0
+            ? "session-corrupt-after-parity"
+            : "success";
+          attemptCount += 1;
+          return {
+            command: process.execPath,
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, scenario, ...args],
+          };
+        },
+      },
+    }).runNext();
+
+    assert.equal(recovered?.state, "DONE", JSON.stringify({
+      attemptCount,
+      children: harness.children.length,
+      lastOutcome: recovered?.lastOutcome,
+      session: recovered?.session,
+    }));
+    assert.equal(recovered?.lastOutcome?.result, "PASS");
+    assert.equal(attemptCount, 2);
+    assert.equal(harness.children.length, 2);
+  });
+
+  it("refuses a normal spawn when authorization-covered task state changes after preparation", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("atomic-launch-authorization-fence");
+    harness.store.create(task);
+    let changed = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        assembleContext: (agent, options) => {
+          const context = assemblePiContext(agent, options);
+          if (!changed) {
+            changed = true;
+            harness.store.mutate(
+              task.id,
+              { event: "UPDATED", summary: "Changed authorization subject before launch fence" },
+              (replacement) => {
+                replacement.updatedAt = new Date(
+                  Date.parse(replacement.updatedAt) + 1,
+                ).toISOString();
+                replacement.lifecycle.repository = "github:example/changed";
+              },
+            );
+          }
+          return context;
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(result.state, "QUEUED");
+    assert.equal(result.custody.status, "HELD");
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(result.activeRun, null);
+    assert.equal(hasFreshOpsWorkerAuthorizationPass(result), false);
+    assert.equal(harness.children.length, 0);
+  });
+
+  it("refuses a quota-probe spawn when its prepared task revision changes", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("atomic-quota-probe-launch-fence");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic due quota wait for a launch-fence race.",
+    };
+    harness.store.create(task);
+    let changed = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        resolveInvocation: (args) => {
+          if (!changed) {
+            changed = true;
+            harness.store.mutate(
+              task.id,
+              { event: "UPDATED", summary: "Changed quota-probe task before launch fence" },
+              (replacement) => {
+                replacement.updatedAt = new Date(
+                  Date.parse(replacement.updatedAt) + 1,
+                ).toISOString();
+                replacement.lifecycle.repository = "github:example/quota-changed";
+              },
+            );
+          }
+          return {
+            command: process.execPath,
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "quota-probe-success", ...args],
+          };
+        },
+      },
+    }).runNext();
+
+    assert.equal(result?.state, "QUEUED");
+    assert.equal(result?.custody.status, "UNCLAIMED");
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(harness.children.length, 0);
+  });
+
+  it("revalidates again immediately before spawning held and unclaimed quota probes", async (t) => {
+    const statuses: Array<"PASS" | "DRIFT" | "QUERY_ERROR"> = [];
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "quota-probe-runner-authorization",
+      version: "1",
+      verify: () => {
+        verificationCalls += 1;
+        const status = statuses.shift() ?? "QUERY_ERROR";
+        return {
+          status,
+          evidenceHash: `sha256:${"8".repeat(64)}`,
+          summary: `Synthetic runner quota probe authorization ${status}`,
+        };
+      },
+    };
+    let quota = admittedQuota();
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+      quotaAdmission: { check: () => quota },
+    });
+    const held = makeTask("held-quota-probe-revalidation");
+    held.state = "RESUMABLE";
+    held.custody = {
+      status: "HELD",
+      claimedAt: held.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    held.lastOutcome = {
+      at: held.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic held quota wait",
+    };
+    harness.store.create(held);
+    statuses.push("PASS", "DRIFT");
+
+    const blocked = await harness.runner().runNext();
+    assert.equal(blocked?.state, "BLOCKED");
+    assert.equal(blocked?.authorizationVerification?.status, "DRIFT");
+    assert.equal(harness.invocations.length, 0);
+    assert.equal(verificationCalls, 2);
+
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    quota = deniedQuota(dueAt);
+    const unclaimed = makeTask("unclaimed-quota-probe-revalidation");
+    unclaimed.schedule.nextRunAt = dueAt;
+    unclaimed.lastOutcome = {
+      at: unclaimed.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait",
+    };
+    harness.store.create(unclaimed);
+    statuses.push("PASS", "QUERY_ERROR");
+
+    const queryError = await harness.runner().runNext();
+    assert.equal(queryError?.state, "QUEUED");
+    assert.equal(queryError?.custody.status, "UNCLAIMED");
+    assert.equal(queryError?.authorizationVerification?.status, "QUERY_ERROR");
+    assert.equal(queryError?.lastOutcome?.kind, "AUTHORIZATION");
+    assert.equal(harness.invocations.length, 0);
+    assert.equal(verificationCalls, 4);
+  });
+
+  it("runs a due reset probe without claiming whole-cycle custody", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("unclaimed-quota-reset-probe");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+
+    const result = await harness.runner().runNext();
+
+    assert.equal(result?.state, "QUEUED");
+    assert.equal(result?.custody.status, "UNCLAIMED");
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(result?.schedule.nextRunAt, null);
+    assert.equal(result?.activeRun, null);
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(harness.invocations.length, 1);
+  });
+
+  it("contains held and unclaimed quota-probe preparation failures", async (t) => {
+    let quota = admittedQuota();
+    const harness = await makeHarness(t, undefined, {
+      quotaAdmission: { check: () => quota },
+    });
+    const held = makeTask("held-quota-preparation-error");
+    held.state = "RESUMABLE";
+    held.custody = {
+      status: "HELD",
+      claimedAt: held.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    held.lastOutcome = {
+      at: held.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic held quota wait",
+    };
+    harness.store.create(held);
+
+    const heldError = await harness.runner({
+      dependencies: {
+        assembleContext: () => {
+          throw new Error("Synthetic strict context assembly failure");
+        },
+      },
+    }).runNext();
+    assert.equal(heldError?.state, "RESUMABLE");
+    assert.equal(heldError?.custody.status, "HELD");
+    assert.equal(heldError?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(heldError?.lastOutcome?.summary ?? "", /context assembly failure/);
+    assert.equal(harness.invocations.length, 0);
+
+    harness.supervisor.cancelTask(held.id, "Exercise unclaimed preparation failure");
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    quota = deniedQuota(dueAt);
+    const unclaimed = makeTask("unclaimed-quota-preparation-error");
+    unclaimed.schedule.nextRunAt = dueAt;
+    unclaimed.lastOutcome = {
+      at: unclaimed.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait",
+    };
+    harness.store.create(unclaimed);
+    const unclaimedRunner = harness.runner();
+    const configuredExtra = harness.primaryResources.extensionPaths.at(-1);
+    assert.ok(configuredExtra);
+    writeFileSync(
+      configuredExtra,
+      "export default function changedAfterPrimaryPin() {}\n",
+      "utf8",
+    );
+
+    const unclaimedError = await unclaimedRunner.runNext();
+    assert.equal(unclaimedError?.state, "QUEUED");
+    assert.equal(unclaimedError?.custody.status, "UNCLAIMED");
+    assert.equal(unclaimedError?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(unclaimedError?.lastOutcome?.summary ?? "", /hashes are inconsistent/);
+    assert.equal(harness.invocations.length, 0);
+  });
+
+  it("executes the bounded probe child through parity and attempt-scoped quota capture", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("bounded-quota-probe-child");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait for the package-owned probe child.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+    let probeSpawnOptions: Parameters<NonNullable<OpsWorkerPiAttemptDependencies["spawnProcess"]>>[2]
+      | undefined;
+
+    const result = await harness.runner({
+      dependencies: {
+        spawnProcess: (command, args, options) => {
+          probeSpawnOptions = options;
+          return spawn(command, args, options);
+        },
+      },
+    }).runNext();
+
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(result?.custody.status, "HELD");
+    assert.equal(harness.invocations.length, 1);
+    assert.ok(harness.invocations[0].includes("--no-session"));
+    assert.equal(probeSpawnOptions?.detached, true);
+    assert.equal(
+      (probeSpawnOptions?.env as Record<string, string> | undefined)
+        ?.MINIME_OPS_WORKER_QUOTA_PROBE,
+      "1",
+    );
+    assert.equal(
+      (probeSpawnOptions?.env as Record<string, string> | undefined)?.NODE_OPTIONS,
+      OPS_WORKER_NODE_OPTIONS,
+    );
+    assert.equal(
+      harness.invocations[0][harness.invocations[0].indexOf("--model") + 1],
+      "openai-codex/gpt-5.5",
+    );
+    assert.equal(
+      harness.invocations[0][harness.invocations[0].indexOf("--thinking") + 1],
+      "medium",
+    );
+    assert.equal(
+      readdirSync(join(harness.supervisor.stateDirectory, "sessions", task.id))
+        .some((name) => name === "quota-smoke-telemetry.json"),
+      false,
+    );
+
+    harness.supervisor.cancelTask(task.id, "Exercise a successful probe without quota headers");
+    const headerlessSuccess = makeTask("bounded-quota-probe-child-headerless-success");
+    headerlessSuccess.state = "RESUMABLE";
+    headerlessSuccess.custody = {
+      status: "HELD",
+      claimedAt: headerlessSuccess.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    headerlessSuccess.lastOutcome = {
+      at: headerlessSuccess.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a headerless successful probe.",
+    };
+    harness.store.create(headerlessSuccess);
+    harness.setScenario("quota-probe-success-no-quota-headers");
+
+    const headerless = await harness.runner().runNext();
+    assert.equal(headerless?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(headerless?.custody.status, "HELD");
+    assert.match(
+      headerless?.lastOutcome?.quotaProbeProof?.subjectHash ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+
+    harness.supervisor.cancelTask(
+      headerlessSuccess.id,
+      "Exercise a typed quota probe response",
+    );
+    const quotaAgain = makeTask("bounded-quota-probe-child-quota");
+    quotaAgain.state = "RESUMABLE";
+    quotaAgain.custody = {
+      status: "HELD",
+      claimedAt: quotaAgain.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    quotaAgain.lastOutcome = {
+      at: quotaAgain.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic rolling quota wait for the package-owned probe child.",
+    };
+    harness.store.create(quotaAgain);
+    harness.setScenario("quota-probe-quota-clean-exit");
+
+    const refreshed = await harness.runner().runNext();
+    assert.equal(refreshed?.lastOutcome?.result, "QUOTA");
+    assert.equal(refreshed?.custody.status, "HELD");
+    assert.equal(refreshed?.rounds.consecutiveInfrastructureFailures, 0);
+    assert.ok(refreshed?.schedule.nextRunAt);
+
+    harness.supervisor.cancelTask(quotaAgain.id, "Exercise a non-2xx probe response");
+    const serverError = makeTask("bounded-quota-probe-child-server-error");
+    serverError.state = "RESUMABLE";
+    serverError.custody = {
+      status: "HELD",
+      claimedAt: serverError.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    serverError.lastOutcome = {
+      at: serverError.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a provider server error.",
+    };
+    harness.store.create(serverError);
+    harness.setScenario("quota-probe-server-error");
+
+    const rejected = await harness.runner().runNext();
+    assert.equal(rejected?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(rejected?.lastOutcome?.summary ?? "", /provider HTTP 503/);
+    assert.equal(rejected?.lastOutcome?.quotaProbeProof, undefined);
+  });
+
+  it("releases the quota-probe launch slot when parity snapshot cleanup fails", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("quota-probe-cleanup-failure");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a cleanup failure.",
+    };
+    harness.store.create(task);
+
+    await assert.rejects(
+      harness.runner({
+        dependencies: {
+          runQuotaProbe: async (request) => {
+            const snapshotRoot = request.parityLaunch.snapshotRoots[0];
+            cleanupOpsWorkerParitySessionSnapshots(request.parityLaunch.sessionDirectory);
+            writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
+            return { status: "SUCCESS" };
+          },
+        },
+      }).runNext(),
+      /Refusing to remove a non-directory ops-worker parity snapshot/,
+    );
+
+    harness.supervisor.cancelTask(task.id, "Release custody after the cleanup failure");
+    const successor = makeTask("quota-probe-cleanup-successor");
+    successor.state = "RESUMABLE";
+    successor.custody = {
+      status: "HELD",
+      claimedAt: successor.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    successor.lastOutcome = {
+      at: successor.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic successor quota wait.",
+    };
+    harness.store.create(successor);
+
+    const result = await harness.runner({
+      dependencies: { runQuotaProbe: async () => ({ status: "SUCCESS" }) },
+    }).runNext();
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+  });
+
+  it("releases the attempt launch slot when parity snapshot cleanup fails", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("attempt-cleanup-failure");
+    harness.store.create(task);
+    let corruptedSnapshot = false;
+
+    await assert.rejects(
+      harness.runner({
+        dependencies: {
+          spawnProcess: (command, args, options) => {
+            const child = spawn(command, args, options);
+            harness.children.push(child);
+            child.once("exit", () => {
+              const sessionDirectory = join(
+                harness.supervisor.stateDirectory,
+                "sessions",
+                task.id,
+              );
+              const snapshotName = readdirSync(sessionDirectory).find((name) =>
+                /^parity-extension-[0-9]+-snapshot-/.test(name));
+              if (snapshotName === undefined) return;
+              const snapshotRoot = join(sessionDirectory, snapshotName);
+              cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
+              writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
+              corruptedSnapshot = true;
+            });
+            return child;
+          },
+        },
+      }).runAttempt(task.id),
+      /Refusing to remove a non-directory ops-worker parity snapshot/,
+    );
+    assert.equal(corruptedSnapshot, true);
+    assert.equal(harness.store.get(task.id)?.state, "CHECKING");
+    harness.supervisor.cancelTask(task.id, "Release custody after the cleanup failure");
+
+    const successor = makeTask("attempt-cleanup-successor");
+    harness.store.create(successor);
+    const result = await harness.runner().runAttempt(successor.id);
+    assert.equal(result.state, "DONE");
+  });
+
+  it("durably fences and safely stops an owned quota probe process group", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("owned-quota-probe-fence");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait for durable probe ownership.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-wait");
+    const controller = new AbortController();
+    const running = harness.runner({ abortSignal: controller.signal }).runNext();
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    const active = harness.supervisor.getTask(task.id)?.activeRun;
+    assert.ok(active);
+    assert.match(active.attemptId, /^quota-probe-/);
+    assert.equal(active.pid, active.processGroupId);
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "OWNED");
+
+    controller.abort();
+    const result = await running;
+
+    assert.equal(result?.state, "RESUMABLE", JSON.stringify(result?.lastOutcome));
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(result?.lastOutcome?.summary ?? "", /worker shutdown/);
+    assert.equal(result?.activeRun, null);
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(result?.custody.status, "HELD");
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    let resolveFirstCheck: ((result: unknown) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
       if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+        return new Promise<unknown>((resolveCheck) => {
           resolveFirstCheck = resolveCheck;
         });
       }
@@ -466,7 +1588,7 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const task = makeTask("stale-checkpoint-check");
     harness.store.create(task);
-    harness.supervisor.requestDoneCheck(task.id);
+    await harness.supervisor.requestDoneCheck(task.id);
 
     const pending = harness.runner().runNext();
     await waitFor(() => resolveFirstCheck !== undefined);
@@ -488,11 +1610,11 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("keeps scheduling when a checkpoint makes the post-attempt done check stale", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
+    let resolveFirstCheck: ((result: unknown) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
       if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
+        return new Promise<unknown>((resolveCheck) => {
           resolveFirstCheck = resolveCheck;
         });
       }
@@ -503,10 +1625,10 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const task = makeTask("stale-post-attempt-check");
     harness.store.create(task);
-    const runner = harness.runner();
+    const runner = harness.runner({ attemptTimeoutMs: 15_000 });
 
     const pending = runner.runAttempt(task.id);
-    await waitFor(() => resolveFirstCheck !== undefined);
+    await waitFor(() => resolveFirstCheck !== undefined, 15_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-during-post-attempt-check",
       payload: { progress: "still-live" },
@@ -526,26 +1648,53 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(checkCalls, 2);
   });
 
-  it("keeps scheduling when a checkpoint makes an early-exit done check stale", async (t) => {
+  it("rejects an early parity PASS that exits before parent persistence and acknowledgement", async (t) => {
     let checkCalls = 0;
-    let resolveFirstCheck: ((result: OpsWorkerDoneCheckResult) => void) | undefined;
     const harness = await makeHarness(t, () => {
       checkCalls += 1;
-      if (checkCalls === 1) {
-        return new Promise<OpsWorkerDoneCheckResult>((resolveCheck) => {
-          resolveFirstCheck = resolveCheck;
-        });
-      }
       return {
         result: "PASS",
-        summary: "Fresh fixture pass after early-exit checkpoint liveness.",
+        summary: "Must not run for an unacknowledged parity report.",
       };
     });
     const task = makeTask("stale-early-exit-check");
     harness.store.create(task);
     const runner = harness.runner({
       dependencies: {
-        spawnProcess: () => {
+        spawnProcess: (_command, _args, options) => {
+          const env = options.env as Record<string, string>;
+          const expected = JSON.parse(readFileSync(
+            env.MINIME_OPS_WORKER_PARITY_EXPECTED_PATH,
+            "utf8",
+          )) as {
+            version: 1;
+            digest: string;
+            primaryContextDigest: string;
+            capabilityDigest: string;
+            extensionsDigest: string;
+            skillsDigest: string;
+            toolsDigest: string;
+            customPromptHash: string | null;
+            appendSystemPromptHash: string;
+            contextFilesDigest: string;
+          };
+          writeFileSync(
+            env.MINIME_OPS_WORKER_PARITY_REPORT_PATH,
+            `${JSON.stringify({
+              version: expected.version,
+              status: "PASS",
+              expectedDigest: expected.digest,
+              primaryContextDigest: expected.primaryContextDigest,
+              actualContextDigest: opsWorkerEffectiveContextDigest(expected),
+              actualSystemPromptHash: `sha256:${"c".repeat(64)}`,
+              actualCapabilityDigest: expected.capabilityDigest,
+              actualExtensionsDigest: expected.extensionsDigest,
+              actualSkillsDigest: expected.skillsDigest,
+              actualToolsDigest: expected.toolsDigest,
+              mismatch: [],
+            })}\n`,
+            "utf8",
+          );
           const child = new EventEmitter() as ChildProcess;
           Object.assign(child, {
             pid: 600_002,
@@ -564,25 +1713,14 @@ describe("ops worker Pi standard-session attempts", () => {
       },
     });
 
-    const pending = runner.runAttempt(task.id);
-    await waitFor(() => resolveFirstCheck !== undefined);
-    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
-      checkpointId: "checkpoint-during-early-exit-check",
-      payload: { progress: "still-live" },
-      summary: "Lifecycle progress arrived during early-exit verification.",
-    });
-    assert.ok(resolveFirstCheck);
-    resolveFirstCheck({ result: "PASS", summary: "Stale fixture pass." });
-
-    const stale = await pending;
-    assert.equal(stale.state, "CHECKING");
-    assert.equal(
-      stale.currentCheckpoint?.checkpointId,
-      "checkpoint-during-early-exit-check",
+    const result = await runner.runAttempt(task.id);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(
+      result.lastOutcome?.summary ?? "",
+      /before parent persistence and acknowledgement/,
     );
-    const completed = await runner.runNext();
-    assert.equal(completed?.state, "DONE");
-    assert.equal(checkCalls, 2);
+    assert.equal(checkCalls, 0);
   });
 
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {
@@ -615,6 +1753,8 @@ describe("ops worker Pi standard-session attempts", () => {
     }));
     const cases = [
       ["quota", "QUOTA"],
+      ["quota-clean-exit", "QUOTA"],
+      ["server-error-clean-exit", "CRASH"],
       ["network", "NETWORK"],
       ["context", "CONTEXT_OVERFLOW"],
       ["large-output", "CRASH"],
@@ -641,9 +1781,70 @@ describe("ops worker Pi standard-session attempts", () => {
       if (scenario === "large-output") {
         assert.match(piEvidence.summary, /omitted \d+ earlier byte/);
       }
-      assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      if (expected === "QUOTA") {
+        assert.equal(harness.supervisor.selectNextTask(), undefined);
+        assert.ok(result.schedule.nextRunAt);
+        assert.ok(Date.parse(result.schedule.nextRunAt) > Date.now());
+      } else {
+        assert.equal(harness.supervisor.selectNextTask()?.task.id, taskId);
+      }
       harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
+  });
+
+  it("fails closed when a clean attempt has no response telemetry", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("clean-exit-without-telemetry");
+    harness.store.create(task);
+    harness.setScenario("success-missing-telemetry");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.match(result.lastOutcome?.summary ?? "", /without valid attempt response telemetry/);
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
+    assert.ok(result.schedule.nextRunAt);
+  });
+
+  it("never reuses an earlier response capture after final telemetry fails", async (t) => {
+    const harness = await makeHarness(t);
+    for (const scenario of ["success-stale-telemetry", "quota-stale-telemetry"]) {
+      const task = makeTask(`failed-final-capture-${scenario}`);
+      harness.store.create(task);
+      harness.setScenario(scenario);
+
+      const result = await harness.runner().runAttempt(task.id);
+
+      assert.equal(result.state, "RESUMABLE");
+      assert.equal(result.lastOutcome?.result, "CRASH");
+      assert.equal(result.rounds.remediation, 0);
+      assert.equal(result.custody.status, "HELD");
+      harness.supervisor.cancelTask(task.id, "Release failed telemetry fixture custody");
+    }
+  });
+
+  it("retains custody and durable progress after a child rc=1", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("rc-one-after-progress");
+    harness.store.create(task);
+    new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
+      checkpointId: "durable-progress-before-rc-one",
+      payload: { phase: "repair-applied", generation: 1 },
+      summary: "A safe remediation checkpoint was durable before child exit.",
+    });
+    harness.setScenario("network");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "NETWORK");
+    assert.equal(result.currentCheckpoint?.checkpointId, "durable-progress-before-rc-one");
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
+    assert.equal(result.custody.releasedAt, null);
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, task.id);
   });
 
   it("quarantines a corrupt session and continues in one fresh standard session", async (t) => {
@@ -676,6 +1877,54 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(quarantined.length, 1);
     assert.match(quarantined[0], /\.corrupt$/);
     assert.ok(harness.invocations[1].includes("--session-id"));
+  });
+
+  it("revalidates authorization before a fresh launch after corrupt-session reset", async (t) => {
+    const statuses: Array<"PASS" | "DRIFT"> = [];
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "session-reset-authorization",
+      version: "1",
+      verify: () => {
+        verificationCalls += 1;
+        const status = statuses.shift() ?? "PASS";
+        return {
+          status,
+          evidenceHash: `sha256:${"7".repeat(64)}`,
+          summary: `Synthetic session-reset authorization ${status}`,
+        };
+      },
+    };
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+    });
+    harness.store.create(makeTask("corrupt-session-drift"));
+    harness.setScenario("crash");
+    const crashed = await harness.runner().runAttempt("corrupt-session-drift");
+    const oldSessionId = crashed.session.sessionId as string;
+    const sessionDirectory = join(
+      harness.supervisor.stateDirectory,
+      "sessions",
+      "corrupt-session-drift",
+    );
+    const sessionFile = readdirSync(sessionDirectory)
+      .find((file) => file.endsWith(".jsonl") && file.includes(oldSessionId));
+    assert.ok(sessionFile);
+    writeFileSync(join(sessionDirectory, sessionFile), "not-json\n", "utf8");
+    statuses.push("PASS", "DRIFT");
+
+    harness.setScenario("success");
+    const blocked = await harness.runner().runAttempt("corrupt-session-drift");
+
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.authorizationVerification?.status, "DRIFT");
+    assert.notEqual(blocked.session.sessionId, oldSessionId);
+    assert.equal(blocked.custody.status, "RELEASED");
+    assert.equal(harness.invocations.length, 1);
+    assert.equal(verificationCalls, 4);
   });
 
   it("keeps an interrupted owner ahead of a queued higher-priority task", async (t) => {
@@ -777,7 +2026,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await waitFor(() => timers.size > 0);
+    await waitFor(() => timers.size > 0, 5_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },
@@ -914,7 +2163,7 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const harness = await makeHarness(t, () => {
       markCheckStarted?.();
-      return new Promise<OpsWorkerDoneCheckResult>(() => undefined);
+      return new Promise<unknown>(() => undefined);
     });
     harness.store.create(makeTask("shutdown-success-check"));
     harness.setScenario("success");
@@ -1040,9 +2289,10 @@ describe("ops worker Pi standard-session attempts", () => {
     const identityGone = await harness.runner({
       dependencies: { readProcessIdentity: () => ({ status: "GONE" }) },
     }).runAttempt("identity-gone");
-    assert.equal(identityGone.state, "DONE");
+    assert.equal(identityGone.state, "BLOCKED");
+    assert.equal(identityGone.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
     assert.equal(identityGone.activeRun, null);
-    assert.equal(identityGone.unverifiedRun, null);
+    assert.ok(identityGone.unverifiedRun);
 
     const missingPidHarness = await makeHarness(t);
     missingPidHarness.store.create(makeTask("missing-pid"));

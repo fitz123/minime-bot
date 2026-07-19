@@ -1,5 +1,6 @@
 import { describe, it, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -944,7 +945,7 @@ describe("assemblePiContext", () => {
     assert.ok(!restored.includes("TAMPERED"), "the tampered content was overwritten");
   });
 
-  it("caches by the source manifest: a cache hit reuses artifacts; a touched source re-assembles", () => {
+  it("hashes source content so same-size same-mtime edits still re-assemble", () => {
     _resetPiContextCache();
     const ws = makeWorkspace({
       claudeMd: "# x\n\nBODY",
@@ -961,16 +962,15 @@ describe("assemblePiContext", () => {
     assert.ok(first);
     assert.ok(readFileSync(first.appendSystemPromptPath, "utf8").includes("RULE_AAA"));
 
-    // Mutate content to the SAME byte length and restore the pinned mtime →
-    // identical manifest signature → cache hit → the stale bundle is returned
-    // (proves no re-read).
+    // Mutate content to the SAME byte length and restore the pinned mtime. A
+    // metadata-only cache would return stale instructions here.
     writeFileSync(rulePath, "RULE_BBB", "utf8");
     utimesSync(rulePath, pinned, pinned);
     const second = assemblePiContext(agent);
     assert.ok(second);
-    const cachedBundle = readFileSync(second.appendSystemPromptPath, "utf8");
-    assert.ok(cachedBundle.includes("RULE_AAA"), "cache hit reused the prior bundle (no re-read)");
-    assert.ok(!cachedBundle.includes("RULE_BBB"));
+    const refreshedBundle = readFileSync(second.appendSystemPromptPath, "utf8");
+    assert.ok(refreshedBundle.includes("RULE_BBB"));
+    assert.ok(!refreshedBundle.includes("RULE_AAA"));
 
     // Bump the mtime → signature changes → re-assemble → fresh content.
     const later = new Date(1_700_000_005_000);
@@ -980,6 +980,48 @@ describe("assemblePiContext", () => {
     assert.ok(
       readFileSync(third.appendSystemPromptPath, "utf8").includes("RULE_BBB"),
       "a touched source re-assembles the bundle",
+    );
+  });
+
+  it("does not cache strict context under a signature observed before assembly", () => {
+    _resetPiContextCache();
+    const ws = makeWorkspace({
+      claudeMd: "# x\n\nBODY",
+      files: { ".claude/rules/platform/x.md": "RULE_AAA" },
+    });
+    const rulePath = join(ws, ".claude", "rules", "platform", "x.md");
+    const agent = agentFor(ws, { id: "strict-cache-race" });
+    let mutated = false;
+    Object.defineProperty(agent, "systemPrompt", {
+      configurable: true,
+      enumerable: true,
+      get(): undefined {
+        if (!mutated) {
+          mutated = true;
+          writeFileSync(rulePath, "RULE_BBB", "utf8");
+        }
+        return undefined;
+      },
+    });
+
+    const first = assemblePiContext(agent, { strict: true });
+    assert.ok(first);
+    writeFileSync(rulePath, "RULE_AAA", "utf8");
+
+    const second = assemblePiContext(agent, { strict: true });
+    assert.ok(second);
+    const bundle = readFileSync(second.appendSystemPromptPath, "utf8");
+    assert.ok(bundle.includes("RULE_AAA"));
+    assert.ok(!bundle.includes("RULE_BBB"));
+  });
+
+  it("fails closed in strict mode when a declared context source is unavailable", () => {
+    const ws = makeWorkspace({
+      claudeMd: "# Strict context\n\n@missing.md\n",
+    });
+    assert.throws(
+      () => assemblePiContext(agentFor(ws, { id: "strictmissing" }), { strict: true }),
+      /@-import is not a readable regular source/,
     );
   });
 
@@ -1101,5 +1143,90 @@ describe("assemblePiContext", () => {
       () => assemblePiContext(agentFor(ws, { id: "throwcase" })),
       /Refusing to use .*\.tmp: not a directory/,
     );
+  });
+});
+
+describe("assemblePiContext — redacted parity manifest", () => {
+  it("hashes the exact accepted primary context sources and assembled bytes", () => {
+    const sourceWorkspace = makeWorkspace({
+      claudeMd: "# Primary\n\n@USER.md\n@MEMORY.md\n",
+      files: {
+        "USER.md": "GENERIC_USER_CONTROL_TOKEN\n",
+        "MEMORY.md": "GENERIC_KNOWLEDGE_CONTROL_TOKEN\n",
+        ".claude/rules/platform/platform.md": "GENERIC_PLATFORM_RULE_TOKEN\n",
+        ".claude/rules/custom/custom.md": "GENERIC_CUSTOM_RULE_TOKEN\n",
+        ".claude/settings.local.json": JSON.stringify({ outputStyle: "ops-persona" }),
+        ".claude/output-styles/ops-persona.md": "GENERIC_OUTPUT_STYLE_TOKEN\n",
+      },
+    });
+    const executionWorkspace = makeWorkspace({});
+    const artifacts = assemblePiContext(
+      agentFor(sourceWorkspace, { systemPrompt: "GENERIC_CONFIG_PERSONA_TOKEN" }),
+      { artifactWorkspaceCwd: executionWorkspace },
+    );
+    assert.ok(artifacts?.systemPromptPath);
+
+    const identities = artifacts.manifest.sources.map(({ kind, identity }) =>
+      `${kind}:${identity}`);
+    assert.deepEqual(identities, [
+      "workspace:workspace:CLAUDE.md",
+      "workspace:workspace:USER.md",
+      "workspace:workspace:MEMORY.md",
+      "platform-rule:workspace:.claude/rules/platform/platform.md",
+      "custom-rule:workspace:.claude/rules/custom/custom.md",
+      "package-directive:package:knowledge-access-v1",
+      "output-style:workspace:.claude/output-styles/ops-persona.md",
+      "agent-config:agent:system-prompt",
+    ]);
+
+    const hash = (body: string): string =>
+      `sha256:${createHash("sha256").update(body).digest("hex")}`;
+    assert.equal(
+      artifacts.manifest.bundleHash,
+      hash(readFileSync(artifacts.appendSystemPromptPath, "utf8")),
+    );
+    assert.equal(
+      artifacts.manifest.personaHash,
+      hash(readFileSync(artifacts.systemPromptPath, "utf8")),
+    );
+    assert.match(artifacts.manifest.digest, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(artifacts.appendSystemPromptPath.startsWith(executionWorkspace), true);
+    assert.equal(artifacts.systemPromptPath.startsWith(executionWorkspace), true);
+    assert.equal(existsSync(join(sourceWorkspace, ".tmp")), false);
+
+    const persistedEvidence = JSON.stringify(artifacts.manifest);
+    for (const privateValue of [
+      sourceWorkspace,
+      executionWorkspace,
+      "GENERIC_USER_CONTROL_TOKEN",
+      "GENERIC_KNOWLEDGE_CONTROL_TOKEN",
+      "GENERIC_PLATFORM_RULE_TOKEN",
+      "GENERIC_CUSTOM_RULE_TOKEN",
+      "GENERIC_OUTPUT_STYLE_TOKEN",
+      "GENERIC_CONFIG_PERSONA_TOKEN",
+    ]) assert.equal(persistedEvidence.includes(privateValue), false);
+  });
+
+  it("is independent of artifact destination and changes with accepted source bytes", () => {
+    const sourceWorkspace = makeWorkspace({
+      claudeMd: "# Primary\n\n@USER.md\n",
+      files: { "USER.md": "CONTEXT_VERSION_ONE\n" },
+    });
+    const firstDestination = makeWorkspace({});
+    const secondDestination = makeWorkspace({});
+    const agent = agentFor(sourceWorkspace, { id: "manifest-determinism" });
+    const first = assemblePiContext(agent, { artifactWorkspaceCwd: firstDestination });
+    const second = assemblePiContext(agent, { artifactWorkspaceCwd: secondDestination });
+    assert.ok(first);
+    assert.ok(second);
+    assert.deepEqual(second.manifest, first.manifest);
+    assert.notEqual(second.appendSystemPromptPath, first.appendSystemPromptPath);
+
+    writeFileSync(join(sourceWorkspace, "USER.md"), "CONTEXT_VERSION_TWO\n", "utf8");
+    _resetPiContextCache();
+    const changed = assemblePiContext(agent, { artifactWorkspaceCwd: secondDestination });
+    assert.ok(changed);
+    assert.notEqual(changed.manifest.digest, first.manifest.digest);
+    assert.notEqual(changed.manifest.bundleHash, first.manifest.bundleHash);
   });
 });

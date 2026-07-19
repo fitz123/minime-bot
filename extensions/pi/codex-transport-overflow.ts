@@ -13,6 +13,9 @@ import {
 } from "../../src/pi-extensions/codex-transport-overflow.js";
 
 export default function (pi: ExtensionAPI): void {
+  // Handler-only extensions otherwise have no SourceInfo surface. This inert
+  // command lets the parity gate observe Pi's active extension metadata.
+  pi.registerCommand("minime-codex-overflow-resource", { handler: async () => {} });
   pi.on("message_end", (event) => {
     const message = event.message;
     const normalized = normalizeCodexTransportOverflowAssistantMessage(

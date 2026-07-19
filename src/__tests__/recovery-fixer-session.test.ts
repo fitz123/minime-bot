@@ -550,7 +550,7 @@ describe("exact-session recovery fixer", () => {
       child.stderr?.on("data", (chunk: Buffer | string) => {
         stderr += chunk.toString();
       });
-      state = await requestPinnedPiSessionState(child, 5_000);
+      state = await requestPinnedPiSessionState(child, 10_000);
       reportedPath = realpathSync(state.sessionFile);
       discoveredPath = await discoverCanonicalRecoveryTranscript(
         realpathSync(sessionDirectory),

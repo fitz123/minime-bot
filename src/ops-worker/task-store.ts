@@ -64,6 +64,7 @@ export interface OpsWorkerJournalEntry {
 
 export type OpsWorkerTaskStoreFaultPoint =
   | "after-mutation-lock-temp-fsync"
+  | "after-mutation-lock-publish-conflict"
   | "after-temp-file-fsync"
   | "after-snapshot-rename"
   | "after-task-directory-fsync"
@@ -364,7 +365,11 @@ class OpsWorkerTaskStoreMutationGuard {
       let existing: ReturnType<typeof readMutationLock>;
       try {
         existing = readMutationLock(this.path);
-      } catch {
+      } catch (error) {
+        // A healthy owner may release after link(2) reports EEXIST but before
+        // this contender inspects the canonical lock. Nothing remains to
+        // recover in that case; retry publication within the bounded loop.
+        if (isMissingError(error)) continue;
         throw new OpsWorkerTaskStoreBusyError();
       }
       const owner = inspectMutationLockOwner(existing.record.pid);
@@ -396,6 +401,10 @@ class OpsWorkerTaskStoreMutationGuard {
             || confirmed.raw !== rechecked.raw
           ) throw new OpsWorkerTaskStoreBusyError();
           unlinkSync(this.path);
+        } catch (error) {
+          // The observed owner may release and exit between inspection and the
+          // recovery guard. A vanished canonical lock is a normal retry race.
+          if (!isMissingError(error)) throw error;
         } finally {
           this.releaseRecoveryGuard();
         }
@@ -445,7 +454,10 @@ class OpsWorkerTaskStoreMutationGuard {
       try {
         linkSync(temporaryPath, this.path);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          this.faultInjector?.("after-mutation-lock-publish-conflict");
+          return false;
+        }
         throw error;
       }
       this.acquiredInode = inode;
@@ -801,6 +813,8 @@ export class OpsWorkerTaskStore {
       || existing.objective !== replacement.objective
       || JSON.stringify(existing.doneCheck) !== JSON.stringify(replacement.doneCheck)
       || JSON.stringify(existing.authorization) !== JSON.stringify(replacement.authorization)
+      || JSON.stringify(existing.legacyCompletion)
+        !== JSON.stringify(replacement.legacyCompletion)
     ) {
       throw new OpsWorkerTaskStoreSafetyError(
         `Refusing to change immutable identity of task ${existing.id}`,
@@ -819,6 +833,30 @@ export class OpsWorkerTaskStore {
   }
 
   private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+    const priorAuthorization = existing.authorizationVerification;
+    const nextAuthorization = replacement.authorizationVerification;
+    if (priorAuthorization !== null) {
+      if (nextAuthorization === null) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase authorization verification for task ${existing.id}`,
+        );
+      }
+      const priorCheckedAt = Date.parse(priorAuthorization.checkedAt);
+      const nextCheckedAt = Date.parse(nextAuthorization.checkedAt);
+      if (nextCheckedAt < priorCheckedAt) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to move authorization verification backwards for task ${existing.id}`,
+        );
+      }
+      if (
+        nextCheckedAt === priorCheckedAt
+        && JSON.stringify(nextAuthorization) !== JSON.stringify(priorAuthorization)
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change authorization evidence at the same checked time for task ${existing.id}`,
+        );
+      }
+    }
     const checkpointIdentities = (
       task: OpsWorkerTask,
     ): ReadonlyMap<string, string> => {

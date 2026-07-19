@@ -33,7 +33,17 @@ import {
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import type { AgentConfig, BotConfig } from "../types.js";
 
-const CONTEXT: PiContextArtifacts = { appendSystemPromptPath: "target-context.md" };
+const TEST_MANIFEST: PiContextArtifacts["manifest"] = {
+  version: 1,
+  sources: [],
+  bundleHash: `sha256:${"a".repeat(64)}`,
+  personaHash: null,
+  digest: `sha256:${"b".repeat(64)}`,
+};
+const CONTEXT: PiContextArtifacts = {
+  appendSystemPromptPath: "target-context.md",
+  manifest: TEST_MANIFEST,
+};
 
 function agent(id: string, askAgent: AgentConfig["askAgent"] = { enabled: true }): AgentConfig {
   return {
@@ -177,6 +187,7 @@ describe("ask-agent helper", () => {
         context: {
           systemPromptPath: "/tmp/target.persona.md",
           appendSystemPromptPath: "/tmp/target.bundle.md",
+          manifest: { ...TEST_MANIFEST, personaHash: `sha256:${"c".repeat(64)}` },
         },
         callerContext: "caller supplied context",
         extensionArgs: [
