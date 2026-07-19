@@ -783,6 +783,17 @@ export class OpsWorkerSupervisor {
       if (!scheduled) return undefined;
       const quotaScheduled = await this.applyQuotaScheduling(scheduled, true);
       if (quotaScheduled) return quotaScheduled;
+      const current = this.requireTask(scheduled.task.id);
+      if (
+        scheduled.action === "RUN"
+        && current.custody.status === "UNCLAIMED"
+        && this.hasFreshQuotaProbePass(current)
+      ) {
+        // Exact proof binding depends on the live model/context/resource contract,
+        // which only the Pi runner can prepare. Defer custody until it can pass the
+        // derived subject back into the atomic authorization-and-claim mutation.
+        return { action: "RUN", task: current };
+      }
       const claimed = await this.claimTaskCustody(
         scheduled.task.id,
         scheduled.action,
@@ -800,6 +811,10 @@ export class OpsWorkerSupervisor {
   async ensureTaskCustody(
     taskId: string,
     action: OpsWorkerScheduledAction,
+    options: {
+      quotaProbeSubjectHash?: string;
+      requireCurrentSelection?: boolean;
+    } = {},
   ): Promise<OpsWorkerTask> {
     this.assertStarted();
     if (action === "RUN" && this.quotaAdmission) {
@@ -810,8 +825,27 @@ export class OpsWorkerSupervisor {
       );
       if (quotaScheduled) return quotaScheduled.task;
     }
-    const claimed = await this.claimTaskCustody(taskId, action, false);
+    if (
+      options.quotaProbeSubjectHash !== undefined
+      && !SHA256_PATTERN.test(options.quotaProbeSubjectHash)
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Quota probe proof subject must be a lowercase sha256 digest",
+      );
+    }
+    const claimed = await this.claimTaskCustody(
+      taskId,
+      action,
+      options.requireCurrentSelection ?? false,
+      options.quotaProbeSubjectHash,
+    );
     if (!claimed) {
+      const current = this.requireTask(taskId);
+      if (
+        action === "RUN"
+        && current.custody.status === "UNCLAIMED"
+        && options.quotaProbeSubjectHash !== undefined
+      ) return current;
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} changed while custody was being claimed`,
       );
@@ -884,6 +918,7 @@ export class OpsWorkerSupervisor {
     taskId: string,
     action: OpsWorkerScheduledAction,
     requireCurrentSelection: boolean,
+    quotaProbeSubjectHash?: string,
   ): Promise<OpsWorkerTask | undefined> {
     if (action !== "RUN" && action !== "CHECK") {
       throw new OpsWorkerSupervisorStateError(
@@ -929,6 +964,30 @@ export class OpsWorkerSupervisor {
         }
         if (task.custody.status === "HELD") {
           return verifierPinned ? undefined : OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        if (
+          task.custody.status === "UNCLAIMED"
+          && task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+        ) {
+          const proofMatches = quotaProbeSubjectHash !== undefined
+            && this.hasFreshQuotaProbePass(task)
+            && task.lastOutcome.quotaProbeProof?.subjectHash === quotaProbeSubjectHash;
+          if (!proofMatches) {
+            selectionChanged = true;
+            if (quotaProbeSubjectHash !== undefined) {
+              const at = this.nextUpdatedAt(task);
+              task.updatedAt = at;
+              task.schedule.nextCheckAt = null;
+              task.schedule.nextRunAt = at;
+              task.lastOutcome = {
+                at,
+                kind: "INFRASTRUCTURE",
+                result: "QUOTA_PROBE_ERROR",
+                summary: "Exact quota smoke probe proof did not match the prepared pre-claim launch",
+              };
+            }
+            return;
+          }
         }
         if (
           task.lastOutcome?.result === "QUOTA_PROBE_PASS"
@@ -1072,6 +1131,7 @@ export class OpsWorkerSupervisor {
   beginPiLaunch(
     taskId: string,
     launchIntent: OpsWorkerUnverifiedRun,
+    preparedTaskUpdatedAt: string,
     quotaProbeSubjectHash?: string,
   ): OpsWorkerTask {
     this.assertStarted();
@@ -1082,6 +1142,11 @@ export class OpsWorkerSupervisor {
     ) {
       throw new OpsWorkerSupervisorStateError(
         "Quota probe proof subject must be a lowercase sha256 digest",
+      );
+    }
+    if (!TIMESTAMP_PATTERN.test(preparedTaskUpdatedAt)) {
+      throw new OpsWorkerSupervisorStateError(
+        "Prepared Pi launch task timestamp must be an ISO-8601 UTC timestamp",
       );
     }
     if (this.piLaunchReservation !== taskId) {
@@ -1113,6 +1178,10 @@ export class OpsWorkerSupervisor {
         summary: "Evaluated exact quota proof and persisted Pi launch intent",
       },
       (replacement) => {
+        if (
+          replacement.updatedAt !== preparedTaskUpdatedAt
+          || !hasFreshOpsWorkerAuthorizationPass(replacement)
+        ) return OPS_WORKER_TASK_STORE_NO_CHANGE;
         if (replacement.state !== "QUEUED" && replacement.state !== "RESUMABLE") {
           throw new OpsWorkerSupervisorStateError(
             `Pi launch intent requires QUEUED or RESUMABLE, found ${replacement.state}`,

@@ -212,6 +212,7 @@ export interface OpsWorkerPiAttemptOptions {
 
 export interface OpsWorkerQuotaProbeRequest {
   taskId: string;
+  taskUpdatedAt: string;
   model: string;
   thinking: PiThinkingLevel;
   context: PiContextArtifacts;
@@ -226,6 +227,12 @@ export type OpsWorkerQuotaProbeResult =
   | { status: "QUOTA"; snapshot: CodexQuotaSnapshot }
   | { status: "TELEMETRY_ERROR"; readStatus: OpsWorkerQuotaReadStatus }
   | { status: "INFRASTRUCTURE_ERROR"; summary: string };
+
+interface OpsWorkerPreparedAttemptLaunch {
+  sessionDirectory: string;
+  context: PiContextArtifacts;
+  parityLaunch: OpsWorkerParityLaunch;
+}
 
 export interface StopOwnedRunOptions {
   inspect: (run: OpsWorkerActiveRun) => OpsWorkerProcessInspection;
@@ -434,7 +441,10 @@ export class OpsWorkerPiAttemptRunner {
     if (scheduled.action === "CHECK") {
       return this.runDoneCheckOrCurrent(scheduled.task.id);
     }
-    return this.runAttempt(scheduled.task.id);
+    return this.runAttempt(
+      scheduled.task.id,
+      scheduled.task.custody.status === "UNCLAIMED",
+    );
   }
 
   private async runDoneCheckOrCurrent(taskId: string): Promise<OpsWorkerTask> {
@@ -446,8 +456,38 @@ export class OpsWorkerPiAttemptRunner {
     }
   }
 
-  async runAttempt(taskId: string): Promise<OpsWorkerTask> {
-    const authorized = await this.supervisor.ensureTaskCustody(taskId, "RUN");
+  async runAttempt(
+    taskId: string,
+    requireCurrentSelection = false,
+  ): Promise<OpsWorkerTask> {
+    const current = this.requireRunnableTask(taskId);
+    let preparedLaunch: OpsWorkerPreparedAttemptLaunch | undefined;
+    let quotaProbeSubjectHash: string | undefined;
+    if (
+      current.custody.status === "UNCLAIMED"
+      && current.lastOutcome?.result === "QUOTA_PROBE_PASS"
+    ) {
+      try {
+        const sessionDirectory = this.prepareSessionDirectory(current);
+        preparedLaunch = this.prepareAttemptLaunch(sessionDirectory);
+        quotaProbeSubjectHash = hashQuotaProbeSubject(
+          this.model,
+          this.thinking,
+          preparedLaunch.context,
+          this.primaryResources,
+          preparedLaunch.parityLaunch,
+        );
+      } catch (error) {
+        return this.supervisor.recordQuotaProbeError(
+          taskId,
+          `Exact pre-claim quota proof validation failed: ${errorMessage(error)}`,
+        );
+      }
+    }
+    const authorized = await this.supervisor.ensureTaskCustody(taskId, "RUN", {
+      quotaProbeSubjectHash,
+      requireCurrentSelection,
+    });
     if (
       authorized.custody.status !== "HELD"
       || !hasFreshOpsWorkerAuthorizationPass(authorized)
@@ -497,7 +537,7 @@ export class OpsWorkerPiAttemptRunner {
         ) return launchAuthorized;
         task = launchAuthorized;
 
-        const result = await this.launchOnce(task, sessionDirectory);
+        const result = await this.launchOnce(task, sessionDirectory, preparedLaunch);
         if (result.classification !== "SESSION_CORRUPT") return result.task;
 
         const invalidFiles = inspectStandardSession(
@@ -538,25 +578,15 @@ export class OpsWorkerPiAttemptRunner {
   private async launchOnce(
     task: OpsWorkerTask,
     sessionDirectory: string,
+    prepared?: OpsWorkerPreparedAttemptLaunch,
   ): Promise<{
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
-    const context = this.assembleContext(this.primaryContextAgent, {
-      artifactWorkspaceCwd: this.workspaceCwd,
-      strict: true,
-    });
-    if (context === null) {
-      throw new Error("Canonical primary context assembly returned no context; refusing a smaller fallback");
-    }
-    const parityLaunch = prepareOpsWorkerParityLaunch({
-      context,
-      resources: this.primaryResources,
-      parityExtensionPath: this.parityExtensionPath,
-      parityExtensionIdentity: this.parityExtensionIdentity,
-      sessionDirectory,
-      opsPolicy: OPS_WORKER_SYSTEM_POLICY,
-    });
+    const launch = prepared?.sessionDirectory === sessionDirectory
+      ? prepared
+      : this.prepareAttemptLaunch(sessionDirectory);
+    const { context, parityLaunch } = launch;
     const quotaProbeSubjectHash = task.lastOutcome?.result === "QUOTA_PROBE_PASS"
       ? hashQuotaProbeSubject(
         this.model,
@@ -593,6 +623,7 @@ export class OpsWorkerPiAttemptRunner {
     const launchState = this.supervisor.beginPiLaunch(
       task.id,
       launchIntent,
+      task.updatedAt,
       quotaProbeSubjectHash,
     );
     if (
@@ -1260,6 +1291,7 @@ export class OpsWorkerPiAttemptRunner {
       launchReserved = true;
       result = await this.runQuotaProbeProcess({
         taskId,
+        taskUpdatedAt: task.updatedAt,
         model: this.model,
         thinking: this.thinking,
         context,
@@ -1319,7 +1351,20 @@ export class OpsWorkerPiAttemptRunner {
       launchedAt: this.now().toISOString(),
       ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
     };
-    this.supervisor.beginPiLaunch(request.taskId, launchIntent);
+    const launchState = this.supervisor.beginPiLaunch(
+      request.taskId,
+      launchIntent,
+      request.taskUpdatedAt,
+    );
+    if (
+      launchState.state !== "BLOCKED"
+      || launchState.unverifiedRun?.attemptId !== attemptId
+    ) {
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: "Exact quota smoke probe task changed before its atomic launch fence",
+      };
+    }
     this.launchFaultInjector?.("after-launch-intent-persisted");
     const env = this.buildEnv(this.workspaceCwd, {
       askCallerAgentId: this.primaryContextAgent.id,
@@ -1628,6 +1673,27 @@ export class OpsWorkerPiAttemptRunner {
     const sessionDirectory = join(sessionsRoot, task.id);
     ensureOwnedDirectory(sessionDirectory);
     return sessionDirectory;
+  }
+
+  private prepareAttemptLaunch(
+    sessionDirectory: string,
+  ): OpsWorkerPreparedAttemptLaunch {
+    const context = this.assembleContext(this.primaryContextAgent, {
+      artifactWorkspaceCwd: this.workspaceCwd,
+      strict: true,
+    });
+    if (context === null) {
+      throw new Error("Canonical primary context assembly returned no context; refusing a smaller fallback");
+    }
+    const parityLaunch = prepareOpsWorkerParityLaunch({
+      context,
+      resources: this.primaryResources,
+      parityExtensionPath: this.parityExtensionPath,
+      parityExtensionIdentity: this.parityExtensionIdentity,
+      sessionDirectory,
+      opsPolicy: OPS_WORKER_SYSTEM_POLICY,
+    });
+    return { sessionDirectory, context, parityLaunch };
   }
 
   private newSessionId(taskId: string): string {

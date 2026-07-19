@@ -1166,7 +1166,7 @@ describe("ops worker supervisor", () => {
     const immediatelyRunnable = await harness.supervisor.claimNextTask();
     assert.equal(immediatelyRunnable?.action, "RUN");
     assert.equal(immediatelyRunnable?.task.id, telemetryTask.id);
-    assert.equal(immediatelyRunnable?.task.custody.status, "HELD");
+    assert.equal(immediatelyRunnable?.task.custody.status, "UNCLAIMED");
     assert.equal(immediatelyRunnable?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
   });
 
@@ -1186,7 +1186,7 @@ describe("ops worker supervisor", () => {
 
     const claimed = await harness.supervisor.claimNextTask();
     assert.equal(claimed?.action, "RUN");
-    assert.equal(claimed?.task.custody.status, "HELD");
+    assert.equal(claimed?.task.custody.status, "UNCLAIMED");
     assert.equal(claimed?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
 
     harness.supervisor.cancelTask(fresh.id, "Exercise stale probe admission");

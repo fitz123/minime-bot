@@ -25,6 +25,7 @@ import {
 import { CODEX_QUOTA_ATTEMPT_FILE_ENV } from "../pi-extensions/codex-usage.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
+  createPiExtensionResourceSnapshot,
   piResourceIdentity,
   resolveOpsWorkerParityExtensionPath,
   resolvePiPrimaryResourceContract,
@@ -160,6 +161,55 @@ describe("primary Pi resource contract", () => {
       ...base,
       toolNames: PI_BUILTIN_TOOL_NAMES.filter((tool) => tool !== "bash"),
     }), /missing built-in bash/);
+  });
+
+  it("hashes every static loader form and rejects unattestable module loading", () => {
+    const root = tempDirectory();
+    const dependency = join(root, "dependency.ts");
+    const extension = join(root, "extension.ts");
+    writeFileSync(dependency, "export const value = 'original';\n", "utf8");
+    writeFileSync(
+      extension,
+      [
+        "export default async function extension() {",
+        "  await import(`./dependency.ts`);",
+        "  await import('./dependency.ts', { with: { type: 'javascript' } });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const original = createPiExtensionResourceSnapshot(extension);
+    assert.deepEqual(
+      original.files.map((file) => file.path),
+      [realpathSync(dependency), realpathSync(extension)].sort(),
+    );
+    writeFileSync(dependency, "export const value = 'changed';\n", "utf8");
+    assert.notEqual(createPiExtensionResourceSnapshot(extension).identity, original.identity);
+
+    writeFileSync(
+      extension,
+      "export default async function extension(name: string) { return import('./' + name); }\n",
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension),
+      /statically analyzable string literal/,
+    );
+    writeFileSync(
+      extension,
+      [
+        "import { createRequire as load } from 'node:module';",
+        "const requireFromHere = load(import.meta.url);",
+        "export default function extension() { requireFromHere('./dependency.ts'); }",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension),
+      /createRequire loading cannot be attested safely/,
+    );
   });
 });
 

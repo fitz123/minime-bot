@@ -27,9 +27,10 @@ import {
   type PiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
 import type { AgentConfig, PiThinkingLevel } from "../types.js";
-import type {
-  OpsWorkerAuthorizationVerifier,
-  OpsWorkerAuthorizationVerifierRegistry,
+import {
+  hasFreshOpsWorkerAuthorizationPass,
+  type OpsWorkerAuthorizationVerifier,
+  type OpsWorkerAuthorizationVerifierRegistry,
 } from "../ops-worker/authorization.js";
 import {
   OpsWorkerDoneCheckRegistry,
@@ -877,6 +878,117 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(completed?.lastOutcome?.result, "PASS");
     assert.equal(completed?.lastOutcome?.quotaProbeProof, undefined);
     assert.equal(harness.children.length, 1);
+  });
+
+  it("rejects a mismatched unclaimed quota proof before taking custody", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("unclaimed-bound-quota-proof");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-success");
+
+    const proof = await harness.runner().runNext();
+    assert.equal(proof?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(proof?.custody.status, "UNCLAIMED");
+    assert.equal(harness.children.length, 1);
+
+    const rejected = await harness.runner({
+      model: "openai-codex/gpt-5.5-mini",
+    }).runNext();
+    assert.equal(rejected?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(rejected?.custody.status, "UNCLAIMED");
+    assert.equal(rejected?.custody.claimedAt, null);
+    assert.equal(harness.children.length, 1);
+  });
+
+  it("refuses a normal spawn when authorization-covered task state changes after preparation", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("atomic-launch-authorization-fence");
+    harness.store.create(task);
+    let changed = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        assembleContext: (agent, options) => {
+          const context = assemblePiContext(agent, options);
+          if (!changed) {
+            changed = true;
+            harness.store.mutate(
+              task.id,
+              { event: "UPDATED", summary: "Changed authorization subject before launch fence" },
+              (replacement) => {
+                replacement.updatedAt = new Date(
+                  Date.parse(replacement.updatedAt) + 1,
+                ).toISOString();
+                replacement.lifecycle.repository = "github:example/changed";
+              },
+            );
+          }
+          return context;
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(result.state, "QUEUED");
+    assert.equal(result.custody.status, "HELD");
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(result.activeRun, null);
+    assert.equal(hasFreshOpsWorkerAuthorizationPass(result), false);
+    assert.equal(harness.children.length, 0);
+  });
+
+  it("refuses a quota-probe spawn when its prepared task revision changes", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("atomic-quota-probe-launch-fence");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic due quota wait for a launch-fence race.",
+    };
+    harness.store.create(task);
+    let changed = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        resolveInvocation: (args) => {
+          if (!changed) {
+            changed = true;
+            harness.store.mutate(
+              task.id,
+              { event: "UPDATED", summary: "Changed quota-probe task before launch fence" },
+              (replacement) => {
+                replacement.updatedAt = new Date(
+                  Date.parse(replacement.updatedAt) + 1,
+                ).toISOString();
+                replacement.lifecycle.repository = "github:example/quota-changed";
+              },
+            );
+          }
+          return {
+            command: process.execPath,
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "quota-probe-success", ...args],
+          };
+        },
+      },
+    }).runNext();
+
+    assert.equal(result?.state, "QUEUED");
+    assert.equal(result?.custody.status, "UNCLAIMED");
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(result?.unverifiedRun, null);
+    assert.equal(harness.children.length, 0);
   });
 
   it("revalidates again immediately before spawning held and unclaimed quota probes", async (t) => {

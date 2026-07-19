@@ -11,6 +11,7 @@ import {
   statSync,
 } from "node:fs";
 import { dirname, extname, isAbsolute, normalize, resolve } from "node:path";
+import ts from "typescript";
 import {
   piExtensionRelpathForDir,
   resolvePiSpawnExtensionArgs,
@@ -36,6 +37,8 @@ const MODULE_FILE_EXTENSIONS = [
   ".tsx",
   ".mts",
   ".cts",
+  ".mtsx",
+  ".ctsx",
   ".js",
   ".jsx",
   ".mjs",
@@ -121,22 +124,76 @@ function trustedFileContentHash(path: string): string {
   return sha256(readTrustedFile(path));
 }
 
-function localModuleSpecifiers(content: Buffer): string[] {
-  const source = content.toString("utf8");
+function localModuleSpecifiers(path: string, content: Buffer): string[] {
+  const source = ts.createSourceFile(
+    path,
+    content.toString("utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const parseDiagnostics = (
+    source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
+  ).parseDiagnostics ?? [];
+  if (parseDiagnostics.length > 0) {
+    throw new TypeError("Pi extension source must parse before its dependency closure is hashed");
+  }
   const specifiers = new Set<string>();
-  const patterns = [
-    /(?:^|\n)\s*(?:import|export)\s+(?:type\s+)?[^;]*?\s+from\s*["']([^"']+)["']/g,
-    /(?:^|\n)\s*import\s*["']([^"']+)["']/g,
-    /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g,
-  ];
-  for (const pattern of patterns) {
-    for (const match of source.matchAll(pattern)) {
-      const specifier = match[1];
-      if (specifier.startsWith("./") || specifier.startsWith("../")) {
-        specifiers.add(specifier);
+  const add = (value: ts.Expression | undefined): void => {
+    if (
+      value === undefined
+      || (!ts.isStringLiteral(value) && !ts.isNoSubstitutionTemplateLiteral(value))
+    ) {
+      throw new TypeError(
+        "Pi extension module loading must use a statically analyzable string literal",
+      );
+    }
+    if (value.text.startsWith("./") || value.text.startsWith("../")) {
+      specifiers.add(value.text);
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && node.text === "createRequire") {
+      throw new TypeError("Pi extension createRequire loading cannot be attested safely");
+    }
+    if (
+      ts.isIdentifier(node)
+      && node.text === "require"
+      && !(
+        ts.isCallExpression(node.parent)
+        && node.parent.expression === node
+      )
+      && !(
+        ts.isPropertyAccessExpression(node.parent)
+        && node.parent.name === node
+        && ts.isCallExpression(node.parent.parent)
+        && node.parent.parent.expression === node.parent
+      )
+    ) {
+      throw new TypeError("Pi extension indirect require loading cannot be attested safely");
+    }
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (node.moduleSpecifier !== undefined) add(node.moduleSpecifier);
+    } else if (
+      ts.isImportEqualsDeclaration(node)
+      && ts.isExternalModuleReference(node.moduleReference)
+    ) {
+      add(node.moduleReference.expression);
+    } else if (ts.isCallExpression(node)) {
+      const directImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const directRequire = ts.isIdentifier(node.expression)
+        && node.expression.text === "require";
+      const propertyRequire = ts.isPropertyAccessExpression(node.expression)
+        && node.expression.name.text === "require";
+      const elementRequire = ts.isElementAccessExpression(node.expression)
+        && ts.isStringLiteral(node.expression.argumentExpression)
+        && node.expression.argumentExpression.text === "require";
+      if (directImport || directRequire || propertyRequire || elementRequire) {
+        add(node.arguments[0]);
       }
     }
-  }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
   return [...specifiers];
 }
 
@@ -149,9 +206,9 @@ function moduleCandidates(importer: string, specifier: string): string[] {
     const sourceExtension = extension === ".js"
       ? [".ts", ".tsx"]
       : extension === ".mjs"
-      ? [".mts", ".ts"]
+      ? [".mts", ".mtsx", ".ts", ".tsx"]
       : extension === ".cjs"
-      ? [".cts", ".ts"]
+      ? [".cts", ".ctsx", ".ts", ".tsx"]
       : [];
     for (const replacement of sourceExtension) {
       candidates.add(`${base.slice(0, -extension.length)}${replacement}`);
@@ -195,7 +252,7 @@ function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
     }
     files.push({ path, contentHash: sha256(content) });
     if (extname(path) === ".json") continue;
-    for (const specifier of localModuleSpecifiers(content)) {
+    for (const specifier of localModuleSpecifiers(path, content)) {
       const dependency = resolveLocalModule(path, specifier);
       if (!seen.has(dependency)) pending.push(dependency);
     }

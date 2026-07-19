@@ -164,6 +164,10 @@ digest before acknowledging. Any missing, internally inconsistent, or
 mismatched evidence fails closed; persisted evidence contains versioned results
 and hashes only.
 
+Extension identities include the complete statically resolved local module
+closure. Computed imports, indirect `require`, and `createRequire` fail closed
+because their executable dependency bytes cannot be pinned before launch.
+
 ## Quota admission and waits
 
 Initial admission evaluates every active window in the existing server-reported
