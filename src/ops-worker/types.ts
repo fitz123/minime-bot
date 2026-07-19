@@ -744,6 +744,7 @@ export const OPS_WORKER_LIMITS = {
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
   maxOutcomeSummaryBytes: 4 * 1024,
+  maxReportAttempts: 1_000,
   maxReportErrorBytes: 2 * 1024,
   maxDeliveryKeyBytes: 256,
   maxResourceKeyBytes: 256,
@@ -2447,7 +2448,12 @@ function parseReport(value: unknown): OpsWorkerReport {
     );
   return {
     state: expectEnum(report.state, OPS_WORKER_REPORT_STATES, "task.report.state"),
-    attempts: expectInteger(report.attempts, "task.report.attempts", 0, 1_000),
+    attempts: expectInteger(
+      report.attempts,
+      "task.report.attempts",
+      0,
+      OPS_WORKER_LIMITS.maxReportAttempts,
+    ),
     lastError,
   };
 }

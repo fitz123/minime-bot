@@ -542,9 +542,20 @@ export class OpsWorkerTelegramControl {
   }
 
   private async deliverOnePendingReport(signal: AbortSignal): Promise<string | null> {
-    const task = this.supervisor.listTasks().find(
-      (candidate) => candidate.report.state === "PENDING",
-    );
+    const task = this.supervisor.listTasks()
+      .filter((candidate) =>
+        candidate.report.state === "PENDING"
+        && candidate.report.attempts < OPS_WORKER_LIMITS.maxReportAttempts)
+      .sort((left, right) => {
+        const leftObservedAt = left.mutationReceipts.report?.queryObservedAt;
+        const rightObservedAt = right.mutationReceipts.report?.queryObservedAt;
+        if (leftObservedAt === undefined && rightObservedAt !== undefined) return -1;
+        if (leftObservedAt !== undefined && rightObservedAt === undefined) return 1;
+        if (leftObservedAt !== rightObservedAt) {
+          return Date.parse(leftObservedAt ?? "") - Date.parse(rightObservedAt ?? "");
+        }
+        return left.id.localeCompare(right.id);
+      })[0];
     if (!task) return null;
     await this.supervisor.recordReportAttempt(task.id, async (prepared) => {
       try {

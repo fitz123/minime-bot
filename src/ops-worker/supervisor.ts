@@ -2539,7 +2539,7 @@ export class OpsWorkerSupervisor {
         `Task ${taskId} has no pending report`,
       );
     }
-    if (task.report.attempts >= 1_000) {
+    if (task.report.attempts >= OPS_WORKER_LIMITS.maxReportAttempts) {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} exhausted its bounded report-attempt counter`,
       );
@@ -2621,7 +2621,7 @@ export class OpsWorkerSupervisor {
             `Task ${taskId} has no pending report`,
           );
         }
-        if (replacement.report.attempts >= 1_000) {
+        if (replacement.report.attempts >= OPS_WORKER_LIMITS.maxReportAttempts) {
           throw new OpsWorkerSupervisorStateError(
             `Task ${taskId} exhausted its bounded report-attempt counter`,
           );

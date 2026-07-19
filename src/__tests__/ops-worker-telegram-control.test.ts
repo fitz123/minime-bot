@@ -181,6 +181,7 @@ async function harness(
     directory?: string;
     instanceId?: string;
     nowStart?: string;
+    authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
   } = {},
 ): Promise<Harness> {
   const directory = options.directory
@@ -203,7 +204,7 @@ async function harness(
     instanceId: options.instanceId ?? "telegram-control-fixture",
     processStartToken: `${options.instanceId ?? "telegram-control-fixture"}-start`,
     now: () => new Date(supervisorNow += 1_000),
-    authorizationVerifiers,
+    authorizationVerifiers: options.authorizationVerifiers ?? authorizationVerifiers,
   };
   const supervisor = new OpsWorkerSupervisor(supervisorOptions);
   await supervisor.start();
@@ -640,5 +641,97 @@ describe("ops worker dedicated Telegram control", () => {
       > Date.parse(claimed.queryObservedAt),
     );
     assert.equal(sent?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("rotates past a report denied by fresh authorization", async (t) => {
+    const fixture = await harness(t, {
+      authorizationVerifiers: {
+        "operator-cli": {
+          identity: "selective-fixture-authorization",
+          version: "1",
+          verify: (task) => task.id === "task-a-denied"
+            ? {
+              status: "DRIFT",
+              evidenceHash: `sha256:${"c".repeat(64)}`,
+              summary: "Fixture authorization denied this report.",
+            }
+            : {
+              status: "PASS",
+              evidenceHash: `sha256:${"d".repeat(64)}`,
+              summary: "Fixture authorization permits this report.",
+            },
+        },
+      },
+    });
+    t.after(() => fixture.close());
+    for (const taskId of ["task-a-denied", "task-b-sendable"]) {
+      const pending = makeTask(taskId);
+      pending.state = "CANCELLED";
+      pending.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: "CANCELLED",
+      };
+      pending.lastOutcome = {
+        at: NOW,
+        kind: "OPERATOR",
+        result: "CANCELLED",
+        summary: "Fixture terminal report.",
+      };
+      pending.report.state = "PENDING";
+      fixture.store.create(pending);
+    }
+    const transport = new FakeTelegramTransport();
+    const client = control(fixture, transport);
+
+    const denied = await client.tick();
+    const delivered = await client.tick();
+
+    assert.equal(denied.reportTaskId, "task-a-denied");
+    assert.equal(delivered.reportTaskId, "task-b-sendable");
+    assert.equal(fixture.store.get("task-a-denied")?.report.state, "PENDING");
+    assert.equal(fixture.store.get("task-b-sendable")?.report.state, "SENT");
+    assert.equal(transport.sendCalls, 1);
+  });
+
+  it("skips an exhausted report without stopping control or later reports", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    for (const taskId of ["task-a-exhausted", "task-b-sendable"]) {
+      const pending = makeTask(taskId);
+      pending.state = "CANCELLED";
+      pending.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: "CANCELLED",
+      };
+      pending.lastOutcome = {
+        at: NOW,
+        kind: "OPERATOR",
+        result: "CANCELLED",
+        summary: "Fixture terminal report.",
+      };
+      pending.report.state = "PENDING";
+      pending.report.attempts = taskId === "task-a-exhausted"
+        ? OPS_WORKER_LIMITS.maxReportAttempts
+        : 0;
+      fixture.store.create(pending);
+    }
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([update(50, "/status")]);
+
+    const result = await control(fixture, transport).tick();
+
+    assert.equal(result.reportTaskId, "task-b-sendable");
+    assert.equal(fixture.store.get("task-a-exhausted")?.report.state, "PENDING");
+    assert.equal(
+      fixture.store.get("task-a-exhausted")?.report.attempts,
+      OPS_WORKER_LIMITS.maxReportAttempts,
+    );
+    assert.equal(fixture.store.get("task-b-sendable")?.report.state, "SENT");
+    assert.equal(fixture.ledger.nextOffset(), 51);
+    assert.equal(transport.sendCalls, 2);
   });
 });
