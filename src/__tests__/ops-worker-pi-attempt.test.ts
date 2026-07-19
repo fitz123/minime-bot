@@ -896,7 +896,8 @@ describe("ops worker Pi standard-session attempts", () => {
 
   it("rejects a mismatched unclaimed quota proof before taking custody", async (t) => {
     const dueAt = new Date(Date.now() - 1_000).toISOString();
-    const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
+    let quota = deniedQuota(dueAt);
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
     const task = makeTask("unclaimed-bound-quota-proof");
     task.schedule.nextRunAt = dueAt;
@@ -914,6 +915,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(proof?.custody.status, "UNCLAIMED");
     assert.equal(harness.children.length, 1);
 
+    quota = admittedQuota();
     const rejected = await harness.runner({
       model: "openai-codex/gpt-5.5-mini",
     }).runNext();

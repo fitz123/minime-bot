@@ -774,9 +774,12 @@ interface CacheEntry {
 }
 
 /**
- * Per-agent cache of the last assembled CONTENT, keyed on source content hashes
- * plus directory membership metadata. Repeat spawns with unchanged sources skip the re-assemble of
- * the source tree, while a touched source re-assembles (freshness parity).
+ * Per-agent cache of the last assembled CONTENT for non-strict callers, keyed on
+ * source content hashes plus directory membership metadata. Repeat ordinary
+ * spawns with unchanged sources skip the re-assemble of the source tree, while a
+ * touched source re-assembles (freshness parity). Strict callers always read the
+ * accepted source bytes directly so a concurrent update cannot cache bytes under
+ * the signature observed before assembly.
  *
  * The cache stores the assembled CONTENT, not just the artifact paths: a cache hit
  * still RE-WRITES the `.tmp/` artifacts from this content (see assemblePiContext).
@@ -855,10 +858,11 @@ function computeManifestSignature(agent: AgentConfig): string {
  * Assemble the full Pi context for an agent and return the artifact paths, or null
  * to signal "no extra context — bare spawn".
  *
- * Caches by a content-sensitive source manifest: an unchanged source set skips
- * re-parsing and re-assembly, but STILL re-writes the `.tmp/` artifacts from
- * the cached content so the files on disk always match what the assembler produced
- * (and so a deleted artifact is transparently recreated).
+ * Non-strict callers cache by a content-sensitive source manifest: an unchanged
+ * source set skips re-parsing and re-assembly, but STILL re-writes the `.tmp/`
+ * artifacts from the cached content so the files on disk always match what the
+ * assembler produced (and so a deleted artifact is transparently recreated).
+ * Strict callers bypass the cache and assemble the accepted bytes afresh.
  *
  * Returns null only for a genuinely empty workspace with no persona. If artifact
  * writing fails after content was assembled, this throws; Pi callers must catch
@@ -868,9 +872,10 @@ export function assemblePiContext(
   agent: AgentConfig,
   options: PiContextAssemblyOptions = {},
 ): PiContextArtifacts | null {
-  const signature = computeManifestSignature(agent);
-  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${options.strict === true}`;
-  const cached = cache.get(cacheKey);
+  const strict = options.strict === true;
+  const signature = strict ? null : computeManifestSignature(agent);
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}`;
+  const cached = strict ? undefined : cache.get(cacheKey);
 
   let bundle: string;
   let persona: string | null;
@@ -884,8 +889,8 @@ export function assemblePiContext(
     persona = cached.persona;
     manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd, options.strict === true);
-    const resolvedPersona = resolvePersonaWithSources(agent, options.strict === true);
+    const assembled = assembleBundle(agent.workspaceCwd, strict);
+    const resolvedPersona = resolvePersonaWithSources(agent, strict);
     if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
       // instead of forcing an empty bundle + --no-context-files.
@@ -915,7 +920,9 @@ export function assemblePiContext(
     systemPromptPath !== undefined
       ? { systemPromptPath, appendSystemPromptPath, manifest }
       : { appendSystemPromptPath, manifest };
-  cache.set(cacheKey, { signature, bundle, persona, manifest });
+  if (signature !== null) {
+    cache.set(cacheKey, { signature, bundle, persona, manifest });
+  }
   return result;
 }
 

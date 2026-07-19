@@ -1009,6 +1009,14 @@ export class OpsWorkerSupervisor {
           }
         }
         if (
+          task.custody.status === "UNCLAIMED"
+          && this.quotaAdmission !== undefined
+          && this.quotaAdmission.check().status !== "ADMITTED"
+        ) {
+          selectionChanged = true;
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        if (
           task.lastOutcome?.result === "QUOTA_PROBE_PASS"
           && !this.hasFreshQuotaProbePass(task)
           && this.quotaAdmission?.check().status !== "ADMITTED"
@@ -1036,11 +1044,14 @@ export class OpsWorkerSupervisor {
     if (scheduled.action !== "RUN" || !this.quotaAdmission) return undefined;
     let task = this.requireTask(scheduled.task.id);
     if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") {
-      if (this.hasFreshQuotaProbePass(task)) return undefined;
-      task = this.invalidateQuotaProbeProof(
-        task.id,
-        "Exact quota smoke probe proof expired before launch",
-      );
+      if (this.hasFreshQuotaProbePass(task)) {
+        if (task.custody.status === "HELD") return undefined;
+      } else {
+        task = this.invalidateQuotaProbeProof(
+          task.id,
+          "Exact quota smoke probe proof expired before launch",
+        );
+      }
     }
     const decision = this.quotaAdmission.check();
     const wait = isOpsWorkerQuotaWait(task);

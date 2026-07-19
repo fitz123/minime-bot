@@ -983,6 +983,38 @@ describe("assemblePiContext", () => {
     );
   });
 
+  it("does not cache strict context under a signature observed before assembly", () => {
+    _resetPiContextCache();
+    const ws = makeWorkspace({
+      claudeMd: "# x\n\nBODY",
+      files: { ".claude/rules/platform/x.md": "RULE_AAA" },
+    });
+    const rulePath = join(ws, ".claude", "rules", "platform", "x.md");
+    const agent = agentFor(ws, { id: "strict-cache-race" });
+    let mutated = false;
+    Object.defineProperty(agent, "systemPrompt", {
+      configurable: true,
+      enumerable: true,
+      get(): undefined {
+        if (!mutated) {
+          mutated = true;
+          writeFileSync(rulePath, "RULE_BBB", "utf8");
+        }
+        return undefined;
+      },
+    });
+
+    const first = assemblePiContext(agent, { strict: true });
+    assert.ok(first);
+    writeFileSync(rulePath, "RULE_AAA", "utf8");
+
+    const second = assemblePiContext(agent, { strict: true });
+    assert.ok(second);
+    const bundle = readFileSync(second.appendSystemPromptPath, "utf8");
+    assert.ok(bundle.includes("RULE_AAA"));
+    assert.ok(!bundle.includes("RULE_BBB"));
+  });
+
   it("fails closed in strict mode when a declared context source is unavailable", () => {
     const ws = makeWorkspace({
       claudeMd: "# Strict context\n\n@missing.md\n",

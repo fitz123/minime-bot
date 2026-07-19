@@ -1164,17 +1164,17 @@ describe("ops worker supervisor", () => {
       "Exact unclaimed quota smoke probe succeeded",
       QUOTA_PROBE_SUBJECT_HASH,
     );
-    const immediatelyRunnable = await harness.supervisor.claimNextTask();
-    assert.equal(immediatelyRunnable?.action, "RUN");
-    assert.equal(immediatelyRunnable?.task.id, telemetryTask.id);
-    assert.equal(immediatelyRunnable?.task.custody.status, "UNCLAIMED");
-    assert.equal(immediatelyRunnable?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    const stillWaiting = await harness.supervisor.claimNextTask();
+    assert.equal(stillWaiting?.action, "WAIT");
+    assert.equal(stillWaiting?.task.id, telemetryTask.id);
+    assert.equal(stillWaiting?.task.custody.status, "UNCLAIMED");
+    assert.equal(stillWaiting?.task.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
   });
 
   it("preserves a fresh probe proof until launch and expires a stale pass", async (t) => {
-    const denied = quotaDecision("NOT_ADMITTED");
+    let decision = quotaDecision("ADMITTED");
     const harness = await makeHarness(t, {
-      quotaAdmission: { check: () => denied },
+      quotaAdmission: { check: () => decision },
     });
     const fresh = makeTask("task-fresh-unclaimed-probe-pass");
     harness.store.create(fresh);
@@ -1191,6 +1191,7 @@ describe("ops worker supervisor", () => {
     assert.equal(claimed?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
 
     harness.supervisor.cancelTask(fresh.id, "Exercise stale probe admission");
+    decision = quotaDecision("NOT_ADMITTED");
     const stale = makeTask("task-stale-unclaimed-probe-pass");
     harness.store.create(stale);
     harness.supervisor.recordQuotaProbeSuccess(
@@ -1204,6 +1205,34 @@ describe("ops worker supervisor", () => {
     assert.equal(waiting?.action, "WAIT");
     assert.equal(waiting?.task.custody.status, "UNCLAIMED");
     assert.equal(waiting?.task.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+  });
+
+  it("rechecks admission atomically before a fresh unclaimed proof takes custody", async (t) => {
+    let checks = 0;
+    const harness = await makeHarness(t, {
+      quotaAdmission: {
+        check: () => {
+          checks += 1;
+          return quotaDecision(checks === 1 ? "ADMITTED" : "NOT_ADMITTED");
+        },
+      },
+    });
+    const task = makeTask("task-atomic-unclaimed-quota-admission");
+    harness.store.create(task);
+    harness.supervisor.recordQuotaProbeSuccess(
+      task.id,
+      "Exact unclaimed quota smoke probe succeeded",
+      QUOTA_PROBE_SUBJECT_HASH,
+    );
+
+    const result = await harness.supervisor.ensureTaskCustody(task.id, "RUN", {
+      quotaProbeSubjectHash: QUOTA_PROBE_SUBJECT_HASH,
+    });
+
+    assert.equal(checks, 2);
+    assert.equal(result.custody.status, "UNCLAIMED");
+    assert.equal(result.custody.claimedAt, null);
+    assert.equal(result.lastOutcome?.result, "QUOTA_PROBE_PASS");
   });
 
   it("uses current admission instead of an expired unclaimed probe pass", async (t) => {
