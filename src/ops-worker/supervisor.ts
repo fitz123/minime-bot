@@ -49,6 +49,8 @@ import {
   type OpsWorkerActiveRun,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
+  type OpsWorkerInterrupt,
+  type OpsWorkerInterruptMode,
   type OpsWorkerLastOutcome,
   type OpsWorkerOutcomeResult,
   type OpsWorkerTask,
@@ -107,8 +109,13 @@ export interface OpsWorkerStartupRunResult {
 
 export interface OpsWorkerStartupReconciliation {
   taskId: string;
-  state: "QUEUED" | "RESUMABLE" | "BLOCKED";
-  result: "CRASH" | "QUOTA_PROBE_ERROR" | "AMBIGUOUS_ORPHAN";
+  state: "QUEUED" | "RESUMABLE" | "BLOCKED" | "CANCELLED";
+  result:
+    | "CRASH"
+    | "QUOTA_PROBE_ERROR"
+    | "AMBIGUOUS_ORPHAN"
+    | "PREEMPTED"
+    | "CANCELLED";
 }
 
 export interface OpsWorkerSupervisorOptions {
@@ -669,6 +676,102 @@ export class OpsWorkerSupervisor {
     return this.instanceId;
   }
 
+  setTaskPaused(taskId: string, paused: boolean): OpsWorkerTask {
+    this.assertStarted();
+    return this.store.setPaused(taskId, paused).task;
+  }
+
+  requestOperatorInterrupt(
+    taskId: string,
+    mode: OpsWorkerInterruptMode,
+    reason: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const requestedAt = this.now().toISOString();
+    const requested = this.store.mutate(
+      taskId,
+      {
+        event: "UPDATED",
+        summary: `Recorded durable operator ${mode} interrupt`,
+      },
+      (task) => {
+        const existing = task.control.interrupt;
+        if (existing !== null) {
+          if (existing.mode === mode && existing.reason === reason) {
+            return OPS_WORKER_TASK_STORE_NO_CHANGE;
+          }
+          throw new OpsWorkerSupervisorStateError(
+            `Task ${task.id} already has a different pending interrupt`,
+          );
+        }
+        if (task.state === "DONE" || task.state === "CANCELLED") {
+          throw new OpsWorkerSupervisorStateError(
+            `Refusing an interrupt for terminal task ${task.id}`,
+          );
+        }
+        task.control.interrupt = { requestedAt, mode, reason };
+        if (mode === "pause" && !task.control.paused) {
+          task.control.paused = true;
+          task.control.pausedAt = requestedAt;
+        }
+        task.updatedAt = this.nextUpdatedAt(task);
+      },
+    ).task;
+    if (requested.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(requested)) {
+      return requested;
+    }
+    return this.completeOperatorInterrupt(
+      taskId,
+      requested.control.interrupt as OpsWorkerInterrupt,
+    );
+  }
+
+  completeOperatorInterrupt(
+    taskId: string,
+    interrupt: OpsWorkerInterrupt,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (JSON.stringify(existing.control.interrupt) !== JSON.stringify(interrupt)) {
+      throw new OpsWorkerSupervisorStateError(
+        `Task ${taskId} operator interrupt changed before its stop was resolved`,
+      );
+    }
+    if (existing.state !== "RUNNING" && !isOpsWorkerUnresolvedOrphan(existing)) {
+      const cleared = this.store.clearInterrupt(taskId, {
+        event: "UPDATED",
+        summary: "Applied operator interrupt at an idle safe boundary",
+      }).task;
+      return interrupt.mode === "cancel"
+        ? this.cancelTask(taskId, interrupt.reason)
+        : cleared;
+    }
+    this.transition(taskId, "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.unverifiedRun = null;
+      task.session.resume = task.session.sessionId !== null;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.control.interrupt = null;
+      if (interrupt.mode === "pause") {
+        task.control.paused = true;
+        task.control.pausedAt ??= at;
+      }
+      task.lastOutcome = {
+        at,
+        kind: "OPERATOR",
+        result: "PREEMPTED",
+        summary: truncateUtf8(
+          interrupt.reason,
+          OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+        ),
+      };
+    }, `Applied proven operator ${interrupt.mode} interrupt`);
+    return interrupt.mode === "cancel"
+      ? this.cancelTask(taskId, interrupt.reason)
+      : this.requireTask(taskId);
+  }
+
   private describeDoneCheckContract(task: OpsWorkerTask): OpsWorkerDoneCheckContractIdentity {
     const contract = this.doneChecks.describe(task.doneCheck.name);
     if (!contract) {
@@ -861,6 +964,7 @@ export class OpsWorkerSupervisor {
     );
     if (!claimed) {
       const current = this.requireTask(taskId);
+      if (current.control.paused) return current;
       if (
         action === "RUN"
         && current.custody.status === "UNCLAIMED"
@@ -894,6 +998,7 @@ export class OpsWorkerSupervisor {
     }
     const now = this.now().getTime();
     const candidateFor = (task: OpsWorkerTask): OpsWorkerScheduledTask[] => {
+      if (task.control.paused) return [];
       if (task.state === "CHECKING") {
         if (
           task.schedule.nextCheckAt !== null
@@ -952,6 +1057,10 @@ export class OpsWorkerSupervisor {
         summary: "Revalidated authorization and claimed exclusive custody",
       },
       onPass: (task) => {
+        if (task.control.paused) {
+          selectionChanged = true;
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
         const expectedStates: readonly OpsWorkerTaskState[] = action === "RUN"
           ? ["QUEUED", "RESUMABLE"]
           : ["CHECKING"];
@@ -1212,6 +1321,7 @@ export class OpsWorkerSupervisor {
         if (
           hashOpsWorkerPiLaunchSubject(replacement) !== preparedTaskSubjectHash
           || !hasFreshOpsWorkerAuthorizationPass(replacement)
+          || replacement.control.paused
         ) return OPS_WORKER_TASK_STORE_NO_CHANGE;
         if (replacement.state !== "QUEUED" && replacement.state !== "RESUMABLE") {
           throw new OpsWorkerSupervisorStateError(
@@ -1347,8 +1457,14 @@ export class OpsWorkerSupervisor {
         "A supervisor may own at most one active or unresolved process group",
       );
     }
-    return this.transition(taskId, "RUNNING", (task) => {
+    return this.transition(taskId, "RUNNING", (task, at) => {
       this.pinDoneCheckContract(task);
+      for (const entry of task.steering) {
+        if (
+          entry.consumedAt === null
+          && (entry.kind === "correction" || entry.kind === "answer")
+        ) entry.consumedAt = at;
+      }
       task.activeRun = structuredClone(activeRun);
       task.unverifiedRun = null;
       task.schedule.nextRunAt = null;
@@ -2285,6 +2401,10 @@ export class OpsWorkerSupervisor {
     }
     return this.transition(taskId, "CANCELLED", (task, at) => {
       task.activeRun = null;
+      task.unverifiedRun = null;
+      task.control.paused = false;
+      task.control.pausedAt = null;
+      task.control.interrupt = null;
       task.schedule.nextRunAt = null;
       task.schedule.nextCheckAt = null;
       task.lastOutcome = {
@@ -2476,6 +2596,18 @@ export class OpsWorkerSupervisor {
         result = { status: "AMBIGUOUS" };
       }
       if (result.status === "GONE" || result.status === "STOPPED") {
+        if (task.control.interrupt !== null) {
+          const applied = this.completeOperatorInterrupt(
+            task.id,
+            task.control.interrupt,
+          );
+          reconciled.push({
+            taskId: task.id,
+            state: applied.state as "RESUMABLE" | "CANCELLED",
+            result: applied.state === "CANCELLED" ? "CANCELLED" : "PREEMPTED",
+          });
+          continue;
+        }
         if (
           interruptedQuotaProbe
           && isOpsWorkerUnclaimedQuotaProbeProcess(task)

@@ -214,6 +214,11 @@ switch (scenario) {
     await emitProviderResponse(200, {});
     process.stdout.write("Investigated a prior HTTP 429 and maximum context length message successfully.\n");
     break;
+  case "delayed-success":
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+    await emitProviderResponse(200, {});
+    process.stdout.write("fake Pi delayed success claim\n");
+    break;
   case "success-missing-telemetry":
     process.stdout.write("fake Pi exited without response telemetry\n");
     break;

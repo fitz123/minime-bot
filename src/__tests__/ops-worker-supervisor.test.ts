@@ -621,6 +621,85 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-later");
   });
 
+  it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
+    const harness = await makeHarness(t, {
+      quotaAdmission: { check: () => ({
+        version: 1,
+        status: "ADMITTED",
+        reason: "HEADROOM",
+        observedAt: NOW,
+        sampledAt: NOW,
+        activeWindows: ["5h"],
+        nextResetAt: null,
+        nextProbeAt: null,
+        evidenceHash: `sha256:${"c".repeat(64)}`,
+        summary: "Fixture quota admission passed.",
+      }) },
+    });
+    const queued = makeTask("task-paused-queued", {
+      sourceKind: "authorized-issue",
+    });
+    harness.store.create(queued);
+    harness.supervisor.setTaskPaused(queued.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+
+    harness.supervisor.setTaskPaused(queued.id, false);
+    const claimed = await harness.supervisor.claimNextTask();
+    assert.equal(claimed?.action, "RUN");
+    assert.equal(claimed?.task.id, queued.id);
+    harness.supervisor.recordPreLaunchInfrastructureOutcome(
+      queued.id,
+      "Hold fixture custody at a safe boundary.",
+    );
+    harness.store.create(makeTask("task-paused-successor", {
+      sourceKind: "alertmanager",
+    }));
+    const claimedAt = harness.store.get(queued.id)?.custody.claimedAt;
+    harness.supervisor.setTaskPaused(queued.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.store.get(queued.id)?.custody.claimedAt, claimedAt);
+    assert.equal(harness.store.get("task-paused-successor")?.state, "QUEUED");
+
+    harness.setNow(LATER);
+    harness.supervisor.setTaskPaused(queued.id, false);
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, queued.id);
+    harness.supervisor.cancelTask(queued.id, "Release paused RUN fixture custody.");
+    harness.supervisor.cancelTask(
+      "task-paused-successor",
+      "Release queued successor fixture.",
+    );
+
+    const checking = makeTask("task-paused-check");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    harness.store.create(checking);
+    harness.supervisor.setTaskPaused(checking.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    harness.supervisor.setTaskPaused(checking.id, false);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+    harness.supervisor.cancelTask(checking.id, "Release paused CHECK fixture custody.");
+
+    const quotaWait = makeTask("task-paused-quota");
+    quotaWait.lastOutcome = {
+      at: NOW,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic authoritative quota wait elapsed.",
+    };
+    quotaWait.schedule.nextRunAt = NOW;
+    harness.store.create(quotaWait);
+    harness.supervisor.setTaskPaused(quotaWait.id, true);
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+    harness.supervisor.setTaskPaused(quotaWait.id, false);
+    assert.equal((await harness.supervisor.claimNextTask())?.action, "QUOTA_PROBE");
+  });
+
   it("atomically claims the selected task before scheduling its action", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("task-claim", {
@@ -2088,6 +2167,107 @@ describe("ops worker supervisor", () => {
     );
   });
 
+  it("keeps an interrupt durable through ambiguity and applies it after restart proves the group stopped", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-interrupt-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-first",
+    });
+    first.store.create(makeTask("task-interrupt-restart"));
+    first.supervisor.markRunning(
+      "task-interrupt-restart",
+      activeRun("interrupt-first"),
+    );
+    assert.throws(
+      () => first.supervisor.cancelTask(
+        "task-interrupt-restart",
+        "Cancellation before a proven stop must fail.",
+      ),
+      /must stop its proven process group/,
+    );
+    const requested = first.supervisor.requestOperatorInterrupt(
+      "task-interrupt-restart",
+      "cancel",
+      "Stop the proven process group before cancellation.",
+    );
+    assert.equal(requested.control.interrupt?.mode, "cancel");
+    first.close();
+
+    const ambiguous = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-ambiguous",
+      reconcileActiveRun: () => ({
+        status: "AMBIGUOUS",
+        summary: "Synthetic ownership ambiguity after restart.",
+      }),
+    });
+    const fenced = ambiguous.store.get("task-interrupt-restart");
+    assert.equal(fenced?.state, "BLOCKED");
+    assert.equal(fenced?.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(fenced?.control.interrupt?.mode, "cancel");
+    assert.throws(
+      () => ambiguous.supervisor.cancelTask(
+        "task-interrupt-restart",
+        "Unresolved orphan must retain the global fence.",
+      ),
+      /remains unresolved/,
+    );
+    ambiguous.close();
+
+    const stopped = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-stopped",
+      reconcileActiveRun: () => ({
+        status: "STOPPED",
+        summary: "The prior owned process group is proven stopped.",
+      }),
+    });
+    const cancelled = stopped.store.get("task-interrupt-restart");
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled?.lastOutcome?.result, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.custody.status, "RELEASED");
+  });
+
+  it("applies a reconciled pause interrupt as a held safe boundary", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-pause-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "pause-first",
+    });
+    first.store.create(makeTask("task-pause-restart"));
+    first.supervisor.markRunning(
+      "task-pause-restart",
+      activeRun("pause-first"),
+    );
+    first.supervisor.requestOperatorInterrupt(
+      "task-pause-restart",
+      "pause",
+      "Pause after the owned group is stopped.",
+    );
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "pause-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "The prior owned process group is proven gone.",
+      }),
+    });
+    const paused = restarted.store.get("task-pause-restart");
+    assert.equal(paused?.state, "RESUMABLE");
+    assert.equal(paused?.control.paused, true);
+    assert.equal(paused?.control.interrupt, null);
+    assert.equal(paused?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(paused?.lastOutcome?.result, "PREEMPTED");
+    assert.equal(paused?.custody.status, "HELD");
+    assert.equal(restarted.supervisor.selectNextTask(), undefined);
+  });
+
   it("reconciles a quota probe fence without spending infrastructure budget", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-quota-probe-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -2184,6 +2364,8 @@ describe("ops worker supervisor", () => {
         authorizationVerification: _authorizationVerification,
         verification: _verification,
         legacyCompletion: _legacyCompletion,
+        steering: _steering,
+        control: _control,
         source,
         schemaVersion: _schemaVersion,
         ...common

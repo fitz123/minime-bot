@@ -778,7 +778,16 @@ export class OpsWorkerTaskStore {
         (candidate) => candidate.steeringId === entry.steeringId,
       );
       if (existing) {
-        if (JSON.stringify(existing) === JSON.stringify(entry)) {
+        if (
+          existing.receivedAt === entry.receivedAt
+          && existing.kind === entry.kind
+          && existing.operatorRef === entry.operatorRef
+          && existing.text === entry.text
+          && (
+            existing.consumedAt === entry.consumedAt
+            || entry.consumedAt === null
+          )
+        ) {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
         throw new OpsWorkerTaskStoreSafetyError(
