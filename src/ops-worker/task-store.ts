@@ -396,6 +396,10 @@ class OpsWorkerTaskStoreMutationGuard {
             || confirmed.raw !== rechecked.raw
           ) throw new OpsWorkerTaskStoreBusyError();
           unlinkSync(this.path);
+        } catch (error) {
+          // The observed owner may release and exit between inspection and the
+          // recovery guard. A vanished canonical lock is a normal retry race.
+          if (!isMissingError(error)) throw error;
         } finally {
           this.releaseRecoveryGuard();
         }

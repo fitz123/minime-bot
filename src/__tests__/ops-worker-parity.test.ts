@@ -424,6 +424,61 @@ describe("ops-worker before-provider parity attestation", () => {
     );
   });
 
+  it("loads a generated source wrapper through Pi's real jiti extension loader", async () => {
+    const root = tempDirectory();
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(skill, "# Real loader parity fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const extensionsDir = join(PACKAGE_ROOT, "extensions", "pi");
+    const targetExtension = realpathSync(
+      join(extensionsDir, "codex-transport-overflow.ts"),
+    );
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { extensionsDir },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const targetIndex = resources.extensionPaths.indexOf(targetExtension);
+    assert.ok(targetIndex >= 0);
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const rpcEntry = fileURLToPath(
+      import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
+    );
+    const loaderPath = join(dirname(rpcEntry), "core", "extensions", "loader.js");
+    const { loadExtensions } = await import(pathToFileURL(loaderPath).href);
+
+    const loaded = await loadExtensions(
+      [launch.extensionPaths[targetIndex]],
+      PACKAGE_ROOT,
+    );
+
+    assert.deepEqual(loaded.errors, []);
+    assert.equal(loaded.extensions.length, 1);
+    const commandNames = [...loaded.extensions[0].commands.keys()];
+    assert.ok(commandNames.includes("minime-codex-overflow-resource"));
+    assert.ok(commandNames.includes(
+      `minime-ops-extension-${resources.extensionIdentities[targetIndex].slice("sha256:".length)}`,
+    ));
+  });
+
   it("fences a generated wrapper when an imported implementation changes", async () => {
     const root = tempDirectory();
     const implementation = join(root, "configured-implementation.mjs");

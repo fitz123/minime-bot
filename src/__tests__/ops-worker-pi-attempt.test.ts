@@ -26,7 +26,7 @@ import {
   resolvePiPrimaryResourceContract,
   type PiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
-import type { AgentConfig } from "../types.js";
+import type { AgentConfig, PiThinkingLevel } from "../types.js";
 import type {
   OpsWorkerAuthorizationVerifier,
   OpsWorkerAuthorizationVerifierRegistry,
@@ -261,6 +261,8 @@ interface Harness {
   invocations: string[][];
   setScenario(scenario: string): void;
   runner(options?: {
+    model?: string;
+    thinking?: PiThinkingLevel;
     attemptTimeoutMs?: number;
     stallTimeoutMs?: number;
     abortSignal?: AbortSignal;
@@ -386,6 +388,8 @@ async function makeHarness(
         workspaceCwd: workspace,
         primaryContextAgent,
         primaryResources,
+        model: options.model,
+        thinking: options.thinking,
         abortSignal: options.abortSignal,
         attemptTimeoutMs: options.attemptTimeoutMs ?? 5_000,
         stallTimeoutMs: options.stallTimeoutMs,
@@ -805,6 +809,74 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(quotaResult?.schedule.nextRunAt, sampled.windows["5h"].resetAt);
     assert.equal(quotaResult?.custody.status, "HELD");
     assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
+  });
+
+  it("binds a fresh quota probe proof to exact launch configuration and consumes it once", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("bound-quota-probe-proof");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait requiring an exact proof.",
+    };
+    harness.store.create(task);
+    const successfulProbe = {
+      runQuotaProbe: async () => ({
+        status: "SUCCESS" as const,
+        snapshot: quotaSnapshot(),
+      }),
+    };
+
+    const initialProof = await harness.runner({
+      dependencies: successfulProbe,
+    }).runNext();
+    const initialSubject = initialProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(initialSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+
+    const changedModel = "openai-codex/gpt-5.5-mini";
+    const modelMismatch = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(modelMismatch?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(harness.children.length, 0);
+
+    const modelProof = await harness.runner({
+      model: changedModel,
+      dependencies: successfulProbe,
+    }).runNext();
+    const modelSubject = modelProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(modelSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+    assert.notEqual(modelSubject, initialSubject);
+
+    writeFileSync(
+      join(harness.primaryWorkspace, "USER.md"),
+      "CHANGED_PRIMARY_USER_CONTEXT\n",
+      "utf8",
+    );
+    const contextMismatch = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(contextMismatch?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.equal(harness.children.length, 0);
+
+    const contextProof = await harness.runner({
+      model: changedModel,
+      dependencies: successfulProbe,
+    }).runNext();
+    const contextSubject = contextProof?.lastOutcome?.quotaProbeProof?.subjectHash;
+    assert.match(contextSubject ?? "", /^sha256:[a-f0-9]{64}$/);
+    assert.notEqual(contextSubject, modelSubject);
+
+    const completed = await harness.runner({ model: changedModel }).runNext();
+    assert.equal(completed?.state, "DONE");
+    assert.equal(completed?.lastOutcome?.result, "PASS");
+    assert.equal(completed?.lastOutcome?.quotaProbeProof, undefined);
+    assert.equal(harness.children.length, 1);
   });
 
   it("revalidates again immediately before spawning held and unclaimed quota probes", async (t) => {

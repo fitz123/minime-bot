@@ -542,7 +542,6 @@ export class OpsWorkerPiAttemptRunner {
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
-    const prompt = buildOpsWorkerAttemptPrompt(task);
     const context = this.assembleContext(this.primaryContextAgent, {
       artifactWorkspaceCwd: this.workspaceCwd,
       strict: true,
@@ -558,6 +557,16 @@ export class OpsWorkerPiAttemptRunner {
       sessionDirectory,
       opsPolicy: OPS_WORKER_SYSTEM_POLICY,
     });
+    const quotaProbeSubjectHash = task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+      ? hashQuotaProbeSubject(
+        this.model,
+        this.thinking,
+        context,
+        this.primaryResources,
+        parityLaunch,
+      )
+      : undefined;
+    const prompt = buildOpsWorkerAttemptPrompt(task);
     const args = buildPiAttemptArgs(
       task,
       sessionDirectory,
@@ -581,7 +590,17 @@ export class OpsWorkerPiAttemptRunner {
       launchedAt,
       ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
     };
-    this.supervisor.beginPiLaunch(task.id, launchIntent);
+    const launchState = this.supervisor.beginPiLaunch(
+      task.id,
+      launchIntent,
+      quotaProbeSubjectHash,
+    );
+    if (
+      launchState.state !== "BLOCKED"
+      || launchState.unverifiedRun?.attemptId !== attemptId
+    ) {
+      return { classification: "CRASH", task: launchState };
+    }
     this.launchFaultInjector?.("after-launch-intent-persisted");
     let child: ChildProcess;
     try {
@@ -1202,6 +1221,7 @@ export class OpsWorkerPiAttemptRunner {
       || !hasFreshOpsWorkerAuthorizationPass(task)
     ) return task;
     let result: OpsWorkerQuotaProbeResult;
+    let proofSubjectHash: string | undefined;
     let launchReserved = false;
     try {
       const context = this.assembleContext(this.primaryContextAgent, {
@@ -1226,6 +1246,13 @@ export class OpsWorkerPiAttemptRunner {
         context,
         this.primaryResources,
         parityLaunch.extensionPaths,
+      );
+      proofSubjectHash = hashQuotaProbeSubject(
+        this.model,
+        this.thinking,
+        context,
+        this.primaryResources,
+        parityLaunch,
       );
       const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
       safeUnlink(attemptFile);
@@ -1253,9 +1280,13 @@ export class OpsWorkerPiAttemptRunner {
       if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
     if (result.status === "SUCCESS") {
+      if (proofSubjectHash === undefined) {
+        throw new Error("Exact quota smoke probe completed without a prepared proof subject");
+      }
       return this.supervisor.recordQuotaProbeSuccess(
         taskId,
         "Exact worker model/thinking/resource quota smoke probe succeeded",
+        proofSubjectHash,
       );
     }
     if (result.status === "QUOTA") {
@@ -1618,6 +1649,24 @@ export class OpsWorkerPiAttemptRunner {
     }
     return task;
   }
+}
+
+function hashQuotaProbeSubject(
+  model: string,
+  thinking: string,
+  context: PiContextArtifacts,
+  resources: PiPrimaryResourceContract,
+  parityLaunch: OpsWorkerParityLaunch,
+): string {
+  const canonical = JSON.stringify([
+    "minime-ops-worker-quota-probe-subject-v1",
+    model,
+    thinking,
+    context.manifest.digest,
+    resources.digest,
+    parityLaunch.expected.digest,
+  ]);
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 export function buildPiAttemptArgs(

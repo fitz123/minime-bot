@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
   createExpectedOpsWorkerParityContract,
@@ -31,6 +31,39 @@ import {
 
 const MAX_REPORT_BYTES = 32 * 1024;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
+
+const PI_EXTENSION_JITI_ALIASES = (() => {
+  const piCodingAgent = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const piAgentCore = fileURLToPath(import.meta.resolve("@earendil-works/pi-agent-core"));
+  const piTui = fileURLToPath(import.meta.resolve("@earendil-works/pi-tui"));
+  const piAiCompat = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/compat"));
+  const piAiOauth = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/oauth"));
+  const typebox = fileURLToPath(import.meta.resolve("typebox"));
+  const typeboxCompile = fileURLToPath(import.meta.resolve("typebox/compile"));
+  const typeboxValue = fileURLToPath(import.meta.resolve("typebox/value"));
+  return {
+    "@earendil-works/pi-coding-agent": piCodingAgent,
+    "@earendil-works/pi-agent-core": piAgentCore,
+    "@earendil-works/pi-tui": piTui,
+    "@earendil-works/pi-ai": piAiCompat,
+    "@earendil-works/pi-ai/compat": piAiCompat,
+    "@earendil-works/pi-ai/oauth": piAiOauth,
+    "@mariozechner/pi-coding-agent": piCodingAgent,
+    "@mariozechner/pi-agent-core": piAgentCore,
+    "@mariozechner/pi-tui": piTui,
+    "@mariozechner/pi-ai": piAiCompat,
+    "@mariozechner/pi-ai/compat": piAiCompat,
+    "@mariozechner/pi-ai/oauth": piAiOauth,
+    typebox,
+    "typebox/compile": typeboxCompile,
+    "typebox/value": typeboxValue,
+    "@sinclair/typebox": typebox,
+    "@sinclair/typebox/compile": typeboxCompile,
+    "@sinclair/typebox/value": typeboxValue,
+  };
+})();
+
+const JITI_STATIC_URL = import.meta.resolve("jiti/static");
 
 export interface OpsWorkerParityLaunch {
   expected: OpsWorkerExpectedParityContract;
@@ -83,8 +116,11 @@ function writePrivateExtensionWrapper(
     "import { createHash } from 'node:crypto';",
     "import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';",
     "import { normalize, resolve } from 'node:path';",
-    `const targetExtensionUrl = ${JSON.stringify(pathToFileURL(targetPath).href)};`,
+    `import { createJiti } from ${JSON.stringify(JITI_STATIC_URL)};`,
+    `const targetExtensionPath = ${JSON.stringify(targetPath)};`,
     `const expectedFiles = ${JSON.stringify(resourceFiles)};`,
+    `const extensionAliases = ${JSON.stringify(PI_EXTENSION_JITI_ALIASES)};`,
+    "const jiti = createJiti(import.meta.url, { alias: extensionAliases, moduleCache: false, tryNative: false });",
     "function sha256(value) { return `sha256:${createHash('sha256').update(value).digest('hex')}`; }",
     "function verifyPinnedResources() {",
     "  for (const expected of expectedFiles) {",
@@ -104,9 +140,8 @@ function writePrivateExtensionWrapper(
     "}",
     "export default async function minimeOpsExtensionWrapper(pi) {",
     "  verifyPinnedResources();",
-    "  const imported = await import(targetExtensionUrl);",
+    "  const targetExtension = await jiti.import(targetExtensionPath, { default: true });",
     "  verifyPinnedResources();",
-    "  const targetExtension = imported.default;",
     "  if (typeof targetExtension !== 'function') throw new TypeError('Pinned Pi extension has no default factory');",
     "  await targetExtension(pi);",
     "  verifyPinnedResources();",

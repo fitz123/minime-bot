@@ -581,6 +581,42 @@ describe("ops worker task contract", () => {
     );
   });
 
+  it("validates typed quota probe proofs while accepting legacy proofless outcomes", () => {
+    const task = makeTask();
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_PROBE_PASS",
+      summary: "Exact quota smoke probe succeeded.",
+      quotaProbeProof: {
+        version: 1,
+        subjectHash: `sha256:${"4".repeat(64)}`,
+      },
+    };
+    assert.deepEqual(parseOpsWorkerTask(task, registry), task);
+
+    const legacyProofless = clone(task);
+    assert.ok(legacyProofless.lastOutcome);
+    delete legacyProofless.lastOutcome.quotaProbeProof;
+    assert.deepEqual(parseOpsWorkerTask(legacyProofless, registry), legacyProofless);
+
+    const wrongOutcome = clone(task);
+    assert.ok(wrongOutcome.lastOutcome);
+    wrongOutcome.lastOutcome.result = "NETWORK";
+    assert.throws(
+      () => parseOpsWorkerTask(wrongOutcome, registry),
+      /quotaProbeProof: is allowed only for an exact quota probe PASS/,
+    );
+
+    const malformed = clone(task);
+    assert.ok(malformed.lastOutcome?.quotaProbeProof);
+    malformed.lastOutcome.quotaProbeProof.subjectHash = "sha256:not-a-proof";
+    assert.throws(
+      () => parseOpsWorkerTask(malformed, registry),
+      /quotaProbeProof\.subjectHash: must be a lowercase sha256/,
+    );
+  });
+
   it("strictly validates bounded composite evidence and immutable verifier identity", () => {
     const task = makeTask();
     attachFreshPass(task, NOW);

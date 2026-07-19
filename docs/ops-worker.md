@@ -112,7 +112,9 @@ component evidence to the task. Older snapshots migrate with these records
 unset, never with an implied PASS. A migrated legacy `DONE` snapshot carries
 fixed source-schema provenance so its report evidence can be updated in v4
 without fabricating aggregate PASS evidence; current-schema completion still
-requires a fresh aggregate PASS.
+requires a fresh aggregate PASS. A newly written `QUOTA_PROBE_PASS` outcome may
+also carry its fixed typed proof subrecord; proofless outcomes remain readable
+for compatibility but never authorize a launch.
 
 The v1 migration derives a task-unique legacy delivery key and non-shareable
 legacy host resource. It also derives custody conservatively: active, checking,
@@ -178,10 +180,13 @@ records that authoritative reset timestamp and creates a durable host-native
 wait. At fresh headroom or the reset deadline, one bounded smoke probe uses the
 exact worker model, thinking level, context, extensions, skills, and tools. The
 probe runs in a detached owned process group and its parity gate blocks every
-tool call. Success resumes;
-another quota response refreshes the reset; invalid telemetry and probe
-infrastructure errors remain distinct bounded outcomes. No LLM is parked and no
-blind polling or guessed reset deadline is used.
+tool call. Success records a short-lived, single-use proof bound to the exact
+model, thinking level, primary context, parity contract, and resource digest.
+The real launch validates and consumes that proof atomically with its durable
+pre-spawn fence; an expired or mismatched proof returns to the probe flow without
+spawning. Another quota response refreshes the reset; invalid telemetry and
+probe infrastructure errors remain distinct bounded outcomes. No LLM is parked
+and no blind polling or guessed reset deadline is used.
 
 ## Typed composite verification
 

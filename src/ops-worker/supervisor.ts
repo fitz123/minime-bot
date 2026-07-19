@@ -42,6 +42,7 @@ import {
 } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
+  OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
   hashOpsWorkerVerificationSubject,
   isOpsWorkerUnclaimedQuotaProbeProcess,
   type OpsWorkerActiveRun,
@@ -65,6 +66,7 @@ const INSTANCE_ID_PATTERN =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 const ALLOWED_STATE_TRANSITIONS: Readonly<
   Record<OpsWorkerTaskState, readonly OpsWorkerTaskState[]>
@@ -930,7 +932,7 @@ export class OpsWorkerSupervisor {
         }
         if (
           task.lastOutcome?.result === "QUOTA_PROBE_PASS"
-          && !this.hasFreshUnclaimedQuotaProbePass(task)
+          && !this.hasFreshQuotaProbePass(task)
           && this.quotaAdmission?.check().status !== "ADMITTED"
         ) {
           selectionChanged = true;
@@ -938,9 +940,6 @@ export class OpsWorkerSupervisor {
         }
         const claimedAt = this.nextUpdatedAt(task);
         task.updatedAt = claimedAt;
-        if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") {
-          task.lastOutcome = null;
-        }
         task.custody = {
           status: "HELD",
           claimedAt,
@@ -957,14 +956,14 @@ export class OpsWorkerSupervisor {
     requireCurrentSelection: boolean,
   ): Promise<OpsWorkerScheduledTask | undefined> {
     if (scheduled.action !== "RUN" || !this.quotaAdmission) return undefined;
-    const task = this.requireTask(scheduled.task.id);
-    if (
-      task.lastOutcome?.result === "QUOTA_PROBE_PASS"
-      && (
-        task.custody.status === "HELD"
-        || this.hasFreshUnclaimedQuotaProbePass(task)
-      )
-    ) return undefined;
+    let task = this.requireTask(scheduled.task.id);
+    if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") {
+      if (this.hasFreshQuotaProbePass(task)) return undefined;
+      task = this.invalidateQuotaProbeProof(
+        task.id,
+        "Exact quota smoke probe proof expired before launch",
+      );
+    }
     const decision = this.quotaAdmission.check();
     const wait = isOpsWorkerQuotaWait(task);
     const authoritativeDeadline = wait
@@ -995,16 +994,39 @@ export class OpsWorkerSupervisor {
     return undefined;
   }
 
-  private hasFreshUnclaimedQuotaProbePass(task: OpsWorkerTask): boolean {
+  private hasFreshQuotaProbePass(task: OpsWorkerTask): boolean {
     if (
-      task.custody.status !== "UNCLAIMED"
-      || task.lastOutcome?.result !== "QUOTA_PROBE_PASS"
+      task.lastOutcome?.result !== "QUOTA_PROBE_PASS"
+      || task.lastOutcome.quotaProbeProof?.version
+        !== OPS_WORKER_QUOTA_PROBE_PROOF_VERSION
     ) return false;
     const passedAt = Date.parse(task.lastOutcome.at);
     const ageMs = this.now().getTime() - passedAt;
     return Number.isFinite(passedAt)
       && ageMs >= -DEFAULT_OPS_WORKER_QUOTA_STALE_MS
       && ageMs <= DEFAULT_OPS_WORKER_QUOTA_STALE_MS;
+  }
+
+  private invalidateQuotaProbeProof(taskId: string, summary: string): OpsWorkerTask {
+    return this.store.mutate(
+      taskId,
+      { event: "TRANSITION", summary },
+      (task) => {
+        if (task.lastOutcome?.result !== "QUOTA_PROBE_PASS") {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        const at = this.nextUpdatedAt(task);
+        task.updatedAt = at;
+        task.schedule.nextCheckAt = null;
+        task.schedule.nextRunAt = at;
+        task.lastOutcome = {
+          at,
+          kind: "INFRASTRUCTURE",
+          result: "QUOTA_PROBE_ERROR",
+          summary,
+        };
+      },
+    ).task;
   }
 
   private async revalidateQuotaProbeAuthorization(
@@ -1050,9 +1072,18 @@ export class OpsWorkerSupervisor {
   beginPiLaunch(
     taskId: string,
     launchIntent: OpsWorkerUnverifiedRun,
+    quotaProbeSubjectHash?: string,
   ): OpsWorkerTask {
     this.assertStarted();
     const task = this.requireTask(taskId);
+    if (
+      quotaProbeSubjectHash !== undefined
+      && !SHA256_PATTERN.test(quotaProbeSubjectHash)
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        "Quota probe proof subject must be a lowercase sha256 digest",
+      );
+    }
     if (this.piLaunchReservation !== taskId) {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} must reserve the Pi launch slot before persisting a launch intent`,
@@ -1075,22 +1106,70 @@ export class OpsWorkerSupervisor {
     }
     const preserveUnclaimedQuotaProbe = task.custody.status === "UNCLAIMED"
       && launchIntent.attemptId.startsWith("quota-probe-");
-    return this.transition(taskId, "BLOCKED", (replacement, at) => {
-      replacement.activeRun = null;
-      replacement.unverifiedRun = structuredClone(launchIntent);
-      replacement.schedule.nextRunAt = null;
-      replacement.schedule.nextCheckAt = null;
-      replacement.lastOutcome = {
-        at,
-        kind: "RECONCILIATION",
-        result: "AMBIGUOUS_ORPHAN",
-        summary: "Persisted Pi launch intent before detached spawn",
-      };
-      replacement.report.state = "PENDING";
-      replacement.report.lastError = null;
-    }, "Persisted Pi launch intent before detached spawn", {
-      preserveUnclaimedQuotaProbe,
-    });
+    return this.store.mutate(
+      taskId,
+      {
+        event: "TRANSITION",
+        summary: "Evaluated exact quota proof and persisted Pi launch intent",
+      },
+      (replacement) => {
+        if (replacement.state !== "QUEUED" && replacement.state !== "RESUMABLE") {
+          throw new OpsWorkerSupervisorStateError(
+            `Pi launch intent requires QUEUED or RESUMABLE, found ${replacement.state}`,
+          );
+        }
+        const hasQuotaProbePass = replacement.lastOutcome?.result
+          === "QUOTA_PROBE_PASS";
+        if (quotaProbeSubjectHash !== undefined || hasQuotaProbePass) {
+          const passedAt = hasQuotaProbePass
+            ? Date.parse(replacement.lastOutcome?.at ?? "")
+            : Number.NaN;
+          const ageMs = this.now().getTime() - passedAt;
+          const fresh = Number.isFinite(passedAt)
+            && ageMs >= -DEFAULT_OPS_WORKER_QUOTA_STALE_MS
+            && ageMs <= DEFAULT_OPS_WORKER_QUOTA_STALE_MS;
+          const matches = quotaProbeSubjectHash !== undefined
+            && replacement.lastOutcome?.quotaProbeProof?.version
+              === OPS_WORKER_QUOTA_PROBE_PROOF_VERSION
+            && replacement.lastOutcome.quotaProbeProof.subjectHash
+              === quotaProbeSubjectHash;
+          if (!fresh || !matches) {
+            const at = this.nextUpdatedAt(replacement);
+            replacement.updatedAt = at;
+            replacement.schedule.nextCheckAt = null;
+            replacement.schedule.nextRunAt = at;
+            replacement.lastOutcome = {
+              at,
+              kind: "INFRASTRUCTURE",
+              result: "QUOTA_PROBE_ERROR",
+              summary: "Exact quota smoke probe proof expired or did not match the prepared launch",
+            };
+            return;
+          }
+        }
+        assertStructuralStateTransition(replacement.state, "BLOCKED");
+        const at = this.nextUpdatedAt(replacement);
+        replacement.state = "BLOCKED";
+        replacement.updatedAt = at;
+        replacement.activeRun = null;
+        replacement.unverifiedRun = structuredClone(launchIntent);
+        replacement.schedule.nextRunAt = null;
+        replacement.schedule.nextCheckAt = null;
+        replacement.lastOutcome = {
+          at,
+          kind: "RECONCILIATION",
+          result: "AMBIGUOUS_ORPHAN",
+          summary: "Persisted Pi launch intent before detached spawn",
+        };
+        replacement.report.state = "PENDING";
+        replacement.report.lastError = null;
+        this.applyCustodyTransition(
+          replacement,
+          at,
+          preserveUnclaimedQuotaProbe,
+        );
+      },
+    ).task;
   }
 
   bindUnverifiedPiLaunch(
@@ -1429,8 +1508,17 @@ export class OpsWorkerSupervisor {
     }, "Recorded authoritative quota reset wait");
   }
 
-  recordQuotaProbeSuccess(taskId: string, summary: string): OpsWorkerTask {
+  recordQuotaProbeSuccess(
+    taskId: string,
+    summary: string,
+    subjectHash: string,
+  ): OpsWorkerTask {
     this.assertStarted();
+    if (!SHA256_PATTERN.test(subjectHash)) {
+      throw new OpsWorkerSupervisorStateError(
+        "Quota probe proof subject must be a lowercase sha256 digest",
+      );
+    }
     const existing = this.requireTask(taskId);
     if (
       existing.state !== "QUEUED"
@@ -1451,6 +1539,10 @@ export class OpsWorkerSupervisor {
         kind: "INFRASTRUCTURE",
         result: "QUOTA_PROBE_PASS",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+        quotaProbeProof: {
+          version: OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
+          subjectHash,
+        },
       };
     };
     if (isOpsWorkerUnclaimedQuotaProbeProcess(existing)) {

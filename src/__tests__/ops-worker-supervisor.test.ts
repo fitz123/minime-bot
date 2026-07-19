@@ -53,6 +53,7 @@ const NOW = "2026-07-17T12:00:00.000Z";
 const LATER = "2026-07-17T12:05:00.000Z";
 const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
 const AUTHORIZATION_EVIDENCE_HASH = `sha256:${"b".repeat(64)}`;
+const QUOTA_PROBE_SUBJECT_HASH = `sha256:${"c".repeat(64)}`;
 const fixtureAuthorizationVerifier: OpsWorkerAuthorizationVerifier = {
   identity: "fixture-authorization",
   version: "1",
@@ -938,6 +939,7 @@ describe("ops worker supervisor", () => {
     harness.supervisor.recordQuotaProbeSuccess(
       "task-quota-admission",
       "Exact worker quota smoke probe succeeded.",
+      QUOTA_PROBE_SUBJECT_HASH,
     );
     current = quotaDecision("NOT_ADMITTED", {
       reason: "STALE",
@@ -947,6 +949,7 @@ describe("ops worker supervisor", () => {
     const runnable = await harness.supervisor.claimNextTask();
     assert.equal(runnable?.action, "RUN");
     assert.equal(runnable?.task.custody.claimedAt, claimedAt);
+    assert.equal(runnable?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
   });
 
   it("revalidates authorization before held and unclaimed quota probes", async (t) => {
@@ -1158,15 +1161,16 @@ describe("ops worker supervisor", () => {
     harness.supervisor.recordQuotaProbeSuccess(
       telemetryTask.id,
       "Exact unclaimed quota smoke probe succeeded",
+      QUOTA_PROBE_SUBJECT_HASH,
     );
     const immediatelyRunnable = await harness.supervisor.claimNextTask();
     assert.equal(immediatelyRunnable?.action, "RUN");
     assert.equal(immediatelyRunnable?.task.id, telemetryTask.id);
     assert.equal(immediatelyRunnable?.task.custody.status, "HELD");
-    assert.equal(immediatelyRunnable?.task.lastOutcome, null);
+    assert.equal(immediatelyRunnable?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
   });
 
-  it("consumes a fresh unclaimed probe pass and expires a stale pass", async (t) => {
+  it("preserves a fresh probe proof until launch and expires a stale pass", async (t) => {
     const denied = quotaDecision("NOT_ADMITTED");
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => denied },
@@ -1176,13 +1180,14 @@ describe("ops worker supervisor", () => {
     harness.supervisor.recordQuotaProbeSuccess(
       fresh.id,
       "Exact unclaimed quota smoke probe succeeded",
+      QUOTA_PROBE_SUBJECT_HASH,
     );
     harness.setNow(LATER);
 
     const claimed = await harness.supervisor.claimNextTask();
     assert.equal(claimed?.action, "RUN");
     assert.equal(claimed?.task.custody.status, "HELD");
-    assert.equal(claimed?.task.lastOutcome, null);
+    assert.equal(claimed?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
 
     harness.supervisor.cancelTask(fresh.id, "Exercise stale probe admission");
     const stale = makeTask("task-stale-unclaimed-probe-pass");
@@ -1190,6 +1195,7 @@ describe("ops worker supervisor", () => {
     harness.supervisor.recordQuotaProbeSuccess(
       stale.id,
       "Exact unclaimed quota smoke probe succeeded",
+      QUOTA_PROBE_SUBJECT_HASH,
     );
     harness.setNow("2026-07-17T12:36:00.000Z");
 
@@ -1208,13 +1214,14 @@ describe("ops worker supervisor", () => {
     harness.supervisor.recordQuotaProbeSuccess(
       task.id,
       "Exact unclaimed quota smoke probe succeeded",
+      QUOTA_PROBE_SUBJECT_HASH,
     );
     harness.setNow("2026-07-17T12:31:00.000Z");
 
     const claimed = await harness.supervisor.claimNextTask();
-    assert.equal(claimed?.action, "RUN");
+    assert.equal(claimed?.action, "QUOTA_PROBE");
     assert.equal(claimed?.task.custody.status, "HELD");
-    assert.equal(claimed?.task.lastOutcome, null);
+    assert.equal(claimed?.task.lastOutcome?.result, "QUOTA_PROBE_ERROR");
   });
 
   it("allows DONE only through a fresh PASS, even without a Pi success claim", async (t) => {

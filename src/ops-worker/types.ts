@@ -402,11 +402,21 @@ export interface OpsWorkerUnverifiedRun {
   ownershipNonceHash: string;
 }
 
+export const OPS_WORKER_QUOTA_PROBE_PROOF_VERSION = 1 as const;
+
+export interface OpsWorkerQuotaProbeProof {
+  version: typeof OPS_WORKER_QUOTA_PROBE_PROOF_VERSION;
+  /** One-way identity of the exact model, thinking, context, and resources probed. */
+  subjectHash: string;
+}
+
 export interface OpsWorkerLastOutcome {
   at: string;
   kind: OpsWorkerOutcomeKind;
   result: OpsWorkerOutcomeResult;
   summary: string;
+  /** Present only for a newly written exact-configuration quota probe PASS. */
+  quotaProbeProof?: OpsWorkerQuotaProbeProof;
 }
 
 export interface OpsWorkerReport {
@@ -2137,19 +2147,73 @@ function parseUnverifiedRun(value: unknown): OpsWorkerUnverifiedRun | null {
   };
 }
 
+function parseQuotaProbeProof(value: unknown): OpsWorkerQuotaProbeProof {
+  const proof = expectObject(value, "task.lastOutcome.quotaProbeProof");
+  expectExactKeys(
+    proof,
+    ["version", "subjectHash"],
+    "task.lastOutcome.quotaProbeProof",
+  );
+  if (proof.version !== OPS_WORKER_QUOTA_PROBE_PROOF_VERSION) {
+    fail(
+      "task.lastOutcome.quotaProbeProof.version",
+      `must equal ${OPS_WORKER_QUOTA_PROBE_PROOF_VERSION}`,
+    );
+  }
+  const subjectHash = expectString(
+    proof.subjectHash,
+    "task.lastOutcome.quotaProbeProof.subjectHash",
+  );
+  if (!SHA256_PATTERN.test(subjectHash)) {
+    fail(
+      "task.lastOutcome.quotaProbeProof.subjectHash",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  return {
+    version: OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
+    subjectHash,
+  };
+}
+
 function parseLastOutcome(value: unknown): OpsWorkerLastOutcome | null {
   if (value === null) return null;
   const outcome = expectObject(value, "task.lastOutcome");
-  expectExactKeys(outcome, ["at", "kind", "result", "summary"], "task.lastOutcome");
+  const hasQuotaProbeProof = Object.prototype.hasOwnProperty.call(
+    outcome,
+    "quotaProbeProof",
+  );
+  expectExactKeys(
+    outcome,
+    hasQuotaProbeProof
+      ? ["at", "kind", "result", "summary", "quotaProbeProof"]
+      : ["at", "kind", "result", "summary"],
+    "task.lastOutcome",
+  );
+  const result = expectEnum(
+    outcome.result,
+    OPS_WORKER_OUTCOME_RESULTS,
+    "task.lastOutcome.result",
+  );
+  if (hasQuotaProbeProof && result !== "QUOTA_PROBE_PASS") {
+    fail(
+      "task.lastOutcome.quotaProbeProof",
+      "is allowed only for an exact quota probe PASS",
+    );
+  }
+  const quotaProbeProof = hasQuotaProbeProof
+    ? parseQuotaProbeProof(outcome.quotaProbeProof)
+    : undefined;
   return {
     at: expectTimestamp(outcome.at, "task.lastOutcome.at"),
     kind: expectEnum(outcome.kind, OPS_WORKER_OUTCOME_KINDS, "task.lastOutcome.kind"),
-    result: expectEnum(outcome.result, OPS_WORKER_OUTCOME_RESULTS, "task.lastOutcome.result"),
+    result,
     summary: expectBoundedText(
       outcome.summary,
       "task.lastOutcome.summary",
       OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
     ),
+    ...(quotaProbeProof === undefined ? {} : { quotaProbeProof }),
   };
 }
 
