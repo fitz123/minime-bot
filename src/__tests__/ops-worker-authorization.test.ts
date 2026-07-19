@@ -495,7 +495,7 @@ function alertmanagerTask(
 }
 
 describe("package-owned alertmanager authorization verifier", () => {
-  it("passes only the exact trusted configured task snapshot and canonical fingerprint", async () => {
+  it("passes the exact trusted task after store-owned runtime evidence changes", async () => {
     const contracts = opsContracts({ read: () => alertmanagerSnapshot() });
     const task = alertmanagerTask();
     const verifier = contracts.alertmanagerAuthorizationVerifier;
@@ -506,6 +506,15 @@ describe("package-owned alertmanager authorization verifier", () => {
       task.submissionFingerprint,
       hashOpsWorkerCanonicalSubmission(task),
     );
+    task.evidence.push({
+      at: NOW,
+      kind: "pi",
+      trust: "trusted",
+      summary: "Bounded runtime parity evidence.",
+      artifact: null,
+    });
+    assert.notEqual(task.submissionFingerprint, hashOpsWorkerCanonicalSubmission(task));
+    assert.equal((await verifier.verify(task)).status, "PASS");
     assert.match(result.evidenceHash, /^sha256:[a-f0-9]{64}$/);
     assert.doesNotMatch(result.summary, /lab|fixture|host:local/i);
   });
@@ -554,10 +563,6 @@ describe("package-owned alertmanager authorization verifier", () => {
     const verifier = opsContracts({ read: () => alertmanagerSnapshot() })
       .alertmanagerAuthorizationVerifier;
     const cases: OpsWorkerTask[] = [];
-
-    const fingerprint = alertmanagerTask();
-    fingerprint.submissionFingerprint = `sha256:${"f".repeat(64)}`;
-    cases.push(fingerprint);
 
     const snapshotHash = alertmanagerTask();
     snapshotHash.authorization.snapshotHash = `sha256:${"e".repeat(64)}`;

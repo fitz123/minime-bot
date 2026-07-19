@@ -1394,6 +1394,7 @@ reply:
         version: "4",
         groupKey: "{}:{alertname=\"MinimeBotUnavailable\"}",
         status: "firing",
+        groupLabels: { alertname: "MinimeBotUnavailable" },
         alerts: [{
           status: "firing",
           labels: { alertname: "MinimeBotUnavailable" },

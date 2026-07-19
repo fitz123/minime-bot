@@ -298,6 +298,26 @@ function parseWebhook(value: unknown): OpsAlertmanagerWebhook {
       || (root.truncatedAlerts as number) > OPS_ALERTMANAGER_INTAKE_LIMITS.maxTruncatedAlerts
     )
   ) fail("INVALID_PAYLOAD", "alertmanager.truncatedAlerts must be a bounded non-negative integer");
+  const groupLabels = root.groupLabels === undefined
+    ? undefined
+    : expectStringMap(
+        root.groupLabels,
+        "alertmanager.groupLabels",
+        OPS_ALERTMANAGER_INTAKE_LIMITS.maxLabelEntries,
+        OPS_ALERTMANAGER_INTAKE_LIMITS.maxLabelValueBytes,
+      );
+  if (
+    firingCount > 0
+    && groupLabels !== undefined
+    && alerts.some((alert) =>
+      alert.status === "firing"
+      && Object.entries(groupLabels).some(([key, value]) => alert.labels[key] !== value))
+  ) {
+    fail(
+      "INVALID_PAYLOAD",
+      "alertmanager.groupLabels must match every firing alert",
+    );
+  }
   return {
     version: "4",
     groupKey: expectString(
@@ -316,16 +336,9 @@ function parseWebhook(value: unknown): OpsAlertmanagerWebhook {
             OPS_ALERTMANAGER_INTAKE_LIMITS.maxReceiverBytes,
           ),
         }),
-    ...(root.groupLabels === undefined
+    ...(groupLabels === undefined
       ? {}
-      : {
-          groupLabels: expectStringMap(
-            root.groupLabels,
-            "alertmanager.groupLabels",
-            OPS_ALERTMANAGER_INTAKE_LIMITS.maxLabelEntries,
-            OPS_ALERTMANAGER_INTAKE_LIMITS.maxLabelValueBytes,
-          ),
-        }),
+      : { groupLabels }),
     ...(root.commonLabels === undefined
       ? {}
       : {

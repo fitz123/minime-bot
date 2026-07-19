@@ -8,7 +8,10 @@ import {
   summarizeOpsWorkerTasks,
   type OpsWorkerPolicySnapshot,
 } from "./status-server.js";
-import type { OpsWorkerSupervisor } from "./supervisor.js";
+import {
+  OpsWorkerSupervisorStateError,
+  type OpsWorkerSupervisor,
+} from "./supervisor.js";
 import {
   OPS_WORKER_LIMITS,
   isOpsWorkerTaskId,
@@ -418,9 +421,13 @@ export class OpsWorkerTelegramControl {
       const task = this.supervisor.getTask(taskId);
       if (!task) return `Unknown ops-worker task ${taskId}.`;
       const steeringId = `telegram:update:${message.updateId}`;
+      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if ((task.state === "DONE" || task.state === "CANCELLED")
-        && !task.steering.some((entry) => entry.steeringId === steeringId)) {
+        && !replayed) {
         return `Task ${taskId} is terminal; steering was not recorded.`;
+      }
+      if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
+        return `Task ${taskId} cannot record more steering.`;
       }
       this.supervisor.appendTaskSteering(taskId, {
         steeringId,
@@ -450,9 +457,20 @@ export class OpsWorkerTelegramControl {
       if (command === "resume" && task.control.interrupt !== null && !replayed) {
         return `Task ${taskId} has a pending ${task.control.interrupt.mode} interrupt.`;
       }
+      if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
+        return `Task ${taskId} cannot record more steering.`;
+      }
       this.appendControlSteering(message, taskId, command === "pause" ? "pause" : "resume", command);
       if (command === "retry") {
-        const retried = this.supervisor.retryBlockedTask(taskId);
+        let retried: OpsWorkerTask;
+        try {
+          retried = this.supervisor.retryBlockedTask(taskId);
+        } catch (error) {
+          if (error instanceof OpsWorkerSupervisorStateError) {
+            return `Retry for ${taskId} was rejected at its current safe boundary.`;
+          }
+          throw error;
+        }
         return `Retried ${taskId}; state=${retried.state}.`;
       }
       const changed = this.supervisor.setTaskPaused(taskId, command === "pause");
@@ -480,6 +498,9 @@ export class OpsWorkerTelegramControl {
         && (task.control.interrupt.mode !== "cancel" || task.control.interrupt.reason !== reason)
         && !replayed
       ) return `Task ${taskId} already has a different pending interrupt.`;
+      if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
+        return `Task ${taskId} cannot record more steering.`;
+      }
       this.appendControlSteering(message, taskId, "cancel", reason);
       const changed = this.supervisor.requestOperatorInterrupt(taskId, "cancel", reason);
       return `Cancellation recorded for ${taskId}; state=${changed.state}.`;

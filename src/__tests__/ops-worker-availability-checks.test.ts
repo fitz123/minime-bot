@@ -326,7 +326,9 @@ describe("bounded loopback availability readers", () => {
 
     const queries: string[] = [];
     const responses = [
-      prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
+      prometheusMatrix([{
+        values: [{ at: Date.parse(NOW) / 1_000, value: "1" }],
+      }]),
       prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
       prometheusMatrix([{
         values: Array.from({ length: 21 }, (_, index) => ({
@@ -360,8 +362,9 @@ describe("bounded loopback availability readers", () => {
       OPS_AVAILABILITY_LIMITS.stabilityWindowMs,
     );
     assert.equal(queries.length, 3);
-    assert.equal(queries.filter((query) => query.includes("/api/v1/query?")).length, 2);
-    assert.equal(queries.filter((query) => query.includes("/api/v1/query_range?")).length, 1);
+    assert.equal(queries.filter((query) => query.includes("/api/v1/query?")).length, 3);
+    assert.equal(queries.filter((query) => query.includes("/api/v1/query_range?")).length, 0);
+    assert.equal(queries.some((query) => query.includes(encodeURIComponent("[315s]"))), true);
   });
 
   it("rejects remote endpoints and strict HTTP/JSON contract violations without retrying", async () => {

@@ -46,6 +46,7 @@ import type {
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
+  inspectOpsWorkerProcessGroup,
   OPS_WORKER_ATTEMPT_TOKEN_ENV,
   OPS_WORKER_NODE_OPTIONS,
   OPS_WORKER_PI_LIMITS,
@@ -936,6 +937,36 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
   });
 
+  it("prioritizes a cancel persisted while a parity-failed group is stopping", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("cancel-during-parity-stop");
+    harness.store.create(task);
+    harness.setScenario("parity-mismatch");
+    let requested = false;
+
+    const cancelled = await harness.runner({
+      dependencies: {
+        inspectProcessGroup: (processGroupId) => {
+          if (!requested) {
+            requested = true;
+            harness.supervisor.requestOperatorInterrupt(
+              task.id,
+              "cancel",
+              "Cancel persisted while parity cleanup stopped the proven group.",
+            );
+          }
+          return inspectOpsWorkerProcessGroup(processGroupId);
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(requested, true);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
+  });
+
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {
     const harness = await makeHarness(t, () => ({
       result: "PRODUCT_FAILURE",
@@ -1754,6 +1785,45 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
+  it("applies cancel interrupts while an owned quota probe is running", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("cancel-owned-quota-probe");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before operator cancellation.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-wait");
+    const running = harness.runner().runNext();
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    const active = harness.supervisor.getTask(task.id)?.activeRun;
+    assert.ok(active);
+
+    harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Cancel the proven owned quota probe.",
+    );
+    const cancelled = await running;
+
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled?.lastOutcome?.result, "CANCELLED");
+    assert.equal(cancelled?.custody.status, "RELEASED");
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
     let checkCalls = 0;
     let resolveFirstCheck: ((result: unknown) => void) | undefined;
@@ -2389,6 +2459,41 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
     assert.equal(cancelled.custody.status, "RELEASED");
     assert.equal(inspectOpsWorkerActiveRun(cancelRun).status, "GONE");
+  });
+
+  it("prioritizes a cancel persisted while a competing shutdown stop is in progress", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-cancel-during-shutdown-stop");
+    harness.store.create(task);
+    harness.setScenario("wait");
+    const controller = new AbortController();
+    let requested = false;
+    const running = harness.runner({
+      abortSignal: controller.signal,
+      dependencies: {
+        signalProcessGroup: (processGroupId, signal) => {
+          if (!requested) {
+            requested = true;
+            harness.supervisor.requestOperatorInterrupt(
+              task.id,
+              "cancel",
+              "Cancel persisted while shutdown was stopping the proven group.",
+            );
+          }
+          process.kill(-processGroupId, signal);
+        },
+      },
+    }).runAttempt(task.id);
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+
+    controller.abort();
+    const cancelled = await running;
+
+    assert.equal(requested, true);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
   });
 
   it("abandons child handles after ambiguous shutdown", async (t) => {

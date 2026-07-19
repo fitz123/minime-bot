@@ -236,6 +236,7 @@ export type OpsWorkerQuotaProbeResult =
   | { status: "SUCCESS" }
   | { status: "QUOTA"; snapshot: CodexQuotaSnapshot }
   | { status: "TELEMETRY_ERROR"; readStatus: OpsWorkerQuotaReadStatus }
+  | { status: "OPERATOR_INTERRUPT"; interrupt: OpsWorkerInterrupt }
   | { status: "INFRASTRUCTURE_ERROR"; summary: string };
 
 interface OpsWorkerPreparedAttemptLaunch {
@@ -860,19 +861,23 @@ export class OpsWorkerPiAttemptRunner {
       }
       await boundedExitWait(exitPromise, this.sleep);
       const current = this.requireTask(task.id);
-      return {
-        classification: "CRASH",
-        task: current.state === "RUNNING"
-          ? this.supervisor.recordResumableInfrastructureOutcome(
+      const resolved = current.state === "RUNNING"
+        ? this.supervisor.recordResumableInfrastructureOutcome(
             task.id,
             "CRASH",
             `Pi ownership was proven but RUNNING persistence failed: ${errorMessage(error)}`,
           )
-          : this.supervisor.recordResolvedPiLaunchFailure(
+        : this.supervisor.recordResolvedPiLaunchFailure(
             task.id,
             attemptId,
             `Pi RUNNING persistence failed after the owned group was proven stopped: ${errorMessage(error)}`,
-          ),
+          );
+      const pendingInterrupt = resolved.control.interrupt;
+      return {
+        classification: "CRASH",
+        task: pendingInterrupt === null
+          ? resolved
+          : this.supervisor.completeOperatorInterrupt(task.id, pendingInterrupt),
       };
     }
 
@@ -943,6 +948,8 @@ export class OpsWorkerPiAttemptRunner {
       }
       const exit = await boundedExitWait(exitPromise, this.sleep);
       if (exit === null) abandonDetachedChild(child);
+      const pendingInterrupt = this.completePendingOperatorInterrupt(task.id);
+      if (pendingInterrupt !== null) return pendingInterrupt;
       const summary = parity === null
         ? parityReadError === null
           ? "Pi did not produce a valid context/capability attestation before the bounded deadline"
@@ -982,6 +989,8 @@ export class OpsWorkerPiAttemptRunner {
         };
       }
       await boundedExitWait(exitPromise, this.sleep);
+      const pendingInterrupt = this.completePendingOperatorInterrupt(task.id);
+      if (pendingInterrupt !== null) return pendingInterrupt;
       return {
         classification: "CRASH",
         task: this.supervisor.recordResumableInfrastructureOutcome(
@@ -1105,15 +1114,11 @@ export class OpsWorkerPiAttemptRunner {
     const exit = await boundedExitWait(exitPromise, this.sleep);
     if (exit === null) abandonDetachedChild(child);
     const evidence = exit ? formatAttemptEvidence(exit) : undefined;
-    if (trigger.kind === "OPERATOR") {
-      return {
-        classification: "CRASH",
-        task: this.supervisor.completeOperatorInterrupt(
-          task.id,
-          trigger.interrupt,
-        ),
-      };
-    }
+    const pendingInterrupt = this.completePendingOperatorInterrupt(
+      task.id,
+      trigger.kind === "OPERATOR" ? trigger.interrupt : undefined,
+    );
+    if (pendingInterrupt !== null) return pendingInterrupt;
     if (trigger.kind === "SHUTDOWN") {
       return {
         classification: "CRASH",
@@ -1193,6 +1198,21 @@ export class OpsWorkerPiAttemptRunner {
     }
     const exit = await boundedExitWait(exitPromise, this.sleep);
     if (exit === null) abandonDetachedChild(child);
+    return {
+      classification: "CRASH",
+      task: this.supervisor.completeOperatorInterrupt(taskId, interrupt),
+    };
+  }
+
+  private completePendingOperatorInterrupt(
+    taskId: string,
+    fallback?: OpsWorkerInterrupt,
+  ): {
+      classification: OpsWorkerPiExitClassification;
+      task: OpsWorkerTask;
+    } | null {
+    const interrupt = this.supervisor.getTask(taskId)?.control.interrupt ?? fallback;
+    if (interrupt === undefined || interrupt === null) return null;
     return {
       classification: "CRASH",
       task: this.supervisor.completeOperatorInterrupt(taskId, interrupt),
@@ -1475,6 +1495,13 @@ export class OpsWorkerPiAttemptRunner {
         if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
       }
     }
+    const pendingInterrupt = this.supervisor.getTask(taskId)?.control.interrupt;
+    if (pendingInterrupt !== null && pendingInterrupt !== undefined) {
+      return this.supervisor.completeOperatorInterrupt(taskId, pendingInterrupt);
+    }
+    if (result.status === "OPERATOR_INTERRUPT") {
+      return this.supervisor.completeOperatorInterrupt(taskId, result.interrupt);
+    }
     if (result.status === "SUCCESS") {
       if (proofSubjectHash === undefined) {
         throw new Error("Exact quota smoke probe completed without a prepared proof subject");
@@ -1715,127 +1742,180 @@ export class OpsWorkerPiAttemptRunner {
           "Quota smoke probe stopped after RUNNING identity persistence failed",
         );
       }
+      const interrupt = this.supervisor.getTask(request.taskId)?.control.interrupt;
+      if (interrupt !== null && interrupt !== undefined) {
+        return { status: "OPERATOR_INTERRUPT", interrupt };
+      }
       return {
         status: "INFRASTRUCTURE_ERROR",
         summary: `Exact quota smoke probe identity persistence failed: ${errorMessage(error)}`,
       };
     }
-    const stopProbe = async (): Promise<OpsWorkerStartupRunResult> =>
-      stopOwnedProcessGroup(activeRun, {
-        inspect: this.inspectActiveRun,
-        inspectGroup: this.inspectProcessGroup,
-        signal: this.signalProcessGroup,
-        sleep: this.sleep,
-        termGraceMs: this.termGraceMs,
-        killGraceMs: this.killGraceMs,
-      });
-    const fenceAmbiguousProbe = (summary: string): never => {
-      abandonDetachedChild(child);
-      this.supervisor.blockAmbiguousActiveRun(request.taskId, summary);
-      throw new Error(summary);
-    };
-    let parity: OpsWorkerParityAttestationReport | null;
+    const operatorInterruptMonitor = createOperatorInterruptMonitor({
+      supervisor: this.supervisor,
+      taskId: request.taskId,
+      isExited: () => exited,
+    });
     try {
-      parity = await this.awaitParityReport(request.parityLaunch, () => exited);
-      if (parity?.status !== "PASS") {
+      const stopProbe = async (): Promise<OpsWorkerStartupRunResult> =>
+        stopOwnedProcessGroup(activeRun, {
+          inspect: this.inspectActiveRun,
+          inspectGroup: this.inspectProcessGroup,
+          signal: this.signalProcessGroup,
+          sleep: this.sleep,
+          termGraceMs: this.termGraceMs,
+          killGraceMs: this.killGraceMs,
+        });
+      const fenceAmbiguousProbe = (summary: string): never => {
+        abandonDetachedChild(child);
+        this.supervisor.blockAmbiguousActiveRun(request.taskId, summary);
+        throw new Error(summary);
+      };
+      const pendingOperatorResult = (
+        fallback?: OpsWorkerInterrupt,
+      ): Extract<OpsWorkerQuotaProbeResult, { status: "OPERATOR_INTERRUPT" }> | null => {
+        const interrupt = this.supervisor.getTask(request.taskId)?.control.interrupt ?? fallback;
+        return interrupt === undefined || interrupt === null
+          ? null
+          : { status: "OPERATOR_INTERRUPT", interrupt };
+      };
+      let parity: OpsWorkerParityAttestationReport | null;
+      try {
+        const parityTrigger = await Promise.race([
+          this.awaitParityReport(request.parityLaunch, () => exited).then((report) => ({
+            kind: "PARITY" as const,
+            report,
+          })),
+          operatorInterruptMonitor.promise,
+        ]);
+        if (parityTrigger.kind === "OPERATOR") {
+          const stopped = await stopProbe();
+          if (stopped.status === "AMBIGUOUS") {
+            fenceAmbiguousProbe(
+              stopped.summary ?? "Quota smoke probe operator interrupt left ambiguous ownership",
+            );
+          }
+          await boundedExitWait(exitPromise, this.sleep);
+          const pendingInterrupt = pendingOperatorResult(parityTrigger.interrupt);
+          if (pendingInterrupt === null) {
+            throw new Error("Quota smoke probe operator interrupt disappeared before completion");
+          }
+          return pendingInterrupt;
+        }
+        parity = parityTrigger.report;
+        if (parity?.status !== "PASS") {
+          const stopped = await stopProbe();
+          if (stopped.status === "AMBIGUOUS") {
+            fenceAmbiguousProbe(
+              stopped.summary ?? "Quota smoke probe parity failure left ambiguous ownership",
+            );
+          }
+          await boundedExitWait(exitPromise, this.sleep);
+          const pendingInterrupt = pendingOperatorResult();
+          if (pendingInterrupt !== null) return pendingInterrupt;
+          return {
+            status: "INFRASTRUCTURE_ERROR",
+            summary: parity === null
+              ? "Exact quota smoke probe did not attest context/capability parity"
+              : `Exact quota smoke probe parity failed: ${parity.mismatch.join(", ")}`,
+          };
+        }
+        acknowledgeOpsWorkerParityPass(request.parityLaunch);
+      } catch (error) {
+        if (this.requireTask(request.taskId).state === "BLOCKED") throw error;
         const stopped = await stopProbe();
         if (stopped.status === "AMBIGUOUS") {
           fenceAmbiguousProbe(
-            stopped.summary ?? "Quota smoke probe parity failure left ambiguous ownership",
+            stopped.summary ?? "Quota smoke probe parity acknowledgement left ambiguous ownership",
           );
         }
         await boundedExitWait(exitPromise, this.sleep);
+        const pendingInterrupt = pendingOperatorResult();
+        if (pendingInterrupt !== null) return pendingInterrupt;
         return {
           status: "INFRASTRUCTURE_ERROR",
-          summary: parity === null
-            ? "Exact quota smoke probe did not attest context/capability parity"
-            : `Exact quota smoke probe parity failed: ${parity.mismatch.join(", ")}`,
+          summary: `Exact quota smoke probe parity failed: ${errorMessage(error)}`,
         };
       }
-      acknowledgeOpsWorkerParityPass(request.parityLaunch);
-    } catch (error) {
-      if (this.requireTask(request.taskId).state === "BLOCKED") throw error;
-      const stopped = await stopProbe();
-      if (stopped.status === "AMBIGUOUS") {
-        fenceAmbiguousProbe(
-          stopped.summary ?? "Quota smoke probe parity acknowledgement left ambiguous ownership",
+      let timeout: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<{ kind: "TIMEOUT" }>((resolveTimeout) => {
+        timeout = setTimeout(
+          () => resolveTimeout({ kind: "TIMEOUT" }),
+          this.quotaProbeTimeoutMs,
         );
+      });
+      const shutdownTrigger = createAbortTrigger(this.abortSignal);
+      const trigger = await Promise.race([
+        exitPromise.then((exit) => ({ kind: "EXIT" as const, exit })),
+        timeoutPromise,
+        shutdownTrigger.promise,
+        operatorInterruptMonitor.promise,
+      ]);
+      if (timeout) clearTimeout(timeout);
+      shutdownTrigger.close();
+      if (trigger.kind !== "EXIT") {
+        const cleanup = await stopProbe();
+        if (cleanup.status === "AMBIGUOUS") {
+          fenceAmbiguousProbe(
+            cleanup.summary ?? "Quota smoke probe cleanup left ambiguous ownership",
+          );
+        }
+        await boundedExitWait(exitPromise, this.sleep);
+        const pendingInterrupt = pendingOperatorResult(
+          trigger.kind === "OPERATOR" ? trigger.interrupt : undefined,
+        );
+        if (pendingInterrupt !== null) return pendingInterrupt;
+        return {
+          status: "INFRASTRUCTURE_ERROR",
+          summary: trigger.kind === "SHUTDOWN"
+            ? "Exact quota smoke probe was interrupted by worker shutdown"
+            : "Exact quota smoke probe exceeded its bounded deadline",
+        };
       }
-      await boundedExitWait(exitPromise, this.sleep);
-      return {
-        status: "INFRASTRUCTURE_ERROR",
-        summary: `Exact quota smoke probe parity failed: ${errorMessage(error)}`,
-      };
-    }
-    let timeout: NodeJS.Timeout | undefined;
-    const timeoutPromise = new Promise<{ kind: "TIMEOUT" }>((resolveTimeout) => {
-      timeout = setTimeout(
-        () => resolveTimeout({ kind: "TIMEOUT" }),
-        this.quotaProbeTimeoutMs,
-      );
-    });
-    const shutdownTrigger = createAbortTrigger(this.abortSignal);
-    const trigger = await Promise.race([
-      exitPromise.then((exit) => ({ kind: "EXIT" as const, exit })),
-      timeoutPromise,
-      shutdownTrigger.promise,
-    ]);
-    if (timeout) clearTimeout(timeout);
-    shutdownTrigger.close();
-    if (trigger.kind !== "EXIT") {
+      const { exit } = trigger;
       const cleanup = await stopProbe();
       if (cleanup.status === "AMBIGUOUS") {
         fenceAmbiguousProbe(
-          cleanup.summary ?? "Quota smoke probe cleanup left ambiguous ownership",
+          cleanup.summary ?? "Quota smoke probe descendants could not be proven gone",
         );
       }
-      await boundedExitWait(exitPromise, this.sleep);
-      return {
-        status: "INFRASTRUCTURE_ERROR",
-        summary: trigger.kind === "SHUTDOWN"
-          ? "Exact quota smoke probe was interrupted by worker shutdown"
-          : "Exact quota smoke probe exceeded its bounded deadline",
-      };
-    }
-    const { exit } = trigger;
-    const cleanup = await stopProbe();
-    if (cleanup.status === "AMBIGUOUS") {
-      fenceAmbiguousProbe(
-        cleanup.summary ?? "Quota smoke probe descendants could not be proven gone",
-      );
-    }
-    const read = new CodexQuotaAttemptFileReader(request.attemptFile).read();
-    safeUnlink(request.attemptFile);
-    if (read.status !== "OK") {
-      return { status: "TELEMETRY_ERROR", readStatus: read.status };
-    }
-    const classification = classifyOpsWorkerPiExit(exit, {
-      responseStatus: read.responseStatus,
-    });
-    if (
-      read.responseStatus !== 429
-      && (read.responseStatus < 200 || read.responseStatus >= 300)
-    ) {
-      return {
-        status: "INFRASTRUCTURE_ERROR",
-        summary: `Exact quota smoke probe received provider HTTP ${read.responseStatus}`,
-      };
-    }
-    if (classification === "SUCCESS_CLAIM") {
-      return { status: "SUCCESS" };
-    }
-    if (classification === "QUOTA") {
-      if (read.snapshot === null) {
-        return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
+      const pendingInterrupt = pendingOperatorResult();
+      if (pendingInterrupt !== null) return pendingInterrupt;
+      const read = new CodexQuotaAttemptFileReader(request.attemptFile).read();
+      safeUnlink(request.attemptFile);
+      if (read.status !== "OK") {
+        return { status: "TELEMETRY_ERROR", readStatus: read.status };
       }
-      return { status: "QUOTA", snapshot: read.snapshot };
+      const classification = classifyOpsWorkerPiExit(exit, {
+        responseStatus: read.responseStatus,
+      });
+      if (
+        read.responseStatus !== 429
+        && (read.responseStatus < 200 || read.responseStatus >= 300)
+      ) {
+        return {
+          status: "INFRASTRUCTURE_ERROR",
+          summary: `Exact quota smoke probe received provider HTTP ${read.responseStatus}`,
+        };
+      }
+      if (classification === "SUCCESS_CLAIM") {
+        return { status: "SUCCESS" };
+      }
+      if (classification === "QUOTA") {
+        if (read.snapshot === null) {
+          return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
+        }
+        return { status: "QUOTA", snapshot: read.snapshot };
+      }
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: classification === "SESSION_CORRUPT"
+          ? "Exact quota smoke probe unexpectedly reported session corruption"
+          : `Exact quota smoke probe failed: ${infrastructureSummary(classification, exit)}`,
+      };
+    } finally {
+      operatorInterruptMonitor.close();
     }
-    return {
-      status: "INFRASTRUCTURE_ERROR",
-      summary: classification === "SESSION_CORRUPT"
-        ? "Exact quota smoke probe unexpectedly reported session corruption"
-        : `Exact quota smoke probe failed: ${infrastructureSummary(classification, exit)}`,
-    };
   }
 
   private prepareSessionDirectory(task: OpsWorkerTask): string {

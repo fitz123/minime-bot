@@ -14,7 +14,6 @@ import type {
 } from "./authorization.js";
 import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
 import {
-  hashOpsWorkerCanonicalSubmission,
   isOpsWorkerRegisteredName,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
@@ -186,9 +185,6 @@ function createAlertmanagerAuthorizationVerifier(
     identity: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
     version: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
     async verify(task: Readonly<OpsWorkerTask>): Promise<OpsWorkerAuthorizationVerifierResult> {
-      if (task.submissionFingerprint !== hashOpsWorkerCanonicalSubmission(task)) {
-        return result("INVALID_CLAIM", "submission-fingerprint-mismatch", task);
-      }
       const claimed = claimedSnapshot(task);
       if (claimed === null) {
         return result("INVALID_CLAIM", "closed-task-claim-mismatch", task);

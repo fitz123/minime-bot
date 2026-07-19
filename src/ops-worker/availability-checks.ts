@@ -746,17 +746,17 @@ export class OpsPrometheusHttpReader implements
     return parsePrometheusVector(await readBoundedJson(response));
   }
 
-  private async queryStabilityRange(
+  private async queryRawRange(
+    rangeMs: number,
     observedAt: string,
     signal: AbortSignal,
   ): Promise<PrometheusMatrixEntry[]> {
-    const end = Date.parse(observedAt) / 1_000;
-    const start = end - OPS_AVAILABILITY_LIMITS.stabilityWindowMs / 1_000;
-    const url = new URL("api/v1/query_range", this.baseUrl);
-    url.searchParams.set("query", PROMETHEUS_UP_QUERY);
-    url.searchParams.set("start", String(start));
-    url.searchParams.set("end", String(end));
-    url.searchParams.set("step", String(OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds));
+    const url = new URL("api/v1/query", this.baseUrl);
+    url.searchParams.set(
+      "query",
+      `${PROMETHEUS_UP_QUERY}[${Math.ceil(rangeMs / 1_000)}s]`,
+    );
+    url.searchParams.set("time", String(Date.parse(observedAt) / 1_000));
     const response = await this.fetch(url, {
       method: "GET",
       headers: { accept: "application/json" },
@@ -771,8 +771,13 @@ export class OpsPrometheusHttpReader implements
     context: OpsAvailabilityReaderContext,
   ): Promise<OpsMonitoringFreshnessReading> {
     assertInvariant(invariant);
-    const samples = await this.queryVector(PROMETHEUS_UP_QUERY, context.signal);
     const observedAt = new Date().toISOString();
+    const series = await this.queryRawRange(
+      OPS_AVAILABILITY_LIMITS.monitoringFreshnessMs,
+      observedAt,
+      context.signal,
+    );
+    const samples = series.flatMap((entry) => entry.samples);
     return {
       observedAt,
       latestSampleAt: samples.length === 0
@@ -799,24 +804,50 @@ export class OpsPrometheusHttpReader implements
     if (direct.some((sample) => sample.value === 0)) {
       return { observedAt, status: "UNHEALTHY", healthySince: null };
     }
-    const stable = await this.queryStabilityRange(observedAt, context.signal);
+    const stepMs = OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds * 1_000;
+    const stable = await this.queryRawRange(
+      OPS_AVAILABILITY_LIMITS.stabilityWindowMs + stepMs,
+      observedAt,
+      context.signal,
+    );
     if (stable.some((series) => series.samples.some(
       (sample) => sample.value !== 0 && sample.value !== 1,
     ))) {
       throw new Error("Prometheus stability result is outside the closed contract");
     }
-    const stepMs = OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds * 1_000;
     const windowStart = Date.parse(observedAt) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs;
-    const expectedSamples = OPS_AVAILABILITY_LIMITS.stabilityWindowMs / stepMs + 1;
     const stableBySeries = new Map(stable.map((series) => [series.seriesId, series]));
     const coversWindow = stable.length === direct.length
       && stable.length > 0
       && direct.every((sample) => {
         const series = stableBySeries.get(sample.seriesId);
-        if (!series || series.samples.length !== expectedSamples) return false;
-        return series.samples.every((entry, index) =>
+        if (!series || series.samples.length === 0) return false;
+        const samples = [...series.samples].sort(
+          (left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt),
+        );
+        const anchor = samples.filter((entry) =>
+          Date.parse(entry.observedAt) <= windowStart).at(-1);
+        const windowSamples = samples.filter((entry) =>
+          Date.parse(entry.observedAt) >= windowStart
+          && Date.parse(entry.observedAt) <= Date.parse(observedAt));
+        if (
+          !anchor
+          || windowStart - Date.parse(anchor.observedAt) > stepMs
+          || windowSamples.length === 0
+        ) return false;
+        const proofSamples = [
+          anchor,
+          ...windowSamples.filter((entry) => entry.observedAt !== anchor.observedAt),
+        ];
+        return proofSamples.every((entry, index) =>
           entry.value === 1
-          && Date.parse(entry.observedAt) === windowStart + index * stepMs);
+          && (
+            index === 0
+            || Date.parse(entry.observedAt)
+              - Date.parse(proofSamples[index - 1].observedAt) <= stepMs
+          ))
+          && Date.parse(proofSamples.at(-1)?.observedAt ?? "")
+            >= Date.parse(observedAt) - stepMs;
       });
     return {
       observedAt,

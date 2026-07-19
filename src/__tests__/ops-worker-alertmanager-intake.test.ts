@@ -299,6 +299,12 @@ describe("Alertmanager conversion and task-store submission", () => {
       () => intake.submit(body(webhook({ groupLabels: undefined })), CONTENT_TYPE),
       "INVALID_PAYLOAD",
     );
+    expectIntakeError(
+      () => intake.submit(body(webhook({
+        groupLabels: { alertname: "DifferentAlertGroup" },
+      })), CONTENT_TYPE),
+      "INVALID_PAYLOAD",
+    );
     const activeReuse = intake.submit(body(webhook({
       alerts: [{
         ...alert(),

@@ -28,6 +28,7 @@ import {
   hashOpsWorkerCanonicalPayload,
   OpsWorkerLifecycle,
 } from "./lifecycle.js";
+import { appendOpsWorkerEvidence } from "./evidence.js";
 import {
   DEFAULT_OPS_WORKER_QUOTA_STALE_MS,
   DEFAULT_OPS_WORKER_QUOTA_RECHECK_MS,
@@ -516,33 +517,6 @@ function assertStructuralStateTransition(
       `Illegal ops-worker transition ${from} -> ${to}`,
     );
   }
-}
-
-function appendEvidence(
-  task: OpsWorkerTask,
-  evidence: OpsWorkerEvidence,
-): void {
-  const entries = [...task.evidence, evidence];
-  while (entries.length > OPS_WORKER_LIMITS.maxEvidenceEntries) {
-    const evictable = entries.findIndex((entry) => {
-      if (task.source.kind !== "alertmanager" || entry.kind !== "alert") return true;
-      try {
-        const value = JSON.parse(entry.summary) as unknown;
-        return !(
-          typeof value === "object"
-          && value !== null
-          && !Array.isArray(value)
-          && (value as { type?: unknown }).type === "alertmanager-group-correlation-v1"
-          && (value as { correlationKey?: unknown }).correlationKey
-            === task.source.correlationKey
-        );
-      } catch {
-        return true;
-      }
-    });
-    entries.splice(evictable < 0 ? 0 : evictable, 1);
-  }
-  task.evidence = entries;
 }
 
 function hasPendingPromptSteering(task: OpsWorkerTask): boolean {
@@ -1545,7 +1519,7 @@ export class OpsWorkerSupervisor {
         }
         const at = this.nextUpdatedAt(task);
         task.updatedAt = at;
-        appendEvidence(task, {
+        appendOpsWorkerEvidence(task, {
           at,
           kind: "system",
           trust: "trusted",
@@ -1617,7 +1591,7 @@ export class OpsWorkerSupervisor {
         summary,
       };
       if (evidenceSummary) {
-        appendEvidence(replacement, this.piEvidence(at, evidenceSummary));
+        appendOpsWorkerEvidence(replacement, this.piEvidence(at, evidenceSummary));
       }
     }, target === "CHECKING"
       ? "Pi claim queued deterministic done check"
@@ -1735,7 +1709,7 @@ export class OpsWorkerSupervisor {
               OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
             ),
           };
-          if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+          if (evidenceSummary) appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
         },
       );
     }
@@ -1757,7 +1731,7 @@ export class OpsWorkerSupervisor {
               OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
             ),
           };
-          if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+          if (evidenceSummary) appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
         },
       ).task;
     }
@@ -1776,7 +1750,7 @@ export class OpsWorkerSupervisor {
           OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
         ),
       };
-      if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      if (evidenceSummary) appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
     }, "Recorded authoritative quota reset wait");
   }
 
@@ -1971,7 +1945,7 @@ export class OpsWorkerSupervisor {
         result: "QUOTA_TELEMETRY_ERROR",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
-      if (evidenceSummary) appendEvidence(task, this.piEvidence(at, evidenceSummary));
+      if (evidenceSummary) appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
     }, "Recorded quota response telemetry error without inventing a reset");
   }
 
@@ -2001,7 +1975,7 @@ export class OpsWorkerSupervisor {
         summary,
       };
       if (evidenceSummary) {
-        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
       }
     }, `Recorded resumable infrastructure outcome ${result}`);
   }
@@ -2114,7 +2088,7 @@ export class OpsWorkerSupervisor {
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
       if (evidenceSummary) {
-        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
       }
     }, target === "CHECKING"
       ? "Resolved short-lived Pi success claim and queued deterministic done check"
@@ -2155,7 +2129,7 @@ export class OpsWorkerSupervisor {
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
       if (evidenceSummary) {
-        appendEvidence(task, this.piEvidence(at, evidenceSummary));
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
       }
     }, `Recorded resolved short-lived Pi outcome ${result}`);
   }
@@ -2244,7 +2218,7 @@ export class OpsWorkerSupervisor {
         result: "CRASH",
         summary: boundedSummary,
       };
-      appendEvidence(task, {
+      appendOpsWorkerEvidence(task, {
         at,
         kind: "system",
         trust: "trusted",
@@ -2387,7 +2361,7 @@ export class OpsWorkerSupervisor {
             result: "ERROR",
             summary: "Composite verification was interrupted by worker shutdown (ABORTED)",
           };
-          appendEvidence(current, {
+          appendOpsWorkerEvidence(current, {
             at,
             kind: "infrastructure",
             trust: "trusted",
@@ -2828,7 +2802,7 @@ export class OpsWorkerSupervisor {
         this.resetAfterCheck(task);
         persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(at, "PASS", result.summary);
-        appendEvidence(task, this.checkEvidence(at, result.summary));
+        appendOpsWorkerEvidence(task, this.checkEvidence(at, result.summary));
         task.report.state = "PENDING";
         task.report.lastError = null;
       }, "Fresh deterministic done check passed", {
@@ -2845,7 +2819,7 @@ export class OpsWorkerSupervisor {
         task.schedule.nextCheckAt = result.nextCheckAt;
         persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(at, "DEFER", result.summary);
-        appendEvidence(task, this.checkEvidence(at, result.summary));
+        appendOpsWorkerEvidence(task, this.checkEvidence(at, result.summary));
       }, "Done check deferred without spending remediation budget", {
         expectedBaseline,
         notBefore: result.checkedAt,
@@ -2859,7 +2833,7 @@ export class OpsWorkerSupervisor {
         task.schedule.nextCheckAt = result.nextCheckAt;
         persistVerification(task, at);
         task.lastOutcome = this.checkOutcome(at, "NOT_READY", result.summary);
-        appendEvidence(task, this.checkEvidence(at, result.summary));
+        appendOpsWorkerEvidence(task, this.checkEvidence(at, result.summary));
       }, "Done check is waiting for product stability without remediation", {
         expectedBaseline,
         notBefore: result.checkedAt,
@@ -2887,7 +2861,7 @@ export class OpsWorkerSupervisor {
           result: result.result,
           summary: result.summary,
         };
-        appendEvidence(task, {
+        appendOpsWorkerEvidence(task, {
           at,
           kind: "infrastructure",
           trust: "trusted",
@@ -2923,7 +2897,7 @@ export class OpsWorkerSupervisor {
           remediationResult,
           result.summary,
         );
-        appendEvidence(task, this.checkEvidence(at, result.summary));
+        appendOpsWorkerEvidence(task, this.checkEvidence(at, result.summary));
         if (task.rounds.remediation >= task.rounds.maxRemediation) {
           task.report.state = "PENDING";
           task.report.lastError = null;

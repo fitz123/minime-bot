@@ -30,6 +30,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  OPS_WORKER_LIMITS,
   withOpsWorkerSubmissionFingerprint,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
@@ -285,6 +286,66 @@ describe("ops worker dedicated Telegram control", () => {
       [undefined, 12, 12, 13],
     );
     assert.deepEqual(transport.getUpdatesBodies[0].allowed_updates, ["message"]);
+  });
+
+  it("acknowledges bounded command rejections instead of replaying poison updates", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const ambiguous = makeTask("task-ambiguous-retry");
+    ambiguous.state = "BLOCKED";
+    ambiguous.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    ambiguous.activeRun = {
+      attemptId: "ambiguous-attempt",
+      supervisorInstanceId: "prior-supervisor",
+      pid: 321,
+      processGroupId: 321,
+      processStartedAt: NOW,
+      processStartToken: "prior-process-start",
+    };
+    ambiguous.lastOutcome = {
+      at: NOW,
+      kind: "RECONCILIATION",
+      result: "AMBIGUOUS_ORPHAN",
+      summary: "Fixture prior process group remains ambiguous.",
+    };
+    ambiguous.report.state = "PENDING";
+    fixture.store.create(ambiguous);
+
+    const full = makeTask("task-full-steering");
+    full.steering = Array.from({ length: OPS_WORKER_LIMITS.maxSteeringEntries }, (_, index) => ({
+      steeringId: `fixture:steering:${index}`,
+      receivedAt: NOW,
+      kind: "answer" as const,
+      operatorRef: "fixture:operator",
+      text: `Bounded steering ${index}`,
+      consumedAt: null,
+    }));
+    fixture.store.create(full);
+
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(70, "/retry task-ambiguous-retry"),
+      update(71, "/answer task-full-steering one more entry"),
+    ]);
+
+    await control(fixture, transport).tick();
+
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 71);
+    assert.equal(fixture.store.get(ambiguous.id)?.state, "BLOCKED");
+    assert.equal(fixture.store.get(ambiguous.id)?.steering.length, 1);
+    assert.equal(
+      fixture.store.get(full.id)?.steering.length,
+      OPS_WORKER_LIMITS.maxSteeringEntries,
+    );
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("rejected at its current safe boundary")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("cannot record more steering")), true);
   });
 
   it("recovers a crash after the task effect without acknowledging or duplicating it", async (t) => {

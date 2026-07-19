@@ -1963,6 +1963,58 @@ describe("ops worker supervisor", () => {
     assert.equal(result.evidence.some((entry) => entry.summary === "Alert evidence 0"), false);
   });
 
+  it("retains Alertmanager correlation through authorization-failure evidence rotation", async (t) => {
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: {
+        alertmanager: {
+          identity: "fixture-alertmanager-authorization",
+          version: "1",
+          verify: () => ({
+            status: "QUERY_ERROR",
+            evidenceHash: `sha256:${"d".repeat(64)}`,
+            summary: "Synthetic transient authorization query failure.",
+          }),
+        },
+      },
+    });
+    const correlationKey = "fixture:authorization-correlation";
+    const task = makeTask("task-authorization-correlation", {
+      sourceKind: "alertmanager",
+      correlationKey,
+    });
+    task.evidence = [
+      {
+        at: NOW,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey,
+          groupLabels: { alertname: "MinimeBotUnavailable" },
+        }),
+        artifact: null,
+      },
+      ...Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries - 1 }, (_, index) => ({
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: `Authorization alert evidence ${index}`,
+        artifact: null,
+      })),
+    ];
+    harness.store.create(task);
+
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+
+    const failed = harness.store.get(task.id);
+    assert.equal(failed?.authorizationVerification?.status, "QUERY_ERROR");
+    assert.equal(failed?.evidence.length, OPS_WORKER_LIMITS.maxEvidenceEntries);
+    assert.equal(failed?.evidence.some((entry) =>
+      entry.summary.includes("alertmanager-group-correlation-v1")), true);
+    assert.equal(failed?.evidence.some((entry) =>
+      entry.summary === "Authorization alert evidence 0"), false);
+  });
+
   it("enforces one supervisor instance and at most one active process group", async (t) => {
     const harness = await makeHarness(t);
     const secondStore = new OpsWorkerTaskStore(harness.directory, {

@@ -356,9 +356,10 @@ passive/product convergence retain their existing distinct outcomes. The
 exported Alertmanager and Prometheus HTTP readers accept only explicit loopback
 base URLs and injected fetch implementations. They perform one bounded query,
 without retries or import-time construction. One composite evaluation makes one
-Prometheus instant query for freshness, one Alertmanager active-alert query, and
-one Prometheus instant query for direct service state. When every direct series
-is healthy, it makes one additional five-minute Prometheus range query. The
+Prometheus raw range-vector query for freshness, one Alertmanager active-alert
+query, and one Prometheus instant query for direct service state. When every
+direct series is healthy, it makes one additional raw range-vector query
+covering the five-minute window plus one fixed scrape step. The
 Alertmanager query includes active suppressed alerts and filters the response by
 the exact group labels stored with the task's correlation evidence; unrelated
 active groups cannot hold the task open. For a trusted `operator-cli`
