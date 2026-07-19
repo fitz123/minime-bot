@@ -120,6 +120,13 @@ describe("ops worker Codex quota admission", () => {
     })), { now: NOW, staleMs: 30 * 60_000 });
     assert.equal(stale.reason, "STALE");
 
+    const resetElapsed = evaluateOpsWorkerQuotaAdmission(readOk(snapshot({
+      sampledAt: "2026-07-18T11:59:00.000Z",
+      fiveHour: { used: 20, resetAt: "2026-07-18T12:00:00.000Z" },
+      week: null,
+    })), { now: NOW, staleMs: 30 * 60_000 });
+    assert.equal(resetElapsed.reason, "STALE");
+
     const resetlessSnapshot = snapshot({ week: null });
     delete resetlessSnapshot.windows["5h"].resetAt;
     delete resetlessSnapshot.windows["5h"].resetTimestamp;

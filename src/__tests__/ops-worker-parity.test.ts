@@ -802,9 +802,9 @@ describe("ops-worker before-provider parity attestation", () => {
 
     await wrapper({ registerCommand: (name: string) => commands.push(name) });
 
-    assert.ok(commands.includes("pi-ai-root"));
+    assert.ok(commands.includes("pi-ai-compat"));
     assert.ok(commands.includes("yaml-package-owned"));
-    assert.equal(commands.includes("pi-ai-compat"), false);
+    assert.equal(commands.includes("pi-ai-root"), false);
     assert.equal(commands.includes("yaml-extension-local"), false);
   });
 

@@ -760,7 +760,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: {
         runQuotaProbe: async (value) => {
           request = value;
-          return { status: "SUCCESS", snapshot: sampled };
+          return { status: "SUCCESS" };
         },
       },
     });
@@ -848,7 +848,6 @@ describe("ops worker Pi standard-session attempts", () => {
     const successfulProbe = {
       runQuotaProbe: async () => ({
         status: "SUCCESS" as const,
-        snapshot: quotaSnapshot(),
       }),
     };
 
@@ -1223,7 +1222,36 @@ describe("ops worker Pi standard-session attempts", () => {
       false,
     );
 
-    harness.supervisor.cancelTask(task.id, "Exercise a typed quota probe response");
+    harness.supervisor.cancelTask(task.id, "Exercise a successful probe without quota headers");
+    const headerlessSuccess = makeTask("bounded-quota-probe-child-headerless-success");
+    headerlessSuccess.state = "RESUMABLE";
+    headerlessSuccess.custody = {
+      status: "HELD",
+      claimedAt: headerlessSuccess.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    headerlessSuccess.lastOutcome = {
+      at: headerlessSuccess.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a headerless successful probe.",
+    };
+    harness.store.create(headerlessSuccess);
+    harness.setScenario("quota-probe-success-no-quota-headers");
+
+    const headerless = await harness.runner().runNext();
+    assert.equal(headerless?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(headerless?.custody.status, "HELD");
+    assert.match(
+      headerless?.lastOutcome?.quotaProbeProof?.subjectHash ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+
+    harness.supervisor.cancelTask(
+      headerlessSuccess.id,
+      "Exercise a typed quota probe response",
+    );
     const quotaAgain = makeTask("bounded-quota-probe-child-quota");
     quotaAgain.state = "RESUMABLE";
     quotaAgain.custody = {
@@ -1269,6 +1297,104 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(rejected?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
     assert.match(rejected?.lastOutcome?.summary ?? "", /provider HTTP 503/);
     assert.equal(rejected?.lastOutcome?.quotaProbeProof, undefined);
+  });
+
+  it("releases the quota-probe launch slot when parity snapshot cleanup fails", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("quota-probe-cleanup-failure");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a cleanup failure.",
+    };
+    harness.store.create(task);
+
+    await assert.rejects(
+      harness.runner({
+        dependencies: {
+          runQuotaProbe: async (request) => {
+            const snapshotRoot = request.parityLaunch.snapshotRoots[0];
+            rmSync(snapshotRoot, { recursive: true, force: true });
+            writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
+            return { status: "SUCCESS" };
+          },
+        },
+      }).runNext(),
+      /Refusing to remove a non-directory ops-worker parity snapshot/,
+    );
+
+    harness.supervisor.cancelTask(task.id, "Release custody after the cleanup failure");
+    const successor = makeTask("quota-probe-cleanup-successor");
+    successor.state = "RESUMABLE";
+    successor.custody = {
+      status: "HELD",
+      claimedAt: successor.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    successor.lastOutcome = {
+      at: successor.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic successor quota wait.",
+    };
+    harness.store.create(successor);
+
+    const result = await harness.runner({
+      dependencies: { runQuotaProbe: async () => ({ status: "SUCCESS" }) },
+    }).runNext();
+    assert.equal(result?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+  });
+
+  it("releases the attempt launch slot when parity snapshot cleanup fails", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("attempt-cleanup-failure");
+    harness.store.create(task);
+    let corruptedSnapshot = false;
+
+    await assert.rejects(
+      harness.runner({
+        dependencies: {
+          spawnProcess: (command, args, options) => {
+            const child = spawn(command, args, options);
+            harness.children.push(child);
+            child.once("exit", () => {
+              const sessionDirectory = join(
+                harness.supervisor.stateDirectory,
+                "sessions",
+                task.id,
+              );
+              const snapshotName = readdirSync(sessionDirectory).find((name) =>
+                /^parity-extension-[0-9]+-snapshot-/.test(name));
+              if (snapshotName === undefined) return;
+              const snapshotRoot = join(sessionDirectory, snapshotName);
+              rmSync(snapshotRoot, { recursive: true, force: true });
+              writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
+              corruptedSnapshot = true;
+            });
+            return child;
+          },
+        },
+      }).runAttempt(task.id),
+      /Refusing to remove a non-directory ops-worker parity snapshot/,
+    );
+    assert.equal(corruptedSnapshot, true);
+    assert.equal(harness.store.get(task.id)?.state, "CHECKING");
+    harness.supervisor.cancelTask(task.id, "Release custody after the cleanup failure");
+
+    const successor = makeTask("attempt-cleanup-successor");
+    harness.store.create(successor);
+    const result = await harness.runner().runAttempt(successor.id);
+    assert.equal(result.state, "DONE");
   });
 
   it("durably fences and safely stops an owned quota probe process group", async (t) => {

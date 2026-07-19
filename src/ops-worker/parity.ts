@@ -43,7 +43,6 @@ const PI_EXTENSION_JITI_ALIASES = (() => {
   const piCodingAgent = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
   const piAgentCore = fileURLToPath(import.meta.resolve("@earendil-works/pi-agent-core"));
   const piTui = fileURLToPath(import.meta.resolve("@earendil-works/pi-tui"));
-  const piAi = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
   const piAiCompat = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/compat"));
   const piAiOauth = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/oauth"));
   const typebox = fileURLToPath(import.meta.resolve("typebox"));
@@ -55,7 +54,7 @@ const PI_EXTENSION_JITI_ALIASES = (() => {
     "@earendil-works/pi-coding-agent": piCodingAgent,
     "@earendil-works/pi-agent-core": piAgentCore,
     "@earendil-works/pi-tui": piTui,
-    "@earendil-works/pi-ai": piAi,
+    "@earendil-works/pi-ai": piAiCompat,
     "@earendil-works/pi-ai/compat": piAiCompat,
     "@earendil-works/pi-ai/oauth": piAiOauth,
     "@mariozechner/pi-coding-agent": piCodingAgent,

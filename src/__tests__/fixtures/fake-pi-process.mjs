@@ -247,6 +247,10 @@ switch (scenario) {
     });
     process.stdout.write("OK\n");
     break;
+  case "quota-probe-success-no-quota-headers":
+    await emitProviderResponse(200, {});
+    process.stdout.write("OK\n");
+    break;
   case "quota-probe-quota":
     await emitProviderResponse(429, {
       "x-codex-primary-used-percent": "100",

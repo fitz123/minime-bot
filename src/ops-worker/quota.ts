@@ -268,6 +268,9 @@ export function evaluateOpsWorkerQuotaAdmission(
     if (resetMs <= sampledAtMs || sampledAtMs < startMs) {
       return closedSnapshotDecision("CONTRADICTORY", snapshot, now, activeWindows);
     }
+    if (resetMs <= now.getTime()) {
+      return closedSnapshotDecision("STALE", snapshot, now, activeWindows);
+    }
     if (window.remainingPercent < OPS_WORKER_QUOTA_MIN_REMAINING_PERCENT) {
       blockers.push({
         reason: "LOW_REMAINING",

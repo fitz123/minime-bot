@@ -226,7 +226,7 @@ export interface OpsWorkerQuotaProbeRequest {
 }
 
 export type OpsWorkerQuotaProbeResult =
-  | { status: "SUCCESS"; snapshot: CodexQuotaSnapshot }
+  | { status: "SUCCESS" }
   | { status: "QUOTA"; snapshot: CodexQuotaSnapshot }
   | { status: "TELEMETRY_ERROR"; readStatus: OpsWorkerQuotaReadStatus }
   | { status: "INFRASTRUCTURE_ERROR"; summary: string };
@@ -584,13 +584,16 @@ export class OpsWorkerPiAttemptRunner {
       }
       throw error;
     } finally {
-      if (preparedLaunch) {
-        const currentTask = this.supervisor.getTask(taskId);
-        if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
-          cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
+      try {
+        if (preparedLaunch) {
+          const currentTask = this.supervisor.getTask(taskId);
+          if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+            cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
+          }
         }
+      } finally {
+        this.supervisor.releasePiProcessGroupLaunch(taskId);
       }
-      this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
   }
 
@@ -1349,13 +1352,16 @@ export class OpsWorkerPiAttemptRunner {
         `Exact quota smoke probe failed: ${errorMessage(error)}`,
       );
     } finally {
-      if (parityLaunch) {
-        const currentTask = this.supervisor.getTask(taskId);
-        if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
-          cleanupOpsWorkerParityLaunch(parityLaunch);
+      try {
+        if (parityLaunch) {
+          const currentTask = this.supervisor.getTask(taskId);
+          if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+            cleanupOpsWorkerParityLaunch(parityLaunch);
+          }
         }
+      } finally {
+        if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
       }
-      if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
     if (result.status === "SUCCESS") {
       if (proofSubjectHash === undefined) {
@@ -1693,9 +1699,6 @@ export class OpsWorkerPiAttemptRunner {
     const classification = classifyOpsWorkerPiExit(exit, {
       responseStatus: read.responseStatus,
     });
-    if (read.snapshot === null) {
-      return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
-    }
     if (
       read.responseStatus !== 429
       && (read.responseStatus < 200 || read.responseStatus >= 300)
@@ -1706,9 +1709,12 @@ export class OpsWorkerPiAttemptRunner {
       };
     }
     if (classification === "SUCCESS_CLAIM") {
-      return { status: "SUCCESS", snapshot: read.snapshot };
+      return { status: "SUCCESS" };
     }
     if (classification === "QUOTA") {
+      if (read.snapshot === null) {
+        return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
+      }
       return { status: "QUOTA", snapshot: read.snapshot };
     }
     return {
