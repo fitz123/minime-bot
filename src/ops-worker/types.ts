@@ -918,9 +918,13 @@ function expectOptionalTimestamp(value: unknown, path: string): string | null {
   return value === null ? null : expectTimestamp(value, path);
 }
 
+export function isOpsWorkerRegisteredName(value: unknown): value is string {
+  return typeof value === "string" && REGISTERED_NAME_PATTERN.test(value);
+}
+
 function expectRegisteredName(value: unknown, path: string): string {
   const name = expectString(value, path);
-  if (!REGISTERED_NAME_PATTERN.test(name)) {
+  if (!isOpsWorkerRegisteredName(name)) {
     return fail(path, "must be a lowercase registered name");
   }
   return name;

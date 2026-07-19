@@ -1030,6 +1030,28 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(`${result.stdout}${result.stderr}`.includes(privateSummary), false);
   });
 
+  it("rejects authorization verifier metadata that cannot be persisted", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const result = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--json",
+    ], fixture.root, dependencies(contracts, {
+      authorizationVerifiers: {
+        "operator-cli": {
+          ...fixtureAuthorizationVerifier,
+          identity: "GitHub:authorization/v1",
+        },
+      },
+    }));
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /authorization verifier identity is not a registered name/);
+  });
+
   it("serves loopback health/status only and exposes no HTTP task intake", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();
@@ -1081,12 +1103,21 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(statusValue.totalTasks, 0);
     assert.equal(statusValue.custodyOwner, null);
     const policy = statusValue.policy as Record<string, Record<string, unknown>>;
+    assert.deepEqual(policy.authorization.configuredSources, ["operator-cli"]);
+    assert.equal(policy.authorization.verifierCount, 1);
+    assert.match(String(policy.authorization.contractsHash), /^sha256:[a-f0-9]{64}$/);
+    assert.equal(policy.verification.verifierCount, 1);
+    assert.match(String(policy.verification.contractsHash), /^sha256:[a-f0-9]{64}$/);
     assert.equal(policy.quota.status, "ADMITTED");
     assert.equal(Object.hasOwn(policy.quota, "summary"), false);
     assert.equal(policy.parity.resourcesDigest, CLI_PRIMARY_RESOURCES.digest);
+    const serializedStatus = JSON.stringify(statusValue);
+    assert.equal(serializedStatus.includes(fixtureAuthorizationVerifier.identity), false);
+    assert.equal(serializedStatus.includes("ops-worker-registry"), false);
+    assert.equal(serializedStatus.includes("fixture-check"), false);
     assert.ok(!Object.hasOwn(statusValue, "evidence"));
-    assert.equal(JSON.stringify(statusValue).includes(CLI_PRIMARY_CONTEXT_AGENT.workspaceCwd), false);
-    assert.equal(JSON.stringify(statusValue).includes(CLI_PRIMARY_CONTEXT_AGENT.systemPrompt), false);
+    assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.workspaceCwd), false);
+    assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.systemPrompt), false);
 
     const intake = await fetch(`${base}/submit`, {
       method: "POST",

@@ -17,6 +17,12 @@ import type {
   SlashCommandInfo,
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
+import {
+  assertOpsWorkerParityContractRepresentable,
+  OPS_WORKER_PARITY_MAX_CONTRACT_BYTES,
+  OPS_WORKER_PARITY_MAX_IDENTITIES,
+  OPS_WORKER_PARITY_MAX_TOOL_NAMES,
+} from "../pi-parity-contract-limits.js";
 import { piResourceIdentity } from "../pi-primary-resources.js";
 
 export const OPS_WORKER_PARITY_PROTOCOL_VERSION = 1 as const;
@@ -28,9 +34,6 @@ export const OPS_WORKER_EXTENSION_MARKER_PREFIX = "minime-ops-extension-";
 export const OPS_WORKER_PARITY_FAILURE_EXIT_CODE = 78;
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
-const MAX_CONTRACT_BYTES = 32 * 1024;
-const MAX_IDENTITIES = 128;
-const MAX_TOOL_NAMES = 128;
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export interface OpsWorkerExpectedParityContract {
@@ -125,7 +128,7 @@ function requireSha256(value: unknown, path: string): string {
 }
 
 function requireDigestList(value: unknown, path: string): string[] {
-  if (!Array.isArray(value) || value.length > MAX_IDENTITIES) {
+  if (!Array.isArray(value) || value.length > OPS_WORKER_PARITY_MAX_IDENTITIES) {
     throw new TypeError(`${path} must be a bounded digest array`);
   }
   const result = value.map((entry, index) => requireSha256(entry, `${path}[${index}]`));
@@ -136,7 +139,7 @@ function requireDigestList(value: unknown, path: string): string[] {
 }
 
 function requireToolNames(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length > MAX_TOOL_NAMES) {
+  if (!Array.isArray(value) || value.length > OPS_WORKER_PARITY_MAX_TOOL_NAMES) {
     throw new TypeError("parity.toolNames must be a bounded array");
   }
   const result = value.map((entry, index) => {
@@ -221,6 +224,7 @@ export function createExpectedOpsWorkerParityContract(input: {
   skillIdentities: readonly string[];
   toolNames: readonly string[];
 }): OpsWorkerExpectedParityContract {
+  assertOpsWorkerParityContractRepresentable(input);
   const extensionIdentities = [...input.extensionIdentities].sort();
   const skillIdentities = [...input.skillIdentities].sort();
   const toolNames = [...input.toolNames].sort();
@@ -460,7 +464,11 @@ function assertPrivateRegularPath(path: string, label: string): void {
 export function readExpectedOpsWorkerParityContract(path: string): OpsWorkerExpectedParityContract {
   assertPrivateRegularPath(path, "parity expected path");
   const direct = lstatSync(path);
-  if (!direct.isFile() || direct.isSymbolicLink() || direct.size > MAX_CONTRACT_BYTES) {
+  if (
+    !direct.isFile()
+    || direct.isSymbolicLink()
+    || direct.size > OPS_WORKER_PARITY_MAX_CONTRACT_BYTES
+  ) {
     throw new TypeError("parity expected file must be a bounded regular file");
   }
   const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));

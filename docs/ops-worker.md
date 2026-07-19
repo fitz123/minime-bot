@@ -70,9 +70,11 @@ work.
 `worker start` also accepts `--host` (only `127.0.0.1` or `::1`) and `--port`
 (an integer from 0 through 65535). Omitted done-check parameters default to an
 empty object. Every command except `start` accepts `--json` for machine-readable
-output. For `receipt-claim`, JSON output is `{ "claimed": <boolean>, "task":
-<snapshot> }`; only `claimed: true` authorizes the caller to attempt the external
-mutation. A replay returns `claimed: false`.
+output. `worker status --json` returns the bounded task summary plus the same
+`policy` snapshot described for `GET /status` below; non-JSON status remains the
+task/custody summary. For `receipt-claim`, JSON output is `{ "claimed":
+<boolean>, "task": <snapshot> }`; only `claimed: true` authorizes the caller to
+attempt the external mutation. A replay returns `claimed: false`.
 
 Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An

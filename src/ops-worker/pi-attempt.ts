@@ -72,6 +72,8 @@ import {
 } from "./supervisor.js";
 import {
   acknowledgeOpsWorkerParityPass,
+  cleanupOpsWorkerParityLaunch,
+  cleanupOpsWorkerParitySessionSnapshots,
   formatOpsWorkerParityEvidence,
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
@@ -479,21 +481,31 @@ export class OpsWorkerPiAttemptRunner {
           preparedLaunch.parityLaunch,
         );
       } catch (error) {
+        if (preparedLaunch) cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
         return this.supervisor.recordQuotaProbeError(
           taskId,
           `Exact pre-claim quota proof validation failed: ${errorMessage(error)}`,
         );
       }
     }
-    const authorized = await this.supervisor.ensureTaskCustody(taskId, "RUN", {
-      quotaProbeSubjectHash,
-      requireCurrentSelection,
-    });
+    let authorized: OpsWorkerTask;
+    try {
+      authorized = await this.supervisor.ensureTaskCustody(taskId, "RUN", {
+        quotaProbeSubjectHash,
+        requireCurrentSelection,
+      });
+    } catch (error) {
+      if (preparedLaunch) cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
+      throw error;
+    }
     if (
       authorized.custody.status !== "HELD"
       || !hasFreshOpsWorkerAuthorizationPass(authorized)
       || isOpsWorkerQuotaWait(authorized)
-    ) return authorized;
+    ) {
+      if (preparedLaunch) cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
+      return authorized;
+    }
     this.supervisor.reservePiProcessGroupLaunch(taskId);
     try {
       if (this.abortSignal?.aborted) {
@@ -572,6 +584,12 @@ export class OpsWorkerPiAttemptRunner {
       }
       throw error;
     } finally {
+      if (preparedLaunch) {
+        const currentTask = this.supervisor.getTask(taskId);
+        if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+          cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
+        }
+      }
       this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
   }
@@ -588,6 +606,7 @@ export class OpsWorkerPiAttemptRunner {
       ? prepared
       : this.prepareAttemptLaunch(sessionDirectory);
     const { context, parityLaunch } = launch;
+    try {
     const quotaProbeSubjectHash = task.lastOutcome?.result === "QUOTA_PROBE_PASS"
       ? hashQuotaProbeSubject(
         this.model,
@@ -1060,6 +1079,12 @@ export class OpsWorkerPiAttemptRunner {
         evidence,
       ),
     };
+    } finally {
+      const currentTask = this.supervisor.getTask(task.id);
+      if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+        cleanupOpsWorkerParityLaunch(parityLaunch);
+      }
+    }
   }
 
   private async finishNaturalExit(
@@ -1266,6 +1291,7 @@ export class OpsWorkerPiAttemptRunner {
     ) return task;
     let result: OpsWorkerQuotaProbeResult;
     let proofSubjectHash: string | undefined;
+    let parityLaunch: OpsWorkerParityLaunch | undefined;
     let launchReserved = false;
     try {
       const context = this.assembleContext(this.primaryContextAgent, {
@@ -1276,7 +1302,8 @@ export class OpsWorkerPiAttemptRunner {
         throw new Error("Exact quota smoke probe could not assemble canonical primary context");
       }
       const sessionDirectory = this.prepareSessionDirectory(task);
-      const parityLaunch = prepareOpsWorkerParityLaunch({
+      cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
+      parityLaunch = prepareOpsWorkerParityLaunch({
         context,
         resources: this.primaryResources,
         parityExtensionPath: this.parityExtensionPath,
@@ -1322,6 +1349,12 @@ export class OpsWorkerPiAttemptRunner {
         `Exact quota smoke probe failed: ${errorMessage(error)}`,
       );
     } finally {
+      if (parityLaunch) {
+        const currentTask = this.supervisor.getTask(taskId);
+        if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+          cleanupOpsWorkerParityLaunch(parityLaunch);
+        }
+      }
       if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
     if (result.status === "SUCCESS") {
@@ -1701,6 +1734,7 @@ export class OpsWorkerPiAttemptRunner {
   private prepareAttemptLaunch(
     sessionDirectory: string,
   ): OpsWorkerPreparedAttemptLaunch {
+    cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
     const context = this.assembleContext(this.primaryContextAgent, {
       artifactWorkspaceCwd: this.workspaceCwd,
       strict: true,
@@ -2371,13 +2405,13 @@ function findSessionCandidates(
   sessionId: string,
 ): string[] {
   const entries = readdirSync(sessionDirectory, { withFileTypes: true });
-  if (entries.length > OPS_WORKER_PI_LIMITS.maxSessionFiles) {
+  const candidates = entries.filter((entry) =>
+    entry.name.endsWith(".jsonl")
+    && entry.name.includes(sessionId));
+  if (candidates.length > OPS_WORKER_PI_LIMITS.maxSessionFiles) {
     throw new Error("Task-owned Pi session directory contains too many files");
   }
-  return entries
-    .filter((entry) =>
-      entry.name.endsWith(".jsonl")
-      && entry.name.includes(sessionId))
+  return candidates
     .map((entry) => entry.name)
     .sort();
 }

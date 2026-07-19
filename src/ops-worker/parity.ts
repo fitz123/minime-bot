@@ -9,8 +9,10 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -83,9 +85,15 @@ export interface OpsWorkerParityLaunch {
   parityExtensionPath: string;
   parityExtensionIdentity: string;
   primaryResources: PiPrimaryResourceContract;
+  sessionDirectory: string;
+  /** Private copied extension closures used only for this child launch. */
+  snapshotRoots: readonly string[];
   /** Generated identity wrappers followed by the package parity gate. */
   extensionPaths: readonly string[];
 }
+
+const PARITY_SNAPSHOT_DIRECTORY_PATTERN =
+  /^parity-(?:extension-[0-9]+|gate)-snapshot-[A-Za-z0-9]+$/;
 
 function sha256(value: string | Buffer): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -219,33 +227,38 @@ function writePrivateExtensionSnapshot(
   label: string,
   targetPath: string,
   snapshot: readonly PiExtensionResourceFile[],
-): { targetPath: string; files: PiExtensionResourceFile[] } {
+): { snapshotRoot: string; targetPath: string; files: PiExtensionResourceFile[] } {
   const common = commonResourceDirectory(snapshot);
   const snapshotRoot = normalize(realpathSync(
     mkdtempSync(join(sessionDirectory, `${label}-snapshot-`)),
   ));
   chmodSync(snapshotRoot, 0o700);
-  const copied = snapshot.map((file) => {
-    const child = relative(common, file.path);
-    if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
-      throw new TypeError("Pi extension snapshot path escaped its private root");
+  try {
+    const copied = snapshot.map((file) => {
+      const child = relative(common, file.path);
+      if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+        throw new TypeError("Pi extension snapshot path escaped its private root");
+      }
+      const destination = join(snapshotRoot, child);
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+      writeFileSync(destination, readPinnedResource(file), { mode: 0o400, flag: "wx" });
+      return { path: destination, contentHash: file.contentHash };
+    });
+    const targetChild = relative(common, targetPath);
+    if (
+      targetChild === ".."
+      || targetChild.startsWith(`..${sep}`)
+      || isAbsolute(targetChild)
+    ) throw new TypeError("Pi extension entrypoint escaped its private snapshot");
+    const copiedTarget = join(snapshotRoot, targetChild);
+    if (!copied.some((file) => file.path === copiedTarget)) {
+      throw new TypeError("Pi extension entrypoint is absent from its private snapshot");
     }
-    const destination = join(snapshotRoot, child);
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    writeFileSync(destination, readPinnedResource(file), { mode: 0o400, flag: "wx" });
-    return { path: destination, contentHash: file.contentHash };
-  });
-  const targetChild = relative(common, targetPath);
-  if (
-    targetChild === ".."
-    || targetChild.startsWith(`..${sep}`)
-    || isAbsolute(targetChild)
-  ) throw new TypeError("Pi extension entrypoint escaped its private snapshot");
-  const copiedTarget = join(snapshotRoot, targetChild);
-  if (!copied.some((file) => file.path === copiedTarget)) {
-    throw new TypeError("Pi extension entrypoint is absent from its private snapshot");
+    return { snapshotRoot, targetPath: copiedTarget, files: copied };
+  } catch (error) {
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    throw error;
   }
-  return { targetPath: copiedTarget, files: copied };
 }
 
 function preparePrivateExtensionWrapper(input: {
@@ -254,7 +267,7 @@ function preparePrivateExtensionWrapper(input: {
   wrapperPath: string;
   targetPath: string;
   identity: string;
-}): string {
+}): { wrapperPath: string; snapshotRoot: string } {
   const snapshot = createPiExtensionResourceSnapshot(input.targetPath);
   if (snapshot.identity !== input.identity) {
     throw new Error("Pi extension changed during parity preparation");
@@ -265,13 +278,55 @@ function preparePrivateExtensionWrapper(input: {
     normalize(realpathSync(input.targetPath)),
     snapshot.files,
   );
-  writePrivateExtensionWrapper(
-    input.wrapperPath,
-    privateSnapshot.targetPath,
-    input.identity,
-    privateSnapshot.files,
-  );
-  return input.wrapperPath;
+  try {
+    writePrivateExtensionWrapper(
+      input.wrapperPath,
+      privateSnapshot.targetPath,
+      input.identity,
+      privateSnapshot.files,
+    );
+    return { wrapperPath: input.wrapperPath, snapshotRoot: privateSnapshot.snapshotRoot };
+  } catch (error) {
+    rmSync(privateSnapshot.snapshotRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function removePrivateSnapshotRoot(sessionDirectory: string, snapshotRoot: string): void {
+  let stats;
+  try {
+    stats = lstatSync(snapshotRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error("Refusing to remove a non-directory ops-worker parity snapshot");
+  }
+  const canonicalSessionDirectory = normalize(realpathSync(sessionDirectory));
+  const canonicalSnapshotRoot = normalize(realpathSync(snapshotRoot));
+  const relativeRoot = relative(canonicalSessionDirectory, canonicalSnapshotRoot);
+  if (
+    relativeRoot.includes(sep)
+    || relativeRoot === ""
+    || relativeRoot === "."
+    || !PARITY_SNAPSHOT_DIRECTORY_PATTERN.test(relativeRoot)
+  ) throw new Error("Refusing to remove an unsafe ops-worker parity snapshot path");
+  rmSync(canonicalSnapshotRoot, { recursive: true, force: true });
+}
+
+export function cleanupOpsWorkerParityLaunch(launch: OpsWorkerParityLaunch): void {
+  for (const snapshotRoot of launch.snapshotRoots) {
+    removePrivateSnapshotRoot(launch.sessionDirectory, snapshotRoot);
+  }
+}
+
+/** Remove crash leftovers only after the caller has proven no child can use them. */
+export function cleanupOpsWorkerParitySessionSnapshots(sessionDirectory: string): void {
+  for (const entry of readdirSync(sessionDirectory, { withFileTypes: true })) {
+    if (!PARITY_SNAPSHOT_DIRECTORY_PATTERN.test(entry.name)) continue;
+    removePrivateSnapshotRoot(sessionDirectory, join(sessionDirectory, entry.name));
+  }
 }
 
 export function prepareOpsWorkerParityLaunch(input: {
@@ -314,36 +369,49 @@ export function prepareOpsWorkerParityLaunch(input: {
   const reportPath = join(input.sessionDirectory, "parity-report-v1.json");
   const ackPath = join(input.sessionDirectory, "parity-ack-v1.txt");
   writePrivateJson(expectedPath, expected);
-  const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
-    const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
-    return preparePrivateExtensionWrapper({
-      sessionDirectory: input.sessionDirectory,
-      label: `parity-extension-${index}`,
-      wrapperPath,
-      targetPath: extensionPath,
-      identity: resources.extensionIdentities[index],
+  const snapshotRoots: string[] = [];
+  try {
+    const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
+      const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
+      const prepared = preparePrivateExtensionWrapper({
+        sessionDirectory: input.sessionDirectory,
+        label: `parity-extension-${index}`,
+        wrapperPath,
+        targetPath: extensionPath,
+        identity: resources.extensionIdentities[index],
+      });
+      snapshotRoots.push(prepared.snapshotRoot);
+      return prepared.wrapperPath;
     });
-  });
-  const parityWrapperPath = join(input.sessionDirectory, "parity-gate.mjs");
-  preparePrivateExtensionWrapper({
-    sessionDirectory: input.sessionDirectory,
-    label: "parity-gate",
-    wrapperPath: parityWrapperPath,
-    targetPath: input.parityExtensionPath,
-    identity: parityExtensionIdentity,
-  });
-  assertSafeSessionFile(reportPath);
-  assertSafeSessionFile(ackPath);
-  return {
-    expected,
-    expectedPath,
-    reportPath,
-    ackPath,
-    parityExtensionPath: input.parityExtensionPath,
-    parityExtensionIdentity,
-    primaryResources: resources,
-    extensionPaths: [...wrappedExtensionPaths, parityWrapperPath],
-  };
+    const parityWrapperPath = join(input.sessionDirectory, "parity-gate.mjs");
+    const preparedParity = preparePrivateExtensionWrapper({
+      sessionDirectory: input.sessionDirectory,
+      label: "parity-gate",
+      wrapperPath: parityWrapperPath,
+      targetPath: input.parityExtensionPath,
+      identity: parityExtensionIdentity,
+    });
+    snapshotRoots.push(preparedParity.snapshotRoot);
+    assertSafeSessionFile(reportPath);
+    assertSafeSessionFile(ackPath);
+    return {
+      expected,
+      expectedPath,
+      reportPath,
+      ackPath,
+      parityExtensionPath: input.parityExtensionPath,
+      parityExtensionIdentity,
+      primaryResources: resources,
+      sessionDirectory: input.sessionDirectory,
+      snapshotRoots,
+      extensionPaths: [...wrappedExtensionPaths, parityWrapperPath],
+    };
+  } catch (error) {
+    for (const snapshotRoot of snapshotRoots) {
+      removePrivateSnapshotRoot(input.sessionDirectory, snapshotRoot);
+    }
+    throw error;
+  }
 }
 
 export function tryReadOpsWorkerParityReport(

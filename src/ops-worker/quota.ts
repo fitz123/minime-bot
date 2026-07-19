@@ -326,59 +326,100 @@ export function evaluateOpsWorkerQuotaResponse(
   read: OpsWorkerQuotaReadResult,
   options: OpsWorkerQuotaAdmissionOptions = {},
 ): OpsWorkerQuotaResponseDecision {
-  const admission = evaluateOpsWorkerQuotaAdmission(read, options);
-  if (
-    read.status !== "OK"
-    || admission.reason === "MISSING"
-    || admission.reason === "READ_ERROR"
-    || admission.reason === "INVALID"
-    || admission.reason === "STALE"
-    || admission.reason === "CONTRADICTORY"
-    || admission.reason === "DURATIONLESS"
-    || admission.reason === "RESETLESS"
-  ) {
-    return {
-      status: "TELEMETRY_ERROR",
-      reason: admission.reason === "HEADROOM" ? "INVALID" : admission.reason,
-      evidenceHash: admission.evidenceHash,
-      summary: `Quota response telemetry is unusable: ${admission.reason}`,
-    };
+  const now = options.now ?? new Date();
+  const staleMs = options.staleMs ?? DEFAULT_OPS_WORKER_QUOTA_STALE_MS;
+  if (!Number.isSafeInteger(staleMs) || staleMs < 1 || staleMs > 24 * 60 * 60_000) {
+    throw new TypeError("quota staleMs must be an integer between 1 and 86400000");
   }
-  const activeWindows = (Object.entries(read.snapshot.windows) as Array<
+  const telemetryError = (
+    reason: Exclude<OpsWorkerQuotaAdmissionReason, "HEADROOM">,
+    snapshot: CodexQuotaSnapshot | null,
+    summary = `Quota response telemetry is unusable: ${reason}`,
+  ): OpsWorkerQuotaResponseDecision => ({
+    status: "TELEMETRY_ERROR",
+    reason,
+    evidenceHash: quotaResponseEvidenceHash({
+      status: "TELEMETRY_ERROR",
+      reason,
+      observedAt: now.toISOString(),
+      sampledAt: snapshot?.sampledAt ?? null,
+      activeLimit: snapshot?.activeLimit ?? null,
+      resetAt: null,
+    }),
+    summary,
+  });
+  if (read.status !== "OK") return telemetryError(read.status, null);
+
+  let snapshot: CodexQuotaSnapshot;
+  try {
+    snapshot = parseStrictCodexQuotaSnapshot(read.snapshot);
+  } catch (error) {
+    return telemetryError(
+      error instanceof QuotaShapeError && error.reason === "DURATIONLESS"
+        ? "DURATIONLESS"
+        : "INVALID",
+      null,
+    );
+  }
+  const sampledAtMs = Date.parse(snapshot.sampledAt);
+  if (
+    sampledAtMs !== Date.parse(snapshot.lastSuccess)
+    || Math.floor(sampledAtMs / 1_000) !== snapshot.lastSuccessTimestamp
+    || sampledAtMs > now.getTime()
+  ) return telemetryError("CONTRADICTORY", snapshot);
+  if (now.getTime() - sampledAtMs > staleMs) {
+    return telemetryError("STALE", snapshot);
+  }
+
+  const activeWindows = (Object.entries(snapshot.windows) as Array<
     [CodexQuotaWindowName, CodexQuotaWindow]
   >).filter(([, window]) => Object.keys(window).length > 0);
   let activeWindow: CodexQuotaWindowName | undefined;
-  if (read.snapshot.activeLimit === undefined && activeWindows.length === 1) {
+  if (snapshot.activeLimit === undefined && activeWindows.length === 1) {
     activeWindow = activeWindows[0][0];
-  } else if (read.snapshot.activeLimit === "primary") {
+  } else if (snapshot.activeLimit === "primary") {
     activeWindow = "5h";
-  } else if (read.snapshot.activeLimit === "secondary") {
+  } else if (snapshot.activeLimit === "secondary") {
     activeWindow = "week";
   }
-  if (activeWindow === undefined || Object.keys(read.snapshot.windows[activeWindow]).length === 0) {
-    return {
-      status: "TELEMETRY_ERROR",
-      reason: "INVALID",
-      evidenceHash: admission.evidenceHash,
-      summary: "Quota response telemetry does not identify one active authoritative limit",
-    };
+  if (activeWindow === undefined || Object.keys(snapshot.windows[activeWindow]).length === 0) {
+    return telemetryError(
+      "INVALID",
+      snapshot,
+      "Quota response telemetry does not identify one active authoritative limit",
+    );
   }
-  const resetAt = read.snapshot.windows[activeWindow].resetAt;
-  if (resetAt === undefined) {
-    return {
-      status: "TELEMETRY_ERROR",
-      reason: "RESETLESS",
-      evidenceHash: admission.evidenceHash,
-      summary: "Quota response telemetry is unusable: RESETLESS",
-    };
+  const authoritative = snapshot.windows[activeWindow];
+  const resetAt = authoritative.resetAt;
+  if (resetAt === undefined || authoritative.resetTimestamp === undefined) {
+    return telemetryError("RESETLESS", snapshot);
+  }
+  const resetAtMs = Date.parse(resetAt);
+  if (
+    resetAtMs !== authoritative.resetTimestamp * 1_000
+    || resetAtMs <= sampledAtMs
+    || sampledAtMs < resetAtMs - WINDOW_DURATIONS_MS[activeWindow]
+  ) {
+    return telemetryError("CONTRADICTORY", snapshot);
   }
   return {
     status: "WAIT",
     resetAt,
-    sampledAt: read.snapshot.sampledAt,
-    evidenceHash: admission.evidenceHash,
+    sampledAt: snapshot.sampledAt,
+    evidenceHash: quotaResponseEvidenceHash({
+      status: "WAIT",
+      reason: null,
+      observedAt: now.toISOString(),
+      sampledAt: snapshot.sampledAt,
+      activeLimit: activeWindow,
+      resetAt,
+    }),
     summary: `Codex quota response requires a reset-aware wait until ${resetAt}`,
   };
+}
+
+function quotaResponseEvidenceHash(value: unknown): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
 export function isAuthoritativeQuotaDecision(

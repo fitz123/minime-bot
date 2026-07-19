@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -35,6 +36,7 @@ import {
 import { resolvePiSpawnExtensionArgs } from "../pi-rpc-protocol.js";
 import {
   acknowledgeOpsWorkerParityPass,
+  cleanupOpsWorkerParityLaunch,
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
 } from "../ops-worker/parity.js";
@@ -162,6 +164,60 @@ describe("primary Pi resource contract", () => {
       ...base,
       toolNames: PI_BUILTIN_TOOL_NAMES.filter((tool) => tool !== "bash"),
     }), /missing built-in bash/);
+  });
+
+  it("rejects primary resources that the child parity protocol cannot represent", () => {
+    const root = tempDirectory();
+    const extensionsDir = join(PACKAGE_ROOT, "extensions", "pi");
+    const defaultExtensionCount = resolvePiSpawnExtensionArgs({ extensionsDir }).length / 2;
+    const extraExtensions = Array.from(
+      { length: 128 - defaultExtensionCount },
+      (_, index) => join(root, `extra-${index}.ts`),
+    );
+    for (const path of extraExtensions) {
+      writeFileSync(path, "export default function extension() {}\n", "utf8");
+    }
+    assert.throws(
+      () => resolvePiPrimaryResourceContract({
+        extensionOptions: { extensionsDir, extraExtensions },
+        skillPaths: [],
+        toolNames: [...PI_BUILTIN_TOOL_NAMES],
+      }),
+      /extensions plus parity gate must not exceed 128/,
+    );
+
+    const tooManyTools = [
+      ...PI_BUILTIN_TOOL_NAMES,
+      ...Array.from(
+        { length: 129 - PI_BUILTIN_TOOL_NAMES.length },
+        (_, index) => `configured_tool_${index}`,
+      ),
+    ];
+    assert.throws(
+      () => resolvePiPrimaryResourceContract({
+        extensionOptions: { extensionsDir },
+        skillPaths: [],
+        toolNames: tooManyTools,
+      }),
+      /tools must not exceed 128/,
+    );
+
+    const identities = Array.from({ length: 128 }, (_, index) => sha256(`identity-${index}`));
+    const longTools = Array.from(
+      { length: 128 },
+      (_, index) => `tool_${index}_${"x".repeat(110)}`,
+    );
+    assert.throws(
+      () => createExpectedOpsWorkerParityContract({
+        primaryContextDigest: sha256("primary"),
+        customPromptHash: sha256("persona"),
+        appendSystemPromptHash: sha256("bundle"),
+        extensionIdentities: identities,
+        skillIdentities: identities,
+        toolNames: longTools,
+      }),
+      /32768-byte parity contract limit/,
+    );
   });
 
   it("hashes the exact Jiti-resolved closure and rejects runtime module loading", () => {
@@ -501,6 +557,50 @@ describe("ops-worker before-provider parity attestation", () => {
         opsPolicy: "GENERIC_POLICY",
       }),
       /parity extension changed after startup pinning/,
+    );
+  });
+
+  it("removes private extension snapshots after use and on preparation failure", () => {
+    const root = tempDirectory();
+    const extension = join(root, "extension.mjs");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(extension, "export default function extension() {}\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      skillPaths: [],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const input = {
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1 as const,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    };
+    const launch = prepareOpsWorkerParityLaunch(input);
+    assert.equal(launch.snapshotRoots.length, 2);
+    assert.equal(launch.snapshotRoots.every((path) => existsSync(path)), true);
+    cleanupOpsWorkerParityLaunch(launch);
+    assert.equal(launch.snapshotRoots.every((path) => !existsSync(path)), true);
+
+    unlinkSync(join(root, "parity-extension-0.mjs"));
+    mkdirSync(join(root, "parity-extension-0.mjs"));
+    assert.throws(() => prepareOpsWorkerParityLaunch(input), /unsafe parity handshake file/);
+    assert.deepEqual(
+      readdirSync(root).filter((name) => /-snapshot-/.test(name)),
+      [],
     );
   });
 

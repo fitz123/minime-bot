@@ -7,6 +7,7 @@ import {
 import {
   OPS_WORKER_AUTHORIZATION_VERIFICATION_STATUSES,
   OPS_WORKER_LIMITS,
+  isOpsWorkerRegisteredName,
   isOpsWorkerTerminalState,
   type OpsWorkerAuthorizationVerification,
   type OpsWorkerAuthorizationVerificationStatus,
@@ -415,8 +416,8 @@ export async function verifyOpsWorkerAuthorization(
   const checkedSnapshotHash = hashOpsWorkerAuthorizationSnapshot(task);
   const verifier = verifiers[task.source.kind];
   const validVerifierMetadata = verifier !== undefined
-    && validIdentity(verifier.identity)
-    && validIdentity(verifier.version);
+    && isOpsWorkerRegisteredName(verifier.identity)
+    && isOpsWorkerRegisteredName(verifier.version);
   const validatorIdentity = validVerifierMetadata ? verifier.identity : "missing-verifier";
   const validatorVersion = validVerifierMetadata ? verifier.version : "1";
   let result: OpsWorkerAuthorizationVerifierResult;

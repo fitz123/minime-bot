@@ -217,6 +217,83 @@ describe("ADR-091 authorized issue verifier", () => {
     );
   });
 
+  it("rejects malformed resolver snapshots before canonical claim hashing", async () => {
+    const cases: Array<{
+      name: string;
+      mutate(candidate: Adr091AuthorizedIssueSnapshot): void;
+    }> = [
+      {
+        name: "duplicate event id",
+        mutate: (candidate) => { candidate.timeline.events[2].id = "edit-1"; },
+      },
+      {
+        name: "event before issue creation",
+        mutate: (candidate) => { candidate.timeline.events[0].at = "2026-07-18T08:59:59.000Z"; },
+      },
+      {
+        name: "invalid event actor",
+        mutate: (candidate) => {
+          const event = candidate.timeline.events[1];
+          assert.equal(event.kind, "LABEL_APPLIED");
+          event.actorIdentity = "invalid actor";
+        },
+      },
+      {
+        name: "invalid event label",
+        mutate: (candidate) => {
+          const event = candidate.timeline.events[1];
+          assert.equal(event.kind, "LABEL_APPLIED");
+          event.label = "invalid label";
+        },
+      },
+      {
+        name: "unknown event kind",
+        mutate: (candidate) => {
+          (candidate.timeline.events[0] as unknown as { kind: string }).kind = "UNKNOWN";
+        },
+      },
+      {
+        name: "invalid issue label",
+        mutate: (candidate) => { candidate.issue.labels = ["invalid label"]; },
+      },
+      {
+        name: "duplicate issue labels",
+        mutate: (candidate) => { candidate.issue.labels = ["ops", "ops"]; },
+      },
+      {
+        name: "too many issue labels",
+        mutate: (candidate) => {
+          candidate.issue.labels = Array.from({ length: 101 }, (_, index) => `label-${index}`);
+        },
+      },
+      {
+        name: "oversized issue title",
+        mutate: (candidate) => { candidate.issue.title = "x".repeat(8 * 1024 + 1); },
+      },
+      {
+        name: "oversized issue body",
+        mutate: (candidate) => { candidate.issue.body = "x".repeat(128 * 1024 + 1); },
+      },
+      {
+        name: "too many timeline events",
+        mutate: (candidate) => {
+          candidate.timeline.events = Array.from({ length: 10_001 }, (_, index) => ({
+            id: `event-${index}`,
+            kind: "CONTENT_EDIT" as const,
+            at: "2026-07-18T10:00:00.000Z",
+          }));
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const malformed = snapshot();
+      testCase.mutate(malformed);
+      const result = await verifier(malformed).verify(task(snapshot()));
+      assert.equal(result.status, "QUERY_ERROR", testCase.name);
+    }
+  });
+
   it("types resolver failures and malformed trusted verifier results as query errors", async () => {
     const remote = snapshot();
     const resolverFailure = createAdr091AuthorizedIssueVerifier({
@@ -248,23 +325,29 @@ describe("ADR-091 authorized issue verifier", () => {
       assert.equal(result.status, "QUERY_ERROR");
     }
 
-    const invalidIdentity = await verifyOpsWorkerAuthorization(
-      task(remote),
-      {
-        "authorized-issue": {
-          identity: "bad identity",
-          version: "1",
-          verify: () => ({
-            status: "PASS",
-            evidenceHash: `sha256:${"a".repeat(64)}`,
-            summary: "would otherwise pass",
-          }),
+    for (const [identity, version] of [
+      ["bad identity", "1"],
+      ["GitHub:authorization/v1", "1"],
+      ["fixture-verifier", "Version/1"],
+    ] as const) {
+      const invalidIdentity = await verifyOpsWorkerAuthorization(
+        task(remote),
+        {
+          "authorized-issue": {
+            identity,
+            version,
+            verify: () => ({
+              status: "PASS",
+              evidenceHash: `sha256:${"a".repeat(64)}`,
+              summary: "would otherwise pass",
+            }),
+          },
         },
-      },
-      NOW,
-    );
-    assert.equal(invalidIdentity.status, "QUERY_ERROR");
-    assert.equal(invalidIdentity.validatorIdentity, "missing-verifier");
+        NOW,
+      );
+      assert.equal(invalidIdentity.status, "QUERY_ERROR");
+      assert.equal(invalidIdentity.validatorIdentity, "missing-verifier");
+    }
   });
 
   it("rejects a missing or inexact canonical claim", async () => {

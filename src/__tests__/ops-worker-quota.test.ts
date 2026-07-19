@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { CodexQuotaSnapshot } from "../pi-extensions/codex-usage.js";
 import {
+  CodexQuotaAttemptFileReader,
   CodexQuotaFileReader,
+  MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES,
   evaluateOpsWorkerQuotaAdmission,
   evaluateOpsWorkerQuotaResponse,
   type OpsWorkerQuotaReadResult,
@@ -204,6 +206,61 @@ describe("ops worker Codex quota admission", () => {
     }
   });
 
+  it("strictly reads exact-attempt captures and rejects malformed or unsafe files", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-ops-attempt-quota-"));
+    try {
+      const attemptFile = join(root, "attempt.json");
+      const reader = new CodexQuotaAttemptFileReader(attemptFile);
+      assert.deepEqual(reader.read(), { status: "MISSING" });
+
+      const valid = { version: 1, responseStatus: 429, snapshot: snapshot() };
+      writeFileSync(attemptFile, `${JSON.stringify(valid)}\n`, "utf8");
+      const captured = reader.read();
+      assert.equal(captured.status, "OK");
+      if (captured.status === "OK") {
+        assert.equal(captured.responseStatus, 429);
+        assert.equal(captured.snapshot?.provider, "codex");
+      }
+
+      writeFileSync(
+        attemptFile,
+        `${JSON.stringify({ version: 1, responseStatus: 204, snapshot: null })}\n`,
+        "utf8",
+      );
+      assert.deepEqual(reader.read(), { status: "OK", responseStatus: 204, snapshot: null });
+
+      const durationless = snapshot();
+      durationless.windows = {
+        ...durationless.windows,
+        month: {},
+      } as CodexQuotaSnapshot["windows"];
+      const invalidCases: Array<[unknown, "INVALID" | "DURATIONLESS"]> = [
+        [{ ...valid, version: 2 }, "INVALID"],
+        [{ ...valid, responseStatus: 99 }, "INVALID"],
+        [{ ...valid, responseStatus: 600 }, "INVALID"],
+        [{ ...valid, unexpected: true }, "INVALID"],
+        [{ version: 1, responseStatus: 429 }, "INVALID"],
+        [{ ...valid, snapshot: { ...snapshot(), unexpected: true } }, "INVALID"],
+        [{ ...valid, snapshot: durationless }, "DURATIONLESS"],
+      ];
+      for (const [value, expected] of invalidCases) {
+        writeFileSync(attemptFile, `${JSON.stringify(value)}\n`, "utf8");
+        assert.equal(reader.read().status, expected);
+      }
+
+      writeFileSync(attemptFile, "x".repeat(MAX_OPS_WORKER_QUOTA_SNAPSHOT_BYTES + 1), "utf8");
+      assert.equal(reader.read().status, "INVALID");
+
+      const target = join(root, "target.json");
+      writeFileSync(target, `${JSON.stringify(valid)}\n`, "utf8");
+      rmSync(attemptFile);
+      symlinkSync(target, attemptFile);
+      assert.equal(reader.read().status, "INVALID");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses the response's named authoritative reset and refreshes a rolling reset", () => {
     const first = evaluateOpsWorkerQuotaResponse(readOk(snapshot({
       activeLimit: "secondary",
@@ -212,6 +269,19 @@ describe("ops worker Codex quota admission", () => {
     })), { now: NOW });
     assert.equal(first.status, "WAIT");
     assert.equal(first.resetAt, "2026-07-20T00:00:00.000Z");
+
+    const namedPrimary = snapshot({
+      activeLimit: "primary",
+      fiveHour: { used: 100, resetAt: "2026-07-18T13:00:00.000Z" },
+      week: { used: 80, resetAt: "2026-07-20T00:00:00.000Z" },
+    });
+    delete namedPrimary.windows.week.resetAt;
+    delete namedPrimary.windows.week.resetTimestamp;
+    delete namedPrimary.windows["5h"].usedPercent;
+    delete namedPrimary.windows["5h"].remainingPercent;
+    const primary = evaluateOpsWorkerQuotaResponse(readOk(namedPrimary), { now: NOW });
+    assert.equal(primary.status, "WAIT");
+    assert.equal(primary.resetAt, "2026-07-18T13:00:00.000Z");
 
     const rolled = evaluateOpsWorkerQuotaResponse(readOk(snapshot({
       sampledAt: "2026-07-18T12:59:59.000Z",

@@ -25,6 +25,7 @@ import {
   OPS_WORKER_SOURCE_KINDS,
   OPS_WORKER_TASK_SCHEMA_VERSION,
   OPS_WORKER_TASK_STATES,
+  isOpsWorkerRegisteredName,
   type OpsWorkerTask,
   type OpsWorkerSourceKind,
   type OpsWorkerTaskState,
@@ -113,8 +114,6 @@ function isLoopbackRemoteAddress(address: string | undefined): boolean {
 }
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
-const POLICY_IDENTITY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/+-]{0,254}[A-Za-z0-9])?$/;
-const REGISTERED_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9.-]{0,78}[a-z0-9])?$/;
 const QUOTA_REASONS = new Set([
   "HEADROOM",
   "MISSING",
@@ -132,14 +131,8 @@ function policyHash(value: unknown): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
-function assertPolicyIdentity(value: unknown, label: string): asserts value is string {
-  if (typeof value !== "string" || !POLICY_IDENTITY_PATTERN.test(value)) {
-    throw new TypeError(`${label} must be a bounded package identity`);
-  }
-}
-
 function assertRegisteredName(value: unknown, label: string): asserts value is string {
-  if (typeof value !== "string" || !REGISTERED_NAME_PATTERN.test(value)) {
+  if (!isOpsWorkerRegisteredName(value)) {
     throw new TypeError(`${label} is not a registered name`);
   }
 }
@@ -189,8 +182,8 @@ export function inspectOpsWorkerPolicy(
   const authorizationContracts = configuredSources.map((source) => {
     const verifier = verifiers[source as OpsWorkerSourceKind];
     if (!verifier) throw new TypeError("Authorization verifier registry is sparse");
-    assertPolicyIdentity(verifier.identity, "authorization verifier identity");
-    assertPolicyIdentity(verifier.version, "authorization verifier version");
+    assertRegisteredName(verifier.identity, "authorization verifier identity");
+    assertRegisteredName(verifier.version, "authorization verifier version");
     return { source, identity: verifier.identity, version: verifier.version };
   });
 

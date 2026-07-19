@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, extname, isAbsolute, normalize, resolve } from "node:path";
 import ts from "typescript";
+import { assertOpsWorkerParityContractRepresentable } from "./pi-parity-contract-limits.js";
 import {
   piExtensionRelpathForDir,
   resolvePiSpawnExtensionArgs,
@@ -505,6 +506,12 @@ function buildPiPrimaryResourceContract(input: {
   }
   const extensionIdentities = extensionPaths.map((path) => piResourceIdentity("extension", path));
   const skillIdentities = skillPaths.map((path) => piResourceIdentity("skill", path));
+  assertOpsWorkerParityContractRepresentable({
+    extensionIdentities,
+    skillIdentities,
+    toolNames,
+    additionalExtensionIdentities: 1,
+  });
   const extensionsDigest = canonicalListDigest("minime-pi-extensions-v1", extensionIdentities);
   const skillsDigest = canonicalListDigest("minime-pi-skills-v1", skillIdentities);
   const toolsDigest = canonicalListDigest("minime-pi-tools-v1", toolNames);

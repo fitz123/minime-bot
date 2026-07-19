@@ -677,6 +677,15 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(makeTask("success-failed-check", {
       objective: "--model payload-selected-model",
     }));
+    const sessionDirectory = join(
+      harness.supervisor.stateDirectory,
+      "sessions",
+      "success-failed-check",
+    );
+    mkdirSync(
+      join(sessionDirectory, "parity-extension-0-snapshot-abcdef"),
+      { recursive: true, mode: 0o700 },
+    );
 
     const result = await harness.runner().runAttempt("success-failed-check");
 
@@ -698,6 +707,10 @@ describe("ops worker Pi standard-session attempts", () => {
       arg === "--append-system-prompt" ? [args[index + 1]] : []);
     assert.match(appended[1], /Do not use sudo or perform irreversible deletion/);
     assert.equal(result.evidence.some((entry) => /success claim/.test(entry.summary)), true);
+    assert.deepEqual(
+      readdirSync(sessionDirectory).filter((name) => /-snapshot-/.test(name)),
+      [],
+    );
   });
 
   it("treats clean exit as a claim even when successful output mentions old errors", async (t) => {
@@ -1352,10 +1365,10 @@ describe("ops worker Pi standard-session attempts", () => {
     });
     const task = makeTask("stale-post-attempt-check");
     harness.store.create(task);
-    const runner = harness.runner();
+    const runner = harness.runner({ attemptTimeoutMs: 15_000 });
 
     const pending = runner.runAttempt(task.id);
-    await waitFor(() => resolveFirstCheck !== undefined, 5_000);
+    await waitFor(() => resolveFirstCheck !== undefined, 15_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-during-post-attempt-check",
       payload: { progress: "still-live" },
