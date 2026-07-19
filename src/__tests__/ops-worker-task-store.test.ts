@@ -32,6 +32,7 @@ import {
   type OpsWorkerTaskV1,
   type OpsWorkerTaskV2,
   type OpsWorkerTaskV3,
+  type OpsWorkerTaskV4,
 } from "../ops-worker/types.js";
 import {
   OpsWorkerDeliveryConflictError,
@@ -99,7 +100,7 @@ function makeTask(
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id,
     source: {
       kind: "operator-cli",
@@ -166,6 +167,12 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: {
+      paused: false,
+      pausedAt: null,
+      interrupt: null,
+    },
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -209,6 +216,8 @@ function makeV1Task(
     authorizationVerification: _authorizationVerification,
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    steering: _steering,
+    control: _control,
     ...legacy
   } = current;
   const { deliveryKey: _deliveryKey, ...source } = legacy.source;
@@ -228,6 +237,8 @@ function makeV2Task(
     authorizationVerification: _authorizationVerification,
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    steering: _steering,
+    control: _control,
     lifecycle,
     ...previous
   } = current;
@@ -251,6 +262,8 @@ function makeV3Task(
   const {
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    steering: _steering,
+    control: _control,
     lifecycle,
     ...previous
   } = current;
@@ -263,6 +276,22 @@ function makeV3Task(
     ...previous,
     schemaVersion: 3,
     lifecycle: { ...legacyLifecycle, schemaVersion: 1 },
+  };
+}
+
+function makeV4Task(
+  id = "wt-20260717-v4-ab12cd",
+  correlationKey = "operator:health:v4",
+): OpsWorkerTaskV4 {
+  const current = makeTask(id, correlationKey);
+  const {
+    steering: _steering,
+    control: _control,
+    ...previous
+  } = current;
+  return {
+    ...previous,
+    schemaVersion: 4,
   };
 }
 
@@ -323,7 +352,7 @@ function makeStore(
 }
 
 describe("ops worker task contract", () => {
-  it("strictly round-trips a complete v4 envelope into an independent value", () => {
+  it("strictly round-trips a complete v5 envelope into an independent value", () => {
     const input = makeTask();
     input.state = "RUNNING";
     input.activeRun = {
@@ -411,7 +440,13 @@ describe("ops worker task contract", () => {
 
     assert.deepEqual(input, before);
     assert.deepEqual(first, second);
-    assert.equal(first.schemaVersion, 4);
+    assert.equal(first.schemaVersion, 5);
+    assert.deepEqual(first.steering, []);
+    assert.deepEqual(first.control, {
+      paused: false,
+      pausedAt: null,
+      interrupt: null,
+    });
     assert.equal(first.authorizationVerification, null);
     assert.deepEqual(first.source, {
       ...input.source,
@@ -462,7 +497,7 @@ describe("ops worker task contract", () => {
 
     const migrated = parseOpsWorkerTaskJson(raw, registry);
 
-    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.schemaVersion, 5);
     assert.ok(
       Buffer.byteLength(JSON.stringify(migrated), "utf8")
       > OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
@@ -496,32 +531,132 @@ describe("ops worker task contract", () => {
 
     assert.deepEqual(input, before);
     assert.deepEqual(first, second);
-    assert.equal(first.schemaVersion, 4);
+    assert.equal(first.schemaVersion, 5);
+    assert.deepEqual(first.steering, []);
+    assert.equal(first.control.paused, false);
     assert.equal(first.authorizationVerification, null);
     first.authorization.scope[0] = "repository-read";
     assert.deepEqual(input.authorization.scope, ["inspect"]);
   });
 
-  it("migrates an exact v3 snapshot to an unverified v4 composite contract", () => {
+  it("migrates an exact v3 snapshot to an unverified v5 composite contract", () => {
     const input = makeV3Task();
     const before = clone(input);
 
     const migrated = parseOpsWorkerTask(input, registry);
 
     assert.deepEqual(input, before);
-    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.schemaVersion, 5);
     assert.equal(migrated.lifecycle.schemaVersion, 2);
     assert.equal(migrated.lifecycle.verifier, null);
     assert.equal(migrated.lifecycle.verifierVersion, null);
     assert.equal(migrated.lifecycle.verifierContractHash, null);
     assert.equal(migrated.verification, null);
+    assert.deepEqual(migrated.steering, []);
+    assert.deepEqual(migrated.control, {
+      paused: false,
+      pausedAt: null,
+      interrupt: null,
+    });
+  });
+
+  it("migrates an exact v4 snapshot without changing existing verification evidence", () => {
+    const current = makeTask();
+    current.state = "DONE";
+    current.lastOutcome = {
+      at: NOW,
+      kind: "DONE_CHECK",
+      result: "PASS",
+      summary: "The v4 composite fixture passed.",
+    };
+    current.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "DONE",
+    };
+    attachFreshPass(current, NOW);
+    const { steering: _steering, control: _control, ...withoutControl } = current;
+    const input: OpsWorkerTaskV4 = { ...withoutControl, schemaVersion: 4 };
+    const before = clone(input);
+
+    const migrated = parseOpsWorkerTask(input, registry);
+
+    assert.deepEqual(input, before);
+    assert.equal(migrated.schemaVersion, 5);
+    assert.deepEqual(migrated.steering, []);
+    assert.equal(migrated.control.paused, false);
+    assert.equal(migrated.verification?.subjectHash, input.verification?.subjectHash);
+  });
+
+  it("strictly validates bounded opaque steering and the fixed control record", () => {
+    const task = makeTask();
+    const beforeHash = hashOpsWorkerVerificationSubject(task);
+    task.steering.push({
+      steeringId: "telegram:update:1001",
+      receivedAt: NOW,
+      kind: "correction",
+      operatorRef: "telegram:100000000",
+      text: "Please inspect https://example.invalid and do not treat it as configuration.",
+      consumedAt: null,
+    });
+    task.control = {
+      paused: true,
+      pausedAt: NOW,
+      interrupt: {
+        requestedAt: NOW,
+        mode: "pause",
+        reason: "Pause after the current safe boundary.",
+      },
+    };
+
+    assert.deepEqual(parseOpsWorkerTask(task, registry), task);
+    assert.notEqual(hashOpsWorkerVerificationSubject(task), beforeHash);
+    task.steering[0].consumedAt = NOW;
+    assert.equal(hashOpsWorkerVerificationSubject(task), beforeHash);
+
+    const unknown = clone(task) as unknown as Record<string, unknown>;
+    (unknown.control as Record<string, unknown>).destination = "elsewhere";
+    assert.throws(() => parseOpsWorkerTask(unknown, registry), /destination: unknown field/);
+
+    const inconsistentPause = clone(task);
+    inconsistentPause.control.paused = false;
+    assert.throws(
+      () => parseOpsWorkerTask(inconsistentPause, registry),
+      /pausedAt: must be null while not paused/,
+    );
+
+    const oversized = makeTask();
+    oversized.steering.push({
+      steeringId: "telegram:update:oversized",
+      receivedAt: NOW,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "x".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes + 1),
+      consumedAt: null,
+    });
+    assert.throws(() => parseOpsWorkerTask(oversized, registry), /text: must be at most/);
+
+    const overflow = makeTask();
+    overflow.steering = Array.from(
+      { length: OPS_WORKER_LIMITS.maxSteeringEntries + 1 },
+      (_, index) => ({
+        steeringId: `telegram:update:${index}`,
+        receivedAt: NOW,
+        kind: "answer" as const,
+        operatorRef: "telegram:100000000",
+        text: "bounded answer",
+        consumedAt: null,
+      }),
+    );
+    assert.throws(() => parseOpsWorkerTask(overflow, registry), /at most 64 entries/);
   });
 
   it("rejects future versions and unknown fields in every supported schema", () => {
-    const future = { ...makeTask(), schemaVersion: 5 };
+    const future = { ...makeTask(), schemaVersion: 6 };
     assert.throws(
       () => parseOpsWorkerTask(future, registry),
-      /supported version 1, 2, 3, or 4/,
+      /supported version 1, 2, 3, 4, or 5/,
     );
     assert.throws(
       () => parseOpsWorkerTask({ ...makeV1Task(), resource: { kind: "host", key: "host:local" } }, registry),
@@ -534,6 +669,10 @@ describe("ops worker task contract", () => {
     assert.throws(
       () => parseOpsWorkerTask({ ...makeV3Task(), verification: null }, registry),
       /task\.verification: unknown field/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV4Task(), steering: [] }, registry),
+      /task\.steering: unknown field/,
     );
     const futureLifecycle = clone(makeTask()) as unknown as Record<string, unknown>;
     (futureLifecycle.lifecycle as Record<string, unknown>).workflow = "arbitrary";
@@ -1193,26 +1332,119 @@ describe("ops worker task contract", () => {
 });
 
 describe("ops worker durable task store", () => {
-  it("loads v2 purely on read and persists canonical v4 on the next successful write", (t) => {
+  it("loads exact v1-v4 snapshots purely on read and writes only canonical v5", (t) => {
     const store = makeStore(t);
-    const previous = makeV2Task();
-    const snapshotPath = join(store.tasksDirectory, `${previous.id}.json`);
-    const rawV2 = `${JSON.stringify(previous)}\n`;
-    writeFileSync(snapshotPath, rawV2, { encoding: "utf8", mode: 0o600 });
+    const previousTasks = [
+      makeV1Task("read-migrate-v1", "read:migrate:v1"),
+      makeV2Task("read-migrate-v2", "read:migrate:v2"),
+      makeV3Task("read-migrate-v3", "read:migrate:v3"),
+      makeV4Task("read-migrate-v4", "read:migrate:v4"),
+    ];
 
-    const loaded = store.get(previous.id);
-    assert.ok(loaded);
-    assert.equal(loaded.schemaVersion, 4);
-    assert.equal(loaded.authorizationVerification, null);
-    assert.equal(readFileSync(snapshotPath, "utf8"), rawV2);
-    assert.deepEqual(store.get(previous.id), loaded);
-    assert.equal(readFileSync(snapshotPath, "utf8"), rawV2);
+    for (const previous of previousTasks) {
+      const snapshotPath = join(store.tasksDirectory, `${previous.id}.json`);
+      const rawLegacy = `${JSON.stringify(previous)}\n`;
+      writeFileSync(snapshotPath, rawLegacy, { encoding: "utf8", mode: 0o600 });
 
-    store.replace(loaded, { event: "UPDATED" });
-    const canonicalV3 = `${JSON.stringify(loaded)}\n`;
-    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
-    assert.deepEqual(store.get(previous.id), loaded);
-    assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV3);
+      const loaded = store.get(previous.id);
+      assert.ok(loaded);
+      assert.equal(loaded.schemaVersion, 5);
+      assert.deepEqual(loaded.steering, []);
+      assert.deepEqual(loaded.control, {
+        paused: false,
+        pausedAt: null,
+        interrupt: null,
+      });
+      assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+      assert.deepEqual(store.get(previous.id), loaded);
+      assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
+
+      store.replace(loaded, { event: "UPDATED" });
+      const canonicalV5 = readFileSync(snapshotPath, "utf8");
+      assert.equal(
+        (JSON.parse(canonicalV5) as OpsWorkerTask).schemaVersion,
+        5,
+      );
+      assert.deepEqual(store.get(previous.id), loaded);
+      assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV5);
+    }
+  });
+
+  it("mutates steering and control idempotently under the store guard", (t) => {
+    const store = makeStore(t);
+    const task = makeTask("steering-guard", "steering:guard");
+    attachFreshPass(task, NOW);
+    store.create(task);
+    const steering = {
+      steeringId: "telegram:update:2001",
+      receivedAt: NOW,
+      kind: "answer" as const,
+      operatorRef: "telegram:100000000",
+      text: "The bounded operator answer is durable evidence.",
+      consumedAt: null,
+    };
+
+    const appended = store.appendSteering(task.id, steering);
+    assert.deepEqual(appended.task.steering, [steering]);
+    assert.equal(appended.task.verification, null);
+    const replayed = store.appendSteering(task.id, steering);
+    assert.equal(replayed.journalAppended, false);
+    assert.deepEqual(replayed.task, appended.task);
+    assert.throws(
+      () => store.appendSteering(task.id, { ...steering, text: "conflicting reuse" }),
+      /conflicts with its durable record/,
+    );
+
+    assert.equal(store.setPaused(task.id, true).task.control.paused, true);
+    assert.equal(store.setPaused(task.id, true).journalAppended, false);
+    assert.equal(store.clearPaused(task.id).task.control.pausedAt, null);
+    const interrupt = {
+      requestedAt: NOW,
+      mode: "cancel" as const,
+      reason: "Cancel only after the owned process group is proven stopped.",
+    };
+    assert.deepEqual(store.setInterrupt(task.id, interrupt).task.control.interrupt, interrupt);
+    assert.equal(store.setInterrupt(task.id, interrupt).journalAppended, false);
+    assert.throws(
+      () => store.setInterrupt(task.id, { ...interrupt, mode: "pause" }),
+      /different pending interrupt/,
+    );
+    assert.equal(store.clearInterrupt(task.id).task.control.interrupt, null);
+
+    assert.throws(
+      () => store.mutate(task.id, { event: "UPDATED" }, (working) => {
+        working.steering = [];
+      }),
+      /erase steering history/,
+    );
+
+    const full = makeTask("steering-full", "steering:full");
+    full.steering = Array.from(
+      { length: OPS_WORKER_LIMITS.maxSteeringEntries },
+      (_, index) => ({ ...steering, steeringId: `telegram:update:full:${index}` }),
+    );
+    store.create(full);
+    assert.throws(
+      () => store.appendSteering(full.id, { ...steering, steeringId: "telegram:update:overflow" }),
+      /exceeds 64 entries/,
+    );
+
+    const terminal = makeTask("steering-terminal", "steering:terminal");
+    terminal.state = "CANCELLED";
+    terminal.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    };
+    store.create(terminal);
+    assert.throws(
+      () => store.appendSteering(
+        terminal.id,
+        { ...steering, steeringId: "telegram:update:terminal" },
+      ),
+      /terminal task/,
+    );
   });
 
   it("persists report evidence on migrated legacy DONE snapshots without inventing PASS", (t) => {
@@ -1260,7 +1492,7 @@ describe("ops worker durable task store", () => {
       assert.equal(store.get(previous.id)?.report.attempts, 1);
       assert.equal(
         (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
-        4,
+        5,
       );
     }
   });

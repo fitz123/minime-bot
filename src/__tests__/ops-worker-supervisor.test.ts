@@ -135,7 +135,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id,
     source: {
       kind: sourceKind,
@@ -163,6 +163,8 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,

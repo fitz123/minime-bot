@@ -27,6 +27,8 @@ import {
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  type OpsWorkerInterrupt,
+  type OpsWorkerSteeringEntry,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
@@ -763,6 +765,121 @@ export class OpsWorkerTaskStore {
     });
   }
 
+  appendSteering(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    audit: OpsWorkerAuditInput = {
+      event: "EVIDENCE",
+      summary: "Recorded durable operator steering",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      const existing = task.steering.find(
+        (candidate) => candidate.steeringId === entry.steeringId,
+      );
+      if (existing) {
+        if (JSON.stringify(existing) === JSON.stringify(entry)) {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Steering id ${JSON.stringify(entry.steeringId)} conflicts with its durable record`,
+        );
+      }
+      if (isOpsWorkerTerminalState(task.state)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing new steering for terminal task ${task.id}`,
+        );
+      }
+      if (task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Task steering exceeds ${OPS_WORKER_LIMITS.maxSteeringEntries} entries`,
+        );
+      }
+      task.steering.push(structuredClone(entry));
+      task.verification = null;
+      task.updatedAt = this.now().toISOString();
+    });
+  }
+
+  setPaused(
+    taskId: string,
+    paused: boolean,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: paused ? "Paused task at a safe boundary" : "Resumed task scheduling",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    if (typeof paused !== "boolean") {
+      throw new OpsWorkerTaskStoreSafetyError("Paused state must be a boolean");
+    }
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.paused === paused) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      if (paused && isOpsWorkerTerminalState(task.state)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to pause terminal task ${task.id}`,
+        );
+      }
+      const now = this.now().toISOString();
+      task.control.paused = paused;
+      task.control.pausedAt = paused ? now : null;
+      task.updatedAt = now;
+    });
+  }
+
+  clearPaused(
+    taskId: string,
+    audit?: OpsWorkerAuditInput,
+  ): OpsWorkerTaskStoreMutationResult {
+    return audit === undefined
+      ? this.setPaused(taskId, false)
+      : this.setPaused(taskId, false, audit);
+  }
+
+  setInterrupt(
+    taskId: string,
+    interrupt: OpsWorkerInterrupt,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: "Recorded durable operator interrupt",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.interrupt !== null) {
+        if (JSON.stringify(task.control.interrupt) === JSON.stringify(interrupt)) {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Task ${task.id} already has a different pending interrupt`,
+        );
+      }
+      if (isOpsWorkerTerminalState(task.state)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing an interrupt for terminal task ${task.id}`,
+        );
+      }
+      task.control.interrupt = structuredClone(interrupt);
+      task.updatedAt = this.now().toISOString();
+    });
+  }
+
+  clearInterrupt(
+    taskId: string,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: "Cleared durable operator interrupt",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.interrupt === null) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      task.control.interrupt = null;
+      task.updatedAt = this.now().toISOString();
+    });
+  }
+
   private ensureSafeDirectories(): void {
     if (ensureDirectory(this.stateDirectory)) {
       fsyncDirectory(dirname(this.stateDirectory));
@@ -833,6 +950,43 @@ export class OpsWorkerTaskStore {
   }
 
   private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+    if (
+      isOpsWorkerTerminalState(existing.state)
+      && replacement.steering.length !== existing.steering.length
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing new steering for terminal task ${existing.id}`,
+      );
+    }
+    if (replacement.steering.length < existing.steering.length) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing to erase steering history for task ${existing.id}`,
+      );
+    }
+    for (let index = 0; index < existing.steering.length; index += 1) {
+      const prior = existing.steering[index];
+      const next = replacement.steering[index];
+      if (
+        next === undefined
+        || prior.steeringId !== next.steeringId
+        || prior.receivedAt !== next.receivedAt
+        || prior.kind !== next.kind
+        || prior.operatorRef !== next.operatorRef
+        || prior.text !== next.text
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase, reorder, or change steering entry ${prior.steeringId}`,
+        );
+      }
+      if (
+        prior.consumedAt !== null
+        && next.consumedAt !== prior.consumedAt
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change consumed steering entry ${prior.steeringId}`,
+        );
+      }
+    }
     const priorAuthorization = existing.authorizationVerification;
     const nextAuthorization = replacement.authorizationVerification;
     if (priorAuthorization !== null) {

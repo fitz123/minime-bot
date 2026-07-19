@@ -271,7 +271,7 @@ describe("ops worker CLI and inactive runtime", () => {
       authorization: { scope: string[] };
     };
     assert.equal(task.id, "op-fixture-task-id");
-    assert.equal(task.schemaVersion, 4);
+    assert.equal(task.schemaVersion, 5);
     assert.equal(task.state, "QUEUED");
     assert.equal(task.source.deliveryKey, "operator-cli:fixture-delivery-one");
     assert.deepEqual(task.resource, {
@@ -293,7 +293,7 @@ describe("ops worker CLI and inactive runtime", () => {
     delete statusValue.policy;
     assert.deepEqual(statusValue, {
         service: "minime-ops-worker",
-        schemaVersion: 4,
+        schemaVersion: 5,
         totalTasks: 1,
         activeProcessGroups: 0,
         custodyOwner: null,
@@ -396,7 +396,7 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(inspected.code, 0, inspected.stderr);
     const normalized = JSON.parse(inspected.stdout) as OpsWorkerTask;
-    assert.equal(normalized.schemaVersion, 4);
+    assert.equal(normalized.schemaVersion, 5);
     assert.equal(normalized.source.deliveryKey, `legacy:${current.id}`);
     assert.deepEqual(normalized.resource, {
       kind: "host",
@@ -1095,7 +1095,7 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 4,
+      schemaVersion: 5,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);
