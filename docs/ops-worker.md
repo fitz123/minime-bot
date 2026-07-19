@@ -182,6 +182,13 @@ aliases rather than extension-local replacements; global/process aliases and
 reflective loader surfaces are rejected. Worker children additionally run with
 V8 string code generation disabled, including quota smoke probes.
 
+Trusted configured extras must provide an explicit, parallel manifest of every
+non-module runtime file they read relative to their entrypoint; an
+empty manifest is an explicit no-assets claim. Those bounded resources,
+entrypoint selection, bytes, and executable bits are included in the identity
+and private copy. The parent re-reads the generated wrappers and exact private
+snapshot manifests before acknowledging parity.
+
 ## Quota admission and waits
 
 Initial admission evaluates every active window in the existing server-reported
@@ -202,7 +209,10 @@ tool call. Success records a short-lived, single-use proof bound to the exact
 model, thinking level, primary context, parity contract, and resource digest.
 The real launch validates and consumes that proof atomically with its durable
 pre-spawn fence; an expired or mismatched proof returns to the probe flow without
-spawning. Another quota response refreshes the reset; invalid telemetry and
+spawning. A successful deadline probe for an unclaimed task does not bypass
+all-window admission or reuse the elapsed reset; if admission remains closed,
+the worker schedules a bounded host-native telemetry recheck. Another quota
+response refreshes the reset; invalid telemetry and
 probe infrastructure errors remain distinct bounded outcomes. No LLM is parked
 and no blind polling or guessed reset deadline is used.
 

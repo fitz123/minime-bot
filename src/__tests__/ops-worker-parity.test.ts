@@ -39,6 +39,7 @@ import { resolvePiSpawnExtensionArgs } from "../pi-rpc-protocol.js";
 import {
   acknowledgeOpsWorkerParityPass,
   cleanupOpsWorkerParityLaunch,
+  cleanupOpsWorkerParitySessionSnapshots,
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
 } from "../ops-worker/parity.js";
@@ -65,7 +66,10 @@ function writeFixtureSkill(root: string, name: string, content: string): string 
 }
 
 after(() => {
-  for (const path of created) rmSync(path, { recursive: true, force: true });
+  for (const path of created) {
+    if (existsSync(path)) cleanupOpsWorkerParitySessionSnapshots(path);
+    rmSync(path, { recursive: true, force: true });
+  }
 });
 
 describe("primary Pi resource contract", () => {
@@ -89,6 +93,7 @@ describe("primary Pi resource contract", () => {
 
     const contract = resolvePiPrimaryResourceContract({
       extensionOptions,
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: tools,
     });
@@ -151,6 +156,7 @@ describe("primary Pi resource contract", () => {
     assert.throws(() => resolvePiPrimaryResourceContract({
       ...base,
       extensionOptions: { ...base.extensionOptions, extraExtensions: [linkedExtension] },
+      extraExtensionResourcePaths: [[]],
     }), /non-symlink/);
     assert.throws(() => resolvePiPrimaryResourceContract({
       ...base,
@@ -172,12 +178,52 @@ describe("primary Pi resource contract", () => {
       ...base,
       toolNames: PI_BUILTIN_TOOL_NAMES.filter((tool) => tool !== "bash"),
     }), /missing built-in bash/);
+    assert.throws(() => resolvePiPrimaryResourceContract({
+      ...base,
+      extensionOptions: { ...base.extensionOptions, extraExtensions: [targetExtension] },
+    }), /require explicit non-module resource manifests/);
 
     symlinkSync(targetExtension, join(dirname(targetSkill), "linked-resource"));
     assert.throws(
       () => resolvePiPrimaryResourceContract(base),
       /must not contain symlinks/,
     );
+  });
+
+  it("binds extension and skill identities to the selected entrypoint", () => {
+    const root = tempDirectory();
+    const extensionA = join(root, "extension-a.mjs");
+    const extensionB = join(root, "extension-b.mjs");
+    writeFileSync(
+      extensionA,
+      "import './extension-b.mjs'; export default function extensionA() {}\n",
+      "utf8",
+    );
+    writeFileSync(
+      extensionB,
+      "import './extension-a.mjs'; export default function extensionB() {}\n",
+      "utf8",
+    );
+    const skillRoot = join(root, "shared-skill-package");
+    mkdirSync(skillRoot);
+    const skillA = join(skillRoot, "A.md");
+    const skillB = join(skillRoot, "B.md");
+    writeFileSync(skillA, "# Skill A\n", "utf8");
+    writeFileSync(skillB, "# Skill B\n", "utf8");
+
+    const contract = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        relpaths: [],
+        extraExtensions: [extensionA, extensionB],
+      },
+      extraExtensionResourcePaths: [[], []],
+      skillPaths: [skillA, skillB],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+
+    assert.notEqual(contract.extensionIdentities[0], contract.extensionIdentities[1]);
+    assert.notEqual(contract.skillIdentities[0], contract.skillIdentities[1]);
+    assert.deepEqual(validatePiPrimaryResourceContract(contract), contract);
   });
 
   it("rejects primary resources that the child parity protocol cannot represent", () => {
@@ -194,6 +240,7 @@ describe("primary Pi resource contract", () => {
     assert.throws(
       () => resolvePiPrimaryResourceContract({
         extensionOptions: { extensionsDir, extraExtensions },
+        extraExtensionResourcePaths: extraExtensions.map(() => []),
         skillPaths: [],
         toolNames: [...PI_BUILTIN_TOOL_NAMES],
       }),
@@ -474,6 +521,7 @@ describe("ops-worker before-provider parity attestation", () => {
         extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
         extraExtensions: [handlerOnly],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -606,6 +654,7 @@ describe("ops-worker before-provider parity attestation", () => {
     writeFileSync(prompt, "PINNED_PROMPT\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -651,6 +700,62 @@ describe("ops-worker before-provider parity attestation", () => {
     cleanupOpsWorkerParityLaunch(launch);
   });
 
+  it("copies explicitly declared non-module resources for configured extensions", async () => {
+    const root = tempDirectory();
+    const extension = join(root, "configured-assets.mjs");
+    const asset = join(root, "configured-message.txt");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(
+      extension,
+      [
+        "import { readFileSync } from 'node:fs';",
+        "export default function extension(pi) {",
+        "  const message = readFileSync(new URL('./configured-message.txt', import.meta.url), 'utf8').trim();",
+        "  pi.registerCommand(`asset-${message}`, { handler: async () => {} });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(asset, "PINNED\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[asset]],
+      skillPaths: [],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    writeFileSync(asset, "CHANGED_LIVE\n", "utf8");
+    const commands: string[] = [];
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[0]).href}?declared=${Date.now()}`
+    )).default;
+
+    await wrapper({ registerCommand: (name: string) => commands.push(name) });
+
+    assert.ok(commands.includes("asset-PINNED"));
+    assert.equal(commands.includes("asset-CHANGED_LIVE"), false);
+    cleanupOpsWorkerParityLaunch(launch);
+  });
+
   it("removes private extension snapshots after use and on preparation failure", () => {
     const root = tempDirectory();
     const extension = join(root, "extension.mjs");
@@ -659,6 +764,7 @@ describe("ops-worker before-provider parity attestation", () => {
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -723,6 +829,7 @@ describe("ops-worker before-provider parity attestation", () => {
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -855,6 +962,7 @@ describe("ops-worker before-provider parity attestation", () => {
         extraExtensions: [extension],
         relpaths: [],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -941,6 +1049,7 @@ describe("ops-worker before-provider parity attestation", () => {
         relpaths: [],
         extraExtensions: [extension],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -1001,6 +1110,7 @@ describe("ops-worker before-provider parity attestation", () => {
         extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
         extraExtensions: [extension],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -1066,6 +1176,7 @@ describe("ops-worker before-provider parity attestation", () => {
         relpaths: [],
         extraExtensions: [extension],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -1112,7 +1223,8 @@ describe("ops-worker before-provider parity attestation", () => {
     const extension = join(root, "ack-extension.mjs");
     const skill = writeFixtureSkill(root, "ack-skill", "# ACK parity fixture\n");
     const bundlePath = join(root, "bundle.md");
-    writeFileSync(implementation, "export default function ackImplementation() {}\n", "utf8");
+    const originalImplementation = "export default function ackImplementation() {}\n";
+    writeFileSync(implementation, originalImplementation, "utf8");
     writeFileSync(extension, "export { default } from './ack-implementation.mjs';\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
@@ -1120,6 +1232,7 @@ describe("ops-worker before-provider parity attestation", () => {
         extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
         extraExtensions: [extension],
       },
+      extraExtensionResourcePaths: [[]],
       skillPaths: [skill],
       toolNames: [...PI_BUILTIN_TOOL_NAMES],
     });
@@ -1163,6 +1276,37 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.throws(
       () => acknowledgeOpsWorkerParityPass(launch),
       /hashes are inconsistent/,
+    );
+    assert.equal(existsSync(launch.ackPath), false);
+
+    writeFileSync(implementation, originalImplementation, "utf8");
+    const preparedWrapper = launch.preparedFiles.find(
+      (file) => file.path === launch.extensionPaths[0],
+    );
+    assert.ok(preparedWrapper);
+    const wrapperSource = readFileSync(preparedWrapper.path, "utf8");
+    chmodSync(preparedWrapper.path, 0o600);
+    writeFileSync(preparedWrapper.path, `${wrapperSource}\n// changed before ACK\n`, "utf8");
+    assert.throws(
+      () => acknowledgeOpsWorkerParityPass(launch),
+      /Prepared Pi launch file/,
+    );
+    writeFileSync(preparedWrapper.path, wrapperSource, "utf8");
+    chmodSync(preparedWrapper.path, 0o400);
+
+    const preparedImplementation = launch.preparedSnapshots
+      .flatMap((snapshot) => snapshot.files)
+      .find((file) => file.path.endsWith("ack-implementation.mjs"));
+    assert.ok(preparedImplementation);
+    chmodSync(preparedImplementation.path, 0o600);
+    writeFileSync(
+      preparedImplementation.path,
+      "export default function changedPreparedImplementation() {}\n",
+      "utf8",
+    );
+    assert.throws(
+      () => acknowledgeOpsWorkerParityPass(launch),
+      /Prepared Pi snapshot file/,
     );
     assert.equal(existsSync(launch.ackPath), false);
   });

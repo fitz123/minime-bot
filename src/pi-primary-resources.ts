@@ -130,6 +130,7 @@ export interface PiExtensionResourceFile {
   /** Private canonical path used only inside the launch handshake. */
   path: string;
   contentHash: string;
+  executable: boolean;
 }
 
 export interface PiExtensionResourceSnapshot {
@@ -137,9 +138,7 @@ export interface PiExtensionResourceSnapshot {
   files: readonly PiExtensionResourceFile[];
 }
 
-export interface PiSkillResourceFile extends PiExtensionResourceFile {
-  executable: boolean;
-}
+export type PiSkillResourceFile = PiExtensionResourceFile;
 
 export interface PiSkillResourceSnapshot {
   identity: string;
@@ -152,6 +151,8 @@ export interface PiPrimaryResourceContract {
   version: typeof PI_PRIMARY_RESOURCE_CONTRACT_VERSION;
   /** Trusted absolute entrypoints used to build repeatable --extension args. */
   extensionPaths: readonly string[];
+  /** Trusted additional regular-file resources, parallel to extensionPaths. */
+  extensionResourcePaths: readonly (readonly string[])[];
   /** Trusted direct skill files used to build repeatable --skill args. */
   skillPaths: readonly string[];
   /** The primary session's complete selected built-in and extension tool surface. */
@@ -166,6 +167,12 @@ export interface PiPrimaryResourceContract {
 
 export interface ResolvePiPrimaryResourceContractOptions {
   extensionOptions?: PiSpawnExtensionOptions;
+  /**
+   * Explicit resource manifests for configured extra extensions, parallel to
+   * extensionOptions.extraExtensions. An empty manifest is an explicit claim
+   * that the extra has no non-module runtime resources.
+   */
+  extraExtensionResourcePaths?: readonly (readonly string[])[];
   skillPaths: readonly string[];
   toolNames: readonly string[];
 }
@@ -500,9 +507,44 @@ function packageOwnedExtensionResourcePaths(
     ));
 }
 
-function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
+function declaredExtensionResourcePaths(
+  paths: readonly string[],
+): Array<{ path: string; executable: boolean }> {
+  const resources: Array<{ path: string; executable: boolean }> = [];
+  for (const [index, path] of paths.entries()) {
+    if (typeof path !== "string" || path.trim() === "" || !isAbsolute(path)) {
+      throw new TypeError(
+        `Pi extension resource manifest[${index}] must be a non-empty absolute path`,
+      );
+    }
+    const normalized = normalize(resolve(path));
+    const direct = lstatSync(normalized);
+    if (direct.isSymbolicLink()) {
+      throw new TypeError("Pi extension resource manifest must not contain symlinks");
+    }
+    if (!direct.isFile()) {
+      throw new TypeError(
+        "Pi extension resource manifest must contain only regular files",
+      );
+    }
+    resources.push({
+      path: strictTrustedFile(normalized, `Pi extension resource manifest[${index}]`),
+      executable: (direct.mode & 0o111) !== 0,
+    });
+  }
+  const unique = new Map(resources.map((resource) => [resource.path, resource]));
+  return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function extensionResourceFiles(
+  entryPath: string,
+  declaredResourcePaths: readonly string[] = [],
+): PiExtensionResourceFile[] {
   const trustedEntryPath = strictTrustedFile(entryPath, "Pi extension resource");
-  const packageOwnedResources = packageOwnedExtensionResourcePaths(trustedEntryPath);
+  const additionalResources = [
+    ...packageOwnedExtensionResourcePaths(trustedEntryPath),
+    ...declaredExtensionResourcePaths(declaredResourcePaths),
+  ];
   const pending = [trustedEntryPath];
   const seen = new Set<string>();
   const files: PiExtensionResourceFile[] = [];
@@ -519,14 +561,18 @@ function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
     if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
       throw new TypeError("Pi extension dependency closure exceeds the bounded byte limit");
     }
-    files.push({ path, contentHash: sha256(content) });
+    files.push({
+      path,
+      contentHash: sha256(content),
+      executable: (lstatSync(path).mode & 0o111) !== 0,
+    });
     if (extname(path) === ".json") continue;
     for (const specifier of localModuleSpecifiers(path, content)) {
       const dependency = resolveLocalModule(path, specifier);
       if (!seen.has(dependency)) pending.push(dependency);
     }
   }
-  for (const resource of packageOwnedResources) {
+  for (const resource of additionalResources) {
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
     if (seen.size > MAX_EXTENSION_RESOURCE_FILES) {
@@ -537,17 +583,29 @@ function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
     if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
       throw new TypeError("Pi extension resource closure exceeds the bounded byte limit");
     }
-    files.push({ path: resource.path, contentHash: sha256(content) });
+    files.push({
+      path: resource.path,
+      contentHash: sha256(content),
+      executable: resource.executable,
+    });
   }
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-export function createPiExtensionResourceSnapshot(path: string): PiExtensionResourceSnapshot {
-  const files = extensionResourceFiles(path);
+export function createPiExtensionResourceSnapshot(
+  path: string,
+  declaredResourcePaths: readonly string[] = [],
+): PiExtensionResourceSnapshot {
+  const entryPath = strictTrustedFile(path, "Pi extension resource");
+  const files = extensionResourceFiles(entryPath, declaredResourcePaths);
+  const entryIndex = files.findIndex((file) => file.path === entryPath);
+  if (entryIndex < 0) {
+    throw new TypeError("Pi extension entrypoint is absent from its resource closure");
+  }
   return {
     files,
     identity: sha256(
-      `minime-pi-extension-identity-v5\0${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)}\0${JSON.stringify(files)}`,
+      `minime-pi-extension-identity-v6\0${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)}\0${entryIndex}\0${JSON.stringify(files)}`,
     ),
   };
 }
@@ -578,19 +636,29 @@ export function createPiSkillResourceSnapshot(path: string): PiSkillResourceSnap
     contentHash: file.contentHash,
     executable: file.executable,
   }));
+  const skillEntrypoint = relative(rootPath, skillPath).split(sep).join("/");
   return {
     rootPath,
     skillPath,
     files,
-    identity: sha256(`minime-pi-skill-identity-v4\0${JSON.stringify(identityFiles)}`),
+    identity: sha256(
+      `minime-pi-skill-identity-v5\0${skillEntrypoint}\0${JSON.stringify(identityFiles)}`,
+    ),
   };
 }
 
 /** Stable one-way identity: private path and content bytes are never persisted or reported. */
-export function piResourceIdentity(kind: "extension" | "skill", path: string): string {
+export function piResourceIdentity(
+  kind: "extension" | "skill",
+  path: string,
+  extensionResourcePaths: readonly string[] = [],
+): string {
   const trustedPath = strictTrustedFile(path, `Pi ${kind} resource`);
   if (kind === "extension") {
-    return createPiExtensionResourceSnapshot(trustedPath).identity;
+    return createPiExtensionResourceSnapshot(trustedPath, extensionResourcePaths).identity;
+  }
+  if (extensionResourcePaths.length > 0) {
+    throw new TypeError("Pi skill identities do not accept extension resource paths");
   }
   // Worker attempts execute a private copy of the accepted skill package. Keep
   // the identity path-independent so that immutable copy retains the primary
@@ -634,8 +702,20 @@ function requireUnique(values: readonly string[], label: string): string[] {
   return result;
 }
 
+function normalizeDeclaredExtensionResourcePath(path: string, label: string): string {
+  if (typeof path !== "string" || path.trim() === "" || !isAbsolute(path)) {
+    throw new TypeError(`${label} must be a non-empty absolute path`);
+  }
+  const normalized = normalize(resolve(path));
+  const direct = lstatSync(normalized);
+  if (direct.isSymbolicLink()) throw new TypeError(`${label} must not be a symlink`);
+  if (direct.isFile()) return strictTrustedFile(normalized, label);
+  throw new TypeError(`${label} must be a regular file`);
+}
+
 function buildPiPrimaryResourceContract(input: {
   extensionPaths: readonly string[];
+  extensionResourcePaths: readonly (readonly string[])[];
   skillPaths: readonly string[];
   toolNames: readonly string[];
 }): PiPrimaryResourceContract {
@@ -644,6 +724,26 @@ function buildPiPrimaryResourceContract(input: {
   if (extensionPaths.length === 0) {
     throw new TypeError("Primary Pi resources must include explicit extensions");
   }
+  if (
+    !Array.isArray(input.extensionResourcePaths)
+    || input.extensionResourcePaths.length !== extensionPaths.length
+  ) {
+    throw new TypeError(
+      "Primary Pi extension resource manifests must be parallel to extension paths",
+    );
+  }
+  const extensionResourcePaths = input.extensionResourcePaths.map((resources, extensionIndex) => {
+    if (!Array.isArray(resources)) {
+      throw new TypeError(
+        `primary extension resource manifest[${extensionIndex}] must be an array`,
+      );
+    }
+    return requireUnique(resources.map((path, resourceIndex) =>
+      normalizeDeclaredExtensionResourcePath(
+        path,
+        `primary extension resource[${extensionIndex}][${resourceIndex}]`,
+      )), `Primary Pi extension resource manifest[${extensionIndex}]`);
+  });
   const skillPaths = requireUnique(input.skillPaths.map((path, index) => {
     const resolved = strictTrustedFile(path, `primary skill[${index}]`);
     if (!resolved.endsWith(".md")) {
@@ -662,8 +762,11 @@ function buildPiPrimaryResourceContract(input: {
       throw new TypeError(`Primary Pi tools are incomplete: missing built-in ${builtIn}`);
     }
   }
-  const extensionIdentities = extensionPaths.map((path) => piResourceIdentity("extension", path));
-  const skillIdentities = skillPaths.map((path) => piResourceIdentity("skill", path));
+  const extensionIdentities = requireUnique(extensionPaths.map((path, index) =>
+    piResourceIdentity("extension", path, extensionResourcePaths[index])),
+  "Primary Pi extension identities");
+  const skillIdentities = requireUnique(skillPaths.map((path) =>
+    piResourceIdentity("skill", path)), "Primary Pi skill identities");
   assertOpsWorkerParityContractRepresentable({
     extensionIdentities,
     skillIdentities,
@@ -676,6 +779,7 @@ function buildPiPrimaryResourceContract(input: {
   return {
     version: PI_PRIMARY_RESOURCE_CONTRACT_VERSION,
     extensionPaths,
+    extensionResourcePaths,
     skillPaths,
     toolNames,
     extensionIdentities,
@@ -696,8 +800,29 @@ export function resolvePiPrimaryResourceContract(
   options: ResolvePiPrimaryResourceContractOptions,
 ): PiPrimaryResourceContract {
   const resolvedExtensionArgs = resolvePiSpawnExtensionArgs(options.extensionOptions);
+  const extensionPaths = extensionPathsFromArgs(resolvedExtensionArgs);
+  const extraExtensions = options.extensionOptions?.extraExtensions ?? [];
+  if (extraExtensions.length > 0 && options.extraExtensionResourcePaths === undefined) {
+    throw new TypeError(
+      "Configured extra Pi extensions require explicit non-module resource manifests",
+    );
+  }
+  const extraResourcePaths = options.extraExtensionResourcePaths ?? [];
+  if (extraResourcePaths.length !== extraExtensions.length) {
+    throw new TypeError(
+      "Configured extra Pi extension resource manifests must be parallel to extra extensions",
+    );
+  }
+  const firstPartyCount = extensionPaths.length - extraExtensions.length;
+  if (firstPartyCount < 0) {
+    throw new TypeError("Primary Pi extension resolver returned fewer paths than configured extras");
+  }
   return buildPiPrimaryResourceContract({
-    extensionPaths: extensionPathsFromArgs(resolvedExtensionArgs),
+    extensionPaths,
+    extensionResourcePaths: [
+      ...Array.from({ length: firstPartyCount }, () => [] as string[]),
+      ...extraResourcePaths,
+    ],
     skillPaths: options.skillPaths,
     toolNames: options.toolNames,
   });

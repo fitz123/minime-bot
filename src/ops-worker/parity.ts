@@ -89,10 +89,23 @@ export interface OpsWorkerParityLaunch {
   sessionDirectory: string;
   /** Private copied extension closures and skill packages used only for this child launch. */
   snapshotRoots: readonly string[];
+  /** Exact private directory manifests launched by the child. */
+  preparedSnapshots: readonly OpsWorkerPreparedSnapshot[];
+  /** Generated wrappers and parent-owned handshake inputs outside snapshot roots. */
+  preparedFiles: readonly OpsWorkerPreparedFile[];
   /** Generated identity wrappers followed by the package parity gate. */
   extensionPaths: readonly string[];
   /** Immutable package copies rooted at each primary skill file. */
   skillPaths: readonly string[];
+}
+
+export interface OpsWorkerPreparedFile extends PiExtensionResourceFile {
+  executable: boolean;
+}
+
+export interface OpsWorkerPreparedSnapshot {
+  rootPath: string;
+  files: readonly OpsWorkerPreparedFile[];
 }
 
 const PARITY_SNAPSHOT_DIRECTORY_PATTERN =
@@ -114,11 +127,13 @@ function assertSafeSessionFile(path: string): void {
   }
 }
 
-function writePrivateJson(path: string, value: unknown): void {
+function writePrivateJson(path: string, value: unknown): OpsWorkerPreparedFile {
   assertSafeSessionFile(path);
+  const content = `${JSON.stringify(value)}\n`;
   const staging = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
-  writeFileSync(staging, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: "wx" });
+  writeFileSync(staging, content, { mode: 0o400, flag: "wx" });
   renameSync(staging, path);
+  return { path, contentHash: sha256(content), executable: false };
 }
 
 function writePrivateExtensionWrapper(
@@ -126,7 +141,7 @@ function writePrivateExtensionWrapper(
   targetPath: string,
   identity: string,
   resourceFiles: readonly PiExtensionResourceFile[],
-): void {
+): OpsWorkerPreparedFile {
   assertSafeSessionFile(path);
   const digest = identity.startsWith("sha256:") ? identity.slice("sha256:".length) : "";
   if (!/^[a-f0-9]{64}$/.test(digest)) {
@@ -148,6 +163,7 @@ function writePrivateExtensionWrapper(
     "  for (const expected of expectedFiles) {",
     "    const direct = lstatSync(expected.path);",
     "    if (!direct.isFile() || direct.isSymbolicLink()) throw new Error('Pi extension resource changed after parity preparation');",
+    "    if (((direct.mode & 0o111) !== 0) !== expected.executable) throw new Error('Pi extension resource changed after parity preparation');",
     "    if (typeof process.getuid === 'function' && direct.uid !== process.getuid()) throw new Error('Pi extension resource changed after parity preparation');",
     "    if (normalize(realpathSync(expected.path)) !== normalize(resolve(expected.path))) throw new Error('Pi extension resource changed after parity preparation');",
     "    const descriptor = openSync(expected.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));",
@@ -174,6 +190,7 @@ function writePrivateExtensionWrapper(
   const staging = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   writeFileSync(staging, source, { mode: 0o400, flag: "wx" });
   renameSync(staging, path);
+  return { path, contentHash: sha256(source), executable: false };
 }
 
 function commonResourceDirectory(files: readonly PiExtensionResourceFile[]): string {
@@ -195,19 +212,40 @@ function commonResourceDirectory(files: readonly PiExtensionResourceFile[]): str
   }
 }
 
+function setPrivateSnapshotDirectoryMode(snapshotRoot: string, mode: number): void {
+  const pending = [snapshotRoot];
+  while (pending.length > 0) {
+    const directory = pending.pop() as string;
+    const direct = lstatSync(directory);
+    if (!direct.isDirectory() || direct.isSymbolicLink()) {
+      throw new Error("Ops-worker parity snapshot contains an unsafe directory");
+    }
+    chmodSync(directory, mode);
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const child = join(directory, entry.name);
+      if (lstatSync(child).isSymbolicLink()) {
+        throw new Error("Ops-worker parity snapshot contains a symlinked directory");
+      }
+      pending.push(child);
+    }
+  }
+}
+
 function readPinnedResource(file: PiExtensionResourceFile, label = "Pi resource"): Buffer {
   const direct = lstatSync(file.path);
   if (
     !direct.isFile()
     || direct.isSymbolicLink()
+    || ((direct.mode & 0o111) !== 0) !== file.executable
     || (typeof process.getuid === "function" && direct.uid !== process.getuid())
     || normalize(realpathSync(file.path)) !== normalize(resolve(file.path))
-  ) throw new Error(`${label} changed during private snapshot creation`);
+  ) throw new Error(`${label} path changed during private snapshot creation`);
   const descriptor = openSync(file.path, constants.O_RDONLY | NO_FOLLOW);
   try {
     const opened = fstatSync(descriptor);
     if (!opened.isFile() || opened.dev !== direct.dev || opened.ino !== direct.ino) {
-      throw new Error(`${label} changed during private snapshot creation`);
+      throw new Error(`${label} identity changed during private snapshot creation`);
     }
     const content = readFileSync(descriptor);
     const completed = fstatSync(descriptor);
@@ -217,8 +255,10 @@ function readPinnedResource(file: PiExtensionResourceFile, label = "Pi resource"
       || completed.size !== opened.size
       || completed.mtimeMs !== opened.mtimeMs
       || completed.ctimeMs !== opened.ctimeMs
-      || sha256(content) !== file.contentHash
-    ) throw new Error(`${label} changed during private snapshot creation`);
+    ) throw new Error(`${label} metadata changed during private snapshot creation`);
+    if (sha256(content) !== file.contentHash) {
+      throw new Error(`${label} content changed during private snapshot creation`);
+    }
     return content;
   } finally {
     closeSync(descriptor);
@@ -230,7 +270,7 @@ function writePrivateExtensionSnapshot(
   label: string,
   targetPath: string,
   snapshot: readonly PiExtensionResourceFile[],
-): { snapshotRoot: string; targetPath: string; files: PiExtensionResourceFile[] } {
+): { snapshotRoot: string; targetPath: string; files: OpsWorkerPreparedFile[] } {
   const common = commonResourceDirectory(snapshot);
   const snapshotRoot = normalize(realpathSync(
     mkdtempSync(join(sessionDirectory, `${label}-snapshot-`)),
@@ -244,8 +284,16 @@ function writePrivateExtensionSnapshot(
       }
       const destination = join(snapshotRoot, child);
       mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-      writeFileSync(destination, readPinnedResource(file), { mode: 0o400, flag: "wx" });
-      return { path: destination, contentHash: file.contentHash };
+      writeFileSync(
+        destination,
+        readPinnedResource(file),
+        { mode: file.executable ? 0o500 : 0o400, flag: "wx" },
+      );
+      return {
+        path: destination,
+        contentHash: file.contentHash,
+        executable: file.executable,
+      };
     });
     const targetChild = relative(common, targetPath);
     if (
@@ -257,8 +305,10 @@ function writePrivateExtensionSnapshot(
     if (!copied.some((file) => file.path === copiedTarget)) {
       throw new TypeError("Pi extension entrypoint is absent from its private snapshot");
     }
+    setPrivateSnapshotDirectoryMode(snapshotRoot, 0o500);
     return { snapshotRoot, targetPath: copiedTarget, files: copied };
   } catch (error) {
+    setPrivateSnapshotDirectoryMode(snapshotRoot, 0o700);
     rmSync(snapshotRoot, { recursive: true, force: true });
     throw error;
   }
@@ -269,7 +319,7 @@ function writePrivateSkillSnapshot(
   label: string,
   sourcePath: string,
   identity: string,
-): { snapshotRoot: string; skillPath: string } {
+): { snapshotRoot: string; skillPath: string; files: OpsWorkerPreparedFile[] } {
   const snapshot = createPiSkillResourceSnapshot(sourcePath);
   if (snapshot.identity !== identity) {
     throw new Error("Pi skill package changed during private snapshot creation");
@@ -291,7 +341,11 @@ function writePrivateSkillSnapshot(
         readPinnedResource(file, "Pi skill package"),
         { mode: file.executable ? 0o500 : 0o400, flag: "wx" },
       );
-      return destination;
+      return {
+        path: destination,
+        contentHash: file.contentHash,
+        executable: file.executable,
+      };
     });
     const skillChild = relative(snapshot.rootPath, snapshot.skillPath);
     if (
@@ -300,14 +354,16 @@ function writePrivateSkillSnapshot(
       || isAbsolute(skillChild)
     ) throw new TypeError("Pi skill entrypoint escaped its private snapshot");
     const skillPath = join(snapshotRoot, skillChild);
-    if (!copied.includes(skillPath)) {
+    if (!copied.some((file) => file.path === skillPath)) {
       throw new TypeError("Pi skill entrypoint is absent from its private snapshot");
     }
     if (piResourceIdentity("skill", skillPath) !== identity) {
       throw new Error("Pi skill package changed during private snapshot creation");
     }
-    return { snapshotRoot, skillPath };
+    setPrivateSnapshotDirectoryMode(snapshotRoot, 0o500);
+    return { snapshotRoot, skillPath, files: copied };
   } catch (error) {
+    setPrivateSnapshotDirectoryMode(snapshotRoot, 0o700);
     rmSync(snapshotRoot, { recursive: true, force: true });
     throw error;
   }
@@ -319,8 +375,15 @@ function preparePrivateExtensionWrapper(input: {
   wrapperPath: string;
   targetPath: string;
   identity: string;
-}): { wrapperPath: string; snapshotRoot: string } {
-  const snapshot = createPiExtensionResourceSnapshot(input.targetPath);
+  resourcePaths?: readonly string[];
+}): {
+  wrapper: OpsWorkerPreparedFile;
+  snapshot: OpsWorkerPreparedSnapshot;
+} {
+  const snapshot = createPiExtensionResourceSnapshot(
+    input.targetPath,
+    input.resourcePaths,
+  );
   if (snapshot.identity !== input.identity) {
     throw new Error("Pi extension changed during parity preparation");
   }
@@ -331,17 +394,79 @@ function preparePrivateExtensionWrapper(input: {
     snapshot.files,
   );
   try {
-    writePrivateExtensionWrapper(
+    const wrapper = writePrivateExtensionWrapper(
       input.wrapperPath,
       privateSnapshot.targetPath,
       input.identity,
       privateSnapshot.files,
     );
-    return { wrapperPath: input.wrapperPath, snapshotRoot: privateSnapshot.snapshotRoot };
+    return {
+      wrapper,
+      snapshot: {
+        rootPath: privateSnapshot.snapshotRoot,
+        files: privateSnapshot.files,
+      },
+    };
   } catch (error) {
-    rmSync(privateSnapshot.snapshotRoot, { recursive: true, force: true });
+    removePrivateSnapshotRoot(input.sessionDirectory, privateSnapshot.snapshotRoot);
     throw error;
   }
+}
+
+function verifyPreparedFile(file: OpsWorkerPreparedFile, label: string): void {
+  const direct = lstatSync(file.path);
+  if (((direct.mode & 0o111) !== 0) !== file.executable) {
+    throw new Error(`${label} executable mode changed after parity preparation`);
+  }
+  readPinnedResource(file, label);
+}
+
+function verifyPreparedSnapshot(snapshot: OpsWorkerPreparedSnapshot): void {
+  const directRoot = lstatSync(snapshot.rootPath);
+  if (
+    !directRoot.isDirectory()
+    || directRoot.isSymbolicLink()
+    || (directRoot.mode & 0o222) !== 0
+    || (typeof process.getuid === "function" && directRoot.uid !== process.getuid())
+    || normalize(realpathSync(snapshot.rootPath)) !== normalize(resolve(snapshot.rootPath))
+  ) throw new Error("Prepared Pi snapshot root changed before acknowledgement");
+
+  const expectedPaths = snapshot.files.map((file) => normalize(resolve(file.path))).sort();
+  if (new Set(expectedPaths).size !== expectedPaths.length) {
+    throw new Error("Prepared Pi snapshot manifest contains duplicate files");
+  }
+  const discovered: string[] = [];
+  const pending = [normalize(resolve(snapshot.rootPath))];
+  while (pending.length > 0) {
+    const directory = pending.pop() as string;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = normalize(resolve(directory, entry.name));
+      const direct = lstatSync(path);
+      if (
+        direct.isSymbolicLink()
+        || (typeof process.getuid === "function" && direct.uid !== process.getuid())
+        || normalize(realpathSync(path)) !== path
+      ) throw new Error("Prepared Pi snapshot changed before acknowledgement");
+      if (direct.isDirectory()) {
+        if ((direct.mode & 0o222) !== 0) {
+          throw new Error("Prepared Pi snapshot directory became writable");
+        }
+        pending.push(path);
+      } else if (direct.isFile()) {
+        discovered.push(path);
+        if (discovered.length > expectedPaths.length) {
+          throw new Error("Prepared Pi snapshot contains an unexpected file");
+        }
+      } else {
+        throw new Error("Prepared Pi snapshot contains an unsafe filesystem entry");
+      }
+    }
+  }
+  discovered.sort();
+  if (JSON.stringify(discovered) !== JSON.stringify(expectedPaths)) {
+    throw new Error("Prepared Pi snapshot file manifest changed before acknowledgement");
+  }
+  for (const file of snapshot.files) verifyPreparedFile(file, "Prepared Pi snapshot file");
 }
 
 function removePrivateSnapshotRoot(sessionDirectory: string, snapshotRoot: string): void {
@@ -364,6 +489,7 @@ function removePrivateSnapshotRoot(sessionDirectory: string, snapshotRoot: strin
     || relativeRoot === "."
     || !PARITY_SNAPSHOT_DIRECTORY_PATTERN.test(relativeRoot)
   ) throw new Error("Refusing to remove an unsafe ops-worker parity snapshot path");
+  setPrivateSnapshotDirectoryMode(canonicalSnapshotRoot, 0o700);
   rmSync(canonicalSnapshotRoot, { recursive: true, force: true });
 }
 
@@ -389,6 +515,7 @@ export function prepareOpsWorkerParityLaunch(input: {
   sessionDirectory: string;
   opsPolicy: string;
 }): OpsWorkerParityLaunch {
+  const sessionDirectory = normalize(realpathSync(input.sessionDirectory));
   const resources = validatePiPrimaryResourceContract(input.resources);
   const parityExtensionIdentity = piResourceIdentity("extension", input.parityExtensionPath);
   if (parityExtensionIdentity !== input.parityExtensionIdentity) {
@@ -417,43 +544,51 @@ export function prepareOpsWorkerParityLaunch(input: {
     skillIdentities: resources.skillIdentities,
     toolNames: resources.toolNames,
   });
-  const expectedPath = join(input.sessionDirectory, "parity-expected-v1.json");
-  const reportPath = join(input.sessionDirectory, "parity-report-v1.json");
-  const ackPath = join(input.sessionDirectory, "parity-ack-v1.txt");
-  writePrivateJson(expectedPath, expected);
+  const expectedPath = join(sessionDirectory, "parity-expected-v1.json");
+  const reportPath = join(sessionDirectory, "parity-report-v1.json");
+  const ackPath = join(sessionDirectory, "parity-ack-v1.txt");
+  const expectedFile = writePrivateJson(expectedPath, expected);
   const snapshotRoots: string[] = [];
+  const preparedSnapshots: OpsWorkerPreparedSnapshot[] = [];
+  const preparedFiles: OpsWorkerPreparedFile[] = [expectedFile];
   try {
     const skillPaths = resources.skillPaths.map((skillPath, index) => {
       const prepared = writePrivateSkillSnapshot(
-        input.sessionDirectory,
+        sessionDirectory,
         `parity-skill-${index}`,
         skillPath,
         resources.skillIdentities[index],
       );
       snapshotRoots.push(prepared.snapshotRoot);
+      preparedSnapshots.push({ rootPath: prepared.snapshotRoot, files: prepared.files });
       return prepared.skillPath;
     });
     const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
-      const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
+      const wrapperPath = join(sessionDirectory, `parity-extension-${index}.mjs`);
       const prepared = preparePrivateExtensionWrapper({
-        sessionDirectory: input.sessionDirectory,
+        sessionDirectory,
         label: `parity-extension-${index}`,
         wrapperPath,
         targetPath: extensionPath,
         identity: resources.extensionIdentities[index],
+        resourcePaths: resources.extensionResourcePaths[index],
       });
-      snapshotRoots.push(prepared.snapshotRoot);
-      return prepared.wrapperPath;
+      snapshotRoots.push(prepared.snapshot.rootPath);
+      preparedSnapshots.push(prepared.snapshot);
+      preparedFiles.push(prepared.wrapper);
+      return prepared.wrapper.path;
     });
-    const parityWrapperPath = join(input.sessionDirectory, "parity-gate.mjs");
+    const parityWrapperPath = join(sessionDirectory, "parity-gate.mjs");
     const preparedParity = preparePrivateExtensionWrapper({
-      sessionDirectory: input.sessionDirectory,
+      sessionDirectory,
       label: "parity-gate",
       wrapperPath: parityWrapperPath,
       targetPath: input.parityExtensionPath,
       identity: parityExtensionIdentity,
     });
-    snapshotRoots.push(preparedParity.snapshotRoot);
+    snapshotRoots.push(preparedParity.snapshot.rootPath);
+    preparedSnapshots.push(preparedParity.snapshot);
+    preparedFiles.push(preparedParity.wrapper);
     assertSafeSessionFile(reportPath);
     assertSafeSessionFile(ackPath);
     return {
@@ -464,14 +599,16 @@ export function prepareOpsWorkerParityLaunch(input: {
       parityExtensionPath: input.parityExtensionPath,
       parityExtensionIdentity,
       primaryResources: resources,
-      sessionDirectory: input.sessionDirectory,
+      sessionDirectory,
       snapshotRoots,
+      preparedSnapshots,
+      preparedFiles,
       extensionPaths: [...wrappedExtensionPaths, parityWrapperPath],
       skillPaths,
     };
   } catch (error) {
     for (const snapshotRoot of snapshotRoots) {
-      removePrivateSnapshotRoot(input.sessionDirectory, snapshotRoot);
+      removePrivateSnapshotRoot(sessionDirectory, snapshotRoot);
     }
     throw error;
   }
@@ -542,6 +679,16 @@ export function acknowledgeOpsWorkerParityPass(launch: OpsWorkerParityLaunch): v
     !== launch.parityExtensionIdentity) {
     throw new Error("Ops-worker parity extension changed before acknowledgement");
   }
+  if (
+    launch.preparedSnapshots.length !== launch.snapshotRoots.length
+    || launch.preparedSnapshots.some(
+      (snapshot, index) => snapshot.rootPath !== launch.snapshotRoots[index],
+    )
+  ) throw new Error("Ops-worker prepared snapshot manifests are inconsistent");
+  for (const snapshot of launch.preparedSnapshots) verifyPreparedSnapshot(snapshot);
+  launch.preparedFiles.forEach((file, index) => {
+    verifyPreparedFile(file, `Prepared Pi launch file[${index}]`);
+  });
   const staging = `${launch.ackPath}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   writeFileSync(staging, `${launch.expected.digest}\n`, { mode: 0o600, flag: "wx" });
   renameSync(staging, launch.ackPath);

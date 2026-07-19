@@ -1475,9 +1475,16 @@ export class OpsWorkerSupervisor {
         `Quota admission wait requires QUEUED or RESUMABLE, found ${existing.state}`,
       );
     }
-    const nextRunAt = isAuthoritativeQuotaDecision(decision)
+    const observedNow = this.now();
+    const authoritativeNextProbeAt = isAuthoritativeQuotaDecision(decision)
       ? decision.nextProbeAt as string
-      : new Date(this.now().getTime() + this.quotaRecheckMs).toISOString();
+      : null;
+    const consumedElapsedDeadline = existing.lastOutcome?.result === "QUOTA_PROBE_PASS"
+      && authoritativeNextProbeAt !== null
+      && Date.parse(authoritativeNextProbeAt) <= observedNow.getTime();
+    const nextRunAt = authoritativeNextProbeAt !== null && !consumedElapsedDeadline
+      ? authoritativeNextProbeAt
+      : new Date(observedNow.getTime() + this.quotaRecheckMs).toISOString();
     return this.store.mutate(
       taskId,
       { event: "TRANSITION", summary: "Recorded durable quota admission wait" },

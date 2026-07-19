@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -37,6 +38,7 @@ import {
   type OpsWorkerDoneCheckDefinition,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import { cleanupOpsWorkerParitySessionSnapshots } from "../ops-worker/parity.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
   OpsWorkerQuotaAdmissionGate,
@@ -330,6 +332,7 @@ async function makeHarness(
       relpaths: [],
       extraExtensions: [extraExtension],
     },
+    extraExtensionResourcePaths: [[]],
     skillPaths: [skillPath],
     toolNames: PRIMARY_TOOL_NAMES,
   });
@@ -370,6 +373,25 @@ async function makeHarness(
       }
     }
     supervisor.close();
+    const sessionsRoot = join(stateDirectory, "sessions");
+    if (existsSync(sessionsRoot)) {
+      for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const sessionDirectory = join(sessionsRoot, entry.name);
+          for (const snapshot of readdirSync(sessionDirectory, { withFileTypes: true })) {
+            if (
+              /^parity-(?:extension-[0-9]+|skill-[0-9]+|gate)-snapshot-[A-Za-z0-9]+$/.test(
+                snapshot.name,
+              )
+              && !snapshot.isDirectory()
+            ) {
+              rmSync(join(sessionDirectory, snapshot.name), { force: true });
+            }
+          }
+          cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
+        }
+      }
+    }
     rmSync(root, { recursive: true, force: true });
   });
   return {
@@ -1435,7 +1457,7 @@ describe("ops worker Pi standard-session attempts", () => {
         dependencies: {
           runQuotaProbe: async (request) => {
             const snapshotRoot = request.parityLaunch.snapshotRoots[0];
-            rmSync(snapshotRoot, { recursive: true, force: true });
+            cleanupOpsWorkerParitySessionSnapshots(request.parityLaunch.sessionDirectory);
             writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
             return { status: "SUCCESS" };
           },
@@ -1489,7 +1511,7 @@ describe("ops worker Pi standard-session attempts", () => {
                 /^parity-extension-[0-9]+-snapshot-/.test(name));
               if (snapshotName === undefined) return;
               const snapshotRoot = join(sessionDirectory, snapshotName);
-              rmSync(snapshotRoot, { recursive: true, force: true });
+              cleanupOpsWorkerParitySessionSnapshots(sessionDirectory);
               writeFileSync(snapshotRoot, "unsafe cleanup fixture\n", "utf8");
               corruptedSnapshot = true;
             });

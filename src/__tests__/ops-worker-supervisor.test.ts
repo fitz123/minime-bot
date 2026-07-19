@@ -1169,6 +1169,8 @@ describe("ops worker supervisor", () => {
     assert.equal(stillWaiting?.task.id, telemetryTask.id);
     assert.equal(stillWaiting?.task.custody.status, "UNCLAIMED");
     assert.equal(stillWaiting?.task.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+    assert.equal(stillWaiting?.task.schedule.nextRunAt, "2026-07-17T12:05:01.000Z");
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
   });
 
   it("preserves a fresh probe proof until launch and expires a stale pass", async (t) => {
