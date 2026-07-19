@@ -43,6 +43,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
+  hashOpsWorkerPiLaunchSubject,
   hashOpsWorkerVerificationSubject,
   isOpsWorkerUnclaimedQuotaProbeProcess,
   type OpsWorkerActiveRun,
@@ -1161,7 +1162,7 @@ export class OpsWorkerSupervisor {
   beginPiLaunch(
     taskId: string,
     launchIntent: OpsWorkerUnverifiedRun,
-    preparedTaskUpdatedAt: string,
+    preparedTaskSubjectHash: string,
     quotaProbeSubjectHash?: string,
   ): OpsWorkerTask {
     this.assertStarted();
@@ -1174,9 +1175,9 @@ export class OpsWorkerSupervisor {
         "Quota probe proof subject must be a lowercase sha256 digest",
       );
     }
-    if (!TIMESTAMP_PATTERN.test(preparedTaskUpdatedAt)) {
+    if (!SHA256_PATTERN.test(preparedTaskSubjectHash)) {
       throw new OpsWorkerSupervisorStateError(
-        "Prepared Pi launch task timestamp must be an ISO-8601 UTC timestamp",
+        "Prepared Pi launch task subject must be a lowercase sha256 digest",
       );
     }
     if (this.piLaunchReservation !== taskId) {
@@ -1209,7 +1210,7 @@ export class OpsWorkerSupervisor {
       },
       (replacement) => {
         if (
-          replacement.updatedAt !== preparedTaskUpdatedAt
+          hashOpsWorkerPiLaunchSubject(replacement) !== preparedTaskSubjectHash
           || !hasFreshOpsWorkerAuthorizationPass(replacement)
         ) return OPS_WORKER_TASK_STORE_NO_CHANGE;
         if (replacement.state !== "QUEUED" && replacement.state !== "RESUMABLE") {

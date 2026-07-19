@@ -433,9 +433,11 @@ export function piResourceIdentity(kind: "extension" | "skill", path: string): s
   if (kind === "extension") {
     return createPiExtensionResourceSnapshot(trustedPath).identity;
   }
+  // Worker attempts execute a private copy of the accepted skill bytes. Keep
+  // the identity path-independent so that immutable copy retains the primary
+  // skill's capability identity without exposing its private host path.
   return sha256([
-    "minime-pi-skill-identity-v2",
-    trustedPath,
+    "minime-pi-skill-identity-v3",
     trustedFileContentHash(trustedPath),
   ].join("\0"));
 }

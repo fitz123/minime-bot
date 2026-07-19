@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
@@ -85,14 +85,16 @@ export interface OpsWorkerParityLaunch {
   parityExtensionIdentity: string;
   primaryResources: PiPrimaryResourceContract;
   sessionDirectory: string;
-  /** Private copied extension closures used only for this child launch. */
+  /** Private copied extension closures and skill files used only for this child launch. */
   snapshotRoots: readonly string[];
   /** Generated identity wrappers followed by the package parity gate. */
   extensionPaths: readonly string[];
+  /** Immutable copies of the primary skill files. */
+  skillPaths: readonly string[];
 }
 
 const PARITY_SNAPSHOT_DIRECTORY_PATTERN =
-  /^parity-(?:extension-[0-9]+|gate)-snapshot-[A-Za-z0-9]+$/;
+  /^parity-(?:extension-[0-9]+|skill-[0-9]+|gate)-snapshot-[A-Za-z0-9]+$/;
 
 function sha256(value: string | Buffer): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -260,6 +262,54 @@ function writePrivateExtensionSnapshot(
   }
 }
 
+function writePrivateSkillSnapshot(
+  sessionDirectory: string,
+  label: string,
+  sourcePath: string,
+  identity: string,
+): { snapshotRoot: string; skillPath: string } {
+  const snapshotRoot = normalize(realpathSync(
+    mkdtempSync(join(sessionDirectory, `${label}-snapshot-`)),
+  ));
+  chmodSync(snapshotRoot, 0o700);
+  try {
+    const direct = lstatSync(sourcePath);
+    if (!direct.isFile() || direct.isSymbolicLink()) {
+      throw new Error("Pi skill changed during private snapshot creation");
+    }
+    const descriptor = openSync(sourcePath, constants.O_RDONLY | NO_FOLLOW);
+    let content: Buffer;
+    try {
+      const opened = fstatSync(descriptor);
+      if (
+        !opened.isFile()
+        || opened.dev !== direct.dev
+        || opened.ino !== direct.ino
+      ) throw new Error("Pi skill changed during private snapshot creation");
+      content = readFileSync(descriptor);
+      const completed = fstatSync(descriptor);
+      if (
+        completed.dev !== opened.dev
+        || completed.ino !== opened.ino
+        || completed.size !== opened.size
+        || completed.mtimeMs !== opened.mtimeMs
+        || completed.ctimeMs !== opened.ctimeMs
+      ) throw new Error("Pi skill changed during private snapshot creation");
+    } finally {
+      closeSync(descriptor);
+    }
+    const skillPath = join(snapshotRoot, basename(sourcePath));
+    writeFileSync(skillPath, content, { mode: 0o400, flag: "wx" });
+    if (piResourceIdentity("skill", skillPath) !== identity) {
+      throw new Error("Pi skill changed during private snapshot creation");
+    }
+    return { snapshotRoot, skillPath };
+  } catch (error) {
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function preparePrivateExtensionWrapper(input: {
   sessionDirectory: string;
   label: string;
@@ -370,6 +420,16 @@ export function prepareOpsWorkerParityLaunch(input: {
   writePrivateJson(expectedPath, expected);
   const snapshotRoots: string[] = [];
   try {
+    const skillPaths = resources.skillPaths.map((skillPath, index) => {
+      const prepared = writePrivateSkillSnapshot(
+        input.sessionDirectory,
+        `parity-skill-${index}`,
+        skillPath,
+        resources.skillIdentities[index],
+      );
+      snapshotRoots.push(prepared.snapshotRoot);
+      return prepared.skillPath;
+    });
     const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
       const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
       const prepared = preparePrivateExtensionWrapper({
@@ -404,6 +464,7 @@ export function prepareOpsWorkerParityLaunch(input: {
       sessionDirectory: input.sessionDirectory,
       snapshotRoots,
       extensionPaths: [...wrappedExtensionPaths, parityWrapperPath],
+      skillPaths,
     };
   } catch (error) {
     for (const snapshotRoot of snapshotRoots) {

@@ -217,6 +217,13 @@ switch (scenario) {
   case "success-missing-telemetry":
     process.stdout.write("fake Pi exited without response telemetry\n");
     break;
+  case "success-stale-telemetry":
+    await emitProviderResponse(200, {});
+    for (const handler of handlers.get("after_provider_response") ?? []) {
+      await handler({ headers: {} }, {});
+    }
+    process.stdout.write("fake Pi should not survive invalid final telemetry\n");
+    break;
   case "crash":
     process.stderr.write("fake Pi crashed\n");
     process.exitCode = 2;
@@ -235,6 +242,16 @@ switch (scenario) {
       "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
     });
     process.stdout.write("fake Pi handled a provider rejection\n");
+    break;
+  case "quota-stale-telemetry":
+    await emitProviderResponse(429, {
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
+    });
+    for (const handler of handlers.get("after_provider_response") ?? []) {
+      await handler({ headers: {} }, {});
+    }
+    process.stdout.write("fake Pi should not reuse stale quota telemetry\n");
     break;
   case "server-error-clean-exit":
     await emitProviderResponse(503, {});

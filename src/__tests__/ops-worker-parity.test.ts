@@ -604,6 +604,59 @@ describe("ops-worker before-provider parity attestation", () => {
     );
   });
 
+  it("launches skills from private byte-identical snapshots", () => {
+    const root = tempDirectory();
+    const skill = join(root, "SKILL.md");
+    const extension = join(root, "extension.mjs");
+    const bundlePath = join(root, "bundle.md");
+    const originalSkill = [
+      "---",
+      "name: pinned-skill",
+      "description: Generic pinned skill fixture.",
+      "---",
+      "# Original pinned instructions",
+      "",
+    ].join("\n");
+    writeFileSync(skill, originalSkill, "utf8");
+    writeFileSync(extension, "export default function extension() {}\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+
+    assert.equal(launch.skillPaths.length, 1);
+    assert.notEqual(launch.skillPaths[0], resources.skillPaths[0]);
+    assert.equal(readFileSync(launch.skillPaths[0], "utf8"), originalSkill);
+    assert.equal(
+      piResourceIdentity("skill", launch.skillPaths[0]),
+      resources.skillIdentities[0],
+    );
+
+    writeFileSync(skill, "# Changed live skill after preparation\n", "utf8");
+    assert.equal(readFileSync(launch.skillPaths[0], "utf8"), originalSkill);
+    cleanupOpsWorkerParityLaunch(launch);
+  });
+
   it("loads a generated source wrapper through Pi's real jiti extension loader", async () => {
     const root = tempDirectory();
     const skill = join(root, "SKILL.md");

@@ -392,6 +392,14 @@ function invalidateChangedCompositeVerification(task: OpsWorkerTask): void {
   task.verification = null;
 }
 
+function assertNoUnverifiedPiLaunch(task: OpsWorkerTask): void {
+  if (task.unverifiedRun !== null) {
+    throw new OpsWorkerLifecycleError(
+      "Lifecycle evidence cannot change while an atomic Pi launch fence is active",
+    );
+  }
+}
+
 /**
  * Atomic, evidence-only lifecycle helpers. They never execute a mutation or
  * contact a transport; callers remain responsible for those external actions.
@@ -418,6 +426,7 @@ export class OpsWorkerLifecycle {
       taskId,
       { event: "EVIDENCE", summary: "Recorded fixed lifecycle identity evidence" },
       (task) => {
+        assertNoUnverifiedPiLaunch(task);
         if (!applyLifecycleIdentity(task.lifecycle, update)) {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
@@ -439,6 +448,7 @@ export class OpsWorkerLifecycle {
       taskId,
       { event: "EVIDENCE", summary: "Recorded package-owned lifecycle checkpoint" },
       (task) => {
+        assertNoUnverifiedPiLaunch(task);
         let changed = applyLifecycleIdentity(task.lifecycle, input.lifecycle);
         const existing = task.currentCheckpoint;
         const historical = existing?.replayHistory.find(
@@ -506,6 +516,7 @@ export class OpsWorkerLifecycle {
       taskId,
       { event: "UPDATED", summary: `Recorded ${input.boundary} query observation` },
       (task) => {
+        assertNoUnverifiedPiLaunch(task);
         const existing = task.mutationReceipts[slot];
         let replayHistory: OpsWorkerMutationReceiptReplay[] = [];
         if (existing !== null) {
@@ -593,6 +604,7 @@ export class OpsWorkerLifecycle {
       taskId,
       { event: "UPDATED", summary: `Claimed ${input.boundary} mutation boundary` },
       (task) => {
+        assertNoUnverifiedPiLaunch(task);
         claimed = this.applyMutationReceiptClaim(
           task,
           input,
@@ -614,6 +626,7 @@ export class OpsWorkerLifecycle {
     input: OpsWorkerMutationOperationInput,
     verification: OpsWorkerAuthorizationVerification,
   ): boolean {
+    assertNoUnverifiedPiLaunch(task);
     return this.applyMutationReceiptClaim(task, input, (receipt) =>
       verification.status === "PASS"
       && verification.checkedSnapshotHash === hashOpsWorkerAuthorizationSnapshot(task)
@@ -671,6 +684,7 @@ export class OpsWorkerLifecycle {
       taskId,
       { event: "UPDATED", summary: `Finished ${input.boundary} mutation receipt` },
       (task) => {
+        assertNoUnverifiedPiLaunch(task);
         const receipt = task.mutationReceipts[slot];
         if (receipt === null) {
           throw new OpsWorkerLifecycleError(

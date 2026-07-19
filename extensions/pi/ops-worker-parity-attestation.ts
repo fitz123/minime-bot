@@ -80,5 +80,11 @@ export default function (pi: ExtensionAPI): void {
       // eslint-disable-next-line no-console -- bounded package-owned capture failure
       console.warn(formatCodexQuotaWriteError(result.error));
     }
+    if (result.status === "write_error" || result.status === "invalid_response_status") {
+      // A prior response capture from this child must never stand in for the
+      // response whose telemetry failed. The parent handles this dedicated exit
+      // before consulting any earlier attempt capture.
+      process.exit(OPS_WORKER_PARITY_FAILURE_EXIT_CODE);
+    }
   });
 }

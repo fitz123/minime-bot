@@ -42,6 +42,7 @@ import {
 import {
   OPS_WORKER_PARITY_ACK_PATH_ENV,
   OPS_WORKER_PARITY_EXPECTED_PATH_ENV,
+  OPS_WORKER_PARITY_FAILURE_EXIT_CODE,
   OPS_WORKER_PARITY_REPORT_PATH_ENV,
   OPS_WORKER_QUOTA_PROBE_ENV,
   type OpsWorkerParityAttestationReport,
@@ -81,6 +82,7 @@ import {
 } from "./parity.js";
 import {
   OPS_WORKER_LIMITS,
+  hashOpsWorkerPiLaunchSubject,
   type OpsWorkerActiveRun,
   type OpsWorkerOutcomeResult,
   type OpsWorkerTask,
@@ -189,7 +191,10 @@ export interface OpsWorkerPiAttemptDependencies {
   ) => Promise<OpsWorkerQuotaProbeResult>;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
   launchFaultInjector?: (
-    point: "after-launch-intent-persisted" | "after-unverified-run-persisted",
+    point:
+      | "before-launch-fence"
+      | "after-launch-intent-persisted"
+      | "after-unverified-run-persisted",
   ) => void;
 }
 
@@ -215,7 +220,7 @@ export interface OpsWorkerPiAttemptOptions {
 
 export interface OpsWorkerQuotaProbeRequest {
   taskId: string;
-  taskUpdatedAt: string;
+  taskSubjectHash: string;
   model: string;
   thinking: PiThinkingLevel;
   context: PiContextArtifacts;
@@ -628,6 +633,7 @@ export class OpsWorkerPiAttemptRunner {
       context,
       this.primaryResources,
       parityLaunch.extensionPaths,
+      parityLaunch.skillPaths,
     );
     const invocation = this.resolveInvocation(args);
     const attemptId = `attempt-${this.randomId()}`;
@@ -643,10 +649,12 @@ export class OpsWorkerPiAttemptRunner {
       launchedAt,
       ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
     };
+    const taskSubjectHash = hashOpsWorkerPiLaunchSubject(task);
+    this.launchFaultInjector?.("before-launch-fence");
     const launchState = this.supervisor.beginPiLaunch(
       task.id,
       launchIntent,
-      task.updatedAt,
+      taskSubjectHash,
       quotaProbeSubjectHash,
     );
     if (
@@ -1320,6 +1328,7 @@ export class OpsWorkerPiAttemptRunner {
         context,
         this.primaryResources,
         parityLaunch.extensionPaths,
+        parityLaunch.skillPaths,
       );
       proofSubjectHash = hashQuotaProbeSubject(
         this.model,
@@ -1334,7 +1343,7 @@ export class OpsWorkerPiAttemptRunner {
       launchReserved = true;
       result = await this.runQuotaProbeProcess({
         taskId,
-        taskUpdatedAt: task.updatedAt,
+        taskSubjectHash: hashOpsWorkerPiLaunchSubject(task),
         model: this.model,
         thinking: this.thinking,
         context,
@@ -1403,10 +1412,11 @@ export class OpsWorkerPiAttemptRunner {
       launchedAt: this.now().toISOString(),
       ownershipNonceHash: hashOwnershipNonce(ownershipNonce),
     };
+    this.launchFaultInjector?.("before-launch-fence");
     const launchState = this.supervisor.beginPiLaunch(
       request.taskId,
       launchIntent,
-      request.taskUpdatedAt,
+      request.taskSubjectHash,
     );
     if (
       launchState.state !== "BLOCKED"
@@ -1806,6 +1816,7 @@ export function buildPiAttemptArgs(
   context: PiContextArtifacts,
   resources: PiPrimaryResourceContract,
   extensionPaths: readonly string[],
+  skillPaths: readonly string[],
 ): string[] {
   if (!task.session.sessionId) {
     throw new Error("Standard Pi session id must be prepared before launch");
@@ -1819,7 +1830,14 @@ export function buildPiAttemptArgs(
     "--no-extensions",
     "--no-skills",
   ];
-  args.push(...buildPiParityResourceArgs(model, thinking, context, resources, extensionPaths));
+  args.push(...buildPiParityResourceArgs(
+    model,
+    thinking,
+    context,
+    resources,
+    extensionPaths,
+    skillPaths,
+  ));
   return args;
 }
 
@@ -1829,6 +1847,7 @@ export function buildPiQuotaProbeArgs(
   context: PiContextArtifacts,
   resources: PiPrimaryResourceContract,
   extensionPaths: readonly string[],
+  skillPaths: readonly string[],
 ): string[] {
   const args = [
     "-p",
@@ -1836,7 +1855,14 @@ export function buildPiQuotaProbeArgs(
     "--no-extensions",
     "--no-skills",
   ];
-  args.push(...buildPiParityResourceArgs(model, thinking, context, resources, extensionPaths));
+  args.push(...buildPiParityResourceArgs(
+    model,
+    thinking,
+    context,
+    resources,
+    extensionPaths,
+    skillPaths,
+  ));
   return args;
 }
 
@@ -1846,6 +1872,7 @@ function buildPiParityResourceArgs(
   context: PiContextArtifacts,
   resources: PiPrimaryResourceContract,
   extensionPaths: readonly string[],
+  skillPaths: readonly string[],
 ): string[] {
   const args: string[] = [];
   if (context.systemPromptPath) {
@@ -1861,7 +1888,10 @@ function buildPiParityResourceArgs(
   for (const extensionPath of extensionPaths) {
     args.push("--extension", extensionPath);
   }
-  for (const skillPath of resources.skillPaths) args.push("--skill", skillPath);
+  if (skillPaths.length !== resources.skillPaths.length) {
+    throw new TypeError("Prepared Pi skill snapshots do not match the primary resource contract");
+  }
+  for (const skillPath of skillPaths) args.push("--skill", skillPath);
   args.push(
     "--tools", resources.toolNames.join(","),
     "--model", model,
@@ -1884,6 +1914,7 @@ export function classifyOpsWorkerPiExit(
   exit: Pick<OpsWorkerPiExit, "code" | "signal" | "error" | "stdout" | "stderr">,
   options: { responseStatus?: number } = {},
 ): OpsWorkerPiExitClassification {
+  if (exit.code === OPS_WORKER_PARITY_FAILURE_EXIT_CODE) return "CRASH";
   // Attempt-scoped provider telemetry is authoritative. A child may handle a
   // rejected request and still exit zero; that must never mint a success claim
   // or quota-probe proof.

@@ -481,6 +481,12 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) as string;
 }
 
+/** Exact durable task state covered by the atomic pre-spawn launch fence. */
+export function hashOpsWorkerPiLaunchSubject(task: OpsWorkerTask): string {
+  const canonical = stableJson(task);
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 /** Immutable fingerprint of the adapter-supplied semantic task envelope. */
 export function hashOpsWorkerCanonicalSubmission(
   task: Pick<

@@ -533,7 +533,11 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(new Set(extensions).size, extensions.length);
     const skills = args.flatMap((arg, index) =>
       arg === "--skill" ? [args[index + 1]] : []);
-    assert.deepEqual(skills, harness.primaryResources.skillPaths);
+    assert.equal(skills.length, harness.primaryResources.skillPaths.length);
+    assert.equal(skills.some((skill) => harness.primaryResources.skillPaths.includes(skill)), false);
+    for (const skill of skills) {
+      assert.match(skill, /parity-skill-\d+-snapshot-[^/]+\/SKILL\.md$/);
+    }
     assert.equal(args[args.indexOf("--tools") + 1], PRIMARY_TOOL_NAMES.join(","));
     const parityEvidence = completed.evidence.find((entry) =>
       entry.summary.includes("Pi parity v1 PASS"));
@@ -628,6 +632,63 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(prompt, /Repository inspection reached the merge boundary/);
     assert.match(prompt, /merge-prompt.*mutation-started/);
     assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+  });
+
+  it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
+    const harness = await makeHarness(t);
+    const staleTask = makeTask("launch-subject-drift");
+    harness.store.create(staleTask);
+    const lifecycle = new OpsWorkerLifecycle(harness.store);
+    let injected = false;
+    let updatedAtBeforeDrift: string | undefined;
+
+    const drifted = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "before-launch-fence" || injected) return;
+          injected = true;
+          updatedAtBeforeDrift = harness.store.get(staleTask.id)?.updatedAt;
+          lifecycle.recordCheckpoint(staleTask.id, {
+            checkpointId: "checkpoint-between-prompt-and-fence",
+            payload: { generation: 2 },
+            summary: "Prompt-relevant checkpoint raced the launch fence.",
+          });
+        },
+      },
+    }).runAttempt(staleTask.id);
+
+    assert.equal(injected, true);
+    assert.equal(drifted.updatedAt, updatedAtBeforeDrift);
+    assert.equal(
+      drifted.currentCheckpoint?.checkpointId,
+      "checkpoint-between-prompt-and-fence",
+    );
+    assert.equal(harness.invocations.length, 0);
+    harness.supervisor.cancelTask(staleTask.id, "Release drifted launch fixture custody");
+
+    const fencedTask = makeTask("launch-lifecycle-freeze");
+    harness.store.create(fencedTask);
+    let rejectedAfterFence = false;
+    const completed = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "after-launch-intent-persisted") return;
+          assert.throws(
+            () => lifecycle.recordCheckpoint(fencedTask.id, {
+              checkpointId: "checkpoint-after-fence",
+              payload: { generation: 3 },
+              summary: "This checkpoint must not cross the persisted launch fence.",
+            }),
+            /atomic Pi launch fence is active/,
+          );
+          rejectedAfterFence = true;
+        },
+      },
+    }).runAttempt(fencedTask.id);
+
+    assert.equal(rejectedAfterFence, true);
+    assert.equal(completed.state, "DONE");
+    assert.equal(completed.currentCheckpoint, null);
   });
 
   it("fails closed instead of falling back after primary context assembly failure", async (t) => {
@@ -797,7 +858,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.deepEqual(
       probeRequest.args.flatMap((arg, index) =>
         arg === "--skill" ? [probeRequest.args[index + 1]] : []),
-      harness.primaryResources.skillPaths,
+      probeRequest.parityLaunch.skillPaths,
     );
 
     harness.supervisor.cancelTask(task.id, "Exercise another probe result");
@@ -1674,6 +1735,23 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result.rounds.remediation, 0);
     assert.equal(result.custody.status, "HELD");
     assert.ok(result.schedule.nextRunAt);
+  });
+
+  it("never reuses an earlier response capture after final telemetry fails", async (t) => {
+    const harness = await makeHarness(t);
+    for (const scenario of ["success-stale-telemetry", "quota-stale-telemetry"]) {
+      const task = makeTask(`failed-final-capture-${scenario}`);
+      harness.store.create(task);
+      harness.setScenario(scenario);
+
+      const result = await harness.runner().runAttempt(task.id);
+
+      assert.equal(result.state, "RESUMABLE");
+      assert.equal(result.lastOutcome?.result, "CRASH");
+      assert.equal(result.rounds.remediation, 0);
+      assert.equal(result.custody.status, "HELD");
+      harness.supervisor.cancelTask(task.id, "Release failed telemetry fixture custody");
+    }
   });
 
   it("retains custody and durable progress after a child rc=1", async (t) => {
