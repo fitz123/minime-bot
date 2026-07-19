@@ -154,11 +154,13 @@ host paths.
 
 Worker Pi launches keep ambient discovery disabled and explicitly load the same
 package-owned/configured extensions, effective skills, and complete selected
-tool names as the primary session. Generated private wrappers give even
-handler-only extensions a deterministic one-way identity. The ops policy is the
-sole intentional additive context delta. Before provider work, a package-owned
-extension compares the effective system prompt with its session baseline and
-reports structured context-file, extension, skill, and tool metadata through a
+tool names as the primary session. Generated private wrappers load verified
+read-only snapshots of each extension closure, including the parity gate, and
+give even handler-only extensions a deterministic one-way identity. The ops
+policy is the sole intentional additive context delta. Before provider work, a
+package-owned extension compares the effective system prompt with its session
+baseline and reports structured context-file, extension, skill, and tool
+metadata through a
 parent/child acknowledgement handshake. The parent recomputes every prepared
 digest before acknowledging. Any missing, internally inconsistent, or
 mismatched evidence fails closed; persisted evidence contains versioned results
@@ -170,9 +172,10 @@ extension ordering and cache configuration cannot change that contract. Dynamic
 imports, runtime `require`, `createRequire`, VM loaders, and runtime code generation
 fail closed because their eventual executable dependency bytes cannot be fenced
 before launch. Extension imports outside the local closure are limited to the
-package-owned primary dependency allowlist; global/process aliases and reflective
-loader surfaces are rejected. Worker children additionally run with V8 string
-code generation disabled, including quota smoke probes.
+package-owned primary dependency allowlist and resolve through fixed package
+aliases rather than extension-local replacements; global/process aliases and
+reflective loader surfaces are rejected. Worker children additionally run with
+V8 string code generation disabled, including quota smoke probes.
 
 ## Quota admission and waits
 
@@ -197,6 +200,11 @@ pre-spawn fence; an expired or mismatched proof returns to the probe flow withou
 spawning. Another quota response refreshes the reset; invalid telemetry and
 probe infrastructure errors remain distinct bounded outcomes. No LLM is parked
 and no blind polling or guessed reset deadline is used.
+
+A normal attempt likewise requires valid attempt-scoped response telemetry: a
+captured 429 enters the reset-aware quota path, another non-2xx response is an
+infrastructure failure, and only a captured 2xx response can support a clean-exit
+completion claim.
 
 ## Typed composite verification
 

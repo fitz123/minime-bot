@@ -1,16 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   fstatSync,
   lstatSync,
+  mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
@@ -37,16 +41,19 @@ const PI_EXTENSION_JITI_ALIASES = (() => {
   const piCodingAgent = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
   const piAgentCore = fileURLToPath(import.meta.resolve("@earendil-works/pi-agent-core"));
   const piTui = fileURLToPath(import.meta.resolve("@earendil-works/pi-tui"));
+  const piAi = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
   const piAiCompat = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/compat"));
   const piAiOauth = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/oauth"));
   const typebox = fileURLToPath(import.meta.resolve("typebox"));
   const typeboxCompile = fileURLToPath(import.meta.resolve("typebox/compile"));
   const typeboxValue = fileURLToPath(import.meta.resolve("typebox/value"));
+  const typescript = fileURLToPath(import.meta.resolve("typescript"));
+  const yaml = fileURLToPath(import.meta.resolve("yaml"));
   return {
     "@earendil-works/pi-coding-agent": piCodingAgent,
     "@earendil-works/pi-agent-core": piAgentCore,
     "@earendil-works/pi-tui": piTui,
-    "@earendil-works/pi-ai": piAiCompat,
+    "@earendil-works/pi-ai": piAi,
     "@earendil-works/pi-ai/compat": piAiCompat,
     "@earendil-works/pi-ai/oauth": piAiOauth,
     "@mariozechner/pi-coding-agent": piCodingAgent,
@@ -61,6 +68,8 @@ const PI_EXTENSION_JITI_ALIASES = (() => {
     "@sinclair/typebox": typebox,
     "@sinclair/typebox/compile": typeboxCompile,
     "@sinclair/typebox/value": typeboxValue,
+    typescript,
+    yaml,
   };
 })();
 
@@ -152,8 +161,117 @@ function writePrivateExtensionWrapper(
     "",
   ].join("\n");
   const staging = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
-  writeFileSync(staging, source, { mode: 0o600, flag: "wx" });
+  writeFileSync(staging, source, { mode: 0o400, flag: "wx" });
   renameSync(staging, path);
+}
+
+function commonResourceDirectory(files: readonly PiExtensionResourceFile[]): string {
+  if (files.length === 0) throw new TypeError("Pi extension snapshot has no files");
+  let common = dirname(files[0].path);
+  for (;;) {
+    const containsEveryFile = files.every((file) => {
+      const child = relative(common, file.path);
+      return child !== ".."
+        && !child.startsWith(`..${sep}`)
+        && !isAbsolute(child);
+    });
+    if (containsEveryFile) return common;
+    const parent = dirname(common);
+    if (parent === common) {
+      throw new TypeError("Pi extension snapshot files do not share a filesystem root");
+    }
+    common = parent;
+  }
+}
+
+function readPinnedResource(file: PiExtensionResourceFile): Buffer {
+  const direct = lstatSync(file.path);
+  if (
+    !direct.isFile()
+    || direct.isSymbolicLink()
+    || (typeof process.getuid === "function" && direct.uid !== process.getuid())
+    || normalize(realpathSync(file.path)) !== normalize(resolve(file.path))
+  ) throw new Error("Pi extension resource changed during private snapshot creation");
+  const descriptor = openSync(file.path, constants.O_RDONLY | NO_FOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== direct.dev || opened.ino !== direct.ino) {
+      throw new Error("Pi extension resource changed during private snapshot creation");
+    }
+    const content = readFileSync(descriptor);
+    const completed = fstatSync(descriptor);
+    if (
+      completed.dev !== opened.dev
+      || completed.ino !== opened.ino
+      || completed.size !== opened.size
+      || completed.mtimeMs !== opened.mtimeMs
+      || completed.ctimeMs !== opened.ctimeMs
+      || sha256(content) !== file.contentHash
+    ) throw new Error("Pi extension resource changed during private snapshot creation");
+    return content;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function writePrivateExtensionSnapshot(
+  sessionDirectory: string,
+  label: string,
+  targetPath: string,
+  snapshot: readonly PiExtensionResourceFile[],
+): { targetPath: string; files: PiExtensionResourceFile[] } {
+  const common = commonResourceDirectory(snapshot);
+  const snapshotRoot = normalize(realpathSync(
+    mkdtempSync(join(sessionDirectory, `${label}-snapshot-`)),
+  ));
+  chmodSync(snapshotRoot, 0o700);
+  const copied = snapshot.map((file) => {
+    const child = relative(common, file.path);
+    if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+      throw new TypeError("Pi extension snapshot path escaped its private root");
+    }
+    const destination = join(snapshotRoot, child);
+    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+    writeFileSync(destination, readPinnedResource(file), { mode: 0o400, flag: "wx" });
+    return { path: destination, contentHash: file.contentHash };
+  });
+  const targetChild = relative(common, targetPath);
+  if (
+    targetChild === ".."
+    || targetChild.startsWith(`..${sep}`)
+    || isAbsolute(targetChild)
+  ) throw new TypeError("Pi extension entrypoint escaped its private snapshot");
+  const copiedTarget = join(snapshotRoot, targetChild);
+  if (!copied.some((file) => file.path === copiedTarget)) {
+    throw new TypeError("Pi extension entrypoint is absent from its private snapshot");
+  }
+  return { targetPath: copiedTarget, files: copied };
+}
+
+function preparePrivateExtensionWrapper(input: {
+  sessionDirectory: string;
+  label: string;
+  wrapperPath: string;
+  targetPath: string;
+  identity: string;
+}): string {
+  const snapshot = createPiExtensionResourceSnapshot(input.targetPath);
+  if (snapshot.identity !== input.identity) {
+    throw new Error("Pi extension changed during parity preparation");
+  }
+  const privateSnapshot = writePrivateExtensionSnapshot(
+    input.sessionDirectory,
+    input.label,
+    normalize(realpathSync(input.targetPath)),
+    snapshot.files,
+  );
+  writePrivateExtensionWrapper(
+    input.wrapperPath,
+    privateSnapshot.targetPath,
+    input.identity,
+    privateSnapshot.files,
+  );
+  return input.wrapperPath;
 }
 
 export function prepareOpsWorkerParityLaunch(input: {
@@ -198,17 +316,21 @@ export function prepareOpsWorkerParityLaunch(input: {
   writePrivateJson(expectedPath, expected);
   const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
     const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
-    const snapshot = createPiExtensionResourceSnapshot(extensionPath);
-    if (snapshot.identity !== resources.extensionIdentities[index]) {
-      throw new Error("Primary extension changed during parity preparation");
-    }
-    writePrivateExtensionWrapper(
+    return preparePrivateExtensionWrapper({
+      sessionDirectory: input.sessionDirectory,
+      label: `parity-extension-${index}`,
       wrapperPath,
-      extensionPath,
-      resources.extensionIdentities[index],
-      snapshot.files,
-    );
-    return wrapperPath;
+      targetPath: extensionPath,
+      identity: resources.extensionIdentities[index],
+    });
+  });
+  const parityWrapperPath = join(input.sessionDirectory, "parity-gate.mjs");
+  preparePrivateExtensionWrapper({
+    sessionDirectory: input.sessionDirectory,
+    label: "parity-gate",
+    wrapperPath: parityWrapperPath,
+    targetPath: input.parityExtensionPath,
+    identity: parityExtensionIdentity,
   });
   assertSafeSessionFile(reportPath);
   assertSafeSessionFile(ackPath);
@@ -220,7 +342,7 @@ export function prepareOpsWorkerParityLaunch(input: {
     parityExtensionPath: input.parityExtensionPath,
     parityExtensionIdentity,
     primaryResources: resources,
-    extensionPaths: [...wrappedExtensionPaths, input.parityExtensionPath],
+    extensionPaths: [...wrappedExtensionPaths, parityWrapperPath],
   };
 }
 

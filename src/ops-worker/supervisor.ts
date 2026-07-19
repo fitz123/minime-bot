@@ -1763,7 +1763,7 @@ export class OpsWorkerSupervisor {
     ).task;
   }
 
-  private recordQuotaTelemetryError(
+  recordQuotaTelemetryError(
     taskId: string,
     summary: string,
     evidenceSummary?: string,

@@ -529,7 +529,7 @@ describe("ops worker Pi standard-session attempts", () => {
     for (const extension of extensions.slice(0, -1)) {
       assert.match(extension, /parity-extension-\d+\.mjs$/);
     }
-    assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
+    assert.match(extensions.at(-1) ?? "", /parity-gate\.mjs$/);
     assert.equal(new Set(extensions).size, extensions.length);
     const skills = args.flatMap((arg, index) =>
       arg === "--skill" ? [args[index + 1]] : []);
@@ -780,7 +780,7 @@ describe("ops worker Pi standard-session attempts", () => {
     for (const extension of extensions.slice(0, -1)) {
       assert.match(extension, /parity-extension-\d+\.mjs$/);
     }
-    assert.match(extensions.at(-1) ?? "", /ops-worker-parity-attestation\.(?:ts|js)$/);
+    assert.match(extensions.at(-1) ?? "", /parity-gate\.mjs$/);
     assert.deepEqual(
       probeRequest.args.flatMap((arg, index) =>
         arg === "--skill" ? [probeRequest.args[index + 1]] : []),
@@ -1481,6 +1481,7 @@ describe("ops worker Pi standard-session attempts", () => {
     const cases = [
       ["quota", "QUOTA"],
       ["quota-clean-exit", "QUOTA"],
+      ["server-error-clean-exit", "CRASH"],
       ["network", "NETWORK"],
       ["context", "CONTEXT_OVERFLOW"],
       ["large-output", "CRASH"],
@@ -1516,6 +1517,22 @@ describe("ops worker Pi standard-session attempts", () => {
       }
       harness.supervisor.cancelTask(taskId, "Release fixture custody");
     }
+  });
+
+  it("fails closed when a clean attempt has no response telemetry", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("clean-exit-without-telemetry");
+    harness.store.create(task);
+    harness.setScenario("success-missing-telemetry");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.match(result.lastOutcome?.summary ?? "", /without valid attempt response telemetry/);
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
+    assert.ok(result.schedule.nextRunAt);
   });
 
   it("retains custody and durable progress after a child rc=1", async (t) => {
@@ -1719,7 +1736,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await waitFor(() => timers.size > 0);
+    await waitFor(() => timers.size > 0, 5_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },

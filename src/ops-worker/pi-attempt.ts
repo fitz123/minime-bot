@@ -1072,13 +1072,21 @@ export class OpsWorkerPiAttemptRunner {
     }> {
     const attemptQuota = new CodexQuotaAttemptFileReader(attemptQuotaFile).read();
     const classification = classifyOpsWorkerPiExit(exit, {
-      quotaResponse: attemptQuota.status === "OK"
-        ? attemptQuota.responseStatus === 429
-        : undefined,
+      responseStatus: attemptQuota.status === "OK" ? attemptQuota.responseStatus : undefined,
     });
     const evidence = formatAttemptEvidence(exit);
     if (classification === "SUCCESS_CLAIM") {
       safeUnlink(attemptQuotaFile);
+      if (attemptQuota.status !== "OK") {
+        return {
+          classification: "CRASH",
+          task: this.supervisor.recordQuotaTelemetryError(
+            taskId,
+            `Pi exited successfully without valid attempt response telemetry (${attemptQuota.status})`,
+            evidence,
+          ),
+        };
+      }
       this.supervisor.recordPiSuccessClaim(
         taskId,
         "Pi exited successfully and claimed the remediation attempt completed",
@@ -1650,7 +1658,7 @@ export class OpsWorkerPiAttemptRunner {
       return { status: "TELEMETRY_ERROR", readStatus: read.status };
     }
     const classification = classifyOpsWorkerPiExit(exit, {
-      quotaResponse: read.responseStatus === 429,
+      responseStatus: read.responseStatus,
     });
     if (read.snapshot === null) {
       return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
@@ -1834,12 +1842,16 @@ export const OPS_WORKER_SYSTEM_POLICY = [
 
 export function classifyOpsWorkerPiExit(
   exit: Pick<OpsWorkerPiExit, "code" | "signal" | "error" | "stdout" | "stderr">,
-  options: { quotaResponse?: boolean } = {},
+  options: { responseStatus?: number } = {},
 ): OpsWorkerPiExitClassification {
   // Attempt-scoped provider telemetry is authoritative. A child may handle a
   // rejected request and still exit zero; that must never mint a success claim
   // or quota-probe proof.
-  if (options.quotaResponse === true) return "QUOTA";
+  if (options.responseStatus === 429) return "QUOTA";
+  if (
+    options.responseStatus !== undefined
+    && (options.responseStatus < 200 || options.responseStatus >= 300)
+  ) return "CRASH";
   if (exit.error === null && exit.signal === null && exit.code === 0) {
     return "SUCCESS_CLAIM";
   }
@@ -1855,7 +1867,7 @@ export function classifyOpsWorkerPiExit(
       .test(combined)
   ) return "CONTEXT_OVERFLOW";
   if (
-    options.quotaResponse === undefined
+    options.responseStatus === undefined
     &&
     /\b(?:quota|rate[ _-]?limit|too many requests|usage limit|http 429|status 429)\b/i
       .test(combined)

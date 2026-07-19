@@ -636,7 +636,79 @@ describe("ops-worker before-provider parity attestation", () => {
     }
   });
 
-  it("fences a generated wrapper when an imported implementation changes", async () => {
+  it("keeps root package semantics and rejects extension-local package replacements", async () => {
+    const root = tempDirectory();
+    const extension = join(root, "package-imports.ts");
+    const localYaml = join(root, "node_modules", "yaml");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    mkdirSync(localYaml, { recursive: true });
+    writeFileSync(
+      join(localYaml, "package.json"),
+      `${JSON.stringify({ type: "module", exports: "./index.js" })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(localYaml, "index.js"),
+      "export function parse() { return { value: 'extension-local' }; }\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      [
+        "import * as ai from '@earendil-works/pi-ai';",
+        "import { parse } from 'yaml';",
+        "export default function (pi) {",
+        "  pi.registerCommand('pi-ai-' + ('getModel' in ai ? 'compat' : 'root'), { handler: async () => {} });",
+        "  pi.registerCommand('yaml-' + parse('value: package-owned').value, { handler: async () => {} });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(skill, "# Package alias fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        relpaths: [],
+        extraExtensions: [extension],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const commands: string[] = [];
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[0]).href}?packages=${Date.now()}`
+    )).default;
+
+    await wrapper({ registerCommand: (name: string) => commands.push(name) });
+
+    assert.ok(commands.includes("pi-ai-root"));
+    assert.ok(commands.includes("yaml-package-owned"));
+    assert.equal(commands.includes("pi-ai-compat"), false);
+    assert.equal(commands.includes("yaml-extension-local"), false);
+  });
+
+  it("executes a verified private snapshot when the original implementation changes", async () => {
     const root = tempDirectory();
     const implementation = join(root, "configured-implementation.mjs");
     const extension = join(root, "configured-extension.mjs");
@@ -696,16 +768,73 @@ describe("ops-worker before-provider parity attestation", () => {
     const commands: string[] = [];
     const events: string[] = [];
     assert.equal((globalThis as Record<string, unknown>)[sideEffectKey], undefined);
-    await assert.rejects(
-      wrapper({
-        registerCommand: (name: string) => commands.push(name),
-        on: (event: string) => events.push(event),
-      }),
-      /resource changed after parity preparation/,
-    );
+    await wrapper({
+      registerCommand: (name: string) => commands.push(name),
+      on: (event: string) => events.push(event),
+    });
     assert.equal((globalThis as Record<string, unknown>)[sideEffectKey], undefined);
-    assert.deepEqual(commands, []);
-    assert.deepEqual(events, []);
+    assert.equal(commands.some((name) => /^minime-ops-extension-[a-f0-9]{64}$/.test(name)), true);
+    assert.deepEqual(events, ["session_start"]);
+  });
+
+  it("executes the verified parity gate snapshot when its source changes", async () => {
+    const root = tempDirectory();
+    const extension = join(root, "configured-extension.mjs");
+    const parityGate = join(root, "parity-gate-source.mjs");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(extension, "export default function () {}\n", "utf8");
+    writeFileSync(
+      parityGate,
+      "export default function (pi) { pi.registerCommand('original-parity-gate', { handler: async () => {} }); }\n",
+      "utf8",
+    );
+    writeFileSync(skill, "# Private parity gate fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        relpaths: [],
+        extraExtensions: [extension],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityGateIdentity = piResourceIdentity("extension", parityGate);
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath: parityGate,
+      parityExtensionIdentity: parityGateIdentity,
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    writeFileSync(
+      parityGate,
+      "export default function (pi) { pi.registerCommand('changed-parity-gate', { handler: async () => {} }); }\n",
+      "utf8",
+    );
+    const commands: string[] = [];
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths.at(-1) as string).href}?gate=${Date.now()}`
+    )).default;
+
+    await wrapper({ registerCommand: (name: string) => commands.push(name) });
+
+    assert.ok(commands.includes("original-parity-gate"));
+    assert.ok(commands.includes(
+      `minime-ops-extension-${parityGateIdentity.slice("sha256:".length)}`,
+    ));
+    assert.equal(commands.includes("changed-parity-gate"), false);
   });
 
   it("revalidates pinned resources immediately before parity acknowledgement", () => {

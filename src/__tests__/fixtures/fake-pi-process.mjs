@@ -151,7 +151,7 @@ const pi = {
 const parityExtension = (await import(
   `${pathToFileURL(parityExtensionPath).href}?fake=${Date.now()}`
 )).default;
-parityExtension(pi);
+await parityExtension(pi);
 const effectiveSystemPrompt = "fake effective system prompt";
 for (const handler of handlers.get("session_start") ?? []) {
   await handler({}, { getSystemPrompt: () => effectiveSystemPrompt });
@@ -207,10 +207,15 @@ async function emitProviderResponse(status, headers) {
 
 switch (scenario) {
   case "success":
+    await emitProviderResponse(200, {});
     process.stdout.write("fake Pi success claim\n");
     break;
   case "success-diagnostic":
+    await emitProviderResponse(200, {});
     process.stdout.write("Investigated a prior HTTP 429 and maximum context length message successfully.\n");
+    break;
+  case "success-missing-telemetry":
+    process.stdout.write("fake Pi exited without response telemetry\n");
     break;
   case "crash":
     process.stderr.write("fake Pi crashed\n");
@@ -230,6 +235,10 @@ switch (scenario) {
       "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
     });
     process.stdout.write("fake Pi handled a provider rejection\n");
+    break;
+  case "server-error-clean-exit":
+    await emitProviderResponse(503, {});
+    process.stdout.write("fake Pi handled a provider server error\n");
     break;
   case "quota-probe-success":
     await emitProviderResponse(200, {
