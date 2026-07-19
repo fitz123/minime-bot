@@ -100,6 +100,7 @@ export const OPS_WORKER_PI_LIMITS = {
 } as const;
 
 export const OPS_WORKER_ATTEMPT_TOKEN_ENV = "MINIME_OPS_WORKER_ATTEMPT_TOKEN";
+export const OPS_WORKER_NODE_OPTIONS = "--disallow-code-generation-from-strings";
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SAFE_RUNTIME_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,254}$/;
@@ -638,6 +639,10 @@ export class OpsWorkerPiAttemptRunner {
       const env = this.buildEnv(this.workspaceCwd, {
         askCallerAgentId: this.primaryContextAgent.id,
       });
+      // The extension closure rejects explicit loader surfaces. Keep V8's
+      // indirect Function/eval constructors disabled as an independent runtime
+      // fence against computed reflective aliases.
+      env.NODE_OPTIONS = OPS_WORKER_NODE_OPTIONS;
       env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
       env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = parityLaunch.expectedPath;
       env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = parityLaunch.reportPath;
@@ -1369,6 +1374,7 @@ export class OpsWorkerPiAttemptRunner {
     const env = this.buildEnv(this.workspaceCwd, {
       askCallerAgentId: this.primaryContextAgent.id,
     });
+    env.NODE_OPTIONS = OPS_WORKER_NODE_OPTIONS;
     env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
     env[OPS_WORKER_PARITY_EXPECTED_PATH_ENV] = request.parityLaunch.expectedPath;
     env[OPS_WORKER_PARITY_REPORT_PATH_ENV] = request.parityLaunch.reportPath;
@@ -1649,6 +1655,15 @@ export class OpsWorkerPiAttemptRunner {
     if (read.snapshot === null) {
       return { status: "TELEMETRY_ERROR", readStatus: "MISSING" };
     }
+    if (
+      read.responseStatus !== 429
+      && (read.responseStatus < 200 || read.responseStatus >= 300)
+    ) {
+      return {
+        status: "INFRASTRUCTURE_ERROR",
+        summary: `Exact quota smoke probe received provider HTTP ${read.responseStatus}`,
+      };
+    }
     if (classification === "SUCCESS_CLAIM") {
       return { status: "SUCCESS", snapshot: read.snapshot };
     }
@@ -1821,13 +1836,16 @@ export function classifyOpsWorkerPiExit(
   exit: Pick<OpsWorkerPiExit, "code" | "signal" | "error" | "stdout" | "stderr">,
   options: { quotaResponse?: boolean } = {},
 ): OpsWorkerPiExitClassification {
+  // Attempt-scoped provider telemetry is authoritative. A child may handle a
+  // rejected request and still exit zero; that must never mint a success claim
+  // or quota-probe proof.
+  if (options.quotaResponse === true) return "QUOTA";
   if (exit.error === null && exit.signal === null && exit.code === 0) {
     return "SUCCESS_CLAIM";
   }
   const combined = sanitizePiProcessOutput(
     [exit.error?.message, exit.stderr, exit.stdout].filter(Boolean).join("\n"),
   );
-  if (options.quotaResponse === true) return "QUOTA";
   if (
     /session file is not a valid pi session|no session found matching|session.*(?:corrupt|malformed)/i
       .test(combined)

@@ -223,8 +223,13 @@ describe("primary Pi resource contract", () => {
       "export default function extension() { return module['require'].bind(module)('./dependency.js'); }\n",
       "export default function extension() { return eval('require')('./dependency.js'); }\n",
       "export default Function('return function extension() {}')();\n",
+      "const p = process; const k = 'get' + 'BuiltinModule'; const m = p[k]('mod' + 'ule'); const c = m['create' + 'Require'](import.meta.url); export default c('./dependency.js');\n",
+      "const g = globalThis; const key = 'Func' + 'tion'; export default g[key]('return () => 1')();\n",
+      "const getter = Reflect.get; export default getter(globalThis, 'Function')('return () => 1')();\n",
+      "const key = 'con' + 'structor'; export default (() => {})[key]('return () => 1')();\n",
       "import { Script } from 'node:vm'; export default function extension() { return Script; }\n",
       "import { createRequire as load } from 'node:module'; export default function extension() { return load; }\n",
+      "import { createJiti } from 'jiti'; export default createJiti(import.meta.url).import('./dependency.js');\n",
       "import unpinned from 'file:///tmp/unpinned.js'; export default unpinned;\n",
     ];
     for (const source of unattestableSources) {

@@ -45,6 +45,7 @@ import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
   OPS_WORKER_ATTEMPT_TOKEN_ENV,
+  OPS_WORKER_NODE_OPTIONS,
   OPS_WORKER_PI_LIMITS,
   OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
@@ -1192,6 +1193,10 @@ describe("ops worker Pi standard-session attempts", () => {
       "1",
     );
     assert.equal(
+      (probeSpawnOptions?.env as Record<string, string> | undefined)?.NODE_OPTIONS,
+      OPS_WORKER_NODE_OPTIONS,
+    );
+    assert.equal(
       harness.invocations[0][harness.invocations[0].indexOf("--model") + 1],
       "openai-codex/gpt-5.5",
     );
@@ -1221,13 +1226,36 @@ describe("ops worker Pi standard-session attempts", () => {
       summary: "Synthetic rolling quota wait for the package-owned probe child.",
     };
     harness.store.create(quotaAgain);
-    harness.setScenario("quota-probe-quota");
+    harness.setScenario("quota-probe-quota-clean-exit");
 
     const refreshed = await harness.runner().runNext();
     assert.equal(refreshed?.lastOutcome?.result, "QUOTA");
     assert.equal(refreshed?.custody.status, "HELD");
     assert.equal(refreshed?.rounds.consecutiveInfrastructureFailures, 0);
     assert.ok(refreshed?.schedule.nextRunAt);
+
+    harness.supervisor.cancelTask(quotaAgain.id, "Exercise a non-2xx probe response");
+    const serverError = makeTask("bounded-quota-probe-child-server-error");
+    serverError.state = "RESUMABLE";
+    serverError.custody = {
+      status: "HELD",
+      claimedAt: serverError.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    serverError.lastOutcome = {
+      at: serverError.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before a provider server error.",
+    };
+    harness.store.create(serverError);
+    harness.setScenario("quota-probe-server-error");
+
+    const rejected = await harness.runner().runNext();
+    assert.equal(rejected?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(rejected?.lastOutcome?.summary ?? "", /provider HTTP 503/);
+    assert.equal(rejected?.lastOutcome?.quotaProbeProof, undefined);
   });
 
   it("durably fences and safely stops an owned quota probe process group", async (t) => {
@@ -1452,6 +1480,7 @@ describe("ops worker Pi standard-session attempts", () => {
     }));
     const cases = [
       ["quota", "QUOTA"],
+      ["quota-clean-exit", "QUOTA"],
       ["network", "NETWORK"],
       ["context", "CONTEXT_OVERFLOW"],
       ["large-output", "CRASH"],
@@ -1478,7 +1507,7 @@ describe("ops worker Pi standard-session attempts", () => {
       if (scenario === "large-output") {
         assert.match(piEvidence.summary, /omitted \d+ earlier byte/);
       }
-      if (scenario === "quota") {
+      if (expected === "QUOTA") {
         assert.equal(harness.supervisor.selectNextTask(), undefined);
         assert.ok(result.schedule.nextRunAt);
         assert.ok(Date.parse(result.schedule.nextRunAt) > Date.now());

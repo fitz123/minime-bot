@@ -224,6 +224,13 @@ switch (scenario) {
     process.stderr.write("fake Pi provider request rejected\n");
     process.exitCode = 1;
     break;
+  case "quota-clean-exit":
+    await emitProviderResponse(429, {
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
+    });
+    process.stdout.write("fake Pi handled a provider rejection\n");
+    break;
   case "quota-probe-success":
     await emitProviderResponse(200, {
       "x-codex-primary-used-percent": "10",
@@ -238,6 +245,20 @@ switch (scenario) {
     });
     process.stderr.write("fake Pi quota probe provider request rejected\n");
     process.exitCode = 1;
+    break;
+  case "quota-probe-quota-clean-exit":
+    await emitProviderResponse(429, {
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 3_600),
+    });
+    process.stdout.write("fake Pi handled a quota probe rejection\n");
+    break;
+  case "quota-probe-server-error":
+    await emitProviderResponse(503, {
+      "x-codex-primary-used-percent": "10",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1_000) + 18_000),
+    });
+    process.stdout.write("fake Pi handled a provider server error\n");
     break;
   case "quota-probe-wait":
     setInterval(() => undefined, 1_000);

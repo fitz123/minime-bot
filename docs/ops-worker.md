@@ -169,7 +169,10 @@ closure using the same fixed Jiti resolver contract as execution. Ambient Jiti
 extension ordering and cache configuration cannot change that contract. Dynamic
 imports, runtime `require`, `createRequire`, VM loaders, and runtime code generation
 fail closed because their eventual executable dependency bytes cannot be fenced
-before launch.
+before launch. Extension imports outside the local closure are limited to the
+package-owned primary dependency allowlist; global/process aliases and reflective
+loader surfaces are rejected. Worker children additionally run with V8 string
+code generation disabled, including quota smoke probes.
 
 ## Quota admission and waits
 

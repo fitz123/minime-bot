@@ -175,7 +175,7 @@ export function parseExpectedOpsWorkerParityContract(
   ];
   if (
     Object.keys(obj).length !== expectedKeys.length
-    || expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(obj, key))
+    || expectedKeys.some((key) => !Object.hasOwn(obj, key))
     || Object.keys(obj).some((key) => !expectedKeys.includes(key))
   ) throw new TypeError("parity contract fields must match the fixed schema");
   if (obj.version !== OPS_WORKER_PARITY_PROTOCOL_VERSION) {
@@ -370,7 +370,7 @@ export function parseOpsWorkerParityAttestationReport(
   ];
   if (
     Object.keys(obj).length !== expectedKeys.length
-    || expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(obj, key))
+    || expectedKeys.some((key) => !Object.hasOwn(obj, key))
     || Object.keys(obj).some((key) => !expectedKeys.includes(key))
   ) throw new TypeError("parity report fields must match the fixed schema");
   if (obj.version !== OPS_WORKER_PARITY_PROTOCOL_VERSION) {

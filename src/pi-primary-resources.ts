@@ -46,26 +46,71 @@ export const PI_EXTENSION_JITI_EXTENSIONS = [
 
 const UNSAFE_MODULE_LOADER_IDENTIFIERS = new Set([
   "Function",
+  "Proxy",
+  "Reflect",
+  "WebAssembly",
   "createRequire",
   "eval",
   "getBuiltinModule",
+  "global",
+  "globalThis",
   "mainModule",
   "require",
+  "self",
 ]);
 const UNSAFE_MODULE_LOADER_PROPERTIES = new Set([
   "Function",
+  "__proto__",
   "_load",
+  "constructor",
   "createRequire",
   "eval",
   "getBuiltinModule",
   "mainModule",
+  "prototype",
   "require",
 ]);
-const UNSAFE_MODULE_LOADER_SPECIFIERS = new Set([
-  "module",
-  "node:module",
-  "node:vm",
-  "vm",
+const SAFE_PROCESS_PROPERTIES = new Set([
+  "argv",
+  "cwd",
+  "env",
+  "execPath",
+  "exit",
+  "getuid",
+  "pid",
+]);
+/**
+ * Bare modules are executable code outside the local closure. Keep this list
+ * fixed to the primary package contract instead of letting an extension select
+ * a second transpiler, VM, or module loader whose eventual bytes cannot be
+ * fenced before launch.
+ */
+const SAFE_EXTENSION_MODULE_SPECIFIERS = new Set([
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-ai/compat",
+  "@earendil-works/pi-ai/oauth",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+  "@mariozechner/pi-agent-core",
+  "@mariozechner/pi-ai",
+  "@mariozechner/pi-ai/compat",
+  "@mariozechner/pi-ai/oauth",
+  "@mariozechner/pi-coding-agent",
+  "@mariozechner/pi-tui",
+  "node:child_process",
+  "node:crypto",
+  "node:fs",
+  "node:os",
+  "node:path",
+  "node:stream",
+  "node:string_decoder",
+  "node:url",
+  "typebox",
+  "typebox/compile",
+  "typebox/value",
+  "typescript",
+  "yaml",
 ]);
 
 export interface PiExtensionResourceFile {
@@ -160,6 +205,54 @@ function localModuleSpecifiers(path: string, content: Buffer): string[] {
     throw new TypeError("Pi extension source must parse before its dependency closure is hashed");
   }
   const specifiers = new Set<string>();
+  const constantInitializers = new Map<string, ts.Expression | null>();
+  const collectConstants = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.initializer !== undefined
+      && ts.isVariableDeclarationList(node.parent)
+      && (node.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
+      constantInitializers.set(
+        node.name.text,
+        constantInitializers.has(node.name.text) ? null : node.initializer,
+      );
+    }
+    ts.forEachChild(node, collectConstants);
+  };
+  collectConstants(source);
+  const staticString = (
+    value: ts.Expression,
+    resolving = new Set<string>(),
+  ): string | undefined => {
+    if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
+      return value.text;
+    }
+    if (
+      ts.isParenthesizedExpression(value)
+      || ts.isAsExpression(value)
+      || ts.isSatisfiesExpression(value)
+      || ts.isNonNullExpression(value)
+    ) return staticString(value.expression, resolving);
+    if (
+      ts.isBinaryExpression(value)
+      && value.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const left = staticString(value.left, resolving);
+      const right = staticString(value.right, resolving);
+      return left === undefined || right === undefined ? undefined : left + right;
+    }
+    if (ts.isIdentifier(value) && !resolving.has(value.text)) {
+      const initializer = constantInitializers.get(value.text);
+      if (initializer !== undefined && initializer !== null) {
+        const next = new Set(resolving);
+        next.add(value.text);
+        return staticString(initializer, next);
+      }
+    }
+    return undefined;
+  };
   const add = (value: ts.Expression | undefined): void => {
     if (
       value === undefined
@@ -169,23 +262,36 @@ function localModuleSpecifiers(path: string, content: Buffer): string[] {
         "Pi extension module loading must use a statically analyzable string literal",
       );
     }
-    if (UNSAFE_MODULE_LOADER_SPECIFIERS.has(value.text)) {
-      throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
-    }
     if (isAbsolute(value.text) || value.text.startsWith("file:")) {
       throw new TypeError("Pi extension absolute module loading cannot be attested safely");
     }
     if (value.text.startsWith("./") || value.text.startsWith("../")) {
       specifiers.add(value.text);
+      return;
+    }
+    if (!SAFE_EXTENSION_MODULE_SPECIFIERS.has(value.text)) {
+      throw new TypeError(
+        "Pi extension external module loading is outside the fixed attested allowlist and cannot be attested safely",
+      );
     }
   };
   const literalProperty = (node: ts.Expression): string | undefined => {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
-      return node.text;
-    }
-    return undefined;
+    return staticString(node);
   };
   const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && node.text === "process") {
+      const parent = node.parent;
+      const property = ts.isPropertyAccessExpression(parent) && parent.expression === node
+        ? parent.name.text
+        : ts.isElementAccessExpression(parent) && parent.expression === node
+        ? literalProperty(parent.argumentExpression)
+        : undefined;
+      if (property === undefined || !SAFE_PROCESS_PROPERTIES.has(property)) {
+        throw new TypeError(
+          "Pi extension process aliases and runtime loader access cannot be attested safely",
+        );
+      }
+    }
     if (
       ts.isIdentifier(node)
       && UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
