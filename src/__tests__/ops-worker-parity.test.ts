@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -54,6 +56,14 @@ function sha256(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
+function writeFixtureSkill(root: string, name: string, content: string): string {
+  const skillDirectory = join(root, name);
+  mkdirSync(skillDirectory, { recursive: true });
+  const skillPath = join(skillDirectory, "SKILL.md");
+  writeFileSync(skillPath, content, "utf8");
+  return skillPath;
+}
+
 after(() => {
   for (const path of created) rmSync(path, { recursive: true, force: true });
 });
@@ -63,7 +73,7 @@ describe("primary Pi resource contract", () => {
     const root = tempDirectory();
     const extra = join(root, "configured-extra.ts");
     const extraImplementation = join(root, "configured-extra-implementation.ts");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "contract-skill", "# Generic parity skill\n");
     const originalImplementation = "export default function configuredExtra() {}\n";
     writeFileSync(extraImplementation, originalImplementation, "utf8");
     writeFileSync(
@@ -71,7 +81,6 @@ describe("primary Pi resource contract", () => {
       "export { default } from './configured-extra-implementation.js';\n",
       "utf8",
     );
-    writeFileSync(skill, "# Generic parity skill\n", "utf8");
     const extensionOptions = {
       extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
       extraExtensions: [extra],
@@ -128,10 +137,9 @@ describe("primary Pi resource contract", () => {
     const root = tempDirectory();
     const targetExtension = join(root, "extension.ts");
     const linkedExtension = join(root, "extension-link.ts");
-    const targetSkill = join(root, "SKILL.md");
+    const targetSkill = writeFixtureSkill(root, "target-skill", "# Generic skill\n");
     const linkedSkill = join(root, "SKILL-link.md");
     writeFileSync(targetExtension, "export default function () {}\n", "utf8");
-    writeFileSync(targetSkill, "# Generic skill\n", "utf8");
     symlinkSync(targetExtension, linkedExtension);
     symlinkSync(targetSkill, linkedSkill);
     const base = {
@@ -164,6 +172,12 @@ describe("primary Pi resource contract", () => {
       ...base,
       toolNames: PI_BUILTIN_TOOL_NAMES.filter((tool) => tool !== "bash"),
     }), /missing built-in bash/);
+
+    symlinkSync(targetExtension, join(dirname(targetSkill), "linked-resource"));
+    assert.throws(
+      () => resolvePiPrimaryResourceContract(base),
+      /must not contain symlinks/,
+    );
   });
 
   it("rejects primary resources that the child parity protocol cannot represent", () => {
@@ -308,10 +322,9 @@ describe("ops-worker before-provider parity attestation", () => {
     const root = tempDirectory();
     const extensionToolPath = join(root, "tool-extension.ts");
     const extensionCommandPath = join(root, "hook-extension.ts");
-    const skillPath = join(root, "SKILL.md");
+    const skillPath = writeFixtureSkill(root, "runtime-skill", "# Runtime parity skill\n");
     writeFileSync(extensionToolPath, "export default function () {}\n", "utf8");
     writeFileSync(extensionCommandPath, "export default function () {}\n", "utf8");
-    writeFileSync(skillPath, "# Runtime parity skill\n", "utf8");
     const customPrompt = "GENERIC_PRIMARY_PERSONA_BODY";
     const appendSystemPrompt = "GENERIC_PRIMARY_BUNDLE_BODY\n\nGENERIC_OPS_POLICY_BODY";
     const toolNames = [...PI_BUILTIN_TOOL_NAMES, "configured_tool"];
@@ -448,14 +461,13 @@ describe("ops-worker before-provider parity attestation", () => {
   it("wraps handler-only extensions with attestable identities and rejects a forged PASS", async () => {
     const root = tempDirectory();
     const handlerOnly = join(root, "handler-only.mjs");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "handler-skill", "# Parity fixture skill\n");
     const bundlePath = join(root, "bundle.md");
     writeFileSync(
       handlerOnly,
       "export default function (pi) { pi.on('session_start', () => undefined); }\n",
       "utf8",
     );
-    writeFileSync(skill, "# Parity fixture skill\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {
@@ -560,6 +572,85 @@ describe("ops-worker before-provider parity attestation", () => {
     );
   });
 
+  it("pins package-owned subagent agents and prompts beside its private entrypoint", async () => {
+    const root = tempDirectory();
+    const subagentDirectory = join(root, "subagent");
+    const agentsDirectory = join(subagentDirectory, "agents");
+    const promptsDirectory = join(subagentDirectory, "prompts");
+    mkdirSync(agentsDirectory, { recursive: true });
+    mkdirSync(promptsDirectory, { recursive: true });
+    const extension = join(subagentDirectory, "index.mjs");
+    const agent = join(agentsDirectory, "worker.md");
+    const prompt = join(promptsDirectory, "implement.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(
+      extension,
+      [
+        "import path from 'node:path';",
+        "import { fileURLToPath } from 'node:url';",
+        "export default function (pi) {",
+        "  pi.on('resources_discover', () => ({",
+        "    promptPaths: [path.join(path.dirname(fileURLToPath(import.meta.url)), 'prompts')],",
+        "  }));",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(agent, "PINNED_AGENT\n", "utf8");
+    writeFileSync(prompt, "PINNED_PROMPT\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const originalIdentity = createPiExtensionResourceSnapshot(extension).identity;
+    writeFileSync(prompt, "CHANGED_PROMPT\n", "utf8");
+    assert.notEqual(createPiExtensionResourceSnapshot(extension).identity, originalIdentity);
+    writeFileSync(prompt, "PINNED_PROMPT\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      skillPaths: [],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    let discoverResources: (() => { promptPaths: string[] }) | undefined;
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[0]).href}?assets=${Date.now()}`
+    )).default;
+    await wrapper({
+      on: (event: string, handler: () => { promptPaths: string[] }) => {
+        if (event === "resources_discover") discoverResources = handler;
+      },
+      registerCommand: () => undefined,
+    });
+    assert.ok(discoverResources);
+    const privatePromptDirectory = discoverResources().promptPaths[0];
+    assert.notEqual(privatePromptDirectory, promptsDirectory);
+    assert.equal(
+      readFileSync(join(privatePromptDirectory, "implement.md"), "utf8"),
+      "PINNED_PROMPT\n",
+    );
+    assert.equal(
+      readFileSync(join(dirname(privatePromptDirectory), "agents", "worker.md"), "utf8"),
+      "PINNED_AGENT\n",
+    );
+    cleanupOpsWorkerParityLaunch(launch);
+  });
+
   it("removes private extension snapshots after use and on preparation failure", () => {
     const root = tempDirectory();
     const extension = join(root, "extension.mjs");
@@ -606,7 +697,6 @@ describe("ops-worker before-provider parity attestation", () => {
 
   it("launches skills from private byte-identical snapshots", () => {
     const root = tempDirectory();
-    const skill = join(root, "SKILL.md");
     const extension = join(root, "extension.mjs");
     const bundlePath = join(root, "bundle.md");
     const originalSkill = [
@@ -617,7 +707,18 @@ describe("ops-worker before-provider parity attestation", () => {
       "# Original pinned instructions",
       "",
     ].join("\n");
-    writeFileSync(skill, originalSkill, "utf8");
+    const skill = writeFixtureSkill(root, "pinned-skill", originalSkill);
+    const skillRoot = dirname(skill);
+    const scriptPath = join(skillRoot, "scripts", "inspect.sh");
+    const referencePath = join(skillRoot, "references", "guide.md");
+    const assetPath = join(skillRoot, "assets", "fixture.txt");
+    mkdirSync(dirname(scriptPath), { recursive: true });
+    mkdirSync(dirname(referencePath), { recursive: true });
+    mkdirSync(dirname(assetPath), { recursive: true });
+    writeFileSync(scriptPath, "#!/bin/sh\nprintf 'skill package'\n", "utf8");
+    chmodSync(scriptPath, 0o700);
+    writeFileSync(referencePath, "PINNED_REFERENCE\n", "utf8");
+    writeFileSync(assetPath, "PINNED_ASSET\n", "utf8");
     writeFileSync(extension, "export default function extension() {}\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
@@ -647,21 +748,36 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.equal(launch.skillPaths.length, 1);
     assert.notEqual(launch.skillPaths[0], resources.skillPaths[0]);
     assert.equal(readFileSync(launch.skillPaths[0], "utf8"), originalSkill);
+    const privateSkillRoot = dirname(launch.skillPaths[0]);
+    assert.equal(
+      readFileSync(join(privateSkillRoot, "references", "guide.md"), "utf8"),
+      "PINNED_REFERENCE\n",
+    );
+    assert.equal(
+      readFileSync(join(privateSkillRoot, "assets", "fixture.txt"), "utf8"),
+      "PINNED_ASSET\n",
+    );
+    assert.notEqual(statSync(join(privateSkillRoot, "scripts", "inspect.sh")).mode & 0o111, 0);
     assert.equal(
       piResourceIdentity("skill", launch.skillPaths[0]),
       resources.skillIdentities[0],
     );
 
     writeFileSync(skill, "# Changed live skill after preparation\n", "utf8");
+    writeFileSync(referencePath, "CHANGED_LIVE_REFERENCE\n", "utf8");
     assert.equal(readFileSync(launch.skillPaths[0], "utf8"), originalSkill);
+    assert.equal(
+      readFileSync(join(privateSkillRoot, "references", "guide.md"), "utf8"),
+      "PINNED_REFERENCE\n",
+    );
+    assert.notEqual(piResourceIdentity("skill", skill), resources.skillIdentities[0]);
     cleanupOpsWorkerParityLaunch(launch);
   });
 
   it("loads a generated source wrapper through Pi's real jiti extension loader", async () => {
     const root = tempDirectory();
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "loader-skill", "# Real loader parity fixture\n");
     const bundlePath = join(root, "bundle.md");
-    writeFileSync(skill, "# Real loader parity fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const extensionsDir = join(PACKAGE_ROOT, "extensions", "pi");
     const targetExtension = realpathSync(
@@ -717,7 +833,7 @@ describe("ops-worker before-provider parity attestation", () => {
     const extension = join(root, "configured-extension.ts");
     const javascriptDependency = join(root, "dependency.js");
     const typescriptDependency = join(root, "dependency.ts");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "jiti-skill", "# Pinned Jiti resolver fixture\n");
     const bundlePath = join(root, "bundle.md");
     writeFileSync(
       extension,
@@ -732,7 +848,6 @@ describe("ops-worker before-provider parity attestation", () => {
     );
     writeFileSync(javascriptDependency, "export const selected = 'javascript';\n", "utf8");
     writeFileSync(typescriptDependency, "export const selected = 'typescript';\n", "utf8");
-    writeFileSync(skill, "# Pinned Jiti resolver fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {
@@ -793,7 +908,7 @@ describe("ops-worker before-provider parity attestation", () => {
     const root = tempDirectory();
     const extension = join(root, "package-imports.ts");
     const localYaml = join(root, "node_modules", "yaml");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "package-skill", "# Package alias fixture\n");
     const bundlePath = join(root, "bundle.md");
     mkdirSync(localYaml, { recursive: true });
     writeFileSync(
@@ -819,7 +934,6 @@ describe("ops-worker before-provider parity attestation", () => {
       ].join("\n"),
       "utf8",
     );
-    writeFileSync(skill, "# Package alias fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {
@@ -865,7 +979,11 @@ describe("ops-worker before-provider parity attestation", () => {
     const root = tempDirectory();
     const implementation = join(root, "configured-implementation.mjs");
     const extension = join(root, "configured-extension.mjs");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(
+      root,
+      "implementation-skill",
+      "# Imported implementation parity fixture\n",
+    );
     const bundlePath = join(root, "bundle.md");
     writeFileSync(
       implementation,
@@ -877,7 +995,6 @@ describe("ops-worker before-provider parity attestation", () => {
       "import { register } from './configured-implementation.mjs';\nexport default register;\n",
       "utf8",
     );
-    writeFileSync(skill, "# Imported implementation parity fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {
@@ -934,7 +1051,7 @@ describe("ops-worker before-provider parity attestation", () => {
     const root = tempDirectory();
     const extension = join(root, "configured-extension.mjs");
     const parityGate = join(root, "parity-gate-source.mjs");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "gate-skill", "# Private parity gate fixture\n");
     const bundlePath = join(root, "bundle.md");
     writeFileSync(extension, "export default function () {}\n", "utf8");
     writeFileSync(
@@ -942,7 +1059,6 @@ describe("ops-worker before-provider parity attestation", () => {
       "export default function (pi) { pi.registerCommand('original-parity-gate', { handler: async () => {} }); }\n",
       "utf8",
     );
-    writeFileSync(skill, "# Private parity gate fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {
@@ -994,11 +1110,10 @@ describe("ops-worker before-provider parity attestation", () => {
     const root = tempDirectory();
     const implementation = join(root, "ack-implementation.mjs");
     const extension = join(root, "ack-extension.mjs");
-    const skill = join(root, "SKILL.md");
+    const skill = writeFixtureSkill(root, "ack-skill", "# ACK parity fixture\n");
     const bundlePath = join(root, "bundle.md");
     writeFileSync(implementation, "export default function ackImplementation() {}\n", "utf8");
     writeFileSync(extension, "export { default } from './ack-implementation.mjs';\n", "utf8");
-    writeFileSync(skill, "# ACK parity fixture\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
       extensionOptions: {

@@ -610,8 +610,10 @@ export class OpsWorkerPiAttemptRunner {
       classification: OpsWorkerPiExitClassification;
       task: OpsWorkerTask;
     }> {
-    const launch = prepared?.sessionDirectory === sessionDirectory
-      ? prepared
+    const usesPreparedLaunch = prepared?.sessionDirectory === sessionDirectory;
+    const ownsLaunch = !usesPreparedLaunch;
+    const launch = usesPreparedLaunch
+      ? prepared as OpsWorkerPreparedAttemptLaunch
       : this.prepareAttemptLaunch(sessionDirectory);
     const { context, parityLaunch } = launch;
     try {
@@ -1092,7 +1094,11 @@ export class OpsWorkerPiAttemptRunner {
     };
     } finally {
       const currentTask = this.supervisor.getTask(task.id);
-      if (currentTask?.activeRun === null && currentTask.unverifiedRun === null) {
+      if (
+        ownsLaunch
+        && currentTask?.activeRun === null
+        && currentTask.unverifiedRun === null
+      ) {
         cleanupOpsWorkerParityLaunch(parityLaunch);
       }
     }

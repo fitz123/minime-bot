@@ -97,6 +97,19 @@ Rationale:
 If a wrapper ever grows logic worth testing, move that logic into a
 `src/pi-extensions/*.ts` helper rather than adding a tsconfig for the wrapper.
 
+## Ops-worker parity resource loading
+
+Ops-worker capability parity intentionally uses two production dependencies at
+runtime. `typescript` performs deterministic AST inspection of each selected
+extension's statically resolved local module closure; dynamic and reflective
+module loading fails closed. The package-owned subagent manifest additionally
+pins its bundled `agents/` and `prompts/` resources.
+`jiti` loads the resulting private, read-only extension snapshots with fixed
+package aliases and resolver settings, so extension-local replacements or
+ambient Jiti configuration cannot change the executed dependency bytes. Skills
+are pinned as complete bounded directory packages rather than as `SKILL.md`
+alone.
+
 ## Context assembler (workspace context parity at spawn)
 
 `bot/src/pi-context-assembler.ts` gives Pi spawns the same workspace context

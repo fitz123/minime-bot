@@ -7,10 +7,21 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   statSync,
 } from "node:fs";
-import { dirname, extname, isAbsolute, normalize, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import ts from "typescript";
 import { assertOpsWorkerParityContractRepresentable } from "./pi-parity-contract-limits.js";
 import {
@@ -33,6 +44,7 @@ const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MAX_EXTENSION_RESOURCE_FILES = 2_048;
 const MAX_EXTENSION_RESOURCE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXTENSION_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
+const MAX_RESOURCE_DIRECTORIES = 2_048;
 export const PI_EXTENSION_JITI_EXTENSIONS = [
   ".js",
   ".mjs",
@@ -125,6 +137,17 @@ export interface PiExtensionResourceSnapshot {
   files: readonly PiExtensionResourceFile[];
 }
 
+export interface PiSkillResourceFile extends PiExtensionResourceFile {
+  executable: boolean;
+}
+
+export interface PiSkillResourceSnapshot {
+  identity: string;
+  rootPath: string;
+  skillPath: string;
+  files: readonly PiSkillResourceFile[];
+}
+
 export interface PiPrimaryResourceContract {
   version: typeof PI_PRIMARY_RESOURCE_CONTRACT_VERSION;
   /** Trusted absolute entrypoints used to build repeatable --extension args. */
@@ -163,7 +186,7 @@ function readTrustedFile(path: string): Buffer {
     || (typeof process.getuid === "function" && direct.uid !== process.getuid())
   ) throw new TypeError("Pi resource must remain a current-user-owned regular file");
   if (direct.size > MAX_EXTENSION_RESOURCE_FILE_BYTES) {
-    throw new TypeError("Pi extension resource file exceeds the bounded size limit");
+    throw new TypeError("Pi resource file exceeds the bounded size limit");
   }
   const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
@@ -188,11 +211,10 @@ function readTrustedFile(path: string): Buffer {
   }
 }
 
-function trustedFileContentHash(path: string): string {
-  return sha256(readTrustedFile(path));
-}
-
-function localModuleSpecifiers(path: string, content: Buffer): string[] {
+function localModuleSpecifiers(
+  path: string,
+  content: Buffer,
+): string[] {
   const source = ts.createSourceFile(
     path,
     content.toString("utf8"),
@@ -390,8 +412,98 @@ function resolveLocalModule(importer: string, specifier: string): string {
   throw new TypeError("Pi extension contains an unresolved local module dependency");
 }
 
+function isContainedPath(base: string, target: string): boolean {
+  const child = relative(base, target);
+  return child === "" || !(
+    child === ".."
+    || child.startsWith(`..${sep}`)
+    || isAbsolute(child)
+  );
+}
+
+function strictTrustedDirectory(path: string, label: string): string {
+  const normalized = normalize(resolve(path));
+  const direct = lstatSync(normalized);
+  if (!direct.isDirectory() || direct.isSymbolicLink()) {
+    throw new TypeError(`${label} must be a regular non-symlink directory`);
+  }
+  if (typeof process.getuid === "function" && direct.uid !== process.getuid()) {
+    throw new TypeError(`${label} must be owned by the current user`);
+  }
+  const real = normalize(realpathSync(normalized));
+  if (real !== normalized || !statSync(real).isDirectory()) {
+    throw new TypeError(`${label} must resolve without a symlink`);
+  }
+  return real;
+}
+
+function trustedDirectoryResourcePaths(
+  rootPath: string,
+  label: string,
+): Array<{ path: string; executable: boolean }> {
+  const root = strictTrustedDirectory(rootPath, label);
+  const pending = [root];
+  const files: Array<{ path: string; executable: boolean }> = [];
+  let directoryCount = 0;
+  while (pending.length > 0) {
+    const directory = pending.pop() as string;
+    directoryCount += 1;
+    if (directoryCount > MAX_RESOURCE_DIRECTORIES) {
+      throw new TypeError(`${label} exceeds the bounded directory limit`);
+    }
+    const entries = readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const direct = lstatSync(path);
+      if (direct.isSymbolicLink()) {
+        throw new TypeError(`${label} must not contain symlinks`);
+      }
+      if (typeof process.getuid === "function" && direct.uid !== process.getuid()) {
+        throw new TypeError(`${label} must remain current-user-owned`);
+      }
+      if (direct.isDirectory()) {
+        const child = strictTrustedDirectory(path, label);
+        if (!isContainedPath(root, child)) {
+          throw new TypeError(`${label} escaped its trusted root`);
+        }
+        pending.push(child);
+        continue;
+      }
+      if (!direct.isFile()) {
+        throw new TypeError(`${label} must contain only regular files and directories`);
+      }
+      const file = strictTrustedFile(path, label);
+      if (!isContainedPath(root, file)) {
+        throw new TypeError(`${label} escaped its trusted root`);
+      }
+      files.push({ path: file, executable: (direct.mode & 0o111) !== 0 });
+      if (files.length > MAX_EXTENSION_RESOURCE_FILES) {
+        throw new TypeError(`${label} exceeds the bounded file limit`);
+      }
+    }
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function packageOwnedExtensionResourcePaths(
+  entryPath: string,
+): Array<{ path: string; executable: boolean }> {
+  if (
+    basename(dirname(entryPath)) !== "subagent"
+    || !/^index\.(?:[cm]?[jt]sx?)$/.test(basename(entryPath))
+  ) return [];
+  return ["agents", "prompts"].flatMap((directory) =>
+    trustedDirectoryResourcePaths(
+      join(dirname(entryPath), directory),
+      `Pi subagent ${directory} resources`,
+    ));
+}
+
 function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
-  const pending = [strictTrustedFile(entryPath, "Pi extension resource")];
+  const trustedEntryPath = strictTrustedFile(entryPath, "Pi extension resource");
+  const packageOwnedResources = packageOwnedExtensionResourcePaths(trustedEntryPath);
+  const pending = [trustedEntryPath];
   const seen = new Set<string>();
   const files: PiExtensionResourceFile[] = [];
   let totalBytes = 0;
@@ -414,6 +526,19 @@ function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
       if (!seen.has(dependency)) pending.push(dependency);
     }
   }
+  for (const resource of packageOwnedResources) {
+    if (seen.has(resource.path)) continue;
+    seen.add(resource.path);
+    if (seen.size > MAX_EXTENSION_RESOURCE_FILES) {
+      throw new TypeError("Pi extension resource closure exceeds the bounded file limit");
+    }
+    const content = readTrustedFile(resource.path);
+    totalBytes += content.length;
+    if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
+      throw new TypeError("Pi extension resource closure exceeds the bounded byte limit");
+    }
+    files.push({ path: resource.path, contentHash: sha256(content) });
+  }
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -422,8 +547,42 @@ export function createPiExtensionResourceSnapshot(path: string): PiExtensionReso
   return {
     files,
     identity: sha256(
-      `minime-pi-extension-identity-v4\0${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)}\0${JSON.stringify(files)}`,
+      `minime-pi-extension-identity-v5\0${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)}\0${JSON.stringify(files)}`,
     ),
+  };
+}
+
+export function createPiSkillResourceSnapshot(path: string): PiSkillResourceSnapshot {
+  const skillPath = strictTrustedFile(path, "Pi skill resource");
+  const rootPath = strictTrustedDirectory(dirname(skillPath), "Pi skill root");
+  const resourcePaths = trustedDirectoryResourcePaths(rootPath, "Pi skill package");
+  const files: PiSkillResourceFile[] = [];
+  let totalBytes = 0;
+  for (const resource of resourcePaths) {
+    const content = readTrustedFile(resource.path);
+    totalBytes += content.length;
+    if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
+      throw new TypeError("Pi skill package exceeds the bounded byte limit");
+    }
+    files.push({
+      path: resource.path,
+      contentHash: sha256(content),
+      executable: resource.executable,
+    });
+  }
+  if (!files.some((file) => file.path === skillPath)) {
+    throw new TypeError("Pi skill entrypoint is absent from its trusted package");
+  }
+  const identityFiles = files.map((file) => ({
+    path: relative(rootPath, file.path).split(sep).join("/"),
+    contentHash: file.contentHash,
+    executable: file.executable,
+  }));
+  return {
+    rootPath,
+    skillPath,
+    files,
+    identity: sha256(`minime-pi-skill-identity-v4\0${JSON.stringify(identityFiles)}`),
   };
 }
 
@@ -433,13 +592,10 @@ export function piResourceIdentity(kind: "extension" | "skill", path: string): s
   if (kind === "extension") {
     return createPiExtensionResourceSnapshot(trustedPath).identity;
   }
-  // Worker attempts execute a private copy of the accepted skill bytes. Keep
+  // Worker attempts execute a private copy of the accepted skill package. Keep
   // the identity path-independent so that immutable copy retains the primary
   // skill's capability identity without exposing its private host path.
-  return sha256([
-    "minime-pi-skill-identity-v3",
-    trustedFileContentHash(trustedPath),
-  ].join("\0"));
+  return createPiSkillResourceSnapshot(trustedPath).identity;
 }
 
 function strictTrustedFile(path: string, label: string): string {

@@ -158,19 +158,22 @@ Worker Pi launches keep ambient discovery disabled and explicitly load the same
 package-owned/configured extensions, effective skills, and complete selected
 tool names as the primary session. Generated private wrappers load verified
 read-only snapshots of each extension closure, including the parity gate, and
-give even handler-only extensions a deterministic one-way identity. The ops
-policy is the sole intentional additive context delta. Before provider work, a
-package-owned extension compares the effective system prompt with its session
-baseline and reports structured context-file, extension, skill, and tool
-metadata through a
+give even handler-only extensions a deterministic one-way identity. The worker
+also replaces every selected skill with a bounded, read-only snapshot of its
+complete directory package, preserving relative scripts, references, assets,
+and executable bits. The ops policy is the sole intentional additive context
+delta. Before provider work, a package-owned extension compares the effective
+system prompt with its session baseline and reports structured context-file,
+extension, skill, and tool metadata through a
 parent/child acknowledgement handshake. The parent recomputes every prepared
 digest before acknowledging. Any missing, internally inconsistent, or
 mismatched evidence fails closed; persisted evidence contains versioned results
 and hashes only.
 
 Extension identities include the complete statically resolved local module
-closure using the same fixed Jiti resolver contract as execution. Ambient Jiti
-extension ordering and cache configuration cannot change that contract. Dynamic
+closure using the same fixed Jiti resolver contract as execution, plus the
+package-owned subagent manifest's bundled agent and prompt resources. Ambient
+Jiti extension ordering and cache configuration cannot change that contract. Dynamic
 imports, runtime `require`, `createRequire`, VM loaders, and runtime code generation
 fail closed because their eventual executable dependency bytes cannot be fenced
 before launch. Extension imports outside the local closure are limited to the
@@ -241,7 +244,10 @@ only as a SHA-256 hash; the helper never runs a command or contacts an external
 system. Identical checkpoint replay is a no-op, while reuse of the checkpoint id
 with different content fails closed, including after a newer checkpoint has
 become current. Checkpoint snapshot updates count as attempt liveness and are
-allowed while the supervisor owns the task.
+allowed while the supervisor owns the task, except during the atomic pre-spawn
+fence. While an `unverifiedRun` is present, lifecycle identity, checkpoint, and
+receipt evidence writes fail closed and callers must retry after launch
+resolution.
 
 `--lifecycle` accepts only `canonicalTask`, `repository`, `base`, `head`,
 `branch`, `pullRequest`, `merge`, `tag`, `release`, `deploy`, `report`, and

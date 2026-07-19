@@ -1,7 +1,11 @@
 import {
   chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -9,7 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
@@ -146,6 +150,7 @@ function ensurePrivateArtifactDir(path: string): void {
  * the `\r` (it is whitespace), so the captured path token stays clean.
  */
 const IMPORT_LINE = /^[ \t]*@(\S+)[ \t]*\r?$/;
+const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 
 /**
  * The fixed `## Knowledge access` directive (verbatim). In v2 workspaces,
@@ -164,13 +169,47 @@ const KNOWLEDGE_ACCESS_DIRECTIVE = [
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");
 
-/** Read a file, returning null on ANY error (fail-safe: missing/unreadable → skip). */
-function safeReadFile(path: string): string | null {
+/**
+ * Read one already-resolved regular file through a stable descriptor. The
+ * realpath checks before and after the descriptor read close the final-component
+ * and intermediate-directory symlink swap windows without weakening normal
+ * fail-safe callers.
+ */
+function safeReadFileBuffer(path: string): Buffer | null {
+  let descriptor: number | undefined;
   try {
-    return readFileSync(path, "utf8");
+    const expectedPath = normalize(resolve(path));
+    const direct = lstatSync(expectedPath);
+    if (!direct.isFile() || direct.isSymbolicLink()) return null;
+    descriptor = openSync(expectedPath, constants.O_RDONLY | NO_FOLLOW);
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== direct.dev
+      || opened.ino !== direct.ino
+      || normalize(realpathSync(expectedPath)) !== expectedPath
+    ) return null;
+    const content = readFileSync(descriptor);
+    const completed = fstatSync(descriptor);
+    if (
+      completed.dev !== opened.dev
+      || completed.ino !== opened.ino
+      || completed.size !== opened.size
+      || completed.mtimeMs !== opened.mtimeMs
+      || completed.ctimeMs !== opened.ctimeMs
+      || normalize(realpathSync(expectedPath)) !== expectedPath
+    ) return null;
+    return content;
   } catch {
     return null;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
+}
+
+/** Read a file, returning null on ANY error (fail-safe: missing/unreadable → skip). */
+function safeReadFile(path: string): string | null {
+  return safeReadFileBuffer(path)?.toString("utf8") ?? null;
 }
 
 function rejectDirectSymlink(path: string, label: string): void {
@@ -239,7 +278,10 @@ function sourceSignature(path: string, baseDir: string): string {
   try {
     const st = statSync(resolved.realPath);
     if (st.isFile()) {
-      return `${path}->${resolved.realPath}:${sha256(readFileSync(resolved.realPath))}`;
+      const content = safeReadFileBuffer(resolved.realPath);
+      return content === null
+        ? `${path}:missing`
+        : `${path}->${resolved.realPath}:${sha256(content)}`;
     }
     return `${path}->${resolved.realPath}:${st.mtimeMs}:${st.size}`;
   } catch {

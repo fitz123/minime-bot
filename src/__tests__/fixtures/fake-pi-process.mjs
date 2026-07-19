@@ -224,6 +224,11 @@ switch (scenario) {
     }
     process.stdout.write("fake Pi should not survive invalid final telemetry\n");
     break;
+  case "session-corrupt-after-parity":
+    writeFileSync(sessionFile, "not-json\n", "utf8");
+    process.stderr.write("Session file is not a valid pi session\n");
+    process.exitCode = 1;
+    break;
   case "crash":
     process.stderr.write("fake Pi crashed\n");
     process.exitCode = 2;

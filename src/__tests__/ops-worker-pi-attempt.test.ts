@@ -663,7 +663,8 @@ describe("ops worker Pi standard-session attempts", () => {
       drifted.currentCheckpoint?.checkpointId,
       "checkpoint-between-prompt-and-fence",
     );
-    assert.equal(harness.invocations.length, 0);
+    assert.equal(harness.invocations.length, 1);
+    assert.equal(harness.children.length, 0);
     harness.supervisor.cancelTask(staleTask.id, "Release drifted launch fixture custody");
 
     const fencedTask = makeTask("launch-lifecycle-freeze");
@@ -984,6 +985,54 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(rejected?.custody.status, "UNCLAIMED");
     assert.equal(rejected?.custody.claimedAt, null);
     assert.equal(harness.children.length, 1);
+  });
+
+  it("retains a caller-prepared parity snapshot across a corrupt-session retry", async (t) => {
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    let quota = deniedQuota(dueAt);
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("prepared-snapshot-session-retry");
+    task.schedule.nextRunAt = dueAt;
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed quota wait before a session retry.",
+    };
+    harness.store.create(task);
+    const proof = await harness.runner({
+      dependencies: { runQuotaProbe: async () => ({ status: "SUCCESS" }) },
+    }).runNext();
+    assert.equal(proof?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.equal(proof?.custody.status, "UNCLAIMED");
+
+    quota = admittedQuota();
+    let attemptCount = 0;
+    const recovered = await harness.runner({
+      dependencies: {
+        resolveInvocation: (args) => {
+          const scenario = attemptCount === 0
+            ? "session-corrupt-after-parity"
+            : "success";
+          attemptCount += 1;
+          return {
+            command: process.execPath,
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, scenario, ...args],
+          };
+        },
+      },
+    }).runNext();
+
+    assert.equal(recovered?.state, "DONE", JSON.stringify({
+      attemptCount,
+      children: harness.children.length,
+      lastOutcome: recovered?.lastOutcome,
+      session: recovered?.session,
+    }));
+    assert.equal(recovered?.lastOutcome?.result, "PASS");
+    assert.equal(attemptCount, 2);
+    assert.equal(harness.children.length, 2);
   });
 
   it("refuses a normal spawn when authorization-covered task state changes after preparation", async (t) => {

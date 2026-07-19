@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
@@ -29,10 +29,12 @@ import {
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
   createPiExtensionResourceSnapshot,
+  createPiSkillResourceSnapshot,
   PI_EXTENSION_JITI_EXTENSIONS,
   piResourceIdentity,
   type PiExtensionResourceFile,
   type PiPrimaryResourceContract,
+  type PiSkillResourceFile,
   validatePiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
 
@@ -85,11 +87,11 @@ export interface OpsWorkerParityLaunch {
   parityExtensionIdentity: string;
   primaryResources: PiPrimaryResourceContract;
   sessionDirectory: string;
-  /** Private copied extension closures and skill files used only for this child launch. */
+  /** Private copied extension closures and skill packages used only for this child launch. */
   snapshotRoots: readonly string[];
   /** Generated identity wrappers followed by the package parity gate. */
   extensionPaths: readonly string[];
-  /** Immutable copies of the primary skill files. */
+  /** Immutable package copies rooted at each primary skill file. */
   skillPaths: readonly string[];
 }
 
@@ -193,19 +195,19 @@ function commonResourceDirectory(files: readonly PiExtensionResourceFile[]): str
   }
 }
 
-function readPinnedResource(file: PiExtensionResourceFile): Buffer {
+function readPinnedResource(file: PiExtensionResourceFile, label = "Pi resource"): Buffer {
   const direct = lstatSync(file.path);
   if (
     !direct.isFile()
     || direct.isSymbolicLink()
     || (typeof process.getuid === "function" && direct.uid !== process.getuid())
     || normalize(realpathSync(file.path)) !== normalize(resolve(file.path))
-  ) throw new Error("Pi extension resource changed during private snapshot creation");
+  ) throw new Error(`${label} changed during private snapshot creation`);
   const descriptor = openSync(file.path, constants.O_RDONLY | NO_FOLLOW);
   try {
     const opened = fstatSync(descriptor);
     if (!opened.isFile() || opened.dev !== direct.dev || opened.ino !== direct.ino) {
-      throw new Error("Pi extension resource changed during private snapshot creation");
+      throw new Error(`${label} changed during private snapshot creation`);
     }
     const content = readFileSync(descriptor);
     const completed = fstatSync(descriptor);
@@ -216,7 +218,7 @@ function readPinnedResource(file: PiExtensionResourceFile): Buffer {
       || completed.mtimeMs !== opened.mtimeMs
       || completed.ctimeMs !== opened.ctimeMs
       || sha256(content) !== file.contentHash
-    ) throw new Error("Pi extension resource changed during private snapshot creation");
+    ) throw new Error(`${label} changed during private snapshot creation`);
     return content;
   } finally {
     closeSync(descriptor);
@@ -268,40 +270,41 @@ function writePrivateSkillSnapshot(
   sourcePath: string,
   identity: string,
 ): { snapshotRoot: string; skillPath: string } {
+  const snapshot = createPiSkillResourceSnapshot(sourcePath);
+  if (snapshot.identity !== identity) {
+    throw new Error("Pi skill package changed during private snapshot creation");
+  }
   const snapshotRoot = normalize(realpathSync(
     mkdtempSync(join(sessionDirectory, `${label}-snapshot-`)),
   ));
   chmodSync(snapshotRoot, 0o700);
   try {
-    const direct = lstatSync(sourcePath);
-    if (!direct.isFile() || direct.isSymbolicLink()) {
-      throw new Error("Pi skill changed during private snapshot creation");
+    const copied = snapshot.files.map((file: PiSkillResourceFile) => {
+      const child = relative(snapshot.rootPath, file.path);
+      if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+        throw new TypeError("Pi skill package path escaped its private root");
+      }
+      const destination = join(snapshotRoot, child);
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        destination,
+        readPinnedResource(file, "Pi skill package"),
+        { mode: file.executable ? 0o500 : 0o400, flag: "wx" },
+      );
+      return destination;
+    });
+    const skillChild = relative(snapshot.rootPath, snapshot.skillPath);
+    if (
+      skillChild === ".."
+      || skillChild.startsWith(`..${sep}`)
+      || isAbsolute(skillChild)
+    ) throw new TypeError("Pi skill entrypoint escaped its private snapshot");
+    const skillPath = join(snapshotRoot, skillChild);
+    if (!copied.includes(skillPath)) {
+      throw new TypeError("Pi skill entrypoint is absent from its private snapshot");
     }
-    const descriptor = openSync(sourcePath, constants.O_RDONLY | NO_FOLLOW);
-    let content: Buffer;
-    try {
-      const opened = fstatSync(descriptor);
-      if (
-        !opened.isFile()
-        || opened.dev !== direct.dev
-        || opened.ino !== direct.ino
-      ) throw new Error("Pi skill changed during private snapshot creation");
-      content = readFileSync(descriptor);
-      const completed = fstatSync(descriptor);
-      if (
-        completed.dev !== opened.dev
-        || completed.ino !== opened.ino
-        || completed.size !== opened.size
-        || completed.mtimeMs !== opened.mtimeMs
-        || completed.ctimeMs !== opened.ctimeMs
-      ) throw new Error("Pi skill changed during private snapshot creation");
-    } finally {
-      closeSync(descriptor);
-    }
-    const skillPath = join(snapshotRoot, basename(sourcePath));
-    writeFileSync(skillPath, content, { mode: 0o400, flag: "wx" });
     if (piResourceIdentity("skill", skillPath) !== identity) {
-      throw new Error("Pi skill changed during private snapshot creation");
+      throw new Error("Pi skill package changed during private snapshot creation");
     }
     return { snapshotRoot, skillPath };
   } catch (error) {
