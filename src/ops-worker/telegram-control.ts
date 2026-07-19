@@ -22,6 +22,7 @@ import {
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
+const MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS = 5 * 60 * 1_000;
 const TRUNCATION_MARKER = "\n… [truncated]";
 
 export type OpsWorkerTelegramFetch = (
@@ -40,6 +41,7 @@ export interface OpsWorkerTelegramControlOptions {
   ledger: OpsWorkerControlLedger;
   fetch?: OpsWorkerTelegramFetch;
   inspectPolicy: () => OpsWorkerPolicySnapshot;
+  now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   /** Test-only durable-boundary hook. Production callers should leave this unset. */
   faultInjector?: (
@@ -55,6 +57,7 @@ export interface OpsWorkerTelegramTickResult {
 
 interface ParsedTelegramMessage {
   updateId: number;
+  fingerprint: string;
   senderId: string;
   chatId: string;
   receivedAt: string;
@@ -125,7 +128,11 @@ function numberId(value: unknown): string | null {
   return Number.isSafeInteger(value) ? String(value) : null;
 }
 
-function parseMessage(update: Record<string, unknown>): ParsedTelegramMessage | null {
+function parseMessage(
+  update: Record<string, unknown>,
+  fingerprint: string,
+  trustedNow: Date,
+): ParsedTelegramMessage | null {
   const updateId = update.update_id;
   if (!Number.isSafeInteger(updateId) || (updateId as number) < 0) return null;
   if (!isPlainObject(update.message)) return null;
@@ -145,11 +152,20 @@ function parseMessage(update: Record<string, unknown>): ParsedTelegramMessage | 
     || (message.date as number) < 0
     || (message.date as number) > 8_640_000_000
   ) return null;
+  const trustedNowMs = trustedNow.getTime();
+  if (!Number.isFinite(trustedNowMs)) {
+    throw new TypeError("Telegram control clock returned an invalid date");
+  }
+  const messageDateMs = (message.date as number) * 1_000;
+  if (messageDateMs > trustedNowMs + MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS) {
+    return null;
+  }
   return {
     updateId: updateId as number,
+    fingerprint,
     senderId,
     chatId,
-    receivedAt: new Date((message.date as number) * 1_000).toISOString(),
+    receivedAt: new Date(messageDateMs).toISOString(),
     text: message.text,
   };
 }
@@ -249,6 +265,7 @@ export class OpsWorkerTelegramControl {
   private readonly ledger: OpsWorkerControlLedger;
   private readonly fetch: OpsWorkerTelegramFetch;
   private readonly inspectPolicy: () => OpsWorkerPolicySnapshot;
+  private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
@@ -263,13 +280,15 @@ export class OpsWorkerTelegramControl {
     this.ledger = options.ledger;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.inspectPolicy = options.inspectPolicy;
+    this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? defaultSleep;
     this.faultInjector = options.faultInjector;
   }
 
   async tick(signal: AbortSignal = new AbortController().signal): Promise<OpsWorkerTelegramTickResult> {
     const reportTaskId = await this.deliverOnePendingReport(signal);
-    const offset = this.ledger.nextOffset();
+    const cursor = this.ledger.pollCursor(this.now());
+    const offset = cursor.offset;
     const value = await this.telegramApi("getUpdates", {
       ...(offset === undefined ? {} : { offset }),
       timeout: this.config.poll.longPollSeconds,
@@ -277,7 +296,9 @@ export class OpsWorkerTelegramControl {
       allowed_updates: ["message"],
     }, signal);
     const updates = parseGetUpdatesResult(value, offset);
-    for (const update of updates) await this.processUpdate(update, signal);
+    for (const update of updates) {
+      await this.processUpdate(update, signal, cursor.epoch);
+    }
     return { updates: updates.length, reportTaskId };
   }
 
@@ -350,30 +371,44 @@ export class OpsWorkerTelegramControl {
   private async processUpdate(
     update: Record<string, unknown>,
     signal: AbortSignal,
+    epoch: number,
   ): Promise<void> {
     const updateId = update.update_id as number;
     const fingerprint = hashOpsWorkerTelegramUpdate(stableJson(update));
     const retained = this.ledger.read().processedUpdates.find(
-      (entry) => entry.updateId === updateId,
+      (entry) => entry.epoch === epoch && entry.updateId === updateId,
     );
     if (retained) {
       if (!fingerprintsEqual(retained.fingerprint, fingerprint)) {
-        this.ledger.record(updateId, fingerprint);
+        this.ledger.record(updateId, fingerprint, {
+          epoch,
+          acknowledgedAt: this.now(),
+        });
       }
       return;
     }
-    const message = parseMessage(update);
+    const message = parseMessage(
+      update,
+      fingerprint,
+      this.now(),
+    );
     if (
       message === null
       || message.chatId !== this.config.telegram.controlChatId
       || !this.config.telegram.operatorIds.includes(message.senderId)
     ) {
-      this.ledger.record(updateId, fingerprint);
+      this.ledger.record(updateId, fingerprint, {
+        epoch,
+        acknowledgedAt: this.now(),
+      });
       return;
     }
     const reply = this.dispatchCommand(message);
     this.faultInjector?.("after-effect-before-ledger", updateId);
-    this.ledger.record(updateId, fingerprint);
+    this.ledger.record(updateId, fingerprint, {
+      epoch,
+      acknowledgedAt: this.now(),
+    });
     this.faultInjector?.("after-ledger-before-reply", updateId);
     await this.sendMessage(reply, signal);
   }
@@ -421,7 +456,7 @@ export class OpsWorkerTelegramControl {
       ) return usage();
       const task = this.supervisor.getTask(taskId);
       if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = `telegram:update:${message.updateId}`;
+      const steeringId = this.steeringId(message);
       const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if ((task.state === "DONE" || task.state === "CANCELLED")
         && !replayed) {
@@ -445,7 +480,7 @@ export class OpsWorkerTelegramControl {
       if (taskId === null) return usage();
       const task = this.supervisor.getTask(taskId);
       if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = `telegram:update:${message.updateId}`;
+      const steeringId = this.steeringId(message);
       const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if ((task.state === "DONE" || task.state === "CANCELLED") && !replayed) {
         return `Task ${taskId} is terminal; ${command} was not recorded.`;
@@ -492,7 +527,7 @@ export class OpsWorkerTelegramControl {
       ) return usage();
       const task = this.supervisor.getTask(taskId);
       if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = `telegram:update:${message.updateId}`;
+      const steeringId = this.steeringId(message);
       const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if (task.state === "CANCELLED" && replayed) return `Cancellation for ${taskId} was already applied.`;
       if (task.state === "DONE" || task.state === "CANCELLED") {
@@ -532,13 +567,17 @@ export class OpsWorkerTelegramControl {
     text: string,
   ): OpsWorkerSteeringEntry {
     return {
-      steeringId: `telegram:update:${message.updateId}`,
+      steeringId: this.steeringId(message),
       receivedAt: message.receivedAt,
       kind,
       operatorRef: `telegram:${message.senderId}`,
       text,
       consumedAt: null,
     };
+  }
+
+  private steeringId(message: ParsedTelegramMessage): string {
+    return `telegram:update:${message.updateId}:${message.fingerprint}`;
   }
 
   private async deliverOnePendingReport(signal: AbortSignal): Promise<string | null> {

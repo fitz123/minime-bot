@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, type TestContext } from "node:test";
@@ -121,5 +121,30 @@ reply:
           && expected.test(error.message),
       );
     }
+  });
+
+  it("opens the config through a no-follow descriptor and enforces the read bound", (t) => {
+    const target = fixtureFile(t, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "1"
+  operatorIds: ["1"]
+`);
+    const link = `${target}.link`;
+    symlinkSync(target, link);
+    assert.throws(
+      () => loadOpsWorkerControlConfig(link, {
+        env: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN_VALUE" },
+      }),
+      (error: unknown) => error instanceof OpsWorkerControlConfigError
+        && /regular file, not a symlink/.test(error.message),
+    );
+
+    const oversized = fixtureFile(t, "x".repeat(64 * 1024 + 1));
+    assert.throws(
+      () => loadOpsWorkerControlConfig(oversized),
+      (error: unknown) => error instanceof OpsWorkerControlConfigError
+        && /exceeds 65536 bytes/.test(error.message),
+    );
   });
 });

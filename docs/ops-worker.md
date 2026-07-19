@@ -162,6 +162,11 @@ persisted, and only then is a reply sent. A crash between the task effect and
 ledger write is safe because the update-derived steering id makes redelivery an
 idempotent replay. Malformed and non-allowlisted updates receive no task effect
 or reply, but their fingerprints are retained before the offset advances.
+The ledger also records the local acknowledgement time and an update-id epoch.
+After a full week without an update it polls once without the stale offset,
+because Telegram may randomize the next update id, and begins a new epoch when
+that update arrives. Fingerprint-qualified steering ids keep this
+resynchronization replay-safe even if a numeric update id is reused.
 
 Corrections and answers are bounded trusted operator evidence and are consumed
 atomically when the next attempt resolves its launch. They are clearly marked

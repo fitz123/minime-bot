@@ -221,12 +221,14 @@ function control(
   fixture: Harness,
   transport: FakeTelegramTransport,
   faultInjector?: ConstructorParameters<typeof OpsWorkerTelegramControl>[0]["faultInjector"],
+  now: () => Date = () => new Date(NOW),
 ): OpsWorkerTelegramControl {
   return new OpsWorkerTelegramControl({
     config,
     supervisor: fixture.supervisor,
     ledger: fixture.ledger,
     fetch: transport.fetch,
+    now,
     inspectPolicy: () => ({
       authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
       verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
@@ -287,6 +289,98 @@ describe("ops worker dedicated Telegram control", () => {
       [undefined, 12, 12, 13],
     );
     assert.deepEqual(transport.getUpdatesBodies[0].allowed_updates, ["message"]);
+  });
+
+  it("resynchronizes randomized update ids after an idle week without steering collisions", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    fixture.store.create(makeTask("task-idle-epoch"));
+    const transport = new FakeTelegramTransport();
+    transport.updates.push(
+      [update(90, "/answer task-idle-epoch first epoch")],
+      [update(90, "/correct task-idle-epoch randomized epoch")],
+    );
+    let now = Date.parse(NOW);
+    const client = control(fixture, transport, undefined, () => new Date(now));
+
+    await client.tick();
+    now += 7 * 24 * 60 * 60 * 1_000;
+    await client.tick();
+
+    assert.deepEqual(
+      transport.getUpdatesBodies.map((body) => body.offset),
+      [undefined, undefined],
+    );
+    const ledger = fixture.ledger.read();
+    assert.equal(ledger.epoch, 1);
+    assert.equal(ledger.lastAckedUpdateId, 90);
+    assert.deepEqual(
+      ledger.processedUpdates.map((entry) => [entry.epoch, entry.updateId]),
+      [[0, 90], [1, 90]],
+    );
+    const steeringIds = fixture.store.get("task-idle-epoch")?.steering
+      .map((entry) => entry.steeringId) ?? [];
+    assert.equal(steeringIds.length, 2);
+    assert.notEqual(steeringIds[0], steeringIds[1]);
+    assert.ok(steeringIds.every((id) =>
+      /^telegram:update:90:sha256:[a-f0-9]{64}$/.test(id)));
+    assert.equal(fixture.ledger.nextOffset(new Date(now)), 91);
+  });
+
+  it("keeps effect replay idempotent when a crash crosses into a reset epoch", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    fixture.store.create(makeTask("task-reset-crash"));
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([update(80, "/answer task-reset-crash first effect")]);
+    let now = Date.parse(NOW);
+    await control(fixture, transport, undefined, () => new Date(now)).tick();
+
+    const redelivered = update(12, "/correct task-reset-crash replay-safe effect");
+    transport.updates.push([redelivered], [redelivered]);
+    now += 7 * 24 * 60 * 60 * 1_000;
+    let armed = true;
+    const crashing = control(fixture, transport, (point, updateId) => {
+      if (armed && point === "after-effect-before-ledger" && updateId === 12) {
+        armed = false;
+        throw new Error("synthetic reset-epoch crash");
+      }
+    }, () => new Date(now));
+    await assert.rejects(crashing.tick(), /synthetic reset-epoch crash/);
+    assert.equal(fixture.store.get("task-reset-crash")?.steering.length, 2);
+
+    await control(fixture, transport, undefined, () => new Date(now)).tick();
+
+    assert.equal(fixture.store.get("task-reset-crash")?.steering.length, 2);
+    assert.equal(fixture.ledger.read().epoch, 1);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 12);
+  });
+
+  it("bounds future Telegram message dates against the trusted intake clock", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    fixture.store.create(makeTask("task-trusted-time"));
+    const transport = new FakeTelegramTransport();
+    const maximumAccepted = update(91, "/answer task-trusted-time bounded skew");
+    (maximumAccepted.message as Record<string, unknown>).date = (
+      Date.parse(NOW) + 5 * 60 * 1_000
+    ) / 1_000;
+    const rejected = update(92, "/correct task-trusted-time untrusted future");
+    (rejected.message as Record<string, unknown>).date = (
+      Date.parse(NOW) + 5 * 60 * 1_000 + 1_000
+    ) / 1_000;
+    transport.updates.push([maximumAccepted, rejected]);
+
+    await control(fixture, transport).tick();
+
+    const task = fixture.store.get("task-trusted-time");
+    assert.equal(task?.steering.length, 1);
+    assert.equal(
+      task?.steering[0].receivedAt,
+      "2026-07-19T10:05:00.000Z",
+    );
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 92);
+    assert.equal(transport.messages.length, 1);
   });
 
   it("acknowledges bounded command rejections instead of replaying poison updates", async (t) => {

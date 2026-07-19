@@ -730,6 +730,30 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.action, "RUN");
   });
 
+  it("consumes steering at or after its durable received timestamp", async (t) => {
+    const harness = await makeHarness(t);
+    const futureReceivedAt = "2243-10-17T00:00:00.000Z";
+    const task = makeTask("task-future-steering");
+    task.steering = [{
+      steeringId: "telegram:epoch:1:update:91",
+      receivedAt: futureReceivedAt,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "Use the trusted bounded answer.",
+      consumedAt: null,
+    }];
+    harness.store.create(task);
+
+    const running = harness.supervisor.markRunning(
+      task.id,
+      activeRun("fixture-supervisor"),
+    );
+
+    assert.equal(running.updatedAt, futureReceivedAt);
+    assert.equal(running.steering[0].consumedAt, futureReceivedAt);
+    assert.equal(running.state, "RUNNING");
+  });
+
   it("atomically claims the selected task before scheduling its action", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("task-claim", {

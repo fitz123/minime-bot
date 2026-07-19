@@ -16,22 +16,38 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
-export const OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION = 1 as const;
+export const OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION = 2 as const;
+export const OPS_WORKER_CONTROL_LEDGER_V1_SCHEMA_VERSION = 1 as const;
 export const OPS_WORKER_CONTROL_LEDGER_MAX_PROCESSED_UPDATES = 256;
 export const OPS_WORKER_CONTROL_LEDGER_MAX_BYTES = 128 * 1024;
+export const OPS_WORKER_TELEGRAM_UPDATE_ID_IDLE_RESET_MS = 7 * 24 * 60 * 60 * 1_000;
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 export interface OpsWorkerProcessedTelegramUpdate {
+  epoch: number;
   updateId: number;
   fingerprint: string;
 }
 
 export interface OpsWorkerControlLedgerState {
   schemaVersion: typeof OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION;
+  epoch: number;
   lastAckedUpdateId: number | null;
+  lastAckedAt: string | null;
   processedUpdates: OpsWorkerProcessedTelegramUpdate[];
+}
+
+export interface OpsWorkerControlLedgerPollCursor {
+  epoch: number;
+  offset: number | undefined;
+  resynchronizing: boolean;
+}
+
+export interface OpsWorkerControlLedgerRecordOptions {
+  epoch?: number;
+  acknowledgedAt?: Date;
 }
 
 export interface OpsWorkerControlLedgerRecordResult {
@@ -61,7 +77,9 @@ export class OpsWorkerControlLedgerSafetyError extends Error {
 function freshLedger(): OpsWorkerControlLedgerState {
   return {
     schemaVersion: OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION,
+    epoch: 0,
     lastAckedUpdateId: null,
+    lastAckedAt: null,
     processedUpdates: [],
   };
 }
@@ -115,6 +133,32 @@ function assertUpdateId(value: unknown, path: string): asserts value is number {
   }
 }
 
+function assertEpoch(value: unknown, path: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new OpsWorkerControlLedgerSafetyError(
+      `${path} must be a non-negative safe integer`,
+    );
+  }
+}
+
+function assertTimestamp(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string") {
+    throw new OpsWorkerControlLedgerSafetyError(`${path} must be a canonical timestamp`);
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    throw new OpsWorkerControlLedgerSafetyError(`${path} must be a canonical timestamp`);
+  }
+}
+
+function canonicalDate(value: Date, path: string): string {
+  const milliseconds = value.getTime();
+  if (!Number.isFinite(milliseconds)) {
+    throw new OpsWorkerControlLedgerSafetyError(`${path} must be a valid date`);
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 function assertFingerprint(value: unknown, path: string): asserts value is string {
   if (typeof value !== "string" || !FINGERPRINT_PATTERN.test(value)) {
     throw new OpsWorkerControlLedgerSafetyError(
@@ -123,7 +167,7 @@ function assertFingerprint(value: unknown, path: string): asserts value is strin
   }
 }
 
-function parseLedger(raw: string): OpsWorkerControlLedgerState {
+function parseLedger(raw: string, legacyAcknowledgedAt: string): OpsWorkerControlLedgerState {
   if (Buffer.byteLength(raw, "utf8") > OPS_WORKER_CONTROL_LEDGER_MAX_BYTES) {
     throw new OpsWorkerControlLedgerSafetyError(
       `Control ledger exceeds ${OPS_WORKER_CONTROL_LEDGER_MAX_BYTES} bytes`,
@@ -137,18 +181,35 @@ function parseLedger(raw: string): OpsWorkerControlLedgerState {
     throw new OpsWorkerControlLedgerSafetyError(`Control ledger is malformed JSON: ${message}`);
   }
   assertPlainObject(value, "control ledger");
-  assertExactKeys(
-    value,
-    ["schemaVersion", "lastAckedUpdateId", "processedUpdates"],
-    "control ledger",
-  );
-  if (value.schemaVersion !== OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION) {
+  const legacy = value.schemaVersion === OPS_WORKER_CONTROL_LEDGER_V1_SCHEMA_VERSION;
+  if (!legacy && value.schemaVersion !== OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION) {
     throw new OpsWorkerControlLedgerSafetyError(
       `Unsupported control ledger schema version ${JSON.stringify(value.schemaVersion)}`,
     );
   }
+  assertExactKeys(
+    value,
+    legacy
+      ? ["schemaVersion", "lastAckedUpdateId", "processedUpdates"]
+      : [
+          "schemaVersion",
+          "epoch",
+          "lastAckedUpdateId",
+          "lastAckedAt",
+          "processedUpdates",
+        ],
+    "control ledger",
+  );
+  const epoch = legacy ? 0 : value.epoch;
+  assertEpoch(epoch, "control ledger.epoch");
   if (value.lastAckedUpdateId !== null) {
     assertUpdateId(value.lastAckedUpdateId, "control ledger.lastAckedUpdateId");
+  }
+  const lastAckedAt = legacy
+    ? value.lastAckedUpdateId === null ? null : legacyAcknowledgedAt
+    : value.lastAckedAt;
+  if (lastAckedAt !== null) {
+    assertTimestamp(lastAckedAt, "control ledger.lastAckedAt");
   }
   if (!Array.isArray(value.processedUpdates)) {
     throw new OpsWorkerControlLedgerSafetyError(
@@ -169,38 +230,61 @@ function parseLedger(raw: string): OpsWorkerControlLedgerState {
       `Control ledger retains more than ${OPS_WORKER_CONTROL_LEDGER_MAX_PROCESSED_UPDATES} updates`,
     );
   }
+  let previousEpoch = -1;
   let previousUpdateId = -1;
   const processedUpdates = value.processedUpdates.map((entryValue, index) => {
     const path = `control ledger.processedUpdates[${index}]`;
     assertPlainObject(entryValue, path);
-    assertExactKeys(entryValue, ["updateId", "fingerprint"], path);
+    assertExactKeys(
+      entryValue,
+      legacy ? ["updateId", "fingerprint"] : ["epoch", "updateId", "fingerprint"],
+      path,
+    );
+    const entryEpoch = legacy ? 0 : entryValue.epoch;
+    assertEpoch(entryEpoch, `${path}.epoch`);
     assertUpdateId(entryValue.updateId, `${path}.updateId`);
     assertFingerprint(entryValue.fingerprint, `${path}.fingerprint`);
-    if (entryValue.updateId <= previousUpdateId) {
+    if (
+      entryEpoch < previousEpoch
+      || (entryEpoch === previousEpoch && entryValue.updateId <= previousUpdateId)
+    ) {
       throw new OpsWorkerControlLedgerSafetyError(
-        "Control ledger update ids must be strictly increasing",
+        "Control ledger update ids must be strictly increasing within ordered epochs",
       );
     }
+    previousEpoch = entryEpoch;
     previousUpdateId = entryValue.updateId;
     return {
+      epoch: entryEpoch,
       updateId: entryValue.updateId,
       fingerprint: entryValue.fingerprint,
     };
   });
   if (
     (value.lastAckedUpdateId === null) !== (processedUpdates.length === 0)
+    || (value.lastAckedUpdateId === null) !== (lastAckedAt === null)
     || (
       value.lastAckedUpdateId !== null
-      && processedUpdates.at(-1)?.updateId !== value.lastAckedUpdateId
+      && (
+        processedUpdates.at(-1)?.epoch !== epoch
+        || processedUpdates.at(-1)?.updateId !== value.lastAckedUpdateId
+      )
     )
   ) {
     throw new OpsWorkerControlLedgerSafetyError(
-      "Control ledger offset must identify the newest retained update",
+      "Control ledger cursor must identify the newest retained update",
+    );
+  }
+  if (processedUpdates.length === 0 && epoch !== 0) {
+    throw new OpsWorkerControlLedgerSafetyError(
+      "A fresh control ledger must begin at epoch zero",
     );
   }
   return {
     schemaVersion: OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION,
+    epoch,
     lastAckedUpdateId: value.lastAckedUpdateId,
+    lastAckedAt,
     processedUpdates,
   };
 }
@@ -315,25 +399,62 @@ export class OpsWorkerControlLedger {
           "Control ledger changed identity while being opened",
         );
       }
-      return parseLedger(readFileSync(descriptor, "utf8"));
+      return parseLedger(readFileSync(descriptor, "utf8"), stats.mtime.toISOString());
     } finally {
       closeSync(descriptor);
     }
   }
 
-  nextOffset(): number | undefined {
-    const updateId = this.read().lastAckedUpdateId;
-    return updateId === null ? undefined : updateId + 1;
+  pollCursor(at: Date = new Date()): OpsWorkerControlLedgerPollCursor {
+    const observedAt = canonicalDate(at, "Telegram poll time");
+    const current = this.read();
+    if (current.lastAckedUpdateId === null || current.lastAckedAt === null) {
+      return { epoch: current.epoch, offset: undefined, resynchronizing: false };
+    }
+    if (
+      Date.parse(observedAt) - Date.parse(current.lastAckedAt)
+      >= OPS_WORKER_TELEGRAM_UPDATE_ID_IDLE_RESET_MS
+    ) {
+      if (current.epoch >= Number.MAX_SAFE_INTEGER) {
+        throw new OpsWorkerControlLedgerSafetyError(
+          "Telegram update-id epoch counter is exhausted",
+        );
+      }
+      return { epoch: current.epoch + 1, offset: undefined, resynchronizing: true };
+    }
+    return {
+      epoch: current.epoch,
+      offset: current.lastAckedUpdateId + 1,
+      resynchronizing: false,
+    };
+  }
+
+  nextOffset(at: Date = new Date()): number | undefined {
+    return this.pollCursor(at).offset;
   }
 
   record(
     updateId: number,
     fingerprint: string,
+    options: OpsWorkerControlLedgerRecordOptions = {},
   ): OpsWorkerControlLedgerRecordResult {
     assertUpdateId(updateId, "updateId");
     assertFingerprint(fingerprint, "fingerprint");
     const current = this.read();
-    const replay = current.processedUpdates.find((entry) => entry.updateId === updateId);
+    const requestedEpoch = options.epoch ?? current.epoch;
+    assertEpoch(requestedEpoch, "epoch");
+    const rawAcknowledgedAt = canonicalDate(
+      options.acknowledgedAt ?? new Date(),
+      "Telegram acknowledgement time",
+    );
+    const acknowledgedAt = current.lastAckedAt === null
+      ? rawAcknowledgedAt
+      : new Date(Math.max(
+          Date.parse(rawAcknowledgedAt),
+          Date.parse(current.lastAckedAt),
+        )).toISOString();
+    const replay = current.processedUpdates.find((entry) =>
+      entry.epoch === requestedEpoch && entry.updateId === updateId);
     if (replay) {
       if (!fingerprintsEqual(replay.fingerprint, fingerprint)) {
         throw new OpsWorkerControlLedgerSafetyError(
@@ -342,18 +463,42 @@ export class OpsWorkerControlLedger {
       }
       return { state: current, recorded: false, replayed: true };
     }
-    if (current.lastAckedUpdateId !== null && updateId <= current.lastAckedUpdateId) {
+    if (requestedEpoch < current.epoch || requestedEpoch > current.epoch + 1) {
+      throw new OpsWorkerControlLedgerSafetyError(
+        `Telegram update epoch ${requestedEpoch} is not current or the next idle epoch`,
+      );
+    }
+    const beginsNewEpoch = requestedEpoch === current.epoch + 1;
+    if (
+      beginsNewEpoch
+      && (
+        current.lastAckedAt === null
+        || Date.parse(rawAcknowledgedAt) - Date.parse(current.lastAckedAt)
+          < OPS_WORKER_TELEGRAM_UPDATE_ID_IDLE_RESET_MS
+      )
+    ) {
+      throw new OpsWorkerControlLedgerSafetyError(
+        "Telegram update-id epoch cannot reset before a full idle week",
+      );
+    }
+    if (
+      !beginsNewEpoch
+      && current.lastAckedUpdateId !== null
+      && updateId <= current.lastAckedUpdateId
+    ) {
       throw new OpsWorkerControlLedgerSafetyError(
         `Telegram update ${updateId} is older than the retained replay window`,
       );
     }
     const processedUpdates = [
       ...current.processedUpdates,
-      { updateId, fingerprint },
+      { epoch: requestedEpoch, updateId, fingerprint },
     ].slice(-this.maxProcessedUpdates);
     const next: OpsWorkerControlLedgerState = {
       schemaVersion: OPS_WORKER_CONTROL_LEDGER_SCHEMA_VERSION,
+      epoch: requestedEpoch,
       lastAckedUpdateId: updateId,
+      lastAckedAt: acknowledgedAt,
       processedUpdates,
     };
     this.write(next);

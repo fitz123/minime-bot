@@ -1,4 +1,10 @@
-import { lstatSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readSync,
+} from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { parseDocument } from "yaml";
 import {
@@ -14,6 +20,7 @@ const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TELEGRAM_CHAT_ID_PATTERN = /^-?(?:0|[1-9][0-9]{0,19})$/;
 const TELEGRAM_OPERATOR_ID_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
+const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 
 export interface OpsWorkerControlTelegramConfig {
   token: string;
@@ -327,14 +334,44 @@ export function loadOpsWorkerControlConfig(
   options: LoadOpsWorkerControlConfigOptions = {},
 ): OpsWorkerControlConfig {
   const resolvedPath = resolve(path);
-  const stats = lstatSync(resolvedPath);
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    fail("Ops control config must be a regular file, not a symlink");
+  let descriptor: number;
+  try {
+    descriptor = openSync(resolvedPath, constants.O_RDONLY | NO_FOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      fail("Ops control config must be a regular file, not a symlink");
+    }
+    throw error;
   }
-  if (stats.size > MAX_CONTROL_CONFIG_BYTES) {
-    fail(`Ops control config exceeds ${MAX_CONTROL_CONFIG_BYTES} bytes`);
+  let raw: string;
+  try {
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile()) {
+      fail("Ops control config must be a regular file, not a symlink");
+    }
+    if (stats.size > MAX_CONTROL_CONFIG_BYTES) {
+      fail(`Ops control config exceeds ${MAX_CONTROL_CONFIG_BYTES} bytes`);
+    }
+    const buffer = Buffer.allocUnsafe(MAX_CONTROL_CONFIG_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.byteLength) {
+      const count = readSync(
+        descriptor,
+        buffer,
+        bytesRead,
+        buffer.byteLength - bytesRead,
+        null,
+      );
+      if (count === 0) break;
+      bytesRead += count;
+    }
+    if (bytesRead > MAX_CONTROL_CONFIG_BYTES) {
+      fail(`Ops control config exceeds ${MAX_CONTROL_CONFIG_BYTES} bytes`);
+    }
+    raw = buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(descriptor);
   }
-  const raw = readFileSync(resolvedPath, "utf8");
   const document = parseDocument(raw, {
     uniqueKeys: true,
   });

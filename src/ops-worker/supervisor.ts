@@ -1522,6 +1522,12 @@ export class OpsWorkerSupervisor {
     if (steeringIds.size !== (consumedSteeringIds?.length ?? steeringIds.size)) {
       throw new OpsWorkerSupervisorStateError("RUNNING steering ids must be unique");
     }
+    const steeringNotBefore = existing.steering
+      .filter((entry) => steeringIds.has(entry.steeringId))
+      .reduce<string | undefined>((latest, entry) =>
+        latest === undefined || Date.parse(entry.receivedAt) > Date.parse(latest)
+          ? entry.receivedAt
+          : latest, undefined);
     return this.transition(taskId, "RUNNING", (task, at) => {
       if (task.control.paused || task.control.interrupt !== null) {
         throw new OpsWorkerSupervisorStateError(
@@ -1557,7 +1563,10 @@ export class OpsWorkerSupervisor {
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
-    }, "Started one supervisor-owned attempt", { preserveUnclaimedQuotaProbe });
+    }, "Started one supervisor-owned attempt", {
+      notBefore: steeringNotBefore,
+      preserveUnclaimedQuotaProbe,
+    });
   }
 
   recordPiParityPass(taskId: string, summary: string): OpsWorkerTask {
