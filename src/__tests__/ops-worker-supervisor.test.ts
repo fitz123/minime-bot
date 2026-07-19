@@ -701,6 +701,34 @@ describe("ops worker supervisor", () => {
     assert.equal((await harness.supervisor.claimNextTask())?.action, "QUOTA_PROBE");
   });
 
+  it("routes prompt-bearing steering received during CHECKING back through RUN", async (t) => {
+    const harness = await makeHarness(t);
+    const checking = makeTask("task-checking-steering");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    checking.schedule.nextCheckAt = LATER;
+    harness.store.create(checking);
+
+    const steered = harness.supervisor.appendTaskSteering(checking.id, {
+      steeringId: "telegram:update:checking-steering",
+      receivedAt: NOW,
+      kind: "correction",
+      operatorRef: "telegram:100000000",
+      text: "Apply this correction before evaluating completion again.",
+      consumedAt: null,
+    });
+
+    assert.equal(steered.state, "RESUMABLE");
+    assert.equal(steered.custody.status, "HELD");
+    assert.equal(steered.schedule.nextCheckAt, null);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "RUN");
+  });
+
   it("atomically claims the selected task before scheduling its action", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("task-claim", {

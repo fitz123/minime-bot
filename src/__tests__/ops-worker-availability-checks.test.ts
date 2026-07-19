@@ -132,6 +132,19 @@ describe("package-owned ops availability done check", () => {
     const staleServiceResult = await run(staleServiceObservation);
     assert.equal(staleServiceResult.result, "NOT_READY");
     assert.equal(staleServiceResult.nextCheckAt, null);
+
+    const mixedProductConvergence = healthyReadings();
+    mixedProductConvergence.monitoring = { observedAt: NOW, latestSampleAt: null };
+    mixedProductConvergence.service = {
+      observedAt: NOW,
+      status: "HEALTHY",
+      healthySince: "2026-07-19T11:58:00.000Z",
+    };
+    const mixedResult = await run(mixedProductConvergence);
+    assert.equal(mixedResult.result, "NOT_READY");
+    assert.equal(mixedResult.components[0].nextCheckAt, null);
+    assert.equal(mixedResult.components[2].nextCheckAt, "2026-07-19T12:03:00.000Z");
+    assert.equal(mixedResult.nextCheckAt, null);
   });
 
   it("defers a fresh firing alert and schedules passive convergence", async () => {

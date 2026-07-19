@@ -15,6 +15,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   isOpsWorkerTaskId,
+  type OpsWorkerSteeringEntry,
   type OpsWorkerSteeringKind,
   type OpsWorkerTask,
 } from "./types.js";
@@ -460,8 +461,8 @@ export class OpsWorkerTelegramControl {
       if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
         return `Task ${taskId} cannot record more steering.`;
       }
-      this.appendControlSteering(message, taskId, command === "pause" ? "pause" : "resume", command);
       if (command === "retry") {
+        this.appendControlSteering(message, taskId, "resume", command);
         let retried: OpsWorkerTask;
         try {
           retried = this.supervisor.retryBlockedTask(taskId);
@@ -473,7 +474,11 @@ export class OpsWorkerTelegramControl {
         }
         return `Retried ${taskId}; state=${retried.state}.`;
       }
-      const changed = this.supervisor.setTaskPaused(taskId, command === "pause");
+      const changed = this.supervisor.setTaskPaused(
+        taskId,
+        command === "pause",
+        this.controlSteering(message, command === "pause" ? "pause" : "resume", command),
+      );
       return `${command === "pause" ? "Paused" : "Resumed"} ${taskId}; state=${changed.state}.`;
     }
     if (command === "cancel") {
@@ -501,8 +506,12 @@ export class OpsWorkerTelegramControl {
       if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
         return `Task ${taskId} cannot record more steering.`;
       }
-      this.appendControlSteering(message, taskId, "cancel", reason);
-      const changed = this.supervisor.requestOperatorInterrupt(taskId, "cancel", reason);
+      const changed = this.supervisor.requestOperatorInterrupt(
+        taskId,
+        "cancel",
+        reason,
+        this.controlSteering(message, "cancel", reason),
+      );
       return `Cancellation recorded for ${taskId}; state=${changed.state}.`;
     }
     return usage();
@@ -514,14 +523,22 @@ export class OpsWorkerTelegramControl {
     kind: OpsWorkerSteeringKind,
     text: string,
   ): void {
-    this.supervisor.appendTaskSteering(taskId, {
+    this.supervisor.appendTaskSteering(taskId, this.controlSteering(message, kind, text));
+  }
+
+  private controlSteering(
+    message: ParsedTelegramMessage,
+    kind: OpsWorkerSteeringKind,
+    text: string,
+  ): OpsWorkerSteeringEntry {
+    return {
       steeringId: `telegram:update:${message.updateId}`,
       receivedAt: message.receivedAt,
       kind,
       operatorRef: `telegram:${message.senderId}`,
       text,
       consumedAt: null,
-    });
+    };
   }
 
   private async deliverOnePendingReport(signal: AbortSignal): Promise<string | null> {

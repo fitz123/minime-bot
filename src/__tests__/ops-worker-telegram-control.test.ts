@@ -430,16 +430,35 @@ describe("ops worker dedicated Telegram control", () => {
       armed = true;
 
       await assert.rejects(client.tick(), /synthetic crash after steering write/);
-      assert.equal(fixture.store.get(taskId)?.steering.length, 1);
+      const persisted = fixture.store.get(taskId);
+      assert.equal(persisted?.steering.length, 1);
       assert.equal(fixture.ledger.nextOffset(), undefined);
+      fixture.close();
 
-      await client.tick();
-      const converged = fixture.store.get(taskId);
+      const restarted = await harness(t, {
+        directory: fixture.directory,
+        instanceId: `multi-write-restarted-${index}`,
+      });
+      if (expected.command === "pause") {
+        assert.equal(persisted?.control.paused, true);
+        assert.equal(restarted.supervisor.selectNextTask(), undefined);
+      } else if (expected.command === "cancel") {
+        assert.equal(persisted?.control.interrupt?.mode, "cancel");
+        assert.equal(restarted.store.get(taskId)?.state, "CANCELLED");
+        assert.equal(restarted.supervisor.selectNextTask(), undefined);
+      } else if (expected.command === "resume") {
+        assert.equal(restarted.supervisor.selectNextTask()?.action, "RUN");
+      } else {
+        assert.equal(restarted.supervisor.selectNextTask(), undefined);
+      }
+
+      await control(restarted, transport).tick();
+      const converged = restarted.store.get(taskId);
       assert.equal(converged?.steering.length, 1);
       assert.equal(converged?.state, expected.expectedState);
       assert.equal(converged?.control.paused, expected.expectedPaused);
-      assert.equal(fixture.ledger.nextOffset(), 41 + index);
-      fixture.close();
+      assert.equal(restarted.ledger.nextOffset(), 41 + index);
+      restarted.close();
     }
   });
 

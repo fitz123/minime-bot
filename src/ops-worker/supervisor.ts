@@ -46,6 +46,7 @@ import {
   OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
   hashOpsWorkerPiLaunchSubject,
   hashOpsWorkerVerificationSubject,
+  isOpsWorkerTerminalState,
   isOpsWorkerUnclaimedQuotaProbeProcess,
   type OpsWorkerActiveRun,
   type OpsWorkerCustodyReleaseReason,
@@ -680,26 +681,36 @@ export class OpsWorkerSupervisor {
     return this.store.appendSteering(taskId, entry).task;
   }
 
-  setTaskPaused(taskId: string, paused: boolean): OpsWorkerTask {
+  setTaskPaused(
+    taskId: string,
+    paused: boolean,
+    steering?: OpsWorkerSteeringEntry,
+  ): OpsWorkerTask {
     this.assertStarted();
-    return this.store.setPaused(taskId, paused).task;
+    return steering === undefined
+      ? this.store.setPaused(taskId, paused).task
+      : this.store.appendSteeringAndSetPaused(taskId, steering, paused).task;
   }
 
   requestOperatorInterrupt(
     taskId: string,
     mode: OpsWorkerInterruptMode,
     reason: string,
+    steering?: OpsWorkerSteeringEntry,
   ): OpsWorkerTask {
     this.assertStarted();
     const requestedAt = this.now().toISOString();
-    const requested = this.store.setInterrupt(taskId, {
+    const interrupt: OpsWorkerInterrupt = {
       requestedAt,
       mode,
       reason,
-    }, {
-      event: "UPDATED",
-      summary: `Recorded durable operator ${mode} interrupt`,
-    }).task;
+    };
+    const requested = (steering === undefined
+      ? this.store.setInterrupt(taskId, interrupt, {
+        event: "UPDATED",
+        summary: `Recorded durable operator ${mode} interrupt`,
+      })
+      : this.store.appendSteeringAndSetInterrupt(taskId, steering, interrupt)).task;
     if (requested.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(requested)) {
       return requested;
     }
@@ -953,6 +964,7 @@ export class OpsWorkerSupervisor {
     if (!claimed) {
       const current = this.requireTask(taskId);
       if (current.control.paused) return current;
+      if (isOpsWorkerTerminalState(current.state)) return current;
       if (
         action === "RUN"
         && current.custody.status === "UNCLAIMED"

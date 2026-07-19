@@ -488,6 +488,56 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(sessionSource, /Session file is not a valid pi session/);
   });
 
+  it("returns a task cancelled while pre-launch authorization is in flight", async (t) => {
+    let releaseAuthorization!: () => void;
+    let authorizationStarted!: () => void;
+    const authorizationGate = new Promise<void>((resolveGate) => {
+      releaseAuthorization = resolveGate;
+    });
+    const started = new Promise<void>((resolveStarted) => {
+      authorizationStarted = resolveStarted;
+    });
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "cancellation-race-authorization",
+      version: "1",
+      verify: async () => {
+        verificationCalls += 1;
+        if (verificationCalls === 2) {
+          authorizationStarted();
+          await authorizationGate;
+        }
+        return {
+          status: "PASS",
+          evidenceHash: `sha256:${"6".repeat(64)}`,
+          summary: "Authorization completed after the operator cancellation.",
+        };
+      },
+    };
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+    });
+    const task = makeTask("cancel-during-authorization");
+    harness.store.create(task);
+
+    const pending = harness.runner().runNext();
+    await started;
+    const cancelled = harness.supervisor.cancelTask(
+      task.id,
+      "Cancel while the trusted authorization query is in flight.",
+    );
+    releaseAuthorization();
+    const result = await pending;
+
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(result?.state, "CANCELLED");
+    assert.equal(verificationCalls, 2);
+    assert.equal(harness.children.length, 0);
+  });
+
   it("injects the assembled agent context before the fixed ops-worker policy", async (t) => {
     const harness = await makeHarness(t);
     harness.store.create(makeTask("assembled-context"));

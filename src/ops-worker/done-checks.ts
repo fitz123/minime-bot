@@ -567,8 +567,9 @@ export class OpsWorkerDoneCheckRegistry {
         )
         : component);
     const result = aggregateOpsWorkerVerificationOutcome(components);
-    const scheduled = components
-      .filter((component) => component.required && component.outcome === result)
+    const decidingComponents = components
+      .filter((component) => component.required && component.outcome === result);
+    const scheduled = decidingComponents
       .map((component) => component.nextCheckAt)
       .filter((value): value is string => value !== null)
       .sort();
@@ -589,9 +590,12 @@ export class OpsWorkerDoneCheckRegistry {
       checkedAt: context.checkedAt,
       result,
       summary,
-      nextCheckAt: result === "DEFER" || result === "NOT_READY"
+      nextCheckAt: result === "DEFER"
         ? scheduled[0] ?? null
-        : null,
+        : result === "NOT_READY"
+          && decidingComponents.every((component) => component.nextCheckAt !== null)
+          ? scheduled[0] ?? null
+          : null,
       components,
     };
   }
