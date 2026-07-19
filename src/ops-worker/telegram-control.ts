@@ -12,6 +12,7 @@ import {
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
+import { OpsWorkerSteeringCapacityError } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
   isOpsWorkerTaskId,
@@ -404,7 +405,13 @@ export class OpsWorkerTelegramControl {
       });
       return;
     }
-    const reply = this.dispatchCommand(message);
+    let reply: string;
+    try {
+      reply = this.dispatchCommand(message);
+    } catch (error) {
+      if (!(error instanceof OpsWorkerSteeringCapacityError)) throw error;
+      reply = "The task has no remaining steering capacity; the command was not recorded.";
+    }
     this.faultInjector?.("after-effect-before-ledger", updateId);
     this.ledger.record(updateId, fingerprint, {
       epoch,
@@ -498,10 +505,12 @@ export class OpsWorkerTelegramControl {
         return `Task ${taskId} cannot record more steering.`;
       }
       if (command === "retry") {
-        this.appendControlSteering(message, taskId, "resume", command);
         let retried: OpsWorkerTask;
         try {
-          retried = this.supervisor.retryBlockedTask(taskId);
+          retried = this.supervisor.retryBlockedTask(
+            taskId,
+            this.controlSteering(message, "resume", command),
+          );
         } catch (error) {
           if (error instanceof OpsWorkerSupervisorStateError) {
             return `Retry for ${taskId} was rejected at its current safe boundary.`;
@@ -551,15 +560,6 @@ export class OpsWorkerTelegramControl {
       return `Cancellation recorded for ${taskId}; state=${changed.state}.`;
     }
     return usage();
-  }
-
-  private appendControlSteering(
-    message: ParsedTelegramMessage,
-    taskId: string,
-    kind: OpsWorkerSteeringKind,
-    text: string,
-  ): void {
-    this.supervisor.appendTaskSteering(taskId, this.controlSteering(message, kind, text));
   }
 
   private controlSteering(

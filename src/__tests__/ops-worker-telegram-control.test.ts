@@ -437,7 +437,7 @@ describe("ops worker dedicated Telegram control", () => {
 
     assert.equal(fixture.ledger.read().lastAckedUpdateId, 71);
     assert.equal(fixture.store.get(ambiguous.id)?.state, "BLOCKED");
-    assert.equal(fixture.store.get(ambiguous.id)?.steering.length, 1);
+    assert.equal(fixture.store.get(ambiguous.id)?.steering.length, 0);
     assert.equal(
       fixture.store.get(full.id)?.steering.length,
       OPS_WORKER_LIMITS.maxSteeringEntries,
@@ -471,6 +471,107 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(fixture.store.get("task-crash")?.steering.length, 1);
     assert.equal(fixture.ledger.nextOffset(), 22);
     assert.equal(transport.messages.length, 1);
+  });
+
+  it("does not reapply an old retry after the task blocks again before redelivery", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const blocked = makeTask("task-retry-aba");
+    blocked.state = "BLOCKED";
+    blocked.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    blocked.rounds.remediation = blocked.rounds.maxRemediation;
+    blocked.lastOutcome = {
+      at: NOW,
+      kind: "PI_EXIT",
+      result: "BLOCKED",
+      summary: "Fixture first blocked episode.",
+    };
+    blocked.report.state = "PENDING";
+    fixture.store.create(blocked);
+
+    const transport = new FakeTelegramTransport();
+    const command = update(22, "/retry task-retry-aba");
+    transport.updates.push([command], [command]);
+    let armed = true;
+    const crashing = control(fixture, transport, (point) => {
+      if (armed && point === "after-effect-before-ledger") {
+        armed = false;
+        throw new Error("synthetic crash before retry acknowledgement");
+      }
+    });
+
+    await assert.rejects(crashing.tick(), /synthetic crash before retry acknowledgement/);
+    assert.equal(fixture.store.get(blocked.id)?.state, "RESUMABLE");
+    assert.equal(fixture.store.get(blocked.id)?.steering.length, 1);
+
+    fixture.store.mutate(blocked.id, {
+      event: "TRANSITION",
+      summary: "Fixture task blocked again before Telegram redelivery",
+    }, (task) => {
+      task.state = "BLOCKED";
+      task.custody = {
+        status: "RELEASED",
+        claimedAt: task.custody.claimedAt,
+        releasedAt: "2026-07-19T10:01:00.000Z",
+        releaseReason: "BLOCKED",
+      };
+      task.rounds.remediation = 2;
+      task.report.state = "SENT";
+      task.lastOutcome = {
+        at: "2026-07-19T10:01:00.000Z",
+        kind: "PI_EXIT",
+        result: "BLOCKED",
+        summary: "Fixture later blocked episode.",
+      };
+      task.updatedAt = "2026-07-19T10:01:00.000Z";
+    });
+
+    await control(fixture, transport).tick();
+    const replayed = fixture.store.get(blocked.id);
+    assert.equal(replayed?.state, "BLOCKED");
+    assert.equal(replayed?.rounds.remediation, 2);
+    assert.equal(replayed?.report.state, "SENT");
+    assert.equal(replayed?.lastOutcome?.summary, "Fixture later blocked episode.");
+    assert.equal(replayed?.steering.length, 1);
+    assert.equal(fixture.ledger.nextOffset(), 23);
+  });
+
+  it("durably rejects steering that would exceed the whole snapshot bound", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const nearCapacity = makeTask("task-steering-capacity");
+    nearCapacity.steering = Array.from({ length: 62 }, (_, index) => ({
+      steeringId: `fixture:capacity:${index}`,
+      receivedAt: NOW,
+      kind: "answer" as const,
+      operatorRef: "fixture:operator",
+      text: "x".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    }));
+    fixture.store.create(nearCapacity);
+    const before = fixture.store.get(nearCapacity.id);
+    assert.ok(before);
+    assert.equal(before.steering.length < OPS_WORKER_LIMITS.maxSteeringEntries, true);
+
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(
+        23,
+        `/answer ${nearCapacity.id} ${"y".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes)}`,
+      ),
+    ]);
+
+    await control(fixture, transport).tick();
+
+    assert.equal(fixture.store.get(nearCapacity.id)?.steering.length, before.steering.length);
+    assert.equal(fixture.ledger.nextOffset(), 24);
+    assert.equal(transport.messages.length, 1);
+    assert.match(String(transport.messages[0].text), /no remaining steering capacity/);
   });
 
   it("converges multi-write commands when a crash follows their steering write", async (t) => {
@@ -549,7 +650,7 @@ describe("ops worker dedicated Telegram control", () => {
       } else if (expected.command === "resume") {
         assert.equal(restarted.supervisor.selectNextTask()?.action, "RUN");
       } else {
-        assert.equal(restarted.supervisor.selectNextTask(), undefined);
+        assert.equal(restarted.supervisor.selectNextTask()?.action, "RUN");
       }
 
       await control(restarted, transport).tick();

@@ -125,7 +125,7 @@ describe("package-owned ops availability done check", () => {
 
     const staleServiceObservation = healthyReadings();
     staleServiceObservation.service = {
-      observedAt: "2026-07-19T11:58:59.999Z",
+      observedAt: "2026-07-19T11:58:44.999Z",
       status: "HEALTHY",
       healthySince: SIX_MINUTES_AGO,
     };
@@ -145,6 +145,29 @@ describe("package-owned ops availability done check", () => {
     assert.equal(mixedResult.components[0].nextCheckAt, null);
     assert.equal(mixedResult.components[2].nextCheckAt, "2026-07-19T12:03:00.000Z");
     assert.equal(mixedResult.nextCheckAt, null);
+  });
+
+  it("accepts direct service samples within the supported scrape jitter", async () => {
+    const withinJitter = "2026-07-19T11:58:50.000Z";
+    const healthy = healthyReadings();
+    healthy.service = {
+      observedAt: withinJitter,
+      status: "HEALTHY",
+      healthySince: SIX_MINUTES_AGO,
+    };
+    const passed = await run(healthy);
+    assert.equal(passed.result, "PASS");
+    assert.equal(passed.components[2].outcome, "PASS");
+
+    const unhealthy = healthyReadings();
+    unhealthy.service = {
+      observedAt: withinJitter,
+      status: "UNHEALTHY",
+      healthySince: null,
+    };
+    const failed = await run(unhealthy);
+    assert.equal(failed.result, "PRODUCT_FAILURE");
+    assert.equal(failed.components[2].outcome, "PRODUCT_FAILURE");
   });
 
   it("defers a fresh firing alert and schedules passive convergence", async () => {

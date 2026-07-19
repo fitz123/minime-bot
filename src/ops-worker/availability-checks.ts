@@ -14,9 +14,15 @@ export const OPS_AVAILABILITY_DONE_CHECK_NAME = "ops.minime-availability" as con
 export const OPS_AVAILABILITY_DONE_CHECK_VERSION = "1" as const;
 export const OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT = "minime-bot-host" as const;
 
+const PROMETHEUS_SCRAPE_INTERVAL_SECONDS = 60;
+const PROMETHEUS_SCRAPE_JITTER_SECONDS = 15;
+
 export const OPS_AVAILABILITY_LIMITS = Object.freeze({
   componentTimeoutMs: 5_000,
   observationFreshnessMs: 60_000,
+  serviceObservationFreshnessMs: (
+    PROMETHEUS_SCRAPE_INTERVAL_SECONDS + PROMETHEUS_SCRAPE_JITTER_SECONDS
+  ) * 1_000,
   monitoringFreshnessMs: 2 * 60_000,
   stabilityWindowMs: 5 * 60_000,
   recheckMs: 60_000,
@@ -26,8 +32,8 @@ export const OPS_AVAILABILITY_LIMITS = Object.freeze({
   maxAlertLabels: 64,
   maxLabelBytes: 2 * 1024,
   maxPrometheusSeries: 16,
-  prometheusScrapeIntervalSeconds: 60,
-  prometheusScrapeJitterSeconds: 15,
+  prometheusScrapeIntervalSeconds: PROMETHEUS_SCRAPE_INTERVAL_SECONDS,
+  prometheusScrapeJitterSeconds: PROMETHEUS_SCRAPE_JITTER_SECONDS,
   maxPrometheusSamplesPerSeries: 32,
 } as const);
 
@@ -399,7 +405,7 @@ export function createOpsAvailabilityDoneCheckRegistry(
             if (!isFresh(
               reading.observedAt,
               observedAt,
-              OPS_AVAILABILITY_LIMITS.observationFreshnessMs,
+              OPS_AVAILABILITY_LIMITS.serviceObservationFreshnessMs,
             ) || reading.status === "UNKNOWN") {
               return result(
                 "NOT_READY",

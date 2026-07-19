@@ -2447,9 +2447,18 @@ export class OpsWorkerSupervisor {
     return this.applyDoneCheckResult(taskId, result, task, baseline);
   }
 
-  retryBlockedTask(taskId: string): OpsWorkerTask {
+  retryBlockedTask(
+    taskId: string,
+    steering?: OpsWorkerSteeringEntry,
+  ): OpsWorkerTask {
     this.assertStarted();
     const existing = this.requireTask(taskId);
+    if (
+      steering !== undefined
+      && existing.steering.some((entry) => entry.steeringId === steering.steeringId)
+    ) {
+      return this.store.appendSteering(taskId, steering).task;
+    }
     if (existing.state !== "BLOCKED") {
       throw new OpsWorkerSupervisorStateError(
         `Operator retry requires BLOCKED, found ${existing.state}`,
@@ -2494,7 +2503,7 @@ export class OpsWorkerSupervisor {
       task.report.lastError = null;
       task.lastOutcome = null;
       task.verification = null;
-    }, "Operator retried blocked task");
+    }, "Operator retried blocked task", { steering });
   }
 
   cancelTask(taskId: string, summary: string): OpsWorkerTask {
@@ -3082,6 +3091,7 @@ export class OpsWorkerSupervisor {
       expectedBaseline?: string;
       notBefore?: string;
       preserveUnclaimedQuotaProbe?: boolean;
+      steering?: OpsWorkerSteeringEntry;
     } = {},
   ): OpsWorkerTask {
     if (to === "DONE" && !options.freshDoneCheckPass) {
@@ -3089,28 +3099,33 @@ export class OpsWorkerSupervisor {
         "DONE is reserved for a fresh deterministic done-check PASS",
       );
     }
-    return this.store.mutate(
-      taskId,
-      { event: "TRANSITION", summary: auditSummary },
-      (task) => {
-        if (
-          options.expectedBaseline !== undefined
-          && JSON.stringify(task) !== options.expectedBaseline
-        ) {
-          throw new OpsWorkerStaleCheckResultError(taskId);
-        }
-        assertStructuralStateTransition(task.state, to);
-        const updatedAt = this.nextUpdatedAt(task, options.notBefore);
-        task.state = to;
-        task.updatedAt = updatedAt;
-        mutate(task, updatedAt);
-        this.applyCustodyTransition(
-          task,
-          updatedAt,
-          options.preserveUnclaimedQuotaProbe,
-        );
-      },
-    ).task;
+    const audit = { event: "TRANSITION", summary: auditSummary } as const;
+    const applyTransition = (task: OpsWorkerTask): void => {
+      if (
+        options.expectedBaseline !== undefined
+        && JSON.stringify(task) !== options.expectedBaseline
+      ) {
+        throw new OpsWorkerStaleCheckResultError(taskId);
+      }
+      assertStructuralStateTransition(task.state, to);
+      const updatedAt = this.nextUpdatedAt(task, options.notBefore);
+      task.state = to;
+      task.updatedAt = updatedAt;
+      mutate(task, updatedAt);
+      this.applyCustodyTransition(
+        task,
+        updatedAt,
+        options.preserveUnclaimedQuotaProbe,
+      );
+    };
+    return (options.steering === undefined
+      ? this.store.mutate(taskId, audit, applyTransition)
+      : this.store.appendSteeringAndMutate(
+          taskId,
+          options.steering,
+          audit,
+          applyTransition,
+        )).task;
   }
 
   private nextUpdatedAt(task: OpsWorkerTask, notBefore?: string): string {

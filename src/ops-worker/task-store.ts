@@ -120,6 +120,13 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
   }
 }
 
+export class OpsWorkerSteeringCapacityError extends OpsWorkerTaskStoreSafetyError {
+  constructor(taskId: string) {
+    super(`Task ${taskId} has no remaining steering snapshot capacity`);
+    this.name = "OpsWorkerSteeringCapacityError";
+  }
+}
+
 export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyError {
   readonly existingTaskId: string;
 
@@ -778,6 +785,22 @@ export class OpsWorkerTaskStore {
         return OPS_WORKER_TASK_STORE_NO_CHANGE;
       }
       task.updatedAt = this.nextUpdatedAt(task);
+      this.assertSteeringSnapshotCapacity(task);
+    });
+  }
+
+  appendSteeringAndMutate(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    audit: OpsWorkerAuditInput,
+    callback: (task: OpsWorkerTask) => void,
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      callback(task);
+      this.assertSteeringSnapshotCapacity(task);
     });
   }
 
@@ -809,6 +832,7 @@ export class OpsWorkerTaskStore {
       const now = this.nextUpdatedAt(task);
       task.control.pausedAt = task.control.paused ? now : null;
       task.updatedAt = now;
+      this.assertSteeringSnapshotCapacity(task);
     });
   }
 
@@ -848,6 +872,7 @@ export class OpsWorkerTaskStore {
       const now = this.nextUpdatedAt(task);
       if (startsPause) task.control.pausedAt = now;
       task.updatedAt = now;
+      this.assertSteeringSnapshotCapacity(task);
     });
   }
 
@@ -988,6 +1013,15 @@ export class OpsWorkerTaskStore {
       task.schedule.nextCheckAt = null;
     }
     return true;
+  }
+
+  private assertSteeringSnapshotCapacity(task: OpsWorkerTask): void {
+    if (
+      Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8")
+      > OPS_WORKER_LIMITS.maxSnapshotBytes
+    ) {
+      throw new OpsWorkerSteeringCapacityError(task.id);
+    }
   }
 
   private ensureSafeDirectories(): void {
