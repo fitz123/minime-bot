@@ -53,8 +53,15 @@ describe("primary Pi resource contract", () => {
   it("uses the primary RPC resolver and hashes explicit extensions, skills, and full tools", () => {
     const root = tempDirectory();
     const extra = join(root, "configured-extra.ts");
+    const extraImplementation = join(root, "configured-extra-implementation.ts");
     const skill = join(root, "SKILL.md");
-    writeFileSync(extra, "export default function () {}\n", "utf8");
+    const originalImplementation = "export default function configuredExtra() {}\n";
+    writeFileSync(extraImplementation, originalImplementation, "utf8");
+    writeFileSync(
+      extra,
+      "export { default } from './configured-extra-implementation.js';\n",
+      "utf8",
+    );
     writeFileSync(skill, "# Generic parity skill\n", "utf8");
     const extensionOptions = {
       extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
@@ -82,6 +89,22 @@ describe("primary Pi resource contract", () => {
     assert.equal(JSON.stringify(contract.extensionIdentities).includes(root), false);
     assert.equal(JSON.stringify(contract.skillIdentities).includes(root), false);
     assert.deepEqual(validatePiPrimaryResourceContract(contract), contract);
+
+    const originalExtensionIdentity = contract.extensionIdentities.at(-1);
+    writeFileSync(
+      extraImplementation,
+      "export default function changedConfiguredExtra() {}\n",
+      "utf8",
+    );
+    assert.notEqual(
+      piResourceIdentity("extension", extra),
+      originalExtensionIdentity,
+    );
+    assert.throws(
+      () => validatePiPrimaryResourceContract(contract),
+      /hashes are inconsistent/,
+    );
+    writeFileSync(extraImplementation, originalImplementation, "utf8");
 
     const originalSkillIdentity = contract.skillIdentities[0];
     writeFileSync(skill, "# Changed generic parity skill\n", "utf8");
@@ -326,7 +349,7 @@ describe("ops-worker before-provider parity attestation", () => {
     const wrapper = (await import(
       `${pathToFileURL(launch.extensionPaths[wrapperIndex]).href}?wrapper=${Date.now()}`
     )).default;
-    wrapper({
+    await wrapper({
       registerCommand: (name: string) => commands.push(name),
       on: (event: string) => events.push(event),
     });
@@ -394,6 +417,74 @@ describe("ops-worker before-provider parity attestation", () => {
       }),
       /parity extension changed after startup pinning/,
     );
+  });
+
+  it("fences a generated wrapper when an imported implementation changes", async () => {
+    const root = tempDirectory();
+    const implementation = join(root, "configured-implementation.mjs");
+    const extension = join(root, "configured-extension.mjs");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(
+      implementation,
+      "export function register(pi) { pi.on('session_start', () => undefined); }\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      "import { register } from './configured-implementation.mjs';\nexport default register;\n",
+      "utf8",
+    );
+    writeFileSync(skill, "# Imported implementation parity fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        extraExtensions: [extension],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const wrapperIndex = resources.extensionPaths.indexOf(realpathSync(extension));
+    assert.ok(wrapperIndex >= 0);
+
+    writeFileSync(
+      implementation,
+      "export function register(pi) { pi.on('changed', () => undefined); }\n",
+      "utf8",
+    );
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[wrapperIndex]).href}?drift=${Date.now()}`
+    )).default;
+    const commands: string[] = [];
+    const events: string[] = [];
+    await assert.rejects(
+      wrapper({
+        registerCommand: (name: string) => commands.push(name),
+        on: (event: string) => events.push(event),
+      }),
+      /resource changed after parity preparation/,
+    );
+    assert.deepEqual(commands, []);
+    assert.deepEqual(events, []);
   });
 
   it("ships a package-owned marker, parity gate, and attempt quota capture", async () => {

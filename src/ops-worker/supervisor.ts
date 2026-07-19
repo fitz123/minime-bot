@@ -29,6 +29,7 @@ import {
   OpsWorkerLifecycle,
 } from "./lifecycle.js";
 import {
+  DEFAULT_OPS_WORKER_QUOTA_STALE_MS,
   DEFAULT_OPS_WORKER_QUOTA_RECHECK_MS,
   isAuthoritativeQuotaDecision,
   type OpsWorkerQuotaAdmissionDecision,
@@ -927,8 +928,19 @@ export class OpsWorkerSupervisor {
         if (task.custody.status === "HELD") {
           return verifierPinned ? undefined : OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
+        if (
+          task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+          && !this.hasFreshUnclaimedQuotaProbePass(task)
+          && this.quotaAdmission?.check().status !== "ADMITTED"
+        ) {
+          selectionChanged = true;
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
         const claimedAt = this.nextUpdatedAt(task);
         task.updatedAt = claimedAt;
+        if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") {
+          task.lastOutcome = null;
+        }
         task.custody = {
           status: "HELD",
           claimedAt,
@@ -946,7 +958,13 @@ export class OpsWorkerSupervisor {
   ): Promise<OpsWorkerScheduledTask | undefined> {
     if (scheduled.action !== "RUN" || !this.quotaAdmission) return undefined;
     const task = this.requireTask(scheduled.task.id);
-    if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") return undefined;
+    if (
+      task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+      && (
+        task.custody.status === "HELD"
+        || this.hasFreshUnclaimedQuotaProbePass(task)
+      )
+    ) return undefined;
     const decision = this.quotaAdmission.check();
     const wait = isOpsWorkerQuotaWait(task);
     const authoritativeDeadline = wait
@@ -975,6 +993,18 @@ export class OpsWorkerSupervisor {
       };
     }
     return undefined;
+  }
+
+  private hasFreshUnclaimedQuotaProbePass(task: OpsWorkerTask): boolean {
+    if (
+      task.custody.status !== "UNCLAIMED"
+      || task.lastOutcome?.result !== "QUOTA_PROBE_PASS"
+    ) return false;
+    const passedAt = Date.parse(task.lastOutcome.at);
+    const ageMs = this.now().getTime() - passedAt;
+    return Number.isFinite(passedAt)
+      && ageMs >= -DEFAULT_OPS_WORKER_QUOTA_STALE_MS
+      && ageMs <= DEFAULT_OPS_WORKER_QUOTA_STALE_MS;
   }
 
   private async revalidateQuotaProbeAuthorization(

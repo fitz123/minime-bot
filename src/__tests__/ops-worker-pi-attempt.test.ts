@@ -902,6 +902,69 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(harness.invocations.length, 1);
   });
 
+  it("contains held and unclaimed quota-probe preparation failures", async (t) => {
+    let quota = admittedQuota();
+    const harness = await makeHarness(t, undefined, {
+      quotaAdmission: { check: () => quota },
+    });
+    const held = makeTask("held-quota-preparation-error");
+    held.state = "RESUMABLE";
+    held.custody = {
+      status: "HELD",
+      claimedAt: held.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    held.lastOutcome = {
+      at: held.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic held quota wait",
+    };
+    harness.store.create(held);
+
+    const heldError = await harness.runner({
+      dependencies: {
+        assembleContext: () => {
+          throw new Error("Synthetic strict context assembly failure");
+        },
+      },
+    }).runNext();
+    assert.equal(heldError?.state, "RESUMABLE");
+    assert.equal(heldError?.custody.status, "HELD");
+    assert.equal(heldError?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(heldError?.lastOutcome?.summary ?? "", /context assembly failure/);
+    assert.equal(harness.invocations.length, 0);
+
+    harness.supervisor.cancelTask(held.id, "Exercise unclaimed preparation failure");
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    quota = deniedQuota(dueAt);
+    const unclaimed = makeTask("unclaimed-quota-preparation-error");
+    unclaimed.schedule.nextRunAt = dueAt;
+    unclaimed.lastOutcome = {
+      at: unclaimed.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Synthetic unclaimed authoritative quota wait",
+    };
+    harness.store.create(unclaimed);
+    const unclaimedRunner = harness.runner();
+    const configuredExtra = harness.primaryResources.extensionPaths.at(-1);
+    assert.ok(configuredExtra);
+    writeFileSync(
+      configuredExtra,
+      "export default function changedAfterPrimaryPin() {}\n",
+      "utf8",
+    );
+
+    const unclaimedError = await unclaimedRunner.runNext();
+    assert.equal(unclaimedError?.state, "QUEUED");
+    assert.equal(unclaimedError?.custody.status, "UNCLAIMED");
+    assert.equal(unclaimedError?.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+    assert.match(unclaimedError?.lastOutcome?.summary ?? "", /hashes are inconsistent/);
+    assert.equal(harness.invocations.length, 0);
+  });
+
   it("executes the bounded probe child through parity and attempt-scoped quota capture", async (t) => {
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });

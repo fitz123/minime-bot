@@ -1194,37 +1194,36 @@ export class OpsWorkerPiAttemptRunner {
       !isOpsWorkerQuotaWait(task)
       || !hasFreshOpsWorkerAuthorizationPass(task)
     ) return task;
-    const context = this.assembleContext(this.primaryContextAgent, {
-      artifactWorkspaceCwd: this.workspaceCwd,
-      strict: true,
-    });
-    if (context === null) {
-      return this.supervisor.recordQuotaProbeError(
-        taskId,
-        "Exact quota smoke probe could not assemble canonical primary context",
-      );
-    }
-    const sessionDirectory = this.prepareSessionDirectory(task);
-    const parityLaunch = prepareOpsWorkerParityLaunch({
-      context,
-      resources: this.primaryResources,
-      parityExtensionPath: this.parityExtensionPath,
-      parityExtensionIdentity: this.parityExtensionIdentity,
-      sessionDirectory,
-      opsPolicy: OPS_WORKER_SYSTEM_POLICY,
-    });
-    const args = buildPiQuotaProbeArgs(
-      this.model,
-      this.thinking,
-      context,
-      this.primaryResources,
-      parityLaunch.extensionPaths,
-    );
-    const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
-    safeUnlink(attemptFile);
     let result: OpsWorkerQuotaProbeResult;
-    this.supervisor.reserveQuotaProbeProcessGroupLaunch(taskId);
+    let launchReserved = false;
     try {
+      const context = this.assembleContext(this.primaryContextAgent, {
+        artifactWorkspaceCwd: this.workspaceCwd,
+        strict: true,
+      });
+      if (context === null) {
+        throw new Error("Exact quota smoke probe could not assemble canonical primary context");
+      }
+      const sessionDirectory = this.prepareSessionDirectory(task);
+      const parityLaunch = prepareOpsWorkerParityLaunch({
+        context,
+        resources: this.primaryResources,
+        parityExtensionPath: this.parityExtensionPath,
+        parityExtensionIdentity: this.parityExtensionIdentity,
+        sessionDirectory,
+        opsPolicy: OPS_WORKER_SYSTEM_POLICY,
+      });
+      const args = buildPiQuotaProbeArgs(
+        this.model,
+        this.thinking,
+        context,
+        this.primaryResources,
+        parityLaunch.extensionPaths,
+      );
+      const attemptFile = join(sessionDirectory, "quota-smoke-telemetry.json");
+      safeUnlink(attemptFile);
+      this.supervisor.reserveQuotaProbeProcessGroupLaunch(taskId);
+      launchReserved = true;
       result = await this.runQuotaProbeProcess({
         taskId,
         model: this.model,
@@ -1244,7 +1243,7 @@ export class OpsWorkerPiAttemptRunner {
         `Exact quota smoke probe failed: ${errorMessage(error)}`,
       );
     } finally {
-      this.supervisor.releasePiProcessGroupLaunch(taskId);
+      if (launchReserved) this.supervisor.releasePiProcessGroupLaunch(taskId);
     }
     if (result.status === "SUCCESS") {
       return this.supervisor.recordQuotaProbeSuccess(

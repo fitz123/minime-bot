@@ -22,7 +22,9 @@ import {
   type OpsWorkerParityAttestationReport,
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
+  createPiExtensionResourceSnapshot,
   piResourceIdentity,
+  type PiExtensionResourceFile,
   type PiPrimaryResourceContract,
   validatePiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
@@ -67,6 +69,7 @@ function writePrivateExtensionWrapper(
   path: string,
   targetPath: string,
   identity: string,
+  resourceFiles: readonly PiExtensionResourceFile[],
 ): void {
   assertSafeSessionFile(path);
   const digest = identity.startsWith("sha256:") ? identity.slice("sha256:".length) : "";
@@ -75,10 +78,33 @@ function writePrivateExtensionWrapper(
   }
   const marker = `${OPS_WORKER_EXTENSION_MARKER_PREFIX}${digest}`;
   const source = [
+    "import { createHash } from 'node:crypto';",
+    "import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';",
+    "import { normalize, resolve } from 'node:path';",
     `import targetExtension from ${JSON.stringify(pathToFileURL(targetPath).href)};`,
-    "export default function minimeOpsExtensionWrapper(pi) {",
+    `const expectedFiles = ${JSON.stringify(resourceFiles)};`,
+    "function sha256(value) { return `sha256:${createHash('sha256').update(value).digest('hex')}`; }",
+    "function verifyPinnedResources() {",
+    "  for (const expected of expectedFiles) {",
+    "    const direct = lstatSync(expected.path);",
+    "    if (!direct.isFile() || direct.isSymbolicLink()) throw new Error('Pi extension resource changed after parity preparation');",
+    "    if (typeof process.getuid === 'function' && direct.uid !== process.getuid()) throw new Error('Pi extension resource changed after parity preparation');",
+    "    if (normalize(realpathSync(expected.path)) !== normalize(resolve(expected.path))) throw new Error('Pi extension resource changed after parity preparation');",
+    "    const descriptor = openSync(expected.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));",
+    "    try {",
+    "      const opened = fstatSync(descriptor);",
+    "      if (!opened.isFile() || opened.dev !== direct.dev || opened.ino !== direct.ino) throw new Error('Pi extension resource changed after parity preparation');",
+    "      const content = readFileSync(descriptor);",
+    "      const completed = fstatSync(descriptor);",
+    "      if (completed.dev !== opened.dev || completed.ino !== opened.ino || completed.size !== opened.size || completed.mtimeMs !== opened.mtimeMs || completed.ctimeMs !== opened.ctimeMs || sha256(content) !== expected.contentHash) throw new Error('Pi extension resource changed after parity preparation');",
+    "    } finally { closeSync(descriptor); }",
+    "  }",
+    "}",
+    "export default async function minimeOpsExtensionWrapper(pi) {",
+    "  verifyPinnedResources();",
+    "  await targetExtension(pi);",
+    "  verifyPinnedResources();",
     `  pi.registerCommand(${JSON.stringify(marker)}, { handler: async () => {} });`,
-    "  return targetExtension(pi);",
     "}",
     "",
   ].join("\n");
@@ -129,10 +155,15 @@ export function prepareOpsWorkerParityLaunch(input: {
   writePrivateJson(expectedPath, expected);
   const wrappedExtensionPaths = resources.extensionPaths.map((extensionPath, index) => {
     const wrapperPath = join(input.sessionDirectory, `parity-extension-${index}.mjs`);
+    const snapshot = createPiExtensionResourceSnapshot(extensionPath);
+    if (snapshot.identity !== resources.extensionIdentities[index]) {
+      throw new Error("Primary extension changed during parity preparation");
+    }
     writePrivateExtensionWrapper(
       wrapperPath,
       extensionPath,
       resources.extensionIdentities[index],
+      snapshot.files,
     );
     return wrapperPath;
   });

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   lstatSync,
   openSync,
@@ -9,7 +10,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { isAbsolute, normalize, resolve } from "node:path";
+import { dirname, extname, isAbsolute, normalize, resolve } from "node:path";
 import {
   piExtensionRelpathForDir,
   resolvePiSpawnExtensionArgs,
@@ -27,6 +28,31 @@ export const PI_BUILTIN_TOOL_NAMES = [
 ] as const;
 
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const MAX_EXTENSION_RESOURCE_FILES = 2_048;
+const MAX_EXTENSION_RESOURCE_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_EXTENSION_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
+const MODULE_FILE_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".json",
+] as const;
+
+export interface PiExtensionResourceFile {
+  /** Private canonical path used only inside the launch handshake. */
+  path: string;
+  contentHash: string;
+}
+
+export interface PiExtensionResourceSnapshot {
+  identity: string;
+  files: readonly PiExtensionResourceFile[];
+}
 
 export interface PiPrimaryResourceContract {
   version: typeof PI_PRIMARY_RESOURCE_CONTRACT_VERSION;
@@ -58,13 +84,16 @@ function canonicalListDigest(domain: string, values: readonly string[]): string 
   return sha256(`${domain}\0${JSON.stringify([...values].sort())}`);
 }
 
-function trustedFileContentHash(path: string): string {
+function readTrustedFile(path: string): Buffer {
   const direct = lstatSync(path);
   if (
     !direct.isFile()
     || direct.isSymbolicLink()
     || (typeof process.getuid === "function" && direct.uid !== process.getuid())
   ) throw new TypeError("Pi resource must remain a current-user-owned regular file");
+  if (direct.size > MAX_EXTENSION_RESOURCE_FILE_BYTES) {
+    throw new TypeError("Pi extension resource file exceeds the bounded size limit");
+  }
   const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const opened = fstatSync(descriptor);
@@ -82,17 +111,116 @@ function trustedFileContentHash(path: string): string {
       || completed.mtimeMs !== opened.mtimeMs
       || completed.ctimeMs !== opened.ctimeMs
     ) throw new TypeError("Pi resource changed while its content was being hashed");
-    return sha256(content);
+    return content;
   } finally {
     closeSync(descriptor);
   }
 }
 
+function trustedFileContentHash(path: string): string {
+  return sha256(readTrustedFile(path));
+}
+
+function localModuleSpecifiers(content: Buffer): string[] {
+  const source = content.toString("utf8");
+  const specifiers = new Set<string>();
+  const patterns = [
+    /(?:^|\n)\s*(?:import|export)\s+(?:type\s+)?[^;]*?\s+from\s*["']([^"']+)["']/g,
+    /(?:^|\n)\s*import\s*["']([^"']+)["']/g,
+    /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const specifier = match[1];
+      if (specifier.startsWith("./") || specifier.startsWith("../")) {
+        specifiers.add(specifier);
+      }
+    }
+  }
+  return [...specifiers];
+}
+
+function moduleCandidates(importer: string, specifier: string): string[] {
+  const base = resolve(dirname(importer), specifier);
+  const extension = extname(base);
+  const candidates = new Set<string>();
+  if (extension !== "") {
+    candidates.add(base);
+    const sourceExtension = extension === ".js"
+      ? [".ts", ".tsx"]
+      : extension === ".mjs"
+      ? [".mts", ".ts"]
+      : extension === ".cjs"
+      ? [".cts", ".ts"]
+      : [];
+    for (const replacement of sourceExtension) {
+      candidates.add(`${base.slice(0, -extension.length)}${replacement}`);
+    }
+  } else {
+    candidates.add(base);
+    for (const candidateExtension of MODULE_FILE_EXTENSIONS) {
+      candidates.add(`${base}${candidateExtension}`);
+      candidates.add(resolve(base, `index${candidateExtension}`));
+    }
+  }
+  return [...candidates];
+}
+
+function resolveLocalModule(importer: string, specifier: string): string {
+  for (const candidate of moduleCandidates(importer, specifier)) {
+    if (!existsSync(candidate)) continue;
+    const direct = lstatSync(candidate);
+    if (direct.isDirectory()) continue;
+    return strictTrustedFile(candidate, "Pi extension dependency");
+  }
+  throw new TypeError("Pi extension contains an unresolved local module dependency");
+}
+
+function extensionResourceFiles(entryPath: string): PiExtensionResourceFile[] {
+  const pending = [strictTrustedFile(entryPath, "Pi extension resource")];
+  const seen = new Set<string>();
+  const files: PiExtensionResourceFile[] = [];
+  let totalBytes = 0;
+  while (pending.length > 0) {
+    const path = pending.pop() as string;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    if (seen.size > MAX_EXTENSION_RESOURCE_FILES) {
+      throw new TypeError("Pi extension dependency closure exceeds the bounded file limit");
+    }
+    const content = readTrustedFile(path);
+    totalBytes += content.length;
+    if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
+      throw new TypeError("Pi extension dependency closure exceeds the bounded byte limit");
+    }
+    files.push({ path, contentHash: sha256(content) });
+    if (extname(path) === ".json") continue;
+    for (const specifier of localModuleSpecifiers(content)) {
+      const dependency = resolveLocalModule(path, specifier);
+      if (!seen.has(dependency)) pending.push(dependency);
+    }
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+export function createPiExtensionResourceSnapshot(path: string): PiExtensionResourceSnapshot {
+  const files = extensionResourceFiles(path);
+  return {
+    files,
+    identity: sha256(
+      `minime-pi-extension-identity-v3\0${JSON.stringify(files)}`,
+    ),
+  };
+}
+
 /** Stable one-way identity: private path and content bytes are never persisted or reported. */
 export function piResourceIdentity(kind: "extension" | "skill", path: string): string {
   const trustedPath = strictTrustedFile(path, `Pi ${kind} resource`);
+  if (kind === "extension") {
+    return createPiExtensionResourceSnapshot(trustedPath).identity;
+  }
   return sha256([
-    `minime-pi-${kind}-identity-v2`,
+    "minime-pi-skill-identity-v2",
     trustedPath,
     trustedFileContentHash(trustedPath),
   ].join("\0"));
