@@ -50,10 +50,21 @@ export interface OpsWorkerPolicySnapshot {
     configuredSources: string[];
     verifierCount: number;
     contractsHash: string;
+    contracts: Array<{
+      source: string;
+      verifierIdentity: string;
+      verifierVersion: string;
+    }>;
   };
   verification: {
     verifierCount: number;
     contractsHash: string;
+    contracts: Array<{
+      name: string;
+      verifierIdentity: string;
+      verifierVersion: string;
+      contractHash: string;
+    }>;
   };
   quota: {
     configured: false;
@@ -184,7 +195,11 @@ export function inspectOpsWorkerPolicy(
     if (!verifier) throw new TypeError("Authorization verifier registry is sparse");
     assertRegisteredName(verifier.identity, "authorization verifier identity");
     assertRegisteredName(verifier.version, "authorization verifier version");
-    return { source, identity: verifier.identity, version: verifier.version };
+    return {
+      source,
+      verifierIdentity: verifier.identity,
+      verifierVersion: verifier.version,
+    };
   });
 
   const checkNames = Object.keys(dependencies.doneChecks.contracts).sort();
@@ -209,10 +224,12 @@ export function inspectOpsWorkerPolicy(
       configuredSources,
       verifierCount: authorizationContracts.length,
       contractsHash: policyHash(authorizationContracts),
+      contracts: authorizationContracts,
     },
     verification: {
       verifierCount: verificationContracts.length,
       contractsHash: policyHash(verificationContracts),
+      contracts: verificationContracts,
     },
     quota: inspectQuotaPolicy(dependencies.quotaAdmission),
     parity: resources === undefined

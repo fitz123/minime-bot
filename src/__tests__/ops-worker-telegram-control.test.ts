@@ -226,8 +226,8 @@ function control(
     ledger: fixture.ledger,
     fetch: transport.fetch,
     inspectPolicy: () => ({
-      authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH },
-      verification: { verifierCount: 1, contractsHash: AUTH_HASH },
+      authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+      verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
       quota: { configured: false },
       parity: { configured: false },
     }),
@@ -324,8 +324,8 @@ describe("ops worker dedicated Telegram control", () => {
       supervisor: fixture.supervisor,
       ledger: fixture.ledger,
       inspectPolicy: () => ({
-        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH },
-        verification: { verifierCount: 1, contractsHash: AUTH_HASH },
+        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
         quota: { configured: false },
         parity: { configured: false },
       }),
@@ -365,8 +365,8 @@ describe("ops worker dedicated Telegram control", () => {
       supervisor: fixture.supervisor,
       ledger: fixture.ledger,
       inspectPolicy: () => ({
-        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH },
-        verification: { verifierCount: 1, contractsHash: AUTH_HASH },
+        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
         quota: { configured: false },
         parity: { configured: false },
       }),

@@ -1218,9 +1218,22 @@ reply:
     assert.equal(Object.hasOwn(policy.quota, "summary"), false);
     assert.equal(policy.parity.resourcesDigest, CLI_PRIMARY_RESOURCES.digest);
     const serializedStatus = JSON.stringify(statusValue);
-    assert.equal(serializedStatus.includes(fixtureAuthorizationVerifier.identity), false);
+    assert.deepEqual(policy.authorization.contracts, [{
+      source: "operator-cli",
+      verifierIdentity: fixtureAuthorizationVerifier.identity,
+      verifierVersion: fixtureAuthorizationVerifier.version,
+    }]);
+    assert.equal(
+      (policy.verification.contracts as Array<Record<string, unknown>>)[0].name,
+      "fixture-check",
+    );
+    assert.deepEqual(
+      Object.keys(
+        (policy.verification.contracts as Array<Record<string, unknown>>)[0],
+      ).sort(),
+      ["contractHash", "name", "verifierIdentity", "verifierVersion"],
+    );
     assert.equal(serializedStatus.includes("ops-worker-registry"), false);
-    assert.equal(serializedStatus.includes("fixture-check"), false);
     assert.ok(!Object.hasOwn(statusValue, "evidence"));
     assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.workspaceCwd), false);
     assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.systemPrompt), false);

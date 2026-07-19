@@ -2775,6 +2775,20 @@ export class OpsWorkerSupervisor {
         notBefore: result.checkedAt,
       });
     }
+    if (result.result === "NOT_READY" && result.nextCheckAt !== null) {
+      return this.transition(taskId, "CHECKING", (task, at) => {
+        task.activeRun = null;
+        task.rounds.consecutiveInfrastructureFailures = 0;
+        task.schedule.nextRunAt = null;
+        task.schedule.nextCheckAt = result.nextCheckAt;
+        persistVerification(task, at);
+        task.lastOutcome = this.checkOutcome(at, "NOT_READY", result.summary);
+        appendEvidence(task, this.checkEvidence(at, result.summary));
+      }, "Done check is waiting for product stability without remediation", {
+        expectedBaseline,
+        notBefore: result.checkedAt,
+      });
+    }
     if (
       result.result === "VERIFIER_INVALID"
       || result.result === "QUERY_ERROR"

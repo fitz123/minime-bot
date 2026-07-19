@@ -1706,6 +1706,30 @@ describe("ops worker supervisor", () => {
     assert.equal(retained.custody.releaseReason, null);
   });
 
+  it("waits for scheduled NOT_READY stability without spending remediation", async (t) => {
+    const harness = await makeHarness(t, {
+      implementation: () => ({
+        result: "NOT_READY",
+        summary: "The healthy fixture has not covered its fixed stability window.",
+        nextCheckAt: LATER,
+      }),
+    });
+    harness.store.create(makeTask("task-stability-wait"));
+    await harness.supervisor.requestDoneCheck("task-stability-wait");
+
+    const waiting = await harness.supervisor.runDoneCheck("task-stability-wait");
+    assert.equal(waiting.state, "CHECKING");
+    assert.equal(waiting.schedule.nextCheckAt, LATER);
+    assert.equal(waiting.rounds.remediation, 0);
+    assert.equal(waiting.verification?.outcome, "NOT_READY");
+    assert.equal(waiting.verification?.nextCheckAt, LATER);
+    assert.equal(waiting.custody.status, "HELD");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    harness.setNow(LATER);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+  });
+
   it("retries query errors and timeouts as typed verification faults with custody held", async (t) => {
     const query = await makeHarness(t, {
       implementation: () => {

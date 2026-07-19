@@ -437,6 +437,25 @@ function inspectPolicy(deps: ReturnType<typeof dependencies>) {
   });
 }
 
+export function assertOpsWorkerStartAuthorizationVerifiers(
+  taskRegistry: OpsWorkerTaskContractRegistry,
+  authorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry | undefined,
+): void {
+  const sourceKinds = new Set([
+    ...Object.values(taskRegistry.templates)
+      .flatMap((template) => template.sourceKinds),
+    ...Object.values(taskRegistry.authorizationProfiles)
+      .flatMap((profile) => profile.sourceKinds),
+  ]);
+  for (const sourceKind of sourceKinds) {
+    if (!authorizationVerifiers?.[sourceKind]) {
+      throw new TypeError(
+        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
+      );
+    }
+  }
+}
+
 function assertStartPolicyDependencies(
   deps: ReturnType<typeof dependencies>,
 ): asserts deps is ReturnType<typeof dependencies> & {
@@ -449,19 +468,10 @@ function assertStartPolicyDependencies(
       "Ops-worker start requires trusted primaryContextAgent, primaryPiResources, and quotaAdmission dependencies",
     );
   }
-  const sourceKinds = new Set([
-    ...Object.values(deps.taskRegistry.templates)
-      .flatMap((template) => template.sourceKinds),
-    ...Object.values(deps.taskRegistry.authorizationProfiles)
-      .flatMap((profile) => profile.sourceKinds),
-  ]);
-  for (const sourceKind of sourceKinds) {
-    if (!deps.authorizationVerifiers?.[sourceKind]) {
-      throw new TypeError(
-        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
-      );
-    }
-  }
+  assertOpsWorkerStartAuthorizationVerifiers(
+    deps.taskRegistry,
+    deps.authorizationVerifiers,
+  );
   inspectPolicy(deps);
 }
 

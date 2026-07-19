@@ -2035,12 +2035,21 @@ function parseVerificationComponent(
     component.nextCheckAt,
     `${path}.nextCheckAt`,
   );
-  if (outcome === "DEFER") {
+  if (outcome === "DEFER" || outcome === "NOT_READY") {
     if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(observedAt)) {
-      fail(`${path}.nextCheckAt`, "DEFER requires a later query timestamp");
+      if (outcome === "DEFER") {
+        fail(`${path}.nextCheckAt`, "DEFER requires a later query timestamp");
+      }
     }
   } else if (nextCheckAt !== null) {
-    fail(`${path}.nextCheckAt`, "must be null unless the outcome is DEFER");
+    fail(`${path}.nextCheckAt`, "must be null unless the outcome schedules convergence");
+  }
+  if (
+    outcome === "NOT_READY"
+    && nextCheckAt !== null
+    && Date.parse(nextCheckAt) <= Date.parse(observedAt)
+  ) {
+    fail(`${path}.nextCheckAt`, "NOT_READY recheck must be later than observedAt");
   }
   return {
     identity: expectRegisteredName(component.identity, `${path}.identity`),
@@ -2132,12 +2141,24 @@ function parseVerification(value: unknown): OpsWorkerVerificationRecord | null {
     verification.nextCheckAt,
     "task.verification.nextCheckAt",
   );
-  if (outcome === "DEFER") {
+  if (outcome === "DEFER" || outcome === "NOT_READY") {
     if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(completedAt)) {
-      fail("task.verification.nextCheckAt", "DEFER requires a later query timestamp");
+      if (outcome === "DEFER") {
+        fail("task.verification.nextCheckAt", "DEFER requires a later query timestamp");
+      }
     }
   } else if (nextCheckAt !== null) {
-    fail("task.verification.nextCheckAt", "must be null unless the outcome is DEFER");
+    fail(
+      "task.verification.nextCheckAt",
+      "must be null unless the outcome schedules convergence",
+    );
+  }
+  if (
+    outcome === "NOT_READY"
+    && nextCheckAt !== null
+    && Date.parse(nextCheckAt) <= Date.parse(completedAt)
+  ) {
+    fail("task.verification.nextCheckAt", "NOT_READY recheck must be later than completion");
   }
   return {
     verifierIdentity: expectRegisteredName(
