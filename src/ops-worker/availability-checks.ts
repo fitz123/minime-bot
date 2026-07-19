@@ -26,7 +26,8 @@ export const OPS_AVAILABILITY_LIMITS = Object.freeze({
   maxAlertLabels: 64,
   maxLabelBytes: 2 * 1024,
   maxPrometheusSeries: 16,
-  prometheusStabilityStepSeconds: 15,
+  prometheusScrapeIntervalSeconds: 60,
+  prometheusScrapeJitterSeconds: 15,
   maxPrometheusSamplesPerSeries: 32,
 } as const);
 
@@ -804,9 +805,12 @@ export class OpsPrometheusHttpReader implements
     if (direct.some((sample) => sample.value === 0)) {
       return { observedAt, status: "UNHEALTHY", healthySince: null };
     }
-    const stepMs = OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds * 1_000;
+    const maxSampleGapMs = (
+      OPS_AVAILABILITY_LIMITS.prometheusScrapeIntervalSeconds
+      + OPS_AVAILABILITY_LIMITS.prometheusScrapeJitterSeconds
+    ) * 1_000;
     const stable = await this.queryRawRange(
-      OPS_AVAILABILITY_LIMITS.stabilityWindowMs + stepMs,
+      OPS_AVAILABILITY_LIMITS.stabilityWindowMs + maxSampleGapMs,
       observedAt,
       context.signal,
     );
@@ -832,7 +836,7 @@ export class OpsPrometheusHttpReader implements
           && Date.parse(entry.observedAt) <= Date.parse(observedAt));
         if (
           !anchor
-          || windowStart - Date.parse(anchor.observedAt) > stepMs
+          || windowStart - Date.parse(anchor.observedAt) > maxSampleGapMs
           || windowSamples.length === 0
         ) return false;
         const proofSamples = [
@@ -844,10 +848,10 @@ export class OpsPrometheusHttpReader implements
           && (
             index === 0
             || Date.parse(entry.observedAt)
-              - Date.parse(proofSamples[index - 1].observedAt) <= stepMs
+              - Date.parse(proofSamples[index - 1].observedAt) <= maxSampleGapMs
           ))
           && Date.parse(proofSamples.at(-1)?.observedAt ?? "")
-            >= Date.parse(observedAt) - stepMs;
+            >= Date.parse(observedAt) - maxSampleGapMs;
       });
     return {
       observedAt,

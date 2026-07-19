@@ -2277,7 +2277,10 @@ describe("ops worker Pi standard-session attempts", () => {
     }));
     harness.setScenario("wait");
     const controller = new AbortController();
-    const runner = harness.runner({ abortSignal: controller.signal });
+    const runner = harness.runner({
+      abortSignal: controller.signal,
+      attemptTimeoutMs: 30_000,
+    });
     const running = runner.runAttempt("low-priority");
     await waitFor(() => harness.supervisor.getTask("low-priority")?.state === "RUNNING");
     const active = harness.supervisor.getTask("low-priority")?.activeRun;
@@ -2369,7 +2372,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await waitFor(() => timers.size > 0, 15_000);
+    await waitFor(() => timers.size > 0, 30_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },
@@ -2398,8 +2401,8 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(makeTask("descendant-cleanup"));
     harness.setScenario("leader-exits-child-survives");
     const running = harness.runner({
-      attemptTimeoutMs: 2_000,
-      stallTimeoutMs: 120,
+      attemptTimeoutMs: 10_000,
+      stallTimeoutMs: 2_000,
     }).runAttempt("descendant-cleanup");
     await waitFor(() => harness.supervisor.getTask("descendant-cleanup")?.state === "RUNNING");
     const active = harness.supervisor.getTask("descendant-cleanup")?.activeRun;

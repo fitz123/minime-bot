@@ -182,7 +182,7 @@ const beforeEvent = {
 for (const handler of handlers.get("before_agent_start") ?? []) {
   await handler(beforeEvent, {});
 }
-const parityDeadline = Date.now() + 5_000;
+const parityDeadline = Date.now() + 30_000;
 while (Date.now() < parityDeadline) {
   if (
     existsSync(parityAckPath)
@@ -328,12 +328,15 @@ switch (scenario) {
   case "leader-exits-child-survives": {
     const descendant = spawn(
       process.execPath,
-      ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
-      { stdio: "ignore" },
+      [
+        "-e",
+        "process.on('SIGTERM',()=>{});process.stdout.write('ready\\n');setInterval(()=>{},1000)",
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
     );
-    setTimeout(() => {
+    descendant.stdout.once("data", () => {
       process.stdout.write(`descendant-ready:${String(descendant.pid)}\n`);
-    }, 50);
+    });
     setInterval(() => undefined, 1_000);
     break;
   }

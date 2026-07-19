@@ -344,9 +344,9 @@ describe("bounded loopback availability readers", () => {
       }]),
       prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
       prometheusMatrix([{
-        values: Array.from({ length: 21 }, (_, index) => ({
+        values: Array.from({ length: 6 }, (_, index) => ({
           at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
-            + index * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+            + index * OPS_AVAILABILITY_LIMITS.prometheusScrapeIntervalSeconds,
           value: "1",
         })),
       }]),
@@ -377,7 +377,7 @@ describe("bounded loopback availability readers", () => {
     assert.equal(queries.length, 3);
     assert.equal(queries.filter((query) => query.includes("/api/v1/query?")).length, 3);
     assert.equal(queries.filter((query) => query.includes("/api/v1/query_range?")).length, 0);
-    assert.equal(queries.some((query) => query.includes(encodeURIComponent("[315s]"))), true);
+    assert.equal(queries.some((query) => query.includes(encodeURIComponent("[375s]"))), true);
   });
 
   it("maps Prometheus silence and zero directly without a stability query", async () => {
@@ -501,16 +501,16 @@ describe("bounded loopback availability readers", () => {
     for (const matrix of [
       prometheusMatrix([{
         labels: { job: "minime-bot", instance: "replacement" },
-        values: Array.from({ length: 21 }, (_, index) => ({
+        values: Array.from({ length: 6 }, (_, index) => ({
           at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
-            + index * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+            + index * OPS_AVAILABILITY_LIMITS.prometheusScrapeIntervalSeconds,
           value: "1",
         })),
       }]),
       prometheusMatrix([{
-        values: Array.from({ length: 20 }, (_, index) => ({
+        values: Array.from({ length: 5 }, (_, index) => ({
           at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
-            + (index + 1) * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+            + (index + 1) * OPS_AVAILABILITY_LIMITS.prometheusScrapeIntervalSeconds,
           value: "1",
         })),
       }]),
@@ -526,6 +526,48 @@ describe("bounded loopback availability readers", () => {
       );
       assert.equal(reading.status, "HEALTHY");
       assert.equal(reading.healthySince, reading.observedAt);
+    }
+  });
+
+  it("accepts the supported one-minute scrape cadence without accepting gaps or zeroes", async () => {
+    const direct = prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]);
+    const samples = Array.from({ length: 7 }, (_, index) => ({
+      at: (Date.parse(NOW) - 6 * 60_000) / 1_000 + index * 60,
+      value: "1",
+    }));
+    const matrices = [
+      { values: samples, stable: true },
+      {
+        values: [-315, -240, -165, -90, -15, 0].map((seconds) => ({
+          at: Date.parse(NOW) / 1_000 + seconds,
+          value: "1",
+        })),
+        stable: true,
+      },
+      { values: samples.filter((_, index) => index !== 3), stable: false },
+      {
+        values: samples.map((sample, index) => ({
+          ...sample,
+          value: index === 3 ? "0" : sample.value,
+        })),
+        stable: false,
+      },
+    ];
+
+    for (const matrix of matrices) {
+      const responses = [direct, prometheusMatrix([{ values: matrix.values }])];
+      const reader = new OpsPrometheusHttpReader(
+        "http://127.0.0.1:9090",
+        async () => jsonResponse(responses.shift()),
+      );
+      const reading = await reader.readServiceAvailability(
+        OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+        readerContext(),
+      );
+      assert.equal(
+        Date.parse(reading.observedAt) - Date.parse(reading.healthySince as string),
+        matrix.stable ? OPS_AVAILABILITY_LIMITS.stabilityWindowMs : 0,
+      );
     }
   });
 });

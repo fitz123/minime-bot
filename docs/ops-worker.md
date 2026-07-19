@@ -372,6 +372,12 @@ availability task, the same reader uses the package-owned
 `alertname="MinimeBotMetricsDown"` invariant because there is no intake group
 descriptor.
 
+The Prometheus reader's trusted cadence is the explicit one-minute scrape
+interval in `examples/monitoring/prometheus.yml`. Stability accepts up to 15
+seconds of scrape jitter between samples and resets the healthy streak when a
+larger gap or an unhealthy sample appears. Embeddings that use this reader must
+preserve that cadence.
+
 ## Custody, checkpoints, and receipts
 
 At most one task holds whole-cycle custody. A claimed task keeps custody through
