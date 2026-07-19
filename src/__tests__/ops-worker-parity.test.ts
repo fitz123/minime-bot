@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -163,18 +164,19 @@ describe("primary Pi resource contract", () => {
     }), /missing built-in bash/);
   });
 
-  it("hashes every static loader form and rejects unattestable module loading", () => {
+  it("hashes the exact Jiti-resolved closure and rejects runtime module loading", () => {
     const root = tempDirectory();
-    const dependency = join(root, "dependency.ts");
+    const javascriptDependency = join(root, "dependency.js");
+    const typescriptDependency = join(root, "dependency.ts");
     const extension = join(root, "extension.ts");
-    writeFileSync(dependency, "export const value = 'original';\n", "utf8");
+    writeFileSync(javascriptDependency, "export const value = 'javascript';\n", "utf8");
+    writeFileSync(typescriptDependency, "export const value = 'typescript';\n", "utf8");
     writeFileSync(
       extension,
       [
-        "export default async function extension() {",
-        "  await import(`./dependency.ts`);",
-        "  await import('./dependency.ts', { with: { type: 'javascript' } });",
-        "}",
+        "import { value } from './dependency';",
+        "export { value as selected } from './dependency';",
+        "export default function extension() { return value; }",
         "",
       ].join("\n"),
       "utf8",
@@ -182,34 +184,57 @@ describe("primary Pi resource contract", () => {
     const original = createPiExtensionResourceSnapshot(extension);
     assert.deepEqual(
       original.files.map((file) => file.path),
-      [realpathSync(dependency), realpathSync(extension)].sort(),
+      [realpathSync(javascriptDependency), realpathSync(extension)].sort(),
     );
-    writeFileSync(dependency, "export const value = 'changed';\n", "utf8");
+    assert.equal(
+      original.files.some((file) => file.path === realpathSync(typescriptDependency)),
+      false,
+    );
+    writeFileSync(javascriptDependency, "export const value = 'changed';\n", "utf8");
     assert.notEqual(createPiExtensionResourceSnapshot(extension).identity, original.identity);
 
+    const directoryDependency = join(root, "directory-dependency");
+    mkdirSync(directoryDependency);
+    writeFileSync(
+      join(directoryDependency, "package.json"),
+      `${JSON.stringify({ main: "./entry.js" })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(directoryDependency, "entry.js"),
+      "export const value = 'package-main';\n",
+      "utf8",
+    );
     writeFileSync(
       extension,
+      "import { value } from './directory-dependency'; export default value;\n",
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension),
+      /directory module resolution is ambiguous/,
+    );
+
+    const unattestableSources = [
       "export default async function extension(name: string) { return import('./' + name); }\n",
-      "utf8",
-    );
-    assert.throws(
-      () => createPiExtensionResourceSnapshot(extension),
-      /statically analyzable string literal/,
-    );
-    writeFileSync(
-      extension,
-      [
-        "import { createRequire as load } from 'node:module';",
-        "const requireFromHere = load(import.meta.url);",
-        "export default function extension() { requireFromHere('./dependency.ts'); }",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    assert.throws(
-      () => createPiExtensionResourceSnapshot(extension),
-      /createRequire loading cannot be attested safely/,
-    );
+      "const dependency = require('./dependency.js'); export default function extension() { return dependency; }\n",
+      "export default function extension() { return require('./dependency.js'); }\n",
+      "export default function extension() { return module[`require`]('./dependency.js'); }\n",
+      "export default function extension() { return module['require'].bind(module)('./dependency.js'); }\n",
+      "export default function extension() { return eval('require')('./dependency.js'); }\n",
+      "export default Function('return function extension() {}')();\n",
+      "import { Script } from 'node:vm'; export default function extension() { return Script; }\n",
+      "import { createRequire as load } from 'node:module'; export default function extension() { return load; }\n",
+      "import unpinned from 'file:///tmp/unpinned.js'; export default unpinned;\n",
+    ];
+    for (const source of unattestableSources) {
+      writeFileSync(extension, source, "utf8");
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension),
+        /cannot be attested safely/,
+        source,
+      );
+    }
   });
 });
 
@@ -527,6 +552,83 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.ok(commandNames.includes(
       `minime-ops-extension-${resources.extensionIdentities[targetIndex].slice("sha256:".length)}`,
     ));
+  });
+
+  it("pins Jiti resolution instead of inheriting an ambient extension order", async () => {
+    const root = tempDirectory();
+    const extension = join(root, "configured-extension.ts");
+    const javascriptDependency = join(root, "dependency.js");
+    const typescriptDependency = join(root, "dependency.ts");
+    const skill = join(root, "SKILL.md");
+    const bundlePath = join(root, "bundle.md");
+    writeFileSync(
+      extension,
+      [
+        "import { selected } from './dependency';",
+        "export default function extension(pi) {",
+        "  pi.registerCommand(`selected-${selected}`, { handler: async () => {} });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(javascriptDependency, "export const selected = 'javascript';\n", "utf8");
+    writeFileSync(typescriptDependency, "export const selected = 'typescript';\n", "utf8");
+    writeFileSync(skill, "# Pinned Jiti resolver fixture\n", "utf8");
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: {
+        extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+        extraExtensions: [extension],
+        relpaths: [],
+      },
+      skillPaths: [skill],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const targetIndex = resources.extensionPaths.indexOf(realpathSync(extension));
+    assert.ok(targetIndex >= 0);
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: root,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const previousExtensions = process.env.JITI_EXTENSIONS;
+    process.env.JITI_EXTENSIONS = JSON.stringify([
+      ".ts",
+      ".tsx",
+      ".js",
+      ".mjs",
+      ".cjs",
+      ".mts",
+      ".cts",
+    ]);
+    try {
+      const commands: string[] = [];
+      const wrapper = (await import(
+        `${pathToFileURL(launch.extensionPaths[targetIndex]).href}?pinned=${Date.now()}`
+      )).default;
+      await wrapper({
+        registerCommand: (name: string) => commands.push(name),
+      });
+      assert.ok(commands.includes("selected-javascript"));
+      assert.equal(commands.includes("selected-typescript"), false);
+    } finally {
+      if (previousExtensions === undefined) delete process.env.JITI_EXTENSIONS;
+      else process.env.JITI_EXTENSIONS = previousExtensions;
+    }
   });
 
   it("fences a generated wrapper when an imported implementation changes", async () => {

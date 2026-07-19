@@ -64,6 +64,7 @@ export interface OpsWorkerJournalEntry {
 
 export type OpsWorkerTaskStoreFaultPoint =
   | "after-mutation-lock-temp-fsync"
+  | "after-mutation-lock-publish-conflict"
   | "after-temp-file-fsync"
   | "after-snapshot-rename"
   | "after-task-directory-fsync"
@@ -364,7 +365,11 @@ class OpsWorkerTaskStoreMutationGuard {
       let existing: ReturnType<typeof readMutationLock>;
       try {
         existing = readMutationLock(this.path);
-      } catch {
+      } catch (error) {
+        // A healthy owner may release after link(2) reports EEXIST but before
+        // this contender inspects the canonical lock. Nothing remains to
+        // recover in that case; retry publication within the bounded loop.
+        if (isMissingError(error)) continue;
         throw new OpsWorkerTaskStoreBusyError();
       }
       const owner = inspectMutationLockOwner(existing.record.pid);
@@ -449,7 +454,10 @@ class OpsWorkerTaskStoreMutationGuard {
       try {
         linkSync(temporaryPath, this.path);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          this.faultInjector?.("after-mutation-lock-publish-conflict");
+          return false;
+        }
         throw error;
       }
       this.acquiredInode = inode;

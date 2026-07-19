@@ -1871,6 +1871,28 @@ describe("ops worker durable task store", () => {
     assert.equal(readFileSync(recoveryGuard, "utf8"), "unfinished recovery\n");
   });
 
+  it("retries when a mutation lock disappears after a publish conflict", (t) => {
+    const directory = testStateDirectory(t);
+    const canonicalLock = join(directory, ".task-store.lock");
+    writeFileSync(canonicalLock, "owner releases before inspection\n", { mode: 0o600 });
+    let conflictCount = 0;
+    const store = makeStore(t, {
+      directory,
+      faultInjector(point) {
+        if (point === "after-mutation-lock-publish-conflict") {
+          conflictCount += 1;
+          unlinkSync(canonicalLock);
+        }
+      },
+    });
+
+    assert.doesNotThrow(() => store.create(
+      makeTask("wt-release-race", "operator:release-race"),
+    ));
+    assert.equal(conflictCount, 1);
+    assert.equal(existsSync(canonicalLock), false);
+  });
+
   it("rejects traversal identifiers and symlinked state paths", (t) => {
     const store = makeStore(t);
     assert.throws(() => store.get("../outside"), /traversal-safe/);

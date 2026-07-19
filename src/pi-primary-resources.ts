@@ -32,19 +32,41 @@ const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MAX_EXTENSION_RESOURCE_FILES = 2_048;
 const MAX_EXTENSION_RESOURCE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXTENSION_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
-const MODULE_FILE_EXTENSIONS = [
+export const PI_EXTENSION_JITI_EXTENSIONS = [
+  ".js",
+  ".mjs",
+  ".cjs",
   ".ts",
   ".tsx",
   ".mts",
   ".cts",
   ".mtsx",
   ".ctsx",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-  ".json",
 ] as const;
+
+const UNSAFE_MODULE_LOADER_IDENTIFIERS = new Set([
+  "Function",
+  "createRequire",
+  "eval",
+  "getBuiltinModule",
+  "mainModule",
+  "require",
+]);
+const UNSAFE_MODULE_LOADER_PROPERTIES = new Set([
+  "Function",
+  "_load",
+  "createRequire",
+  "eval",
+  "getBuiltinModule",
+  "mainModule",
+  "require",
+]);
+const UNSAFE_MODULE_LOADER_SPECIFIERS = new Set([
+  "module",
+  "node:module",
+  "node:vm",
+  "vm",
+]);
 
 export interface PiExtensionResourceFile {
   /** Private canonical path used only inside the launch handshake. */
@@ -147,29 +169,64 @@ function localModuleSpecifiers(path: string, content: Buffer): string[] {
         "Pi extension module loading must use a statically analyzable string literal",
       );
     }
+    if (UNSAFE_MODULE_LOADER_SPECIFIERS.has(value.text)) {
+      throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
+    }
+    if (isAbsolute(value.text) || value.text.startsWith("file:")) {
+      throw new TypeError("Pi extension absolute module loading cannot be attested safely");
+    }
     if (value.text.startsWith("./") || value.text.startsWith("../")) {
       specifiers.add(value.text);
     }
   };
+  const literalProperty = (node: ts.Expression): string | undefined => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      return node.text;
+    }
+    return undefined;
+  };
   const visit = (node: ts.Node): void => {
-    if (ts.isIdentifier(node) && node.text === "createRequire") {
-      throw new TypeError("Pi extension createRequire loading cannot be attested safely");
+    if (
+      ts.isIdentifier(node)
+      && UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+    ) {
+      throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
     }
     if (
       ts.isIdentifier(node)
-      && node.text === "require"
-      && !(
-        ts.isCallExpression(node.parent)
-        && node.parent.expression === node
-      )
+      && node.text === "module"
       && !(
         ts.isPropertyAccessExpression(node.parent)
-        && node.parent.name === node
-        && ts.isCallExpression(node.parent.parent)
-        && node.parent.parent.expression === node.parent
+        && node.parent.expression === node
+        && node.parent.name.text === "exports"
+      )
+      && !(
+        ts.isElementAccessExpression(node.parent)
+        && node.parent.expression === node
+        && literalProperty(node.parent.argumentExpression) === "exports"
       )
     ) {
-      throw new TypeError("Pi extension indirect require loading cannot be attested safely");
+      throw new TypeError("Pi extension indirect module loading cannot be attested safely");
+    }
+    if (
+      ts.isPropertyAccessExpression(node)
+      && UNSAFE_MODULE_LOADER_PROPERTIES.has(node.name.text)
+    ) {
+      throw new TypeError("Pi extension indirect module loading cannot be attested safely");
+    }
+    if (
+      ts.isElementAccessExpression(node)
+      && (
+        UNSAFE_MODULE_LOADER_PROPERTIES.has(
+          literalProperty(node.argumentExpression) ?? "",
+        )
+        || (
+          ts.isIdentifier(node.expression)
+          && (node.expression.text === "globalThis" || node.expression.text === "module")
+        )
+      )
+    ) {
+      throw new TypeError("Pi extension computed module loading cannot be attested safely");
     }
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       if (node.moduleSpecifier !== undefined) add(node.moduleSpecifier);
@@ -177,18 +234,11 @@ function localModuleSpecifiers(path: string, content: Buffer): string[] {
       ts.isImportEqualsDeclaration(node)
       && ts.isExternalModuleReference(node.moduleReference)
     ) {
-      add(node.moduleReference.expression);
+      throw new TypeError("Pi extension runtime require loading cannot be attested safely");
     } else if (ts.isCallExpression(node)) {
       const directImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const directRequire = ts.isIdentifier(node.expression)
-        && node.expression.text === "require";
-      const propertyRequire = ts.isPropertyAccessExpression(node.expression)
-        && node.expression.name.text === "require";
-      const elementRequire = ts.isElementAccessExpression(node.expression)
-        && ts.isStringLiteral(node.expression.argumentExpression)
-        && node.expression.argumentExpression.text === "require";
-      if (directImport || directRequire || propertyRequire || elementRequire) {
-        add(node.arguments[0]);
+      if (directImport) {
+        throw new TypeError("Pi extension dynamic import loading cannot be attested safely");
       }
     }
     ts.forEachChild(node, visit);
@@ -197,38 +247,38 @@ function localModuleSpecifiers(path: string, content: Buffer): string[] {
   return [...specifiers];
 }
 
-function moduleCandidates(importer: string, specifier: string): string[] {
+function resolveLocalModule(importer: string, specifier: string): string {
   const base = resolve(dirname(importer), specifier);
+  if (existsSync(base)) {
+    const direct = lstatSync(base);
+    if (direct.isDirectory()) {
+      throw new TypeError(
+        "Pi extension directory module resolution is ambiguous and cannot be attested safely",
+      );
+    }
+    return strictTrustedFile(base, "Pi extension dependency");
+  }
   const extension = extname(base);
-  const candidates = new Set<string>();
   if (extension !== "") {
-    candidates.add(base);
-    const sourceExtension = extension === ".js"
-      ? [".ts", ".tsx"]
-      : extension === ".mjs"
-      ? [".mts", ".mtsx", ".ts", ".tsx"]
-      : extension === ".cjs"
-      ? [".cts", ".ctsx", ".ts", ".tsx"]
-      : [];
-    for (const replacement of sourceExtension) {
-      candidates.add(`${base.slice(0, -extension.length)}${replacement}`);
+    const sourceExtension = {
+      ".cjs": ".cts",
+      ".js": ".ts",
+      ".jsx": ".tsx",
+      ".mjs": ".mts",
+    }[extension];
+    if (sourceExtension !== undefined) {
+      const sourceCandidate = `${base.slice(0, -extension.length)}${sourceExtension}`;
+      if (existsSync(sourceCandidate)) {
+        return strictTrustedFile(sourceCandidate, "Pi extension dependency");
+      }
     }
   } else {
-    candidates.add(base);
-    for (const candidateExtension of MODULE_FILE_EXTENSIONS) {
-      candidates.add(`${base}${candidateExtension}`);
-      candidates.add(resolve(base, `index${candidateExtension}`));
+    for (const candidateExtension of PI_EXTENSION_JITI_EXTENSIONS) {
+      const candidate = `${base}${candidateExtension}`;
+      if (existsSync(candidate)) {
+        return strictTrustedFile(candidate, "Pi extension dependency");
+      }
     }
-  }
-  return [...candidates];
-}
-
-function resolveLocalModule(importer: string, specifier: string): string {
-  for (const candidate of moduleCandidates(importer, specifier)) {
-    if (!existsSync(candidate)) continue;
-    const direct = lstatSync(candidate);
-    if (direct.isDirectory()) continue;
-    return strictTrustedFile(candidate, "Pi extension dependency");
   }
   throw new TypeError("Pi extension contains an unresolved local module dependency");
 }
@@ -265,7 +315,7 @@ export function createPiExtensionResourceSnapshot(path: string): PiExtensionReso
   return {
     files,
     identity: sha256(
-      `minime-pi-extension-identity-v3\0${JSON.stringify(files)}`,
+      `minime-pi-extension-identity-v4\0${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)}\0${JSON.stringify(files)}`,
     ),
   };
 }

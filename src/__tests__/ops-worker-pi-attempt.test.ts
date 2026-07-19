@@ -326,6 +326,7 @@ async function makeHarness(
   const primaryResources = resolvePiPrimaryResourceContract({
     extensionOptions: {
       extensionsDir: join(PACKAGE_ROOT, "extensions", "pi"),
+      relpaths: [],
       extraExtensions: [extraExtension],
     },
     skillPaths: [skillPath],
@@ -1326,7 +1327,7 @@ describe("ops worker Pi standard-session attempts", () => {
     const runner = harness.runner();
 
     const pending = runner.runAttempt(task.id);
-    await waitFor(() => resolveFirstCheck !== undefined);
+    await waitFor(() => resolveFirstCheck !== undefined, 5_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-during-post-attempt-check",
       payload: { progress: "still-live" },

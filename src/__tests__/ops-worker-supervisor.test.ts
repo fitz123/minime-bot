@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1953,6 +1954,46 @@ describe("ops worker supervisor", () => {
       }),
       /process start token contains unsafe characters/,
     );
+
+    const released = makeLockHarness("released");
+    const releasedPath = join(released.directory, "supervisor.lock");
+    writeFileSync(releasedPath, "owner releases before inspection\n", { mode: 0o600 });
+    let releaseConflictCount = 0;
+    const afterRelease = new OpsWorkerSupervisor({
+      store: released.store,
+      doneChecks: released.doneChecks,
+      instanceId: "after-release-owner",
+      processStartToken: "after-release-owner-start",
+      lockFaultInjector: (point) => {
+        if (point === "after-lock-publish-conflict") {
+          releaseConflictCount += 1;
+          unlinkSync(releasedPath);
+        }
+      },
+    });
+    await afterRelease.start();
+    afterRelease.close();
+    assert.equal(releaseConflictCount, 1);
+
+    const vanished = makeLockHarness("vanished");
+    const vanishedPath = join(vanished.directory, "supervisor.lock");
+    writeFileSync(
+      vanishedPath,
+      `${JSON.stringify(lockRecord("vanished-owner"))}\n`,
+      { mode: 0o600 },
+    );
+    const afterVanished = new OpsWorkerSupervisor({
+      store: vanished.store,
+      doneChecks: vanished.doneChecks,
+      instanceId: "after-vanished-owner",
+      processStartToken: "after-vanished-owner-start",
+      inspectLockOwner: () => {
+        unlinkSync(vanishedPath);
+        return "STALE";
+      },
+    });
+    await afterVanished.start();
+    afterVanished.close();
 
     const atomic = makeLockHarness("atomic");
     const interrupted = new OpsWorkerSupervisor({

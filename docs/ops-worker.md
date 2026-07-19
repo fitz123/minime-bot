@@ -165,8 +165,11 @@ mismatched evidence fails closed; persisted evidence contains versioned results
 and hashes only.
 
 Extension identities include the complete statically resolved local module
-closure. Computed imports, indirect `require`, and `createRequire` fail closed
-because their executable dependency bytes cannot be pinned before launch.
+closure using the same fixed Jiti resolver contract as execution. Ambient Jiti
+extension ordering and cache configuration cannot change that contract. Dynamic
+imports, runtime `require`, `createRequire`, VM loaders, and runtime code generation
+fail closed because their eventual executable dependency bytes cannot be fenced
+before launch.
 
 ## Quota admission and waits
 

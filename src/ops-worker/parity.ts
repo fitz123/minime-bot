@@ -23,6 +23,7 @@ import {
 } from "../pi-extensions/ops-worker-parity-attestation.js";
 import {
   createPiExtensionResourceSnapshot,
+  PI_EXTENSION_JITI_EXTENSIONS,
   piResourceIdentity,
   type PiExtensionResourceFile,
   type PiPrimaryResourceContract,
@@ -120,7 +121,8 @@ function writePrivateExtensionWrapper(
     `const targetExtensionPath = ${JSON.stringify(targetPath)};`,
     `const expectedFiles = ${JSON.stringify(resourceFiles)};`,
     `const extensionAliases = ${JSON.stringify(PI_EXTENSION_JITI_ALIASES)};`,
-    "const jiti = createJiti(import.meta.url, { alias: extensionAliases, moduleCache: false, tryNative: false });",
+    `const extensionJitiExtensions = ${JSON.stringify(PI_EXTENSION_JITI_EXTENSIONS)};`,
+    "const jiti = createJiti(import.meta.url, { alias: extensionAliases, esmEvalTempFile: false, extensions: extensionJitiExtensions, fsCache: true, interopDefault: true, jsx: false, moduleCache: false, nativeModules: [], rebuildFsCache: false, sourceMaps: false, transformModules: [], tryNative: false, tsconfigPaths: false });",
     "function sha256(value) { return `sha256:${createHash('sha256').update(value).digest('hex')}`; }",
     "function verifyPinnedResources() {",
     "  for (const expected of expectedFiles) {",

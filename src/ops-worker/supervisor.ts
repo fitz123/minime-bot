@@ -133,7 +133,9 @@ export interface OpsWorkerSupervisorOptions {
     task: OpsWorkerTask,
   ) => OpsWorkerStartupRunResult | Promise<OpsWorkerStartupRunResult>;
   /** Test-only crash-boundary hook. Production callers should leave this unset. */
-  lockFaultInjector?: (point: "after-temp-file-fsync") => void;
+  lockFaultInjector?: (
+    point: "after-temp-file-fsync" | "after-lock-publish-conflict",
+  ) => void;
 }
 
 export class OpsWorkerSupervisorStateError extends Error {
@@ -285,7 +287,9 @@ class OpsWorkerSingleInstanceGuard {
   private readonly inspectOwner:
     | ((owner: OpsWorkerSupervisorLockRecord) => OpsWorkerLockOwnerStatus)
     | undefined;
-  private readonly faultInjector: ((point: "after-temp-file-fsync") => void) | undefined;
+  private readonly faultInjector: ((
+    point: "after-temp-file-fsync" | "after-lock-publish-conflict",
+  ) => void) | undefined;
   private acquiredInode: bigint | number | undefined;
   private recoveryInode: bigint | number | undefined;
 
@@ -295,7 +299,9 @@ class OpsWorkerSingleInstanceGuard {
     inspectOwner:
       | ((owner: OpsWorkerSupervisorLockRecord) => OpsWorkerLockOwnerStatus)
       | undefined,
-    faultInjector: ((point: "after-temp-file-fsync") => void) | undefined,
+    faultInjector: ((
+      point: "after-temp-file-fsync" | "after-lock-publish-conflict",
+    ) => void) | undefined,
   ) {
     this.path = join(stateDirectory, SUPERVISOR_LOCK_FILE_NAME);
     this.recoveryPath = join(stateDirectory, SUPERVISOR_LOCK_RECOVERY_FILE_NAME);
@@ -309,7 +315,13 @@ class OpsWorkerSingleInstanceGuard {
       this.assertNoRecoveryGuard();
       if (this.publishCompleteRecord()) return;
 
-      const existing = readSupervisorLock(this.path);
+      let existing: ReturnType<typeof readSupervisorLock>;
+      try {
+        existing = readSupervisorLock(this.path);
+      } catch (error) {
+        if (isMissingError(error)) continue;
+        throw error;
+      }
       const existingStats = existing.stats;
       const ownerRaw = existing.raw;
       const owner = existing.owner;
@@ -354,6 +366,10 @@ class OpsWorkerSingleInstanceGuard {
           );
         }
         unlinkSync(this.path);
+      } catch (error) {
+        // A stale owner can finish cleanup before this contender completes its
+        // guarded recheck. A missing canonical lock is safe to retry.
+        if (!isMissingError(error)) throw error;
       } finally {
         this.releaseRecoveryGuard();
       }
@@ -382,7 +398,10 @@ class OpsWorkerSingleInstanceGuard {
       try {
         linkSync(temporaryPath, this.path);
       } catch (error) {
-        if (isAlreadyExistsError(error)) return false;
+        if (isAlreadyExistsError(error)) {
+          this.faultInjector?.("after-lock-publish-conflict");
+          return false;
+        }
         throw error;
       }
       this.acquiredInode = inode;
