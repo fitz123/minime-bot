@@ -53,6 +53,7 @@ import {
   type OpsWorkerInterruptMode,
   type OpsWorkerLastOutcome,
   type OpsWorkerOutcomeResult,
+  type OpsWorkerSteeringEntry,
   type OpsWorkerTask,
   type OpsWorkerTaskState,
   type OpsWorkerUnverifiedRun,
@@ -674,6 +675,11 @@ export class OpsWorkerSupervisor {
 
   get supervisorInstanceId(): string {
     return this.instanceId;
+  }
+
+  appendTaskSteering(taskId: string, entry: OpsWorkerSteeringEntry): OpsWorkerTask {
+    this.assertStarted();
+    return this.store.appendSteering(taskId, entry).task;
   }
 
   setTaskPaused(taskId: string, paused: boolean): OpsWorkerTask {

@@ -226,6 +226,8 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(result.code, 0);
     assert.match(result.stdout, /worker start --state-dir <path> --agent-workspace <path>/);
+    assert.match(result.stdout, /--control-config <path>/);
+    assert.match(result.stdout, /dedicated second-token Telegram poller/);
     assert.match(result.stdout, /worker submit --state-dir <path> --template <registered>/);
     assert.match(result.stdout, /--delivery-key <adapter-delivery-key>/);
     assert.match(result.stdout, /worker checkpoint --state-dir <path>/);
@@ -364,6 +366,8 @@ describe("ops worker CLI and inactive runtime", () => {
       authorizationVerification: _authorizationVerification,
       verification: _verification,
       legacyCompletion: _legacyCompletion,
+      steering: _steering,
+      control: _control,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {
@@ -810,6 +814,108 @@ describe("ops worker CLI and inactive runtime", () => {
     const completed = store.get(taskId);
     assert.equal(completed?.state, "DONE");
     assert.equal(completed?.lastOutcome?.result, "PASS");
+  });
+
+  it("starts the dedicated Telegram control loop only with --control-config", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controlConfig = join(fixture.root, "ops-control.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    const telegramMethods: string[] = [];
+    const deps = dependencies(contracts, {
+      controlConfigEnv: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN" },
+      telegramFetch: async (input) => {
+        const method = String(input).split("/").at(-1) ?? "";
+        telegramMethods.push(method);
+        return method === "getUpdates"
+          ? Response.json({ ok: true, result: [] })
+          : Response.json({ ok: true, result: { message_id: 1 } });
+      },
+      piAttemptDependencies: {
+        resolveInvocation: (args) => ({
+          command: process.execPath,
+          args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "success", ...args],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+      },
+    });
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(submitted.code, 0, submitted.stderr);
+
+    const started = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], fixture.root, deps);
+
+    assert.equal(started.code, 0, started.stderr);
+    assert.deepEqual(telegramMethods, ["sendMessage", "getUpdates"]);
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+    });
+    assert.equal(store.list()[0].report.state, "SENT");
+
+    let omittedPollerCalled = false;
+    const omittedFixture = fixtureRoot(t);
+    const omitted = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      omittedFixture.stateDirectory,
+      "--agent-workspace",
+      omittedFixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], omittedFixture.root, dependencies(contracts, {
+      telegramFetch: async () => {
+        omittedPollerCalled = true;
+        throw new Error("Telegram must remain inactive without --control-config");
+      },
+    }));
+    assert.equal(omitted.code, 0, omitted.stderr);
+    assert.equal(omittedPollerCalled, false);
+
+    const nonStart = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      omittedFixture.stateDirectory,
+      "--control-config",
+      join(fixture.root, "missing-control.yaml"),
+    ], fixture.root, deps);
+    assert.equal(nonStart.code, 2);
+    assert.match(nonStart.stderr, /unknown worker status option: --control-config/);
   });
 
   it("requires and applies the strict quota dependency before a CLI-started claim", async (t) => {
