@@ -47,7 +47,7 @@ function contracts() {
     },
     clock: () => new Date(NOW),
     monitoringFreshnessReader: {
-      read: () => ({
+      readMonitoringFreshness: () => ({
         observedAt: NOW,
         latestSampleAt: NOW,
       } satisfies OpsMonitoringFreshnessReading),
@@ -59,7 +59,7 @@ function contracts() {
       } satisfies OpsAlertStateReading),
     },
     serviceAvailabilityReader: {
-      read: () => ({
+      readServiceAvailability: () => ({
         observedAt: NOW,
         status: "HEALTHY",
         healthySince: "2026-07-19T09:50:00.000Z",
@@ -295,6 +295,10 @@ describe("Alertmanager conversion and task-store submission", () => {
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {
     const { intake, store } = fixture(t);
     const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    expectIntakeError(
+      () => intake.submit(body(webhook({ groupLabels: undefined })), CONTENT_TYPE),
+      "INVALID_PAYLOAD",
+    );
     const activeReuse = intake.submit(body(webhook({
       alerts: [{
         ...alert(),
@@ -335,6 +339,19 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.deepEqual(resolved, { ok: true, taskId: null, replayed: false });
     assert.equal(store.list().length, 0);
     assert.throws(() => intake.submit(body(webhook({ version: "3" })), CONTENT_TYPE));
+    expectIntakeError(
+      () => intake.submit(body(webhook({ groupLabels: undefined })), CONTENT_TYPE),
+      "INVALID_PAYLOAD",
+    );
+    expectIntakeError(
+      () => intake.submit(body(webhook({
+        groupLabels: {
+          first: "a".repeat(2 * 1024),
+          second: "b".repeat(2 * 1024),
+        },
+      })), CONTENT_TYPE),
+      "INVALID_PAYLOAD",
+    );
     assert.equal(store.list().length, 0);
   });
 });

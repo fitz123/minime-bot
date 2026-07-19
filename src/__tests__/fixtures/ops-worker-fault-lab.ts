@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import type { CodexQuotaSnapshot } from "../../pi-extensions/codex-usage.js";
+import { assemblePiContext } from "../../pi-context-assembler.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   resolvePiPrimaryResourceContract,
@@ -36,7 +36,6 @@ import {
   createOpsTaskContracts,
 } from "../../ops-worker/ops-contracts.js";
 import {
-  classifyOpsWorkerPiExit,
   OpsWorkerPiAttemptRunner,
   stopOwnedProcessGroup,
 } from "../../ops-worker/pi-attempt.js";
@@ -64,7 +63,6 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
-  hashOpsWorkerPiLaunchSubject,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
@@ -476,13 +474,13 @@ async function runAvailability(readings: AvailabilityReadings) {
   const doneChecks = createOpsAvailabilityDoneCheckRegistry({
     clock: () => new Date(NOW),
     monitoringFreshnessReader: {
-      read: async () => structuredClone(readings.monitoring) as OpsMonitoringFreshnessReading,
+      readMonitoringFreshness: async () => structuredClone(readings.monitoring) as OpsMonitoringFreshnessReading,
     },
     alertStateReader: {
       read: async () => structuredClone(readings.alerts) as OpsAlertStateReading,
     },
     serviceAvailabilityReader: {
-      read: async () => structuredClone(readings.service) as OpsServiceAvailabilityReading,
+      readServiceAvailability: async () => structuredClone(readings.service) as OpsServiceAvailabilityReading,
     },
   });
   return doneChecks.run(
@@ -506,13 +504,13 @@ function availabilityContracts() {
     },
     clock: () => new Date(NOW),
     monitoringFreshnessReader: {
-      read: () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
+      readMonitoringFreshness: () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
     },
     alertStateReader: {
       read: () => healthyReadings().alerts as OpsAlertStateReading,
     },
     serviceAvailabilityReader: {
-      read: () => healthyReadings().service as OpsServiceAvailabilityReading,
+      readServiceAvailability: () => healthyReadings().service as OpsServiceAvailabilityReading,
     },
   });
 }
@@ -625,18 +623,16 @@ async function createPiRunnerFixture(context: ScenarioContext): Promise<{
       NonNullable<ConstructorParameters<typeof OpsWorkerPiAttemptRunner>[0]["dependencies"]>["launchFaultInjector"]
     >,
   ): void;
-  injectLaunchFault(
-    point: Parameters<
-      NonNullable<
-        NonNullable<ConstructorParameters<typeof OpsWorkerPiAttemptRunner>[0]["dependencies"]>["launchFaultInjector"]
-      >
-    >[0],
-  ): void;
 }> {
   const workspace = join(context.root, "agent-workspace");
   const primaryWorkspace = join(context.root, "primary-context");
   mkdirSync(workspace, { mode: 0o700 });
   mkdirSync(primaryWorkspace, { mode: 0o700 });
+  writeFileSync(
+    join(primaryWorkspace, "CLAUDE.md"),
+    "# Fault lab primary context\n\nExercise only deterministic fake dependencies.\n",
+    "utf8",
+  );
   const primaryContextAgent: AgentConfig = {
     id: "main",
     workspaceCwd: primaryWorkspace,
@@ -668,9 +664,6 @@ async function createPiRunnerFixture(context: ScenarioContext): Promise<{
     setLaunchFaultInjector(injector): void {
       launchFaultInjector = injector;
     },
-    injectLaunchFault(point): void {
-      launchFaultInjector?.(point);
-    },
     runner: new OpsWorkerPiAttemptRunner({
       supervisor: created.supervisor,
       workspaceCwd: workspace,
@@ -680,7 +673,15 @@ async function createPiRunnerFixture(context: ScenarioContext): Promise<{
       termGraceMs: 200,
       killGraceMs: 200,
       dependencies: {
-        assembleContext: () => null,
+        assembleContext: (agent, options) => assemblePiContext(agent, options),
+        resolveInvocation: (args) => ({
+          command: process.execPath,
+          args: [FAKE_PI_PROCESS, "partial-progress-rc1", ...args],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined ? [] : [[key, process.env[key] as string]]),
+        ),
         now: context.clock.now,
         launchFaultInjector: (point) => launchFaultInjector?.(point),
       },
@@ -986,58 +987,23 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       const fixture = await createPiRunnerFixture(context);
       const task = makeTask("child-rc1-progress");
       fixture.store.create(task);
-      const preLaunch = await fixture.runner.runAttempt(task.id);
-      assert.equal(preLaunch.state, "RESUMABLE");
+      fixture.lifecycle.recordCheckpoint(task.id, {
+        checkpointId: "checkpoint-before-rc1",
+        payload: { inspected: true },
+        summary: "Partial deterministic progress was persisted.",
+      });
       let fenceObserved = false;
       fixture.setLaunchFaultInjector((point) => {
-        if (point !== "before-launch-fence") return;
-        fixture.lifecycle.recordCheckpoint(task.id, {
-          checkpointId: "checkpoint-before-rc1",
-          payload: { inspected: true },
-          summary: "Partial deterministic progress was persisted.",
-        });
-        fenceObserved = true;
+        if (point === "after-launch-intent-persisted") fenceObserved = true;
       });
-      const preparedSubject = hashOpsWorkerPiLaunchSubject(preLaunch);
-      fixture.supervisor.reservePiProcessGroupLaunch(task.id);
-      fixture.injectLaunchFault("before-launch-fence");
-      const drifted = fixture.supervisor.beginPiLaunch(task.id, {
-        attemptId: "attempt-fault-lab-drift",
-        supervisorInstanceId: fixture.supervisor.supervisorInstanceId,
-        pid: null,
-        expectedProcessGroupId: null,
-        launchedAt: context.clock.at(2_000),
-        ownershipNonceHash: `sha256:${"e".repeat(64)}`,
-      }, preparedSubject);
-      fixture.supervisor.releasePiProcessGroupLaunch(task.id);
+      const result = await fixture.runner.runAttempt(task.id);
       assert.equal(fenceObserved, true);
-      assert.equal(drifted.unverifiedRun, null);
-      assert.equal(drifted.currentCheckpoint?.checkpointId, "checkpoint-before-rc1");
-
-      const child = spawnSync(
-        process.execPath,
-        [FAKE_PI_PROCESS, "partial-progress-rc1"],
-        { encoding: "utf8", timeout: 5_000 },
-      );
-      assert.equal(child.status, 1);
-      const classification = classifyOpsWorkerPiExit({
-        code: child.status,
-        signal: child.signal as NodeJS.Signals | null,
-        error: child.error ?? null,
-        stdout: child.stdout,
-        stderr: child.stderr,
-      }, { responseStatus: 200 });
-      assert.equal(classification, "CRASH");
-      fixture.supervisor.markRunning(task.id, activeRun(fixture.supervisor, "attempt-rc1"));
-      const result = fixture.supervisor.recordResumableInfrastructureOutcome(
-        task.id,
-        classification,
-        "Fake Pi returned rc=1 after partial progress.",
-      );
       assert.equal(result.state, "RESUMABLE");
       assert.equal(result.lastOutcome?.result, "CRASH");
       assert.equal(result.currentCheckpoint?.checkpointId, "checkpoint-before-rc1");
       assert.equal(result.verification, null);
+      assert.equal(result.activeRun, null);
+      assert.equal(result.unverifiedRun, null);
     },
   },
   {
@@ -1237,27 +1203,15 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       assert.equal(result.components[0].outcome, "NOT_READY");
       assert.equal(result.components[1].outcome, "PASS");
       assert.equal(result.components[2].outcome, "PASS");
-      assert.equal(
-        result.nextCheckAt,
-        new Date(Date.parse(NOW) + OPS_AVAILABILITY_LIMITS.recheckMs).toISOString(),
-      );
+      assert.equal(result.nextCheckAt, null);
     },
   },
   {
     name: "report-crash-before-receipt-finish",
     summary: "A report crash after send re-queries and redelivers before finishing its receipt.",
     async run(context) {
-      let renameCount = 0;
-      let armed = false;
       const first = await createSupervisor(context, {
         instanceId: "fault-lab-report-first",
-        faultInjector(point) {
-          if (!armed || point !== "after-snapshot-rename") return;
-          renameCount += 1;
-          if (renameCount === 3) {
-            throw new Error("synthetic report crash before receipt finish");
-          }
-        },
       });
       const task = makeTask("report-receipt-crash");
       task.state = "CANCELLED";
@@ -1276,9 +1230,12 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       task.report.state = "PENDING";
       first.store.create(task);
       const transport = new FakeTelegramTransport(context.observe);
-      armed = true;
       await assert.rejects(
-        createTelegramControl(context, first.supervisor, transport).tick(),
+        createTelegramControl(context, first.supervisor, transport, (point) => {
+          if (point === "after-report-send-before-receipt-finish") {
+            throw new Error("synthetic report crash before receipt finish");
+          }
+        }).tick(),
         /synthetic report crash/,
       );
       const claimed = first.store.get(task.id)?.mutationReceipts.report;

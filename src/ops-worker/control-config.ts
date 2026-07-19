@@ -127,6 +127,21 @@ function expectInteger(
   return value as number;
 }
 
+function expectTelegramId(
+  value: unknown,
+  path: string,
+  pattern: RegExp,
+): string {
+  const id = expectString(value, path);
+  const numeric = Number(id);
+  if (
+    !pattern.test(id)
+    || !Number.isSafeInteger(numeric)
+    || String(numeric) !== id
+  ) fail(`${path} must be a canonical safe Telegram integer id string`);
+  return id;
+}
+
 function optionalInteger(
   value: Record<string, unknown>,
   key: string,
@@ -204,21 +219,22 @@ function parseTelegram(
     ["controlChatId", "operatorIds"],
     "telegram",
   );
-  const controlChatId = expectString(telegram.controlChatId, "telegram.controlChatId");
-  if (!TELEGRAM_CHAT_ID_PATTERN.test(controlChatId)) {
-    fail("telegram.controlChatId must be a canonical Telegram integer id string");
-  }
+  const controlChatId = expectTelegramId(
+    telegram.controlChatId,
+    "telegram.controlChatId",
+    TELEGRAM_CHAT_ID_PATTERN,
+  );
   if (!Array.isArray(telegram.operatorIds)) fail("telegram.operatorIds must be an array");
   if (telegram.operatorIds.length < 1) fail("telegram.operatorIds must contain at least one operator id");
   if (telegram.operatorIds.length > MAX_OPERATORS) {
     fail(`telegram.operatorIds must contain at most ${MAX_OPERATORS} operator ids`);
   }
   const operatorIds = telegram.operatorIds.map((entry, index) => {
-    const id = expectString(entry, `telegram.operatorIds[${index}]`);
-    if (!TELEGRAM_OPERATOR_ID_PATTERN.test(id)) {
-      fail(`telegram.operatorIds[${index}] must be a canonical non-negative Telegram integer id string`);
-    }
-    return id;
+    return expectTelegramId(
+      entry,
+      `telegram.operatorIds[${index}]`,
+      TELEGRAM_OPERATOR_ID_PATTERN,
+    );
   });
   if (new Set(operatorIds).size !== operatorIds.length) {
     fail("telegram.operatorIds must not contain duplicates");

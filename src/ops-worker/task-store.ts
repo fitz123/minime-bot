@@ -856,7 +856,10 @@ export class OpsWorkerTaskStore {
   ): OpsWorkerTaskStoreMutationResult {
     return this.mutate(taskId, audit, (task) => {
       if (task.control.interrupt !== null) {
-        if (JSON.stringify(task.control.interrupt) === JSON.stringify(interrupt)) {
+        if (
+          task.control.interrupt.mode === interrupt.mode
+          && task.control.interrupt.reason === interrupt.reason
+        ) {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
         throw new OpsWorkerTaskStoreSafetyError(
@@ -869,6 +872,10 @@ export class OpsWorkerTaskStore {
         );
       }
       task.control.interrupt = structuredClone(interrupt);
+      if (interrupt.mode === "pause" && !task.control.paused) {
+        task.control.paused = true;
+        task.control.pausedAt = interrupt.requestedAt;
+      }
       task.updatedAt = this.now().toISOString();
     });
   }

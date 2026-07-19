@@ -30,7 +30,7 @@ import {
 
 export const OPS_ALERTMANAGER_INTAKE_LIMITS = Object.freeze({
   maxBodyBytes: 256 * 1024,
-  maxAlerts: OPS_WORKER_LIMITS.maxEvidenceEntries,
+  maxAlerts: OPS_WORKER_LIMITS.maxEvidenceEntries - 1,
   maxLabelEntries: 64,
   maxAnnotationEntries: 64,
   maxKeyBytes: 256,
@@ -429,6 +429,38 @@ function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorke
   };
 }
 
+function alertGroupCorrelationEvidence(
+  correlationKey: string,
+  groupLabels: Record<string, string> | undefined,
+  at: string,
+): OpsWorkerEvidence {
+  if (!groupLabels || Object.keys(groupLabels).length === 0) {
+    fail(
+      "INVALID_PAYLOAD",
+      "Alertmanager firing groups require non-empty groupLabels for exact correlation",
+    );
+  }
+  const value = {
+    type: "alertmanager-group-correlation-v1",
+    correlationKey,
+    groupLabels,
+  };
+  const summary = JSON.stringify(value);
+  if (Buffer.byteLength(summary, "utf8") > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+    fail(
+      "INVALID_PAYLOAD",
+      "Alertmanager groupLabels exceed the exact correlation evidence bound",
+    );
+  }
+  return {
+    at,
+    kind: "alert",
+    trust: "untrusted",
+    summary,
+    artifact: null,
+  };
+}
+
 export class OpsWorkerAlertmanagerIntake {
   private readonly store: OpsWorkerTaskStore;
   private readonly doneChecks: OpsWorkerDoneCheckRegistry;
@@ -484,17 +516,11 @@ export class OpsWorkerAlertmanagerIntake {
       correlationKey,
       deliveryKey,
       deliveryDigest,
+      webhook.groupLabels,
     );
-
     const active = this.store.findActiveByCorrelation(correlationKey);
     if (active) return { ok: true, taskId: active.id, replayed: true };
-    if (this.store.list().some((candidate) => candidate.source.deliveryKey === deliveryKey)) {
-      const replay = this.store.create(task, {
-        event: "CREATED",
-        summary: "Accepted authenticated Alertmanager firing episode",
-      });
-      return { ok: true, taskId: replay.task.id, replayed: true };
-    }
+
     try {
       const created = this.store.create(task, {
         event: "CREATED",
@@ -514,6 +540,7 @@ export class OpsWorkerAlertmanagerIntake {
     correlationKey: string,
     deliveryKey: string,
     deliveryDigest: string,
+    groupLabels: Record<string, string> | undefined,
   ): OpsWorkerTask {
     const current = this.now();
     if (!(current instanceof Date) || !Number.isFinite(current.getTime())) {
@@ -552,7 +579,10 @@ export class OpsWorkerAlertmanagerIntake {
       priority: OPS_WORKER_SOURCE_PRIORITIES.alertmanager,
       objective:
         OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective,
-      evidence: firingAlerts.map((entry) => alertEvidence(entry, now)),
+      evidence: [
+        alertGroupCorrelationEvidence(correlationKey, groupLabels, now),
+        ...firingAlerts.map((entry) => alertEvidence(entry, now)),
+      ],
       doneCheck: {
         name: OPS_AVAILABILITY_DONE_CHECK_NAME,
         params: { invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT },

@@ -2468,9 +2468,13 @@ function parseLegacyCompletion(value: unknown): OpsWorkerLegacyCompletion | null
 }
 
 export function assertOpsWorkerTaskId(id: unknown): asserts id is string {
-  if (typeof id !== "string" || !TASK_ID_PATTERN.test(id)) {
+  if (!isOpsWorkerTaskId(id)) {
     fail("task.id", "must be a traversal-safe lowercase task identifier");
   }
+}
+
+export function isOpsWorkerTaskId(id: unknown): id is string {
+  return typeof id === "string" && TASK_ID_PATTERN.test(id);
 }
 
 export function isOpsWorkerTerminalState(

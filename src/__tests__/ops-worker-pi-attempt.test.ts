@@ -51,6 +51,7 @@ import {
   OPS_WORKER_PI_LIMITS,
   OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
+  buildOpsWorkerAttemptPrompt,
   type OpsWorkerPiAttemptDependencies,
   type OpsWorkerQuotaProbeRequest,
   type OpsWorkerProcessGroupInspection,
@@ -755,6 +756,87 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(blocked.state, "BLOCKED");
     assert.equal(blocked.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
     assert.equal(blocked.steering[0]?.consumedAt, null);
+  });
+
+  it("does not consume steering that arrives after the prompt snapshot", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-steering-launch-race");
+    harness.store.create(task);
+    harness.store.appendSteering(task.id, {
+      steeringId: "telegram:update:3020",
+      receivedAt: task.updatedAt,
+      kind: "correction",
+      operatorRef: "telegram:100000000",
+      text: "Apply the first bounded correction.",
+      consumedAt: null,
+    });
+    const firstPrompt = join(harness.root, "steering-race-first.txt");
+    let injected = false;
+
+    const first = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: firstPrompt,
+        }),
+        launchFaultInjector: (point) => {
+          if (point !== "after-unverified-run-persisted" || injected) return;
+          injected = true;
+          harness.store.appendSteering(task.id, {
+            steeringId: "telegram:update:3021",
+            receivedAt: task.updatedAt,
+            kind: "answer",
+            operatorRef: "telegram:100000000",
+            text: "This answer arrived during process identity proof.",
+            consumedAt: null,
+          });
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(injected, true);
+    assert.equal(first.state, "RESUMABLE");
+    assert.equal(first.steering[0].consumedAt !== null, true);
+    assert.equal(first.steering[1].consumedAt, null);
+    assert.match(readFileSync(firstPrompt, "utf8"), /first bounded correction/);
+    assert.doesNotMatch(readFileSync(firstPrompt, "utf8"), /arrived during process identity/);
+
+    const secondPrompt = join(harness.root, "steering-race-second.txt");
+    const completed = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: secondPrompt,
+        }),
+      },
+    }).runAttempt(task.id);
+    assert.equal(completed.state, "DONE");
+    assert.match(readFileSync(secondPrompt, "utf8"), /arrived during process identity/);
+  });
+
+  it("reserves prompt space for complete steering and the final instruction", () => {
+    const task = makeTask("bounded-steering-prompt");
+    task.evidence = Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries }, (_, index) => ({
+      at: task.createdAt,
+      kind: "alert" as const,
+      trust: "untrusted" as const,
+      summary: `${index}:`.padEnd(OPS_WORKER_LIMITS.maxEvidenceSummaryBytes, "e"),
+      artifact: null,
+    }));
+    task.steering = [{
+      steeringId: "telegram:update:3030",
+      receivedAt: task.updatedAt,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "s".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    }];
+
+    const prompt = buildOpsWorkerAttemptPrompt(task);
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    assert.match(prompt, /telegram:update:3030/);
+    assert.match(prompt, /"text":"s+"/);
+    assert.match(prompt, /Perform one bounded remediation attempt/);
   });
 
   it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
@@ -2222,6 +2304,36 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(harness.supervisor.selectNextTask(), undefined);
     harness.supervisor.setTaskPaused(paused.id, false);
     assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+  });
+
+  it("applies a pause that lands during launch identity proof before provider work", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("pause-during-launch-resolution");
+    harness.store.create(task);
+    const promptPath = join(harness.root, "pause-during-launch-prompt.txt");
+    let paused = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+        launchFaultInjector: (point) => {
+          if (point !== "after-unverified-run-persisted" || paused) return;
+          paused = true;
+          harness.supervisor.setTaskPaused(task.id, true);
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(paused, true);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.control.paused, true);
+    assert.equal(result.activeRun, null);
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(existsSync(promptPath), false);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
   });
 
   it("stops only proven owned groups for pause and cancel operator interrupts", async (t) => {

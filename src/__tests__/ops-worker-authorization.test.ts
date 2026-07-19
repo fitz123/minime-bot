@@ -410,7 +410,7 @@ function opsContracts(
     alertmanagerAuthorizationSnapshotReader: reader,
     clock: () => new Date(NOW),
     monitoringFreshnessReader: {
-      read: async () => ({
+      readMonitoringFreshness: async () => ({
         observedAt: NOW,
         latestSampleAt: "2026-07-18T11:59:00.000Z",
       } satisfies OpsMonitoringFreshnessReading),
@@ -422,7 +422,7 @@ function opsContracts(
       } satisfies OpsAlertStateReading),
     },
     serviceAvailabilityReader: {
-      read: async () => ({
+      readServiceAvailability: async () => ({
         observedAt: NOW,
         status: "HEALTHY",
         healthySince: "2026-07-18T11:50:00.000Z",

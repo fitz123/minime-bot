@@ -3,7 +3,12 @@ import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckContext,
 } from "./done-checks.js";
-import type { JsonObject, OpsWorkerVerificationOutcome } from "./types.js";
+import type {
+  JsonObject,
+  OpsWorkerEvidence,
+  OpsWorkerSourceKind,
+  OpsWorkerVerificationOutcome,
+} from "./types.js";
 
 export const OPS_AVAILABILITY_DONE_CHECK_NAME = "ops.minime-availability" as const;
 export const OPS_AVAILABILITY_DONE_CHECK_VERSION = "1" as const;
@@ -21,6 +26,8 @@ export const OPS_AVAILABILITY_LIMITS = Object.freeze({
   maxAlertLabels: 64,
   maxLabelBytes: 2 * 1024,
   maxPrometheusSeries: 16,
+  prometheusStabilityStepSeconds: 15,
+  maxPrometheusSamplesPerSeries: 32,
 } as const);
 
 export interface OpsAvailabilityInvariant {
@@ -41,6 +48,10 @@ export type OpsAvailabilityInvariantName = keyof typeof OPS_AVAILABILITY_INVARIA
 
 export interface OpsAvailabilityReaderContext {
   signal: AbortSignal;
+  taskId: string;
+  sourceKind?: OpsWorkerSourceKind;
+  sourceCorrelationKey?: string;
+  sourceEvidence?: readonly OpsWorkerEvidence[];
 }
 
 export interface OpsMonitoringFreshnessReading {
@@ -60,11 +71,7 @@ export interface OpsServiceAvailabilityReading {
 }
 
 export interface OpsMonitoringFreshnessReader {
-  read?(
-    invariant: OpsAvailabilityInvariantName,
-    context: OpsAvailabilityReaderContext,
-  ): OpsMonitoringFreshnessReading | Promise<OpsMonitoringFreshnessReading>;
-  readMonitoringFreshness?(
+  readMonitoringFreshness(
     invariant: OpsAvailabilityInvariantName,
     context: OpsAvailabilityReaderContext,
   ): OpsMonitoringFreshnessReading | Promise<OpsMonitoringFreshnessReading>;
@@ -78,11 +85,7 @@ export interface OpsAlertStateReader {
 }
 
 export interface OpsServiceAvailabilityReader {
-  read?(
-    invariant: OpsAvailabilityInvariantName,
-    context: OpsAvailabilityReaderContext,
-  ): OpsServiceAvailabilityReading | Promise<OpsServiceAvailabilityReading>;
-  readServiceAvailability?(
+  readServiceAvailability(
     invariant: OpsAvailabilityInvariantName,
     context: OpsAvailabilityReaderContext,
   ): OpsServiceAvailabilityReading | Promise<OpsServiceAvailabilityReading>;
@@ -108,8 +111,6 @@ const TIMESTAMP_PATTERN =
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const ALERT_NAME = "MinimeBotMetricsDown";
 const PROMETHEUS_UP_QUERY = 'up{job="minime-bot"}';
-const PROMETHEUS_STABILITY_QUERY =
-  'min_over_time(up{job="minime-bot"}[5m])';
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -149,7 +150,7 @@ function hashEvidence(value: unknown): string {
 function componentObservedAt(clock: () => Date, checkedAt: string): string {
   const current = clock();
   if (!(current instanceof Date) || !Number.isFinite(current.getTime())) {
-    return checkedAt;
+    throw new TypeError("Availability done-check clock returned an invalid date");
   }
   return new Date(Math.max(current.getTime(), Date.parse(checkedAt))).toISOString();
 }
@@ -243,44 +244,10 @@ function assertDependencies(deps: OpsAvailabilityDoneCheckDependencies): void {
   if (
     !deps
     || typeof deps.clock !== "function"
-    || (
-      typeof deps.monitoringFreshnessReader?.read !== "function"
-      && typeof deps.monitoringFreshnessReader?.readMonitoringFreshness !== "function"
-    )
+    || typeof deps.monitoringFreshnessReader?.readMonitoringFreshness !== "function"
     || typeof deps.alertStateReader?.read !== "function"
-    || (
-      typeof deps.serviceAvailabilityReader?.read !== "function"
-      && typeof deps.serviceAvailabilityReader?.readServiceAvailability !== "function"
-    )
+    || typeof deps.serviceAvailabilityReader?.readServiceAvailability !== "function"
   ) throw new TypeError("Availability done check requires all trusted read-only dependencies");
-}
-
-function readMonitoringFreshness(
-  reader: OpsMonitoringFreshnessReader,
-  invariant: OpsAvailabilityInvariantName,
-  context: OpsAvailabilityReaderContext,
-): OpsMonitoringFreshnessReading | Promise<OpsMonitoringFreshnessReading> {
-  if (reader.readMonitoringFreshness) {
-    return reader.readMonitoringFreshness(invariant, context);
-  }
-  return (reader.read as NonNullable<OpsMonitoringFreshnessReader["read"]>)(
-    invariant,
-    context,
-  );
-}
-
-function readServiceAvailability(
-  reader: OpsServiceAvailabilityReader,
-  invariant: OpsAvailabilityInvariantName,
-  context: OpsAvailabilityReaderContext,
-): OpsServiceAvailabilityReading | Promise<OpsServiceAvailabilityReading> {
-  if (reader.readServiceAvailability) {
-    return reader.readServiceAvailability(invariant, context);
-  }
-  return (reader.read as NonNullable<OpsServiceAvailabilityReader["read"]>)(
-    invariant,
-    context,
-  );
 }
 
 export function createOpsAvailabilityDoneCheckRegistry(
@@ -300,10 +267,15 @@ export function createOpsAvailabilityDoneCheckRegistry(
           convergence: "PRODUCT",
           timeoutMs: OPS_AVAILABILITY_LIMITS.componentTimeoutMs,
           async run(params, context): Promise<unknown> {
-            const raw = await readMonitoringFreshness(
-              deps.monitoringFreshnessReader,
+            const raw = await deps.monitoringFreshnessReader.readMonitoringFreshness(
               invariantFromParams(params),
-              { signal: context.signal },
+              {
+                signal: context.signal,
+                taskId: context.taskId,
+                sourceKind: context.sourceKind,
+                sourceCorrelationKey: context.sourceCorrelationKey,
+                sourceEvidence: context.sourceEvidence,
+              },
             );
             const reading = parseMonitoringReading(raw);
             if (!reading) return invalidReaderResult();
@@ -333,7 +305,6 @@ export function createOpsAvailabilityDoneCheckRegistry(
                 "Monitoring telemetry is missing or outside the trusted freshness bound.",
                 observedAt,
                 reading,
-                scheduledAt(observedAt),
               );
             }
             return result(
@@ -353,7 +324,13 @@ export function createOpsAvailabilityDoneCheckRegistry(
           async run(params, context): Promise<unknown> {
             const raw = await deps.alertStateReader.read(
               invariantFromParams(params),
-              { signal: context.signal },
+              {
+                signal: context.signal,
+                taskId: context.taskId,
+                sourceKind: context.sourceKind,
+                sourceCorrelationKey: context.sourceCorrelationKey,
+                sourceEvidence: context.sourceEvidence,
+              },
             );
             const reading = parseAlertReading(raw);
             if (!reading) return invalidReaderResult();
@@ -398,10 +375,15 @@ export function createOpsAvailabilityDoneCheckRegistry(
           convergence: "PRODUCT",
           timeoutMs: OPS_AVAILABILITY_LIMITS.componentTimeoutMs,
           async run(params, context): Promise<unknown> {
-            const raw = await readServiceAvailability(
-              deps.serviceAvailabilityReader,
+            const raw = await deps.serviceAvailabilityReader.readServiceAvailability(
               invariantFromParams(params),
-              { signal: context.signal },
+              {
+                signal: context.signal,
+                taskId: context.taskId,
+                sourceKind: context.sourceKind,
+                sourceCorrelationKey: context.sourceCorrelationKey,
+                sourceEvidence: context.sourceEvidence,
+              },
             );
             const reading = parseServiceReading(raw);
             if (!reading) return invalidReaderResult();
@@ -423,7 +405,6 @@ export function createOpsAvailabilityDoneCheckRegistry(
                 "Direct service availability has no fresh trusted observation.",
                 observedAt,
                 reading,
-                scheduledAt(observedAt),
               );
             }
             if (reading.status === "UNHEALTHY") {
@@ -555,6 +536,38 @@ function assertBoundedLabelMap(value: unknown): asserts value is Record<string, 
   }
 }
 
+function correlatedGroupLabels(
+  context: OpsAvailabilityReaderContext,
+): Record<string, string> {
+  if (context.sourceKind === "operator-cli") {
+    return { alertname: ALERT_NAME };
+  }
+  if (
+    context.sourceKind !== "alertmanager"
+    || typeof context.sourceCorrelationKey !== "string"
+    || !Array.isArray(context.sourceEvidence)
+  ) throw new Error("Alertmanager reader requires trusted task correlation context");
+  for (const evidence of context.sourceEvidence) {
+    if (evidence.kind !== "alert") continue;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(evidence.summary) as unknown;
+    } catch {
+      continue;
+    }
+    if (
+      !isPlainObject(decoded)
+      || !hasExactDataKeys(decoded, ["type", "correlationKey", "groupLabels"])
+      || decoded.type !== "alertmanager-group-correlation-v1"
+      || decoded.correlationKey !== context.sourceCorrelationKey
+    ) continue;
+    assertBoundedLabelMap(decoded.groupLabels);
+    if (Object.keys(decoded.groupLabels).length === 0) break;
+    return decoded.groupLabels;
+  }
+  throw new Error("Alertmanager task lacks a usable correlated group-label descriptor");
+}
+
 export class OpsAlertmanagerHttpReader implements OpsAlertStateReader {
   private readonly baseUrl: URL;
 
@@ -571,12 +584,12 @@ export class OpsAlertmanagerHttpReader implements OpsAlertStateReader {
     context: OpsAvailabilityReaderContext,
   ): Promise<OpsAlertStateReading> {
     assertInvariant(invariant);
+    const groupLabels = correlatedGroupLabels(context);
     const url = new URL("api/v2/alerts", this.baseUrl);
     url.searchParams.set("active", "true");
-    url.searchParams.set("silenced", "false");
-    url.searchParams.set("inhibited", "false");
+    url.searchParams.set("silenced", "true");
+    url.searchParams.set("inhibited", "true");
     url.searchParams.set("unprocessed", "true");
-    url.searchParams.set("filter", `alertname="${ALERT_NAME}"`);
     const response = await this.fetch(url, {
       method: "GET",
       headers: { accept: "application/json" },
@@ -594,23 +607,58 @@ export class OpsAlertmanagerHttpReader implements OpsAlertStateReader {
         throw new Error("Alertmanager returned an invalid bounded alert");
       }
       assertBoundedLabelMap(item.labels);
-      if (item.labels.alertname !== ALERT_NAME) {
-        throw new Error("Alertmanager returned an alert outside the registered invariant");
-      }
       if (!isPlainObject(item.status) || !["active", "suppressed", "unprocessed"].includes(String(item.status.state))) {
         throw new Error("Alertmanager returned an invalid alert status");
       }
     }
+    const correlated = raw.filter((item) => Object.entries(groupLabels).every(
+      ([key, value]) => (item as { labels: Record<string, string> }).labels[key] === value,
+    ));
     return {
       observedAt: new Date().toISOString(),
-      status: raw.length === 0 ? "RESOLVED" : "FIRING",
+      status: correlated.length === 0 ? "RESOLVED" : "FIRING",
     };
   }
 }
 
 interface PrometheusVectorEntry {
+  seriesId: string;
   observedAt: string;
   value: number;
+}
+
+interface PrometheusMatrixEntry {
+  seriesId: string;
+  samples: Array<Pick<PrometheusVectorEntry, "observedAt" | "value">>;
+}
+
+function canonicalLabelIdentity(labels: Record<string, string>): string {
+  return JSON.stringify(Object.fromEntries(
+    Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)),
+  ));
+}
+
+function parsePrometheusSample(
+  value: unknown,
+): Pick<PrometheusVectorEntry, "observedAt" | "value"> {
+  if (
+    !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length !== 2
+    || typeof value[1] !== "string"
+  ) throw new Error("Prometheus returned an invalid bounded sample");
+  const seconds = value[0];
+  const numeric = Number(value[1]);
+  if (
+    typeof seconds !== "number"
+    || !Number.isFinite(seconds)
+    || seconds < 0
+    || !Number.isFinite(numeric)
+  ) throw new Error("Prometheus returned a non-finite sample");
+  return {
+    observedAt: new Date(seconds * 1_000).toISOString(),
+    value: numeric,
+  };
 }
 
 function parsePrometheusVector(raw: unknown): PrometheusVectorEntry[] {
@@ -623,30 +671,54 @@ function parsePrometheusVector(raw: unknown): PrometheusVectorEntry[] {
     || Object.getPrototypeOf(raw.data.result) !== Array.prototype
     || raw.data.result.length > OPS_AVAILABILITY_LIMITS.maxPrometheusSeries
   ) throw new Error("Prometheus returned an invalid bounded vector");
-  return raw.data.result.map((candidate) => {
+  const parsed = raw.data.result.map((candidate) => {
     if (
       !isPlainObject(candidate)
       || !isPlainObject(candidate.metric)
       || Object.keys(candidate.metric).length > OPS_AVAILABILITY_LIMITS.maxAlertLabels
-      || !Array.isArray(candidate.value)
-      || Object.getPrototypeOf(candidate.value) !== Array.prototype
-      || candidate.value.length !== 2
-      || typeof candidate.value[1] !== "string"
     ) throw new Error("Prometheus returned an invalid bounded vector sample");
     assertBoundedLabelMap(candidate.metric);
-    const seconds = candidate.value[0];
-    const numeric = Number(candidate.value[1]);
-    if (
-      typeof seconds !== "number"
-      || !Number.isFinite(seconds)
-      || seconds < 0
-      || !Number.isFinite(numeric)
-    ) throw new Error("Prometheus returned a non-finite vector sample");
+    const sample = parsePrometheusSample(candidate.value);
     return {
-      observedAt: new Date(seconds * 1_000).toISOString(),
-      value: numeric,
+      seriesId: canonicalLabelIdentity(candidate.metric),
+      ...sample,
     };
   });
+  if (new Set(parsed.map((entry) => entry.seriesId)).size !== parsed.length) {
+    throw new Error("Prometheus returned duplicate vector series identities");
+  }
+  return parsed;
+}
+
+function parsePrometheusMatrix(raw: unknown): PrometheusMatrixEntry[] {
+  if (!isPlainObject(raw) || raw.status !== "success" || !isPlainObject(raw.data)) {
+    throw new Error("Prometheus returned an invalid success envelope");
+  }
+  if (
+    raw.data.resultType !== "matrix"
+    || !Array.isArray(raw.data.result)
+    || Object.getPrototypeOf(raw.data.result) !== Array.prototype
+    || raw.data.result.length > OPS_AVAILABILITY_LIMITS.maxPrometheusSeries
+  ) throw new Error("Prometheus returned an invalid bounded matrix");
+  const parsed = raw.data.result.map((candidate) => {
+    if (
+      !isPlainObject(candidate)
+      || !isPlainObject(candidate.metric)
+      || Object.keys(candidate.metric).length > OPS_AVAILABILITY_LIMITS.maxAlertLabels
+      || !Array.isArray(candidate.values)
+      || Object.getPrototypeOf(candidate.values) !== Array.prototype
+      || candidate.values.length > OPS_AVAILABILITY_LIMITS.maxPrometheusSamplesPerSeries
+    ) throw new Error("Prometheus returned an invalid bounded matrix series");
+    assertBoundedLabelMap(candidate.metric);
+    return {
+      seriesId: canonicalLabelIdentity(candidate.metric),
+      samples: candidate.values.map(parsePrometheusSample),
+    };
+  });
+  if (new Set(parsed.map((entry) => entry.seriesId)).size !== parsed.length) {
+    throw new Error("Prometheus returned duplicate matrix series identities");
+  }
+  return parsed;
 }
 
 export class OpsPrometheusHttpReader implements
@@ -662,7 +734,7 @@ export class OpsPrometheusHttpReader implements
     if (typeof fetch !== "function") throw new TypeError("Prometheus reader requires injected fetch");
   }
 
-  private async query(query: string, signal: AbortSignal): Promise<PrometheusVectorEntry[]> {
+  private async queryVector(query: string, signal: AbortSignal): Promise<PrometheusVectorEntry[]> {
     const url = new URL("api/v1/query", this.baseUrl);
     url.searchParams.set("query", query);
     const response = await this.fetch(url, {
@@ -674,12 +746,32 @@ export class OpsPrometheusHttpReader implements
     return parsePrometheusVector(await readBoundedJson(response));
   }
 
+  private async queryStabilityRange(
+    observedAt: string,
+    signal: AbortSignal,
+  ): Promise<PrometheusMatrixEntry[]> {
+    const end = Date.parse(observedAt) / 1_000;
+    const start = end - OPS_AVAILABILITY_LIMITS.stabilityWindowMs / 1_000;
+    const url = new URL("api/v1/query_range", this.baseUrl);
+    url.searchParams.set("query", PROMETHEUS_UP_QUERY);
+    url.searchParams.set("start", String(start));
+    url.searchParams.set("end", String(end));
+    url.searchParams.set("step", String(OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds));
+    const response = await this.fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal,
+    });
+    return parsePrometheusMatrix(await readBoundedJson(response));
+  }
+
   async readMonitoringFreshness(
     invariant: OpsAvailabilityInvariantName,
     context: OpsAvailabilityReaderContext,
   ): Promise<OpsMonitoringFreshnessReading> {
     assertInvariant(invariant);
-    const samples = await this.query(PROMETHEUS_UP_QUERY, context.signal);
+    const samples = await this.queryVector(PROMETHEUS_UP_QUERY, context.signal);
     const observedAt = new Date().toISOString();
     return {
       observedAt,
@@ -694,7 +786,7 @@ export class OpsPrometheusHttpReader implements
     context: OpsAvailabilityReaderContext,
   ): Promise<OpsServiceAvailabilityReading> {
     assertInvariant(invariant);
-    const direct = await this.query(PROMETHEUS_UP_QUERY, context.signal);
+    const direct = await this.queryVector(PROMETHEUS_UP_QUERY, context.signal);
     if (direct.some((sample) => sample.value !== 0 && sample.value !== 1)) {
       throw new Error("Prometheus direct availability result is outside the closed contract");
     }
@@ -707,13 +799,25 @@ export class OpsPrometheusHttpReader implements
     if (direct.some((sample) => sample.value === 0)) {
       return { observedAt, status: "UNHEALTHY", healthySince: null };
     }
-    const stable = await this.query(PROMETHEUS_STABILITY_QUERY, context.signal);
-    if (stable.some((sample) => sample.value !== 0 && sample.value !== 1)) {
+    const stable = await this.queryStabilityRange(observedAt, context.signal);
+    if (stable.some((series) => series.samples.some(
+      (sample) => sample.value !== 0 && sample.value !== 1,
+    ))) {
       throw new Error("Prometheus stability result is outside the closed contract");
     }
+    const stepMs = OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds * 1_000;
+    const windowStart = Date.parse(observedAt) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs;
+    const expectedSamples = OPS_AVAILABILITY_LIMITS.stabilityWindowMs / stepMs + 1;
+    const stableBySeries = new Map(stable.map((series) => [series.seriesId, series]));
     const coversWindow = stable.length === direct.length
       && stable.length > 0
-      && stable.every((sample) => sample.value === 1);
+      && direct.every((sample) => {
+        const series = stableBySeries.get(sample.seriesId);
+        if (!series || series.samples.length !== expectedSamples) return false;
+        return series.samples.every((entry, index) =>
+          entry.value === 1
+          && Date.parse(entry.observedAt) === windowStart + index * stepMs);
+      });
     return {
       observedAt,
       status: "HEALTHY",

@@ -11,13 +11,13 @@ import {
 import type { OpsWorkerSupervisor } from "./supervisor.js";
 import {
   OPS_WORKER_LIMITS,
+  isOpsWorkerTaskId,
   type OpsWorkerSteeringKind,
   type OpsWorkerTask,
 } from "./types.js";
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
-const TASK_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const TRUNCATION_MARKER = "\n… [truncated]";
 
 export type OpsWorkerTelegramFetch = (
@@ -27,7 +27,8 @@ export type OpsWorkerTelegramFetch = (
 
 export type OpsWorkerTelegramControlFaultPoint =
   | "after-effect-before-ledger"
-  | "after-ledger-before-reply";
+  | "after-ledger-before-reply"
+  | "after-report-send-before-receipt-finish";
 
 export interface OpsWorkerTelegramControlOptions {
   config: OpsWorkerControlConfig;
@@ -235,7 +236,7 @@ function usage(): string {
 
 function taskArgument(value: string | undefined): string | null {
   const taskId = value?.trim();
-  return taskId && TASK_ID_PATTERN.test(taskId) ? taskId : null;
+  return isOpsWorkerTaskId(taskId) ? taskId : null;
 }
 
 export class OpsWorkerTelegramControl {
@@ -507,16 +508,15 @@ export class OpsWorkerTelegramControl {
       (candidate) => candidate.report.state === "PENDING",
     );
     if (!task) return null;
-    try {
-      await this.sendMessage(reportSummary(task), signal);
-    } catch (error) {
-      await this.supervisor.recordReportAttempt(task.id, {
-        sent: false,
-        error: safeError(error),
-      });
-      return task.id;
-    }
-    await this.supervisor.recordReportAttempt(task.id, { sent: true });
+    await this.supervisor.recordReportAttempt(task.id, async (prepared) => {
+      try {
+        await this.sendMessage(reportSummary(prepared), signal);
+      } catch (error) {
+        return { sent: false, error: safeError(error) };
+      }
+      this.faultInjector?.("after-report-send-before-receipt-finish", -1);
+      return { sent: true };
+    });
     return task.id;
   }
 }

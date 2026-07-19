@@ -326,7 +326,7 @@ export class OpsWorkerControlLedger {
     return updateId === null ? undefined : updateId + 1;
   }
 
-  recordProcessedUpdate(
+  record(
     updateId: number,
     fingerprint: string,
   ): OpsWorkerControlLedgerRecordResult {
@@ -358,13 +358,6 @@ export class OpsWorkerControlLedger {
     };
     this.write(next);
     return { state: structuredClone(next), recorded: true, replayed: false };
-  }
-
-  record(
-    updateId: number,
-    fingerprint: string,
-  ): OpsWorkerControlLedgerRecordResult {
-    return this.recordProcessedUpdate(updateId, fingerprint);
   }
 
   private write(state: OpsWorkerControlLedgerState): void {

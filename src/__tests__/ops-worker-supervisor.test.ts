@@ -40,6 +40,7 @@ import {
   OpsWorkerSupervisorStateError,
 } from "../ops-worker/supervisor.js";
 import {
+  OPS_WORKER_LIMITS,
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
@@ -1367,7 +1368,7 @@ describe("ops worker supervisor", () => {
     const completionAt = done.updatedAt;
     const failedReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
-      { sent: false, error: "Synthetic report transport failure" },
+      async () => ({ sent: false, error: "Synthetic report transport failure" }),
     );
     assert.equal(failedReport.updatedAt, completionAt);
     assert.equal(failedReport.report.attempts, 1);
@@ -1386,7 +1387,7 @@ describe("ops worker supervisor", () => {
     const firstQueryHash = failedReport.mutationReceipts.report?.queryResultHash;
     const sentReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sentReport.updatedAt, completionAt);
     assert.equal(sentReport.report.attempts, 2);
@@ -1395,7 +1396,7 @@ describe("ops worker supervisor", () => {
     assert.notEqual(sentReport.mutationReceipts.report?.queryResultHash, firstQueryHash);
     assert.equal(sentReport.mutationReceipts.report?.outcome?.result, "APPLIED");
     await assert.rejects(
-      harness.supervisor.recordReportAttempt("task-pass", { sent: true }),
+      harness.supervisor.recordReportAttempt("task-pass", async () => ({ sent: true })),
       /no pending report/,
     );
     assert.throws(
@@ -1422,7 +1423,7 @@ describe("ops worker supervisor", () => {
 
     armed = true;
     await assert.rejects(
-      harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
+      harness.supervisor.recordReportAttempt("task-report-crash", async () => ({ sent: true })),
       /Synthetic crash after atomic report snapshot rename/,
     );
     assert.equal(renamedSnapshots, 4);
@@ -1434,6 +1435,7 @@ describe("ops worker supervisor", () => {
 
   it("revalidates after the external query and before claiming a mutation receipt", async (t) => {
     let checks = 0;
+    let sends = 0;
     const verifier: OpsWorkerAuthorizationVerifier = {
       identity: "mutation-authorization",
       version: "1",
@@ -1461,9 +1463,13 @@ describe("ops worker supervisor", () => {
 
     const done = await harness.supervisor.recordReportAttempt(
       "task-mutation-authorization",
-      { sent: true },
+      async () => {
+        sends += 1;
+        return { sent: true };
+      },
     );
     assert.equal(checks, 2);
+    assert.equal(sends, 0);
     assert.equal(done.state, "DONE");
     assert.equal(done.authorizationVerification?.status, "PASS");
     assert.equal(done.custody.releaseReason, "DONE");
@@ -1531,7 +1537,7 @@ describe("ops worker supervisor", () => {
     const immutableProof = structuredClone(done.verification);
     const sent = await terminal.supervisor.recordReportAttempt(
       "task-changing-auth-report",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sent.state, "DONE");
     assert.deepEqual(sent.verification, immutableProof);
@@ -1552,15 +1558,18 @@ describe("ops worker supervisor", () => {
     const blocked = await harness.supervisor.runDoneCheck("task-report-retry");
     assert.equal(blocked.state, "BLOCKED");
 
-    await harness.supervisor.recordReportAttempt("task-report-retry", {
+    await harness.supervisor.recordReportAttempt("task-report-retry", async () => ({
       sent: false,
       error: "Synthetic ambiguous report failure",
-    });
+    }));
     assert.throws(
       () => harness.supervisor.retryBlockedTask("task-report-retry"),
       /claimed report receipt still requires reconciliation/,
     );
-    await harness.supervisor.recordReportAttempt("task-report-retry", { sent: true });
+    await harness.supervisor.recordReportAttempt(
+      "task-report-retry",
+      async () => ({ sent: true }),
+    );
     const resumed = harness.supervisor.retryBlockedTask("task-report-retry");
     assert.equal(resumed.state, "RESUMABLE");
     assert.equal(resumed.report.state, "NONE");
@@ -1910,6 +1919,50 @@ describe("ops worker supervisor", () => {
     );
   });
 
+  it("retains Alertmanager group correlation evidence when bounded evidence rotates", async (t) => {
+    const harness = await makeHarness(t);
+    const correlationKey = "fixture:correlated-alert-group";
+    const task = makeTask("task-correlation-evidence", {
+      sourceKind: "alertmanager",
+      correlationKey,
+    });
+    task.evidence = [
+      {
+        at: NOW,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey,
+          groupLabels: { alertname: "MinimeBotUnavailable" },
+        }),
+        artifact: null,
+      },
+      ...Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries - 1 }, (_, index) => ({
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: `Alert evidence ${index}`,
+        artifact: null,
+      })),
+    ];
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+
+    const result = harness.supervisor.recordResumableInfrastructureOutcome(
+      task.id,
+      "NETWORK",
+      "Rotate one bounded evidence entry.",
+      undefined,
+      "New Pi evidence forces bounded evidence rotation.",
+    );
+
+    assert.equal(result.evidence.length, OPS_WORKER_LIMITS.maxEvidenceEntries);
+    assert.equal(result.evidence.some((entry) =>
+      entry.summary.includes("alertmanager-group-correlation-v1")), true);
+    assert.equal(result.evidence.some((entry) => entry.summary === "Alert evidence 0"), false);
+  });
+
   it("enforces one supervisor instance and at most one active process group", async (t) => {
     const harness = await makeHarness(t);
     const secondStore = new OpsWorkerTaskStore(harness.directory, {
@@ -2255,6 +2308,45 @@ describe("ops worker supervisor", () => {
     assert.equal(cancelled?.custody.status, "RELEASED");
   });
 
+  it("gates and reconciles an idle cancel persisted before its safe-boundary transition", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-idle-interrupt-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    let armed = false;
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "idle-interrupt-first",
+      faultInjector: (point) => {
+        if (armed && point === "after-snapshot-rename") {
+          armed = false;
+          throw new Error("Synthetic crash after idle interrupt persistence");
+        }
+      },
+    });
+    first.store.create(makeTask("task-idle-interrupt"));
+    armed = true;
+
+    assert.throws(
+      () => first.supervisor.requestOperatorInterrupt(
+        "task-idle-interrupt",
+        "cancel",
+        "Persist cancellation before the idle safe boundary.",
+      ),
+      /Synthetic crash after idle interrupt persistence/,
+    );
+    assert.equal(first.store.get("task-idle-interrupt")?.control.interrupt?.mode, "cancel");
+    assert.equal(first.supervisor.selectNextTask(), undefined);
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "idle-interrupt-restarted",
+    });
+    const cancelled = restarted.store.get("task-idle-interrupt");
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.custody.status, "RELEASED");
+  });
+
   it("applies a reconciled pause interrupt as a held safe boundary", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-pause-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -2463,7 +2555,7 @@ describe("ops worker supervisor", () => {
 
     const attempted = await restarted.supervisor.recordReportAttempt(
       "task-ambiguous",
-      { sent: false, error: "Fixture report transport unavailable" },
+      async () => ({ sent: false, error: "Fixture report transport unavailable" }),
     );
     assert.equal(attempted.report.attempts, 1);
     assert.equal(attempted.report.state, "PENDING");
@@ -2478,7 +2570,7 @@ describe("ops worker supervisor", () => {
     assert.equal(final.store.get("task-ambiguous")?.mutationReceipts.report?.outcome, null);
     const sent = await final.supervisor.recordReportAttempt(
       "task-ambiguous",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.report.attempts, 2);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Server } from "node:net";
 import { describe, it } from "node:test";
 import {
   OPS_WORKER_FAULT_LAB_SCENARIO_NAMES,
@@ -30,7 +31,32 @@ const EXPECTED_SCENARIOS = [
 ] as const;
 
 describe("ops-worker batched fake fault lab", () => {
-  it("runs the exact deterministic ADR-099 matrix without external network activity", async () => {
+  it("runs the exact deterministic ADR-099 matrix without external network activity", async (t) => {
+    let attemptedFetches = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      attemptedFetches += 1;
+      throw new Error("The fault lab must not use the ambient fetch implementation");
+    });
+    const originalListen = Server.prototype.listen;
+    t.mock.method(
+      Server.prototype,
+      "listen",
+      function guardedListen(this: Server, ...args: unknown[]): Server {
+        const first = args[0];
+        const host = typeof first === "object" && first !== null && "host" in first
+          ? (first as { host?: unknown }).host
+          : typeof args[1] === "string"
+          ? args[1]
+          : undefined;
+        assert.equal(
+          host === "127.0.0.1" || host === "::1",
+          true,
+          `The fault lab attempted a non-loopback bind: ${String(host)}`,
+        );
+        return Reflect.apply(originalListen, this, args) as Server;
+      } as typeof originalListen,
+    );
+
     assert.deepEqual(OPS_WORKER_FAULT_LAB_SCENARIO_NAMES, EXPECTED_SCENARIOS);
 
     const firstSafety: OpsWorkerFaultLabSafetyEvent[] = [];
@@ -44,6 +70,7 @@ describe("ops-worker batched fake fault lab", () => {
     assert.equal(first.scenarios.every((scenario) => scenario.outcome === "PASS"), true);
     assert.deepEqual(first.failures, []);
     assert.equal(first.pass, true);
+    assert.equal(attemptedFetches, 0);
 
     for (const safety of [firstSafety, secondSafety]) {
       assert.equal(

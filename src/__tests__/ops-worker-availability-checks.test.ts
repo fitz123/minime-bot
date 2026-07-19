@@ -7,11 +7,12 @@ import {
   OpsAlertmanagerHttpReader,
   OpsPrometheusHttpReader,
   createOpsAvailabilityDoneCheckRegistry,
+  type OpsAvailabilityReaderContext,
   type OpsAlertStateReading,
   type OpsMonitoringFreshnessReading,
   type OpsServiceAvailabilityReading,
 } from "../ops-worker/availability-checks.js";
-import type { JsonObject } from "../ops-worker/types.js";
+import type { JsonObject, OpsWorkerEvidence } from "../ops-worker/types.js";
 
 const NOW = "2026-07-19T12:00:00.000Z";
 const ONE_MINUTE_AGO = "2026-07-19T11:59:00.000Z";
@@ -47,13 +48,13 @@ function registry(readings: Readings) {
   return createOpsAvailabilityDoneCheckRegistry({
     clock: () => new Date(NOW),
     monitoringFreshnessReader: {
-      read: async () => structuredClone(readings.monitoring) as OpsMonitoringFreshnessReading,
+      readMonitoringFreshness: async () => structuredClone(readings.monitoring) as OpsMonitoringFreshnessReading,
     },
     alertStateReader: {
       read: async () => structuredClone(readings.alerts) as OpsAlertStateReading,
     },
     serviceAvailabilityReader: {
-      read: async () => structuredClone(readings.service) as OpsServiceAvailabilityReading,
+      readServiceAvailability: async () => structuredClone(readings.service) as OpsServiceAvailabilityReading,
     },
   });
 }
@@ -110,7 +111,7 @@ describe("package-owned ops availability done check", () => {
       const result = await run(readings);
       assert.equal(result.result, "NOT_READY");
       assert.equal(result.components[0].outcome, "NOT_READY");
-      assert.equal(result.nextCheckAt, ONE_MINUTE_LATER);
+      assert.equal(result.nextCheckAt, null);
     }
 
     const staleAlertQuery = healthyReadings();
@@ -118,7 +119,9 @@ describe("package-owned ops availability done check", () => {
       observedAt: "2026-07-19T11:58:59.999Z",
       status: "RESOLVED",
     };
-    assert.equal((await run(staleAlertQuery)).result, "NOT_READY");
+    const staleAlertResult = await run(staleAlertQuery);
+    assert.equal(staleAlertResult.result, "NOT_READY");
+    assert.equal(staleAlertResult.nextCheckAt, ONE_MINUTE_LATER);
 
     const staleServiceObservation = healthyReadings();
     staleServiceObservation.service = {
@@ -126,7 +129,9 @@ describe("package-owned ops availability done check", () => {
       status: "HEALTHY",
       healthySince: SIX_MINUTES_AGO,
     };
-    assert.equal((await run(staleServiceObservation)).result, "NOT_READY");
+    const staleServiceResult = await run(staleServiceObservation);
+    assert.equal(staleServiceResult.result, "NOT_READY");
+    assert.equal(staleServiceResult.nextCheckAt, null);
   });
 
   it("defers a fresh firing alert and schedules passive convergence", async () => {
@@ -166,10 +171,10 @@ describe("package-owned ops availability done check", () => {
   it("maps reader failures to QUERY_ERROR and malformed output to VERIFIER_INVALID", async () => {
     const queryFailure = createOpsAvailabilityDoneCheckRegistry({
       clock: () => new Date(NOW),
-      monitoringFreshnessReader: { read: async () => { throw new Error("offline"); } },
+      monitoringFreshnessReader: { readMonitoringFreshness: async () => { throw new Error("offline"); } },
       alertStateReader: { read: async () => healthyReadings().alerts as OpsAlertStateReading },
       serviceAvailabilityReader: {
-        read: async () => healthyReadings().service as OpsServiceAvailabilityReading,
+        readServiceAvailability: async () => healthyReadings().service as OpsServiceAvailabilityReading,
       },
     });
     const queryResult = await queryFailure.run(
@@ -192,13 +197,34 @@ describe("package-owned ops availability done check", () => {
     }
   });
 
+  it("fails through the typed query path when the trusted clock is invalid", async () => {
+    const checks = createOpsAvailabilityDoneCheckRegistry({
+      clock: () => new Date(Number.NaN),
+      monitoringFreshnessReader: {
+        readMonitoringFreshness: async () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
+      },
+      alertStateReader: {
+        read: async () => healthyReadings().alerts as OpsAlertStateReading,
+      },
+      serviceAvailabilityReader: {
+        readServiceAvailability: async () => healthyReadings().service as OpsServiceAvailabilityReading,
+      },
+    });
+    const result = await checks.run(
+      { name: OPS_AVAILABILITY_DONE_CHECK_NAME, params: PARAMS },
+      { taskId: "invalid-clock", checkedAt: NOW, now: () => new Date(NOW) },
+    );
+    assert.equal(result.result, "QUERY_ERROR");
+    assert.equal(result.components.every((component) => component.outcome === "QUERY_ERROR"), true);
+  });
+
   it("accepts only the bounded closed invariant parameter", async () => {
     let calls = 0;
     const checks = createOpsAvailabilityDoneCheckRegistry({
       clock: () => new Date(NOW),
-      monitoringFreshnessReader: { read: async () => { calls += 1; return healthyReadings().monitoring as OpsMonitoringFreshnessReading; } },
+      monitoringFreshnessReader: { readMonitoringFreshness: async () => { calls += 1; return healthyReadings().monitoring as OpsMonitoringFreshnessReading; } },
       alertStateReader: { read: async () => { calls += 1; return healthyReadings().alerts as OpsAlertStateReading; } },
-      serviceAvailabilityReader: { read: async () => { calls += 1; return healthyReadings().service as OpsServiceAvailabilityReading; } },
+      serviceAvailabilityReader: { readServiceAvailability: async () => { calls += 1; return healthyReadings().service as OpsServiceAvailabilityReading; } },
     });
     for (const params of [
       {},
@@ -238,6 +264,47 @@ function prometheusVector(value: Array<{ at: number; value: string }>): unknown 
   };
 }
 
+function prometheusMatrix(
+  series: Array<{
+    labels?: Record<string, string>;
+    values: Array<{ at: number; value: string }>;
+  }>,
+): unknown {
+  return {
+    status: "success",
+    data: {
+      resultType: "matrix",
+      result: series.map((entry) => ({
+        metric: entry.labels ?? { job: "minime-bot" },
+        values: entry.values.map((sample) => [sample.at, sample.value]),
+      })),
+    },
+  };
+}
+
+const ALERT_CORRELATION_KEY = `fixture:group:${"a".repeat(64)}`;
+const ALERT_CORRELATION_EVIDENCE: OpsWorkerEvidence[] = [{
+  at: NOW,
+  kind: "alert",
+  trust: "untrusted",
+  summary: JSON.stringify({
+    type: "alertmanager-group-correlation-v1",
+    correlationKey: ALERT_CORRELATION_KEY,
+    groupLabels: { alertname: "MinimeBotUnavailable", instance: "local" },
+  }),
+  artifact: null,
+}];
+
+function readerContext(): OpsAvailabilityReaderContext {
+  return {
+    signal: new AbortController().signal,
+    taskId: "ops-availability-fixture",
+    sourceKind: "alertmanager",
+    sourceCorrelationKey: ALERT_CORRELATION_KEY,
+    sourceEvidence: ALERT_CORRELATION_EVIDENCE,
+  };
+}
+
 describe("bounded loopback availability readers", () => {
   it("queries Alertmanager and Prometheus through injected fetch only", async () => {
     const alertRequests: string[] = [];
@@ -250,18 +317,24 @@ describe("bounded loopback availability readers", () => {
     );
     const alerts = await alertReader.read(
       OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-      { signal: new AbortController().signal },
+      readerContext(),
     );
     assert.equal(alerts.status, "RESOLVED");
     assert.equal(alertRequests.length, 1);
     assert.match(alertRequests[0], /^http:\/\/127\.0\.0\.1:9093\/api\/v2\/alerts\?/);
-    assert.match(alertRequests[0], /MinimeBotMetricsDown/);
+    assert.doesNotMatch(alertRequests[0], /filter=/);
 
     const queries: string[] = [];
     const responses = [
       prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
       prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
-      prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]),
+      prometheusMatrix([{
+        values: Array.from({ length: 21 }, (_, index) => ({
+          at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
+            + index * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+          value: "1",
+        })),
+      }]),
     ];
     const prometheus = new OpsPrometheusHttpReader(
       "http://[::1]:9090",
@@ -274,11 +347,11 @@ describe("bounded loopback availability readers", () => {
     );
     const monitoring = await prometheus.readMonitoringFreshness(
       OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-      { signal: new AbortController().signal },
+      readerContext(),
     );
     const service = await prometheus.readServiceAvailability(
       OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-      { signal: new AbortController().signal },
+      readerContext(),
     );
     assert.equal(monitoring.latestSampleAt, NOW);
     assert.equal(service.status, "HEALTHY");
@@ -287,7 +360,8 @@ describe("bounded loopback availability readers", () => {
       OPS_AVAILABILITY_LIMITS.stabilityWindowMs,
     );
     assert.equal(queries.length, 3);
-    assert.equal(queries.every((query) => query.startsWith("http://[::1]:9090/api/v1/query?")), true);
+    assert.equal(queries.filter((query) => query.includes("/api/v1/query?")).length, 2);
+    assert.equal(queries.filter((query) => query.includes("/api/v1/query_range?")).length, 1);
   });
 
   it("rejects remote endpoints and strict HTTP/JSON contract violations without retrying", async () => {
@@ -314,10 +388,92 @@ describe("bounded loopback availability readers", () => {
       );
       await assert.rejects(
         reader.read(OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT, {
-          signal: new AbortController().signal,
+          ...readerContext(),
         }),
       );
       assert.equal(calls, 1);
+    }
+  });
+
+  it("matches only the task's correlated Alertmanager group, including suppressed alerts", async () => {
+    const reader = new OpsAlertmanagerHttpReader(
+      "http://127.0.0.1:9093",
+      async () => jsonResponse([
+        {
+          labels: { alertname: "OtherAlert", instance: "other" },
+          status: { state: "active" },
+        },
+        {
+          labels: { alertname: "MinimeBotUnavailable", instance: "local" },
+          status: { state: "suppressed" },
+        },
+      ]),
+    );
+    const firing = await reader.read(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    );
+    assert.equal(firing.status, "FIRING");
+
+    const unrelated = new OpsAlertmanagerHttpReader(
+      "http://127.0.0.1:9093",
+      async () => jsonResponse([{
+        labels: { alertname: "MinimeBotUnavailable", instance: "different" },
+        status: { state: "active" },
+      }]),
+    );
+    assert.equal((await unrelated.read(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    )).status, "RESOLVED");
+
+    const operatorReader = new OpsAlertmanagerHttpReader(
+      "http://127.0.0.1:9093",
+      async () => jsonResponse([{
+        labels: { alertname: "MinimeBotMetricsDown", instance: "local" },
+        status: { state: "active" },
+      }]),
+    );
+    assert.equal((await operatorReader.read(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      {
+        signal: new AbortController().signal,
+        taskId: "operator-availability-fixture",
+        sourceKind: "operator-cli",
+      },
+    )).status, "FIRING");
+  });
+
+  it("requires identical series and a complete fixed-step stability window", async () => {
+    const direct = prometheusVector([{ at: Date.parse(NOW) / 1_000, value: "1" }]);
+    for (const matrix of [
+      prometheusMatrix([{
+        labels: { job: "minime-bot", instance: "replacement" },
+        values: Array.from({ length: 21 }, (_, index) => ({
+          at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
+            + index * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+          value: "1",
+        })),
+      }]),
+      prometheusMatrix([{
+        values: Array.from({ length: 20 }, (_, index) => ({
+          at: (Date.parse(NOW) - OPS_AVAILABILITY_LIMITS.stabilityWindowMs) / 1_000
+            + (index + 1) * OPS_AVAILABILITY_LIMITS.prometheusStabilityStepSeconds,
+          value: "1",
+        })),
+      }]),
+    ]) {
+      const responses = [direct, matrix];
+      const reader = new OpsPrometheusHttpReader(
+        "http://127.0.0.1:9090",
+        async () => jsonResponse(responses.shift()),
+      );
+      const reading = await reader.readServiceAvailability(
+        OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+        readerContext(),
+      );
+      assert.equal(reading.status, "HEALTHY");
+      assert.equal(reading.healthySince, reading.observedAt);
     }
   });
 });

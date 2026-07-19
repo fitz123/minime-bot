@@ -40,7 +40,7 @@ describe("ops worker Telegram control ledger", () => {
     assert.equal(ledger.nextOffset(), undefined);
     assert.equal(existsSync(ledger.ledgerPath), false);
 
-    const recorded = ledger.recordProcessedUpdate(41, fingerprint(41));
+    const recorded = ledger.record(41, fingerprint(41));
 
     assert.equal(recorded.recorded, true);
     assert.equal(recorded.replayed, false);

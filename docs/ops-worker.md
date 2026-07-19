@@ -59,7 +59,9 @@ minime-bot worker cancel --state-dir "$STATE_DIR" --id <task-id> --reason <reaso
 ```
 
 `worker start --once` performs at most one eligible scheduler action and exits.
-Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
+When `--control-config` is also present, it then performs exactly one bounded
+Telegram control tick, including at most one terminal-report attempt, before
+exiting. Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
 invocation, model/tool flags, authorization scope, remediation budget, task
 priority, and source kind are not task-supplied CLI options.
 
@@ -140,7 +142,10 @@ reply:
 
 `tokenEnv` may be replaced by the pair `sopsFile` and `tokenSopsKey`;
 `bearerTokenEnv` may likewise be replaced by `sopsFile` and
-`bearerTokenSopsKey`. Secret values never belong in the YAML. Intake is
+`bearerTokenSopsKey`. Relative SOPS paths resolve from the control config's
+directory. The config itself must be a non-symlink regular file of at most 64
+KiB. The `poll` and `reply` sections are optional and use the defaults shown
+above when omitted. Secret values never belong in the YAML. Intake is
 optional, but when present its host must be `127.0.0.1` or `::1` and its port
 is also the status server port.
 
@@ -168,7 +173,8 @@ process group. Ambiguous ownership retains the task, interrupt, and global
 fence for startup reconciliation.
 
 Each control-loop tick sends at most one pending terminal report. Report sends
-use the fixed receipt boundary. A crash after send but before receipt finish
+use the fixed receipt boundary: fresh authorization is proved and the receipt
+is claimed before the Telegram send is attempted. A crash after send but before receipt finish
 requires a strictly newer external-state query and permits at-least-once
 redelivery; it never invents a false unsent or sent state.
 
@@ -329,6 +335,9 @@ Alertmanager and local CLI submissions, authorization profile
 `ops.host-availability`, and invariant `minime-bot-host`. The invariant fixes
 the host resource, objective, scopes, and composite parameters in package code.
 Alert payloads and task text cannot select probes or policy.
+The factory provides the closed Alertmanager authorization verifier only. A
+trusted embedding that enables `operator-cli` submission must separately
+register its own `operator-cli` verifier; startup otherwise fails closed.
 
 The `ops.minime-availability` composite requires three fresh components:
 
@@ -346,7 +355,16 @@ or an agent completion claim is insufficient. Reader exceptions remain
 passive/product convergence retain their existing distinct outcomes. The
 exported Alertmanager and Prometheus HTTP readers accept only explicit loopback
 base URLs and injected fetch implementations. They perform one bounded query,
-without retries or import-time construction.
+without retries or import-time construction. One composite evaluation makes one
+Prometheus instant query for freshness, one Alertmanager active-alert query, and
+one Prometheus instant query for direct service state. When every direct series
+is healthy, it makes one additional five-minute Prometheus range query. The
+Alertmanager query includes active suppressed alerts and filters the response by
+the exact group labels stored with the task's correlation evidence; unrelated
+active groups cannot hold the task open. For a trusted `operator-cli`
+availability task, the same reader uses the package-owned
+`alertname="MinimeBotMetricsDown"` invariant because there is no intake group
+descriptor.
 
 ## Custody, checkpoints, and receipts
 
@@ -436,9 +454,18 @@ constant-time matched bearer token. The 256 KiB body limit mirrors the native
 receiver. Firing episodes derive their delivery and correlation keys from the
 trusted source identity, group key, and episode start. Identical delivery or an
 already-active correlation replays the existing task; resolved-only groups do
-not create work. Alert labels and annotations are stored only as bounded
+not create work. A firing group must include non-empty group labels that fit the
+bounded correlation descriptor; intake rejects a group it could not later query
+exactly. Alert labels and annotations are stored only as bounded
 untrusted evidence. Responses expose only `ok`, `taskId`, and `replayed`, while
 authentication, media, syntax, method, and size failures use bounded typed JSON.
+
+Clients send `POST /intake/alertmanager` with `Authorization: Bearer <token>`
+and `Content-Type: application/json`; the body is the Alertmanager v4 webhook.
+A newly accepted firing episode returns HTTP 200 with
+`{"ok":true,"taskId":"<generated-id>","replayed":false}`. An identical or
+active-correlation replay returns the existing id with `replayed:true`.
+Resolved-only input returns `{"ok":true,"taskId":null,"replayed":false}`.
 
 ## Batched fake fault lab
 

@@ -312,6 +312,76 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(transport.messages.length, 1);
   });
 
+  it("converges multi-write commands when a crash follows their steering write", async (t) => {
+    const cases = [
+      { command: "pause", expectedState: "QUEUED", expectedPaused: true },
+      { command: "resume", expectedState: "QUEUED", expectedPaused: false },
+      { command: "retry", expectedState: "RESUMABLE", expectedPaused: false },
+      { command: "cancel", expectedState: "CANCELLED", expectedPaused: false },
+    ] as const;
+    for (const [index, expected] of cases.entries()) {
+      let armed = false;
+      const fixture = await harness(t, {
+        instanceId: `multi-write-${index}`,
+        faultInjector(point) {
+          if (armed && point === "after-snapshot-rename") {
+            armed = false;
+            throw new Error("synthetic crash after steering write");
+          }
+        },
+      });
+      const taskId = `task-multi-${index}`;
+      const task = makeTask(taskId);
+      if (expected.command.startsWith("resume")) task.control = {
+        paused: true,
+        pausedAt: NOW,
+        interrupt: null,
+      };
+      if (expected.command.startsWith("retry")) {
+        task.state = "BLOCKED";
+        task.custody = {
+          status: "RELEASED",
+          claimedAt: null,
+          releasedAt: NOW,
+          releaseReason: "BLOCKED",
+        };
+        task.rounds.remediation = task.rounds.maxRemediation;
+        task.lastOutcome = {
+          at: NOW,
+          kind: "OPERATOR",
+          result: "BLOCKED",
+          summary: "Fixture blocked before replay-safe retry.",
+        };
+        task.report.state = "PENDING";
+      }
+      fixture.store.create(task);
+      const transport = new FakeTelegramTransport();
+      const client = control(fixture, transport);
+      if (expected.command.startsWith("retry")) {
+        transport.updates.push([]);
+        await client.tick();
+      }
+      const command = update(
+        40 + index,
+        `/${expected.command} ${taskId}${expected.command === "cancel" ? " planned recovery" : ""}`,
+      );
+      transport.updates.push([command], [command]);
+      armed = true;
+
+      await assert.rejects(client.tick(), /synthetic crash after steering write/);
+      assert.equal(fixture.store.get(taskId)?.steering.length, 1);
+      assert.equal(fixture.ledger.nextOffset(), undefined);
+
+      await client.tick();
+      const converged = fixture.store.get(taskId);
+      assert.equal(converged?.steering.length, 1);
+      assert.equal(converged?.state, expected.expectedState);
+      assert.equal(converged?.control.paused, expected.expectedPaused);
+      assert.equal(fixture.ledger.nextOffset(), 41 + index);
+      fixture.close();
+    }
+  });
+
   it("retries transport failures with bounded backoff and never skips the durable offset", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
@@ -377,6 +447,19 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(fixture.ledger.nextOffset(), undefined);
   });
 
+  it("durably handles task ids outside the canonical store contract as malformed commands", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([update(29, "/task invalid.task")]);
+
+    await control(fixture, transport).tick();
+
+    assert.equal(fixture.ledger.nextOffset(), 30);
+    assert.equal(transport.messages.length, 1);
+    assert.match(String(transport.messages[0].text), /^Usage:/);
+  });
+
   it("implements bounded summaries and safe-boundary pause, resume, cancel, and retry", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
@@ -422,17 +505,9 @@ describe("ops worker dedicated Telegram control", () => {
   it("redelivers a report after a crash with a strictly newer receipt query", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-telegram-report-crash-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
-    let renameCount = 0;
-    let armed = false;
     const first = await harness(t, {
       directory,
       instanceId: "report-first",
-      faultInjector(point) {
-        if (armed && point === "after-snapshot-rename") {
-          renameCount += 1;
-          if (renameCount === 3) throw new Error("synthetic crash before receipt finish");
-        }
-      },
     });
     const pending = makeTask("task-report");
     pending.state = "CANCELLED";
@@ -452,9 +527,14 @@ describe("ops worker dedicated Telegram control", () => {
     first.store.create(pending);
     const transport = new FakeTelegramTransport();
     transport.updates.push([]);
-    armed = true;
-
-    await assert.rejects(control(first, transport).tick(), /synthetic crash before receipt finish/);
+    await assert.rejects(
+      control(first, transport, (point) => {
+        if (point === "after-report-send-before-receipt-finish") {
+          throw new Error("synthetic crash before receipt finish");
+        }
+      }).tick(),
+      /synthetic crash before receipt finish/,
+    );
     assert.match(String(transport.messages[0].text), /… \[truncated\]$/);
     const claimed = first.store.get("task-report")?.mutationReceipts.report;
     assert.ok(claimed?.mutationStartedAt);

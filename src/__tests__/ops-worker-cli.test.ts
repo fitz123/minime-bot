@@ -1282,7 +1282,7 @@ reply:
       },
       clock: () => new Date("2026-07-19T10:00:00.000Z"),
       monitoringFreshnessReader: {
-        read: () => ({
+        readMonitoringFreshness: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",
           latestSampleAt: "2026-07-19T10:00:00.000Z",
         } satisfies OpsMonitoringFreshnessReading),
@@ -1294,7 +1294,7 @@ reply:
         } satisfies OpsAlertStateReading),
       },
       serviceAvailabilityReader: {
-        read: () => ({
+        readServiceAvailability: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",
           status: "HEALTHY",
           healthySince: "2026-07-19T09:50:00.000Z",

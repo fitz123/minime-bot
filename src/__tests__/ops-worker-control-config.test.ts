@@ -106,6 +106,9 @@ reply:
       [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  controlChatId: "1"\n  operatorIds: ["1"]\nintake:\n  host: 0.0.0.0\n  port: 9466\n  bearerTokenEnv: TEST_INTAKE_TOKEN\n  sourceIdentity: lab-alertmanager\n`, /intake.host must be 127\.0\.0\.1 or ::1/],
       [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  sopsFile: ./secret.yaml\n  tokenSopsKey: telegram.token\n  controlChatId: "1"\n  operatorIds: ["1"]\n`, /exactly one token source/],
       [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  controlChatId: "1"\n  operatorIds: ["1"]\npoll:\n  longPollSeconds: 50\n  requestTimeoutMs: 1000\n`, /requestTimeoutMs must exceed/],
+      [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  controlChatId: "9007199254740992"\n  operatorIds: ["1"]\n`, /canonical safe Telegram integer id/],
+      [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  controlChatId: "-0"\n  operatorIds: ["1"]\n`, /canonical safe Telegram integer id/],
+      [`telegram:\n  tokenEnv: TEST_OPS_TOKEN\n  controlChatId: "1"\n  operatorIds: ["9007199254740992"]\n`, /canonical safe Telegram integer id/],
     ] as const;
 
     for (const [yaml, expected] of invalid) {

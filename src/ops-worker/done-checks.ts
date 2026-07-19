@@ -4,8 +4,10 @@ import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_VERIFICATION_OUTCOMES,
   type JsonObject,
+  type OpsWorkerEvidence,
   type OpsWorkerDoneCheck,
   type OpsWorkerDoneCheckContract,
+  type OpsWorkerSourceKind,
   type OpsWorkerVerificationComponentEvidence,
   type OpsWorkerVerificationConvergenceKind,
   type OpsWorkerVerificationOutcome,
@@ -37,6 +39,9 @@ export interface OpsWorkerDoneCheckContext {
   signal: AbortSignal;
   taskId: string;
   checkedAt: string;
+  sourceKind?: OpsWorkerSourceKind;
+  sourceCorrelationKey?: string;
+  sourceEvidence?: readonly OpsWorkerEvidence[];
 }
 
 export interface OpsWorkerDoneCheckComponentDefinition {
