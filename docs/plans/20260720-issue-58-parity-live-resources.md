@@ -22,17 +22,17 @@ The change remains fail-closed for ordinary symlinks, arbitrary generated-direct
 
 ### Task 1: Exclude only bounded generated Python directories from skill snapshots
 
-- [x] Add regression tests for `.venv` symlink/directory, nested `__pycache__`, and `.pytest_cache` exclusion; exact-name near misses must remain included, and an ordinary nested symlink must still fail.
-- [x] Add the skill-only exact-name traversal exclusion and prove source/copy identities match while excluded entries are absent from prepared snapshots.
-- [x] Run the focused parity test and commit the logical unit.
+- [ ] Add regression tests for `.venv` symlink/directory, nested `__pycache__`, and `.pytest_cache` exclusion; exact-name near misses must remain included, and an ordinary nested symlink must still fail.
+- [ ] Add the skill-only exact-name traversal exclusion and prove source/copy identities match while excluded entries are absent from prepared snapshots.
+- [ ] Run the focused parity test and commit the logical unit.
 
 ### Task 2: Attest and execute the configured extension from a contained package layout
 
-- [x] Add focused tests for the exact accepted graph (`node:vm`, manifest-covered `acorn`, `globalThis.navigator`, inert `process:` key) and for rejection of unlisted/subpath imports, missing manifest coverage, unsafe aliases, computed access, object shorthand, computed keys, and loader-property access.
-- [x] Implement the exact allowlist/AST changes and fail-closed `acorn` package-entry/package-metadata manifest coverage in `src/pi-primary-resources.ts`.
-- [x] Preserve a hoisted `node_modules` segment when copying extension snapshots in `src/ops-worker/parity.ts`; test actual Jiti loading from the copied `acorn` package after the live fixture changes, with no ambient resolution.
-- [x] Add the Unreleased changelog entry; run focused parity/attempt/CLI tests and then the repository validation contract: `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, and minimal-workspace validation. Run configured gitleaks, public-safety/identity checks, and verify the Ralphex diffstat equals `git diff --stat main...HEAD`.
-- [x] Commit the logical unit and leave a clean branch ready for the supervisor-owned PR/release cycle.
+- [ ] Add focused tests for the exact accepted graph (`node:vm`, manifest-covered `acorn`, `globalThis.navigator`, inert `process:` key) and for rejection of unlisted/subpath imports, missing manifest coverage, unsafe aliases, computed access, object shorthand, computed keys, and loader-property access.
+- [ ] Implement the exact allowlist/AST changes and fail-closed `acorn` package-entry/package-metadata manifest coverage in `src/pi-primary-resources.ts`.
+- [ ] Preserve a hoisted `node_modules` segment when copying extension snapshots in `src/ops-worker/parity.ts`; test actual Jiti loading from the copied `acorn` package after the live fixture changes, with no ambient resolution.
+- [ ] Add the Unreleased changelog entry; run focused parity/attempt/CLI tests and then the repository validation contract: `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, and minimal-workspace validation. Run configured gitleaks, public-safety/identity checks, and verify the Ralphex diffstat equals `git diff --stat main...HEAD`.
+- [ ] Commit the logical unit and leave a clean branch ready for the supervisor-owned PR/release cycle.
 
 ## Post-implementation gates
 
