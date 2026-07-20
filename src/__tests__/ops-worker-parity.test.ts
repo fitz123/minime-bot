@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -30,6 +30,7 @@ import { CODEX_QUOTA_ATTEMPT_FILE_ENV } from "../pi-extensions/codex-usage.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   createPiExtensionResourceSnapshot,
+  createPiSkillResourceSnapshot,
   piResourceIdentity,
   resolveOpsWorkerParityExtensionPath,
   resolvePiPrimaryResourceContract,
@@ -183,11 +184,52 @@ describe("primary Pi resource contract", () => {
       extensionOptions: { ...base.extensionOptions, extraExtensions: [targetExtension] },
     }), /require explicit non-module resource manifests/);
 
-    symlinkSync(targetExtension, join(dirname(targetSkill), "linked-resource"));
+    const nestedSkillDirectory = join(dirname(targetSkill), "nested");
+    mkdirSync(nestedSkillDirectory);
+    symlinkSync(targetExtension, join(nestedSkillDirectory, "linked-resource"));
     assert.throws(
       () => resolvePiPrimaryResourceContract(base),
       /must not contain symlinks/,
     );
+  });
+
+  it("excludes only exact generated Python directory names from skill snapshots", () => {
+    const root = tempDirectory();
+    const skill = writeFixtureSkill(root, "python-skill", "# Generic Python skill\n");
+    const skillRoot = dirname(skill);
+    const ignoredEnvironment = join(root, "ignored-python-environment");
+    mkdirSync(ignoredEnvironment);
+    writeFileSync(join(ignoredEnvironment, "external.py"), "IGNORED_VENV\n", "utf8");
+    symlinkSync(ignoredEnvironment, join(skillRoot, ".venv"), "dir");
+
+    const ignoredPaths = [
+      join(skillRoot, "nested", ".venv", "environment.py"),
+      join(skillRoot, "nested", "__pycache__", "module.pyc"),
+      join(skillRoot, ".pytest_cache", "state"),
+    ];
+    const includedPaths = [
+      join(skillRoot, ".venv-copy", "environment.py"),
+      join(skillRoot, "nested", "__pycache__-saved", "module.pyc"),
+      join(skillRoot, ".pytest_cache.old", "state"),
+    ];
+    for (const path of [...ignoredPaths, ...includedPaths]) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${relative(skillRoot, path)}\n`, "utf8");
+    }
+
+    const snapshot = createPiSkillResourceSnapshot(skill);
+    const snapshotPaths = snapshot.files.map((file) => relative(snapshot.rootPath, file.path));
+
+    assert.equal(snapshotPaths.includes("SKILL.md"), true);
+    assert.equal(snapshotPaths.some((path) => path === ".venv" || path.startsWith(".venv/")), false);
+    assert.equal(snapshotPaths.some((path) => path.includes("/.venv/")), false);
+    assert.equal(snapshotPaths.some((path) => path === ".pytest_cache" || path.startsWith(".pytest_cache/")), false);
+    assert.equal(snapshotPaths.some((path) => path.includes("/__pycache__/")), false);
+    assert.deepEqual(
+      includedPaths.map((path) => snapshotPaths.includes(relative(skillRoot, path))),
+      [true, true, true],
+    );
+    assert.equal(piResourceIdentity("skill", skill), snapshot.identity);
   });
 
   it("binds extension and skill identities to the selected entrypoint", () => {
@@ -818,13 +860,26 @@ describe("ops-worker before-provider parity attestation", () => {
     const scriptPath = join(skillRoot, "scripts", "inspect.sh");
     const referencePath = join(skillRoot, "references", "guide.md");
     const assetPath = join(skillRoot, "assets", "fixture.txt");
+    const ignoredEnvironment = join(root, "ignored-python-environment");
+    const ignoredCachePath = join(skillRoot, "nested", "__pycache__", "module.pyc");
+    const ignoredPytestPath = join(skillRoot, ".pytest_cache", "state");
+    const includedNearMissPath = join(skillRoot, ".pytest_cache.old", "state");
     mkdirSync(dirname(scriptPath), { recursive: true });
     mkdirSync(dirname(referencePath), { recursive: true });
     mkdirSync(dirname(assetPath), { recursive: true });
+    mkdirSync(ignoredEnvironment);
+    writeFileSync(join(ignoredEnvironment, "external.py"), "IGNORED_VENV\n", "utf8");
+    symlinkSync(ignoredEnvironment, join(skillRoot, ".venv"), "dir");
+    mkdirSync(dirname(ignoredCachePath), { recursive: true });
+    mkdirSync(dirname(ignoredPytestPath), { recursive: true });
+    mkdirSync(dirname(includedNearMissPath), { recursive: true });
     writeFileSync(scriptPath, "#!/bin/sh\nprintf 'skill package'\n", "utf8");
     chmodSync(scriptPath, 0o700);
     writeFileSync(referencePath, "PINNED_REFERENCE\n", "utf8");
     writeFileSync(assetPath, "PINNED_ASSET\n", "utf8");
+    writeFileSync(ignoredCachePath, "IGNORED_CACHE\n", "utf8");
+    writeFileSync(ignoredPytestPath, "IGNORED_PYTEST\n", "utf8");
+    writeFileSync(includedNearMissPath, "PINNED_NEAR_MISS\n", "utf8");
     writeFileSync(extension, "export default function extension() {}\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
@@ -863,6 +918,13 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.equal(
       readFileSync(join(privateSkillRoot, "assets", "fixture.txt"), "utf8"),
       "PINNED_ASSET\n",
+    );
+    assert.equal(existsSync(join(privateSkillRoot, ".venv")), false);
+    assert.equal(existsSync(join(privateSkillRoot, "nested", "__pycache__")), false);
+    assert.equal(existsSync(join(privateSkillRoot, ".pytest_cache")), false);
+    assert.equal(
+      readFileSync(join(privateSkillRoot, ".pytest_cache.old", "state"), "utf8"),
+      "PINNED_NEAR_MISS\n",
     );
     assert.notEqual(statSync(join(privateSkillRoot, "scripts", "inspect.sh")).mode & 0o111, 0);
     assert.equal(

@@ -22,9 +22,9 @@ The change remains fail-closed for ordinary symlinks, arbitrary generated-direct
 
 ### Task 1: Exclude only bounded generated Python directories from skill snapshots
 
-- [ ] Add regression tests for `.venv` symlink/directory, nested `__pycache__`, and `.pytest_cache` exclusion; exact-name near misses must remain included, and an ordinary nested symlink must still fail.
-- [ ] Add the skill-only exact-name traversal exclusion and prove source/copy identities match while excluded entries are absent from prepared snapshots.
-- [ ] Run the focused parity test and commit the logical unit.
+- [x] Add regression tests for `.venv` symlink/directory, nested `__pycache__`, and `.pytest_cache` exclusion; exact-name near misses must remain included, and an ordinary nested symlink must still fail.
+- [x] Add the skill-only exact-name traversal exclusion and prove source/copy identities match while excluded entries are absent from prepared snapshots.
+- [x] Run the focused parity test and commit the logical unit.
 
 ### Task 2: Attest and execute the configured extension from a contained package layout
 

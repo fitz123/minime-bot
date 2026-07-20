@@ -45,6 +45,11 @@ const MAX_EXTENSION_RESOURCE_FILES = 2_048;
 const MAX_EXTENSION_RESOURCE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXTENSION_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_RESOURCE_DIRECTORIES = 2_048;
+const SKILL_GENERATED_DIRECTORY_NAMES = new Set([
+  ".venv",
+  ".pytest_cache",
+  "__pycache__",
+]);
 export const PI_EXTENSION_JITI_EXTENSIONS = [
   ".js",
   ".mjs",
@@ -447,6 +452,7 @@ function strictTrustedDirectory(path: string, label: string): string {
 function trustedDirectoryResourcePaths(
   rootPath: string,
   label: string,
+  excludedEntryNames: ReadonlySet<string> = new Set(),
 ): Array<{ path: string; executable: boolean }> {
   const root = strictTrustedDirectory(rootPath, label);
   const pending = [root];
@@ -461,6 +467,7 @@ function trustedDirectoryResourcePaths(
     const entries = readdirSync(directory, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      if (excludedEntryNames.has(entry.name)) continue;
       const path = join(directory, entry.name);
       const direct = lstatSync(path);
       if (direct.isSymbolicLink()) {
@@ -613,7 +620,11 @@ export function createPiExtensionResourceSnapshot(
 export function createPiSkillResourceSnapshot(path: string): PiSkillResourceSnapshot {
   const skillPath = strictTrustedFile(path, "Pi skill resource");
   const rootPath = strictTrustedDirectory(dirname(skillPath), "Pi skill root");
-  const resourcePaths = trustedDirectoryResourcePaths(rootPath, "Pi skill package");
+  const resourcePaths = trustedDirectoryResourcePaths(
+    rootPath,
+    "Pi skill package",
+    SKILL_GENERATED_DIRECTORY_NAMES,
+  );
   const files: PiSkillResourceFile[] = [];
   let totalBytes = 0;
   for (const resource of resourcePaths) {
