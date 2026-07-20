@@ -2,10 +2,11 @@
 
 ## Unreleased
 
-- Add continuous authorization verification, primary context/capability parity
-  attestation, authoritative quota admission and reset-aware probes, typed
-  composite verification, schema v4 migration, and bounded policy status to the
-  inactive-by-default ops-worker.
+## 2026.7.19
+
+- Extend the default Ask Agent child deadline to avoid false timeout failures (#99, #100).
+- Add and harden inactive-by-default ops-worker lifecycle custody, continuous authorization, primary context/capability parity, quota admission, typed verification, and schema v4 migration (#58, #101, #102).
+- Add durable operator steering and controls, authenticated Alertmanager intake, package-owned availability contracts, reliable Telegram reporting, and the deterministic ADR-099 fault lab (#58, #104).
 
 ## 2026.7.18
 
