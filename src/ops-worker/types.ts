@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-export const OPS_WORKER_TASK_SCHEMA_VERSION = 4 as const;
+export const OPS_WORKER_TASK_SCHEMA_VERSION = 5 as const;
+export const OPS_WORKER_TASK_V4_SCHEMA_VERSION = 4 as const;
 export const OPS_WORKER_TASK_V3_SCHEMA_VERSION = 3 as const;
 export const OPS_WORKER_TASK_V2_SCHEMA_VERSION = 2 as const;
 export const OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION = 1 as const;
@@ -117,6 +118,20 @@ export type OpsWorkerOutcomeResult =
 export const OPS_WORKER_REPORT_STATES = ["NONE", "PENDING", "SENT"] as const;
 
 export type OpsWorkerReportState = (typeof OPS_WORKER_REPORT_STATES)[number];
+
+export const OPS_WORKER_STEERING_KINDS = [
+  "correction",
+  "answer",
+  "pause",
+  "resume",
+  "cancel",
+] as const;
+
+export type OpsWorkerSteeringKind = (typeof OPS_WORKER_STEERING_KINDS)[number];
+
+export const OPS_WORKER_INTERRUPT_MODES = ["pause", "cancel"] as const;
+
+export type OpsWorkerInterruptMode = (typeof OPS_WORKER_INTERRUPT_MODES)[number];
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -433,6 +448,37 @@ export interface OpsWorkerLegacyCompletion {
   sourceSchemaVersion: 1 | 2 | 3;
 }
 
+export interface OpsWorkerSteeringEntry {
+  steeringId: string;
+  receivedAt: string;
+  kind: OpsWorkerSteeringKind;
+  operatorRef: string;
+  /** Bounded opaque operator data. It is never parsed as executable configuration. */
+  text: string;
+  consumedAt: string | null;
+}
+
+export interface OpsWorkerInterrupt {
+  requestedAt: string;
+  mode: OpsWorkerInterruptMode;
+  /** Bounded opaque operator data. It is never parsed as executable configuration. */
+  reason: string;
+}
+
+export interface OpsWorkerControl {
+  paused: boolean;
+  pausedAt: string | null;
+  interrupt: OpsWorkerInterrupt | null;
+}
+
+export function createEmptyOpsWorkerControl(): OpsWorkerControl {
+  return {
+    paused: false,
+    pausedAt: null,
+    interrupt: null,
+  };
+}
+
 export interface OpsWorkerTask {
   schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
   id: string;
@@ -451,6 +497,8 @@ export interface OpsWorkerTask {
   authorizationVerification: OpsWorkerAuthorizationVerification | null;
   verification: OpsWorkerVerificationRecord | null;
   legacyCompletion: OpsWorkerLegacyCompletion | null;
+  steering: OpsWorkerSteeringEntry[];
+  control: OpsWorkerControl;
   state: OpsWorkerTaskState;
   rounds: OpsWorkerRounds;
   schedule: OpsWorkerSchedule;
@@ -557,8 +605,18 @@ export function hashOpsWorkerVerificationSubject(
     | "submissionFingerprint"
     | "authorization"
     | "authorizationVerification"
+    | "steering"
   >,
 ): string {
+  const pendingSteering = task.steering
+    .filter((entry) => entry.consumedAt === null)
+    .map(({ steeringId, receivedAt, kind, operatorRef, text }) => ({
+      steeringId,
+      receivedAt,
+      kind,
+      operatorRef,
+      text,
+    }));
   const canonical = stableJson({
     source: task.source,
     resource: task.resource,
@@ -592,6 +650,9 @@ export function hashOpsWorkerVerificationSubject(
         status: task.authorizationVerification.status,
         evidenceHash: task.authorizationVerification.evidenceHash,
       },
+    // Keep the empty case byte-identical to the v4 verification subject so
+    // exact v4 PASS snapshots remain valid during pure read migration.
+    ...(pendingSteering.length === 0 ? {} : { pendingSteering }),
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -609,6 +670,8 @@ export type OpsWorkerTaskV1 = Omit<
   | "authorizationVerification"
   | "verification"
   | "legacyCompletion"
+  | "steering"
+  | "control"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
@@ -621,6 +684,8 @@ export type OpsWorkerTaskV2 = Omit<
   | "authorizationVerification"
   | "verification"
   | "legacyCompletion"
+  | "steering"
+  | "control"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V2_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
@@ -628,10 +693,22 @@ export type OpsWorkerTaskV2 = Omit<
 
 export type OpsWorkerTaskV3 = Omit<
   OpsWorkerTask,
-  "schemaVersion" | "lifecycle" | "verification" | "legacyCompletion"
+  | "schemaVersion"
+  | "lifecycle"
+  | "verification"
+  | "legacyCompletion"
+  | "steering"
+  | "control"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V3_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
+};
+
+export type OpsWorkerTaskV4 = Omit<
+  OpsWorkerTask,
+  "schemaVersion" | "steering" | "control"
+> & {
+  schemaVersion: typeof OPS_WORKER_TASK_V4_SCHEMA_VERSION;
 };
 
 export interface OpsWorkerTemplateContract {
@@ -662,11 +739,15 @@ export interface OpsWorkerTaskContractRegistry {
 
 export const OPS_WORKER_LIMITS = {
   maxLegacySnapshotBytes: 256 * 1024,
-  maxSnapshotBytes: 512 * 1024,
+  maxPreV5SnapshotBytes: 512 * 1024,
+  maxSnapshotBytes: 513 * 1024,
+  /** Space retained after steering admission for bounded lifecycle and verification growth. */
+  minRuntimeMutationHeadroomBytes: 256 * 1024,
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
   maxOutcomeSummaryBytes: 4 * 1024,
+  maxReportAttempts: 1_000,
   maxReportErrorBytes: 2 * 1024,
   maxDeliveryKeyBytes: 256,
   maxResourceKeyBytes: 256,
@@ -683,7 +764,41 @@ export const OPS_WORKER_LIMITS = {
   maxVerificationComponents: 32,
   maxVerificationComponentSummaryBytes: 1024,
   maxVerificationSummaryBytes: 4 * 1024,
+  maxSteeringEntries: 64,
+  maxSteeringIdBytes: 256,
+  maxSteeringOperatorRefBytes: 256,
+  maxSteeringTextBytes: 8 * 1024,
+  maxPendingSteeringPromptBytes: 64 * 1024,
+  maxInterruptReasonBytes: 4 * 1024,
 } as const;
+
+export interface SerializedOpsWorkerPendingSteering {
+  text: string;
+  steeringIds: string[];
+}
+
+/** Serialize every pending prompt-relevant steering entry using the launch wire format. */
+export function serializeOpsWorkerPendingSteering(
+  entries: readonly OpsWorkerSteeringEntry[],
+): SerializedOpsWorkerPendingSteering {
+  const steeringIds: string[] = [];
+  const lines: string[] = [];
+  for (const entry of entries) {
+    if (
+      entry.consumedAt !== null
+      || (entry.kind !== "correction" && entry.kind !== "answer")
+    ) continue;
+    lines.push(JSON.stringify({
+      steeringId: entry.steeringId,
+      receivedAt: entry.receivedAt,
+      kind: entry.kind,
+      operatorRef: entry.operatorRef,
+      text: entry.text,
+    }));
+    steeringIds.push(entry.steeringId);
+  }
+  return { text: lines.join("\n"), steeringIds };
+}
 
 const V1_TASK_KEYS = [
   "schemaVersion",
@@ -739,11 +854,18 @@ const V3_TASK_KEYS = [
   ...V2_TASK_KEYS.slice(V2_TASK_KEYS.indexOf("state")),
 ] as const;
 
-const TASK_KEYS = [
+const V4_TASK_KEYS = [
   ...V3_TASK_KEYS.slice(0, V3_TASK_KEYS.indexOf("state")),
   "verification",
   "legacyCompletion",
   ...V3_TASK_KEYS.slice(V3_TASK_KEYS.indexOf("state")),
+] as const;
+
+const TASK_KEYS = [
+  ...V4_TASK_KEYS.slice(0, V4_TASK_KEYS.indexOf("state")),
+  "steering",
+  "control",
+  ...V4_TASK_KEYS.slice(V4_TASK_KEYS.indexOf("state")),
 ] as const;
 
 const TASK_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -922,6 +1044,114 @@ function expectTimestamp(value: unknown, path: string): string {
 
 function expectOptionalTimestamp(value: unknown, path: string): string | null {
   return value === null ? null : expectTimestamp(value, path);
+}
+
+function parseSteering(value: unknown): OpsWorkerSteeringEntry[] {
+  const entries = expectDensePlainArray(value, "task.steering");
+  if (entries.length > OPS_WORKER_LIMITS.maxSteeringEntries) {
+    fail(
+      "task.steering",
+      `must contain at most ${OPS_WORKER_LIMITS.maxSteeringEntries} entries`,
+    );
+  }
+  const steeringIds = new Set<string>();
+  const parsed = entries.map((entryValue, index) => {
+    const path = `task.steering[${index}]`;
+    const entry = expectObject(entryValue, path);
+    expectExactKeys(
+      entry,
+      ["steeringId", "receivedAt", "kind", "operatorRef", "text", "consumedAt"],
+      path,
+    );
+    const steeringId = expectBoundedText(
+      entry.steeringId,
+      `${path}.steeringId`,
+      OPS_WORKER_LIMITS.maxSteeringIdBytes,
+    );
+    if (!CORRELATION_KEY_PATTERN.test(steeringId)) {
+      fail(`${path}.steeringId`, "must use only registered identity punctuation");
+    }
+    if (steeringIds.has(steeringId)) {
+      fail(`${path}.steeringId`, "must be unique within the task");
+    }
+    steeringIds.add(steeringId);
+    const receivedAt = expectTimestamp(entry.receivedAt, `${path}.receivedAt`);
+    const consumedAt = expectOptionalTimestamp(entry.consumedAt, `${path}.consumedAt`);
+    if (consumedAt !== null && Date.parse(consumedAt) < Date.parse(receivedAt)) {
+      fail(`${path}.consumedAt`, "must not be earlier than receivedAt");
+    }
+    return {
+      steeringId,
+      receivedAt,
+      kind: expectEnum(entry.kind, OPS_WORKER_STEERING_KINDS, `${path}.kind`),
+      operatorRef: expectBoundedText(
+        entry.operatorRef,
+        `${path}.operatorRef`,
+        OPS_WORKER_LIMITS.maxSteeringOperatorRefBytes,
+      ),
+      text: expectBoundedText(
+        entry.text,
+        `${path}.text`,
+        OPS_WORKER_LIMITS.maxSteeringTextBytes,
+        { allowEmpty: true },
+      ),
+      consumedAt,
+    };
+  });
+  if (
+    Buffer.byteLength(serializeOpsWorkerPendingSteering(parsed).text, "utf8")
+    > OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes
+  ) {
+    fail(
+      "task.steering",
+      `pending correction and answer entries must serialize to at most ${OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes} UTF-8 bytes`,
+    );
+  }
+  return parsed;
+}
+
+function parseInterrupt(value: unknown): OpsWorkerInterrupt | null {
+  if (value === null) return null;
+  const interrupt = expectObject(value, "task.control.interrupt");
+  expectExactKeys(
+    interrupt,
+    ["requestedAt", "mode", "reason"],
+    "task.control.interrupt",
+  );
+  return {
+    requestedAt: expectTimestamp(
+      interrupt.requestedAt,
+      "task.control.interrupt.requestedAt",
+    ),
+    mode: expectEnum(
+      interrupt.mode,
+      OPS_WORKER_INTERRUPT_MODES,
+      "task.control.interrupt.mode",
+    ),
+    reason: expectBoundedText(
+      interrupt.reason,
+      "task.control.interrupt.reason",
+      OPS_WORKER_LIMITS.maxInterruptReasonBytes,
+    ),
+  };
+}
+
+function parseControl(value: unknown): OpsWorkerControl {
+  const control = expectObject(value, "task.control");
+  expectExactKeys(control, ["paused", "pausedAt", "interrupt"], "task.control");
+  const paused = expectBoolean(control.paused, "task.control.paused");
+  const pausedAt = expectOptionalTimestamp(control.pausedAt, "task.control.pausedAt");
+  if (paused !== (pausedAt !== null)) {
+    fail(
+      "task.control.pausedAt",
+      paused ? "must be set while paused" : "must be null while not paused",
+    );
+  }
+  return {
+    paused,
+    pausedAt,
+    interrupt: parseInterrupt(control.interrupt),
+  };
 }
 
 export function isOpsWorkerRegisteredName(value: unknown): value is string {
@@ -1797,6 +2027,30 @@ export function aggregateOpsWorkerVerificationOutcome(
     : "VERIFIER_INVALID";
 }
 
+function assertVerificationNextCheckAt(
+  outcome: OpsWorkerVerificationOutcome,
+  nextCheckAt: string | null,
+  anchor: string,
+  path: string,
+  anchorLabel: string,
+): void {
+  if (outcome === "DEFER") {
+    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(anchor)) {
+      fail(path, "DEFER requires a later query timestamp");
+    }
+    return;
+  }
+  if (outcome === "NOT_READY") {
+    if (nextCheckAt !== null && Date.parse(nextCheckAt) <= Date.parse(anchor)) {
+      fail(path, `NOT_READY recheck must be later than ${anchorLabel}`);
+    }
+    return;
+  }
+  if (nextCheckAt !== null) {
+    fail(path, "must be null unless the outcome schedules convergence");
+  }
+}
+
 function parseVerificationComponent(
   value: unknown,
   index: number,
@@ -1848,13 +2102,13 @@ function parseVerificationComponent(
     component.nextCheckAt,
     `${path}.nextCheckAt`,
   );
-  if (outcome === "DEFER") {
-    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(observedAt)) {
-      fail(`${path}.nextCheckAt`, "DEFER requires a later query timestamp");
-    }
-  } else if (nextCheckAt !== null) {
-    fail(`${path}.nextCheckAt`, "must be null unless the outcome is DEFER");
-  }
+  assertVerificationNextCheckAt(
+    outcome,
+    nextCheckAt,
+    observedAt,
+    `${path}.nextCheckAt`,
+    "observedAt",
+  );
   return {
     identity: expectRegisteredName(component.identity, `${path}.identity`),
     version: expectRegisteredName(component.version, `${path}.version`),
@@ -1945,13 +2199,13 @@ function parseVerification(value: unknown): OpsWorkerVerificationRecord | null {
     verification.nextCheckAt,
     "task.verification.nextCheckAt",
   );
-  if (outcome === "DEFER") {
-    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(completedAt)) {
-      fail("task.verification.nextCheckAt", "DEFER requires a later query timestamp");
-    }
-  } else if (nextCheckAt !== null) {
-    fail("task.verification.nextCheckAt", "must be null unless the outcome is DEFER");
-  }
+  assertVerificationNextCheckAt(
+    outcome,
+    nextCheckAt,
+    completedAt,
+    "task.verification.nextCheckAt",
+    "completion",
+  );
   return {
     verifierIdentity: expectRegisteredName(
       verification.verifierIdentity,
@@ -2239,7 +2493,12 @@ function parseReport(value: unknown): OpsWorkerReport {
     );
   return {
     state: expectEnum(report.state, OPS_WORKER_REPORT_STATES, "task.report.state"),
-    attempts: expectInteger(report.attempts, "task.report.attempts", 0, 1_000),
+    attempts: expectInteger(
+      report.attempts,
+      "task.report.attempts",
+      0,
+      OPS_WORKER_LIMITS.maxReportAttempts,
+    ),
     lastError,
   };
 }
@@ -2260,9 +2519,13 @@ function parseLegacyCompletion(value: unknown): OpsWorkerLegacyCompletion | null
 }
 
 export function assertOpsWorkerTaskId(id: unknown): asserts id is string {
-  if (typeof id !== "string" || !TASK_ID_PATTERN.test(id)) {
+  if (!isOpsWorkerTaskId(id)) {
     fail("task.id", "must be a traversal-safe lowercase task identifier");
   }
+}
+
+export function isOpsWorkerTaskId(id: unknown): id is string {
+  return typeof id === "string" && TASK_ID_PATTERN.test(id);
 }
 
 export function isOpsWorkerTerminalState(
@@ -2285,6 +2548,8 @@ type OpsWorkerTaskCommon = Omit<
   | "authorizationVerification"
   | "verification"
   | "legacyCompletion"
+  | "steering"
+  | "control"
 >;
 
 function parseTaskCommon(
@@ -2502,6 +2767,8 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: copy.state === "DONE" ? { sourceSchemaVersion: 1 } : null,
+    steering: [],
+    control: createEmptyOpsWorkerControl(),
     state: copy.state,
     rounds: copy.rounds,
     schedule: copy.schedule,
@@ -2544,6 +2811,8 @@ export function migrateOpsWorkerTaskV2(task: OpsWorkerTaskV2): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 2 } : null,
+    steering: [],
+    control: createEmptyOpsWorkerControl(),
     ...common,
   };
 }
@@ -2561,6 +2830,20 @@ export function migrateOpsWorkerTaskV3(task: OpsWorkerTaskV3): OpsWorkerTask {
     lifecycle: migrateLifecycleV1(lifecycle),
     verification: null,
     legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 3 } : null,
+    steering: [],
+    control: createEmptyOpsWorkerControl(),
+    ...common,
+  };
+}
+
+/** Pure migration for an already validated exact v4 snapshot. */
+export function migrateOpsWorkerTaskV4(task: OpsWorkerTaskV4): OpsWorkerTask {
+  const copy = structuredClone(task);
+  const { schemaVersion: _schemaVersion, ...common } = copy;
+  return {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    steering: [],
+    control: createEmptyOpsWorkerControl(),
     ...common,
   };
 }
@@ -2689,11 +2972,11 @@ function parseOpsWorkerTaskV4(
   task: Record<string, unknown>,
   registry: OpsWorkerTaskContractRegistry,
 ): OpsWorkerTask {
-  expectExactKeys(task, TASK_KEYS, "task");
-  if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
+  expectExactKeys(task, V4_TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_V4_SCHEMA_VERSION) {
     fail(
       "task.schemaVersion",
-      `must equal ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+      `must equal ${OPS_WORKER_TASK_V4_SCHEMA_VERSION}`,
     );
   }
   assertOpsWorkerTaskId(task.id);
@@ -2709,8 +2992,8 @@ function parseOpsWorkerTaskV4(
       "must be a lowercase sha256:<hex> digest",
     );
   }
-  const parsed: OpsWorkerTask = {
-    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+  const previous: OpsWorkerTaskV4 = {
+    schemaVersion: OPS_WORKER_TASK_V4_SCHEMA_VERSION,
     id,
     source,
     resource: parseResource(task.resource),
@@ -2726,6 +3009,14 @@ function parseOpsWorkerTaskV4(
     legacyCompletion: parseLegacyCompletion(task.legacyCompletion),
     ...parseTaskCommon(task, id, source, registry),
   };
+  const parsed = migrateOpsWorkerTaskV4(previous);
+  assertTaskVerification(parsed);
+  assertTaskCustodyMatchesState(parsed);
+  assertParsedSnapshotSize(parsed);
+  return parsed;
+}
+
+function assertTaskVerification(parsed: OpsWorkerTask): void {
   const verifier = parsed.verification;
   if (verifier !== null && (
     parsed.lifecycle.verifier !== verifier.verifierIdentity
@@ -2770,12 +3061,58 @@ function parseOpsWorkerTaskV4(
       "DONE requires fresh aggregate PASS evidence from the terminal transition",
     );
   }
+}
+
+function parseOpsWorkerTaskV5(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
+  expectExactKeys(task, TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSource(task.source, registry);
+  const submissionFingerprint = expectString(
+    task.submissionFingerprint,
+    "task.submissionFingerprint",
+  );
+  if (!SHA256_PATTERN.test(submissionFingerprint)) {
+    fail(
+      "task.submissionFingerprint",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  const parsed: OpsWorkerTask = {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    id,
+    source,
+    resource: parseResource(task.resource),
+    lifecycle: parseLifecycle(task.lifecycle),
+    currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
+    mutationReceipts: parseMutationReceipts(task.mutationReceipts),
+    custody: parseCustody(task.custody),
+    submissionFingerprint,
+    authorizationVerification: parseAuthorizationVerification(
+      task.authorizationVerification,
+    ),
+    verification: parseVerification(task.verification),
+    legacyCompletion: parseLegacyCompletion(task.legacyCompletion),
+    steering: parseSteering(task.steering),
+    control: parseControl(task.control),
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  assertTaskVerification(parsed);
   assertTaskCustodyMatchesState(parsed);
   assertParsedSnapshotSize(parsed);
   return parsed;
 }
 
-/** Parse and copy exact v1-v4 input. Unknown versions fail closed. */
+/** Parse and copy exact v1-v5 input. Unknown versions fail closed. */
 export function parseOpsWorkerTask(
   value: unknown,
   registry: OpsWorkerTaskContractRegistry,
@@ -2794,12 +3131,15 @@ export function parseOpsWorkerTask(
   if (descriptor.value === OPS_WORKER_TASK_V3_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV3(task, registry);
   }
-  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+  if (descriptor.value === OPS_WORKER_TASK_V4_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV4(task, registry);
+  }
+  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV5(task, registry);
   }
   fail(
     "task.schemaVersion",
-    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V4_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
   );
 }
 
@@ -2833,6 +3173,17 @@ export function parseOpsWorkerTaskJson(
     fail(
       "task",
       `legacy snapshot exceeds ${OPS_WORKER_LIMITS.maxLegacySnapshotBytes} UTF-8 bytes`,
+    );
+  }
+  if (
+    (schemaVersion === OPS_WORKER_TASK_V2_SCHEMA_VERSION
+      || schemaVersion === OPS_WORKER_TASK_V3_SCHEMA_VERSION
+      || schemaVersion === OPS_WORKER_TASK_V4_SCHEMA_VERSION)
+    && bytes > OPS_WORKER_LIMITS.maxPreV5SnapshotBytes
+  ) {
+    fail(
+      "task",
+      `pre-v5 snapshot exceeds ${OPS_WORKER_LIMITS.maxPreV5SnapshotBytes} UTF-8 bytes`,
     );
   }
   return parseOpsWorkerTask(value, registry);

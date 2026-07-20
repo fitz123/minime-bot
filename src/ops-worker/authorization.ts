@@ -15,6 +15,7 @@ import {
   type OpsWorkerSourceKind,
   type OpsWorkerTask,
 } from "./types.js";
+import { appendOpsWorkerEvidence } from "./evidence.js";
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const SAFE_IDENTITY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/+-]{0,254}[A-Za-z0-9])?$/;
@@ -551,9 +552,7 @@ export class OpsWorkerAuthorizationCoordinator {
             // A fresh denial fences the requested mutation, but terminal task state is
             // immutable. Retain the successful composite evidence that established the
             // terminal state and append the denial as an audit-only observation.
-            task.evidence = [...task.evidence, authorizationEvidence(verification)].slice(
-              -OPS_WORKER_LIMITS.maxEvidenceEntries,
-            );
+            appendOpsWorkerEvidence(task, authorizationEvidence(verification));
             return;
           }
           const previousVerification = task.authorizationVerification;
@@ -570,9 +569,7 @@ export class OpsWorkerAuthorizationCoordinator {
             if (sameSubjectAuthorization) {
               task.authorizationVerification = verification;
             } else {
-              task.evidence = [...task.evidence, authorizationEvidence(verification)].slice(
-                -OPS_WORKER_LIMITS.maxEvidenceEntries,
-              );
+              appendOpsWorkerEvidence(task, authorizationEvidence(verification));
             }
             options.onPass?.(task, verification);
             return;
@@ -593,9 +590,7 @@ export class OpsWorkerAuthorizationCoordinator {
           }
           const at = atOrAfter(this.now(), task.updatedAt);
           task.updatedAt = at;
-          task.evidence = [...task.evidence, authorizationEvidence(verification)].slice(
-            -OPS_WORKER_LIMITS.maxEvidenceEntries,
-          );
+          appendOpsWorkerEvidence(task, authorizationEvidence(verification));
           task.lastOutcome = {
             at,
             kind: "AUTHORIZATION",

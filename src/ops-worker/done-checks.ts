@@ -4,8 +4,10 @@ import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_VERIFICATION_OUTCOMES,
   type JsonObject,
+  type OpsWorkerEvidence,
   type OpsWorkerDoneCheck,
   type OpsWorkerDoneCheckContract,
+  type OpsWorkerSourceKind,
   type OpsWorkerVerificationComponentEvidence,
   type OpsWorkerVerificationConvergenceKind,
   type OpsWorkerVerificationOutcome,
@@ -37,6 +39,9 @@ export interface OpsWorkerDoneCheckContext {
   signal: AbortSignal;
   taskId: string;
   checkedAt: string;
+  sourceKind?: OpsWorkerSourceKind;
+  sourceCorrelationKey?: string;
+  sourceEvidence?: readonly OpsWorkerEvidence[];
 }
 
 export interface OpsWorkerDoneCheckComponentDefinition {
@@ -196,17 +201,19 @@ function parseComponentResult(
     throw new TypeError("component returned an unknown closed outcome");
   }
   const outcome = suppliedResult as OpsWorkerVerificationOutcome;
+  const hasScheduledRecheck = outcome === "DEFER"
+    || (outcome === "NOT_READY" && hasOwn(result, "nextCheckAt"));
   if (component.legacyResult) {
     assertExactKeys(
       result,
-      result.result === "DEFER"
+      hasScheduledRecheck
         ? ["result", "summary", "nextCheckAt"]
         : ["result", "summary"],
     );
   } else {
     assertExactKeys(
       result,
-      outcome === "DEFER"
+      hasScheduledRecheck
         ? ["result", "summary", "observedAt", "evidenceHash", "nextCheckAt"]
         : ["result", "summary", "observedAt", "evidenceHash"],
     );
@@ -228,10 +235,10 @@ function parseComponentResult(
     throw new TypeError("component evidenceHash must be a lowercase sha256 digest");
   }
   let nextCheckAt: string | null = null;
-  if (outcome === "DEFER") {
+  if (hasScheduledRecheck) {
     nextCheckAt = parseTimestamp(result.nextCheckAt, "component nextCheckAt");
     if (Date.parse(nextCheckAt) <= Date.parse(observedAt)) {
-      throw new TypeError("DEFER nextCheckAt must be later than observedAt");
+      throw new TypeError("scheduled nextCheckAt must be later than observedAt");
     }
   }
   if (
@@ -549,7 +556,7 @@ export class OpsWorkerDoneCheckRegistry {
     const components = queriedComponents.map((component, index) =>
       Date.parse(component.observedAt) > Date.parse(completedAt)
         || (
-          component.outcome === "DEFER"
+          component.nextCheckAt !== null
           && Date.parse(component.nextCheckAt as string) <= Date.parse(completedAt)
         )
         ? generatedComponentResult(
@@ -560,8 +567,9 @@ export class OpsWorkerDoneCheckRegistry {
         )
         : component);
     const result = aggregateOpsWorkerVerificationOutcome(components);
-    const deferred = components
-      .filter((component) => component.required && component.outcome === "DEFER")
+    const decidingComponents = components
+      .filter((component) => component.required && component.outcome === result);
+    const scheduled = decidingComponents
       .map((component) => component.nextCheckAt)
       .filter((value): value is string => value !== null)
       .sort();
@@ -582,7 +590,12 @@ export class OpsWorkerDoneCheckRegistry {
       checkedAt: context.checkedAt,
       result,
       summary,
-      nextCheckAt: result === "DEFER" ? deferred[0] ?? null : null,
+      nextCheckAt: result === "DEFER"
+        ? scheduled[0] ?? null
+        : result === "NOT_READY"
+          && decidingComponents.every((component) => component.nextCheckAt !== null)
+          ? scheduled[0] ?? null
+          : null,
       components,
     };
   }

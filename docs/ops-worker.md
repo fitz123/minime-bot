@@ -4,7 +4,8 @@ The ops worker is an opt-in, inactive-by-default core. Installing or starting
 `minime-bot` does not start it. The foundation provides durable task snapshots,
 one single-instance supervisor, ordinary Pi session continuation, deterministic
 composite verification, continuous authorization checks, reset-aware quota
-waits, a strict local CLI, and read-only loopback health/status. Each attempt
+waits, a strict local CLI, optional dedicated Telegram control, authenticated
+loopback Alertmanager intake, and bounded health/status. Each attempt
 assembles the canonical primary agent's exact accepted context in a trusted
 source workspace, adds only the fixed ops-worker policy, and executes in a
 separate worker workspace. Pi's flat context loading is disabled only after
@@ -26,7 +27,8 @@ All commands require an explicit state directory. Starting the supervisor also
 requires an explicit agent workspace:
 
 ```text
-minime-bot worker start --state-dir "$STATE_DIR" --agent-workspace "$AGENT_WORKSPACE"
+minime-bot worker start --state-dir "$STATE_DIR" --agent-workspace "$AGENT_WORKSPACE" \
+  [--control-config /path/to/ops-control.yaml]
 minime-bot worker status --state-dir "$STATE_DIR"
 minime-bot worker list --state-dir "$STATE_DIR"
 minime-bot worker inspect --state-dir "$STATE_DIR" --id <task-id>
@@ -57,7 +59,9 @@ minime-bot worker cancel --state-dir "$STATE_DIR" --id <task-id> --reason <reaso
 ```
 
 `worker start --once` performs at most one eligible scheduler action and exits.
-Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
+When `--control-config` is also present, it then performs exactly one bounded
+Telegram control tick, including at most one terminal-report attempt, before
+exiting. Without `--once`, it runs until SIGINT or SIGTERM. The package-owned Pi
 invocation, model/tool flags, authorization scope, remediation budget, task
 priority, and source kind are not task-supplied CLI options.
 
@@ -80,7 +84,12 @@ Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An
 identical replay returns the existing task, including after completion, without
 adding a snapshot or audit transition. Reusing that key with a different
-canonical submission fails closed. Each v4 snapshot retains a store-owned
+canonical submission fails closed, except that the Alertmanager adapter may
+coalesce an evolving notification into the task that currently owns the same
+active correlation. Each accepted coalesced delivery key and submission
+fingerprint is retained as bounded protected trusted receipt evidence, so its exact
+replay still returns that task after termination; an unrecorded conflicting
+payload fails closed. Each v5 snapshot retains a store-owned
 immutable submission fingerprint, so later runtime evidence updates or bounded
 evidence eviction cannot make a conflicting delivery look identical. The
 correlation key has a different role:
@@ -92,19 +101,100 @@ use `host:<name>`; repository resources use a lowercase non-host namespace plus
 an owner/name identity, for example `github:example/project`. A resource is not
 a lane, executable, URL, or independently acquired lock.
 
-`retry` and `cancel` acquire the supervisor's single-instance
-guard and therefore fail safely if the long-running supervisor is active;
-live control transport is not part of this foundation. A running task cannot
-be cancelled without its owning supervisor first proving and stopping the
-process group.
+CLI `retry` and `cancel` acquire the supervisor's single-instance guard and
+therefore fail safely if the long-running supervisor is active. An explicitly
+started worker may instead expose the dedicated Telegram control commands
+described below. A running task cannot be cancelled without its owning
+supervisor first proving and stopping the process group.
+
+## Dedicated Telegram control
+
+`worker start --control-config <path>` is the only entrypoint that loads the
+separate ops control YAML and starts its long poller. Omitting the option keeps
+the pre-control startup behavior. No install, build, pack, help, validation, or
+other worker command reads this file or starts a listener. The control client
+uses an independently configured second BotFather token; it never reads the
+primary `telegramToken*` settings, imports grammY, or shares the primary bot's
+`getUpdates` stream.
+
+The config is strict, rejects unknown keys, requires a non-empty operator
+allowlist, and accepts exactly one secret source for each token. Values below
+are placeholders:
+
+```yaml
+telegram:
+  tokenEnv: MINIME_OPS_TELEGRAM_TOKEN
+  controlChatId: "100000000"
+  operatorIds:
+    - "100000000"
+
+intake:
+  host: 127.0.0.1
+  port: 9465
+  bearerTokenEnv: MINIME_OPS_INTAKE_TOKEN
+  sourceIdentity: example-alertmanager
+
+poll:
+  longPollSeconds: 30
+  requestTimeoutMs: 35000
+  retryMinMs: 250
+  retryMaxMs: 5000
+  maxResponseBytes: 262144
+
+reply:
+  maxBytes: 3500
+```
+
+`tokenEnv` may be replaced by the pair `sopsFile` and `tokenSopsKey`;
+`bearerTokenEnv` may likewise be replaced by `sopsFile` and
+`bearerTokenSopsKey`. Relative SOPS paths resolve from the control config's
+directory. The config itself must be a non-symlink regular file of at most 64
+KiB. The `poll` and `reply` sections are optional and use the defaults shown
+above when omitted. Secret values never belong in the YAML. Intake is
+optional, but when present its host must be `127.0.0.1` or `::1` and its port
+is also the status server port.
+
+The bounded command set is `/status`, `/tasks`, `/task <id>`, `/answer <id>
+<text>`, `/correct <id> <text>`, `/pause <id>`, `/resume <id>`, `/cancel <id>
+<reason>`, and `/retry <id>`. Telegram text can select and steer only an
+existing task. It cannot create tasks or select configuration, commands,
+destinations, URLs, models, tools, templates, profiles, or verifier components.
+
+Every update is fingerprinted in the versioned ledger at
+`<state-dir>/control/telegram.json`. An allowlisted command's task or steering
+effect is persisted first, then the update fingerprint and monotonic offset are
+persisted, and only then is a reply sent. A crash between the task effect and
+ledger write is safe because the update-derived steering id makes redelivery an
+idempotent replay. Malformed and non-allowlisted updates receive no task effect
+or reply, but their fingerprints are retained before the offset advances.
+The ledger also records the local acknowledgement time and an update-id epoch.
+After a full week without an update it polls once without the stale offset,
+because Telegram may randomize the next update id, and begins a new epoch when
+that update arrives. Fingerprint-qualified steering ids keep this
+resynchronization replay-safe even if a numeric update id is reused.
+
+Corrections and answers are bounded trusted operator evidence and are consumed
+atomically when the next attempt resolves its launch. They are clearly marked
+as data in the prompt and are never written into a running child's stdin or
+session. Pause prevents the next scheduler action while preserving custody and
+queue position; an in-flight attempt reaches its next safe boundary without a
+signal. Cancel is the explicit interrupt path: it stops only a proven owned
+process group. Ambiguous ownership retains the task, interrupt, and global
+fence for startup reconciliation.
+
+Each control-loop tick sends at most one pending terminal report. Report sends
+use the fixed receipt boundary: fresh authorization is proved and the receipt
+is claimed before the Telegram send is attempted. A crash after send but before receipt finish
+requires a strictly newer external-state query and permits at-least-once
+redelivery; it never invents a false unsent or sent state.
 
 ## Schema and migration
 
-Schema v4 is the only write format. Exact schema v1, v2, and v3 snapshots remain
-readable through deterministic pure migrations. Reading, listing, or inspecting
-an older snapshot does not rewrite it; its first successful store mutation
-writes one canonical v4 snapshot. Unknown fields, fields from a later schema,
-and future schema versions are rejected.
+Schema v5 is the only write format. Exact schema v1, v2, v3, and v4 snapshots
+remain readable through deterministic pure migrations. Reading, listing, or
+inspecting an older snapshot does not rewrite it; its first successful store
+mutation writes one canonical v5 snapshot. Unknown fields, v5-only fields on an
+older version, and future schema versions are rejected.
 
 V3 added one fixed authorization-verification record: validator identity and
 version, checked authorization snapshot hash, checked time, closed status, and
@@ -112,11 +202,17 @@ bounded redacted evidence hash/summary. V4 adds the immutable composite verifier
 identity/version/contract hash to the lifecycle manifest and fresh aggregate
 component evidence to the task. Older snapshots migrate with these records
 unset, never with an implied PASS. A migrated legacy `DONE` snapshot carries
-fixed source-schema provenance so its report evidence can be updated in v4
-without fabricating aggregate PASS evidence; current-schema completion still
+fixed source-schema provenance so its report evidence can be updated in the
+current schema without fabricating aggregate PASS evidence; current-schema completion still
 requires a fresh aggregate PASS. A newly written `QUOTA_PROBE_PASS` outcome may
 also carry its fixed typed proof subrecord; proofless outcomes remain readable
 for compatibility but never authorize a launch.
+
+V5 adds the bounded append-only steering list and fixed control record containing
+pause and pending interrupt state. Older snapshots migrate with no steering,
+`paused: false`, and no interrupt. Steering ids are replay-safe, conflicting id
+reuse and overflow fail closed, and pending steering contributes to the
+verification subject hash so it invalidates stale aggregate evidence.
 
 The v1 migration derives a task-unique legacy delivery key and non-shareable
 legacy host resource. It also derives custody conservatively: active, checking,
@@ -233,12 +329,59 @@ Component and aggregate outcomes are `PASS`, `NOT_READY`, `PRODUCT_FAILURE`,
 component must PASS for aggregate PASS. `DEFER` is reserved for passive external
 convergence. Product work resumes remediation; verifier invalidity, query
 failure, and timeout retry verification without consuming remediation. The
-aggregate subject hash includes the current task, checkpoint, and authorization
-state, so stale or partial PASS evidence is discarded. Only a fresh aggregate
-PASS recorded atomically with the terminal transition can produce `DONE` and
-release custody. Repeated diagnostic failures remain retryable with custody
-held; only product evidence can exhaust remediation and block the task. This
-phase intentionally registers no production components.
+aggregate subject hash includes the current task, checkpoint, authorization,
+and pending steering state, so stale or partial PASS evidence is discarded.
+Only a fresh aggregate PASS recorded atomically with the terminal transition
+can produce `DONE` and release custody. Repeated diagnostic failures remain
+retryable with custody held; only product evidence can exhaust remediation and
+block the task. This package exports the `ops.minime-availability` version 1
+composite and its task contract factory for a trusted worker embedding; no
+production embedding is constructed or activated by the installed binary.
+
+## Availability contract
+
+`createOpsTaskContracts` registers template `ops.availability` for authenticated
+Alertmanager and local CLI submissions, authorization profile
+`ops.host-availability`, and invariant `minime-bot-host`. The invariant fixes
+the host resource, objective, scopes, and composite parameters in package code.
+Alert payloads and task text cannot select probes or policy.
+The factory provides the closed Alertmanager authorization verifier only. A
+trusted embedding that enables `operator-cli` submission must separately
+register its own `operator-cli` verifier; startup otherwise fails closed.
+
+The `ops.minime-availability` composite requires three fresh components:
+
+- `monitoring-freshness` is PRODUCT evidence that the telemetry pipeline has a
+  recent sample. Silence is `NOT_READY`, never health.
+- `alert-state` is PASSIVE evidence from a fresh correlated Alertmanager query.
+  A still-firing group returns `DEFER` with a bounded recheck.
+- `service-stability` is PRODUCT evidence that direct availability is healthy
+  and has stayed healthy for the fixed five-minute window. A shorter streak is
+  `NOT_READY`; a fresh unhealthy observation is `PRODUCT_FAILURE`.
+
+Aggregate PASS requires all three. Resolved-alert disappearance, stale data,
+or an agent completion claim is insufficient. Reader exceptions remain
+`QUERY_ERROR`; malformed reader output is `VERIFIER_INVALID`; timeouts and
+passive/product convergence retain their existing distinct outcomes. The
+exported Alertmanager and Prometheus HTTP readers accept only explicit loopback
+base URLs and injected fetch implementations. They perform one bounded query,
+without retries or import-time construction. One composite evaluation makes one
+Prometheus raw range-vector query for freshness, one Alertmanager active-alert
+query, and one Prometheus instant query for direct service state. When every
+direct series is healthy, it makes one additional raw range-vector query
+covering the five-minute window plus one fixed scrape step. The
+Alertmanager query includes active suppressed alerts and filters the response by
+the exact group labels stored with the task's correlation evidence; unrelated
+active groups cannot hold the task open. For a trusted `operator-cli`
+availability task, the same reader uses the package-owned
+`alertname="MinimeBotMetricsDown"` invariant because there is no intake group
+descriptor.
+
+The Prometheus reader's trusted cadence is the explicit one-minute scrape
+interval in `examples/monitoring/prometheus.yml`. Stability accepts up to 15
+seconds of scrape jitter between samples and resets the healthy streak when a
+larger gap or an unhealthy sample appears. Embeddings that use this reader must
+preserve that cadence.
 
 ## Custody, checkpoints, and receipts
 
@@ -296,7 +439,9 @@ or cancellation is rejected until restart reconciliation proves the group gone.
 ## Loopback status
 
 The supervisor binds to `127.0.0.1:9465` by default. Only `127.0.0.1` and `::1`
-are accepted bind addresses. The surface is read-only:
+are accepted bind addresses. The surface is read-only unless an explicit
+`worker start --control-config` file registers the fixed Alertmanager intake
+route:
 
 - `GET /healthz` returns process health.
 - `GET /status` returns bounded task-state counts and the number of active
@@ -306,16 +451,70 @@ are accepted bind addresses. The surface is read-only:
   digests for parity. It never includes objectives, canonical task bodies,
   context contents, personas, resource paths, lifecycle evidence, checkpoints,
   receipts, quota summaries, or credentials.
+- `POST /intake/alertmanager`, when explicitly configured, requires the
+  configured bearer token and accepts only a bounded Alertmanager v4 webhook.
+  It can submit only the package-owned availability task contract; alert text,
+  labels, and annotations remain bounded untrusted evidence. The route is
+  absent when intake is not configured.
 
-There is no HTTP task intake, retry, cancellation, command, or arbitrary proxy
-route in this foundation. CLI submission and lifecycle evidence recording write
-through the strict local task store.
+There is no generic HTTP task intake, retry, cancellation, command, or arbitrary
+proxy route. Both the fixed adapter and CLI submission write through the strict
+local task store.
 
-## Deferred work
+Ops intake is an additional Alertmanager receiver. It never replaces or
+forwards through the independent native Alertmanager-to-Telegram delivery in
+`scripts/alertmanager_webhook.py`; that path and `scripts/monitoring_native.py`
+remain separate and unchanged.
 
-Alertmanager intake, authenticated HTTP intake, Telegram reporting, report
-transport retries, production task templates and composite components, the full
-fault lab, deployment configuration, launch activation, release workflows, and
-production drills are later phases. Install, build, pack, help, and workspace
-validation do not start a worker process or listener. Existing recovery
-components remain in place during coexistence.
+The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a
+constant-time matched bearer token. The 256 KiB body limit mirrors the native
+receiver. Firing episodes derive their delivery and correlation keys from the
+trusted source identity, group key, and episode start. Identical delivery or an
+already-active correlation replays the existing task. Coalescing first records
+a durable delivery receipt in that task, preserving exact replay after the task
+becomes terminal. Resolved-only groups do not create work. A firing group must
+include non-empty group labels that fit the
+bounded correlation descriptor; intake rejects a group it could not later query
+exactly. Alert labels and annotations are stored only as bounded
+untrusted evidence. Responses expose only `ok`, `taskId`, and `replayed`, while
+authentication, media, syntax, method, and size failures use bounded typed JSON.
+
+Clients send `POST /intake/alertmanager` with `Authorization: Bearer <token>`
+and `Content-Type: application/json`; the body is the Alertmanager v4 webhook.
+A newly accepted firing episode returns HTTP 200 with
+`{"ok":true,"taskId":"<generated-id>","replayed":false}`. An identical or
+active-correlation replay returns the existing id with `replayed:true`.
+Resolved-only input returns `{"ok":true,"taskId":null,"replayed":false}`.
+
+## Batched fake fault lab
+
+The development fault lab lives at
+`src/__tests__/fixtures/ops-worker-fault-lab.ts` and is asserted by
+`src/__tests__/ops-worker-fault-lab.test.ts`. It runs the complete ADR-099
+regression matrix in one batch. Every scenario receives an isolated temporary
+state directory, deterministic clock, and fake Pi, Telegram, intake, or reader
+dependencies as appropriate. It exercises public store, supervisor, runner,
+control, intake, and done-check surfaces and returns one deterministic aggregate
+with `labVersion`, ordered `scenarios`, `failures`, and `pass`.
+
+```text
+node --experimental-test-module-mocks --import tsx --test \
+  src/__tests__/ops-worker-fault-lab.test.ts
+```
+
+The test requires exactly the registered scenario-name set, two identical
+aggregate runs, all PASS outcomes, no external fetch passthrough, and no
+non-loopback socket bind. The lab complements the focused unit suites; it does
+not replace them.
+
+## Inactivity and deferred work
+
+Deployment configuration, launch activation, release workflows, production
+rollout, outage drills, and legacy cleanup remain later phases. The package
+still installs no control config, token, receiver, verifier dependencies, or
+launch state. Install, build, pack, help, and workspace validation do not start
+a worker process, poller, or listener. Only an explicit `worker start` with the
+complete trusted embedding dependencies can run the worker, and only an
+explicit `--control-config` can add the Telegram poller or intake route.
+Existing recovery components and the independent native delivery path remain
+in place during coexistence.

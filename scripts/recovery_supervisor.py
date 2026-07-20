@@ -5142,6 +5142,27 @@ class EmergencyNotifier:
             # the bounded HTTP request pool.
             return True
 
+    def report_corrupt_spool(self) -> bool:
+        """Deliver the fixed spool-corruption alert without writing to that spool."""
+        code = "spool_corrupt"
+        with self._lock:
+            now = self.clock()
+            state = self._state()
+            if now - state.get(code, 0.0) < self.cooldown:
+                return True
+            if self.delivery is None:
+                return False
+            try:
+                self.delivery(_EMERGENCY_MESSAGES[code])
+            except (MonitoringError, OSError):
+                return False
+            state[code] = now
+            try:
+                _atomic_json(self.state_path, state)
+            except OSError:
+                pass
+            return True
+
     def drain(self) -> None:
         with self._lock:
             self._drain_locked(self._state())
@@ -6320,7 +6341,7 @@ class RecoveryService:
             try:
                 self.emergency.drain()
             except SpoolError:
-                pass
+                self.emergency.report_corrupt_spool()
             return summary
         try:
             self._drain_events()
@@ -6360,7 +6381,7 @@ class RecoveryService:
         try:
             self.emergency.drain()
         except SpoolError:
-            self.emergency.emit("spool_corrupt")
+            self.emergency.report_corrupt_spool()
         if self._ledger_corrupt:
             return summary
         if self.verifier is not None:
@@ -6960,7 +6981,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             emergency.drain()
         except SpoolError:
-            pass
+            emergency.report_corrupt_spool()
         print("recovery supervisor ledger validation failed", file=sys.stderr)
         return 1
     except LedgerUnavailable:
@@ -7028,7 +7049,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 emergency.drain()
             except SpoolError:
-                pass
+                emergency.report_corrupt_spool()
             print("recovery supervisor ledger validation failed", file=sys.stderr)
             return 1
     def serve_requests() -> None:

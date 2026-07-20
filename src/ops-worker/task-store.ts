@@ -27,13 +27,21 @@ import {
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  serializeOpsWorkerPendingSteering,
+  type OpsWorkerInterrupt,
+  type OpsWorkerSteeringEntry,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
+import {
+  appendOpsWorkerEvidence,
+  compactOpsWorkerEvidenceForSnapshot,
+} from "./evidence.js";
 
 export const OPS_WORKER_JOURNAL_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_OPS_WORKER_MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
 export const MAX_OPS_WORKER_JOURNAL_ENTRY_BYTES = 8 * 1024;
+const MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS = 32;
 
 export const OPS_WORKER_AUDIT_EVENTS = [
   "CREATED",
@@ -118,6 +126,13 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
   }
 }
 
+export class OpsWorkerSteeringCapacityError extends OpsWorkerTaskStoreSafetyError {
+  constructor(taskId: string) {
+    super(`Task ${taskId} has no remaining steering capacity`);
+    this.name = "OpsWorkerSteeringCapacityError";
+  }
+}
+
 export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyError {
   readonly existingTaskId: string;
 
@@ -128,6 +143,54 @@ export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyErro
     this.name = "OpsWorkerDeliveryConflictError";
     this.existingTaskId = existingTaskId;
   }
+}
+
+interface OpsWorkerDeliveryReceipt {
+  type: "alertmanager-delivery-receipt-v1";
+  deliveryKey: string;
+  submissionFingerprint: string;
+}
+
+function parseDeliveryReceipt(evidence: OpsWorkerTask["evidence"][number]):
+OpsWorkerDeliveryReceipt | undefined {
+  if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).length !== 3
+      || record.type !== "alertmanager-delivery-receipt-v1"
+      || typeof record.deliveryKey !== "string"
+      || typeof record.submissionFingerprint !== "string"
+    ) return undefined;
+    return record as unknown as OpsWorkerDeliveryReceipt;
+  } catch {
+    return undefined;
+  }
+}
+
+function deliveryFingerprints(task: OpsWorkerTask, deliveryKey: string): Set<string> {
+  const fingerprints = new Set<string>();
+  if (task.source.deliveryKey === deliveryKey) {
+    fingerprints.add(task.submissionFingerprint);
+  }
+  for (const evidence of task.evidence) {
+    const receipt = parseDeliveryReceipt(evidence);
+    if (receipt?.deliveryKey === deliveryKey) {
+      fingerprints.add(receipt.submissionFingerprint);
+    }
+  }
+  return fingerprints;
+}
+
+function serializedDeliveryReceipts(task: OpsWorkerTask): Set<string> {
+  return new Set(
+    task.evidence
+      .map(parseDeliveryReceipt)
+      .filter((receipt): receipt is OpsWorkerDeliveryReceipt => receipt !== undefined)
+      .map((receipt) => JSON.stringify(receipt)),
+  );
 }
 
 export class OpsWorkerTaskStoreBusyError extends Error {
@@ -664,15 +727,22 @@ export class OpsWorkerTaskStore {
     value: unknown,
     audit: OpsWorkerAuditInput = { event: "CREATED" },
   ): OpsWorkerTaskStoreCreateResult {
-    const task = parseOpsWorkerTask(value, this.registry);
-    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+    const supplied = parseOpsWorkerTask(value, this.registry);
+    const task = parseOpsWorkerTask({
+      ...supplied,
+      submissionFingerprint: hashOpsWorkerCanonicalSubmission(supplied),
+    }, this.registry);
+    if (serializedDeliveryReceipts(task).size > 0) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Delivery receipts may be created only by Alertmanager correlation reuse",
+      );
+    }
     assertAuditInput(audit);
     return this.withMutationLock(() => {
       this.ensureSafeDirectories();
       const currentTasks = this.list();
-      const deliveryMatches = currentTasks.filter(
-        (candidate) => candidate.source.deliveryKey === task.source.deliveryKey,
-      );
+      const deliveryMatches = currentTasks.filter((candidate) =>
+        deliveryFingerprints(candidate, task.source.deliveryKey).size > 0);
       if (deliveryMatches.length > 1) {
         throw new OpsWorkerTaskStoreSafetyError(
           `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
@@ -681,7 +751,11 @@ export class OpsWorkerTaskStore {
       const replay = deliveryMatches[0];
       if (replay) {
         this.assertGlobalInvariants(currentTasks);
-        this.assertCanonicalSubmission(replay, task);
+        if (!deliveryFingerprints(replay, task.source.deliveryKey).has(
+          task.submissionFingerprint,
+        )) {
+          throw new OpsWorkerDeliveryConflictError(task.source.deliveryKey, replay.id);
+        }
         return {
           task: replay,
           created: false,
@@ -689,6 +763,139 @@ export class OpsWorkerTaskStore {
           journalAppended: false,
         };
       }
+      const snapshotPath = this.snapshotPath(task.id);
+      if (assertPathMissingOrRegularFile(snapshotPath)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to replace existing task ${task.id} through create`,
+        );
+      }
+      this.assertJournalSafe();
+      this.assertGlobalInvariants([...currentTasks, task]);
+      this.injectFault("after-correlation-check");
+      return {
+        task,
+        created: true,
+        ...this.write(task, snapshotPath, audit),
+      };
+    });
+  }
+
+  /**
+   * Atomically reuse one active correlation while retaining every accepted
+   * Alertmanager delivery fingerprint for permanent replay after termination.
+   */
+  createOrReuseActiveCorrelation(
+    value: unknown,
+    audit: OpsWorkerAuditInput = { event: "CREATED" },
+  ): OpsWorkerTaskStoreCreateResult {
+    const supplied = parseOpsWorkerTask(value, this.registry);
+    const task = parseOpsWorkerTask({
+      ...supplied,
+      submissionFingerprint: hashOpsWorkerCanonicalSubmission(supplied),
+    }, this.registry);
+    if (task.source.kind !== "alertmanager") {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Active-correlation delivery reuse is restricted to Alertmanager submissions",
+      );
+    }
+    if (serializedDeliveryReceipts(task).size > 0) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Alertmanager submissions cannot supply store-owned delivery receipts",
+      );
+    }
+    assertAuditInput(audit);
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const currentTasks = this.list();
+      const deliveryOwners = currentTasks.filter((candidate) =>
+        deliveryFingerprints(candidate, task.source.deliveryKey).size > 0);
+      if (deliveryOwners.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      const deliveryOwner = deliveryOwners[0];
+      if (
+        deliveryOwner
+        && deliveryFingerprints(deliveryOwner, task.source.deliveryKey)
+          .has(task.submissionFingerprint)
+      ) {
+        this.assertGlobalInvariants(currentTasks);
+        return {
+          task: deliveryOwner,
+          created: false,
+          snapshotPath: this.snapshotPath(deliveryOwner.id),
+          journalAppended: false,
+        };
+      }
+
+      const activeCorrelationOwners = currentTasks.filter((candidate) =>
+        candidate.source.correlationKey === task.source.correlationKey
+        && !isOpsWorkerTerminalState(candidate.state));
+      if (activeCorrelationOwners.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple active tasks own correlation key ${JSON.stringify(task.source.correlationKey)}`,
+        );
+      }
+      const activeOwner = activeCorrelationOwners[0];
+      if (deliveryOwner && deliveryOwner.id !== activeOwner?.id) {
+        throw new OpsWorkerDeliveryConflictError(
+          task.source.deliveryKey,
+          deliveryOwner.id,
+        );
+      }
+      if (activeOwner) {
+        const working = structuredClone(activeOwner);
+        const receiptCount = working.evidence.filter((evidence) =>
+          parseDeliveryReceipt(evidence) !== undefined).length;
+        if (receiptCount >= MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
+          );
+        }
+        const receipt: OpsWorkerDeliveryReceipt = {
+          type: "alertmanager-delivery-receipt-v1",
+          deliveryKey: task.source.deliveryKey,
+          submissionFingerprint: task.submissionFingerprint,
+        };
+        try {
+          appendOpsWorkerEvidence(working, {
+            at: this.nextUpdatedAt(working),
+            kind: "system",
+            trust: "trusted",
+            summary: JSON.stringify(receipt),
+            artifact: null,
+          });
+        } catch (error) {
+          if (!(error instanceof RangeError)) throw error;
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
+          );
+        }
+        working.updatedAt = this.nextUpdatedAt(working);
+        compactOpsWorkerEvidenceForSnapshot(working);
+        const persisted = parseOpsWorkerTask(working, this.registry);
+        this.assertImmutableIdentity(activeOwner, persisted);
+        this.assertReplaySafety(activeOwner, persisted, receipt);
+        this.assertJournalSafe();
+        this.assertGlobalInvariants(this.withReplacement(currentTasks, persisted));
+        this.injectFault("after-correlation-check");
+        return {
+          task: persisted,
+          created: false,
+          ...this.write(persisted, this.snapshotPath(persisted.id), {
+            event: "EVIDENCE",
+            summary: "Recorded coalesced Alertmanager delivery receipt",
+          }),
+        };
+      }
+      if (deliveryOwner) {
+        throw new OpsWorkerDeliveryConflictError(
+          task.source.deliveryKey,
+          deliveryOwner.id,
+        );
+      }
+
       const snapshotPath = this.snapshotPath(task.id);
       if (assertPathMissingOrRegularFile(snapshotPath)) {
         throw new OpsWorkerTaskStoreSafetyError(
@@ -750,6 +957,7 @@ export class OpsWorkerTaskStore {
           journalAppended: false,
         };
       }
+      compactOpsWorkerEvidenceForSnapshot(working);
       const task = parseOpsWorkerTask(working, this.registry);
       this.assertImmutableIdentity(existing, task);
       this.assertReplaySafety(existing, task);
@@ -761,6 +969,263 @@ export class OpsWorkerTaskStore {
         ...this.write(task, snapshotPath, audit),
       };
     });
+  }
+
+  appendSteering(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    audit: OpsWorkerAuditInput = {
+      event: "EVIDENCE",
+      summary: "Recorded durable operator steering",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      task.updatedAt = this.nextUpdatedAt(task);
+      this.assertSteeringCapacity(task);
+    });
+  }
+
+  appendSteeringAndMutate(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    audit: OpsWorkerAuditInput,
+    callback: (task: OpsWorkerTask) => void,
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      callback(task);
+      this.assertSteeringCapacity(task);
+    });
+  }
+
+  appendSteeringAndSetPaused(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    paused: boolean,
+  ): OpsWorkerTaskStoreMutationResult {
+    if (typeof paused !== "boolean") {
+      throw new OpsWorkerTaskStoreSafetyError("Paused state must be a boolean");
+    }
+    return this.mutate(taskId, {
+      event: "UPDATED",
+      summary: paused
+        ? "Recorded operator steering and paused task atomically"
+        : "Recorded operator steering and resumed task atomically",
+    }, (task) => {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      if (task.control.paused !== paused) {
+        if (paused && isOpsWorkerTerminalState(task.state)) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing to pause terminal task ${task.id}`,
+          );
+        }
+        task.control.paused = paused;
+      }
+      const now = this.nextUpdatedAt(task);
+      task.control.pausedAt = task.control.paused ? now : null;
+      task.updatedAt = now;
+      this.assertSteeringCapacity(task);
+    });
+  }
+
+  appendSteeringAndSetInterrupt(
+    taskId: string,
+    entry: OpsWorkerSteeringEntry,
+    interrupt: OpsWorkerInterrupt,
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, {
+      event: "UPDATED",
+      summary: `Recorded operator steering and ${interrupt.mode} interrupt atomically`,
+    }, (task) => {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      let startsPause = false;
+      if (task.control.interrupt !== null) {
+        if (
+          task.control.interrupt.mode !== interrupt.mode
+          || task.control.interrupt.reason !== interrupt.reason
+        ) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Task ${task.id} already has a different pending interrupt`,
+          );
+        }
+      } else {
+        if (isOpsWorkerTerminalState(task.state)) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Refusing an interrupt for terminal task ${task.id}`,
+          );
+        }
+        task.control.interrupt = structuredClone(interrupt);
+        if (interrupt.mode === "pause" && !task.control.paused) {
+          task.control.paused = true;
+          startsPause = true;
+        }
+      }
+      const now = this.nextUpdatedAt(task);
+      if (startsPause) task.control.pausedAt = now;
+      task.updatedAt = now;
+      this.assertSteeringCapacity(task);
+    });
+  }
+
+  setPaused(
+    taskId: string,
+    paused: boolean,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: paused ? "Paused task at a safe boundary" : "Resumed task scheduling",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    if (typeof paused !== "boolean") {
+      throw new OpsWorkerTaskStoreSafetyError("Paused state must be a boolean");
+    }
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.paused === paused) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      if (paused && isOpsWorkerTerminalState(task.state)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to pause terminal task ${task.id}`,
+        );
+      }
+      const now = this.nextUpdatedAt(task);
+      task.control.paused = paused;
+      task.control.pausedAt = paused ? now : null;
+      task.updatedAt = now;
+    });
+  }
+
+  clearPaused(
+    taskId: string,
+    audit?: OpsWorkerAuditInput,
+  ): OpsWorkerTaskStoreMutationResult {
+    return audit === undefined
+      ? this.setPaused(taskId, false)
+      : this.setPaused(taskId, false, audit);
+  }
+
+  setInterrupt(
+    taskId: string,
+    interrupt: OpsWorkerInterrupt,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: "Recorded durable operator interrupt",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.interrupt !== null) {
+        if (
+          task.control.interrupt.mode === interrupt.mode
+          && task.control.interrupt.reason === interrupt.reason
+        ) {
+          return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        }
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Task ${task.id} already has a different pending interrupt`,
+        );
+      }
+      if (isOpsWorkerTerminalState(task.state)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing an interrupt for terminal task ${task.id}`,
+        );
+      }
+      const now = this.nextUpdatedAt(task);
+      task.control.interrupt = structuredClone(interrupt);
+      if (interrupt.mode === "pause" && !task.control.paused) {
+        task.control.paused = true;
+        task.control.pausedAt = now;
+      }
+      task.updatedAt = now;
+    });
+  }
+
+  clearInterrupt(
+    taskId: string,
+    audit: OpsWorkerAuditInput = {
+      event: "UPDATED",
+      summary: "Cleared durable operator interrupt",
+    },
+  ): OpsWorkerTaskStoreMutationResult {
+    return this.mutate(taskId, audit, (task) => {
+      if (task.control.interrupt === null) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      task.control.interrupt = null;
+      task.updatedAt = this.nextUpdatedAt(task);
+    });
+  }
+
+  private nextUpdatedAt(task: Pick<OpsWorkerTask, "updatedAt">): string {
+    return new Date(Math.max(
+      this.now().getTime(),
+      Date.parse(task.updatedAt) + 1,
+    )).toISOString();
+  }
+
+  private appendSteeringEntry(
+    task: OpsWorkerTask,
+    entry: OpsWorkerSteeringEntry,
+  ): boolean {
+    const existing = task.steering.find(
+      (candidate) => candidate.steeringId === entry.steeringId,
+    );
+    if (existing) {
+      if (
+        existing.receivedAt === entry.receivedAt
+        && existing.kind === entry.kind
+        && existing.operatorRef === entry.operatorRef
+        && existing.text === entry.text
+        && (
+          existing.consumedAt === entry.consumedAt
+          || entry.consumedAt === null
+        )
+      ) return false;
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Steering id ${JSON.stringify(entry.steeringId)} conflicts with its durable record`,
+      );
+    }
+    if (isOpsWorkerTerminalState(task.state)) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing new steering for terminal task ${task.id}`,
+      );
+    }
+    if (task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Task steering exceeds ${OPS_WORKER_LIMITS.maxSteeringEntries} entries`,
+      );
+    }
+    task.steering.push(structuredClone(entry));
+    task.verification = null;
+    if (
+      task.state === "CHECKING"
+      && (entry.kind === "correction" || entry.kind === "answer")
+    ) {
+      task.state = "RESUMABLE";
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+    }
+    return true;
+  }
+
+  private assertSteeringCapacity(task: OpsWorkerTask): void {
+    if (
+      Buffer.byteLength(serializeOpsWorkerPendingSteering(task.steering).text, "utf8")
+        > OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes
+      ||
+      Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8")
+      > OPS_WORKER_LIMITS.maxSnapshotBytes
+        - OPS_WORKER_LIMITS.minRuntimeMutationHeadroomBytes
+    ) {
+      throw new OpsWorkerSteeringCapacityError(task.id);
+    }
   }
 
   private ensureSafeDirectories(): void {
@@ -832,7 +1297,67 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+  private assertReplaySafety(
+    existing: OpsWorkerTask,
+    replacement: OpsWorkerTask,
+    allowedDeliveryReceipt?: OpsWorkerDeliveryReceipt,
+  ): void {
+    if (
+      isOpsWorkerTerminalState(existing.state)
+      && replacement.steering.length !== existing.steering.length
+    ) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing new steering for terminal task ${existing.id}`,
+      );
+    }
+    if (replacement.steering.length < existing.steering.length) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Refusing to erase steering history for task ${existing.id}`,
+      );
+    }
+    for (let index = 0; index < existing.steering.length; index += 1) {
+      const prior = existing.steering[index];
+      const next = replacement.steering[index];
+      if (
+        next === undefined
+        || prior.steeringId !== next.steeringId
+        || prior.receivedAt !== next.receivedAt
+        || prior.kind !== next.kind
+        || prior.operatorRef !== next.operatorRef
+        || prior.text !== next.text
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase, reorder, or change steering entry ${prior.steeringId}`,
+        );
+      }
+      if (
+        prior.consumedAt !== null
+        && next.consumedAt !== prior.consumedAt
+      ) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to change consumed steering entry ${prior.steeringId}`,
+        );
+      }
+    }
+    const existingDeliveryReceipts = serializedDeliveryReceipts(existing);
+    const replacementDeliveryReceipts = serializedDeliveryReceipts(replacement);
+    for (const receipt of existingDeliveryReceipts) {
+      if (!replacementDeliveryReceipts.has(receipt)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase durable delivery receipt from task ${existing.id}`,
+        );
+      }
+    }
+    const allowedReceipt = allowedDeliveryReceipt === undefined
+      ? undefined
+      : JSON.stringify(allowedDeliveryReceipt);
+    for (const receipt of replacementDeliveryReceipts) {
+      if (!existingDeliveryReceipts.has(receipt) && receipt !== allowedReceipt) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing caller-supplied delivery receipt for task ${existing.id}`,
+        );
+      }
+    }
     const priorAuthorization = existing.authorizationVerification;
     const nextAuthorization = replacement.authorizationVerification;
     if (priorAuthorization !== null) {
@@ -990,15 +1515,6 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertCanonicalSubmission(existing: OpsWorkerTask, replay: OpsWorkerTask): void {
-    if (existing.submissionFingerprint !== replay.submissionFingerprint) {
-      throw new OpsWorkerDeliveryConflictError(
-        replay.source.deliveryKey,
-        existing.id,
-      );
-    }
-  }
-
   private withReplacement(
     tasks: readonly OpsWorkerTask[],
     replacement: OpsWorkerTask,
@@ -1022,13 +1538,27 @@ export class OpsWorkerTaskStore {
     const activeCorrelationOwners = new Map<string, string>();
     const heldOwners: string[] = [];
     for (const task of tasks) {
-      const deliveryOwner = deliveryOwners.get(task.source.deliveryKey);
-      if (deliveryOwner && deliveryOwner !== task.id) {
-        throw new OpsWorkerTaskStoreSafetyError(
-          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
-        );
+      const taskDeliveryKeys = new Set([task.source.deliveryKey]);
+      for (const evidence of task.evidence) {
+        const receipt = parseDeliveryReceipt(evidence);
+        if (receipt) {
+          if (task.source.kind !== "alertmanager") {
+            throw new OpsWorkerTaskStoreSafetyError(
+              `Non-Alertmanager task ${task.id} contains a delivery receipt`,
+            );
+          }
+          taskDeliveryKeys.add(receipt.deliveryKey);
+        }
       }
-      deliveryOwners.set(task.source.deliveryKey, task.id);
+      for (const deliveryKey of taskDeliveryKeys) {
+        const deliveryOwner = deliveryOwners.get(deliveryKey);
+        if (deliveryOwner && deliveryOwner !== task.id) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Multiple tasks own delivery key ${JSON.stringify(deliveryKey)}`,
+          );
+        }
+        deliveryOwners.set(deliveryKey, task.id);
+      }
 
       if (!isOpsWorkerTerminalState(task.state)) {
         const correlationOwner = activeCorrelationOwners.get(task.source.correlationKey);

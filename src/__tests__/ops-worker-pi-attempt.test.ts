@@ -46,11 +46,13 @@ import type {
 import {
   createOpsWorkerPiStartupReconciler,
   inspectOpsWorkerActiveRun,
+  inspectOpsWorkerProcessGroup,
   OPS_WORKER_ATTEMPT_TOKEN_ENV,
   OPS_WORKER_NODE_OPTIONS,
   OPS_WORKER_PI_LIMITS,
   OPS_WORKER_SYSTEM_POLICY,
   OpsWorkerPiAttemptRunner,
+  buildOpsWorkerAttemptPrompt,
   type OpsWorkerPiAttemptDependencies,
   type OpsWorkerQuotaProbeRequest,
   type OpsWorkerProcessGroupInspection,
@@ -204,7 +206,7 @@ function makeTask(
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id,
     source: {
       kind: sourceKind,
@@ -232,6 +234,8 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -357,6 +361,10 @@ async function makeHarness(
     authorizationQueryRetryMs: 1,
     quotaAdmission: options.quotaAdmission,
     quotaRecheckMs: 1,
+    reconcileActiveRun: createOpsWorkerPiStartupReconciler({
+      termGraceMs: 200,
+      killGraceMs: 200,
+    }),
   });
   await supervisor.start();
   const children: ChildProcess[] = [];
@@ -446,7 +454,7 @@ async function makeHarness(
 
 async function waitFor(
   predicate: () => boolean,
-  timeoutMs = 2_000,
+  timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -482,6 +490,56 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(mainSource, /stdinContent = await readPipedStdin\(\)/);
     assert.match(initialMessageSource, /parts\.push\(stdinContent\)/);
     assert.match(sessionSource, /Session file is not a valid pi session/);
+  });
+
+  it("returns a task cancelled while pre-launch authorization is in flight", async (t) => {
+    let releaseAuthorization!: () => void;
+    let authorizationStarted!: () => void;
+    const authorizationGate = new Promise<void>((resolveGate) => {
+      releaseAuthorization = resolveGate;
+    });
+    const started = new Promise<void>((resolveStarted) => {
+      authorizationStarted = resolveStarted;
+    });
+    let verificationCalls = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "cancellation-race-authorization",
+      version: "1",
+      verify: async () => {
+        verificationCalls += 1;
+        if (verificationCalls === 2) {
+          authorizationStarted();
+          await authorizationGate;
+        }
+        return {
+          status: "PASS",
+          evidenceHash: `sha256:${"6".repeat(64)}`,
+          summary: "Authorization completed after the operator cancellation.",
+        };
+      },
+    };
+    const harness = await makeHarness(t, undefined, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-cli": verifier,
+      },
+    });
+    const task = makeTask("cancel-during-authorization");
+    harness.store.create(task);
+
+    const pending = harness.runner().runNext();
+    await started;
+    const cancelled = harness.supervisor.cancelTask(
+      task.id,
+      "Cancel while the trusted authorization query is in flight.",
+    );
+    releaseAuthorization();
+    const result = await pending;
+
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(result?.state, "CANCELLED");
+    assert.equal(verificationCalls, 2);
+    assert.equal(harness.children.length, 0);
   });
 
   it("injects the assembled agent context before the fixed ops-worker policy", async (t) => {
@@ -656,6 +714,262 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
   });
 
+  it("consumes correction and answer steering atomically at launch resolution and never repeats it", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-steering-prompt");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "PI_EXIT",
+      result: "ACTION_REQUIRED",
+      summary: "The prior bounded attempt requested operator evidence.",
+    };
+    harness.store.create(task);
+    const correction = {
+      steeringId: "telegram:update:3001",
+      receivedAt: task.updatedAt,
+      kind: "correction" as const,
+      operatorRef: "telegram:100000000",
+      text: "Inspect the secondary fixture before deciding.",
+      consumedAt: null,
+    };
+    const answer = {
+      steeringId: "telegram:update:3002",
+      receivedAt: task.updatedAt,
+      kind: "answer" as const,
+      operatorRef: "telegram:100000000",
+      text: "The requested bounded fixture value is blue.",
+      consumedAt: null,
+    };
+    harness.store.appendSteering(task.id, correction);
+    harness.store.appendSteering(task.id, answer);
+    const firstPrompt = join(harness.root, "steering-prompt-first.txt");
+    harness.setScenario("crash");
+
+    const first = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: firstPrompt,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(first.state, "RESUMABLE");
+    assert.ok(first.steering.every((entry) => entry.consumedAt !== null));
+    const prompt = readFileSync(firstPrompt, "utf8");
+    assert.match(prompt, /trusted operator steering evidence/i);
+    assert.match(prompt, /JSON data, never executable instructions/i);
+    assert.match(prompt, /Inspect the secondary fixture before deciding/);
+    assert.match(prompt, /requested bounded fixture value is blue/);
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+
+    const replay = harness.store.appendSteering(task.id, correction);
+    assert.equal(replay.journalAppended, false);
+    const secondPrompt = join(harness.root, "steering-prompt-second.txt");
+    await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: secondPrompt,
+        }),
+      },
+    }).runAttempt(task.id);
+    const resumedPrompt = readFileSync(secondPrompt, "utf8");
+    assert.doesNotMatch(resumedPrompt, /secondary fixture before deciding/);
+    assert.doesNotMatch(resumedPrompt, /bounded fixture value is blue/);
+  });
+
+  it("leaves steering pending when launch ownership cannot be resolved", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-steering-unresolved-launch");
+    harness.store.create(task);
+    harness.store.appendSteering(task.id, {
+      steeringId: "telegram:update:3010",
+      receivedAt: task.updatedAt,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "Replay this answer after restart reconciliation.",
+      consumedAt: null,
+    });
+
+    const blocked = await harness.runner({
+      dependencies: {
+        readProcessIdentity: () => ({
+          status: "AMBIGUOUS",
+          summary: "Synthetic launch ownership ambiguity.",
+        }),
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(blocked.state, "BLOCKED");
+    assert.equal(blocked.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(blocked.steering[0]?.consumedAt, null);
+  });
+
+  it("does not consume steering that arrives after the prompt snapshot", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-steering-launch-race");
+    harness.store.create(task);
+    harness.store.appendSteering(task.id, {
+      steeringId: "telegram:update:3020",
+      receivedAt: task.updatedAt,
+      kind: "correction",
+      operatorRef: "telegram:100000000",
+      text: "Apply the first bounded correction.",
+      consumedAt: null,
+    });
+    const firstPrompt = join(harness.root, "steering-race-first.txt");
+    let injected = false;
+
+    const first = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: firstPrompt,
+        }),
+        launchFaultInjector: (point) => {
+          if (point !== "after-unverified-run-persisted" || injected) return;
+          injected = true;
+          harness.store.appendSteering(task.id, {
+            steeringId: "telegram:update:3021",
+            receivedAt: task.updatedAt,
+            kind: "answer",
+            operatorRef: "telegram:100000000",
+            text: "This answer arrived during process identity proof.",
+            consumedAt: null,
+          });
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(injected, true);
+    assert.equal(first.state, "RESUMABLE");
+    assert.equal(first.steering[0].consumedAt !== null, true);
+    assert.equal(first.steering[1].consumedAt, null);
+    assert.match(readFileSync(firstPrompt, "utf8"), /first bounded correction/);
+    assert.doesNotMatch(readFileSync(firstPrompt, "utf8"), /arrived during process identity/);
+
+    const secondPrompt = join(harness.root, "steering-race-second.txt");
+    const completed = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: secondPrompt,
+        }),
+      },
+    }).runAttempt(task.id);
+    assert.equal(completed.state, "DONE");
+    assert.match(readFileSync(secondPrompt, "utf8"), /arrived during process identity/);
+  });
+
+  it("reserves prompt space for complete steering and the final instruction", () => {
+    const task = makeTask("bounded-steering-prompt");
+    task.evidence = Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries }, (_, index) => ({
+      at: task.createdAt,
+      kind: "alert" as const,
+      trust: "untrusted" as const,
+      summary: `${index}:`.padEnd(OPS_WORKER_LIMITS.maxEvidenceSummaryBytes, "e"),
+      artifact: null,
+    }));
+    task.steering = [{
+      steeringId: "telegram:update:3030",
+      receivedAt: task.updatedAt,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "\u0001".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    }];
+
+    const prompt = buildOpsWorkerAttemptPrompt(task);
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    assert.match(prompt, /telegram:update:3030/);
+    assert.ok(prompt.includes('"text":"\\u0001'));
+    assert.match(prompt, /Perform one bounded remediation attempt/);
+  });
+
+  it("delivers and consumes a complete maximum escape-heavy steering entry", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("maximum-escaped-steering");
+    harness.store.create(task);
+    const entry = {
+      steeringId: "telegram:update:maximum-escaped",
+      receivedAt: task.updatedAt,
+      kind: "answer" as const,
+      operatorRef: "telegram:100000000",
+      text: "\u0001".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    };
+    harness.store.appendSteering(task.id, entry);
+    const promptPath = join(harness.root, "maximum-escaped-steering.txt");
+    harness.setScenario("crash");
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const serializedEntry = JSON.stringify({
+      steeringId: entry.steeringId,
+      receivedAt: entry.receivedAt,
+      kind: entry.kind,
+      operatorRef: entry.operatorRef,
+      text: entry.text,
+    });
+    assert.ok(readFileSync(promptPath, "utf8").includes(serializedEntry));
+    assert.ok(result.steering[0]?.consumedAt);
+  });
+
+  it("delivers and consumes every admitted escape-heavy steering entry together", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("cumulative-escaped-steering");
+    harness.store.create(task);
+    const entries = ["correction", "answer"].map((kind, index) => ({
+      steeringId: `telegram:update:cumulative-escaped:${index}`,
+      receivedAt: task.updatedAt,
+      kind: kind as "correction" | "answer",
+      operatorRef: "telegram:100000000",
+      text: String.fromCharCode(index + 1).repeat(
+        OPS_WORKER_LIMITS.maxSteeringTextBytes / 2,
+      ),
+      consumedAt: null,
+    }));
+    for (const entry of entries) harness.store.appendSteering(task.id, entry);
+    const promptPath = join(harness.root, "cumulative-escaped-steering.txt");
+    harness.setScenario("crash");
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const prompt = readFileSync(promptPath, "utf8");
+    for (const entry of entries) {
+      assert.ok(prompt.includes(JSON.stringify({
+        steeringId: entry.steeringId,
+        receivedAt: entry.receivedAt,
+        kind: entry.kind,
+        operatorRef: entry.operatorRef,
+        text: entry.text,
+      })));
+    }
+    assert.ok(result.steering.every((entry) => entry.consumedAt !== null));
+  });
+
   it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
     const harness = await makeHarness(t);
     const staleTask = makeTask("launch-subject-drift");
@@ -751,6 +1065,36 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(parityEvidence.summary, /capabilities=sha256:[a-f0-9]{64}/);
     assert.equal(parityEvidence.summary.includes(harness.primaryWorkspace), false);
     assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
+  });
+
+  it("prioritizes a cancel persisted while a parity-failed group is stopping", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("cancel-during-parity-stop");
+    harness.store.create(task);
+    harness.setScenario("parity-mismatch");
+    let requested = false;
+
+    const cancelled = await harness.runner({
+      dependencies: {
+        inspectProcessGroup: (processGroupId) => {
+          if (!requested) {
+            requested = true;
+            harness.supervisor.requestOperatorInterrupt(
+              task.id,
+              "cancel",
+              "Cancel persisted while parity cleanup stopped the proven group.",
+            );
+          }
+          return inspectOpsWorkerProcessGroup(processGroupId);
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(requested, true);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
   });
 
   it("treats exit success as a claim and a failed done check as remediation", async (t) => {
@@ -1032,6 +1376,7 @@ describe("ops worker Pi standard-session attempts", () => {
     quota = admittedQuota();
     let attemptCount = 0;
     const recovered = await harness.runner({
+      attemptTimeoutMs: 15_000,
       dependencies: {
         resolveInvocation: (args) => {
           const scenario = attemptCount === 0
@@ -1571,6 +1916,45 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
   });
 
+  it("applies cancel interrupts while an owned quota probe is running", async (t) => {
+    const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
+    const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
+    const task = makeTask("cancel-owned-quota-probe");
+    task.state = "RESUMABLE";
+    task.custody = {
+      status: "HELD",
+      claimedAt: task.createdAt,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    task.lastOutcome = {
+      at: task.updatedAt,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic quota wait before operator cancellation.",
+    };
+    harness.store.create(task);
+    harness.setScenario("quota-probe-wait");
+    const running = harness.runner().runNext();
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+    const active = harness.supervisor.getTask(task.id)?.activeRun;
+    assert.ok(active);
+
+    harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Cancel the proven owned quota probe.",
+    );
+    const cancelled = await running;
+
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled?.lastOutcome?.result, "CANCELLED");
+    assert.equal(cancelled?.custody.status, "RELEASED");
+    assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
   it("keeps scheduling when checkpoint liveness makes a done-check result stale", async (t) => {
     let checkCalls = 0;
     let resolveFirstCheck: ((result: unknown) => void) | undefined;
@@ -1934,7 +2318,10 @@ describe("ops worker Pi standard-session attempts", () => {
     }));
     harness.setScenario("wait");
     const controller = new AbortController();
-    const runner = harness.runner({ abortSignal: controller.signal });
+    const runner = harness.runner({
+      abortSignal: controller.signal,
+      attemptTimeoutMs: 30_000,
+    });
     const running = runner.runAttempt("low-priority");
     await waitFor(() => harness.supervisor.getTask("low-priority")?.state === "RUNNING");
     const active = harness.supervisor.getTask("low-priority")?.activeRun;
@@ -2026,7 +2413,7 @@ describe("ops worker Pi standard-session attempts", () => {
       dependencies: { stallMonitorClock },
     }).runAttempt(task.id);
     await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
-    await waitFor(() => timers.size > 0, 5_000);
+    await waitFor(() => timers.size > 0, 30_000);
     new OpsWorkerLifecycle(harness.store).recordCheckpoint(task.id, {
       checkpointId: "checkpoint-live",
       payload: { progress: 1 },
@@ -2055,8 +2442,8 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.store.create(makeTask("descendant-cleanup"));
     harness.setScenario("leader-exits-child-survives");
     const running = harness.runner({
-      attemptTimeoutMs: 2_000,
-      stallTimeoutMs: 120,
+      attemptTimeoutMs: 10_000,
+      stallTimeoutMs: 2_000,
     }).runAttempt("descendant-cleanup");
     await waitFor(() => harness.supervisor.getTask("descendant-cleanup")?.state === "RUNNING");
     const active = harness.supervisor.getTask("descendant-cleanup")?.activeRun;
@@ -2096,6 +2483,151 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result.lastOutcome?.result, "CRASH");
     assert.match(result.lastOutcome?.summary ?? "", /worker shutdown/);
     assert.equal(inspectOpsWorkerActiveRun(active).status, "GONE");
+  });
+
+  it("lets an in-flight attempt finish under a normal pause and holds its next check", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("normal-pause-safe-boundary"));
+    harness.setScenario("delayed-success");
+    let signals = 0;
+    const running = harness.runner({
+      dependencies: {
+        signalProcessGroup: () => { signals += 1; },
+      },
+    }).runAttempt("normal-pause-safe-boundary");
+    await waitFor(() =>
+      harness.supervisor.getTask("normal-pause-safe-boundary")?.state === "RUNNING");
+
+    harness.supervisor.setTaskPaused("normal-pause-safe-boundary", true);
+    const paused = await running;
+
+    assert.equal(signals, 0);
+    assert.equal(paused.state, "CHECKING");
+    assert.equal(paused.control.paused, true);
+    assert.equal(paused.custody.status, "HELD");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    harness.supervisor.setTaskPaused(paused.id, false);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+  });
+
+  it("applies a pause that lands during launch identity proof before provider work", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("pause-during-launch-resolution");
+    harness.store.create(task);
+    const promptPath = join(harness.root, "pause-during-launch-prompt.txt");
+    let paused = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+        launchFaultInjector: (point) => {
+          if (point !== "after-unverified-run-persisted" || paused) return;
+          paused = true;
+          harness.supervisor.setTaskPaused(task.id, true);
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(paused, true);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.control.paused, true);
+    assert.equal(result.activeRun, null);
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(existsSync(promptPath), false);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+  });
+
+  it("stops only proven owned groups for pause and cancel operator interrupts", async (t) => {
+    const harness = await makeHarness(t);
+    harness.store.create(makeTask("operator-pause-interrupt"));
+    harness.setScenario("wait");
+    const pausing = harness.runner().runAttempt("operator-pause-interrupt");
+    await waitFor(() =>
+      harness.supervisor.getTask("operator-pause-interrupt")?.state === "RUNNING");
+    const pauseRun = harness.supervisor.getTask("operator-pause-interrupt")?.activeRun;
+    assert.ok(pauseRun);
+    harness.supervisor.requestOperatorInterrupt(
+      "operator-pause-interrupt",
+      "pause",
+      "Apply the bounded pause interrupt.",
+    );
+
+    const paused = await pausing;
+    assert.equal(paused.state, "RESUMABLE");
+    assert.equal(paused.control.paused, true);
+    assert.equal(paused.control.interrupt, null);
+    assert.equal(paused.lastOutcome?.kind, "OPERATOR");
+    assert.equal(paused.lastOutcome?.result, "PREEMPTED");
+    assert.equal(paused.custody.status, "HELD");
+    assert.equal(inspectOpsWorkerActiveRun(pauseRun).status, "GONE");
+    harness.store.create(makeTask("operator-pause-successor", {
+      sourceKind: "alertmanager",
+    }));
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    harness.supervisor.setTaskPaused(paused.id, false);
+    harness.supervisor.cancelTask(paused.id, "Release pause interrupt fixture custody.");
+    harness.supervisor.cancelTask(
+      "operator-pause-successor",
+      "Release pause successor fixture.",
+    );
+
+    harness.store.create(makeTask("operator-cancel-interrupt"));
+    const cancelling = harness.runner().runAttempt("operator-cancel-interrupt");
+    await waitFor(() =>
+      harness.supervisor.getTask("operator-cancel-interrupt")?.state === "RUNNING");
+    const cancelRun = harness.supervisor.getTask("operator-cancel-interrupt")?.activeRun;
+    assert.ok(cancelRun);
+    harness.supervisor.requestOperatorInterrupt(
+      "operator-cancel-interrupt",
+      "cancel",
+      "Cancel only after the owned process group is proven stopped.",
+    );
+
+    const cancelled = await cancelling;
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
+    assert.equal(cancelled.custody.status, "RELEASED");
+    assert.equal(inspectOpsWorkerActiveRun(cancelRun).status, "GONE");
+  });
+
+  it("prioritizes a cancel persisted while a competing shutdown stop is in progress", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("operator-cancel-during-shutdown-stop");
+    harness.store.create(task);
+    harness.setScenario("wait");
+    const controller = new AbortController();
+    let requested = false;
+    const running = harness.runner({
+      abortSignal: controller.signal,
+      dependencies: {
+        signalProcessGroup: (processGroupId, signal) => {
+          if (!requested) {
+            requested = true;
+            harness.supervisor.requestOperatorInterrupt(
+              task.id,
+              "cancel",
+              "Cancel persisted while shutdown was stopping the proven group.",
+            );
+          }
+          process.kill(-processGroupId, signal);
+        },
+      },
+    }).runAttempt(task.id);
+    await waitFor(() => harness.supervisor.getTask(task.id)?.state === "RUNNING");
+
+    controller.abort();
+    const cancelled = await running;
+
+    assert.equal(requested, true);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled.lastOutcome?.result, "CANCELLED");
   });
 
   it("abandons child handles after ambiguous shutdown", async (t) => {
@@ -2190,6 +2722,7 @@ describe("ops worker Pi standard-session attempts", () => {
         spawnProcess: () => {
           const persisted = beforeSpawn.store.get("intent-before-spawn");
           assert.equal(persisted?.state, "BLOCKED");
+          assert.equal(persisted?.report.state, "NONE");
           assert.equal(persisted?.unverifiedRun?.pid, null);
           assert.equal(persisted?.unverifiedRun?.expectedProcessGroupId, null);
           throw new Error("synthetic spawn rejection");

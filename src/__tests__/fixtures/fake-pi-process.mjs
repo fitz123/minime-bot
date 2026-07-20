@@ -9,9 +9,16 @@ import {
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readExpectedOpsWorkerParityContract } from "../../pi-extensions/ops-worker-parity-attestation.js";
 
 const [scenario, ...args] = process.argv.slice(2);
+if (scenario === "partial-progress-rc1") {
+  process.stdout.write("fake Pi retained partial checkpoint progress\n");
+  process.stderr.write("fake Pi exited rc=1 after partial progress\n");
+  process.exit(1);
+}
+const { readExpectedOpsWorkerParityContract } = await import(
+  "../../pi-extensions/ops-worker-parity-attestation.js"
+);
 const quotaProbe = scenario.startsWith("quota-probe-");
 let privatePrompt = "";
 for await (const chunk of process.stdin) privatePrompt += chunk.toString();
@@ -175,7 +182,7 @@ const beforeEvent = {
 for (const handler of handlers.get("before_agent_start") ?? []) {
   await handler(beforeEvent, {});
 }
-const parityDeadline = Date.now() + 5_000;
+const parityDeadline = Date.now() + 30_000;
 while (Date.now() < parityDeadline) {
   if (
     existsSync(parityAckPath)
@@ -213,6 +220,11 @@ switch (scenario) {
   case "success-diagnostic":
     await emitProviderResponse(200, {});
     process.stdout.write("Investigated a prior HTTP 429 and maximum context length message successfully.\n");
+    break;
+  case "delayed-success":
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+    await emitProviderResponse(200, {});
+    process.stdout.write("fake Pi delayed success claim\n");
     break;
   case "success-missing-telemetry":
     process.stdout.write("fake Pi exited without response telemetry\n");
@@ -316,12 +328,15 @@ switch (scenario) {
   case "leader-exits-child-survives": {
     const descendant = spawn(
       process.execPath,
-      ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
-      { stdio: "ignore" },
+      [
+        "-e",
+        "process.on('SIGTERM',()=>{});process.stdout.write('ready\\n');setInterval(()=>{},1000)",
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
     );
-    setTimeout(() => {
+    descendant.stdout.once("data", () => {
       process.stdout.write(`descendant-ready:${String(descendant.pid)}\n`);
-    }, 50);
+    });
     setInterval(() => undefined, 1_000);
     break;
   }

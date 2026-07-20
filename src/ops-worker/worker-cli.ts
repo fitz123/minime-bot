@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
+import type { ResolveSecretOptions } from "../secrets.js";
 import {
   hasFreshOpsWorkerAuthorizationPass,
   OpsWorkerAuthorizationCoordinator,
@@ -30,6 +31,14 @@ import {
   type OpsWorkerSupervisorLockRecord,
 } from "./supervisor.js";
 import { OpsWorkerTaskStore } from "./task-store.js";
+import { loadOpsWorkerControlConfig } from "./control-config.js";
+import { OpsWorkerAlertmanagerIntake } from "./alertmanager-intake.js";
+import { OpsWorkerControlLedger } from "./control-ledger.js";
+import { assertOpsAlertmanagerIntakeContracts } from "./ops-contracts.js";
+import {
+  OpsWorkerTelegramControl,
+  type OpsWorkerTelegramFetch,
+} from "./telegram-control.js";
 import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
@@ -84,6 +93,10 @@ export interface OpsWorkerCliDependencies {
   quotaAdmission?: OpsWorkerQuotaAdmissionGate;
   abortSignal?: AbortSignal;
   schedulerPollMs?: number;
+  controlConfigEnv?: NodeJS.ProcessEnv;
+  controlConfigSecretResolver?: (options: ResolveSecretOptions) => string;
+  telegramFetch?: OpsWorkerTelegramFetch;
+  telegramSleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 }
 
 export interface RunOpsWorkerCliOptions {
@@ -125,12 +138,13 @@ const WORKER_VALUE_OPTIONS = new Set([
   "artifact",
   "boundary",
   "checkpoint-id",
+  "control-config",
 ]);
 
 const WORKER_BOOL_OPTIONS = new Set(["json", "once"]);
 
 const WORKER_ACTION_OPTIONS: Readonly<Record<string, readonly string[]>> = {
-  start: ["state-dir", "agent-workspace", "host", "port", "once"],
+  start: ["state-dir", "agent-workspace", "host", "port", "control-config", "once"],
   status: ["state-dir", "json"],
   list: ["state-dir", "json"],
   inspect: ["state-dir", "id", "json"],
@@ -425,6 +439,25 @@ function inspectPolicy(deps: ReturnType<typeof dependencies>) {
   });
 }
 
+export function assertOpsWorkerStartAuthorizationVerifiers(
+  taskRegistry: OpsWorkerTaskContractRegistry,
+  authorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry | undefined,
+): void {
+  const sourceKinds = new Set([
+    ...Object.values(taskRegistry.templates)
+      .flatMap((template) => template.sourceKinds),
+    ...Object.values(taskRegistry.authorizationProfiles)
+      .flatMap((profile) => profile.sourceKinds),
+  ]);
+  for (const sourceKind of sourceKinds) {
+    if (!authorizationVerifiers?.[sourceKind]) {
+      throw new TypeError(
+        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
+      );
+    }
+  }
+}
+
 function assertStartPolicyDependencies(
   deps: ReturnType<typeof dependencies>,
 ): asserts deps is ReturnType<typeof dependencies> & {
@@ -437,19 +470,10 @@ function assertStartPolicyDependencies(
       "Ops-worker start requires trusted primaryContextAgent, primaryPiResources, and quotaAdmission dependencies",
     );
   }
-  const sourceKinds = new Set([
-    ...Object.values(deps.taskRegistry.templates)
-      .flatMap((template) => template.sourceKinds),
-    ...Object.values(deps.taskRegistry.authorizationProfiles)
-      .flatMap((profile) => profile.sourceKinds),
-  ]);
-  for (const sourceKind of sourceKinds) {
-    if (!deps.authorizationVerifiers?.[sourceKind]) {
-      throw new TypeError(
-        `Ops-worker start is missing a trusted authorization verifier for ${sourceKind}`,
-      );
-    }
-  }
+  assertOpsWorkerStartAuthorizationVerifiers(
+    deps.taskRegistry,
+    deps.authorizationVerifiers,
+  );
   inspectPolicy(deps);
 }
 
@@ -537,6 +561,8 @@ function createTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -661,17 +687,66 @@ async function runStart(
   const directory = stateDirectory(parsed, cliOptions.cwd);
   const workspace = resolveCliPath(requiredValue(parsed, "agent-workspace"), cliOptions.cwd);
   assertStartPolicyDependencies(deps);
-  const host = parsed.values.get("host") ?? DEFAULT_OPS_WORKER_STATUS_HOST;
-  const port = parsePort(parsed.values.get("port"));
+  const controlConfigPath = parsed.values.get("control-config");
+  const controlConfig = controlConfigPath === undefined
+    ? undefined
+    : loadOpsWorkerControlConfig(resolveCliPath(controlConfigPath, cliOptions.cwd), {
+      env: deps.controlConfigEnv,
+      resolveSecret: deps.controlConfigSecretResolver,
+    });
+  const configuredIntake = controlConfig?.intake;
+  const intakeBearerToken = configuredIntake?.bearerToken;
+  if (configuredIntake !== undefined) {
+    assertOpsAlertmanagerIntakeContracts(
+      deps.taskRegistry,
+      deps.doneChecks,
+      deps.authorizationVerifiers,
+    );
+  }
+  const requestedHost = parsed.values.get("host");
+  const requestedPort = parsed.values.get("port");
+  if (configuredIntake !== undefined) {
+    if (requestedHost !== undefined && requestedHost !== configuredIntake.host) {
+      throw new OpsWorkerCliUsageError(
+        "--host must match intake.host because intake extends the existing status server",
+      );
+    }
+    if (requestedPort !== undefined && parsePort(requestedPort) !== configuredIntake.port) {
+      throw new OpsWorkerCliUsageError(
+        "--port must match intake.port because intake extends the existing status server",
+      );
+    }
+  }
+  const host = configuredIntake?.host ?? requestedHost ?? DEFAULT_OPS_WORKER_STATUS_HOST;
+  const port = configuredIntake?.port ?? parsePort(requestedPort);
   const store = createStore(directory, deps);
+  const alertmanagerIntake = configuredIntake === undefined
+    ? undefined
+    : new OpsWorkerAlertmanagerIntake({
+        store,
+        doneChecks: deps.doneChecks,
+        sourceIdentity: configuredIntake.sourceIdentity,
+        now: deps.now,
+      });
   const supervisor = createSupervisor(store, deps);
   let started = false;
   let statusServer: Awaited<ReturnType<typeof startOpsWorkerStatusServer>> | undefined;
   let processAbort: ReturnType<typeof installProcessAbortSignal> | undefined;
+  let controlAbort: AbortController | undefined;
+  let removeOuterAbort: (() => void) | undefined;
   try {
     processAbort = deps.abortSignal ? undefined : installProcessAbortSignal();
-    const signal = deps.abortSignal ?? processAbort?.signal;
-    if (!signal) throw new Error("Ops-worker abort signal was not initialized");
+    const outerSignal = deps.abortSignal ?? processAbort?.signal;
+    if (!outerSignal) throw new Error("Ops-worker abort signal was not initialized");
+    let signal = outerSignal;
+    if (controlConfig !== undefined) {
+      controlAbort = new AbortController();
+      const abortControl = (): void => controlAbort?.abort();
+      if (outerSignal.aborted) abortControl();
+      else outerSignal.addEventListener("abort", abortControl, { once: true });
+      removeOuterAbort = () => outerSignal.removeEventListener("abort", abortControl);
+      signal = controlAbort.signal;
+    }
     const runner = new OpsWorkerPiAttemptRunner({
       supervisor,
       workspaceCwd: workspace,
@@ -687,13 +762,32 @@ async function runStart(
       host,
       port,
       inspectPolicy: () => inspectPolicy(deps),
+      ...(alertmanagerIntake === undefined || intakeBearerToken === undefined
+        ? {}
+        : {
+            alertmanagerIntake: {
+              intake: alertmanagerIntake,
+              bearerTokenProvider: () => intakeBearerToken,
+            },
+          }),
     });
+    const telegramControl = controlConfig === undefined
+      ? undefined
+      : new OpsWorkerTelegramControl({
+        config: controlConfig,
+        supervisor,
+        ledger: new OpsWorkerControlLedger(directory),
+        fetch: deps.telegramFetch,
+        inspectPolicy: () => inspectPolicy(deps),
+        sleep: deps.telegramSleep,
+      });
     writeLine(
       cliOptions.stdout,
     `Ops worker started; status http://${statusServer.host.includes(":") ? `[${statusServer.host}]` : statusServer.host}:${statusServer.port}/status`,
     );
     if (parsed.flags.has("once")) {
       const result = await runner.runNext();
+      await telegramControl?.tick(signal);
       writeLine(
         cliOptions.stdout,
         result ? `Processed ${result.id}: ${result.state}` : "No eligible ops-worker task.",
@@ -701,12 +795,28 @@ async function runStart(
       return 0;
     }
     const pollMs = validateSchedulerPollMs(deps.schedulerPollMs);
-    while (!signal.aborted) {
-      const result = await runner.runNext();
-      if (!result) await abortableDelay(pollMs, signal);
+    const schedulerLoop = async (): Promise<void> => {
+      while (!signal.aborted) {
+        const result = await runner.runNext();
+        if (!result) await abortableDelay(pollMs, signal);
+      }
+    };
+    if (!telegramControl) {
+      await schedulerLoop();
+      return 0;
+    }
+    const loops = [schedulerLoop(), telegramControl.run(signal)];
+    try {
+      await Promise.all(loops);
+    } catch (error) {
+      controlAbort?.abort();
+      await Promise.allSettled(loops);
+      throw error;
     }
     return 0;
   } finally {
+    controlAbort?.abort();
+    removeOuterAbort?.();
     processAbort?.close();
     await statusServer?.close();
     if (started) supervisor.close();

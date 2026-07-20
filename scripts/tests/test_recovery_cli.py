@@ -554,7 +554,13 @@ class RecoveryCliTests(unittest.TestCase):
     def test_retained_commands_are_bounded_and_removed_commands_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_config(root)
+            document = config_document()
+            assert isinstance(document["slotPolicy"], dict)
+            unavailable_node = root / "unavailable-node"
+            document["slotPolicy"]["nodeExecutable"] = str(unavailable_node)
+            (root / "recovery.json").write_text(
+                json.dumps(document), encoding="utf-8"
+            )
 
             code, output, error = call_cli(root, "config", "validate")
             self.assertEqual((code, error), (0, ""))
@@ -571,6 +577,7 @@ class RecoveryCliTests(unittest.TestCase):
                 },
             )
 
+            self.assertFalse(unavailable_node.exists())
             code, status, error = call_cli(root, "status")
             self.assertEqual((code, error), (0, ""))
             status_result = json.loads(status)

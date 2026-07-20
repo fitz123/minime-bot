@@ -38,8 +38,10 @@ import {
   OpsWorkerSupervisor,
   OpsWorkerSupervisorAlreadyRunningError,
   OpsWorkerSupervisorStateError,
+  type OpsWorkerStartupRunResult,
 } from "../ops-worker/supervisor.js";
 import {
+  OPS_WORKER_LIMITS,
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
@@ -135,7 +137,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id,
     source: {
       kind: sourceKind,
@@ -163,6 +165,8 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,
@@ -617,6 +621,137 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-operator");
     harness.setNow(LATER);
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-later");
+  });
+
+  it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
+    const harness = await makeHarness(t, {
+      quotaAdmission: { check: () => ({
+        version: 1,
+        status: "ADMITTED",
+        reason: "HEADROOM",
+        observedAt: NOW,
+        sampledAt: NOW,
+        activeWindows: ["5h"],
+        nextResetAt: null,
+        nextProbeAt: null,
+        evidenceHash: `sha256:${"c".repeat(64)}`,
+        summary: "Fixture quota admission passed.",
+      }) },
+    });
+    const queued = makeTask("task-paused-queued", {
+      sourceKind: "authorized-issue",
+    });
+    harness.store.create(queued);
+    harness.supervisor.setTaskPaused(queued.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+
+    harness.supervisor.setTaskPaused(queued.id, false);
+    const claimed = await harness.supervisor.claimNextTask();
+    assert.equal(claimed?.action, "RUN");
+    assert.equal(claimed?.task.id, queued.id);
+    harness.supervisor.recordPreLaunchInfrastructureOutcome(
+      queued.id,
+      "Hold fixture custody at a safe boundary.",
+    );
+    harness.store.create(makeTask("task-paused-successor", {
+      sourceKind: "alertmanager",
+    }));
+    const claimedAt = harness.store.get(queued.id)?.custody.claimedAt;
+    harness.supervisor.setTaskPaused(queued.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.store.get(queued.id)?.custody.claimedAt, claimedAt);
+    assert.equal(harness.store.get("task-paused-successor")?.state, "QUEUED");
+
+    harness.setNow(LATER);
+    harness.supervisor.setTaskPaused(queued.id, false);
+    assert.equal(harness.supervisor.selectNextTask()?.task.id, queued.id);
+    harness.supervisor.cancelTask(queued.id, "Release paused RUN fixture custody.");
+    harness.supervisor.cancelTask(
+      "task-paused-successor",
+      "Release queued successor fixture.",
+    );
+
+    const checking = makeTask("task-paused-check");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    harness.store.create(checking);
+    harness.supervisor.setTaskPaused(checking.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    harness.supervisor.setTaskPaused(checking.id, false);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+    harness.supervisor.cancelTask(checking.id, "Release paused CHECK fixture custody.");
+
+    const quotaWait = makeTask("task-paused-quota");
+    quotaWait.lastOutcome = {
+      at: NOW,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA",
+      summary: "Synthetic authoritative quota wait elapsed.",
+    };
+    quotaWait.schedule.nextRunAt = NOW;
+    harness.store.create(quotaWait);
+    harness.supervisor.setTaskPaused(quotaWait.id, true);
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+    harness.supervisor.setTaskPaused(quotaWait.id, false);
+    assert.equal((await harness.supervisor.claimNextTask())?.action, "QUOTA_PROBE");
+  });
+
+  it("routes prompt-bearing steering received during CHECKING back through RUN", async (t) => {
+    const harness = await makeHarness(t);
+    const checking = makeTask("task-checking-steering");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    checking.schedule.nextCheckAt = LATER;
+    harness.store.create(checking);
+
+    const steered = harness.supervisor.appendTaskSteering(checking.id, {
+      steeringId: "telegram:update:checking-steering",
+      receivedAt: NOW,
+      kind: "correction",
+      operatorRef: "telegram:100000000",
+      text: "Apply this correction before evaluating completion again.",
+      consumedAt: null,
+    });
+
+    assert.equal(steered.state, "RESUMABLE");
+    assert.equal(steered.custody.status, "HELD");
+    assert.equal(steered.schedule.nextCheckAt, null);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "RUN");
+  });
+
+  it("consumes steering at or after its durable received timestamp", async (t) => {
+    const harness = await makeHarness(t);
+    const futureReceivedAt = "2243-10-17T00:00:00.000Z";
+    const task = makeTask("task-future-steering");
+    task.steering = [{
+      steeringId: "telegram:epoch:1:update:91",
+      receivedAt: futureReceivedAt,
+      kind: "answer",
+      operatorRef: "telegram:100000000",
+      text: "Use the trusted bounded answer.",
+      consumedAt: null,
+    }];
+    harness.store.create(task);
+
+    const running = harness.supervisor.markRunning(
+      task.id,
+      activeRun("fixture-supervisor"),
+    );
+
+    assert.equal(running.updatedAt, futureReceivedAt);
+    assert.equal(running.steering[0].consumedAt, futureReceivedAt);
+    assert.equal(running.state, "RUNNING");
   });
 
   it("atomically claims the selected task before scheduling its action", async (t) => {
@@ -1286,7 +1421,7 @@ describe("ops worker supervisor", () => {
     const completionAt = done.updatedAt;
     const failedReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
-      { sent: false, error: "Synthetic report transport failure" },
+      async () => ({ sent: false, error: "Synthetic report transport failure" }),
     );
     assert.equal(failedReport.updatedAt, completionAt);
     assert.equal(failedReport.report.attempts, 1);
@@ -1305,7 +1440,7 @@ describe("ops worker supervisor", () => {
     const firstQueryHash = failedReport.mutationReceipts.report?.queryResultHash;
     const sentReport = await harness.supervisor.recordReportAttempt(
       "task-pass",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sentReport.updatedAt, completionAt);
     assert.equal(sentReport.report.attempts, 2);
@@ -1314,7 +1449,7 @@ describe("ops worker supervisor", () => {
     assert.notEqual(sentReport.mutationReceipts.report?.queryResultHash, firstQueryHash);
     assert.equal(sentReport.mutationReceipts.report?.outcome?.result, "APPLIED");
     await assert.rejects(
-      harness.supervisor.recordReportAttempt("task-pass", { sent: true }),
+      harness.supervisor.recordReportAttempt("task-pass", async () => ({ sent: true })),
       /no pending report/,
     );
     assert.throws(
@@ -1341,7 +1476,7 @@ describe("ops worker supervisor", () => {
 
     armed = true;
     await assert.rejects(
-      harness.supervisor.recordReportAttempt("task-report-crash", { sent: true }),
+      harness.supervisor.recordReportAttempt("task-report-crash", async () => ({ sent: true })),
       /Synthetic crash after atomic report snapshot rename/,
     );
     assert.equal(renamedSnapshots, 4);
@@ -1353,6 +1488,7 @@ describe("ops worker supervisor", () => {
 
   it("revalidates after the external query and before claiming a mutation receipt", async (t) => {
     let checks = 0;
+    let sends = 0;
     const verifier: OpsWorkerAuthorizationVerifier = {
       identity: "mutation-authorization",
       version: "1",
@@ -1380,9 +1516,13 @@ describe("ops worker supervisor", () => {
 
     const done = await harness.supervisor.recordReportAttempt(
       "task-mutation-authorization",
-      { sent: true },
+      async () => {
+        sends += 1;
+        return { sent: true };
+      },
     );
     assert.equal(checks, 2);
+    assert.equal(sends, 0);
     assert.equal(done.state, "DONE");
     assert.equal(done.authorizationVerification?.status, "PASS");
     assert.equal(done.custody.releaseReason, "DONE");
@@ -1450,7 +1590,7 @@ describe("ops worker supervisor", () => {
     const immutableProof = structuredClone(done.verification);
     const sent = await terminal.supervisor.recordReportAttempt(
       "task-changing-auth-report",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sent.state, "DONE");
     assert.deepEqual(sent.verification, immutableProof);
@@ -1471,15 +1611,18 @@ describe("ops worker supervisor", () => {
     const blocked = await harness.supervisor.runDoneCheck("task-report-retry");
     assert.equal(blocked.state, "BLOCKED");
 
-    await harness.supervisor.recordReportAttempt("task-report-retry", {
+    await harness.supervisor.recordReportAttempt("task-report-retry", async () => ({
       sent: false,
       error: "Synthetic ambiguous report failure",
-    });
+    }));
     assert.throws(
       () => harness.supervisor.retryBlockedTask("task-report-retry"),
       /claimed report receipt still requires reconciliation/,
     );
-    await harness.supervisor.recordReportAttempt("task-report-retry", { sent: true });
+    await harness.supervisor.recordReportAttempt(
+      "task-report-retry",
+      async () => ({ sent: true }),
+    );
     const resumed = harness.supervisor.retryBlockedTask("task-report-retry");
     assert.equal(resumed.state, "RESUMABLE");
     assert.equal(resumed.report.state, "NONE");
@@ -1521,6 +1664,62 @@ describe("ops worker supervisor", () => {
     resolveCheck({ result: "PASS", summary: "Late fixture pass" });
     await assert.rejects(pending, OpsWorkerStaleCheckResultError);
     assert.equal(harness.store.get("task-stale")?.state, "CANCELLED");
+  });
+
+  it("starts a fresh cancellation report after a failed or exhausted BLOCKED report", async (t) => {
+    const harness = await makeHarness(t);
+    for (const taskId of ["task-cancel-failed-report", "task-cancel-exhausted-report"]) {
+      const blocked = makeTask(taskId);
+      blocked.state = "BLOCKED";
+      blocked.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: "BLOCKED",
+      };
+      blocked.lastOutcome = {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PRODUCT_FAILURE",
+        summary: "Fixture blocked before operator cancellation.",
+      };
+      blocked.report.state = "PENDING";
+      blocked.report.attempts = taskId.includes("exhausted")
+        ? OPS_WORKER_LIMITS.maxReportAttempts
+        : 0;
+      harness.store.create(blocked);
+    }
+
+    const failed = await harness.supervisor.recordReportAttempt(
+      "task-cancel-failed-report",
+      async () => ({ sent: false, error: "synthetic prior report failure" }),
+    );
+    const priorOperationId = failed.mutationReceipts.report?.operationId;
+    assert.ok(priorOperationId);
+    assert.equal(failed.mutationReceipts.report?.outcome, null);
+
+    for (const taskId of ["task-cancel-failed-report", "task-cancel-exhausted-report"]) {
+      const cancelled = harness.supervisor.cancelTask(taskId, "Operator cancelled the fixture.");
+      assert.equal(cancelled.state, "CANCELLED");
+      assert.equal(cancelled.report.state, "PENDING");
+      assert.equal(cancelled.report.attempts, 0);
+      if (taskId === "task-cancel-failed-report") {
+        assert.equal(cancelled.mutationReceipts.report?.outcome?.result, "NOT_NEEDED");
+      }
+      const sent = await harness.supervisor.recordReportAttempt(
+        taskId,
+        async () => ({ sent: true }),
+      );
+      assert.equal(sent.report.state, "SENT");
+      assert.equal(sent.report.attempts, 1);
+      if (taskId === "task-cancel-failed-report") {
+        assert.equal(
+          sent.mutationReceipts.report?.replayHistory.some((entry) =>
+            entry.operationId === priorOperationId),
+          true,
+        );
+      }
+    }
   });
 
   it("returns PRODUCT_FAILURE evidence to the same task and blocks at budget exhaustion", async (t) => {
@@ -1623,6 +1822,30 @@ describe("ops worker supervisor", () => {
     assert.ok(retained.schedule.nextCheckAt);
     assert.equal(retained.custody.status, "HELD");
     assert.equal(retained.custody.releaseReason, null);
+  });
+
+  it("waits for scheduled NOT_READY stability without spending remediation", async (t) => {
+    const harness = await makeHarness(t, {
+      implementation: () => ({
+        result: "NOT_READY",
+        summary: "The healthy fixture has not covered its fixed stability window.",
+        nextCheckAt: LATER,
+      }),
+    });
+    harness.store.create(makeTask("task-stability-wait"));
+    await harness.supervisor.requestDoneCheck("task-stability-wait");
+
+    const waiting = await harness.supervisor.runDoneCheck("task-stability-wait");
+    assert.equal(waiting.state, "CHECKING");
+    assert.equal(waiting.schedule.nextCheckAt, LATER);
+    assert.equal(waiting.rounds.remediation, 0);
+    assert.equal(waiting.verification?.outcome, "NOT_READY");
+    assert.equal(waiting.verification?.nextCheckAt, LATER);
+    assert.equal(waiting.custody.status, "HELD");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    harness.setNow(LATER);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
   });
 
   it("retries query errors and timeouts as typed verification faults with custody held", async (t) => {
@@ -1803,6 +2026,102 @@ describe("ops worker supervisor", () => {
       () => harness.supervisor.retryBlockedTask(task.id),
       /Operator retry requires BLOCKED, found RESUMABLE/,
     );
+  });
+
+  it("retains Alertmanager group correlation evidence when bounded evidence rotates", async (t) => {
+    const harness = await makeHarness(t);
+    const correlationKey = "fixture:correlated-alert-group";
+    const task = makeTask("task-correlation-evidence", {
+      sourceKind: "alertmanager",
+      correlationKey,
+    });
+    task.evidence = [
+      {
+        at: NOW,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey,
+          groupLabels: { alertname: "MinimeBotUnavailable" },
+        }),
+        artifact: null,
+      },
+      ...Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries - 1 }, (_, index) => ({
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: `Alert evidence ${index}`,
+        artifact: null,
+      })),
+    ];
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+
+    const result = harness.supervisor.recordResumableInfrastructureOutcome(
+      task.id,
+      "NETWORK",
+      "Rotate one bounded evidence entry.",
+      undefined,
+      "New Pi evidence forces bounded evidence rotation.",
+    );
+
+    assert.equal(result.evidence.length, OPS_WORKER_LIMITS.maxEvidenceEntries);
+    assert.equal(result.evidence.some((entry) =>
+      entry.summary.includes("alertmanager-group-correlation-v1")), true);
+    assert.equal(result.evidence.some((entry) => entry.summary === "Alert evidence 0"), false);
+  });
+
+  it("retains Alertmanager correlation through authorization-failure evidence rotation", async (t) => {
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: {
+        alertmanager: {
+          identity: "fixture-alertmanager-authorization",
+          version: "1",
+          verify: () => ({
+            status: "QUERY_ERROR",
+            evidenceHash: `sha256:${"d".repeat(64)}`,
+            summary: "Synthetic transient authorization query failure.",
+          }),
+        },
+      },
+    });
+    const correlationKey = "fixture:authorization-correlation";
+    const task = makeTask("task-authorization-correlation", {
+      sourceKind: "alertmanager",
+      correlationKey,
+    });
+    task.evidence = [
+      {
+        at: NOW,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey,
+          groupLabels: { alertname: "MinimeBotUnavailable" },
+        }),
+        artifact: null,
+      },
+      ...Array.from({ length: OPS_WORKER_LIMITS.maxEvidenceEntries - 1 }, (_, index) => ({
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: `Authorization alert evidence ${index}`,
+        artifact: null,
+      })),
+    ];
+    harness.store.create(task);
+
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+
+    const failed = harness.store.get(task.id);
+    assert.equal(failed?.authorizationVerification?.status, "QUERY_ERROR");
+    assert.equal(failed?.evidence.length, OPS_WORKER_LIMITS.maxEvidenceEntries);
+    assert.equal(failed?.evidence.some((entry) =>
+      entry.summary.includes("alertmanager-group-correlation-v1")), true);
+    assert.equal(failed?.evidence.some((entry) =>
+      entry.summary === "Authorization alert evidence 0"), false);
   });
 
   it("enforces one supervisor instance and at most one active process group", async (t) => {
@@ -2086,6 +2405,185 @@ describe("ops worker supervisor", () => {
     );
   });
 
+  it("keeps an interrupt durable through ambiguity and applies it after restart proves the group stopped", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-interrupt-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-first",
+    });
+    first.store.create(makeTask("task-interrupt-restart"));
+    first.supervisor.markRunning(
+      "task-interrupt-restart",
+      activeRun("interrupt-first"),
+    );
+    assert.throws(
+      () => first.supervisor.cancelTask(
+        "task-interrupt-restart",
+        "Cancellation before a proven stop must fail.",
+      ),
+      /must stop its proven process group/,
+    );
+    const requested = first.supervisor.requestOperatorInterrupt(
+      "task-interrupt-restart",
+      "cancel",
+      "Stop the proven process group before cancellation.",
+    );
+    assert.equal(requested.control.interrupt?.mode, "cancel");
+    first.close();
+
+    const ambiguous = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-ambiguous",
+      reconcileActiveRun: () => ({
+        status: "AMBIGUOUS",
+        summary: "Synthetic ownership ambiguity after restart.",
+      }),
+    });
+    const fenced = ambiguous.store.get("task-interrupt-restart");
+    assert.equal(fenced?.state, "BLOCKED");
+    assert.equal(fenced?.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(fenced?.control.interrupt?.mode, "cancel");
+    assert.throws(
+      () => ambiguous.supervisor.cancelTask(
+        "task-interrupt-restart",
+        "Unresolved orphan must retain the global fence.",
+      ),
+      /remains unresolved/,
+    );
+    ambiguous.close();
+
+    const stopped = await makeHarness(t, {
+      directory,
+      instanceId: "interrupt-stopped",
+      reconcileActiveRun: () => ({
+        status: "STOPPED",
+        summary: "The prior owned process group is proven stopped.",
+      }),
+    });
+    const cancelled = stopped.store.get("task-interrupt-restart");
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(cancelled?.lastOutcome?.result, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.custody.status, "RELEASED");
+  });
+
+  it("keeps public interrupt resolution fenced until the supervisor proves the group stopped", async (t) => {
+    let resolution: OpsWorkerStartupRunResult = {
+      status: "AMBIGUOUS",
+      summary: "Synthetic live process group remains ambiguous.",
+    };
+    const harness = await makeHarness(t, {
+      reconcileActiveRun: () => resolution,
+    });
+    const task = makeTask("task-interrupt-resolution-proof");
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const requested = harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Cancellation requires a supervisor-owned stop proof.",
+    );
+    const interrupt = requested.control.interrupt;
+    assert.ok(interrupt);
+    assert.equal("completeOperatorInterrupt" in harness.supervisor, false);
+
+    const fenced = await harness.supervisor.resolveOperatorInterrupt(task.id, interrupt);
+    assert.equal(fenced.state, "BLOCKED");
+    assert.equal(fenced.lastOutcome?.result, "AMBIGUOUS_ORPHAN");
+    assert.equal(fenced.control.interrupt?.mode, "cancel");
+    assert.ok(fenced.activeRun);
+    assert.equal(fenced.custody.status, "HELD");
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+
+    resolution = {
+      status: "STOPPED",
+      summary: "Synthetic process group is now proven stopped.",
+    };
+    const cancelled = await harness.supervisor.resolveOperatorInterrupt(task.id, interrupt);
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.control.interrupt, null);
+    assert.equal(cancelled.activeRun, null);
+    assert.equal(cancelled.custody.status, "RELEASED");
+  });
+
+  it("gates and reconciles an idle cancel persisted before its safe-boundary transition", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-idle-interrupt-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    let armed = false;
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "idle-interrupt-first",
+      faultInjector: (point) => {
+        if (armed && point === "after-snapshot-rename") {
+          armed = false;
+          throw new Error("Synthetic crash after idle interrupt persistence");
+        }
+      },
+    });
+    first.store.create(makeTask("task-idle-interrupt"));
+    armed = true;
+
+    assert.throws(
+      () => first.supervisor.requestOperatorInterrupt(
+        "task-idle-interrupt",
+        "cancel",
+        "Persist cancellation before the idle safe boundary.",
+      ),
+      /Synthetic crash after idle interrupt persistence/,
+    );
+    assert.equal(first.store.get("task-idle-interrupt")?.control.interrupt?.mode, "cancel");
+    assert.equal(first.supervisor.selectNextTask(), undefined);
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "idle-interrupt-restarted",
+    });
+    const cancelled = restarted.store.get("task-idle-interrupt");
+    assert.equal(cancelled?.state, "CANCELLED");
+    assert.equal(cancelled?.control.interrupt, null);
+    assert.equal(cancelled?.custody.status, "RELEASED");
+  });
+
+  it("applies a reconciled pause interrupt as a held safe boundary", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-pause-restart-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "pause-first",
+    });
+    first.store.create(makeTask("task-pause-restart"));
+    first.supervisor.markRunning(
+      "task-pause-restart",
+      activeRun("pause-first"),
+    );
+    first.supervisor.requestOperatorInterrupt(
+      "task-pause-restart",
+      "pause",
+      "Pause after the owned group is stopped.",
+    );
+    first.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "pause-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "The prior owned process group is proven gone.",
+      }),
+    });
+    const paused = restarted.store.get("task-pause-restart");
+    assert.equal(paused?.state, "RESUMABLE");
+    assert.equal(paused?.control.paused, true);
+    assert.equal(paused?.control.interrupt, null);
+    assert.equal(paused?.lastOutcome?.kind, "OPERATOR");
+    assert.equal(paused?.lastOutcome?.result, "PREEMPTED");
+    assert.equal(paused?.custody.status, "HELD");
+    assert.equal(restarted.supervisor.selectNextTask(), undefined);
+  });
+
   it("reconciles a quota probe fence without spending infrastructure budget", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-quota-probe-restart-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -2182,6 +2680,8 @@ describe("ops worker supervisor", () => {
         authorizationVerification: _authorizationVerification,
         verification: _verification,
         legacyCompletion: _legacyCompletion,
+        steering: _steering,
+        control: _control,
         source,
         schemaVersion: _schemaVersion,
         ...common
@@ -2255,7 +2755,7 @@ describe("ops worker supervisor", () => {
 
     const attempted = await restarted.supervisor.recordReportAttempt(
       "task-ambiguous",
-      { sent: false, error: "Fixture report transport unavailable" },
+      async () => ({ sent: false, error: "Fixture report transport unavailable" }),
     );
     assert.equal(attempted.report.attempts, 1);
     assert.equal(attempted.report.state, "PENDING");
@@ -2270,7 +2770,7 @@ describe("ops worker supervisor", () => {
     assert.equal(final.store.get("task-ambiguous")?.mutationReceipts.report?.outcome, null);
     const sent = await final.supervisor.recordReportAttempt(
       "task-ambiguous",
-      { sent: true },
+      async () => ({ sent: true }),
     );
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.report.attempts, 2);

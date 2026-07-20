@@ -19,6 +19,22 @@ import { runCliAsync } from "../cli.js";
 import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
+import {
+  OPS_AVAILABILITY_DONE_CHECK_NAME,
+  OPS_AVAILABILITY_DONE_CHECK_VERSION,
+  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+  type OpsAlertStateReading,
+  type OpsMonitoringFreshnessReading,
+  type OpsServiceAvailabilityReading,
+} from "../ops-worker/availability-checks.js";
+import {
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
+  OPS_AVAILABILITY_TEMPLATE_NAME,
+  OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+  assertOpsAlertmanagerIntakeContracts,
+  createOpsTaskContracts,
+} from "../ops-worker/ops-contracts.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
   OpsWorkerQuotaAdmissionGate,
@@ -226,6 +242,8 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(result.code, 0);
     assert.match(result.stdout, /worker start --state-dir <path> --agent-workspace <path>/);
+    assert.match(result.stdout, /--control-config <path>/);
+    assert.match(result.stdout, /dedicated second-token Telegram poller/);
     assert.match(result.stdout, /worker submit --state-dir <path> --template <registered>/);
     assert.match(result.stdout, /--delivery-key <adapter-delivery-key>/);
     assert.match(result.stdout, /worker checkpoint --state-dir <path>/);
@@ -271,7 +289,7 @@ describe("ops worker CLI and inactive runtime", () => {
       authorization: { scope: string[] };
     };
     assert.equal(task.id, "op-fixture-task-id");
-    assert.equal(task.schemaVersion, 4);
+    assert.equal(task.schemaVersion, 5);
     assert.equal(task.state, "QUEUED");
     assert.equal(task.source.deliveryKey, "operator-cli:fixture-delivery-one");
     assert.deepEqual(task.resource, {
@@ -293,7 +311,7 @@ describe("ops worker CLI and inactive runtime", () => {
     delete statusValue.policy;
     assert.deepEqual(statusValue, {
         service: "minime-ops-worker",
-        schemaVersion: 4,
+        schemaVersion: 5,
         totalTasks: 1,
         activeProcessGroups: 0,
         custodyOwner: null,
@@ -364,6 +382,8 @@ describe("ops worker CLI and inactive runtime", () => {
       authorizationVerification: _authorizationVerification,
       verification: _verification,
       legacyCompletion: _legacyCompletion,
+      steering: _steering,
+      control: _control,
       ...legacyFields
     } = current;
     const legacySource: OpsWorkerTaskV1["source"] = {
@@ -396,7 +416,7 @@ describe("ops worker CLI and inactive runtime", () => {
 
     assert.equal(inspected.code, 0, inspected.stderr);
     const normalized = JSON.parse(inspected.stdout) as OpsWorkerTask;
-    assert.equal(normalized.schemaVersion, 4);
+    assert.equal(normalized.schemaVersion, 5);
     assert.equal(normalized.source.deliveryKey, `legacy:${current.id}`);
     assert.deepEqual(normalized.resource, {
       kind: "host",
@@ -812,6 +832,108 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(completed?.lastOutcome?.result, "PASS");
   });
 
+  it("starts the dedicated Telegram control loop only with --control-config", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controlConfig = join(fixture.root, "ops-control.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    const telegramMethods: string[] = [];
+    const deps = dependencies(contracts, {
+      controlConfigEnv: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN" },
+      telegramFetch: async (input) => {
+        const method = String(input).split("/").at(-1) ?? "";
+        telegramMethods.push(method);
+        return method === "getUpdates"
+          ? Response.json({ ok: true, result: [] })
+          : Response.json({ ok: true, result: { message_id: 1 } });
+      },
+      piAttemptDependencies: {
+        resolveInvocation: (args) => ({
+          command: process.execPath,
+          args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "success", ...args],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+      },
+    });
+    const submitted = await runWorkerCli(
+      submitArgs(fixture.stateDirectory),
+      fixture.root,
+      deps,
+    );
+    assert.equal(submitted.code, 0, submitted.stderr);
+
+    const started = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], fixture.root, deps);
+
+    assert.equal(started.code, 0, started.stderr);
+    assert.deepEqual(telegramMethods, ["sendMessage", "getUpdates"]);
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: contracts.taskRegistry,
+    });
+    assert.equal(store.list()[0].report.state, "SENT");
+
+    let omittedPollerCalled = false;
+    const omittedFixture = fixtureRoot(t);
+    const omitted = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      omittedFixture.stateDirectory,
+      "--agent-workspace",
+      omittedFixture.workspace,
+      "--port",
+      "0",
+      "--once",
+    ], omittedFixture.root, dependencies(contracts, {
+      telegramFetch: async () => {
+        omittedPollerCalled = true;
+        throw new Error("Telegram must remain inactive without --control-config");
+      },
+    }));
+    assert.equal(omitted.code, 0, omitted.stderr);
+    assert.equal(omittedPollerCalled, false);
+
+    const nonStart = await runWorkerCli([
+      "worker",
+      "status",
+      "--state-dir",
+      omittedFixture.stateDirectory,
+      "--control-config",
+      join(fixture.root, "missing-control.yaml"),
+    ], fixture.root, deps);
+    assert.equal(nonStart.code, 2);
+    assert.match(nonStart.stderr, /unknown worker status option: --control-config/);
+  });
+
   it("requires and applies the strict quota dependency before a CLI-started claim", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();
@@ -1095,7 +1217,7 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 4,
+      schemaVersion: 5,
     });
     const status = await fetch(`${base}/status`);
     assert.equal(status.status, 200);
@@ -1112,9 +1234,22 @@ describe("ops worker CLI and inactive runtime", () => {
     assert.equal(Object.hasOwn(policy.quota, "summary"), false);
     assert.equal(policy.parity.resourcesDigest, CLI_PRIMARY_RESOURCES.digest);
     const serializedStatus = JSON.stringify(statusValue);
-    assert.equal(serializedStatus.includes(fixtureAuthorizationVerifier.identity), false);
+    assert.deepEqual(policy.authorization.contracts, [{
+      source: "operator-cli",
+      verifierIdentity: fixtureAuthorizationVerifier.identity,
+      verifierVersion: fixtureAuthorizationVerifier.version,
+    }]);
+    assert.equal(
+      (policy.verification.contracts as Array<Record<string, unknown>>)[0].name,
+      "fixture-check",
+    );
+    assert.deepEqual(
+      Object.keys(
+        (policy.verification.contracts as Array<Record<string, unknown>>)[0],
+      ).sort(),
+      ["contractHash", "name", "verifierIdentity", "verifierVersion"],
+    );
     assert.equal(serializedStatus.includes("ops-worker-registry"), false);
-    assert.equal(serializedStatus.includes("fixture-check"), false);
     assert.ok(!Object.hasOwn(statusValue, "evidence"));
     assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.workspaceCwd), false);
     assert.equal(serializedStatus.includes(CLI_PRIMARY_CONTEXT_AGENT.systemPrompt), false);
@@ -1125,11 +1260,311 @@ describe("ops worker CLI and inactive runtime", () => {
       headers: { "content-type": "application/json" },
     });
     assert.equal(intake.status, 404);
+    const disabledAlertmanager = await fetch(`${base}/intake/alertmanager`, {
+      method: "POST",
+      body: "{}",
+      headers: { "content-type": "application/json" },
+    });
+    assert.equal(disabledAlertmanager.status, 404);
     const mutatingStatus = await fetch(`${base}/status`, { method: "POST" });
     assert.equal(mutatingStatus.status, 405);
 
     controller.abort();
     assert.equal(await running, 0);
+  });
+
+  it("rejects incomplete and counterfeit Alertmanager intake contracts", () => {
+    const opsContracts = createOpsTaskContracts({
+      alertmanagerAuthorizationSnapshotReader: { read: () => ({}) },
+      clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      monitoringFreshnessReader: {
+        readMonitoringFreshness: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        }),
+      },
+      alertStateReader: {
+        read: () => ({ observedAt: "2026-07-19T10:00:00.000Z", status: "RESOLVED" }),
+      },
+      serviceAvailabilityReader: {
+        readServiceAvailability: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "HEALTHY",
+          healthySince: "2026-07-19T09:50:00.000Z",
+        }),
+      },
+    });
+    assert.doesNotThrow(() => assertOpsAlertmanagerIntakeContracts(
+      opsContracts.taskRegistry,
+      opsContracts.doneChecks,
+      opsContracts.authorizationVerifiers,
+    ));
+
+    const wrongProfileRegistry: OpsWorkerTaskContractRegistry = {
+      ...opsContracts.taskRegistry,
+      authorizationProfiles: {
+        ...opsContracts.taskRegistry.authorizationProfiles,
+        [OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE]: {
+          sourceKinds: ["alertmanager"],
+          scope: ["inspect"],
+        },
+      },
+    };
+    assert.throws(
+      () => assertOpsAlertmanagerIntakeContracts(
+        wrongProfileRegistry,
+        opsContracts.doneChecks,
+        opsContracts.authorizationVerifiers,
+      ),
+      /fixed ops\.host-availability authorization profile/,
+    );
+
+    const counterfeitDoneChecks = new OpsWorkerDoneCheckRegistry({
+      [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
+        identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
+        version: OPS_AVAILABILITY_DONE_CHECK_VERSION,
+        timeoutMs: 100,
+        validateParams: () => ({}),
+        run: () => ({ result: "PASS", summary: "Counterfeit verifier passed." }),
+      },
+    });
+    for (const doneChecks of [new OpsWorkerDoneCheckRegistry({}), counterfeitDoneChecks]) {
+      assert.throws(
+        () => assertOpsAlertmanagerIntakeContracts(
+          opsContracts.taskRegistry,
+          doneChecks,
+          opsContracts.authorizationVerifiers,
+        ),
+        /package-owned availability done check/,
+      );
+    }
+
+    const counterfeitVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+      version: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
+      verify: () => ({
+        status: "PASS",
+        evidenceHash: `sha256:${"f".repeat(64)}`,
+        summary: "Counterfeit authorization passed.",
+      }),
+    };
+    for (const authorization of [undefined, {}, { alertmanager: counterfeitVerifier }]) {
+      assert.throws(
+        () => assertOpsAlertmanagerIntakeContracts(
+          opsContracts.taskRegistry,
+          opsContracts.doneChecks,
+          authorization,
+        ),
+        /package-owned Alertmanager authorization verifier/,
+      );
+    }
+  });
+
+  it("registers authenticated Alertmanager intake only from worker start control config", async (t) => {
+    const fixture = fixtureRoot(t);
+    const controller = new AbortController();
+    const opsContracts = createOpsTaskContracts({
+      alertmanagerAuthorizationSnapshotReader: {
+        read: () => ({
+          sourceIdentity: "lab-alertmanager",
+          invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+          template: OPS_AVAILABILITY_TEMPLATE_NAME,
+          profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+        }),
+      },
+      clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      monitoringFreshnessReader: {
+        readMonitoringFreshness: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        } satisfies OpsMonitoringFreshnessReading),
+      },
+      alertStateReader: {
+        read: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "RESOLVED",
+        } satisfies OpsAlertStateReading),
+      },
+      serviceAvailabilityReader: {
+        readServiceAvailability: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "HEALTHY",
+          healthySince: "2026-07-19T09:50:00.000Z",
+        } satisfies OpsServiceAvailabilityReading),
+      },
+    });
+    const controlConfig = join(fixture.root, "ops-control-with-intake.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+intake:
+  host: 127.0.0.1
+  port: 0
+  bearerTokenEnv: TEST_INTAKE_TOKEN
+  sourceIdentity: lab-alertmanager
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    let stdout = "";
+    let stderr = "";
+    let resolveListening: (() => void) | undefined;
+    const listening = new Promise<void>((resolvePromise) => {
+      resolveListening = resolvePromise;
+    });
+    const deps = dependencies({
+      taskRegistry: opsContracts.taskRegistry,
+      doneChecks: opsContracts.doneChecks,
+    }, {
+      abortSignal: controller.signal,
+      schedulerPollMs: 20,
+      authorizationVerifiers: {
+        ...opsContracts.authorizationVerifiers,
+        "operator-cli": fixtureAuthorizationVerifier,
+      },
+      quotaAdmission: {
+        check: () => ({
+          ...structuredClone(fixtureQuotaAdmissionDecision),
+          status: "NOT_ADMITTED",
+          reason: "LOW_REMAINING",
+          nextResetAt: "2027-07-19T11:00:00.000Z",
+          nextProbeAt: "2027-07-19T11:00:00.000Z",
+          summary: "Fixture quota prevents task launch during intake wiring coverage.",
+        }),
+      },
+      controlConfigEnv: {
+        TEST_OPS_TOKEN: "TEST_OPS_TOKEN",
+        TEST_INTAKE_TOKEN: "TEST_INTAKE_TOKEN",
+      },
+      telegramFetch: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        const abort = (): void => reject(new DOMException("aborted", "AbortError"));
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      }),
+    });
+
+    const incompleteFixture = fixtureRoot(t);
+    const incomplete = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      incompleteFixture.stateDirectory,
+      "--agent-workspace",
+      incompleteFixture.workspace,
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], incompleteFixture.root, dependencies({
+      taskRegistry: {
+        templates: {},
+        authorizationProfiles: {},
+        doneChecks: opsContracts.taskRegistry.doneChecks,
+      },
+      doneChecks: opsContracts.doneChecks,
+    }, {
+      controlConfigEnv: {
+        TEST_OPS_TOKEN: "TEST_OPS_TOKEN",
+        TEST_INTAKE_TOKEN: "TEST_INTAKE_TOKEN",
+      },
+    }));
+    assert.equal(incomplete.code, 1);
+    assert.match(
+      incomplete.stderr,
+      /requires the fixed ops\.availability template for alertmanager/,
+    );
+
+    const running = runCliAsync([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--control-config",
+      controlConfig,
+    ], {
+      cwd: fixture.root,
+      env: {},
+      workerDependencies: deps,
+      stdout: (text) => {
+        stdout += text;
+        if (text.includes("/status")) resolveListening?.();
+      },
+      stderr: (text) => {
+        stderr += text;
+      },
+    });
+    t.after(() => controller.abort());
+    await listening;
+    const base = /status (http:\/\/[^/]+)\/status/.exec(stdout)?.[1];
+    assert.ok(base);
+
+    const response = await fetch(`${base}/intake/alertmanager`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer TEST_INTAKE_TOKEN",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        version: "4",
+        groupKey: "{}:{alertname=\"MinimeBotUnavailable\"}",
+        status: "firing",
+        groupLabels: { alertname: "MinimeBotUnavailable" },
+        alerts: [{
+          status: "firing",
+          labels: { alertname: "MinimeBotUnavailable" },
+          annotations: { summary: "Generic local availability alert." },
+          startsAt: "2026-07-19T09:59:00.000Z",
+        }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const submitted = await response.json() as {
+      ok: boolean;
+      taskId: string | null;
+      replayed: boolean;
+    };
+    assert.equal(submitted.ok, true);
+    assert.equal(submitted.replayed, false);
+    assert.match(submitted.taskId ?? "", /^am-[a-f0-9]{48}$/);
+
+    controller.abort();
+    assert.equal(await running, 0, stderr);
+    assert.equal(stderr, "");
+    const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
+      registry: opsContracts.taskRegistry,
+    });
+    assert.equal(store.get(submitted.taskId ?? "")?.source.kind, "alertmanager");
+
+    const mismatchFixture = fixtureRoot(t);
+    const mismatchConfig = join(mismatchFixture.root, "ops-control-with-intake.yaml");
+    writeFileSync(mismatchConfig, readFileSync(controlConfig, "utf8"));
+    const mismatch = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      mismatchFixture.stateDirectory,
+      "--agent-workspace",
+      mismatchFixture.workspace,
+      "--control-config",
+      mismatchConfig,
+      "--port",
+      "9465",
+      "--once",
+    ], mismatchFixture.root, {
+      ...deps,
+      abortSignal: undefined,
+    });
+    assert.equal(mismatch.code, 2);
+    assert.match(mismatch.stderr, /--port must match intake\.port/);
   });
 
   it("rejects non-loopback status binds", async (t) => {

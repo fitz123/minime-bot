@@ -57,7 +57,7 @@ const registry: OpsWorkerTaskContractRegistry = {
 
 function makeTask(id = "lifecycle-task"): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id,
     source: {
       kind: "operator-cli",
@@ -82,6 +82,8 @@ function makeTask(id = "lifecycle-task"): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    steering: [],
+    control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,

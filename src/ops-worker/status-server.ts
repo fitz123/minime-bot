@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -7,6 +7,11 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { OpsWorkerAuthorizationVerifierRegistry } from "./authorization.js";
+import {
+  OPS_ALERTMANAGER_INTAKE_LIMITS,
+  OpsWorkerAlertmanagerIntakeError,
+  type OpsWorkerAlertmanagerIntake,
+} from "./alertmanager-intake.js";
 import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
 import {
   OPS_WORKER_QUOTA_POLICY_VERSION,
@@ -50,10 +55,21 @@ export interface OpsWorkerPolicySnapshot {
     configuredSources: string[];
     verifierCount: number;
     contractsHash: string;
+    contracts: Array<{
+      source: string;
+      verifierIdentity: string;
+      verifierVersion: string;
+    }>;
   };
   verification: {
     verifierCount: number;
     contractsHash: string;
+    contracts: Array<{
+      name: string;
+      verifierIdentity: string;
+      verifierVersion: string;
+      contractHash: string;
+    }>;
   };
   quota: {
     configured: false;
@@ -87,6 +103,10 @@ export interface OpsWorkerStatusServerOptions {
   inspectPolicy: () => OpsWorkerPolicySnapshot;
   host?: string;
   port?: number;
+  alertmanagerIntake?: {
+    intake: OpsWorkerAlertmanagerIntake;
+    bearerTokenProvider: () => string;
+  };
 }
 
 export interface StartedOpsWorkerStatusServer {
@@ -184,7 +204,11 @@ export function inspectOpsWorkerPolicy(
     if (!verifier) throw new TypeError("Authorization verifier registry is sparse");
     assertRegisteredName(verifier.identity, "authorization verifier identity");
     assertRegisteredName(verifier.version, "authorization verifier version");
-    return { source, identity: verifier.identity, version: verifier.version };
+    return {
+      source,
+      verifierIdentity: verifier.identity,
+      verifierVersion: verifier.version,
+    };
   });
 
   const checkNames = Object.keys(dependencies.doneChecks.contracts).sort();
@@ -209,10 +233,12 @@ export function inspectOpsWorkerPolicy(
       configuredSources,
       verifierCount: authorizationContracts.length,
       contractsHash: policyHash(authorizationContracts),
+      contracts: authorizationContracts,
     },
     verification: {
       verifierCount: verificationContracts.length,
       contractsHash: policyHash(verificationContracts),
+      contracts: verificationContracts,
     },
     quota: inspectQuotaPolicy(dependencies.quotaAdmission),
     parity: resources === undefined
@@ -242,6 +268,73 @@ function writeJson(
     "x-content-type-options": "nosniff",
   });
   response.end(includeBody ? body : undefined);
+}
+
+function writeIntakeError(
+  response: ServerResponse,
+  statusCode: number,
+  code: string,
+  message: string,
+): void {
+  writeJson(response, statusCode, {
+    ok: false,
+    error: { code, message },
+  });
+}
+
+function bearerTokenMatches(
+  authorization: string | undefined,
+  expectedToken: string,
+): boolean {
+  if (
+    expectedToken.length === 0
+    || expectedToken.includes("\0")
+    || /\s/.test(expectedToken)
+    || Buffer.byteLength(expectedToken, "utf8") > 4 * 1024
+  ) throw new TypeError("Alertmanager bearer token provider returned an invalid secret");
+  const matched = /^Bearer ([^\s]+)$/i.exec(authorization ?? "");
+  const suppliedToken = matched?.[1] ?? "";
+  const expectedHash = createHash("sha256").update(expectedToken).digest();
+  const suppliedHash = createHash("sha256").update(suppliedToken).digest();
+  return matched !== null && timingSafeEqual(expectedHash, suppliedHash);
+}
+
+async function readAlertmanagerBody(request: IncomingMessage): Promise<Buffer> {
+  const contentLength = request.headers["content-length"];
+  if (contentLength !== undefined) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(contentLength)) {
+      request.resume();
+      throw new OpsWorkerAlertmanagerIntakeError(
+        "INVALID_PAYLOAD",
+        "Alertmanager intake content-length is invalid",
+      );
+    }
+    const declaredBytes = Number(contentLength);
+    if (
+      !Number.isSafeInteger(declaredBytes)
+      || declaredBytes > OPS_ALERTMANAGER_INTAKE_LIMITS.maxBodyBytes
+    ) {
+      request.resume();
+      throw new OpsWorkerAlertmanagerIntakeError(
+        "BODY_TOO_LARGE",
+        `Alertmanager intake body exceeds ${OPS_ALERTMANAGER_INTAKE_LIMITS.maxBodyBytes} bytes`,
+      );
+    }
+  }
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const rawChunk of request) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+    totalBytes += chunk.byteLength;
+    if (totalBytes > OPS_ALERTMANAGER_INTAKE_LIMITS.maxBodyBytes) {
+      throw new OpsWorkerAlertmanagerIntakeError(
+        "BODY_TOO_LARGE",
+        `Alertmanager intake body exceeds ${OPS_ALERTMANAGER_INTAKE_LIMITS.maxBodyBytes} bytes`,
+      );
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, totalBytes);
 }
 
 export function summarizeOpsWorkerTasks(
@@ -282,8 +375,27 @@ export function inspectOpsWorkerStatus(
 function createRequestHandler(
   supervisor: OpsWorkerSupervisor,
   inspectPolicy: () => OpsWorkerPolicySnapshot,
+  alertmanagerIntake: OpsWorkerStatusServerOptions["alertmanagerIntake"],
 ): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response) => {
+    void handleRequest(request, response).catch(() => {
+      if (!response.headersSent) {
+        writeIntakeError(
+          response,
+          503,
+          "INTAKE_UNAVAILABLE",
+          "Alertmanager intake is unavailable",
+        );
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    });
+  };
+
+  async function handleRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
     if (!isLoopbackRemoteAddress(request.socket.remoteAddress)) {
       writeJson(response, 403, { ok: false, error: "loopback only" });
       return;
@@ -294,6 +406,80 @@ function createRequestHandler(
       path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
     } catch {
       writeJson(response, 400, { ok: false, error: "invalid request target" });
+      return;
+    }
+    if (path === "/intake/alertmanager") {
+      if (alertmanagerIntake === undefined) {
+        request.resume();
+        writeJson(response, 404, { ok: false, error: "not found" });
+        return;
+      }
+      if (method !== "POST") {
+        request.resume();
+        response.setHeader("allow", "POST");
+        writeIntakeError(
+          response,
+          405,
+          "METHOD_NOT_ALLOWED",
+          "Alertmanager intake accepts POST only",
+        );
+        return;
+      }
+      let authorized: boolean;
+      try {
+        authorized = bearerTokenMatches(
+          typeof request.headers.authorization === "string"
+            ? request.headers.authorization
+            : undefined,
+          alertmanagerIntake.bearerTokenProvider(),
+        );
+      } catch {
+        request.resume();
+        writeIntakeError(
+          response,
+          503,
+          "INTAKE_UNAVAILABLE",
+          "Alertmanager intake authentication is unavailable",
+        );
+        return;
+      }
+      if (!authorized) {
+        request.resume();
+        response.setHeader("www-authenticate", "Bearer");
+        writeIntakeError(
+          response,
+          401,
+          "UNAUTHORIZED",
+          "Alertmanager intake authentication failed",
+        );
+        return;
+      }
+      try {
+        const body = await readAlertmanagerBody(request);
+        const result = alertmanagerIntake.intake.submit(
+          body,
+          typeof request.headers["content-type"] === "string"
+            ? request.headers["content-type"]
+            : undefined,
+        );
+        writeJson(response, 200, result);
+      } catch (error) {
+        if (error instanceof OpsWorkerAlertmanagerIntakeError) {
+          writeIntakeError(
+            response,
+            error.code === "BODY_TOO_LARGE" ? 413 : 400,
+            error.code,
+            error.message,
+          );
+          return;
+        }
+        writeIntakeError(
+          response,
+          503,
+          "INTAKE_UNAVAILABLE",
+          "Alertmanager intake could not submit the task safely",
+        );
+      }
       return;
     }
     const knownPath = path === "/healthz" || path === "/status";
@@ -322,7 +508,7 @@ function createRequestHandler(
         error: "status unavailable",
       }, method !== "HEAD");
     }
-  };
+  }
 }
 
 function listen(server: Server, host: string, port: number): Promise<AddressInfo> {
@@ -365,6 +551,7 @@ export async function startOpsWorkerStatusServer(
   const server = createServer(createRequestHandler(
     options.supervisor,
     options.inspectPolicy,
+    options.alertmanagerIntake,
   ));
   const address = await listen(server, host, port);
   let closed = false;
