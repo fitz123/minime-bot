@@ -564,6 +564,9 @@ describe("primary Pi resource contract", () => {
       "import vm from 'node:vm'; export default new vm.Script('1', { importModuleDynamically() {} });\n",
       "import vm from 'node:vm'; export default new vm.Script(\"import('data:text/javascript,export default 42')\", { importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });\n",
       "import vm from 'node:vm'; const args = ['1', { importModuleDynamically() {} }]; export default new vm.Script(...args);\n",
+      "const property = 'cwd'; function load(property: string) { return process[property]('node:fs'); } export default function extension() { return load('getBuiltinModule'); }\n",
+      "const property = 'cwd'; try { throw 'getBuiltinModule'; } catch (property) { process[property]('node:fs'); } export default function extension() {}\n",
+      "import vm from 'node:vm'; const context = vm.createContext({}); export default function extension(external: object) { let context = external; return new vm.Script('1').runInContext(context); }\n",
     ];
     for (const source of rejected) {
       writeFileSync(extension, source, "utf8");

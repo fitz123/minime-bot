@@ -281,8 +281,38 @@ function extensionModuleSpecifiers(
     }
     vmBindings.add(clause.name.text);
   }
+  const bindingCounts = new Map<string, number>();
   const constantInitializers = new Map<string, ts.Expression | null>();
-  const collectConstants = (node: ts.Node): void => {
+  const recordBindingName = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) {
+      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
+    }
+  };
+  const collectBindings = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      recordBindingName(node.name);
+    } else if (
+      (ts.isFunctionDeclaration(node)
+        || ts.isFunctionExpression(node)
+        || ts.isClassDeclaration(node)
+        || ts.isClassExpression(node)
+        || ts.isEnumDeclaration(node))
+      && node.name !== undefined
+    ) {
+      recordBindingName(node.name);
+    } else if (ts.isImportClause(node) && node.name !== undefined) {
+      recordBindingName(node.name);
+    } else if (
+      ts.isImportSpecifier(node)
+      || ts.isNamespaceImport(node)
+      || ts.isImportEqualsDeclaration(node)
+    ) {
+      recordBindingName(node.name);
+    }
     if (
       ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name)
@@ -295,9 +325,13 @@ function extensionModuleSpecifiers(
         constantInitializers.has(node.name.text) ? null : node.initializer,
       );
     }
-    ts.forEachChild(node, collectConstants);
+    ts.forEachChild(node, collectBindings);
   };
-  collectConstants(source);
+  collectBindings(source);
+  const uniqueConstantInitializer = (name: string): ts.Expression | undefined => {
+    if (bindingCounts.get(name) !== 1) return undefined;
+    return constantInitializers.get(name) ?? undefined;
+  };
   const staticString = (
     value: ts.Expression,
     resolving = new Set<string>(),
@@ -320,8 +354,8 @@ function extensionModuleSpecifiers(
       return left === undefined || right === undefined ? undefined : left + right;
     }
     if (ts.isIdentifier(value) && !resolving.has(value.text)) {
-      const initializer = constantInitializers.get(value.text);
-      if (initializer !== undefined && initializer !== null) {
+      const initializer = uniqueConstantInitializer(value.text);
+      if (initializer !== undefined) {
         const next = new Set(resolving);
         next.add(value.text);
         return staticString(initializer, next);
@@ -383,7 +417,8 @@ function extensionModuleSpecifiers(
       || expression.expression.name.text !== "createContext"
       || !ts.isIdentifier(expression.expression.expression)
     ) return false;
-    return vmBindings.has(expression.expression.expression.text);
+    const binding = expression.expression.expression.text;
+    return vmBindings.has(binding) && bindingCounts.get(binding) === 1;
   };
   const assertSafeVmScriptExecution = (invocation: ts.NewExpression): void => {
     let expression: ts.Expression = invocation;
@@ -410,11 +445,10 @@ function extensionModuleSpecifiers(
     }
     const context = unwrapExpression(execution.arguments[0]);
     const initializer = ts.isIdentifier(context)
-      ? constantInitializers.get(context.text)
+      ? uniqueConstantInitializer(context.text)
       : undefined;
     if (
       initializer === undefined
-      || initializer === null
       || !directVmCreateContextCall(initializer)
     ) {
       throw new TypeError(
