@@ -28,6 +28,10 @@ export const OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY =
 export const OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION = "1" as const;
 export const OPS_AVAILABILITY_RESOURCE_KEY = "host:local" as const;
 
+const PACKAGE_OWNED_AVAILABILITY_REGISTRIES = new WeakSet<OpsWorkerDoneCheckRegistry>();
+const PACKAGE_OWNED_ALERTMANAGER_VERIFIERS =
+  new WeakSet<OpsWorkerAuthorizationVerifier>();
+
 export interface OpsAlertmanagerAuthorizationSnapshot {
   sourceIdentity: string;
   invariant: OpsAvailabilityInvariantName;
@@ -77,7 +81,8 @@ export function assertOpsAlertmanagerIntakeContracts(
   }
   const doneCheck = doneChecks.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
   if (
-    doneCheck?.verifierIdentity !== OPS_AVAILABILITY_DONE_CHECK_NAME
+    !PACKAGE_OWNED_AVAILABILITY_REGISTRIES.has(doneChecks)
+    || doneCheck?.verifierIdentity !== OPS_AVAILABILITY_DONE_CHECK_NAME
     || doneCheck.verifierVersion !== OPS_AVAILABILITY_DONE_CHECK_VERSION
   ) {
     throw new TypeError(
@@ -86,7 +91,9 @@ export function assertOpsAlertmanagerIntakeContracts(
   }
   const verifier = authorizationVerifiers?.alertmanager;
   if (
-    verifier?.identity !== OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY
+    !verifier
+    || !PACKAGE_OWNED_ALERTMANAGER_VERIFIERS.has(verifier)
+    || verifier.identity !== OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY
     || verifier.version !== OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION
   ) {
     throw new TypeError(
@@ -264,6 +271,8 @@ export function createOpsTaskContracts(
   const alertmanagerAuthorizationVerifier = createAlertmanagerAuthorizationVerifier(
     deps.alertmanagerAuthorizationSnapshotReader,
   );
+  PACKAGE_OWNED_AVAILABILITY_REGISTRIES.add(doneChecks);
+  PACKAGE_OWNED_ALERTMANAGER_VERIFIERS.add(alertmanagerAuthorizationVerifier);
   const taskRegistry: OpsWorkerTaskContractRegistry = Object.freeze({
     templates: Object.freeze({
       [OPS_AVAILABILITY_TEMPLATE_NAME]: Object.freeze({

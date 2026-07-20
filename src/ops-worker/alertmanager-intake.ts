@@ -4,17 +4,17 @@ import {
   OPS_AVAILABILITY_INVARIANTS,
   OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
 } from "./availability-checks.js";
-import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
+import type {
+  OpsWorkerDoneCheckContractIdentity,
+  OpsWorkerDoneCheckRegistry,
+} from "./done-checks.js";
 import {
   OPS_AVAILABILITY_RESOURCE_KEY,
   OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   hashOpsAlertmanagerAuthorizationSnapshot,
 } from "./ops-contracts.js";
-import {
-  OpsWorkerDuplicateCorrelationError,
-  type OpsWorkerTaskStore,
-} from "./task-store.js";
+import type { OpsWorkerTaskStore } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_SOURCE_PRIORITIES,
@@ -476,7 +476,7 @@ function alertGroupCorrelationEvidence(
 
 export class OpsWorkerAlertmanagerIntake {
   private readonly store: OpsWorkerTaskStore;
-  private readonly doneChecks: OpsWorkerDoneCheckRegistry;
+  private readonly doneCheck: OpsWorkerDoneCheckContractIdentity;
   private readonly sourceIdentity: string;
   private readonly now: () => Date;
 
@@ -487,11 +487,12 @@ export class OpsWorkerAlertmanagerIntake {
     if (!options.store || typeof options.store.create !== "function") {
       throw new TypeError("Alertmanager intake requires an ops-worker task store");
     }
-    if (!options.doneChecks?.describe(OPS_AVAILABILITY_DONE_CHECK_NAME)) {
+    const doneCheck = options.doneChecks?.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
+    if (!doneCheck) {
       throw new TypeError("Alertmanager intake requires the package-owned availability done check");
     }
     this.store = options.store;
-    this.doneChecks = options.doneChecks;
+    this.doneCheck = doneCheck;
     this.sourceIdentity = options.sourceIdentity;
     this.now = options.now ?? (() => new Date());
   }
@@ -528,18 +529,11 @@ export class OpsWorkerAlertmanagerIntake {
       deliveryDigest,
       webhook.groupLabels,
     );
-    try {
-      const created = this.store.create(task, {
-        event: "CREATED",
-        summary: "Accepted authenticated Alertmanager firing episode",
-      });
-      return { ok: true, taskId: created.task.id, replayed: !created.created };
-    } catch (error) {
-      if (!(error instanceof OpsWorkerDuplicateCorrelationError)) throw error;
-      const concurrent = this.store.get(error.existingTaskId);
-      if (!concurrent || concurrent.source.correlationKey !== correlationKey) throw error;
-      return { ok: true, taskId: concurrent.id, replayed: true };
-    }
+    const created = this.store.createOrReuseActiveCorrelation(task, {
+      event: "CREATED",
+      summary: "Accepted authenticated Alertmanager firing episode",
+    });
+    return { ok: true, taskId: created.task.id, replayed: !created.created };
   }
 
   private createTask(
@@ -554,10 +548,7 @@ export class OpsWorkerAlertmanagerIntake {
       throw new TypeError("Alertmanager intake clock returned an invalid date");
     }
     const now = current.toISOString();
-    const doneCheck = this.doneChecks.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
-    if (!doneCheck) {
-      throw new TypeError("Package-owned availability done check became unavailable");
-    }
+    const doneCheck = this.doneCheck;
     const lifecycle = createEmptyOpsWorkerLifecycleManifest();
     lifecycle.verifier = doneCheck.verifierIdentity;
     lifecycle.verifierVersion = doneCheck.verifierVersion;

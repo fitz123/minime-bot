@@ -771,6 +771,28 @@ export class OpsWorkerSupervisor {
     );
   }
 
+  private supersedeReportEpisode(
+    task: OpsWorkerTask,
+    at: string,
+    reason: string,
+  ): void {
+    const receipt = task.mutationReceipts.report;
+    if (receipt?.outcome === null) {
+      const floor = receipt.mutationStartedAt ?? receipt.queryObservedAt;
+      receipt.outcome = {
+        recordedAt: timestampAtOrAfter(new Date(at), floor),
+        result: "NOT_NEEDED",
+        evidenceHash: hashOpsWorkerCanonicalPayload({
+          taskId: task.id,
+          operationId: receipt.operationId,
+          reason,
+        }),
+      };
+    }
+    task.report.attempts = 0;
+    task.report.lastError = null;
+  }
+
   #completeOperatorInterrupt(
     taskId: string,
     interrupt: OpsWorkerInterrupt,
@@ -817,8 +839,12 @@ export class OpsWorkerSupervisor {
         ),
       };
       task.verification = null;
+      this.supersedeReportEpisode(
+        task,
+        at,
+        `operator ${interrupt.mode} superseded the prior report episode`,
+      );
       task.report.state = interrupt.mode === "cancel" ? "PENDING" : "NONE";
-      task.report.lastError = null;
     }, `Applied proven operator ${interrupt.mode} interrupt`);
   }
 
@@ -2379,7 +2405,8 @@ export class OpsWorkerSupervisor {
         result: "AMBIGUOUS_ORPHAN",
         summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
       };
-      replacement.report.state = "PENDING";
+      replacement.report.state = "NONE";
+      replacement.report.attempts = 0;
       replacement.report.lastError = null;
     }, "Blocked Pi launch whose process-group identity could not be proven", {
       preserveUnclaimedQuotaProbe,
@@ -2534,8 +2561,12 @@ export class OpsWorkerSupervisor {
         summary,
       };
       task.verification = null;
+      this.supersedeReportEpisode(
+        task,
+        at,
+        "operator cancellation superseded the prior report episode",
+      );
       task.report.state = "PENDING";
-      task.report.lastError = null;
     }, "Task cancelled");
   }
 

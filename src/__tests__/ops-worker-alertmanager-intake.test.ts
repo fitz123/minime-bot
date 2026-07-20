@@ -305,12 +305,32 @@ describe("Alertmanager conversion and task-store submission", () => {
       })), CONTENT_TYPE),
       "INVALID_PAYLOAD",
     );
-    const activeReuse = intake.submit(body(webhook({
+    const coalescedEpisode = webhook({
       alerts: [alert("2026-07-19T09:59:30.000Z")],
-    })), CONTENT_TYPE);
+    });
+    const activeReuse = intake.submit(body(coalescedEpisode), CONTENT_TYPE);
+    const evolvingEpisode = webhook({
+      alerts: [{
+        ...alert(),
+        annotations: { summary: "The active group gained updated evidence." },
+      }],
+    });
+    const evolvingReuse = intake.submit(body(evolvingEpisode), CONTENT_TYPE);
 
     assert.deepEqual(activeReuse, { ok: true, taskId: first.taskId, replayed: true });
+    assert.deepEqual(evolvingReuse, { ok: true, taskId: first.taskId, replayed: true });
     assert.equal(store.list().length, 1);
+    assert.throws(
+      () => store.mutate(
+        first.taskId ?? "",
+        { event: "UPDATED", summary: "Fixture attempted receipt erasure" },
+        (task) => {
+          task.evidence = task.evidence.filter((evidence) =>
+            !evidence.summary.includes("alertmanager-delivery-receipt-v1"));
+        },
+      ),
+      /Refusing to erase durable delivery receipt/,
+    );
 
     const terminal = structuredClone(store.get(first.taskId ?? ""));
     assert.ok(terminal);
@@ -337,6 +357,17 @@ describe("Alertmanager conversion and task-store submission", () => {
       taskId: first.taskId,
       replayed: true,
     });
+    assert.deepEqual(intake.submit(body(coalescedEpisode), CONTENT_TYPE), {
+      ok: true,
+      taskId: first.taskId,
+      replayed: true,
+    });
+    assert.deepEqual(intake.submit(body(evolvingEpisode), CONTENT_TYPE), {
+      ok: true,
+      taskId: first.taskId,
+      replayed: true,
+    });
+    assert.equal(store.list().length, 2);
   });
 
   it("does not create a task for a resolved-only group or any rejected payload", (t) => {

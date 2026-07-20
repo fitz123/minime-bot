@@ -1988,6 +1988,30 @@ export function aggregateOpsWorkerVerificationOutcome(
     : "VERIFIER_INVALID";
 }
 
+function assertVerificationNextCheckAt(
+  outcome: OpsWorkerVerificationOutcome,
+  nextCheckAt: string | null,
+  anchor: string,
+  path: string,
+  anchorLabel: string,
+): void {
+  if (outcome === "DEFER") {
+    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(anchor)) {
+      fail(path, "DEFER requires a later query timestamp");
+    }
+    return;
+  }
+  if (outcome === "NOT_READY") {
+    if (nextCheckAt !== null && Date.parse(nextCheckAt) <= Date.parse(anchor)) {
+      fail(path, `NOT_READY recheck must be later than ${anchorLabel}`);
+    }
+    return;
+  }
+  if (nextCheckAt !== null) {
+    fail(path, "must be null unless the outcome schedules convergence");
+  }
+}
+
 function parseVerificationComponent(
   value: unknown,
   index: number,
@@ -2039,22 +2063,13 @@ function parseVerificationComponent(
     component.nextCheckAt,
     `${path}.nextCheckAt`,
   );
-  if (outcome === "DEFER" || outcome === "NOT_READY") {
-    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(observedAt)) {
-      if (outcome === "DEFER") {
-        fail(`${path}.nextCheckAt`, "DEFER requires a later query timestamp");
-      }
-    }
-  } else if (nextCheckAt !== null) {
-    fail(`${path}.nextCheckAt`, "must be null unless the outcome schedules convergence");
-  }
-  if (
-    outcome === "NOT_READY"
-    && nextCheckAt !== null
-    && Date.parse(nextCheckAt) <= Date.parse(observedAt)
-  ) {
-    fail(`${path}.nextCheckAt`, "NOT_READY recheck must be later than observedAt");
-  }
+  assertVerificationNextCheckAt(
+    outcome,
+    nextCheckAt,
+    observedAt,
+    `${path}.nextCheckAt`,
+    "observedAt",
+  );
   return {
     identity: expectRegisteredName(component.identity, `${path}.identity`),
     version: expectRegisteredName(component.version, `${path}.version`),
@@ -2145,25 +2160,13 @@ function parseVerification(value: unknown): OpsWorkerVerificationRecord | null {
     verification.nextCheckAt,
     "task.verification.nextCheckAt",
   );
-  if (outcome === "DEFER" || outcome === "NOT_READY") {
-    if (nextCheckAt === null || Date.parse(nextCheckAt) <= Date.parse(completedAt)) {
-      if (outcome === "DEFER") {
-        fail("task.verification.nextCheckAt", "DEFER requires a later query timestamp");
-      }
-    }
-  } else if (nextCheckAt !== null) {
-    fail(
-      "task.verification.nextCheckAt",
-      "must be null unless the outcome schedules convergence",
-    );
-  }
-  if (
-    outcome === "NOT_READY"
-    && nextCheckAt !== null
-    && Date.parse(nextCheckAt) <= Date.parse(completedAt)
-  ) {
-    fail("task.verification.nextCheckAt", "NOT_READY recheck must be later than completion");
-  }
+  assertVerificationNextCheckAt(
+    outcome,
+    nextCheckAt,
+    completedAt,
+    "task.verification.nextCheckAt",
+    "completion",
+  );
   return {
     verifierIdentity: expectRegisteredName(
       verification.verifierIdentity,

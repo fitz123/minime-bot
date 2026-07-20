@@ -187,6 +187,7 @@ async function harness(
     instanceId?: string;
     nowStart?: string;
     authorizationVerifiers?: OpsWorkerAuthorizationVerifierRegistry;
+    reconcileActiveRun?: OpsWorkerSupervisorOptions["reconcileActiveRun"];
   } = {},
 ): Promise<Harness> {
   const directory = options.directory
@@ -210,6 +211,7 @@ async function harness(
     processStartToken: `${options.instanceId ?? "telegram-control-fixture"}-start`,
     now: () => new Date(supervisorNow += 1_000),
     authorizationVerifiers: options.authorizationVerifiers ?? authorizationVerifiers,
+    reconcileActiveRun: options.reconcileActiveRun,
   };
   const supervisor = new OpsWorkerSupervisor(supervisorOptions);
   await supervisor.start();
@@ -728,6 +730,72 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(fixture.ledger.nextOffset(), undefined);
   });
 
+  it("rejects malformed or non-strict getUpdates batches before ledger mutation", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const malformedResults: unknown[] = [
+      { ok: false, result: [] },
+      { ok: true, result: [null] },
+      { ok: true, result: [update(31, "/status"), update(31, "/tasks")] },
+      { ok: true, result: [update(32, "/status"), update(31, "/tasks")] },
+      { ok: true, result: Array.from({ length: 101 }, (_, index) => update(index, "/status")) },
+    ];
+
+    for (const value of malformedResults) {
+      const client = new OpsWorkerTelegramControl({
+        config,
+        supervisor: fixture.supervisor,
+        ledger: fixture.ledger,
+        inspectPolicy: () => ({
+          authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+          verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+          quota: { configured: false },
+          parity: { configured: false },
+        }),
+        fetch: async () => Response.json(value),
+      });
+      await assert.rejects(client.tick(), /Telegram/);
+      assert.equal(fixture.ledger.nextOffset(), undefined);
+    }
+  });
+
+  it("retries a duplicate-id batch as a bounded transport failure", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const controller = new AbortController();
+    const backoffs: number[] = [];
+    const responses: unknown[] = [
+      { ok: true, result: [update(40, "/status"), update(40, "/tasks")] },
+      { ok: true, result: [update(40, "/status")] },
+    ];
+    const client = new OpsWorkerTelegramControl({
+      config,
+      supervisor: fixture.supervisor,
+      ledger: fixture.ledger,
+      inspectPolicy: () => ({
+        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        quota: { configured: false },
+        parity: { configured: false },
+      }),
+      fetch: async (input) => {
+        if (String(input).endsWith("/getUpdates")) {
+          return Response.json(responses.shift());
+        }
+        controller.abort();
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      },
+      sleep: async (milliseconds) => {
+        backoffs.push(milliseconds);
+      },
+    });
+
+    await client.run(controller.signal);
+
+    assert.deepEqual(backoffs, [config.poll.retryMinMs]);
+    assert.equal(fixture.ledger.nextOffset(), 41);
+  });
+
   it("durably handles task ids outside the canonical store contract as malformed commands", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
@@ -798,6 +866,45 @@ describe("ops worker dedicated Telegram control", () => {
       Buffer.byteLength(String(message.text), "utf8") <= config.reply.maxBytes));
     assert.match(String(transport.messages.at(-1)?.text), /Usage:/);
     assert.equal(JSON.stringify(transport.messages).includes("Exercise the bounded"), false);
+  });
+
+  it("keeps a persistently ambiguous unverified launch fence non-reportable after restart", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-telegram-unverified-fence-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await harness(t, {
+      directory,
+      instanceId: "unverified-report-first",
+    });
+    first.store.create(makeTask("task-unverified-report"));
+    const blocked = first.supervisor.blockUnverifiedPiLaunch(
+      "task-unverified-report",
+      {
+        attemptId: "attempt-unverified-report",
+        supervisorInstanceId: "unverified-report-first",
+        pid: 4321,
+        expectedProcessGroupId: 4321,
+        launchedAt: NOW,
+        ownershipNonceHash: `sha256:${"c".repeat(64)}`,
+      },
+      "Synthetic launch ownership remains ambiguous.",
+    );
+    assert.equal(blocked.report.state, "NONE");
+    first.close();
+
+    const restarted = await harness(t, {
+      directory,
+      instanceId: "unverified-report-restarted",
+      reconcileActiveRun: () => ({ status: "AMBIGUOUS" }),
+    });
+    t.after(() => restarted.close());
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([]);
+
+    const result = await control(restarted, transport).tick();
+
+    assert.equal(result.reportTaskId, null);
+    assert.equal(restarted.store.get("task-unverified-report")?.report.state, "NONE");
+    assert.equal(transport.sendCalls, 0);
   });
 
   it("redelivers a report after a crash with a strictly newer receipt query", async (t) => {

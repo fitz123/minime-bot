@@ -305,11 +305,46 @@ function parsePoll(value: unknown): OpsWorkerControlPollTuning {
     "poll",
   );
   const parsed = {
-    longPollSeconds: optionalInteger(poll, "longPollSeconds", 30, 1, 50, "poll"),
-    requestTimeoutMs: optionalInteger(poll, "requestTimeoutMs", 35_000, 1_000, 120_000, "poll"),
-    retryMinMs: optionalInteger(poll, "retryMinMs", 250, 10, 60_000, "poll"),
-    retryMaxMs: optionalInteger(poll, "retryMaxMs", 5_000, 10, 300_000, "poll"),
-    maxResponseBytes: optionalInteger(poll, "maxResponseBytes", 256 * 1024, 1_024, 1024 * 1024, "poll"),
+    longPollSeconds: optionalInteger(
+      poll,
+      "longPollSeconds",
+      DEFAULT_OPS_WORKER_CONTROL_POLL_TUNING.longPollSeconds,
+      1,
+      50,
+      "poll",
+    ),
+    requestTimeoutMs: optionalInteger(
+      poll,
+      "requestTimeoutMs",
+      DEFAULT_OPS_WORKER_CONTROL_POLL_TUNING.requestTimeoutMs,
+      1_000,
+      120_000,
+      "poll",
+    ),
+    retryMinMs: optionalInteger(
+      poll,
+      "retryMinMs",
+      DEFAULT_OPS_WORKER_CONTROL_POLL_TUNING.retryMinMs,
+      10,
+      60_000,
+      "poll",
+    ),
+    retryMaxMs: optionalInteger(
+      poll,
+      "retryMaxMs",
+      DEFAULT_OPS_WORKER_CONTROL_POLL_TUNING.retryMaxMs,
+      10,
+      300_000,
+      "poll",
+    ),
+    maxResponseBytes: optionalInteger(
+      poll,
+      "maxResponseBytes",
+      DEFAULT_OPS_WORKER_CONTROL_POLL_TUNING.maxResponseBytes,
+      1_024,
+      1024 * 1024,
+      "poll",
+    ),
   };
   if (parsed.requestTimeoutMs <= parsed.longPollSeconds * 1_000) {
     fail("poll.requestTimeoutMs must exceed the configured long-poll duration");
@@ -325,7 +360,14 @@ function parseReply(value: unknown): OpsWorkerControlReplyTuning {
   const reply = expectObject(value, "reply");
   assertKeys(reply, ["maxBytes"], [], "reply");
   return {
-    maxBytes: optionalInteger(reply, "maxBytes", 3_500, 256, 4_096, "reply"),
+    maxBytes: optionalInteger(
+      reply,
+      "maxBytes",
+      DEFAULT_OPS_WORKER_CONTROL_REPLY_TUNING.maxBytes,
+      256,
+      4_096,
+      "reply",
+    ),
   };
 }
 

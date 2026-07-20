@@ -1666,6 +1666,62 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.store.get("task-stale")?.state, "CANCELLED");
   });
 
+  it("starts a fresh cancellation report after a failed or exhausted BLOCKED report", async (t) => {
+    const harness = await makeHarness(t);
+    for (const taskId of ["task-cancel-failed-report", "task-cancel-exhausted-report"]) {
+      const blocked = makeTask(taskId);
+      blocked.state = "BLOCKED";
+      blocked.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: "BLOCKED",
+      };
+      blocked.lastOutcome = {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PRODUCT_FAILURE",
+        summary: "Fixture blocked before operator cancellation.",
+      };
+      blocked.report.state = "PENDING";
+      blocked.report.attempts = taskId.includes("exhausted")
+        ? OPS_WORKER_LIMITS.maxReportAttempts
+        : 0;
+      harness.store.create(blocked);
+    }
+
+    const failed = await harness.supervisor.recordReportAttempt(
+      "task-cancel-failed-report",
+      async () => ({ sent: false, error: "synthetic prior report failure" }),
+    );
+    const priorOperationId = failed.mutationReceipts.report?.operationId;
+    assert.ok(priorOperationId);
+    assert.equal(failed.mutationReceipts.report?.outcome, null);
+
+    for (const taskId of ["task-cancel-failed-report", "task-cancel-exhausted-report"]) {
+      const cancelled = harness.supervisor.cancelTask(taskId, "Operator cancelled the fixture.");
+      assert.equal(cancelled.state, "CANCELLED");
+      assert.equal(cancelled.report.state, "PENDING");
+      assert.equal(cancelled.report.attempts, 0);
+      if (taskId === "task-cancel-failed-report") {
+        assert.equal(cancelled.mutationReceipts.report?.outcome?.result, "NOT_NEEDED");
+      }
+      const sent = await harness.supervisor.recordReportAttempt(
+        taskId,
+        async () => ({ sent: true }),
+      );
+      assert.equal(sent.report.state, "SENT");
+      assert.equal(sent.report.attempts, 1);
+      if (taskId === "task-cancel-failed-report") {
+        assert.equal(
+          sent.mutationReceipts.report?.replayHistory.some((entry) =>
+            entry.operationId === priorOperationId),
+          true,
+        );
+      }
+    }
+  });
+
   it("returns PRODUCT_FAILURE evidence to the same task and blocks at budget exhaustion", async (t) => {
     const harness = await makeHarness(t, {
       implementation: () => ({

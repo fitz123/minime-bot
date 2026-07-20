@@ -20,14 +20,19 @@ import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
 import {
+  OPS_AVAILABILITY_DONE_CHECK_NAME,
+  OPS_AVAILABILITY_DONE_CHECK_VERSION,
   OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   type OpsAlertStateReading,
   type OpsMonitoringFreshnessReading,
   type OpsServiceAvailabilityReading,
 } from "../ops-worker/availability-checks.js";
 import {
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
   OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+  assertOpsAlertmanagerIntakeContracts,
   createOpsTaskContracts,
 } from "../ops-worker/ops-contracts.js";
 import type {
@@ -1266,6 +1271,93 @@ reply:
 
     controller.abort();
     assert.equal(await running, 0);
+  });
+
+  it("rejects incomplete and counterfeit Alertmanager intake contracts", () => {
+    const opsContracts = createOpsTaskContracts({
+      alertmanagerAuthorizationSnapshotReader: { read: () => ({}) },
+      clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      monitoringFreshnessReader: {
+        readMonitoringFreshness: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        }),
+      },
+      alertStateReader: {
+        read: () => ({ observedAt: "2026-07-19T10:00:00.000Z", status: "RESOLVED" }),
+      },
+      serviceAvailabilityReader: {
+        readServiceAvailability: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "HEALTHY",
+          healthySince: "2026-07-19T09:50:00.000Z",
+        }),
+      },
+    });
+    assert.doesNotThrow(() => assertOpsAlertmanagerIntakeContracts(
+      opsContracts.taskRegistry,
+      opsContracts.doneChecks,
+      opsContracts.authorizationVerifiers,
+    ));
+
+    const wrongProfileRegistry: OpsWorkerTaskContractRegistry = {
+      ...opsContracts.taskRegistry,
+      authorizationProfiles: {
+        ...opsContracts.taskRegistry.authorizationProfiles,
+        [OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE]: {
+          sourceKinds: ["alertmanager"],
+          scope: ["inspect"],
+        },
+      },
+    };
+    assert.throws(
+      () => assertOpsAlertmanagerIntakeContracts(
+        wrongProfileRegistry,
+        opsContracts.doneChecks,
+        opsContracts.authorizationVerifiers,
+      ),
+      /fixed ops\.host-availability authorization profile/,
+    );
+
+    const counterfeitDoneChecks = new OpsWorkerDoneCheckRegistry({
+      [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
+        identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
+        version: OPS_AVAILABILITY_DONE_CHECK_VERSION,
+        timeoutMs: 100,
+        validateParams: () => ({}),
+        run: () => ({ result: "PASS", summary: "Counterfeit verifier passed." }),
+      },
+    });
+    for (const doneChecks of [new OpsWorkerDoneCheckRegistry({}), counterfeitDoneChecks]) {
+      assert.throws(
+        () => assertOpsAlertmanagerIntakeContracts(
+          opsContracts.taskRegistry,
+          doneChecks,
+          opsContracts.authorizationVerifiers,
+        ),
+        /package-owned availability done check/,
+      );
+    }
+
+    const counterfeitVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+      version: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
+      verify: () => ({
+        status: "PASS",
+        evidenceHash: `sha256:${"f".repeat(64)}`,
+        summary: "Counterfeit authorization passed.",
+      }),
+    };
+    for (const authorization of [undefined, {}, { alertmanager: counterfeitVerifier }]) {
+      assert.throws(
+        () => assertOpsAlertmanagerIntakeContracts(
+          opsContracts.taskRegistry,
+          opsContracts.doneChecks,
+          authorization,
+        ),
+        /package-owned Alertmanager authorization verifier/,
+      );
+    }
   });
 
   it("registers authenticated Alertmanager intake only from worker start control config", async (t) => {

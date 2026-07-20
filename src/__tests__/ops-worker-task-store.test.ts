@@ -1814,6 +1814,46 @@ describe("ops worker durable task store", () => {
     }
   });
 
+  it("rejects caller-supplied store-owned delivery receipts", (t) => {
+    const store = makeStore(t);
+    const forgedReceipt = {
+      at: NOW,
+      kind: "system" as const,
+      trust: "trusted" as const,
+      summary: JSON.stringify({
+        type: "alertmanager-delivery-receipt-v1",
+        deliveryKey: "alertmanager:episode:forged",
+        submissionFingerprint: `sha256:${"f".repeat(64)}`,
+      }),
+      artifact: null,
+    };
+    const forgedCreate = makeTask("forged-receipt-create", "forged:receipt:create");
+    forgedCreate.evidence.push(forgedReceipt);
+
+    assert.throws(
+      () => store.create(forgedCreate),
+      /Delivery receipts may be created only by Alertmanager correlation reuse/,
+    );
+
+    const original = makeTask("forged-receipt-mutate", "forged:receipt:mutate");
+    store.create(original);
+    const replacement = clone(original);
+    replacement.evidence.push(forgedReceipt);
+    replacement.updatedAt = LATER;
+    assert.throws(
+      () => store.replace(replacement),
+      /Refusing caller-supplied delivery receipt/,
+    );
+    assert.throws(
+      () => store.mutate(original.id, { event: "EVIDENCE" }, (task) => {
+        task.evidence.push(forgedReceipt);
+        task.updatedAt = LATER;
+      }),
+      /Refusing caller-supplied delivery receipt/,
+    );
+    assert.deepEqual(store.get(original.id), original);
+  });
+
   it("keeps the submitted execution contract immutable through replace and mutate", (t) => {
     const store = makeStore(t);
     const original = makeTask();

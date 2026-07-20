@@ -32,11 +32,15 @@ import {
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
-import { compactOpsWorkerEvidenceForSnapshot } from "./evidence.js";
+import {
+  appendOpsWorkerEvidence,
+  compactOpsWorkerEvidenceForSnapshot,
+} from "./evidence.js";
 
 export const OPS_WORKER_JOURNAL_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_OPS_WORKER_MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
 export const MAX_OPS_WORKER_JOURNAL_ENTRY_BYTES = 8 * 1024;
+const MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS = 32;
 
 export const OPS_WORKER_AUDIT_EVENTS = [
   "CREATED",
@@ -138,6 +142,54 @@ export class OpsWorkerDeliveryConflictError extends OpsWorkerTaskStoreSafetyErro
     this.name = "OpsWorkerDeliveryConflictError";
     this.existingTaskId = existingTaskId;
   }
+}
+
+interface OpsWorkerDeliveryReceipt {
+  type: "alertmanager-delivery-receipt-v1";
+  deliveryKey: string;
+  submissionFingerprint: string;
+}
+
+function parseDeliveryReceipt(evidence: OpsWorkerTask["evidence"][number]):
+OpsWorkerDeliveryReceipt | undefined {
+  if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).length !== 3
+      || record.type !== "alertmanager-delivery-receipt-v1"
+      || typeof record.deliveryKey !== "string"
+      || typeof record.submissionFingerprint !== "string"
+    ) return undefined;
+    return record as unknown as OpsWorkerDeliveryReceipt;
+  } catch {
+    return undefined;
+  }
+}
+
+function deliveryFingerprints(task: OpsWorkerTask, deliveryKey: string): Set<string> {
+  const fingerprints = new Set<string>();
+  if (task.source.deliveryKey === deliveryKey) {
+    fingerprints.add(task.submissionFingerprint);
+  }
+  for (const evidence of task.evidence) {
+    const receipt = parseDeliveryReceipt(evidence);
+    if (receipt?.deliveryKey === deliveryKey) {
+      fingerprints.add(receipt.submissionFingerprint);
+    }
+  }
+  return fingerprints;
+}
+
+function serializedDeliveryReceipts(task: OpsWorkerTask): Set<string> {
+  return new Set(
+    task.evidence
+      .map(parseDeliveryReceipt)
+      .filter((receipt): receipt is OpsWorkerDeliveryReceipt => receipt !== undefined)
+      .map((receipt) => JSON.stringify(receipt)),
+  );
 }
 
 export class OpsWorkerTaskStoreBusyError extends Error {
@@ -676,13 +728,17 @@ export class OpsWorkerTaskStore {
   ): OpsWorkerTaskStoreCreateResult {
     const task = parseOpsWorkerTask(value, this.registry);
     task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+    if (serializedDeliveryReceipts(task).size > 0) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Delivery receipts may be created only by Alertmanager correlation reuse",
+      );
+    }
     assertAuditInput(audit);
     return this.withMutationLock(() => {
       this.ensureSafeDirectories();
       const currentTasks = this.list();
-      const deliveryMatches = currentTasks.filter(
-        (candidate) => candidate.source.deliveryKey === task.source.deliveryKey,
-      );
+      const deliveryMatches = currentTasks.filter((candidate) =>
+        deliveryFingerprints(candidate, task.source.deliveryKey).size > 0);
       if (deliveryMatches.length > 1) {
         throw new OpsWorkerTaskStoreSafetyError(
           `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
@@ -691,7 +747,11 @@ export class OpsWorkerTaskStore {
       const replay = deliveryMatches[0];
       if (replay) {
         this.assertGlobalInvariants(currentTasks);
-        this.assertCanonicalSubmission(replay, task);
+        if (!deliveryFingerprints(replay, task.source.deliveryKey).has(
+          task.submissionFingerprint,
+        )) {
+          throw new OpsWorkerDeliveryConflictError(task.source.deliveryKey, replay.id);
+        }
         return {
           task: replay,
           created: false,
@@ -699,6 +759,136 @@ export class OpsWorkerTaskStore {
           journalAppended: false,
         };
       }
+      const snapshotPath = this.snapshotPath(task.id);
+      if (assertPathMissingOrRegularFile(snapshotPath)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to replace existing task ${task.id} through create`,
+        );
+      }
+      this.assertJournalSafe();
+      this.assertGlobalInvariants([...currentTasks, task]);
+      this.injectFault("after-correlation-check");
+      return {
+        task,
+        created: true,
+        ...this.write(task, snapshotPath, audit),
+      };
+    });
+  }
+
+  /**
+   * Atomically reuse one active correlation while retaining every accepted
+   * Alertmanager delivery fingerprint for permanent replay after termination.
+   */
+  createOrReuseActiveCorrelation(
+    value: unknown,
+    audit: OpsWorkerAuditInput = { event: "CREATED" },
+  ): OpsWorkerTaskStoreCreateResult {
+    const task = parseOpsWorkerTask(value, this.registry);
+    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+    if (task.source.kind !== "alertmanager") {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Active-correlation delivery reuse is restricted to Alertmanager submissions",
+      );
+    }
+    if (serializedDeliveryReceipts(task).size > 0) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        "Alertmanager submissions cannot supply store-owned delivery receipts",
+      );
+    }
+    assertAuditInput(audit);
+    return this.withMutationLock(() => {
+      this.ensureSafeDirectories();
+      const currentTasks = this.list();
+      const deliveryOwners = currentTasks.filter((candidate) =>
+        deliveryFingerprints(candidate, task.source.deliveryKey).size > 0);
+      if (deliveryOwners.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
+        );
+      }
+      const deliveryOwner = deliveryOwners[0];
+      if (
+        deliveryOwner
+        && deliveryFingerprints(deliveryOwner, task.source.deliveryKey)
+          .has(task.submissionFingerprint)
+      ) {
+        this.assertGlobalInvariants(currentTasks);
+        return {
+          task: deliveryOwner,
+          created: false,
+          snapshotPath: this.snapshotPath(deliveryOwner.id),
+          journalAppended: false,
+        };
+      }
+
+      const activeCorrelationOwners = currentTasks.filter((candidate) =>
+        candidate.source.correlationKey === task.source.correlationKey
+        && !isOpsWorkerTerminalState(candidate.state));
+      if (activeCorrelationOwners.length > 1) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Multiple active tasks own correlation key ${JSON.stringify(task.source.correlationKey)}`,
+        );
+      }
+      const activeOwner = activeCorrelationOwners[0];
+      if (deliveryOwner && deliveryOwner.id !== activeOwner?.id) {
+        throw new OpsWorkerDeliveryConflictError(
+          task.source.deliveryKey,
+          deliveryOwner.id,
+        );
+      }
+      if (activeOwner) {
+        const working = structuredClone(activeOwner);
+        const receiptCount = working.evidence.filter((evidence) =>
+          parseDeliveryReceipt(evidence) !== undefined).length;
+        if (receiptCount >= MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
+          );
+        }
+        const receipt: OpsWorkerDeliveryReceipt = {
+          type: "alertmanager-delivery-receipt-v1",
+          deliveryKey: task.source.deliveryKey,
+          submissionFingerprint: task.submissionFingerprint,
+        };
+        try {
+          appendOpsWorkerEvidence(working, {
+            at: this.nextUpdatedAt(working),
+            kind: "system",
+            trust: "trusted",
+            summary: JSON.stringify(receipt),
+            artifact: null,
+          });
+        } catch (error) {
+          if (!(error instanceof RangeError)) throw error;
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
+          );
+        }
+        working.updatedAt = this.nextUpdatedAt(working);
+        compactOpsWorkerEvidenceForSnapshot(working);
+        const persisted = parseOpsWorkerTask(working, this.registry);
+        this.assertImmutableIdentity(activeOwner, persisted);
+        this.assertReplaySafety(activeOwner, persisted, receipt);
+        this.assertJournalSafe();
+        this.assertGlobalInvariants(this.withReplacement(currentTasks, persisted));
+        this.injectFault("after-correlation-check");
+        return {
+          task: persisted,
+          created: false,
+          ...this.write(persisted, this.snapshotPath(persisted.id), {
+            event: "EVIDENCE",
+            summary: "Recorded coalesced Alertmanager delivery receipt",
+          }),
+        };
+      }
+      if (deliveryOwner) {
+        throw new OpsWorkerDeliveryConflictError(
+          task.source.deliveryKey,
+          deliveryOwner.id,
+        );
+      }
+
       const snapshotPath = this.snapshotPath(task.id);
       if (assertPathMissingOrRegularFile(snapshotPath)) {
         throw new OpsWorkerTaskStoreSafetyError(
@@ -1097,7 +1287,11 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertReplaySafety(existing: OpsWorkerTask, replacement: OpsWorkerTask): void {
+  private assertReplaySafety(
+    existing: OpsWorkerTask,
+    replacement: OpsWorkerTask,
+    allowedDeliveryReceipt?: OpsWorkerDeliveryReceipt,
+  ): void {
     if (
       isOpsWorkerTerminalState(existing.state)
       && replacement.steering.length !== existing.steering.length
@@ -1132,6 +1326,25 @@ export class OpsWorkerTaskStore {
       ) {
         throw new OpsWorkerTaskStoreSafetyError(
           `Refusing to change consumed steering entry ${prior.steeringId}`,
+        );
+      }
+    }
+    const existingDeliveryReceipts = serializedDeliveryReceipts(existing);
+    const replacementDeliveryReceipts = serializedDeliveryReceipts(replacement);
+    for (const receipt of existingDeliveryReceipts) {
+      if (!replacementDeliveryReceipts.has(receipt)) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing to erase durable delivery receipt from task ${existing.id}`,
+        );
+      }
+    }
+    const allowedReceipt = allowedDeliveryReceipt === undefined
+      ? undefined
+      : JSON.stringify(allowedDeliveryReceipt);
+    for (const receipt of replacementDeliveryReceipts) {
+      if (!existingDeliveryReceipts.has(receipt) && receipt !== allowedReceipt) {
+        throw new OpsWorkerTaskStoreSafetyError(
+          `Refusing caller-supplied delivery receipt for task ${existing.id}`,
         );
       }
     }
@@ -1292,15 +1505,6 @@ export class OpsWorkerTaskStore {
     }
   }
 
-  private assertCanonicalSubmission(existing: OpsWorkerTask, replay: OpsWorkerTask): void {
-    if (existing.submissionFingerprint !== replay.submissionFingerprint) {
-      throw new OpsWorkerDeliveryConflictError(
-        replay.source.deliveryKey,
-        existing.id,
-      );
-    }
-  }
-
   private withReplacement(
     tasks: readonly OpsWorkerTask[],
     replacement: OpsWorkerTask,
@@ -1324,13 +1528,27 @@ export class OpsWorkerTaskStore {
     const activeCorrelationOwners = new Map<string, string>();
     const heldOwners: string[] = [];
     for (const task of tasks) {
-      const deliveryOwner = deliveryOwners.get(task.source.deliveryKey);
-      if (deliveryOwner && deliveryOwner !== task.id) {
-        throw new OpsWorkerTaskStoreSafetyError(
-          `Multiple tasks own delivery key ${JSON.stringify(task.source.deliveryKey)}`,
-        );
+      const taskDeliveryKeys = new Set([task.source.deliveryKey]);
+      for (const evidence of task.evidence) {
+        const receipt = parseDeliveryReceipt(evidence);
+        if (receipt) {
+          if (task.source.kind !== "alertmanager") {
+            throw new OpsWorkerTaskStoreSafetyError(
+              `Non-Alertmanager task ${task.id} contains a delivery receipt`,
+            );
+          }
+          taskDeliveryKeys.add(receipt.deliveryKey);
+        }
       }
-      deliveryOwners.set(task.source.deliveryKey, task.id);
+      for (const deliveryKey of taskDeliveryKeys) {
+        const deliveryOwner = deliveryOwners.get(deliveryKey);
+        if (deliveryOwner && deliveryOwner !== task.id) {
+          throw new OpsWorkerTaskStoreSafetyError(
+            `Multiple tasks own delivery key ${JSON.stringify(deliveryKey)}`,
+          );
+        }
+        deliveryOwners.set(deliveryKey, task.id);
+      }
 
       if (!isOpsWorkerTerminalState(task.state)) {
         const correlationOwner = activeCorrelationOwners.get(task.source.correlationKey);

@@ -84,7 +84,12 @@ Submission creates an authoritative `tasks/<id>.json` snapshot before success
 is reported. The delivery key identifies one adapter delivery permanently. An
 identical replay returns the existing task, including after completion, without
 adding a snapshot or audit transition. Reusing that key with a different
-canonical submission fails closed. Each v5 snapshot retains a store-owned
+canonical submission fails closed, except that the Alertmanager adapter may
+coalesce an evolving notification into the task that currently owns the same
+active correlation. Each accepted coalesced delivery key and submission
+fingerprint is retained as bounded protected trusted receipt evidence, so its exact
+replay still returns that task after termination; an unrecorded conflicting
+payload fails closed. Each v5 snapshot retains a store-owned
 immutable submission fingerprint, so later runtime evidence updates or bounded
 evidence eviction cannot make a conflicting delivery look identical. The
 correlation key has a different role:
@@ -465,8 +470,10 @@ The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a
 constant-time matched bearer token. The 256 KiB body limit mirrors the native
 receiver. Firing episodes derive their delivery and correlation keys from the
 trusted source identity, group key, and episode start. Identical delivery or an
-already-active correlation replays the existing task; resolved-only groups do
-not create work. A firing group must include non-empty group labels that fit the
+already-active correlation replays the existing task. Coalescing first records
+a durable delivery receipt in that task, preserving exact replay after the task
+becomes terminal. Resolved-only groups do not create work. A firing group must
+include non-empty group labels that fit the
 bounded correlation descriptor; intake rejects a group it could not later query
 exactly. Alert labels and annotations are stored only as bounded
 untrusted evidence. Responses expose only `ok`, `taskId`, and `replayed`, while

@@ -231,6 +231,86 @@ describe("package-owned ops availability done check", () => {
       assert.equal(result.result, "VERIFIER_INVALID");
       assert.equal(result.components[0].outcome, "VERIFIER_INVALID");
     }
+
+    for (const failingComponent of ["alerts", "service"] as const) {
+      const checks = createOpsAvailabilityDoneCheckRegistry({
+        clock: () => new Date(NOW),
+        monitoringFreshnessReader: {
+          readMonitoringFreshness: async () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
+        },
+        alertStateReader: {
+          read: async () => {
+            if (failingComponent === "alerts") throw new Error("offline");
+            return healthyReadings().alerts as OpsAlertStateReading;
+          },
+        },
+        serviceAvailabilityReader: {
+          readServiceAvailability: async () => {
+            if (failingComponent === "service") throw new Error("offline");
+            return healthyReadings().service as OpsServiceAvailabilityReading;
+          },
+        },
+      });
+      const result = await checks.run(
+        { name: OPS_AVAILABILITY_DONE_CHECK_NAME, params: PARAMS },
+        { taskId: `query-error-${failingComponent}`, checkedAt: NOW, now: () => new Date(NOW) },
+      );
+      const componentIndex = failingComponent === "alerts" ? 1 : 2;
+      assert.equal(result.result, "QUERY_ERROR");
+      assert.equal(result.components[componentIndex].outcome, "QUERY_ERROR");
+    }
+
+    for (const { field, malformed, componentIndex } of [
+      {
+        field: "alerts" as const,
+        malformed: { observedAt: NOW, status: "RESOLVED", extra: true },
+        componentIndex: 1,
+      },
+      {
+        field: "alerts" as const,
+        malformed: { observedAt: "2026-07-19T12:00:01.000Z", status: "RESOLVED" },
+        componentIndex: 1,
+      },
+      {
+        field: "alerts" as const,
+        malformed: { observedAt: NOW, status: "UNKNOWN" },
+        componentIndex: 1,
+      },
+      {
+        field: "service" as const,
+        malformed: { observedAt: NOW, status: "HEALTHY", healthySince: null },
+        componentIndex: 2,
+      },
+      {
+        field: "service" as const,
+        malformed: { observedAt: NOW, status: "UNHEALTHY", healthySince: SIX_MINUTES_AGO },
+        componentIndex: 2,
+      },
+      {
+        field: "service" as const,
+        malformed: {
+          observedAt: NOW,
+          status: "HEALTHY",
+          healthySince: "2026-07-19T12:00:01.000Z",
+        },
+        componentIndex: 2,
+      },
+      {
+        field: "service" as const,
+        malformed: {
+          observedAt: "2026-07-19T12:00:01.000Z",
+          status: "HEALTHY",
+          healthySince: SIX_MINUTES_AGO,
+        },
+        componentIndex: 2,
+      },
+    ]) {
+      const readings = healthyReadings();
+      readings[field] = malformed;
+      const result = await run(readings);
+      assert.equal(result.result, "VERIFIER_INVALID");
+      assert.equal(result.components[componentIndex].outcome, "VERIFIER_INVALID");
+    }
   });
 
   it("fails through the typed query path when the trusted clock is invalid", async () => {

@@ -209,7 +209,7 @@ function parseGetUpdatesResult(value: unknown, offset: number | undefined): Reco
       `Telegram getUpdates returned more than ${MAX_UPDATES_PER_POLL} updates`,
     );
   }
-  let previous = offset === undefined ? -1 : offset - 1;
+  let previous: number | undefined;
   return value.result.map((entry, index) => {
     if (!isPlainObject(entry)) {
       throw new OpsWorkerTelegramTransportError(`Telegram update ${index} is not an object`);
@@ -218,8 +218,11 @@ function parseGetUpdatesResult(value: unknown, offset: number | undefined): Reco
     if (!Number.isSafeInteger(updateId) || (updateId as number) < 0) {
       throw new OpsWorkerTelegramTransportError(`Telegram update ${index} has an invalid update_id`);
     }
-    if ((updateId as number) < previous) {
-      throw new OpsWorkerTelegramTransportError("Telegram updates are not monotonically ordered");
+    if (
+      (index === 0 && offset !== undefined && (updateId as number) < offset - 1)
+      || (previous !== undefined && (updateId as number) <= previous)
+    ) {
+      throw new OpsWorkerTelegramTransportError("Telegram updates are not strictly ordered");
     }
     previous = updateId as number;
     return entry;
