@@ -361,6 +361,67 @@ function extensionModuleSpecifiers(
     }
     return undefined;
   };
+  const unwrapExpression = (node: ts.Expression): ts.Expression => {
+    let current = node;
+    while (
+      ts.isParenthesizedExpression(current)
+      || ts.isAsExpression(current)
+      || ts.isSatisfiesExpression(current)
+      || ts.isNonNullExpression(current)
+    ) current = current.expression;
+    return current;
+  };
+  const directVmCreateContextCall = (node: ts.Expression): boolean => {
+    const expression = unwrapExpression(node);
+    if (
+      !ts.isCallExpression(expression)
+      || expression.questionDotToken !== undefined
+      || expression.arguments.length !== 1
+      || expression.arguments.some((argument) => ts.isSpreadElement(argument))
+      || !ts.isPropertyAccessExpression(expression.expression)
+      || expression.expression.questionDotToken !== undefined
+      || expression.expression.name.text !== "createContext"
+      || !ts.isIdentifier(expression.expression.expression)
+    ) return false;
+    return vmBindings.has(expression.expression.expression.text);
+  };
+  const assertSafeVmScriptExecution = (invocation: ts.NewExpression): void => {
+    let expression: ts.Expression = invocation;
+    while (
+      ts.isParenthesizedExpression(expression.parent)
+      && expression.parent.expression === expression
+    ) expression = expression.parent;
+    const access = expression.parent;
+    const execution = access?.parent;
+    if (
+      !ts.isPropertyAccessExpression(access)
+      || access.expression !== expression
+      || access.questionDotToken !== undefined
+      || access.name.text !== "runInContext"
+      || !ts.isCallExpression(execution)
+      || execution.expression !== access
+      || execution.questionDotToken !== undefined
+      || execution.arguments.length !== 1
+      || execution.arguments.some((argument) => ts.isSpreadElement(argument))
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm Script execution outside a direct attested context cannot be attested safely",
+      );
+    }
+    const context = unwrapExpression(execution.arguments[0]);
+    const initializer = ts.isIdentifier(context)
+      ? constantInitializers.get(context.text)
+      : undefined;
+    if (
+      initializer === undefined
+      || initializer === null
+      || !directVmCreateContextCall(initializer)
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm Script context cannot be attested safely",
+      );
+    }
+  };
   const assertSafeVmBindingUsage = (node: ts.Identifier): void => {
     const parent = node.parent;
     if (ts.isImportClause(parent) && parent.name === node) return;
@@ -380,31 +441,45 @@ function extensionModuleSpecifiers(
       && ts.isCallExpression(invocation)
       && invocation.expression === parent
       && invocation.questionDotToken === undefined
-    ) return;
+    ) {
+      if (!directVmCreateContextCall(invocation)) {
+        throw new TypeError(
+          "Pi extension node:vm context construction cannot be attested safely",
+        );
+      }
+      return;
+    }
     if (
       operation === "Script"
       && ts.isNewExpression(invocation)
       && invocation.expression === parent
     ) {
       const args = invocation.arguments ?? [];
-      if (args.length > 2 || args.some((argument) => ts.isSpreadElement(argument))) {
+      if (
+        args.length < 1
+        || args.length > 2
+        || args.some((argument) => ts.isSpreadElement(argument))
+      ) {
         throw new TypeError(
           "Pi extension node:vm Script options cannot be attested safely",
         );
       }
       const options = args[1];
-      if (options === undefined) return;
       if (
-        !ts.isObjectLiteralExpression(options)
-        || options.properties.some((property) =>
-          !ts.isPropertyAssignment(property)
-          || objectPropertyName(property.name) !== "filename"
+        options !== undefined
+        && (
+          !ts.isObjectLiteralExpression(options)
+          || options.properties.some((property) =>
+            !ts.isPropertyAssignment(property)
+            || objectPropertyName(property.name) !== "filename"
+          )
         )
       ) {
         throw new TypeError(
           "Pi extension node:vm Script options cannot be attested safely",
         );
       }
+      assertSafeVmScriptExecution(invocation);
       return;
     }
     throw new TypeError(

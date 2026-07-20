@@ -107,9 +107,11 @@ pins its bundled `agents/` and `prompts/` resources.
 `jiti` loads the resulting private, read-only extension snapshots with fixed
 package aliases and resolver settings, so extension-local replacements or
 ambient Jiti configuration cannot change the executed dependency bytes.
-`node:vm` is accepted only through one default binding used directly by
-`createContext` and `new Script`, with loader-bearing options, aliases, computed
-access, re-exports, and other VM APIs rejected. Bare `acorn` imports require
+`node:vm` is accepted only through one default binding and a direct
+`new Script(...).runInContext(context)` chain whose context is a unique constant
+initialized by direct `createContext(...)`; other execution methods, aliases,
+extra execution options, loader-bearing options, computed access, re-exports,
+and other VM APIs are rejected. Bare `acorn` imports require
 manifest-covered package metadata and a self-contained import entry with no
 module-loading escape, then execute from a copied, layout-preserving
 `node_modules` snapshot rather than ambient resolution. Skills are pinned as

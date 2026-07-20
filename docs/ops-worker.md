@@ -274,12 +274,14 @@ package-owned subagent manifest's bundled agent and prompt resources. Ambient
 Jiti extension ordering and cache configuration cannot change that contract.
 Dynamic imports, runtime `require`, `createRequire`, and reflective loaders fail
 closed because their eventual executable dependency bytes cannot be fenced
-before launch. `node:vm` is accepted only through one default binding used in
-direct `vm.createContext(...)` calls and direct `new vm.Script(...)`
-construction with no options or an object containing only `filename`. Aliases,
-computed access, other VM APIs, re-exports, and loader-bearing Script options
-fail closed. Workflow source passed to that bounded `vm.Script` use is runtime
-tool input, not a primary resource dependency. Worker children still disable
+before launch. `node:vm` is accepted only through one default binding. Each
+Script must be constructed and executed in one direct
+`new vm.Script(...).runInContext(...)` chain, and the sole execution argument
+must be a unique constant initialized by a direct `vm.createContext(...)` call.
+Script/context aliases, other execution methods, computed access, other VM APIs,
+re-exports, extra execution options, and loader-bearing Script options fail
+closed. Workflow source passed to that bounded `vm.Script` use is runtime tool
+input, not a primary resource dependency. Worker children still disable
 ordinary V8 string code generation such as `eval` and `Function`, but that flag
 does not disable `vm.Script` and is not treated as its security fence. Bare
 `acorn` imports additionally require explicit manifest coverage of the package
