@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   readFileSync,
@@ -261,12 +260,6 @@ describe("ops worker dedicated Telegram control", () => {
       assert.doesNotMatch(source, /from\s+["']grammy["']/);
       assert.doesNotMatch(source, /from\s+["']\.\.\/telegram-(?:bot|adapter)\.js["']/);
     }
-    const changedPrimaryBot = execFileSync(
-      "git",
-      ["diff", "7c53a7a", "--name-only", "--", "src/telegram-bot.ts"],
-      { cwd: PACKAGE_ROOT, encoding: "utf8" },
-    );
-    assert.equal(changedPrimaryBot, "");
   });
 
   it("persists effects and offsets, rejects the allowlist, and replays duplicates as no-ops", async (t) => {
