@@ -83,6 +83,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   hashOpsWorkerPiLaunchSubject,
+  serializeOpsWorkerPendingSteering,
   type OpsWorkerActiveRun,
   type OpsWorkerInterrupt,
   type OpsWorkerOutcomeResult,
@@ -93,7 +94,7 @@ import {
 export const OPS_WORKER_PI_LIMITS = {
   maxCapturedStreamBytes: 32 * 1024,
   maxPromptBytes: 128 * 1024,
-  maxSteeringPromptBytes: 64 * 1024,
+  maxSteeringPromptBytes: OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes,
   maxSessionFiles: 64,
   defaultAttemptTimeoutMs: 30 * 60 * 1_000,
   defaultStallTimeoutMs: 20 * 60 * 1_000,
@@ -2489,31 +2490,13 @@ function buildPreparedOpsWorkerAttemptPrompt(
 ): PreparedOpsWorkerAttemptPrompt {
   const evidence = task.evidence.map((entry) =>
     `[${entry.kind}/${entry.trust}] ${entry.summary}`).join("\n");
-  const steeringLines: string[] = [];
-  const steeringIds: string[] = [];
-  let steeringBytes = 0;
-  for (const entry of task.steering) {
-    if (
-      entry.consumedAt !== null
-      || (entry.kind !== "correction" && entry.kind !== "answer")
-    ) continue;
-    const line = JSON.stringify({
-        steeringId: entry.steeringId,
-        receivedAt: entry.receivedAt,
-        kind: entry.kind,
-        operatorRef: entry.operatorRef,
-        text: entry.text,
-      });
-    const addedBytes = Buffer.byteLength(
-      `${steeringLines.length === 0 ? "" : "\n"}${line}`,
-      "utf8",
-    );
-    if (steeringBytes + addedBytes > OPS_WORKER_PI_LIMITS.maxSteeringPromptBytes) break;
-    steeringLines.push(line);
-    steeringIds.push(entry.steeringId);
-    steeringBytes += addedBytes;
+  const { text: steering, steeringIds } = serializeOpsWorkerPendingSteering(task.steering);
+  if (
+    Buffer.byteLength(steering, "utf8")
+    > OPS_WORKER_PI_LIMITS.maxSteeringPromptBytes
+  ) {
+    throw new TypeError("Ops-worker pending steering exceeds the fixed prompt sub-budget");
   }
-  const steering = steeringLines.join("\n");
   const lifecycleIdentity = Object.entries(task.lifecycle)
     .filter(([slot, identity]) => slot !== "schemaVersion" && identity !== null)
     .map(([slot, identity]) => `${slot}=${String(identity)}`)

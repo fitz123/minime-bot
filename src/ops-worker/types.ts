@@ -768,8 +768,37 @@ export const OPS_WORKER_LIMITS = {
   maxSteeringIdBytes: 256,
   maxSteeringOperatorRefBytes: 256,
   maxSteeringTextBytes: 8 * 1024,
+  maxPendingSteeringPromptBytes: 64 * 1024,
   maxInterruptReasonBytes: 4 * 1024,
 } as const;
+
+export interface SerializedOpsWorkerPendingSteering {
+  text: string;
+  steeringIds: string[];
+}
+
+/** Serialize every pending prompt-relevant steering entry using the launch wire format. */
+export function serializeOpsWorkerPendingSteering(
+  entries: readonly OpsWorkerSteeringEntry[],
+): SerializedOpsWorkerPendingSteering {
+  const steeringIds: string[] = [];
+  const lines: string[] = [];
+  for (const entry of entries) {
+    if (
+      entry.consumedAt !== null
+      || (entry.kind !== "correction" && entry.kind !== "answer")
+    ) continue;
+    lines.push(JSON.stringify({
+      steeringId: entry.steeringId,
+      receivedAt: entry.receivedAt,
+      kind: entry.kind,
+      operatorRef: entry.operatorRef,
+      text: entry.text,
+    }));
+    steeringIds.push(entry.steeringId);
+  }
+  return { text: lines.join("\n"), steeringIds };
+}
 
 const V1_TASK_KEYS = [
   "schemaVersion",
@@ -1026,7 +1055,7 @@ function parseSteering(value: unknown): OpsWorkerSteeringEntry[] {
     );
   }
   const steeringIds = new Set<string>();
-  return entries.map((entryValue, index) => {
+  const parsed = entries.map((entryValue, index) => {
     const path = `task.steering[${index}]`;
     const entry = expectObject(entryValue, path);
     expectExactKeys(
@@ -1069,6 +1098,16 @@ function parseSteering(value: unknown): OpsWorkerSteeringEntry[] {
       consumedAt,
     };
   });
+  if (
+    Buffer.byteLength(serializeOpsWorkerPendingSteering(parsed).text, "utf8")
+    > OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes
+  ) {
+    fail(
+      "task.steering",
+      `pending correction and answer entries must serialize to at most ${OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes} UTF-8 bytes`,
+    );
+  }
+  return parsed;
 }
 
 function parseInterrupt(value: unknown): OpsWorkerInterrupt | null {

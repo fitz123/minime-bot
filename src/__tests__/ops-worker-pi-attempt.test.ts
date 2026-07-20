@@ -930,6 +930,46 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.ok(result.steering[0]?.consumedAt);
   });
 
+  it("delivers and consumes every admitted escape-heavy steering entry together", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("cumulative-escaped-steering");
+    harness.store.create(task);
+    const entries = ["correction", "answer"].map((kind, index) => ({
+      steeringId: `telegram:update:cumulative-escaped:${index}`,
+      receivedAt: task.updatedAt,
+      kind: kind as "correction" | "answer",
+      operatorRef: "telegram:100000000",
+      text: String.fromCharCode(index + 1).repeat(
+        OPS_WORKER_LIMITS.maxSteeringTextBytes / 2,
+      ),
+      consumedAt: null,
+    }));
+    for (const entry of entries) harness.store.appendSteering(task.id, entry);
+    const promptPath = join(harness.root, "cumulative-escaped-steering.txt");
+    harness.setScenario("crash");
+
+    const result = await harness.runner({
+      dependencies: {
+        buildEnv: () => ({
+          PATH: process.env.PATH ?? "",
+          MINIME_TEST_PRIVATE_PROMPT_PATH: promptPath,
+        }),
+      },
+    }).runAttempt(task.id);
+
+    const prompt = readFileSync(promptPath, "utf8");
+    for (const entry of entries) {
+      assert.ok(prompt.includes(JSON.stringify({
+        steeringId: entry.steeringId,
+        receivedAt: entry.receivedAt,
+        kind: entry.kind,
+        operatorRef: entry.operatorRef,
+        text: entry.text,
+      })));
+    }
+    assert.ok(result.steering.every((entry) => entry.consumedAt !== null));
+  });
+
   it("fences prompt-relevant lifecycle drift across the pre-spawn boundary", async (t) => {
     const harness = await makeHarness(t);
     const staleTask = makeTask("launch-subject-drift");

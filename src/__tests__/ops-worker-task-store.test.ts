@@ -344,10 +344,11 @@ function makeStore(
     maxJournalBytes?: number;
     faultInjector?: (point: OpsWorkerTaskStoreFaultPoint) => void;
     now?: () => Date;
+    registry?: OpsWorkerTaskContractRegistry;
   } = {},
 ): OpsWorkerTaskStore {
   return new OpsWorkerTaskStore(options.directory ?? testStateDirectory(t), {
-    registry,
+    registry: options.registry ?? registry,
     now: options.now ?? (() => new Date(NOW)),
     maxJournalBytes: options.maxJournalBytes,
     faultInjector: options.faultInjector,
@@ -1511,6 +1512,35 @@ describe("ops worker durable task store", () => {
     );
   });
 
+  it("rejects pending steering that would exceed the shared launch prompt budget", (t) => {
+    const store = makeStore(t);
+    const task = makeTask("steering-prompt-capacity", "steering:prompt:capacity");
+    store.create(task);
+    const first = {
+      steeringId: "telegram:update:prompt-capacity:1",
+      receivedAt: NOW,
+      kind: "answer" as const,
+      operatorRef: "telegram:100000000",
+      text: "\u0001".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+      consumedAt: null,
+    };
+    store.appendSteering(task.id, first);
+    const snapshotPath = join(store.tasksDirectory, `${task.id}.json`);
+    const snapshotBeforeOverflow = readFileSync(snapshotPath, "utf8");
+    const journalBeforeOverflow = readFileSync(store.journalPath, "utf8");
+
+    assert.throws(
+      () => store.appendSteering(task.id, {
+        ...first,
+        steeringId: "telegram:update:prompt-capacity:2",
+      }),
+      OpsWorkerSteeringCapacityError,
+    );
+    assert.equal(readFileSync(snapshotPath, "utf8"), snapshotBeforeOverflow);
+    assert.equal(readFileSync(store.journalPath, "utf8"), journalBeforeOverflow);
+    assert.deepEqual(store.get(task.id)?.steering, [first]);
+  });
+
   it("does not reapply stale pause or interrupt effects when steering is replayed", (t) => {
     const store = makeStore(t);
     const pauseTask = makeTask("steering-pause-aba", "steering:pause:aba");
@@ -1619,7 +1649,7 @@ describe("ops worker durable task store", () => {
     assert.equal(grown.steering.length, accepted);
     assert.ok(
       grown.evidence.length > 0
-        && grown.evidence.length < OPS_WORKER_LIMITS.maxEvidenceEntries,
+        && grown.evidence.length <= OPS_WORKER_LIMITS.maxEvidenceEntries,
     );
     assert.ok(
       Buffer.byteLength(`${JSON.stringify(grown)}\n`, "utf8")
@@ -1745,6 +1775,63 @@ describe("ops worker durable task store", () => {
     assert.equal(entry.taskId, makeTask().id);
     assert.equal(entry.state, "QUEUED");
     assert.equal(entry.event, "CREATED");
+  });
+
+  it("revalidates verification after assigning the store-owned submission fingerprint", (t) => {
+    const directStore = makeStore(t);
+    const direct = makeTask(
+      "stale-create-verification",
+      "stale:create:verification",
+    );
+    direct.submissionFingerprint = `sha256:${"a".repeat(64)}`;
+    attachFreshPass(direct, NOW);
+    assert.doesNotThrow(() => parseOpsWorkerTask(direct, registry));
+
+    assert.throws(
+      () => directStore.create(direct),
+      /task\.verification\.subjectHash: is stale/,
+    );
+    assert.equal(
+      existsSync(join(directStore.tasksDirectory, `${direct.id}.json`)),
+      false,
+    );
+
+    const alertmanagerRegistry: OpsWorkerTaskContractRegistry = {
+      ...registry,
+      templates: {
+        ...registry.templates,
+        "operator-health": {
+          sourceKinds: ["operator-cli", "operator-telegram", "alertmanager"],
+        },
+      },
+      authorizationProfiles: {
+        ...registry.authorizationProfiles,
+        "operator.inspect.v1": {
+          sourceKinds: ["operator-cli", "operator-telegram", "alertmanager"],
+          scope: ["inspect"],
+        },
+      },
+    };
+    const correlationStore = makeStore(t, { registry: alertmanagerRegistry });
+    const correlated = makeTask(
+      "stale-correlation-verification",
+      "alertmanager:stale:verification",
+    );
+    correlated.source.kind = "alertmanager";
+    correlated.source.deliveryKey = "alertmanager:stale:delivery";
+    correlated.priority = 0;
+    correlated.submissionFingerprint = `sha256:${"b".repeat(64)}`;
+    attachFreshPass(correlated, NOW);
+    assert.doesNotThrow(() => parseOpsWorkerTask(correlated, alertmanagerRegistry));
+
+    assert.throws(
+      () => correlationStore.createOrReuseActiveCorrelation(correlated),
+      /task\.verification\.subjectHash: is stale/,
+    );
+    assert.equal(
+      existsSync(join(correlationStore.tasksDirectory, `${correlated.id}.json`)),
+      false,
+    );
   });
 
   it("atomically replaces a snapshot and leaves no temp file on success", (t) => {

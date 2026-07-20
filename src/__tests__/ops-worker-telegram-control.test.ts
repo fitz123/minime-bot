@@ -550,7 +550,7 @@ describe("ops worker dedicated Telegram control", () => {
     nearCapacity.steering = Array.from({ length: 62 }, (_, index) => ({
       steeringId: `fixture:capacity:${index}`,
       receivedAt: NOW,
-      kind: "answer" as const,
+      kind: "pause" as const,
       operatorRef: "fixture:operator",
       text: "x".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
       consumedAt: null,

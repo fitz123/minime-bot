@@ -27,6 +27,7 @@ import {
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  serializeOpsWorkerPendingSteering,
   type OpsWorkerInterrupt,
   type OpsWorkerSteeringEntry,
   type OpsWorkerTask,
@@ -127,7 +128,7 @@ export class OpsWorkerTaskStoreSafetyError extends Error {
 
 export class OpsWorkerSteeringCapacityError extends OpsWorkerTaskStoreSafetyError {
   constructor(taskId: string) {
-    super(`Task ${taskId} has no remaining steering snapshot capacity`);
+    super(`Task ${taskId} has no remaining steering capacity`);
     this.name = "OpsWorkerSteeringCapacityError";
   }
 }
@@ -726,8 +727,11 @@ export class OpsWorkerTaskStore {
     value: unknown,
     audit: OpsWorkerAuditInput = { event: "CREATED" },
   ): OpsWorkerTaskStoreCreateResult {
-    const task = parseOpsWorkerTask(value, this.registry);
-    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+    const supplied = parseOpsWorkerTask(value, this.registry);
+    const task = parseOpsWorkerTask({
+      ...supplied,
+      submissionFingerprint: hashOpsWorkerCanonicalSubmission(supplied),
+    }, this.registry);
     if (serializedDeliveryReceipts(task).size > 0) {
       throw new OpsWorkerTaskStoreSafetyError(
         "Delivery receipts may be created only by Alertmanager correlation reuse",
@@ -784,8 +788,11 @@ export class OpsWorkerTaskStore {
     value: unknown,
     audit: OpsWorkerAuditInput = { event: "CREATED" },
   ): OpsWorkerTaskStoreCreateResult {
-    const task = parseOpsWorkerTask(value, this.registry);
-    task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+    const supplied = parseOpsWorkerTask(value, this.registry);
+    const task = parseOpsWorkerTask({
+      ...supplied,
+      submissionFingerprint: hashOpsWorkerCanonicalSubmission(supplied),
+    }, this.registry);
     if (task.source.kind !== "alertmanager") {
       throw new OpsWorkerTaskStoreSafetyError(
         "Active-correlation delivery reuse is restricted to Alertmanager submissions",
@@ -977,7 +984,7 @@ export class OpsWorkerTaskStore {
         return OPS_WORKER_TASK_STORE_NO_CHANGE;
       }
       task.updatedAt = this.nextUpdatedAt(task);
-      this.assertSteeringSnapshotCapacity(task);
+      this.assertSteeringCapacity(task);
     });
   }
 
@@ -992,7 +999,7 @@ export class OpsWorkerTaskStore {
         return OPS_WORKER_TASK_STORE_NO_CHANGE;
       }
       callback(task);
-      this.assertSteeringSnapshotCapacity(task);
+      this.assertSteeringCapacity(task);
     });
   }
 
@@ -1024,7 +1031,7 @@ export class OpsWorkerTaskStore {
       const now = this.nextUpdatedAt(task);
       task.control.pausedAt = task.control.paused ? now : null;
       task.updatedAt = now;
-      this.assertSteeringSnapshotCapacity(task);
+      this.assertSteeringCapacity(task);
     });
   }
 
@@ -1065,7 +1072,7 @@ export class OpsWorkerTaskStore {
       const now = this.nextUpdatedAt(task);
       if (startsPause) task.control.pausedAt = now;
       task.updatedAt = now;
-      this.assertSteeringSnapshotCapacity(task);
+      this.assertSteeringCapacity(task);
     });
   }
 
@@ -1208,8 +1215,11 @@ export class OpsWorkerTaskStore {
     return true;
   }
 
-  private assertSteeringSnapshotCapacity(task: OpsWorkerTask): void {
+  private assertSteeringCapacity(task: OpsWorkerTask): void {
     if (
+      Buffer.byteLength(serializeOpsWorkerPendingSteering(task.steering).text, "utf8")
+        > OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes
+      ||
       Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8")
       > OPS_WORKER_LIMITS.maxSnapshotBytes
         - OPS_WORKER_LIMITS.minRuntimeMutationHeadroomBytes

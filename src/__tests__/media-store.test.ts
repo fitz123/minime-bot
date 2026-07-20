@@ -352,6 +352,7 @@ describe("ensureSessionMediaDir permissions", () => {
   it("chmods an existing loose-permission MEDIA_BASE to 0o700", () => {
     // Simulate pre-squat: another process created the dir with loose perms.
     mkdirSync(MEDIA_BASE, { recursive: true, mode: 0o755 });
+    chmodSync(MEDIA_BASE, 0o755);
     assert.strictEqual(statSync(MEDIA_BASE).mode & 0o777, 0o755);
 
     ensureSessionMediaDir("chat-tighten");
@@ -361,6 +362,7 @@ describe("ensureSessionMediaDir permissions", () => {
 
   it("chmods an existing loose-permission session dir to 0o700", () => {
     mkdirSync(sessionMediaDir("chat-loose"), { recursive: true, mode: 0o755 });
+    chmodSync(sessionMediaDir("chat-loose"), 0o755);
     assert.strictEqual(statSync(sessionMediaDir("chat-loose")).mode & 0o777, 0o755);
 
     ensureSessionMediaDir("chat-loose");
