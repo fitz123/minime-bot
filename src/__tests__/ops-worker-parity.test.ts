@@ -408,15 +408,12 @@ describe("primary Pi resource contract", () => {
     const extension = join(root, "node_modules", "configured-workflow", "index.ts");
     mkdirSync(dirname(packageEntry), { recursive: true });
     mkdirSync(dirname(extension), { recursive: true });
-    writeFileSync(
-      packageMetadata,
-      `${JSON.stringify({
+    const packageMetadataSource = `${JSON.stringify({
         name: "acorn",
         main: "./dist/acorn.cjs",
         exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
-      })}\n`,
-      "utf8",
-    );
+      })}\n`;
+    writeFileSync(packageMetadata, packageMetadataSource, "utf8");
     writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
     const accepted = [
       "import { Script } from 'node:vm';",
@@ -443,6 +440,36 @@ describe("primary Pi resource contract", () => {
         /manifest must cover the acorn package metadata and runtime entry/,
       );
     }
+
+    const outsideEntry = join(root, "outside.mjs");
+    writeFileSync(outsideEntry, "export const parse = () => ({ type: 'Outside' });\n", "utf8");
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./../../outside.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(
+        extension,
+        [packageMetadata, outsideEntry],
+      ),
+      /manifest must cover the acorn package metadata and runtime entry/,
+    );
+
+    writeFileSync(packageMetadata, packageMetadataSource, "utf8");
+    writeFileSync(
+      packageEntry,
+      "import value from 'ambient-only'; export const parse = () => value;\n",
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /declared package entry must be self-contained/,
+    );
+    writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
 
     const rejected = [
       "import value from 'unlisted-package'; export default value;\n",

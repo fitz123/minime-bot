@@ -256,11 +256,13 @@ tool names as the primary session. Generated private wrappers load verified
 read-only snapshots of each extension closure, including the parity gate, and
 give even handler-only extensions a deterministic one-way identity. The worker
 also replaces every selected skill with a bounded, read-only snapshot of its
-complete directory package, preserving relative scripts, references, assets,
-and executable bits. The ops policy is the sole intentional additive context
-delta. Before provider work, a package-owned extension compares the effective
-system prompt with its session baseline and reports structured context-file,
-extension, skill, and tool metadata through a
+selected directory package, preserving relative scripts, references, assets,
+and executable bits while omitting exact generated Python directories named
+`.venv`, `.pytest_cache`, or `__pycache__` at any depth. Near-miss names remain
+part of the snapshot, and all other symlinks fail closed. The ops policy is the
+sole intentional additive context delta. Before provider work, a package-owned
+extension compares the effective system prompt with its session baseline and
+reports structured context-file, extension, skill, and tool metadata through a
 parent/child acknowledgement handshake. The parent recomputes every prepared
 digest before acknowledging. Any missing, internally inconsistent, or
 mismatched evidence fails closed; persisted evidence contains versioned results
@@ -269,14 +271,21 @@ and hashes only.
 Extension identities include the complete statically resolved local module
 closure using the same fixed Jiti resolver contract as execution, plus the
 package-owned subagent manifest's bundled agent and prompt resources. Ambient
-Jiti extension ordering and cache configuration cannot change that contract. Dynamic
-imports, runtime `require`, `createRequire`, VM loaders, and runtime code generation
-fail closed because their eventual executable dependency bytes cannot be fenced
-before launch. Extension imports outside the local closure are limited to the
+Jiti extension ordering and cache configuration cannot change that contract.
+Dynamic imports, runtime `require`, `createRequire`, reflective loaders, and
+runtime code generation fail closed because their eventual executable
+dependency bytes cannot be fenced before launch. Direct `node:vm` imports are
+permitted by the fixed built-in allowlist, but worker children still run with V8
+string code generation disabled, including quota smoke probes. Bare `acorn`
+imports additionally require explicit manifest coverage of the package metadata
+and resolved import entry. That entry must pass a deterministic self-contained
+module-loading gate and is copied under its preserved `node_modules` layout;
+static or dynamic package-entry imports, runtime loaders, arbitrary bare or
+subpath extension imports, and ambient package resolution remain rejected.
+Other extension imports outside the local closure are limited to the
 package-owned primary dependency allowlist and resolve through fixed package
 aliases rather than extension-local replacements; global/process aliases and
-reflective loader surfaces are rejected. Worker children additionally run with
-V8 string code generation disabled, including quota smoke probes.
+reflective loader surfaces are rejected.
 
 Trusted configured extras must provide an explicit, parallel manifest of every
 non-module runtime file they read relative to their entrypoint; an

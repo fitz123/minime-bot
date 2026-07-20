@@ -412,6 +412,79 @@ function extensionModuleSpecifiers(
   };
 }
 
+function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer): void {
+  const source = ts.createSourceFile(
+    path,
+    content.toString("utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const parseDiagnostics = (
+    source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
+  ).parseDiagnostics ?? [];
+  if (parseDiagnostics.length > 0) {
+    throw new TypeError(
+      "Pi extension declared package entry must parse before its bytes are attested",
+    );
+  }
+  const loaderIdentifiers = new Set([
+    "Function",
+    "Proxy",
+    "Reflect",
+    "WebAssembly",
+    "createRequire",
+    "eval",
+    "getBuiltinModule",
+    "global",
+    "globalThis",
+    "mainModule",
+    "module",
+    "process",
+    "require",
+  ]);
+  const loaderProperties = new Set([
+    "_load",
+    "createRequire",
+    "getBuiltinModule",
+    "mainModule",
+    "process",
+    "require",
+  ]);
+  const reject = (): never => {
+    throw new TypeError(
+      "Pi extension declared package entry must be self-contained and cannot use runtime module loaders",
+    );
+  };
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+      && node.moduleSpecifier !== undefined
+    ) reject();
+    if (
+      ts.isImportEqualsDeclaration(node)
+      || (
+        ts.isCallExpression(node)
+        && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      )
+    ) reject();
+    if (ts.isIdentifier(node) && loaderIdentifiers.has(node.text)) reject();
+    if (
+      ts.isPropertyAccessExpression(node)
+      && loaderProperties.has(node.name.text)
+    ) reject();
+    if (
+      ts.isElementAccessExpression(node)
+      && (
+        ts.isStringLiteral(node.argumentExpression)
+        || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression)
+      )
+      && loaderProperties.has(node.argumentExpression.text)
+    ) reject();
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+}
+
 function resolveLocalModule(importer: string, specifier: string): string {
   const base = resolve(dirname(importer), specifier);
   if (existsSync(base)) {
@@ -571,7 +644,7 @@ function assertDeclaredPackageResourceCoverage(
   importer: string,
   specifier: string,
   declaredResources: ReadonlySet<string>,
-): void {
+): string {
   let searchDirectory = dirname(importer);
   let metadataPath: string | undefined;
   for (;;) {
@@ -646,6 +719,7 @@ function assertDeclaredPackageResourceCoverage(
       `Pi extension resource manifest must cover the ${specifier} package metadata and runtime entry`,
     );
   }
+  return entryPath;
 }
 
 function extensionResourceFiles(
@@ -660,6 +734,7 @@ function extensionResourceFiles(
   const declaredResources = new Set(additionalResources.map((resource) => resource.path));
   const pending = [trustedEntryPath];
   const seen = new Set<string>();
+  const declaredPackageEntries = new Set<string>();
   const files: PiExtensionResourceFile[] = [];
   let totalBytes = 0;
   while (pending.length > 0) {
@@ -680,13 +755,23 @@ function extensionResourceFiles(
       executable: (lstatSync(path).mode & 0o111) !== 0,
     });
     if (extname(path) === ".json") continue;
+    if (declaredPackageEntries.has(path)) {
+      assertDeclaredPackageEntrySelfContained(path, content);
+      continue;
+    }
     const specifiers = extensionModuleSpecifiers(path, content);
     for (const specifier of specifiers.local) {
       const dependency = resolveLocalModule(path, specifier);
       if (!seen.has(dependency)) pending.push(dependency);
     }
     for (const specifier of specifiers.declaredPackages) {
-      assertDeclaredPackageResourceCoverage(path, specifier, declaredResources);
+      const dependency = assertDeclaredPackageResourceCoverage(
+        path,
+        specifier,
+        declaredResources,
+      );
+      declaredPackageEntries.add(dependency);
+      if (!seen.has(dependency)) pending.push(dependency);
     }
   }
   for (const resource of additionalResources) {
