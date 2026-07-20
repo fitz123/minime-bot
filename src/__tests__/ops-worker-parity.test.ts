@@ -497,6 +497,33 @@ describe("primary Pi resource contract", () => {
         source,
       );
     }
+
+    const consumer = join(dirname(extension), "consumer.ts");
+    writeFileSync(
+      packageEntry,
+      "import { readFileSync } from 'node:fs'; export const parse = readFileSync;\n",
+      "utf8",
+    );
+    writeFileSync(
+      consumer,
+      "import { parse } from 'acorn'; export default parse;\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      [
+        "import './consumer.ts';",
+        "import '../acorn/dist/acorn.mjs';",
+        "export default function extension() {}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /declared package entry must be self-contained/,
+    );
+
     writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
 
     const rejected = [

@@ -272,16 +272,19 @@ Extension identities include the complete statically resolved local module
 closure using the same fixed Jiti resolver contract as execution, plus the
 package-owned subagent manifest's bundled agent and prompt resources. Ambient
 Jiti extension ordering and cache configuration cannot change that contract.
-Dynamic imports, runtime `require`, `createRequire`, reflective loaders, and
-runtime code generation fail closed because their eventual executable
-dependency bytes cannot be fenced before launch. Direct `node:vm` imports are
-permitted by the fixed built-in allowlist, but worker children still run with V8
-string code generation disabled, including quota smoke probes. Bare `acorn`
-imports additionally require explicit manifest coverage of the package metadata
-and resolved import entry. That entry must pass a deterministic self-contained
-module-loading gate and is copied under its preserved `node_modules` layout;
-static or dynamic package-entry imports, runtime loaders, arbitrary bare or
-subpath extension imports, and ambient package resolution remain rejected.
+Dynamic imports, runtime `require`, `createRequire`, and reflective loaders fail
+closed because their eventual executable dependency bytes cannot be fenced
+before launch. Direct `node:vm` imports are an intentional fixed built-in
+capability for configured workflow execution: workflow source passed to
+`vm.Script` is runtime tool input, not a primary resource dependency. Worker
+children still disable ordinary V8 string code generation such as `eval` and
+`Function`, but that flag does not disable `vm.Script` and is not treated as its
+security fence. Bare `acorn` imports additionally require explicit manifest
+coverage of the package metadata and resolved import entry. That entry must pass
+a deterministic self-contained module-loading gate and is copied under its
+preserved `node_modules` layout; static or dynamic package-entry imports,
+runtime loaders, arbitrary bare or subpath extension imports, and ambient
+package resolution remain rejected.
 Other extension imports outside the local closure are limited to the
 package-owned primary dependency allowlist and resolve through fixed package
 aliases rather than extension-local replacements; global/process aliases and

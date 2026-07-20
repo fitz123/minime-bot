@@ -794,7 +794,18 @@ function extensionResourceFiles(
         declaredResources,
       );
       declaredPackageEntries.add(dependency);
-      if (!seen.has(dependency)) pending.push(dependency);
+      if (seen.has(dependency)) {
+        const content = readTrustedFile(dependency);
+        const captured = files.find((file) => file.path === dependency);
+        if (captured?.contentHash !== sha256(content)) {
+          throw new TypeError(
+            `Pi extension ${specifier} package entry changed before it could be validated`,
+          );
+        }
+        assertDeclaredPackageEntrySelfContained(dependency, content);
+      } else {
+        pending.push(dependency);
+      }
     }
   }
   for (const resource of additionalResources) {
