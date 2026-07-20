@@ -32,6 +32,7 @@ import {
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
+import { compactOpsWorkerEvidenceForSnapshot } from "./evidence.js";
 
 export const OPS_WORKER_JOURNAL_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_OPS_WORKER_MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
@@ -759,6 +760,7 @@ export class OpsWorkerTaskStore {
           journalAppended: false,
         };
       }
+      compactOpsWorkerEvidenceForSnapshot(working);
       const task = parseOpsWorkerTask(working, this.registry);
       this.assertImmutableIdentity(existing, task);
       this.assertReplaySafety(existing, task);
@@ -818,10 +820,10 @@ export class OpsWorkerTaskStore {
         ? "Recorded operator steering and paused task atomically"
         : "Recorded operator steering and resumed task atomically",
     }, (task) => {
-      const appended = this.appendSteeringEntry(task, entry);
-      if (task.control.paused === paused) {
-        if (!appended) return OPS_WORKER_TASK_STORE_NO_CHANGE;
-      } else {
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
+      if (task.control.paused !== paused) {
         if (paused && isOpsWorkerTerminalState(task.state)) {
           throw new OpsWorkerTaskStoreSafetyError(
             `Refusing to pause terminal task ${task.id}`,
@@ -845,7 +847,9 @@ export class OpsWorkerTaskStore {
       event: "UPDATED",
       summary: `Recorded operator steering and ${interrupt.mode} interrupt atomically`,
     }, (task) => {
-      const appended = this.appendSteeringEntry(task, entry);
+      if (!this.appendSteeringEntry(task, entry)) {
+        return OPS_WORKER_TASK_STORE_NO_CHANGE;
+      }
       let startsPause = false;
       if (task.control.interrupt !== null) {
         if (
@@ -856,7 +860,6 @@ export class OpsWorkerTaskStore {
             `Task ${task.id} already has a different pending interrupt`,
           );
         }
-        if (!appended) return OPS_WORKER_TASK_STORE_NO_CHANGE;
       } else {
         if (isOpsWorkerTerminalState(task.state)) {
           throw new OpsWorkerTaskStoreSafetyError(
@@ -1019,6 +1022,7 @@ export class OpsWorkerTaskStore {
     if (
       Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8")
       > OPS_WORKER_LIMITS.maxSnapshotBytes
+        - OPS_WORKER_LIMITS.minRuntimeMutationHeadroomBytes
     ) {
       throw new OpsWorkerSteeringCapacityError(task.id);
     }

@@ -741,6 +741,8 @@ export const OPS_WORKER_LIMITS = {
   maxLegacySnapshotBytes: 256 * 1024,
   maxPreV5SnapshotBytes: 512 * 1024,
   maxSnapshotBytes: 513 * 1024,
+  /** Space retained after steering admission for bounded lifecycle and verification growth. */
+  minRuntimeMutationHeadroomBytes: 256 * 1024,
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,

@@ -1336,6 +1336,7 @@ describe("ops worker Pi standard-session attempts", () => {
     quota = admittedQuota();
     let attemptCount = 0;
     const recovered = await harness.runner({
+      attemptTimeoutMs: 15_000,
       dependencies: {
         resolveInvocation: (args) => {
           const scenario = attemptCount === 0

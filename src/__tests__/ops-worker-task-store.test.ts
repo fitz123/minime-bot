@@ -37,10 +37,12 @@ import {
 import {
   OpsWorkerDeliveryConflictError,
   OpsWorkerDuplicateCorrelationError,
+  OpsWorkerSteeringCapacityError,
   OpsWorkerTaskStore,
   OpsWorkerTaskStoreSafetyError,
   type OpsWorkerTaskStoreFaultPoint,
 } from "../ops-worker/task-store.js";
+import { appendOpsWorkerEvidence } from "../ops-worker/evidence.js";
 
 const NOW = "2026-07-17T12:00:00.000Z";
 const LATER = "2026-07-17T12:01:00.000Z";
@@ -1506,6 +1508,122 @@ describe("ops worker durable task store", () => {
         { ...steering, steeringId: "telegram:update:terminal" },
       ),
       /terminal task/,
+    );
+  });
+
+  it("does not reapply stale pause or interrupt effects when steering is replayed", (t) => {
+    const store = makeStore(t);
+    const pauseTask = makeTask("steering-pause-aba", "steering:pause:aba");
+    store.create(pauseTask);
+    const pause = {
+      steeringId: "telegram:update:pause:1",
+      receivedAt: NOW,
+      kind: "pause" as const,
+      operatorRef: "telegram:100000000",
+      text: "pause",
+      consumedAt: null,
+    };
+    const resume = {
+      ...pause,
+      steeringId: "telegram:update:resume:2",
+      kind: "resume" as const,
+      text: "resume",
+    };
+
+    store.appendSteeringAndSetPaused(pauseTask.id, pause, true);
+    const resumed = store.appendSteeringAndSetPaused(pauseTask.id, resume, false);
+    const replayedPause = store.appendSteeringAndSetPaused(pauseTask.id, pause, true);
+    assert.equal(replayedPause.journalAppended, false);
+    assert.deepEqual(replayedPause.task, resumed.task);
+    assert.equal(replayedPause.task.control.paused, false);
+
+    const interruptTask = makeTask("steering-interrupt-aba", "steering:interrupt:aba");
+    store.create(interruptTask);
+    const interruptSteering = {
+      ...pause,
+      steeringId: "telegram:update:interrupt:3",
+    };
+    store.appendSteeringAndSetInterrupt(interruptTask.id, interruptSteering, {
+      requestedAt: NOW,
+      mode: "pause",
+      reason: "Reach the next proven safe boundary.",
+    });
+    store.clearInterrupt(interruptTask.id);
+    const cleared = store.clearPaused(interruptTask.id);
+
+    const replayedInterrupt = store.appendSteeringAndSetInterrupt(
+      interruptTask.id,
+      interruptSteering,
+      {
+        requestedAt: NOW,
+        mode: "pause",
+        reason: "Reach the next proven safe boundary.",
+      },
+    );
+    assert.equal(replayedInterrupt.journalAppended, false);
+    assert.deepEqual(replayedInterrupt.task, cleared.task);
+    assert.equal(replayedInterrupt.task.control.interrupt, null);
+    assert.equal(replayedInterrupt.task.control.paused, false);
+  });
+
+  it("keeps accepted steering closed under bounded runtime evidence growth", (t) => {
+    const store = makeStore(t);
+    const task = makeTask("steering-runtime-headroom", "steering:runtime:headroom");
+    task.evidence = [];
+    store.create(task);
+
+    let accepted = 0;
+    for (let index = 0; index < OPS_WORKER_LIMITS.maxSteeringEntries; index += 1) {
+      try {
+        store.appendSteering(task.id, {
+          steeringId: `telegram:update:capacity:${index}`,
+          receivedAt: NOW,
+          kind: "answer",
+          operatorRef: "telegram:100000000",
+          text: "x".repeat(OPS_WORKER_LIMITS.maxSteeringTextBytes),
+          consumedAt: null,
+        });
+        accepted += 1;
+      } catch (error) {
+        assert.ok(error instanceof OpsWorkerSteeringCapacityError);
+        break;
+      }
+    }
+    assert.ok(accepted > 0 && accepted < OPS_WORKER_LIMITS.maxSteeringEntries);
+    const beforeGrowth = store.get(task.id);
+    assert.ok(beforeGrowth);
+    assert.ok(
+      Buffer.byteLength(`${JSON.stringify(beforeGrowth)}\n`, "utf8")
+        <= OPS_WORKER_LIMITS.maxSnapshotBytes
+          - OPS_WORKER_LIMITS.minRuntimeMutationHeadroomBytes,
+    );
+
+    const grown = store.mutate(task.id, {
+      event: "EVIDENCE",
+      summary: "Recorded bounded runtime evidence after steering",
+    }, (working) => {
+      for (let index = 0; index < OPS_WORKER_LIMITS.maxEvidenceEntries; index += 1) {
+        appendOpsWorkerEvidence(working, {
+          at: NOW,
+          kind: "pi",
+          trust: "trusted",
+          summary: `${index.toString().padStart(2, "0")}:${"e".repeat(
+            OPS_WORKER_LIMITS.maxEvidenceSummaryBytes - 3,
+          )}`,
+          artifact: null,
+        });
+      }
+      working.updatedAt = new Date(Date.parse(working.updatedAt) + 1).toISOString();
+    }).task;
+
+    assert.equal(grown.steering.length, accepted);
+    assert.ok(
+      grown.evidence.length > 0
+        && grown.evidence.length < OPS_WORKER_LIMITS.maxEvidenceEntries,
+    );
+    assert.ok(
+      Buffer.byteLength(`${JSON.stringify(grown)}\n`, "utf8")
+        <= OPS_WORKER_LIMITS.maxSnapshotBytes,
     );
   });
 

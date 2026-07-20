@@ -22,6 +22,10 @@ function isProtectedAlertmanagerCorrelationEvidence(
   }
 }
 
+function serializedTaskBytes(task: Readonly<OpsWorkerTask>): number {
+  return Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8");
+}
+
 /** Append bounded runtime evidence without evicting the exact alert-group descriptor. */
 export function appendOpsWorkerEvidence(
   task: OpsWorkerTask,
@@ -34,4 +38,14 @@ export function appendOpsWorkerEvidence(
     entries.splice(evictable < 0 ? 0 : evictable, 1);
   }
   task.evidence = entries;
+}
+
+/** Evict oldest non-essential runtime evidence until the snapshot fits its durable bound. */
+export function compactOpsWorkerEvidenceForSnapshot(task: OpsWorkerTask): void {
+  while (serializedTaskBytes(task) > OPS_WORKER_LIMITS.maxSnapshotBytes) {
+    const evictable = task.evidence.findIndex((entry) =>
+      !isProtectedAlertmanagerCorrelationEvidence(task, entry));
+    if (evictable < 0) return;
+    task.evidence.splice(evictable, 1);
+  }
 }

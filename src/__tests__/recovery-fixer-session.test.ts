@@ -809,7 +809,7 @@ describe("exact-session recovery fixer", () => {
     assert.equal(existsSync(lazyTranscriptPath as string), false);
   });
 
-  it("validates private credentials and every fenced protocol route over loopback HTTP", async () => {
+  it("validates private credentials and every fenced protocol route over loopback HTTP", async (t) => {
     const root = mkdtempSync(join(tmpdir(), "minime-recovery-client-"));
     temporary.push(root);
     const tokenPath = join(root, "fixer-token");
@@ -850,6 +850,12 @@ describe("exact-session recovery fixer", () => {
         ));
       });
     });
+    const closeServer = async (): Promise<void> => {
+      if (!server.listening) return;
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    };
+    t.after(closeServer);
     await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
     const address = server.address();
     assert.ok(address && typeof address === "object");
@@ -857,7 +863,7 @@ describe("exact-session recovery fixer", () => {
     env.MINIME_RECOVERY_FIXER_CREDENTIAL_FILE = tokenPath;
     env.MINIME_RECOVERY_PREIMAGE_DIRECTORY = join(root, "preimages");
     const contract = readRecoveryRuntimeContract(env);
-    const client = new RecoveryProtocolClient(contract, { timeoutMs: 50 });
+    const client = new RecoveryProtocolClient(contract, { timeoutMs: 1_000 });
     const runtime = { model: "openai-codex/gpt-5.5", node: "v22.0.0", package: "1.0.0", pi: "0.80.6" };
     await client.state();
     await client.heartbeat();
@@ -905,8 +911,9 @@ describe("exact-session recovery fixer", () => {
     responseMode = "oversized";
     await assert.rejects(client.state(), /too large/);
     responseMode = "timeout";
-    await assert.rejects(client.state(), /timed out/);
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    const timeoutClient = new RecoveryProtocolClient(contract, { timeoutMs: 50 });
+    await assert.rejects(timeoutClient.state(), /timed out/);
+    await closeServer();
   });
 
   it("runs the bind-before-prompt fixer flow with the recovery-only wrapper set", async () => {
