@@ -272,6 +272,7 @@ export class OpsWorkerTelegramControl {
   private readonly inspectPolicy: () => OpsWorkerPolicySnapshot;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private pendingReply: string | undefined;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
     | undefined;
@@ -291,6 +292,7 @@ export class OpsWorkerTelegramControl {
   }
 
   async tick(signal: AbortSignal = new AbortController().signal): Promise<OpsWorkerTelegramTickResult> {
+    await this.flushPendingReply(signal);
     const reportTaskId = await this.deliverOnePendingReport(signal);
     const cursor = this.ledger.pollCursor(this.now());
     const offset = cursor.offset;
@@ -373,6 +375,12 @@ export class OpsWorkerTelegramControl {
     }, signal);
   }
 
+  private async flushPendingReply(signal: AbortSignal): Promise<void> {
+    if (this.pendingReply === undefined) return;
+    await this.sendMessage(this.pendingReply, signal);
+    this.pendingReply = undefined;
+  }
+
   private async processUpdate(
     update: Record<string, unknown>,
     signal: AbortSignal,
@@ -421,7 +429,8 @@ export class OpsWorkerTelegramControl {
       acknowledgedAt: this.now(),
     });
     this.faultInjector?.("after-ledger-before-reply", updateId);
-    await this.sendMessage(reply, signal);
+    this.pendingReply = reply;
+    await this.flushPendingReply(signal);
   }
 
   private dispatchCommand(message: ParsedTelegramMessage): string {

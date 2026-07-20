@@ -710,6 +710,57 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(fixture.ledger.nextOffset(), 26);
   });
 
+  it("retries a failed command reply before polling past its durable offset", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const controller = new AbortController();
+    const backoffs: number[] = [];
+    const calls: string[] = [];
+    let sendAttempts = 0;
+    const client = new OpsWorkerTelegramControl({
+      config,
+      supervisor: fixture.supervisor,
+      ledger: fixture.ledger,
+      inspectPolicy: () => ({
+        authorization: { configuredSources: ["operator-cli"], verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        verification: { verifierCount: 1, contractsHash: AUTH_HASH, contracts: [] },
+        quota: { configured: false },
+        parity: { configured: false },
+      }),
+      fetch: async (input, init) => {
+        const method = String(input).split("/").at(-1) ?? "unknown";
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        calls.push(`${method}:${String(body.offset)}`);
+        if (method === "sendMessage") {
+          sendAttempts += 1;
+          return sendAttempts === 1
+            ? Response.json({ ok: false }, { status: 503 })
+            : Response.json({ ok: true, result: { message_id: 1 } });
+        }
+        if (body.offset === 26) controller.abort();
+        return Response.json({
+          ok: true,
+          result: body.offset === undefined ? [update(25, "/status")] : [],
+        });
+      },
+      sleep: async (milliseconds) => {
+        backoffs.push(milliseconds);
+      },
+    });
+
+    await client.run(controller.signal);
+
+    assert.deepEqual(backoffs, [config.poll.retryMinMs]);
+    assert.equal(sendAttempts, 2);
+    assert.deepEqual(calls, [
+      "getUpdates:undefined",
+      "sendMessage:undefined",
+      "sendMessage:undefined",
+      "getUpdates:26",
+    ]);
+    assert.equal(fixture.ledger.nextOffset(), 26);
+  });
+
   it("rejects an oversized Telegram body without changing the ledger", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
