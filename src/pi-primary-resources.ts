@@ -663,11 +663,17 @@ function declaredExtensionResourcePaths(
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
+interface DeclaredPackageResourceCoverage {
+  entryPath: string;
+  metadataHash: string;
+  metadataPath: string;
+}
+
 function assertDeclaredPackageResourceCoverage(
   importer: string,
   specifier: string,
   declaredResources: ReadonlySet<string>,
-): string {
+): DeclaredPackageResourceCoverage {
   let searchDirectory = dirname(importer);
   let metadataPath: string | undefined;
   for (;;) {
@@ -689,8 +695,10 @@ function assertDeclaredPackageResourceCoverage(
     );
   }
   let metadata: Record<string, unknown>;
+  let metadataContent: Buffer;
   try {
-    const parsed = JSON.parse(readTrustedFile(metadataPath).toString("utf8")) as unknown;
+    metadataContent = readTrustedFile(metadataPath);
+    const parsed = JSON.parse(metadataContent.toString("utf8")) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
     metadata = parsed as Record<string, unknown>;
   } catch {
@@ -742,7 +750,11 @@ function assertDeclaredPackageResourceCoverage(
       `Pi extension resource manifest must cover the ${specifier} package metadata and runtime entry`,
     );
   }
-  return entryPath;
+  return {
+    entryPath,
+    metadataHash: sha256(metadataContent),
+    metadataPath,
+  };
 }
 
 function extensionResourceFiles(
@@ -758,6 +770,7 @@ function extensionResourceFiles(
   const pending = [trustedEntryPath];
   const seen = new Set<string>();
   const declaredPackageEntries = new Set<string>();
+  const declaredPackageMetadataHashes = new Map<string, string>();
   const files: PiExtensionResourceFile[] = [];
   let totalBytes = 0;
   while (pending.length > 0) {
@@ -788,11 +801,31 @@ function extensionResourceFiles(
       if (!seen.has(dependency)) pending.push(dependency);
     }
     for (const specifier of specifiers.declaredPackages) {
-      const dependency = assertDeclaredPackageResourceCoverage(
+      const coverage = assertDeclaredPackageResourceCoverage(
         path,
         specifier,
         declaredResources,
       );
+      const expectedMetadataHash = declaredPackageMetadataHashes.get(coverage.metadataPath);
+      if (
+        expectedMetadataHash !== undefined
+        && expectedMetadataHash !== coverage.metadataHash
+      ) {
+        throw new TypeError(
+          `Pi extension ${specifier} package metadata changed before it could be captured`,
+        );
+      }
+      declaredPackageMetadataHashes.set(coverage.metadataPath, coverage.metadataHash);
+      const capturedMetadata = files.find((file) => file.path === coverage.metadataPath);
+      if (
+        capturedMetadata !== undefined
+        && capturedMetadata.contentHash !== coverage.metadataHash
+      ) {
+        throw new TypeError(
+          `Pi extension ${specifier} package metadata changed before it could be validated`,
+        );
+      }
+      const dependency = coverage.entryPath;
       declaredPackageEntries.add(dependency);
       if (seen.has(dependency)) {
         const content = readTrustedFile(dependency);
@@ -815,13 +848,23 @@ function extensionResourceFiles(
       throw new TypeError("Pi extension resource closure exceeds the bounded file limit");
     }
     const content = readTrustedFile(resource.path);
+    const contentHash = sha256(content);
+    const expectedMetadataHash = declaredPackageMetadataHashes.get(resource.path);
+    if (
+      expectedMetadataHash !== undefined
+      && expectedMetadataHash !== contentHash
+    ) {
+      throw new TypeError(
+        "Pi extension declared package metadata changed before it could be captured",
+      );
+    }
     totalBytes += content.length;
     if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
       throw new TypeError("Pi extension resource closure exceeds the bounded byte limit");
     }
     files.push({
       path: resource.path,
-      contentHash: sha256(content),
+      contentHash,
       executable: resource.executable,
     });
   }

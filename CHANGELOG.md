@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Accept configured extensions that use `node:vm` and explicitly manifested `acorn` runtime resources while preserving fail-closed immutable snapshot resolution (#58).
+- Exclude exact generated Python directories (`.venv`, `.pytest_cache`, and `__pycache__`) from effective skill packages, and accept configured extensions that use `node:vm` and explicitly manifested `acorn` runtime resources while preserving fail-closed immutable snapshot resolution (#58).
 
 ## 2026.7.19
 

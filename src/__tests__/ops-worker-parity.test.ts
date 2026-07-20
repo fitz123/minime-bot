@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   statSync,
@@ -44,6 +46,7 @@ import {
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
 } from "../ops-worker/parity.js";
+import { OPS_WORKER_NODE_OPTIONS } from "../ops-worker/pi-attempt.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const created: string[] = [];
@@ -416,7 +419,12 @@ describe("primary Pi resource contract", () => {
     const packageMetadataSource = `${JSON.stringify({
         name: "acorn",
         main: "./dist/acorn.cjs",
-        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
       })}\n`;
     writeFileSync(packageMetadata, packageMetadataSource, "utf8");
     writeFileSync(
@@ -431,11 +439,11 @@ describe("primary Pi resource contract", () => {
       "utf8",
     );
     const accepted = [
-      "import { Script } from 'node:vm';",
+      "import vm from 'node:vm';",
       "import { parse } from 'acorn';",
-      "const runtime = { process: 'inert-key' };",
-      "const navigatorValue = globalThis.navigator;",
-      "export default function extension() { return [Script, parse, runtime, navigatorValue]; }",
+      "const runtime = { process: process.cwd() };",
+      "const navigatorValue = globalThis.navigator?.hardwareConcurrency;",
+      "export default function extension() { return [vm.Script, parse, runtime, navigatorValue]; }",
       "",
     ].join("\n");
     writeFileSync(extension, accepted, "utf8");
@@ -542,6 +550,58 @@ describe("primary Pi resource contract", () => {
         /cannot be attested safely/,
         source,
       );
+    }
+  });
+
+  it("rejects package metadata replaced after its entry is selected", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const safeEntry = join(packageRoot, "dist", "safe.mjs");
+    const unsafeEntry = join(packageRoot, "dist", "unsafe.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "configured-workflow", "index.ts");
+    mkdirSync(dirname(safeEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    const safeMetadata = `${JSON.stringify({
+      name: "acorn",
+      exports: { ".": { import: "./dist/safe.mjs" } },
+    })}\n`;
+    const unsafeMetadata = `${JSON.stringify({
+      name: "acorn",
+      exports: { ".": { import: "./dist/unsafe.mjs" } },
+    })}\n`;
+    writeFileSync(packageMetadata, safeMetadata, "utf8");
+    writeFileSync(safeEntry, "export const parse = () => ({ type: 'SAFE' });\n", "utf8");
+    writeFileSync(
+      unsafeEntry,
+      "import { readFileSync } from 'node:fs'; export const parse = readFileSync;\n",
+      "utf8",
+    );
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    const originalJsonParse = JSON.parse;
+    let replaced = false;
+    JSON.parse = ((text: string, reviver?: (this: unknown, key: string, value: unknown) => unknown) => {
+      const parsed = originalJsonParse(text, reviver);
+      if (!replaced && text === safeMetadata) {
+        replaced = true;
+        const staging = `${packageMetadata}.replacement`;
+        writeFileSync(staging, unsafeMetadata, "utf8");
+        renameSync(staging, packageMetadata);
+      }
+      return parsed;
+    }) as typeof JSON.parse;
+    try {
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(
+          extension,
+          [packageMetadata, safeEntry, unsafeEntry],
+        ),
+        /package metadata changed before it could be captured/,
+      );
+      assert.equal(replaced, true);
+    } finally {
+      JSON.parse = originalJsonParse;
     }
   });
 });
@@ -959,7 +1019,12 @@ describe("ops-worker before-provider parity attestation", () => {
       `${JSON.stringify({
         name: "acorn",
         main: "./dist/acorn.cjs",
-        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
       })}\n`,
       "utf8",
     );
@@ -971,13 +1036,13 @@ describe("ops-worker before-provider parity attestation", () => {
     writeFileSync(
       extension,
       [
-        "import { Script } from 'node:vm';",
+        "import vm from 'node:vm';",
         "import { parse } from 'acorn';",
-        "const runtime = { process: 'inert-key' };",
-        "const navigatorValue = globalThis.navigator;",
+        "const runtime = { process: process.cwd() };",
+        "const navigatorValue = globalThis.navigator?.hardwareConcurrency;",
         "export default function extension(pi) {",
         "  const parsed = parse('fixture', { ecmaVersion: 'latest' });",
-        "  new Script('1 + 1').runInNewContext();",
+        "  new vm.Script('1 + 1').runInNewContext();",
         "  void runtime; void navigatorValue;",
         "  pi.registerCommand(`acorn-${parsed.type}`, { handler: async () => {} });",
         "}",
@@ -1029,7 +1094,12 @@ describe("ops-worker before-provider parity attestation", () => {
       `${JSON.stringify({
         name: "acorn",
         main: "./dist/acorn.cjs",
-        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
       })}\n`,
       "utf8",
     );
@@ -1039,11 +1109,27 @@ describe("ops-worker before-provider parity attestation", () => {
       "utf8",
     );
 
-    const commands: string[] = [];
-    const wrapper = (await import(
-      `${pathToFileURL(launch.extensionPaths[0]).href}?acorn=${Date.now()}`
-    )).default;
-    await wrapper({ registerCommand: (name: string) => commands.push(name) });
+    const wrapperUrl = `${pathToFileURL(launch.extensionPaths[0]).href}?acorn=${Date.now()}`;
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        [
+          `const wrapper = (await import(${JSON.stringify(wrapperUrl)})).default;`,
+          "const commands = [];",
+          "await wrapper({ registerCommand: (name) => commands.push(name) });",
+          "process.stdout.write(JSON.stringify(commands));",
+        ].join("\n"),
+      ],
+      {
+        cwd: sessionRoot,
+        encoding: "utf8",
+        env: { ...process.env, NODE_OPTIONS: OPS_WORKER_NODE_OPTIONS },
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    const commands = JSON.parse(child.stdout) as string[];
 
     assert.ok(commands.includes("acorn-PINNED_PROGRAM"));
     assert.equal(commands.includes("acorn-AMBIENT_PROGRAM"), false);
