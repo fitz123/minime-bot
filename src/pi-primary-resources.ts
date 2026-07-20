@@ -72,6 +72,8 @@ const UNSAFE_MODULE_LOADER_IDENTIFIERS = new Set([
   "getBuiltinModule",
   "global",
   "globalThis",
+  "jitiESMResolve",
+  "jitiImport",
   "mainModule",
   "require",
   "self",
@@ -230,6 +232,16 @@ interface PiExtensionModuleSpecifiers {
   declaredPackages: string[];
 }
 
+function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
+  if (node.text !== "arguments") return false;
+  const parent = node.parent as ts.Node & { name?: ts.Node };
+  if (parent.name === node && !ts.isShorthandPropertyAssignment(parent)) return false;
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return false;
+  }
+  return true;
+}
+
 function extensionModuleSpecifiers(
   path: string,
   content: Buffer,
@@ -349,7 +361,10 @@ function extensionModuleSpecifiers(
       && node.parent.questionDotToken === undefined;
     if (
       ts.isIdentifier(node)
-      && UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+      && (
+        UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+        || referencesJitiWrapperArguments(node)
+      )
       && !safeGlobalNavigatorAccess
     ) {
       throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
@@ -437,6 +452,8 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
     "getBuiltinModule",
     "global",
     "globalThis",
+    "jitiESMResolve",
+    "jitiImport",
     "mainModule",
     "module",
     "process",
@@ -467,7 +484,13 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
         && node.expression.kind === ts.SyntaxKind.ImportKeyword
       )
     ) reject();
-    if (ts.isIdentifier(node) && loaderIdentifiers.has(node.text)) reject();
+    if (
+      ts.isIdentifier(node)
+      && (
+        loaderIdentifiers.has(node.text)
+        || referencesJitiWrapperArguments(node)
+      )
+    ) reject();
     if (
       ts.isPropertyAccessExpression(node)
       && loaderProperties.has(node.name.text)

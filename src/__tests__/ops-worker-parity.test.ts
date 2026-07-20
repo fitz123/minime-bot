@@ -335,7 +335,9 @@ describe("primary Pi resource contract", () => {
       [
         "import { value } from './dependency';",
         "export { value as selected } from './dependency';",
-        "export default function extension() { return value; }",
+        "const payload = { arguments: [] };",
+        "function localArguments() { return arguments.length + payload.arguments.length; }",
+        "export default function extension() { return [value, localArguments()]; }",
         "",
       ].join("\n"),
       "utf8",
@@ -386,6 +388,9 @@ describe("primary Pi resource contract", () => {
       "const g = globalThis; const key = 'Func' + 'tion'; export default g[key]('return () => 1')();\n",
       "const getter = Reflect.get; export default getter(globalThis, 'Function')('return () => 1')();\n",
       "const key = 'con' + 'structor'; export default (() => {})[key]('return () => 1')();\n",
+      "export default jitiImport('/tmp/unpinned.mjs', { default: true });\n",
+      "export default jitiESMResolve('/tmp/unpinned.mjs');\n",
+      "export default arguments[1]('/tmp/unpinned.mjs');\n",
       "import { createRequire as load } from 'node:module'; export default function extension() { return load; }\n",
       "import { createJiti } from 'jiti'; export default createJiti(import.meta.url).import('./dependency.js');\n",
       "import unpinned from 'file:///tmp/unpinned.js'; export default unpinned;\n",
@@ -414,7 +419,17 @@ describe("primary Pi resource contract", () => {
         exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
       })}\n`;
     writeFileSync(packageMetadata, packageMetadataSource, "utf8");
-    writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
+    writeFileSync(
+      packageEntry,
+      [
+        "export function parse() {",
+        "  const node = { arguments: [] };",
+        "  return { type: arguments.length >= 0 && node.arguments.length === 0 ? 'Program' : 'Never' };",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     const accepted = [
       "import { Script } from 'node:vm';",
       "import { parse } from 'acorn';",
@@ -469,6 +484,19 @@ describe("primary Pi resource contract", () => {
       () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
       /declared package entry must be self-contained/,
     );
+    const injectedPackageLoaders = [
+      "export const parse = () => jitiImport('/tmp/unpinned.mjs', { default: true });\n",
+      "export const parse = () => jitiESMResolve('/tmp/unpinned.mjs');\n",
+      "export const parse = () => arguments[1]('/tmp/unpinned.mjs');\n",
+    ];
+    for (const source of injectedPackageLoaders) {
+      writeFileSync(packageEntry, source, "utf8");
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+        /declared package entry must be self-contained/,
+        source,
+      );
+    }
     writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
 
     const rejected = [
