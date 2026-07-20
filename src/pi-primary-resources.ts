@@ -387,7 +387,7 @@ function extensionModuleSpecifiers(
       && invocation.expression === parent
     ) {
       const args = invocation.arguments ?? [];
-      if (args.length > 2) {
+      if (args.length > 2 || args.some((argument) => ts.isSpreadElement(argument))) {
         throw new TypeError(
           "Pi extension node:vm Script options cannot be attested safely",
         );
@@ -767,13 +767,26 @@ function assertDeclaredPackageResourceCoverage(
   let searchDirectory = dirname(importer);
   let metadataPath: string | undefined;
   for (;;) {
-    const candidate = join(searchDirectory, "node_modules", specifier, "package.json");
-    if (existsSync(candidate)) {
+    const packageCandidate = join(searchDirectory, "node_modules", specifier);
+    const metadataCandidate = join(packageCandidate, "package.json");
+    const fileShadow = PI_EXTENSION_JITI_EXTENSIONS.some((extension) =>
+      existsSync(`${packageCandidate}${extension}`));
+    if (fileShadow) {
+      throw new TypeError(
+        `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+      );
+    }
+    if (existsSync(metadataCandidate)) {
       metadataPath = strictTrustedFile(
-        candidate,
+        metadataCandidate,
         `Pi extension ${specifier} package metadata`,
       );
       break;
+    }
+    if (existsSync(packageCandidate)) {
+      throw new TypeError(
+        `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+      );
     }
     const parent = dirname(searchDirectory);
     if (parent === searchDirectory) break;

@@ -497,9 +497,13 @@ describe("primary Pi resource contract", () => {
       /declared package entry must be self-contained/,
     );
     const injectedPackageLoaders = [
+      "export const parse = () => import('data:text/javascript,export default 42');\n",
+      "export const parse = () => Function('return 42')();\n",
       "export const parse = () => jitiImport('/tmp/unpinned.mjs', { default: true });\n",
       "export const parse = () => jitiESMResolve('/tmp/unpinned.mjs');\n",
       "export const parse = () => arguments[1]('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value.require('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value['require']('/tmp/unpinned.mjs');\n",
     ];
     for (const source of injectedPackageLoaders) {
       writeFileSync(packageEntry, source, "utf8");
@@ -553,6 +557,7 @@ describe("primary Pi resource contract", () => {
       "import vm from 'node:vm'; export default vm.compileFunction;\n",
       "import vm from 'node:vm'; export default new vm.Script('1', { importModuleDynamically() {} });\n",
       "import vm from 'node:vm'; export default new vm.Script(\"import('data:text/javascript,export default 42')\", { importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });\n",
+      "import vm from 'node:vm'; const args = ['1', { importModuleDynamically() {} }]; export default new vm.Script(...args);\n",
     ];
     for (const source of rejected) {
       writeFileSync(extension, source, "utf8");
@@ -562,6 +567,34 @@ describe("primary Pi resource contract", () => {
         source,
       );
     }
+  });
+
+  it("rejects a nearer metadata-less acorn package shadowing the manifested package", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "node_modules", "configured-workflow", "index.ts");
+    const shadowEntry = join(dirname(extension), "node_modules", "acorn", "index.js");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    mkdirSync(dirname(shadowEntry), { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(packageEntry, "export const parse = () => ({ type: 'PINNED' });\n", "utf8");
+    writeFileSync(shadowEntry, "export const parse = () => ({ type: 'SHADOW' });\n", "utf8");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /package metadata cannot be resolved for attestation/,
+    );
   });
 
   it("rejects package metadata replaced after its entry is selected", () => {
@@ -1137,8 +1170,10 @@ describe("ops-worker before-provider parity attestation", () => {
         cwd: sessionRoot,
         encoding: "utf8",
         env: { ...process.env, NODE_OPTIONS: OPS_WORKER_NODE_OPTIONS },
+        timeout: 10_000,
       },
     );
+    assert.ifError(child.error);
     assert.equal(child.status, 0, child.stderr);
     const commands = JSON.parse(child.stdout) as string[];
 
