@@ -106,8 +106,10 @@ module loading fails closed. The package-owned subagent manifest additionally
 pins its bundled `agents/` and `prompts/` resources.
 `jiti` loads the resulting private, read-only extension snapshots with fixed
 package aliases and resolver settings, so extension-local replacements or
-ambient Jiti configuration cannot change the executed dependency bytes. Direct
-`node:vm` imports are fixed-allowlist built-ins. Bare `acorn` imports require
+ambient Jiti configuration cannot change the executed dependency bytes.
+`node:vm` is accepted only through one default binding used directly by
+`createContext` and `new Script`, with loader-bearing options, aliases, computed
+access, re-exports, and other VM APIs rejected. Bare `acorn` imports require
 manifest-covered package metadata and a self-contained import entry with no
 module-loading escape, then execute from a copied, layout-preserving
 `node_modules` snapshot rather than ambient resolution. Skills are pinned as

@@ -260,6 +260,27 @@ function extensionModuleSpecifiers(
   }
   const specifiers = new Set<string>();
   const declaredPackages = new Set<string>();
+  const vmBindings = new Set<string>();
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement)
+      || !ts.isStringLiteral(statement.moduleSpecifier)
+      || statement.moduleSpecifier.text !== "node:vm"
+    ) continue;
+    const clause = statement.importClause;
+    if (
+      clause === undefined
+      || clause.isTypeOnly
+      || clause.name === undefined
+      || clause.namedBindings !== undefined
+      || vmBindings.size > 0
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm loading cannot be attested safely without one default binding with bounded direct usage",
+      );
+    }
+    vmBindings.add(clause.name.text);
+  }
   const constantInitializers = new Map<string, ts.Expression | null>();
   const collectConstants = (node: ts.Node): void => {
     if (
@@ -334,7 +355,76 @@ function extensionModuleSpecifiers(
   const literalProperty = (node: ts.Expression): string | undefined => {
     return staticString(node);
   };
+  const objectPropertyName = (node: ts.PropertyName): string | undefined => {
+    if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) {
+      return node.text;
+    }
+    return undefined;
+  };
+  const assertSafeVmBindingUsage = (node: ts.Identifier): void => {
+    const parent = node.parent;
+    if (ts.isImportClause(parent) && parent.name === node) return;
+    if (
+      !ts.isPropertyAccessExpression(parent)
+      || parent.expression !== node
+      || parent.questionDotToken !== undefined
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm aliases and computed access cannot be attested safely",
+      );
+    }
+    const operation = parent.name.text;
+    const invocation = parent.parent;
+    if (
+      operation === "createContext"
+      && ts.isCallExpression(invocation)
+      && invocation.expression === parent
+      && invocation.questionDotToken === undefined
+    ) return;
+    if (
+      operation === "Script"
+      && ts.isNewExpression(invocation)
+      && invocation.expression === parent
+    ) {
+      const args = invocation.arguments ?? [];
+      if (args.length > 2) {
+        throw new TypeError(
+          "Pi extension node:vm Script options cannot be attested safely",
+        );
+      }
+      const options = args[1];
+      if (options === undefined) return;
+      if (
+        !ts.isObjectLiteralExpression(options)
+        || options.properties.some((property) =>
+          !ts.isPropertyAssignment(property)
+          || objectPropertyName(property.name) !== "filename"
+        )
+      ) {
+        throw new TypeError(
+          "Pi extension node:vm Script options cannot be attested safely",
+        );
+      }
+      return;
+    }
+    throw new TypeError(
+      "Pi extension node:vm usage outside the bounded workflow API cannot be attested safely",
+    );
+  };
   const visit = (node: ts.Node): void => {
+    if (
+      ts.isExportDeclaration(node)
+      && node.moduleSpecifier !== undefined
+      && ts.isStringLiteral(node.moduleSpecifier)
+      && node.moduleSpecifier.text === "node:vm"
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm re-exports cannot be attested safely",
+      );
+    }
+    if (ts.isIdentifier(node) && vmBindings.has(node.text)) {
+      assertSafeVmBindingUsage(node);
+    }
     if (ts.isIdentifier(node) && node.text === "process") {
       const parent = node.parent;
       const inertPropertyName = ts.isPropertyAssignment(parent)

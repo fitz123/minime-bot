@@ -274,13 +274,16 @@ package-owned subagent manifest's bundled agent and prompt resources. Ambient
 Jiti extension ordering and cache configuration cannot change that contract.
 Dynamic imports, runtime `require`, `createRequire`, and reflective loaders fail
 closed because their eventual executable dependency bytes cannot be fenced
-before launch. Direct `node:vm` imports are an intentional fixed built-in
-capability for configured workflow execution: workflow source passed to
-`vm.Script` is runtime tool input, not a primary resource dependency. Worker
-children still disable ordinary V8 string code generation such as `eval` and
-`Function`, but that flag does not disable `vm.Script` and is not treated as its
-security fence. Bare `acorn` imports additionally require explicit manifest
-coverage of the package metadata and resolved import entry. That entry must pass
+before launch. `node:vm` is accepted only through one default binding used in
+direct `vm.createContext(...)` calls and direct `new vm.Script(...)`
+construction with no options or an object containing only `filename`. Aliases,
+computed access, other VM APIs, re-exports, and loader-bearing Script options
+fail closed. Workflow source passed to that bounded `vm.Script` use is runtime
+tool input, not a primary resource dependency. Worker children still disable
+ordinary V8 string code generation such as `eval` and `Function`, but that flag
+does not disable `vm.Script` and is not treated as its security fence. Bare
+`acorn` imports additionally require explicit manifest coverage of the package
+metadata and resolved import entry. That entry must pass
 a deterministic self-contained module-loading gate and is copied under its
 preserved `node_modules` layout; static or dynamic package-entry imports,
 runtime loaders, arbitrary bare or subpath extension imports, and ambient

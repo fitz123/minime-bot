@@ -443,7 +443,11 @@ describe("primary Pi resource contract", () => {
       "import { parse } from 'acorn';",
       "const runtime = { process: process.cwd() };",
       "const navigatorValue = globalThis.navigator?.hardwareConcurrency;",
-      "export default function extension() { return [vm.Script, parse, runtime, navigatorValue]; }",
+      "export default function extension() {",
+      "  const context = vm.createContext({});",
+      "  const script = new vm.Script('1 + 1', { filename: 'workflow.js' });",
+      "  return [script.runInContext(context), parse, runtime, navigatorValue];",
+      "}",
       "",
     ].join("\n");
     writeFileSync(extension, accepted, "utf8");
@@ -542,6 +546,13 @@ describe("primary Pi resource contract", () => {
       "export default function extension() { return { process }; }\n",
       "export default function extension() { return { [process]: true }; }\n",
       "export default function extension() { return globalThis.require; }\n",
+      "import { Script } from 'node:vm'; export default Script;\n",
+      "import * as vm from 'node:vm'; export default vm;\n",
+      "export { Script } from 'node:vm';\n",
+      "import vm from 'node:vm'; const Script = vm.Script; export default Script;\n",
+      "import vm from 'node:vm'; export default vm.compileFunction;\n",
+      "import vm from 'node:vm'; export default new vm.Script('1', { importModuleDynamically() {} });\n",
+      "import vm from 'node:vm'; export default new vm.Script(\"import('data:text/javascript,export default 42')\", { importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });\n",
     ];
     for (const source of rejected) {
       writeFileSync(extension, source, "utf8");
