@@ -386,7 +386,6 @@ describe("primary Pi resource contract", () => {
       "const g = globalThis; const key = 'Func' + 'tion'; export default g[key]('return () => 1')();\n",
       "const getter = Reflect.get; export default getter(globalThis, 'Function')('return () => 1')();\n",
       "const key = 'con' + 'structor'; export default (() => {})[key]('return () => 1')();\n",
-      "import { Script } from 'node:vm'; export default function extension() { return Script; }\n",
       "import { createRequire as load } from 'node:module'; export default function extension() { return load; }\n",
       "import { createJiti } from 'jiti'; export default createJiti(import.meta.url).import('./dependency.js');\n",
       "import unpinned from 'file:///tmp/unpinned.js'; export default unpinned;\n",
@@ -395,6 +394,69 @@ describe("primary Pi resource contract", () => {
       writeFileSync(extension, source, "utf8");
       assert.throws(
         () => createPiExtensionResourceSnapshot(extension),
+        /cannot be attested safely/,
+        source,
+      );
+    }
+  });
+
+  it("attests only the exact declared acorn graph and safe syntax forms", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "node_modules", "configured-workflow", "index.ts");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
+    const accepted = [
+      "import { Script } from 'node:vm';",
+      "import { parse } from 'acorn';",
+      "const runtime = { process: 'inert-key' };",
+      "const navigatorValue = globalThis.navigator;",
+      "export default function extension() { return [Script, parse, runtime, navigatorValue]; }",
+      "",
+    ].join("\n");
+    writeFileSync(extension, accepted, "utf8");
+
+    const snapshot = createPiExtensionResourceSnapshot(
+      extension,
+      [packageMetadata, packageEntry],
+    );
+    assert.deepEqual(
+      snapshot.files.map((file) => file.path),
+      [realpathSync(extension), realpathSync(packageMetadata), realpathSync(packageEntry)].sort(),
+    );
+
+    for (const manifest of [[packageMetadata], [packageEntry], []]) {
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, manifest),
+        /manifest must cover the acorn package metadata and runtime entry/,
+      );
+    }
+
+    const rejected = [
+      "import value from 'unlisted-package'; export default value;\n",
+      "import { parse } from 'acorn/dist/acorn.mjs'; export default parse;\n",
+      "const root = globalThis; export default root;\n",
+      "const navigatorValue = globalThis['navigator']; export default navigatorValue;\n",
+      "export default function extension() { return { process }; }\n",
+      "export default function extension() { return { [process]: true }; }\n",
+      "export default function extension() { return globalThis.require; }\n",
+    ];
+    for (const source of rejected) {
+      writeFileSync(extension, source, "utf8");
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
         /cannot be attested safely/,
         source,
       );
@@ -795,6 +857,114 @@ describe("ops-worker before-provider parity attestation", () => {
 
     assert.ok(commands.includes("asset-PINNED"));
     assert.equal(commands.includes("asset-CHANGED_LIVE"), false);
+    cleanupOpsWorkerParityLaunch(launch);
+  });
+
+  it("loads declared acorn only from a copied hoisted node_modules snapshot", async () => {
+    const root = tempDirectory();
+    const sourceRoot = join(root, "source");
+    const sessionRoot = join(root, "session");
+    const packageRoot = join(sourceRoot, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(sourceRoot, "node_modules", "configured-workflow", "index.ts");
+    const bundlePath = join(sessionRoot, "bundle.md");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    mkdirSync(sessionRoot, { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      packageEntry,
+      "export const parse = () => ({ type: 'PINNED_PROGRAM' });\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      [
+        "import { Script } from 'node:vm';",
+        "import { parse } from 'acorn';",
+        "const runtime = { process: 'inert-key' };",
+        "const navigatorValue = globalThis.navigator;",
+        "export default function extension(pi) {",
+        "  const parsed = parse('fixture', { ecmaVersion: 'latest' });",
+        "  new Script('1 + 1').runInNewContext();",
+        "  void runtime; void navigatorValue;",
+        "  pi.registerCommand(`acorn-${parsed.type}`, { handler: async () => {} });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[packageMetadata, packageEntry]],
+      skillPaths: [],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: sessionRoot,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const extensionSnapshot = launch.preparedSnapshots.find((snapshot) =>
+      snapshot.files.some((file) => file.path.endsWith(join("configured-workflow", "index.ts"))));
+    assert.ok(extensionSnapshot);
+    assert.equal(
+      extensionSnapshot.files.some((file) =>
+        relative(extensionSnapshot.rootPath, file.path)
+          === join("node_modules", "acorn", "dist", "acorn.mjs")),
+      true,
+    );
+
+    writeFileSync(extension, "throw new Error('LIVE_EXTENSION_LOADED');\n", "utf8");
+    writeFileSync(packageEntry, "throw new Error('LIVE_ACORN_LOADED');\n", "utf8");
+    const ambientRoot = join(sessionRoot, "node_modules", "acorn");
+    mkdirSync(join(ambientRoot, "dist"), { recursive: true });
+    writeFileSync(
+      join(ambientRoot, "package.json"),
+      `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: { ".": { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(ambientRoot, "dist", "acorn.mjs"),
+      "export const parse = () => ({ type: 'AMBIENT_PROGRAM' });\n",
+      "utf8",
+    );
+
+    const commands: string[] = [];
+    const wrapper = (await import(
+      `${pathToFileURL(launch.extensionPaths[0]).href}?acorn=${Date.now()}`
+    )).default;
+    await wrapper({ registerCommand: (name: string) => commands.push(name) });
+
+    assert.ok(commands.includes("acorn-PINNED_PROGRAM"));
+    assert.equal(commands.includes("acorn-AMBIENT_PROGRAM"), false);
     cleanupOpsWorkerParityLaunch(launch);
   });
 

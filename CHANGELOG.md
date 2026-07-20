@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accept configured extensions that use `node:vm` and explicitly manifested `acorn` runtime resources while preserving fail-closed immutable snapshot resolution (#58).
+
 ## 2026.7.19
 
 - Extend the default Ask Agent child deadline to avoid false timeout failures (#99, #100).

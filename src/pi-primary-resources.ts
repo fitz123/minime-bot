@@ -124,6 +124,8 @@ const SAFE_EXTENSION_MODULE_SPECIFIERS = new Set([
   "node:stream",
   "node:string_decoder",
   "node:url",
+  "node:vm",
+  "acorn",
   "typebox",
   "typebox/compile",
   "typebox/value",
@@ -223,10 +225,15 @@ function readTrustedFile(path: string): Buffer {
   }
 }
 
-function localModuleSpecifiers(
+interface PiExtensionModuleSpecifiers {
+  local: string[];
+  declaredPackages: string[];
+}
+
+function extensionModuleSpecifiers(
   path: string,
   content: Buffer,
-): string[] {
+): PiExtensionModuleSpecifiers {
   const source = ts.createSourceFile(
     path,
     content.toString("utf8"),
@@ -240,6 +247,7 @@ function localModuleSpecifiers(
     throw new TypeError("Pi extension source must parse before its dependency closure is hashed");
   }
   const specifiers = new Set<string>();
+  const declaredPackages = new Set<string>();
   const constantInitializers = new Map<string, ts.Expression | null>();
   const collectConstants = (node: ts.Node): void => {
     if (
@@ -306,9 +314,10 @@ function localModuleSpecifiers(
     }
     if (!SAFE_EXTENSION_MODULE_SPECIFIERS.has(value.text)) {
       throw new TypeError(
-        "Pi extension external module loading is outside the fixed attested allowlist and cannot be attested safely",
+        `Pi extension external module ${JSON.stringify(value.text)} is outside the fixed attested allowlist and cannot be attested safely`,
       );
     }
+    if (value.text === "acorn") declaredPackages.add(value.text);
   };
   const literalProperty = (node: ts.Expression): string | undefined => {
     return staticString(node);
@@ -316,20 +325,32 @@ function localModuleSpecifiers(
   const visit = (node: ts.Node): void => {
     if (ts.isIdentifier(node) && node.text === "process") {
       const parent = node.parent;
+      const inertPropertyName = ts.isPropertyAssignment(parent)
+        && parent.name === node;
       const property = ts.isPropertyAccessExpression(parent) && parent.expression === node
         ? parent.name.text
         : ts.isElementAccessExpression(parent) && parent.expression === node
         ? literalProperty(parent.argumentExpression)
         : undefined;
-      if (property === undefined || !SAFE_PROCESS_PROPERTIES.has(property)) {
+      if (
+        !inertPropertyName
+        && (property === undefined || !SAFE_PROCESS_PROPERTIES.has(property))
+      ) {
         throw new TypeError(
           "Pi extension process aliases and runtime loader access cannot be attested safely",
         );
       }
     }
+    const safeGlobalNavigatorAccess = ts.isIdentifier(node)
+      && node.text === "globalThis"
+      && ts.isPropertyAccessExpression(node.parent)
+      && node.parent.expression === node
+      && node.parent.name.text === "navigator"
+      && node.parent.questionDotToken === undefined;
     if (
       ts.isIdentifier(node)
       && UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+      && !safeGlobalNavigatorAccess
     ) {
       throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
     }
@@ -385,7 +406,10 @@ function localModuleSpecifiers(
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return [...specifiers];
+  return {
+    local: [...specifiers],
+    declaredPackages: [...declaredPackages],
+  };
 }
 
 function resolveLocalModule(importer: string, specifier: string): string {
@@ -543,6 +567,87 @@ function declaredExtensionResourcePaths(
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
+function assertDeclaredPackageResourceCoverage(
+  importer: string,
+  specifier: string,
+  declaredResources: ReadonlySet<string>,
+): void {
+  let searchDirectory = dirname(importer);
+  let metadataPath: string | undefined;
+  for (;;) {
+    const candidate = join(searchDirectory, "node_modules", specifier, "package.json");
+    if (existsSync(candidate)) {
+      metadataPath = strictTrustedFile(
+        candidate,
+        `Pi extension ${specifier} package metadata`,
+      );
+      break;
+    }
+    const parent = dirname(searchDirectory);
+    if (parent === searchDirectory) break;
+    searchDirectory = parent;
+  }
+  if (metadataPath === undefined) {
+    throw new TypeError(
+      `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+    );
+  }
+  let metadata: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(readTrustedFile(metadataPath).toString("utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+    metadata = parsed as Record<string, unknown>;
+  } catch {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  if (metadata.name !== specifier) {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  const selectImportTarget = (value: unknown): string | undefined => {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      for (const candidate of value) {
+        const selected = selectImportTarget(candidate);
+        if (selected !== undefined) return selected;
+      }
+      return undefined;
+    }
+    if (typeof value !== "object" || value === null) return undefined;
+    for (const [condition, candidate] of Object.entries(value)) {
+      if (condition !== "node" && condition !== "import" && condition !== "default") continue;
+      const selected = selectImportTarget(candidate);
+      if (selected !== undefined) return selected;
+    }
+    return undefined;
+  };
+  const exportsRoot = typeof metadata.exports === "object"
+    && metadata.exports !== null
+    && !Array.isArray(metadata.exports)
+    && Object.hasOwn(metadata.exports, ".")
+    ? (metadata.exports as Record<string, unknown>)["."]
+    : metadata.exports;
+  const entryTarget = metadata.exports === undefined
+    ? (typeof metadata.main === "string" ? metadata.main : "./index.js")
+    : selectImportTarget(exportsRoot);
+  if (entryTarget === undefined || !entryTarget.startsWith("./")) {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  const packageRoot = dirname(metadataPath);
+  const entryPath = strictTrustedFile(
+    resolve(packageRoot, entryTarget),
+    `Pi extension ${specifier} package entry`,
+  );
+  if (
+    !isContainedPath(packageRoot, entryPath)
+    || !declaredResources.has(metadataPath)
+    || !declaredResources.has(entryPath)
+  ) {
+    throw new TypeError(
+      `Pi extension resource manifest must cover the ${specifier} package metadata and runtime entry`,
+    );
+  }
+}
+
 function extensionResourceFiles(
   entryPath: string,
   declaredResourcePaths: readonly string[] = [],
@@ -552,6 +657,7 @@ function extensionResourceFiles(
     ...packageOwnedExtensionResourcePaths(trustedEntryPath),
     ...declaredExtensionResourcePaths(declaredResourcePaths),
   ];
+  const declaredResources = new Set(additionalResources.map((resource) => resource.path));
   const pending = [trustedEntryPath];
   const seen = new Set<string>();
   const files: PiExtensionResourceFile[] = [];
@@ -574,9 +680,13 @@ function extensionResourceFiles(
       executable: (lstatSync(path).mode & 0o111) !== 0,
     });
     if (extname(path) === ".json") continue;
-    for (const specifier of localModuleSpecifiers(path, content)) {
+    const specifiers = extensionModuleSpecifiers(path, content);
+    for (const specifier of specifiers.local) {
       const dependency = resolveLocalModule(path, specifier);
       if (!seen.has(dependency)) pending.push(dependency);
+    }
+    for (const specifier of specifiers.declaredPackages) {
+      assertDeclaredPackageResourceCoverage(path, specifier, declaredResources);
     }
   }
   for (const resource of additionalResources) {
