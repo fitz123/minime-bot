@@ -610,6 +610,70 @@ describe("primary Pi resource contract", () => {
     );
   });
 
+  it("rejects a symlinked declared acorn package directory", () => {
+    const root = tempDirectory();
+    const storedPackageRoot = join(root, "store", "acorn");
+    const linkedPackageRoot = join(root, "app", "node_modules", "acorn");
+    const packageEntry = join(linkedPackageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(linkedPackageRoot, "package.json");
+    const extension = join(root, "app", "configured-workflow", "index.ts");
+    mkdirSync(join(storedPackageRoot, "dist"), { recursive: true });
+    mkdirSync(dirname(linkedPackageRoot), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    writeFileSync(
+      join(storedPackageRoot, "package.json"),
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(storedPackageRoot, "dist", "acorn.mjs"),
+      "export const parse = () => ({ type: 'STORED' });\n",
+      "utf8",
+    );
+    symlinkSync(storedPackageRoot, linkedPackageRoot, "dir");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /regular non-symlink directory/,
+    );
+  });
+
+  it("rejects symlinks within a declared acorn package path", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const storedDist = join(root, "store", "dist");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "configured-workflow", "index.ts");
+    mkdirSync(packageRoot, { recursive: true });
+    mkdirSync(storedDist, { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(storedDist, "acorn.mjs"),
+      "export const parse = () => ({ type: 'STORED' });\n",
+      "utf8",
+    );
+    symlinkSync(storedDist, join(packageRoot, "dist"), "dir");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /manifest must cover the acorn package metadata and runtime entry/,
+    );
+  });
+
   it("rejects package metadata replaced after its entry is selected", () => {
     const root = tempDirectory();
     const packageRoot = join(root, "node_modules", "acorn");

@@ -965,8 +965,12 @@ function assertDeclaredPackageResourceCoverage(
       );
     }
     if (existsSync(metadataCandidate)) {
+      const packageRoot = strictTrustedDirectory(
+        packageCandidate,
+        `Pi extension ${specifier} package root`,
+      );
       metadataPath = strictTrustedFile(
-        metadataCandidate,
+        join(packageRoot, "package.json"),
         `Pi extension ${specifier} package metadata`,
       );
       break;
@@ -1028,12 +1032,14 @@ function assertDeclaredPackageResourceCoverage(
     throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
   }
   const packageRoot = dirname(metadataPath);
+  const entryCandidate = normalize(resolve(packageRoot, entryTarget));
   const entryPath = strictTrustedFile(
-    resolve(packageRoot, entryTarget),
+    entryCandidate,
     `Pi extension ${specifier} package entry`,
   );
   if (
-    !isContainedPath(packageRoot, entryPath)
+    entryPath !== entryCandidate
+    || !isContainedPath(packageRoot, entryPath)
     || !declaredResources.has(metadataPath)
     || !declaredResources.has(entryPath)
   ) {
