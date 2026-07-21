@@ -318,7 +318,6 @@ function extensionModuleSpecifiers(
       && ts.isIdentifier(node.name)
       && node.initializer !== undefined
       && ts.isVariableDeclarationList(node.parent)
-      && (node.parent.flags & ts.NodeFlags.Const) !== 0
     ) {
       constantInitializers.set(
         node.name.text,
@@ -678,7 +677,6 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
       && ts.isIdentifier(node.name)
       && node.initializer !== undefined
       && ts.isVariableDeclarationList(node.parent)
-      && (node.parent.flags & ts.NodeFlags.Const) !== 0
     ) {
       constantInitializers.set(
         node.name.text,
