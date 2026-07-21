@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.7.22
+
 - Allow bounded recovery prerequisite version probes enough time to complete on a heavily loaded host instead of failing after five seconds (#58).
 
 ## 2026.7.21
