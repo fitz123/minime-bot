@@ -259,7 +259,50 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
   const bindingCounts = new Map<string, number>();
   const constantInitializers = new Map<string, ts.Expression | null>();
   const bindingWrites = new Map<string, StaticBindingWrite[]>();
-  const opaqueComputedPropertyBindings = new Set<string>();
+  const scopedBindingNames = new Map<ts.Node, Set<string>>();
+  const opaqueComputedPropertyBindings = new Map<ts.Node, Set<string>>();
+  const opaqueAssignmentTargets: ts.Identifier[] = [];
+  const addScopedName = (
+    bindings: Map<ts.Node, Set<string>>,
+    scope: ts.Node,
+    name: string,
+  ): void => {
+    const names = bindings.get(scope) ?? new Set<string>();
+    names.add(name);
+    bindings.set(scope, names);
+  };
+  const enclosingFunctionScope = (node: ts.Node): ts.Node => {
+    for (let current = node.parent; current; current = current.parent) {
+      if (ts.isFunctionLike(current) || ts.isSourceFile(current)) return current;
+    }
+    return source;
+  };
+  const enclosingLexicalScope = (node: ts.Node): ts.Node => {
+    for (let current = node.parent; current; current = current.parent) {
+      if (
+        ts.isBlock(current)
+        || ts.isCaseBlock(current)
+        || ts.isCatchClause(current)
+        || ts.isForStatement(current)
+        || ts.isForInStatement(current)
+        || ts.isForOfStatement(current)
+        || ts.isSourceFile(current)
+      ) return current;
+    }
+    return source;
+  };
+  const declarationScope = (node: ts.Node): ts.Node => {
+    if (ts.isParameter(node)) return enclosingFunctionScope(node);
+    if (ts.isVariableDeclaration(node)) {
+      if (ts.isCatchClause(node.parent)) return node.parent;
+      if (
+        ts.isVariableDeclarationList(node.parent)
+        && (node.parent.flags & ts.NodeFlags.BlockScoped) !== 0
+      ) return enclosingLexicalScope(node);
+      return enclosingFunctionScope(node);
+    }
+    return enclosingLexicalScope(node);
+  };
   const recordBindingName = (name: ts.BindingName): void => {
     if (ts.isIdentifier(name)) {
       bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
@@ -269,13 +312,20 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
     }
   };
-  const recordOpaqueBindingName = (name: ts.BindingName): void => {
+  const recordScopedBindingName = (
+    name: ts.BindingName,
+    scope: ts.Node,
+    opaque: boolean,
+  ): void => {
     if (ts.isIdentifier(name)) {
-      opaqueComputedPropertyBindings.add(name.text);
+      addScopedName(scopedBindingNames, scope, name.text);
+      if (opaque) addScopedName(opaqueComputedPropertyBindings, scope, name.text);
       return;
     }
     for (const element of name.elements) {
-      if (!ts.isOmittedExpression(element)) recordOpaqueBindingName(element.name);
+      if (!ts.isOmittedExpression(element)) {
+        recordScopedBindingName(element.name, scope, opaque);
+      }
     }
   };
   const recordOpaqueAssignmentTarget = (target: ts.Expression): void => {
@@ -289,7 +339,7 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       return;
     }
     if (ts.isIdentifier(target)) {
-      opaqueComputedPropertyBindings.add(target.text);
+      opaqueAssignmentTargets.push(target);
       return;
     }
     if (ts.isArrayLiteralExpression(target)) {
@@ -304,7 +354,7 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
     if (ts.isObjectLiteralExpression(target)) {
       for (const property of target.properties) {
         if (ts.isShorthandPropertyAssignment(property)) {
-          opaqueComputedPropertyBindings.add(property.name.text);
+          opaqueAssignmentTargets.push(property.name);
         } else if (ts.isPropertyAssignment(property)) {
           recordOpaqueAssignmentTarget(property.initializer);
         } else if (ts.isSpreadAssignment(property)) {
@@ -320,6 +370,12 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       recordOpaqueAssignmentTarget(target.left);
     }
   };
+  const bindingScope = (identifier: ts.Identifier): ts.Node | undefined => {
+    for (let current = identifier.parent; current; current = current.parent) {
+      if (scopedBindingNames.get(current)?.has(identifier.text)) return current;
+    }
+    return undefined;
+  };
   const recordBindingWrite = (
     name: string,
     value: ts.Expression,
@@ -332,7 +388,11 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
   const collectBindings = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
       recordBindingName(node.name);
-      if (!ts.isIdentifier(node.name)) recordOpaqueBindingName(node.name);
+      recordScopedBindingName(
+        node.name,
+        declarationScope(node),
+        false,
+      );
     } else if (
       (ts.isFunctionDeclaration(node)
         || ts.isFunctionExpression(node)
@@ -342,14 +402,24 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       && node.name !== undefined
     ) {
       recordBindingName(node.name);
+      if (ts.isFunctionExpression(node) || ts.isClassExpression(node)) {
+        recordScopedBindingName(node.name, node, false);
+      } else {
+        recordScopedBindingName(node.name, declarationScope(node), false);
+        if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
+          recordScopedBindingName(node.name, node, false);
+        }
+      }
     } else if (ts.isImportClause(node) && node.name !== undefined) {
       recordBindingName(node.name);
+      recordScopedBindingName(node.name, source, false);
     } else if (
       ts.isImportSpecifier(node)
       || ts.isNamespaceImport(node)
       || ts.isImportEqualsDeclaration(node)
     ) {
       recordBindingName(node.name);
+      recordScopedBindingName(node.name, source, false);
     }
     if (
       ts.isVariableDeclaration(node)
@@ -395,6 +465,13 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
     ts.forEachChild(node, collectBindings);
   };
   collectBindings(source);
+  for (const target of opaqueAssignmentTargets) {
+    addScopedName(
+      opaqueComputedPropertyBindings,
+      bindingScope(target) ?? source,
+      target.text,
+    );
+  }
   const uniqueConstantInitializer = (name: string): ts.Expression | undefined => {
     if (bindingCounts.get(name) !== 1) return undefined;
     return constantInitializers.get(name) ?? undefined;
@@ -463,7 +540,9 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
         || ts.isSatisfiesExpression(current)
         || ts.isNonNullExpression(current)
       ) current = current.expression;
-      return ts.isIdentifier(current) && opaqueComputedPropertyBindings.has(current.text);
+      if (!ts.isIdentifier(current)) return false;
+      const scope = bindingScope(current) ?? source;
+      return opaqueComputedPropertyBindings.get(scope)?.has(current.text) ?? false;
     },
     staticString,
     staticStrings,

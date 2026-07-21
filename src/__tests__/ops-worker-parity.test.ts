@@ -357,6 +357,19 @@ describe("primary Pi resource contract", () => {
     writeFileSync(javascriptDependency, "export const value = 'changed';\n", "utf8");
     assert.notEqual(createPiExtensionResourceSnapshot(extension).identity, original.identity);
 
+    writeFileSync(
+      extension,
+      [
+        "function optionalValue(values: Record<string, string>, key: string) { return values[key]; }",
+        "const source = { safe: 'value' };",
+        "const pairs = Object.entries(source).map(([key, value]) => [key, source[key] ?? value]);",
+        "export default optionalValue(Object.fromEntries(pairs), 'safe');",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    assert.doesNotThrow(() => createPiExtensionResourceSnapshot(extension));
+
     const directoryDependency = join(root, "directory-dependency");
     mkdirSync(directoryDependency);
     writeFileSync(
