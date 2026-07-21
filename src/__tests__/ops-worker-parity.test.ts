@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   statSync,
@@ -14,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -30,6 +32,7 @@ import { CODEX_QUOTA_ATTEMPT_FILE_ENV } from "../pi-extensions/codex-usage.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
   createPiExtensionResourceSnapshot,
+  createPiSkillResourceSnapshot,
   piResourceIdentity,
   resolveOpsWorkerParityExtensionPath,
   resolvePiPrimaryResourceContract,
@@ -43,6 +46,7 @@ import {
   prepareOpsWorkerParityLaunch,
   tryReadOpsWorkerParityReport,
 } from "../ops-worker/parity.js";
+import { OPS_WORKER_NODE_OPTIONS } from "../ops-worker/pi-attempt.js";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const created: string[] = [];
@@ -183,11 +187,52 @@ describe("primary Pi resource contract", () => {
       extensionOptions: { ...base.extensionOptions, extraExtensions: [targetExtension] },
     }), /require explicit non-module resource manifests/);
 
-    symlinkSync(targetExtension, join(dirname(targetSkill), "linked-resource"));
+    const nestedSkillDirectory = join(dirname(targetSkill), "nested");
+    mkdirSync(nestedSkillDirectory);
+    symlinkSync(targetExtension, join(nestedSkillDirectory, "linked-resource"));
     assert.throws(
       () => resolvePiPrimaryResourceContract(base),
       /must not contain symlinks/,
     );
+  });
+
+  it("excludes only exact generated Python directory names from skill snapshots", () => {
+    const root = tempDirectory();
+    const skill = writeFixtureSkill(root, "python-skill", "# Generic Python skill\n");
+    const skillRoot = dirname(skill);
+    const ignoredEnvironment = join(root, "ignored-python-environment");
+    mkdirSync(ignoredEnvironment);
+    writeFileSync(join(ignoredEnvironment, "external.py"), "IGNORED_VENV\n", "utf8");
+    symlinkSync(ignoredEnvironment, join(skillRoot, ".venv"), "dir");
+
+    const ignoredPaths = [
+      join(skillRoot, "nested", ".venv", "environment.py"),
+      join(skillRoot, "nested", "__pycache__", "module.pyc"),
+      join(skillRoot, ".pytest_cache", "state"),
+    ];
+    const includedPaths = [
+      join(skillRoot, ".venv-copy", "environment.py"),
+      join(skillRoot, "nested", "__pycache__-saved", "module.pyc"),
+      join(skillRoot, ".pytest_cache.old", "state"),
+    ];
+    for (const path of [...ignoredPaths, ...includedPaths]) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${relative(skillRoot, path)}\n`, "utf8");
+    }
+
+    const snapshot = createPiSkillResourceSnapshot(skill);
+    const snapshotPaths = snapshot.files.map((file) => relative(snapshot.rootPath, file.path));
+
+    assert.equal(snapshotPaths.includes("SKILL.md"), true);
+    assert.equal(snapshotPaths.some((path) => path === ".venv" || path.startsWith(".venv/")), false);
+    assert.equal(snapshotPaths.some((path) => path.includes("/.venv/")), false);
+    assert.equal(snapshotPaths.some((path) => path === ".pytest_cache" || path.startsWith(".pytest_cache/")), false);
+    assert.equal(snapshotPaths.some((path) => path.includes("/__pycache__/")), false);
+    assert.deepEqual(
+      includedPaths.map((path) => snapshotPaths.includes(relative(skillRoot, path))),
+      [true, true, true],
+    );
+    assert.equal(piResourceIdentity("skill", skill), snapshot.identity);
   });
 
   it("binds extension and skill identities to the selected entrypoint", () => {
@@ -293,7 +338,9 @@ describe("primary Pi resource contract", () => {
       [
         "import { value } from './dependency';",
         "export { value as selected } from './dependency';",
-        "export default function extension() { return value; }",
+        "const payload = { arguments: [] };",
+        "function localArguments() { return arguments.length + payload.arguments.length; }",
+        "export default function extension() { return [value, localArguments()]; }",
         "",
       ].join("\n"),
       "utf8",
@@ -309,6 +356,19 @@ describe("primary Pi resource contract", () => {
     );
     writeFileSync(javascriptDependency, "export const value = 'changed';\n", "utf8");
     assert.notEqual(createPiExtensionResourceSnapshot(extension).identity, original.identity);
+
+    writeFileSync(
+      extension,
+      [
+        "function optionalValue(values: Record<string, string>, key: string) { return values[key]; }",
+        "const source = { safe: 'value' };",
+        "const pairs = Object.entries(source).map(([key, value]) => [key, source[key] ?? value]);",
+        "export default optionalValue(Object.fromEntries(pairs), 'safe');",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    assert.doesNotThrow(() => createPiExtensionResourceSnapshot(extension));
 
     const directoryDependency = join(root, "directory-dependency");
     mkdirSync(directoryDependency);
@@ -344,7 +404,12 @@ describe("primary Pi resource contract", () => {
       "const g = globalThis; const key = 'Func' + 'tion'; export default g[key]('return () => 1')();\n",
       "const getter = Reflect.get; export default getter(globalThis, 'Function')('return () => 1')();\n",
       "const key = 'con' + 'structor'; export default (() => {})[key]('return () => 1')();\n",
-      "import { Script } from 'node:vm'; export default function extension() { return Script; }\n",
+      "let key = 'con'; key += 'structor'; export default (() => {})[key]('return () => 1')();\n",
+      "let key = 'safe'; key ||= 'constructor'; export default (() => {})[key]('return () => 1')();\n",
+      "let key = 'safe'; ({ key } = { key: 'constructor' }); export default (() => {})[key]('return () => 1')();\n",
+      "export default jitiImport('/tmp/unpinned.mjs', { default: true });\n",
+      "export default jitiESMResolve('/tmp/unpinned.mjs');\n",
+      "export default arguments[1]('/tmp/unpinned.mjs');\n",
       "import { createRequire as load } from 'node:module'; export default function extension() { return load; }\n",
       "import { createJiti } from 'jiti'; export default createJiti(import.meta.url).import('./dependency.js');\n",
       "import unpinned from 'file:///tmp/unpinned.js'; export default unpinned;\n",
@@ -356,6 +421,332 @@ describe("primary Pi resource contract", () => {
         /cannot be attested safely/,
         source,
       );
+    }
+  });
+
+  it("attests only the exact declared acorn graph and safe syntax forms", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "node_modules", "configured-workflow", "index.ts");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    const packageMetadataSource = `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
+      })}\n`;
+    writeFileSync(packageMetadata, packageMetadataSource, "utf8");
+    writeFileSync(
+      packageEntry,
+      [
+        "export function parse() {",
+        "  const node = { arguments: [] };",
+        "  return { type: arguments.length >= 0 && node.arguments.length === 0 ? 'Program' : 'Never' };",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const accepted = [
+      "import vm from 'node:vm';",
+      "import { parse } from 'acorn';",
+      "const runtime = { process: process.cwd() };",
+      "const navigatorValue = globalThis.navigator?.hardwareConcurrency;",
+      "export default function extension() {",
+      "  const context = vm.createContext({});",
+      "  return [new vm.Script('1 + 1', { filename: 'workflow.js' }).runInContext(context), parse, runtime, navigatorValue];",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(extension, accepted, "utf8");
+
+    const snapshot = createPiExtensionResourceSnapshot(
+      extension,
+      [packageMetadata, packageEntry],
+    );
+    assert.deepEqual(
+      snapshot.files.map((file) => file.path),
+      [realpathSync(extension), realpathSync(packageMetadata), realpathSync(packageEntry)].sort(),
+    );
+
+    for (const manifest of [[packageMetadata], [packageEntry], []]) {
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, manifest),
+        /manifest must cover the acorn package metadata and runtime entry/,
+      );
+    }
+
+    const outsideEntry = join(root, "outside.mjs");
+    writeFileSync(outsideEntry, "export const parse = () => ({ type: 'Outside' });\n", "utf8");
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./../../outside.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(
+        extension,
+        [packageMetadata, outsideEntry],
+      ),
+      /manifest must cover the acorn package metadata and runtime entry/,
+    );
+
+    writeFileSync(packageMetadata, packageMetadataSource, "utf8");
+    writeFileSync(
+      packageEntry,
+      "import value from 'ambient-only'; export const parse = () => value;\n",
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /declared package entry must be self-contained/,
+    );
+    const injectedPackageLoaders = [
+      "export const parse = () => import('data:text/javascript,export default 42');\n",
+      "export const parse = () => Function('return 42')();\n",
+      "export const parse = () => jitiImport('/tmp/unpinned.mjs', { default: true });\n",
+      "export const parse = () => jitiESMResolve('/tmp/unpinned.mjs');\n",
+      "export const parse = () => arguments[1]('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value.require('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value['require']('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value.constructor('return 42')();\n",
+      "const value = {}; export const parse = () => value['constructor']('return 42')();\n",
+      "const key = 'require'; const value = {}; export const parse = () => value[key]('/tmp/unpinned.mjs');\n",
+      "const key = 'con' + 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'con'; key += 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; key ||= 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; ({ key } = { key: 'constructor' }); export const parse = () => []['filter'][key]('return 42')();\n",
+    ];
+    for (const source of injectedPackageLoaders) {
+      writeFileSync(packageEntry, source, "utf8");
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+        /declared package entry must be self-contained/,
+        source,
+      );
+    }
+
+    const consumer = join(dirname(extension), "consumer.ts");
+    writeFileSync(
+      packageEntry,
+      "import { readFileSync } from 'node:fs'; export const parse = readFileSync;\n",
+      "utf8",
+    );
+    writeFileSync(
+      consumer,
+      "import { parse } from 'acorn'; export default parse;\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      [
+        "import './consumer.ts';",
+        "import '../acorn/dist/acorn.mjs';",
+        "export default function extension() {}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /declared package entry must be self-contained/,
+    );
+
+    writeFileSync(packageEntry, "export const parse = () => ({ type: 'Program' });\n", "utf8");
+
+    const rejected = [
+      "import value from 'unlisted-package'; export default value;\n",
+      "import { parse } from 'acorn/dist/acorn.mjs'; export default parse;\n",
+      "const root = globalThis; export default root;\n",
+      "const navigatorValue = globalThis['navigator']; export default navigatorValue;\n",
+      "export default function extension() { return { process }; }\n",
+      "export default function extension() { return { [process]: true }; }\n",
+      "export default function extension() { return globalThis.require; }\n",
+      "import { Script } from 'node:vm'; export default Script;\n",
+      "import * as vm from 'node:vm'; export default vm;\n",
+      "export { Script } from 'node:vm';\n",
+      "import vm from 'node:vm'; const Script = vm.Script; export default Script;\n",
+      "import vm from 'node:vm'; export default vm.compileFunction;\n",
+      "import vm from 'node:vm'; export default new vm.Script(\"process.getBuiltinModule('node:fs')\").runInThisContext();\n",
+      "import vm from 'node:vm'; export default new vm.Script('1').runInNewContext();\n",
+      "import vm from 'node:vm'; const script = new vm.Script('1'); export default script;\n",
+      "import vm from 'node:vm'; const context = {}; export default new vm.Script('1').runInContext(context);\n",
+      "import vm from 'node:vm'; export default new vm.Script('1').runInContext(vm.createContext({}));\n",
+      "import vm from 'node:vm'; const context = vm.createContext({}); const alias = context; export default new vm.Script('1').runInContext(alias);\n",
+      "import vm from 'node:vm'; const context = vm.createContext({}); export default new vm.Script('1').runInContext(context, {});\n",
+      "import vm from 'node:vm'; export default new vm.Script('1', { importModuleDynamically() {} });\n",
+      "import vm from 'node:vm'; export default new vm.Script(\"import('data:text/javascript,export default 42')\", { importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });\n",
+      "import vm from 'node:vm'; const args = ['1', { importModuleDynamically() {} }]; export default new vm.Script(...args);\n",
+      "const property = 'cwd'; function load(property: string) { return process[property]('node:fs'); } export default function extension() { return load('getBuiltinModule'); }\n",
+      "const property = 'cwd'; try { throw 'getBuiltinModule'; } catch (property) { process[property]('node:fs'); } export default function extension() {}\n",
+      "let property = 'cwd'; property = 'getBuiltinModule'; export default process[property]('node:fs');\n",
+      "let property = 'safe'; property = 'createRequire'; const value = {}; export default value[property]('/tmp/unpinned.mjs');\n",
+      "import vm from 'node:vm'; const context = vm.createContext({}); export default function extension(external: object) { let context = external; return new vm.Script('1').runInContext(context); }\n",
+      "import vm from 'node:vm'; const external = {}; let context = vm.createContext({}); context = external; export default new vm.Script('1').runInContext(context);\n",
+    ];
+    for (const source of rejected) {
+      writeFileSync(extension, source, "utf8");
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+        /cannot be attested safely/,
+        source,
+      );
+    }
+  });
+
+  it("rejects a nearer metadata-less acorn package shadowing the manifested package", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "node_modules", "configured-workflow", "index.ts");
+    const shadowEntry = join(dirname(extension), "node_modules", "acorn", "index.js");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    mkdirSync(dirname(shadowEntry), { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(packageEntry, "export const parse = () => ({ type: 'PINNED' });\n", "utf8");
+    writeFileSync(shadowEntry, "export const parse = () => ({ type: 'SHADOW' });\n", "utf8");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /package metadata cannot be resolved for attestation/,
+    );
+  });
+
+  it("rejects a symlinked declared acorn package directory", () => {
+    const root = tempDirectory();
+    const storedPackageRoot = join(root, "store", "acorn");
+    const linkedPackageRoot = join(root, "app", "node_modules", "acorn");
+    const packageEntry = join(linkedPackageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(linkedPackageRoot, "package.json");
+    const extension = join(root, "app", "configured-workflow", "index.ts");
+    mkdirSync(join(storedPackageRoot, "dist"), { recursive: true });
+    mkdirSync(dirname(linkedPackageRoot), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    writeFileSync(
+      join(storedPackageRoot, "package.json"),
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(storedPackageRoot, "dist", "acorn.mjs"),
+      "export const parse = () => ({ type: 'STORED' });\n",
+      "utf8",
+    );
+    symlinkSync(storedPackageRoot, linkedPackageRoot, "dir");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /regular non-symlink directory/,
+    );
+  });
+
+  it("rejects symlinks within a declared acorn package path", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const storedDist = join(root, "store", "dist");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "configured-workflow", "index.ts");
+    mkdirSync(packageRoot, { recursive: true });
+    mkdirSync(storedDist, { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        exports: { ".": { import: "./dist/acorn.mjs" } },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(storedDist, "acorn.mjs"),
+      "export const parse = () => ({ type: 'STORED' });\n",
+      "utf8",
+    );
+    symlinkSync(storedDist, join(packageRoot, "dist"), "dir");
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    assert.throws(
+      () => createPiExtensionResourceSnapshot(extension, [packageMetadata, packageEntry]),
+      /manifest must cover the acorn package metadata and runtime entry/,
+    );
+  });
+
+  it("rejects package metadata replaced after its entry is selected", () => {
+    const root = tempDirectory();
+    const packageRoot = join(root, "node_modules", "acorn");
+    const safeEntry = join(packageRoot, "dist", "safe.mjs");
+    const unsafeEntry = join(packageRoot, "dist", "unsafe.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(root, "configured-workflow", "index.ts");
+    mkdirSync(dirname(safeEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    const safeMetadata = `${JSON.stringify({
+      name: "acorn",
+      exports: { ".": { import: "./dist/safe.mjs" } },
+    })}\n`;
+    const unsafeMetadata = `${JSON.stringify({
+      name: "acorn",
+      exports: { ".": { import: "./dist/unsafe.mjs" } },
+    })}\n`;
+    writeFileSync(packageMetadata, safeMetadata, "utf8");
+    writeFileSync(safeEntry, "export const parse = () => ({ type: 'SAFE' });\n", "utf8");
+    writeFileSync(
+      unsafeEntry,
+      "import { readFileSync } from 'node:fs'; export const parse = readFileSync;\n",
+      "utf8",
+    );
+    writeFileSync(extension, "import { parse } from 'acorn'; export default parse;\n", "utf8");
+
+    const originalJsonParse = JSON.parse;
+    let replaced = false;
+    JSON.parse = ((text: string, reviver?: (this: unknown, key: string, value: unknown) => unknown) => {
+      const parsed = originalJsonParse(text, reviver);
+      if (!replaced && text === safeMetadata) {
+        replaced = true;
+        const staging = `${packageMetadata}.replacement`;
+        writeFileSync(staging, unsafeMetadata, "utf8");
+        renameSync(staging, packageMetadata);
+      }
+      return parsed;
+    }) as typeof JSON.parse;
+    try {
+      assert.throws(
+        () => createPiExtensionResourceSnapshot(
+          extension,
+          [packageMetadata, safeEntry, unsafeEntry],
+        ),
+        /package metadata changed before it could be captured/,
+      );
+      assert.equal(replaced, true);
+    } finally {
+      JSON.parse = originalJsonParse;
     }
   });
 });
@@ -756,6 +1147,143 @@ describe("ops-worker before-provider parity attestation", () => {
     cleanupOpsWorkerParityLaunch(launch);
   });
 
+  it("loads declared acorn only from a copied hoisted node_modules snapshot", async () => {
+    const root = tempDirectory();
+    const sourceRoot = join(root, "source");
+    const sessionRoot = join(root, "session");
+    const packageRoot = join(sourceRoot, "node_modules", "acorn");
+    const packageEntry = join(packageRoot, "dist", "acorn.mjs");
+    const packageMetadata = join(packageRoot, "package.json");
+    const extension = join(sourceRoot, "node_modules", "configured-workflow", "index.ts");
+    const bundlePath = join(sessionRoot, "bundle.md");
+    mkdirSync(dirname(packageEntry), { recursive: true });
+    mkdirSync(dirname(extension), { recursive: true });
+    mkdirSync(sessionRoot, { recursive: true });
+    writeFileSync(
+      packageMetadata,
+      `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      packageEntry,
+      "export const parse = () => ({ type: 'PINNED_PROGRAM' });\n",
+      "utf8",
+    );
+    writeFileSync(
+      extension,
+      [
+        "import vm from 'node:vm';",
+        "import { parse } from 'acorn';",
+        "const runtime = { process: process.cwd() };",
+        "const navigatorValue = globalThis.navigator?.hardwareConcurrency;",
+        "export default function extension(pi) {",
+        "  const parsed = parse('fixture', { ecmaVersion: 'latest' });",
+        "  const context = vm.createContext({});",
+        "  new vm.Script('1 + 1').runInContext(context);",
+        "  void runtime; void navigatorValue;",
+        "  pi.registerCommand(`acorn-${parsed.type}`, { handler: async () => {} });",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
+    const resources = resolvePiPrimaryResourceContract({
+      extensionOptions: { relpaths: [], extraExtensions: [extension] },
+      extraExtensionResourcePaths: [[packageMetadata, packageEntry]],
+      skillPaths: [],
+      toolNames: [...PI_BUILTIN_TOOL_NAMES],
+    });
+    const parityExtensionPath = resolveOpsWorkerParityExtensionPath();
+    const launch = prepareOpsWorkerParityLaunch({
+      context: {
+        appendSystemPromptPath: bundlePath,
+        manifest: {
+          version: 1,
+          sources: [],
+          bundleHash: sha256("GENERIC_BUNDLE\n"),
+          personaHash: null,
+          digest: sha256("GENERIC_MANIFEST"),
+        },
+      },
+      resources,
+      parityExtensionPath,
+      parityExtensionIdentity: piResourceIdentity("extension", parityExtensionPath),
+      sessionDirectory: sessionRoot,
+      opsPolicy: "GENERIC_POLICY",
+    });
+    const extensionSnapshot = launch.preparedSnapshots.find((snapshot) =>
+      snapshot.files.some((file) => file.path.endsWith(join("configured-workflow", "index.ts"))));
+    assert.ok(extensionSnapshot);
+    assert.equal(
+      extensionSnapshot.files.some((file) =>
+        relative(extensionSnapshot.rootPath, file.path)
+          === join("node_modules", "acorn", "dist", "acorn.mjs")),
+      true,
+    );
+
+    writeFileSync(extension, "throw new Error('LIVE_EXTENSION_LOADED');\n", "utf8");
+    writeFileSync(packageEntry, "throw new Error('LIVE_ACORN_LOADED');\n", "utf8");
+    const ambientRoot = join(sessionRoot, "node_modules", "acorn");
+    mkdirSync(join(ambientRoot, "dist"), { recursive: true });
+    writeFileSync(
+      join(ambientRoot, "package.json"),
+      `${JSON.stringify({
+        name: "acorn",
+        main: "./dist/acorn.cjs",
+        exports: {
+          ".": [
+            { import: "./dist/acorn.mjs", require: "./dist/acorn.cjs" },
+            "./dist/acorn.cjs",
+          ],
+        },
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(ambientRoot, "dist", "acorn.mjs"),
+      "export const parse = () => ({ type: 'AMBIENT_PROGRAM' });\n",
+      "utf8",
+    );
+
+    const wrapperUrl = `${pathToFileURL(launch.extensionPaths[0]).href}?acorn=${Date.now()}`;
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        [
+          `const wrapper = (await import(${JSON.stringify(wrapperUrl)})).default;`,
+          "const commands = [];",
+          "await wrapper({ registerCommand: (name) => commands.push(name) });",
+          "process.stdout.write(JSON.stringify(commands));",
+        ].join("\n"),
+      ],
+      {
+        cwd: sessionRoot,
+        encoding: "utf8",
+        env: { ...process.env, NODE_OPTIONS: OPS_WORKER_NODE_OPTIONS },
+        timeout: 10_000,
+      },
+    );
+    assert.ifError(child.error);
+    assert.equal(child.status, 0, child.stderr);
+    const commands = JSON.parse(child.stdout) as string[];
+
+    assert.ok(commands.includes("acorn-PINNED_PROGRAM"));
+    assert.equal(commands.includes("acorn-AMBIENT_PROGRAM"), false);
+    cleanupOpsWorkerParityLaunch(launch);
+  });
+
   it("removes private extension snapshots after use and on preparation failure", () => {
     const root = tempDirectory();
     const extension = join(root, "extension.mjs");
@@ -818,13 +1346,26 @@ describe("ops-worker before-provider parity attestation", () => {
     const scriptPath = join(skillRoot, "scripts", "inspect.sh");
     const referencePath = join(skillRoot, "references", "guide.md");
     const assetPath = join(skillRoot, "assets", "fixture.txt");
+    const ignoredEnvironment = join(root, "ignored-python-environment");
+    const ignoredCachePath = join(skillRoot, "nested", "__pycache__", "module.pyc");
+    const ignoredPytestPath = join(skillRoot, ".pytest_cache", "state");
+    const includedNearMissPath = join(skillRoot, ".pytest_cache.old", "state");
     mkdirSync(dirname(scriptPath), { recursive: true });
     mkdirSync(dirname(referencePath), { recursive: true });
     mkdirSync(dirname(assetPath), { recursive: true });
+    mkdirSync(ignoredEnvironment);
+    writeFileSync(join(ignoredEnvironment, "external.py"), "IGNORED_VENV\n", "utf8");
+    symlinkSync(ignoredEnvironment, join(skillRoot, ".venv"), "dir");
+    mkdirSync(dirname(ignoredCachePath), { recursive: true });
+    mkdirSync(dirname(ignoredPytestPath), { recursive: true });
+    mkdirSync(dirname(includedNearMissPath), { recursive: true });
     writeFileSync(scriptPath, "#!/bin/sh\nprintf 'skill package'\n", "utf8");
     chmodSync(scriptPath, 0o700);
     writeFileSync(referencePath, "PINNED_REFERENCE\n", "utf8");
     writeFileSync(assetPath, "PINNED_ASSET\n", "utf8");
+    writeFileSync(ignoredCachePath, "IGNORED_CACHE\n", "utf8");
+    writeFileSync(ignoredPytestPath, "IGNORED_PYTEST\n", "utf8");
+    writeFileSync(includedNearMissPath, "PINNED_NEAR_MISS\n", "utf8");
     writeFileSync(extension, "export default function extension() {}\n", "utf8");
     writeFileSync(bundlePath, "GENERIC_BUNDLE\n", "utf8");
     const resources = resolvePiPrimaryResourceContract({
@@ -863,6 +1404,13 @@ describe("ops-worker before-provider parity attestation", () => {
     assert.equal(
       readFileSync(join(privateSkillRoot, "assets", "fixture.txt"), "utf8"),
       "PINNED_ASSET\n",
+    );
+    assert.equal(existsSync(join(privateSkillRoot, ".venv")), false);
+    assert.equal(existsSync(join(privateSkillRoot, "nested", "__pycache__")), false);
+    assert.equal(existsSync(join(privateSkillRoot, ".pytest_cache")), false);
+    assert.equal(
+      readFileSync(join(privateSkillRoot, ".pytest_cache.old", "state"), "utf8"),
+      "PINNED_NEAR_MISS\n",
     );
     assert.notEqual(statSync(join(privateSkillRoot, "scripts", "inspect.sh")).mode & 0o111, 0);
     assert.equal(

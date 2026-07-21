@@ -45,6 +45,11 @@ const MAX_EXTENSION_RESOURCE_FILES = 2_048;
 const MAX_EXTENSION_RESOURCE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXTENSION_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_RESOURCE_DIRECTORIES = 2_048;
+const SKILL_GENERATED_DIRECTORY_NAMES = new Set([
+  ".venv",
+  ".pytest_cache",
+  "__pycache__",
+]);
 export const PI_EXTENSION_JITI_EXTENSIONS = [
   ".js",
   ".mjs",
@@ -67,6 +72,8 @@ const UNSAFE_MODULE_LOADER_IDENTIFIERS = new Set([
   "getBuiltinModule",
   "global",
   "globalThis",
+  "jitiESMResolve",
+  "jitiImport",
   "mainModule",
   "require",
   "self",
@@ -119,6 +126,8 @@ const SAFE_EXTENSION_MODULE_SPECIFIERS = new Set([
   "node:stream",
   "node:string_decoder",
   "node:url",
+  "node:vm",
+  "acorn",
   "typebox",
   "typebox/compile",
   "typebox/value",
@@ -218,40 +227,255 @@ function readTrustedFile(path: string): Buffer {
   }
 }
 
-function localModuleSpecifiers(
-  path: string,
-  content: Buffer,
-): string[] {
-  const source = ts.createSourceFile(
-    path,
-    content.toString("utf8"),
-    ts.ScriptTarget.Latest,
-    true,
-  );
-  const parseDiagnostics = (
-    source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
-  ).parseDiagnostics ?? [];
-  if (parseDiagnostics.length > 0) {
-    throw new TypeError("Pi extension source must parse before its dependency closure is hashed");
+interface PiExtensionModuleSpecifiers {
+  local: string[];
+  declaredPackages: string[];
+}
+
+interface StaticBindingAnalysis {
+  bindingCount(name: string): number;
+  hasOpaqueComputedPropertyBinding(value: ts.Expression): boolean;
+  staticString(value: ts.Expression, resolving?: Set<string>): string | undefined;
+  staticStrings(value: ts.Expression): ReadonlySet<string>;
+  uniqueConstantInitializer(name: string): ts.Expression | undefined;
+}
+
+interface StaticBindingWrite {
+  kind: "append" | "value";
+  value: ts.Expression;
+}
+
+function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
+  if (node.text !== "arguments") return false;
+  const parent = node.parent as ts.Node & { name?: ts.Node };
+  if (parent.name === node && !ts.isShorthandPropertyAssignment(parent)) return false;
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return false;
   }
-  const specifiers = new Set<string>();
+  return true;
+}
+
+function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalysis {
+  const bindingCounts = new Map<string, number>();
   const constantInitializers = new Map<string, ts.Expression | null>();
-  const collectConstants = (node: ts.Node): void => {
+  const bindingWrites = new Map<string, StaticBindingWrite[]>();
+  const scopedBindingNames = new Map<ts.Node, Set<string>>();
+  const opaqueComputedPropertyBindings = new Map<ts.Node, Set<string>>();
+  const opaqueAssignmentTargets: ts.Identifier[] = [];
+  const addScopedName = (
+    bindings: Map<ts.Node, Set<string>>,
+    scope: ts.Node,
+    name: string,
+  ): void => {
+    const names = bindings.get(scope) ?? new Set<string>();
+    names.add(name);
+    bindings.set(scope, names);
+  };
+  const enclosingFunctionScope = (node: ts.Node): ts.Node => {
+    for (let current = node.parent; current; current = current.parent) {
+      if (ts.isFunctionLike(current) || ts.isSourceFile(current)) return current;
+    }
+    return source;
+  };
+  const enclosingLexicalScope = (node: ts.Node): ts.Node => {
+    for (let current = node.parent; current; current = current.parent) {
+      if (
+        ts.isBlock(current)
+        || ts.isCaseBlock(current)
+        || ts.isCatchClause(current)
+        || ts.isForStatement(current)
+        || ts.isForInStatement(current)
+        || ts.isForOfStatement(current)
+        || ts.isSourceFile(current)
+      ) return current;
+    }
+    return source;
+  };
+  const declarationScope = (node: ts.Node): ts.Node => {
+    if (ts.isParameter(node)) return enclosingFunctionScope(node);
+    if (ts.isVariableDeclaration(node)) {
+      if (ts.isCatchClause(node.parent)) return node.parent;
+      if (
+        ts.isVariableDeclarationList(node.parent)
+        && (node.parent.flags & ts.NodeFlags.BlockScoped) !== 0
+      ) return enclosingLexicalScope(node);
+      return enclosingFunctionScope(node);
+    }
+    return enclosingLexicalScope(node);
+  };
+  const recordBindingName = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) {
+      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
+    }
+  };
+  const recordScopedBindingName = (
+    name: ts.BindingName,
+    scope: ts.Node,
+    opaque: boolean,
+  ): void => {
+    if (ts.isIdentifier(name)) {
+      addScopedName(scopedBindingNames, scope, name.text);
+      if (opaque) addScopedName(opaqueComputedPropertyBindings, scope, name.text);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) {
+        recordScopedBindingName(element.name, scope, opaque);
+      }
+    }
+  };
+  const recordOpaqueAssignmentTarget = (target: ts.Expression): void => {
+    if (
+      ts.isParenthesizedExpression(target)
+      || ts.isAsExpression(target)
+      || ts.isSatisfiesExpression(target)
+      || ts.isNonNullExpression(target)
+    ) {
+      recordOpaqueAssignmentTarget(target.expression);
+      return;
+    }
+    if (ts.isIdentifier(target)) {
+      opaqueAssignmentTargets.push(target);
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (const element of target.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        recordOpaqueAssignmentTarget(
+          ts.isSpreadElement(element) ? element.expression : element,
+        );
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          opaqueAssignmentTargets.push(property.name);
+        } else if (ts.isPropertyAssignment(property)) {
+          recordOpaqueAssignmentTarget(property.initializer);
+        } else if (ts.isSpreadAssignment(property)) {
+          recordOpaqueAssignmentTarget(property.expression);
+        }
+      }
+      return;
+    }
+    if (
+      ts.isBinaryExpression(target)
+      && target.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) {
+      recordOpaqueAssignmentTarget(target.left);
+    }
+  };
+  const bindingScope = (identifier: ts.Identifier): ts.Node | undefined => {
+    for (let current = identifier.parent; current; current = current.parent) {
+      if (scopedBindingNames.get(current)?.has(identifier.text)) return current;
+    }
+    return undefined;
+  };
+  const recordBindingWrite = (
+    name: string,
+    value: ts.Expression,
+    kind: StaticBindingWrite["kind"] = "value",
+  ): void => {
+    const writes = bindingWrites.get(name) ?? [];
+    writes.push({ kind, value });
+    bindingWrites.set(name, writes);
+  };
+  const collectBindings = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      recordBindingName(node.name);
+      recordScopedBindingName(
+        node.name,
+        declarationScope(node),
+        false,
+      );
+    } else if (
+      (ts.isFunctionDeclaration(node)
+        || ts.isFunctionExpression(node)
+        || ts.isClassDeclaration(node)
+        || ts.isClassExpression(node)
+        || ts.isEnumDeclaration(node))
+      && node.name !== undefined
+    ) {
+      recordBindingName(node.name);
+      if (ts.isFunctionExpression(node) || ts.isClassExpression(node)) {
+        recordScopedBindingName(node.name, node, false);
+      } else {
+        recordScopedBindingName(node.name, declarationScope(node), false);
+        if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
+          recordScopedBindingName(node.name, node, false);
+        }
+      }
+    } else if (ts.isImportClause(node) && node.name !== undefined) {
+      recordBindingName(node.name);
+      recordScopedBindingName(node.name, source, false);
+    } else if (
+      ts.isImportSpecifier(node)
+      || ts.isNamespaceImport(node)
+      || ts.isImportEqualsDeclaration(node)
+    ) {
+      recordBindingName(node.name);
+      recordScopedBindingName(node.name, source, false);
+    }
     if (
       ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name)
       && node.initializer !== undefined
-      && ts.isVariableDeclarationList(node.parent)
-      && (node.parent.flags & ts.NodeFlags.Const) !== 0
     ) {
-      constantInitializers.set(
-        node.name.text,
-        constantInitializers.has(node.name.text) ? null : node.initializer,
+      recordBindingWrite(node.name.text, node.initializer);
+      if (
+        ts.isVariableDeclarationList(node.parent)
+        && (node.parent.flags & ts.NodeFlags.Const) !== 0
+      ) {
+        constantInitializers.set(
+          node.name.text,
+          constantInitializers.has(node.name.text) ? null : node.initializer,
+        );
+      }
+    } else if (
+      ts.isBinaryExpression(node)
+      && ts.isIdentifier(node.left)
+      && (
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken
+      )
+    ) {
+      recordBindingWrite(
+        node.left.text,
+        node.right,
+        node.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken ? "append" : "value",
       );
+    } else if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && (
+        ts.isArrayLiteralExpression(node.left)
+        || ts.isObjectLiteralExpression(node.left)
+      )
+    ) {
+      recordOpaqueAssignmentTarget(node.left);
     }
-    ts.forEachChild(node, collectConstants);
+    ts.forEachChild(node, collectBindings);
   };
-  collectConstants(source);
+  collectBindings(source);
+  for (const target of opaqueAssignmentTargets) {
+    addScopedName(
+      opaqueComputedPropertyBindings,
+      bindingScope(target) ?? source,
+      target.text,
+    );
+  }
+  const uniqueConstantInitializer = (name: string): ts.Expression | undefined => {
+    if (bindingCounts.get(name) !== 1) return undefined;
+    return constantInitializers.get(name) ?? undefined;
+  };
   const staticString = (
     value: ts.Expression,
     resolving = new Set<string>(),
@@ -274,8 +498,8 @@ function localModuleSpecifiers(
       return left === undefined || right === undefined ? undefined : left + right;
     }
     if (ts.isIdentifier(value) && !resolving.has(value.text)) {
-      const initializer = constantInitializers.get(value.text);
-      if (initializer !== undefined && initializer !== null) {
+      const initializer = uniqueConstantInitializer(value.text);
+      if (initializer !== undefined) {
         const next = new Set(resolving);
         next.add(value.text);
         return staticString(initializer, next);
@@ -283,6 +507,95 @@ function localModuleSpecifiers(
     }
     return undefined;
   };
+  const staticStrings = (value: ts.Expression): ReadonlySet<string> => {
+    const values = new Set<string>();
+    const direct = staticString(value);
+    if (direct !== undefined) values.add(direct);
+    if (ts.isIdentifier(value)) {
+      const possibleValues = new Set<string>();
+      for (const write of bindingWrites.get(value.text) ?? []) {
+        const resolved = staticString(write.value, new Set([value.text]));
+        if (resolved === undefined) continue;
+        if (write.kind === "append") {
+          for (const previous of [...possibleValues]) {
+            const appended = previous + resolved;
+            possibleValues.add(appended);
+            values.add(appended);
+          }
+        } else {
+          possibleValues.add(resolved);
+          values.add(resolved);
+        }
+      }
+    }
+    return values;
+  };
+  return {
+    bindingCount: (name) => bindingCounts.get(name) ?? 0,
+    hasOpaqueComputedPropertyBinding: (value) => {
+      let current = value;
+      while (
+        ts.isParenthesizedExpression(current)
+        || ts.isAsExpression(current)
+        || ts.isSatisfiesExpression(current)
+        || ts.isNonNullExpression(current)
+      ) current = current.expression;
+      if (!ts.isIdentifier(current)) return false;
+      const scope = bindingScope(current) ?? source;
+      return opaqueComputedPropertyBindings.get(scope)?.has(current.text) ?? false;
+    },
+    staticString,
+    staticStrings,
+    uniqueConstantInitializer,
+  };
+}
+
+function extensionModuleSpecifiers(
+  path: string,
+  content: Buffer,
+): PiExtensionModuleSpecifiers {
+  const source = ts.createSourceFile(
+    path,
+    content.toString("utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const parseDiagnostics = (
+    source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
+  ).parseDiagnostics ?? [];
+  if (parseDiagnostics.length > 0) {
+    throw new TypeError("Pi extension source must parse before its dependency closure is hashed");
+  }
+  const specifiers = new Set<string>();
+  const declaredPackages = new Set<string>();
+  const vmBindings = new Set<string>();
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement)
+      || !ts.isStringLiteral(statement.moduleSpecifier)
+      || statement.moduleSpecifier.text !== "node:vm"
+    ) continue;
+    const clause = statement.importClause;
+    if (
+      clause === undefined
+      || clause.isTypeOnly
+      || clause.name === undefined
+      || clause.namedBindings !== undefined
+      || vmBindings.size > 0
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm loading cannot be attested safely without one default binding with bounded direct usage",
+      );
+    }
+    vmBindings.add(clause.name.text);
+  }
+  const {
+    bindingCount,
+    hasOpaqueComputedPropertyBinding,
+    staticString,
+    staticStrings,
+    uniqueConstantInitializer,
+  } = createStaticBindingAnalysis(source);
   const add = (value: ts.Expression | undefined): void => {
     if (
       value === undefined
@@ -301,30 +614,190 @@ function localModuleSpecifiers(
     }
     if (!SAFE_EXTENSION_MODULE_SPECIFIERS.has(value.text)) {
       throw new TypeError(
-        "Pi extension external module loading is outside the fixed attested allowlist and cannot be attested safely",
+        `Pi extension external module ${JSON.stringify(value.text)} is outside the fixed attested allowlist and cannot be attested safely`,
       );
     }
+    if (value.text === "acorn") declaredPackages.add(value.text);
   };
   const literalProperty = (node: ts.Expression): string | undefined => {
     return staticString(node);
   };
+  const objectPropertyName = (node: ts.PropertyName): string | undefined => {
+    if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) {
+      return node.text;
+    }
+    return undefined;
+  };
+  const unwrapExpression = (node: ts.Expression): ts.Expression => {
+    let current = node;
+    while (
+      ts.isParenthesizedExpression(current)
+      || ts.isAsExpression(current)
+      || ts.isSatisfiesExpression(current)
+      || ts.isNonNullExpression(current)
+    ) current = current.expression;
+    return current;
+  };
+  const directVmCreateContextCall = (node: ts.Expression): boolean => {
+    const expression = unwrapExpression(node);
+    if (
+      !ts.isCallExpression(expression)
+      || expression.questionDotToken !== undefined
+      || expression.arguments.length !== 1
+      || expression.arguments.some((argument) => ts.isSpreadElement(argument))
+      || !ts.isPropertyAccessExpression(expression.expression)
+      || expression.expression.questionDotToken !== undefined
+      || expression.expression.name.text !== "createContext"
+      || !ts.isIdentifier(expression.expression.expression)
+    ) return false;
+    const binding = expression.expression.expression.text;
+    return vmBindings.has(binding) && bindingCount(binding) === 1;
+  };
+  const assertSafeVmScriptExecution = (invocation: ts.NewExpression): void => {
+    let expression: ts.Expression = invocation;
+    while (
+      ts.isParenthesizedExpression(expression.parent)
+      && expression.parent.expression === expression
+    ) expression = expression.parent;
+    const access = expression.parent;
+    const execution = access?.parent;
+    if (
+      !ts.isPropertyAccessExpression(access)
+      || access.expression !== expression
+      || access.questionDotToken !== undefined
+      || access.name.text !== "runInContext"
+      || !ts.isCallExpression(execution)
+      || execution.expression !== access
+      || execution.questionDotToken !== undefined
+      || execution.arguments.length !== 1
+      || execution.arguments.some((argument) => ts.isSpreadElement(argument))
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm Script execution outside a direct attested context cannot be attested safely",
+      );
+    }
+    const context = unwrapExpression(execution.arguments[0]);
+    const initializer = ts.isIdentifier(context)
+      ? uniqueConstantInitializer(context.text)
+      : undefined;
+    if (
+      initializer === undefined
+      || !directVmCreateContextCall(initializer)
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm Script context cannot be attested safely",
+      );
+    }
+  };
+  const assertSafeVmBindingUsage = (node: ts.Identifier): void => {
+    const parent = node.parent;
+    if (ts.isImportClause(parent) && parent.name === node) return;
+    if (
+      !ts.isPropertyAccessExpression(parent)
+      || parent.expression !== node
+      || parent.questionDotToken !== undefined
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm aliases and computed access cannot be attested safely",
+      );
+    }
+    const operation = parent.name.text;
+    const invocation = parent.parent;
+    if (
+      operation === "createContext"
+      && ts.isCallExpression(invocation)
+      && invocation.expression === parent
+      && invocation.questionDotToken === undefined
+    ) {
+      if (!directVmCreateContextCall(invocation)) {
+        throw new TypeError(
+          "Pi extension node:vm context construction cannot be attested safely",
+        );
+      }
+      return;
+    }
+    if (
+      operation === "Script"
+      && ts.isNewExpression(invocation)
+      && invocation.expression === parent
+    ) {
+      const args = invocation.arguments ?? [];
+      if (
+        args.length < 1
+        || args.length > 2
+        || args.some((argument) => ts.isSpreadElement(argument))
+      ) {
+        throw new TypeError(
+          "Pi extension node:vm Script options cannot be attested safely",
+        );
+      }
+      const options = args[1];
+      if (
+        options !== undefined
+        && (
+          !ts.isObjectLiteralExpression(options)
+          || options.properties.some((property) =>
+            !ts.isPropertyAssignment(property)
+            || objectPropertyName(property.name) !== "filename"
+          )
+        )
+      ) {
+        throw new TypeError(
+          "Pi extension node:vm Script options cannot be attested safely",
+        );
+      }
+      assertSafeVmScriptExecution(invocation);
+      return;
+    }
+    throw new TypeError(
+      "Pi extension node:vm usage outside the bounded workflow API cannot be attested safely",
+    );
+  };
   const visit = (node: ts.Node): void => {
+    if (
+      ts.isExportDeclaration(node)
+      && node.moduleSpecifier !== undefined
+      && ts.isStringLiteral(node.moduleSpecifier)
+      && node.moduleSpecifier.text === "node:vm"
+    ) {
+      throw new TypeError(
+        "Pi extension node:vm re-exports cannot be attested safely",
+      );
+    }
+    if (ts.isIdentifier(node) && vmBindings.has(node.text)) {
+      assertSafeVmBindingUsage(node);
+    }
     if (ts.isIdentifier(node) && node.text === "process") {
       const parent = node.parent;
+      const inertPropertyName = ts.isPropertyAssignment(parent)
+        && parent.name === node;
       const property = ts.isPropertyAccessExpression(parent) && parent.expression === node
         ? parent.name.text
         : ts.isElementAccessExpression(parent) && parent.expression === node
         ? literalProperty(parent.argumentExpression)
         : undefined;
-      if (property === undefined || !SAFE_PROCESS_PROPERTIES.has(property)) {
+      if (
+        !inertPropertyName
+        && (property === undefined || !SAFE_PROCESS_PROPERTIES.has(property))
+      ) {
         throw new TypeError(
           "Pi extension process aliases and runtime loader access cannot be attested safely",
         );
       }
     }
+    const safeGlobalNavigatorAccess = ts.isIdentifier(node)
+      && node.text === "globalThis"
+      && ts.isPropertyAccessExpression(node.parent)
+      && node.parent.expression === node
+      && node.parent.name.text === "navigator"
+      && node.parent.questionDotToken === undefined;
     if (
       ts.isIdentifier(node)
-      && UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+      && (
+        UNSAFE_MODULE_LOADER_IDENTIFIERS.has(node.text)
+        || referencesJitiWrapperArguments(node)
+      )
+      && !safeGlobalNavigatorAccess
     ) {
       throw new TypeError("Pi extension runtime module loaders cannot be attested safely");
     }
@@ -353,8 +826,10 @@ function localModuleSpecifiers(
     if (
       ts.isElementAccessExpression(node)
       && (
-        UNSAFE_MODULE_LOADER_PROPERTIES.has(
-          literalProperty(node.argumentExpression) ?? "",
+        hasOpaqueComputedPropertyBinding(node.argumentExpression)
+        ||
+        [...staticStrings(node.argumentExpression)].some((property) =>
+          UNSAFE_MODULE_LOADER_PROPERTIES.has(property)
         )
         || (
           ts.isIdentifier(node.expression)
@@ -380,7 +855,97 @@ function localModuleSpecifiers(
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return [...specifiers];
+  return {
+    local: [...specifiers],
+    declaredPackages: [...declaredPackages],
+  };
+}
+
+function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer): void {
+  const source = ts.createSourceFile(
+    path,
+    content.toString("utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const parseDiagnostics = (
+    source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
+  ).parseDiagnostics ?? [];
+  if (parseDiagnostics.length > 0) {
+    throw new TypeError(
+      "Pi extension declared package entry must parse before its bytes are attested",
+    );
+  }
+  const {
+    hasOpaqueComputedPropertyBinding,
+    staticStrings,
+  } = createStaticBindingAnalysis(source);
+  const loaderIdentifiers = new Set([
+    "Function",
+    "Proxy",
+    "Reflect",
+    "WebAssembly",
+    "createRequire",
+    "eval",
+    "getBuiltinModule",
+    "global",
+    "globalThis",
+    "jitiESMResolve",
+    "jitiImport",
+    "mainModule",
+    "module",
+    "process",
+    "require",
+  ]);
+  const loaderProperties = new Set([
+    "_load",
+    "constructor",
+    "createRequire",
+    "getBuiltinModule",
+    "mainModule",
+    "process",
+    "require",
+  ]);
+  const reject = (): never => {
+    throw new TypeError(
+      "Pi extension declared package entry must be self-contained and cannot use runtime module loaders",
+    );
+  };
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+      && node.moduleSpecifier !== undefined
+    ) reject();
+    if (
+      ts.isImportEqualsDeclaration(node)
+      || (
+        ts.isCallExpression(node)
+        && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      )
+    ) reject();
+    if (
+      ts.isIdentifier(node)
+      && (
+        loaderIdentifiers.has(node.text)
+        || referencesJitiWrapperArguments(node)
+      )
+    ) reject();
+    if (
+      ts.isPropertyAccessExpression(node)
+      && loaderProperties.has(node.name.text)
+    ) reject();
+    if (
+      ts.isElementAccessExpression(node)
+      && (
+        hasOpaqueComputedPropertyBinding(node.argumentExpression)
+        || [...staticStrings(node.argumentExpression)].some((property) =>
+          loaderProperties.has(property)
+        )
+      )
+    ) reject();
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
 }
 
 function resolveLocalModule(importer: string, specifier: string): string {
@@ -447,6 +1012,7 @@ function strictTrustedDirectory(path: string, label: string): string {
 function trustedDirectoryResourcePaths(
   rootPath: string,
   label: string,
+  excludedEntryNames: ReadonlySet<string> = new Set(),
 ): Array<{ path: string; executable: boolean }> {
   const root = strictTrustedDirectory(rootPath, label);
   const pending = [root];
@@ -461,6 +1027,7 @@ function trustedDirectoryResourcePaths(
     const entries = readdirSync(directory, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      if (excludedEntryNames.has(entry.name)) continue;
       const path = join(directory, entry.name);
       const direct = lstatSync(path);
       if (direct.isSymbolicLink()) {
@@ -536,6 +1103,119 @@ function declaredExtensionResourcePaths(
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
+interface DeclaredPackageResourceCoverage {
+  entryPath: string;
+  metadataHash: string;
+  metadataPath: string;
+}
+
+function assertDeclaredPackageResourceCoverage(
+  importer: string,
+  specifier: string,
+  declaredResources: ReadonlySet<string>,
+): DeclaredPackageResourceCoverage {
+  let searchDirectory = dirname(importer);
+  let metadataPath: string | undefined;
+  for (;;) {
+    const packageCandidate = join(searchDirectory, "node_modules", specifier);
+    const metadataCandidate = join(packageCandidate, "package.json");
+    const fileShadow = PI_EXTENSION_JITI_EXTENSIONS.some((extension) =>
+      existsSync(`${packageCandidate}${extension}`));
+    if (fileShadow) {
+      throw new TypeError(
+        `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+      );
+    }
+    if (existsSync(metadataCandidate)) {
+      const packageRoot = strictTrustedDirectory(
+        packageCandidate,
+        `Pi extension ${specifier} package root`,
+      );
+      metadataPath = strictTrustedFile(
+        join(packageRoot, "package.json"),
+        `Pi extension ${specifier} package metadata`,
+      );
+      break;
+    }
+    if (existsSync(packageCandidate)) {
+      throw new TypeError(
+        `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+      );
+    }
+    const parent = dirname(searchDirectory);
+    if (parent === searchDirectory) break;
+    searchDirectory = parent;
+  }
+  if (metadataPath === undefined) {
+    throw new TypeError(
+      `Pi extension ${specifier} package metadata cannot be resolved for attestation`,
+    );
+  }
+  let metadata: Record<string, unknown>;
+  let metadataContent: Buffer;
+  try {
+    metadataContent = readTrustedFile(metadataPath);
+    const parsed = JSON.parse(metadataContent.toString("utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+    metadata = parsed as Record<string, unknown>;
+  } catch {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  if (metadata.name !== specifier) {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  const selectImportTarget = (value: unknown): string | undefined => {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      for (const candidate of value) {
+        const selected = selectImportTarget(candidate);
+        if (selected !== undefined) return selected;
+      }
+      return undefined;
+    }
+    if (typeof value !== "object" || value === null) return undefined;
+    for (const [condition, candidate] of Object.entries(value)) {
+      if (condition !== "node" && condition !== "import" && condition !== "default") continue;
+      const selected = selectImportTarget(candidate);
+      if (selected !== undefined) return selected;
+    }
+    return undefined;
+  };
+  const exportsRoot = typeof metadata.exports === "object"
+    && metadata.exports !== null
+    && !Array.isArray(metadata.exports)
+    && Object.hasOwn(metadata.exports, ".")
+    ? (metadata.exports as Record<string, unknown>)["."]
+    : metadata.exports;
+  const entryTarget = metadata.exports === undefined
+    ? (typeof metadata.main === "string" ? metadata.main : "./index.js")
+    : selectImportTarget(exportsRoot);
+  if (entryTarget === undefined || !entryTarget.startsWith("./")) {
+    throw new TypeError(`Pi extension ${specifier} package metadata is invalid`);
+  }
+  const packageRoot = dirname(metadataPath);
+  const entryCandidate = normalize(resolve(packageRoot, entryTarget));
+  const entryPath = strictTrustedFile(
+    entryCandidate,
+    `Pi extension ${specifier} package entry`,
+  );
+  if (
+    entryPath !== entryCandidate
+    || !isContainedPath(packageRoot, entryPath)
+    || !declaredResources.has(metadataPath)
+    || !declaredResources.has(entryPath)
+  ) {
+    throw new TypeError(
+      `Pi extension resource manifest must cover the ${specifier} package metadata and runtime entry`,
+    );
+  }
+  return {
+    entryPath,
+    metadataHash: sha256(metadataContent),
+    metadataPath,
+  };
+}
+
 function extensionResourceFiles(
   entryPath: string,
   declaredResourcePaths: readonly string[] = [],
@@ -545,8 +1225,11 @@ function extensionResourceFiles(
     ...packageOwnedExtensionResourcePaths(trustedEntryPath),
     ...declaredExtensionResourcePaths(declaredResourcePaths),
   ];
+  const declaredResources = new Set(additionalResources.map((resource) => resource.path));
   const pending = [trustedEntryPath];
   const seen = new Set<string>();
+  const declaredPackageEntries = new Set<string>();
+  const declaredPackageMetadataHashes = new Map<string, string>();
   const files: PiExtensionResourceFile[] = [];
   let totalBytes = 0;
   while (pending.length > 0) {
@@ -567,9 +1250,54 @@ function extensionResourceFiles(
       executable: (lstatSync(path).mode & 0o111) !== 0,
     });
     if (extname(path) === ".json") continue;
-    for (const specifier of localModuleSpecifiers(path, content)) {
+    if (declaredPackageEntries.has(path)) {
+      assertDeclaredPackageEntrySelfContained(path, content);
+      continue;
+    }
+    const specifiers = extensionModuleSpecifiers(path, content);
+    for (const specifier of specifiers.local) {
       const dependency = resolveLocalModule(path, specifier);
       if (!seen.has(dependency)) pending.push(dependency);
+    }
+    for (const specifier of specifiers.declaredPackages) {
+      const coverage = assertDeclaredPackageResourceCoverage(
+        path,
+        specifier,
+        declaredResources,
+      );
+      const expectedMetadataHash = declaredPackageMetadataHashes.get(coverage.metadataPath);
+      if (
+        expectedMetadataHash !== undefined
+        && expectedMetadataHash !== coverage.metadataHash
+      ) {
+        throw new TypeError(
+          `Pi extension ${specifier} package metadata changed before it could be captured`,
+        );
+      }
+      declaredPackageMetadataHashes.set(coverage.metadataPath, coverage.metadataHash);
+      const capturedMetadata = files.find((file) => file.path === coverage.metadataPath);
+      if (
+        capturedMetadata !== undefined
+        && capturedMetadata.contentHash !== coverage.metadataHash
+      ) {
+        throw new TypeError(
+          `Pi extension ${specifier} package metadata changed before it could be validated`,
+        );
+      }
+      const dependency = coverage.entryPath;
+      declaredPackageEntries.add(dependency);
+      if (seen.has(dependency)) {
+        const content = readTrustedFile(dependency);
+        const captured = files.find((file) => file.path === dependency);
+        if (captured?.contentHash !== sha256(content)) {
+          throw new TypeError(
+            `Pi extension ${specifier} package entry changed before it could be validated`,
+          );
+        }
+        assertDeclaredPackageEntrySelfContained(dependency, content);
+      } else {
+        pending.push(dependency);
+      }
     }
   }
   for (const resource of additionalResources) {
@@ -579,13 +1307,23 @@ function extensionResourceFiles(
       throw new TypeError("Pi extension resource closure exceeds the bounded file limit");
     }
     const content = readTrustedFile(resource.path);
+    const contentHash = sha256(content);
+    const expectedMetadataHash = declaredPackageMetadataHashes.get(resource.path);
+    if (
+      expectedMetadataHash !== undefined
+      && expectedMetadataHash !== contentHash
+    ) {
+      throw new TypeError(
+        "Pi extension declared package metadata changed before it could be captured",
+      );
+    }
     totalBytes += content.length;
     if (totalBytes > MAX_EXTENSION_RESOURCE_TOTAL_BYTES) {
       throw new TypeError("Pi extension resource closure exceeds the bounded byte limit");
     }
     files.push({
       path: resource.path,
-      contentHash: sha256(content),
+      contentHash,
       executable: resource.executable,
     });
   }
@@ -613,7 +1351,11 @@ export function createPiExtensionResourceSnapshot(
 export function createPiSkillResourceSnapshot(path: string): PiSkillResourceSnapshot {
   const skillPath = strictTrustedFile(path, "Pi skill resource");
   const rootPath = strictTrustedDirectory(dirname(skillPath), "Pi skill root");
-  const resourcePaths = trustedDirectoryResourcePaths(rootPath, "Pi skill package");
+  const resourcePaths = trustedDirectoryResourcePaths(
+    rootPath,
+    "Pi skill package",
+    SKILL_GENERATED_DIRECTORY_NAMES,
+  );
   const files: PiSkillResourceFile[] = [];
   let totalBytes = 0;
   for (const resource of resourcePaths) {

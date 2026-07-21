@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiContextArtifacts } from "../pi-context-assembler.js";
 import {
@@ -203,7 +203,9 @@ function commonResourceDirectory(files: readonly PiExtensionResourceFile[]): str
         && !child.startsWith(`..${sep}`)
         && !isAbsolute(child);
     });
-    if (containsEveryFile) return common;
+    if (containsEveryFile) {
+      return basename(common) === "node_modules" ? dirname(common) : common;
+    }
     const parent = dirname(common);
     if (parent === common) {
       throw new TypeError("Pi extension snapshot files do not share a filesystem root");
