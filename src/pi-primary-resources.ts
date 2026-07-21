@@ -234,9 +234,15 @@ interface PiExtensionModuleSpecifiers {
 
 interface StaticBindingAnalysis {
   bindingCount(name: string): number;
+  hasOpaqueComputedPropertyBinding(value: ts.Expression): boolean;
   staticString(value: ts.Expression, resolving?: Set<string>): string | undefined;
   staticStrings(value: ts.Expression): ReadonlySet<string>;
   uniqueConstantInitializer(name: string): ts.Expression | undefined;
+}
+
+interface StaticBindingWrite {
+  kind: "append" | "value";
+  value: ts.Expression;
 }
 
 function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
@@ -252,7 +258,8 @@ function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
 function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalysis {
   const bindingCounts = new Map<string, number>();
   const constantInitializers = new Map<string, ts.Expression | null>();
-  const assignedValues = new Map<string, ts.Expression[]>();
+  const bindingWrites = new Map<string, StaticBindingWrite[]>();
+  const opaqueComputedPropertyBindings = new Set<string>();
   const recordBindingName = (name: ts.BindingName): void => {
     if (ts.isIdentifier(name)) {
       bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
@@ -262,14 +269,70 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
     }
   };
-  const recordAssignedValue = (name: string, value: ts.Expression): void => {
-    const values = assignedValues.get(name) ?? [];
-    values.push(value);
-    assignedValues.set(name, values);
+  const recordOpaqueBindingName = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) {
+      opaqueComputedPropertyBindings.add(name.text);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) recordOpaqueBindingName(element.name);
+    }
+  };
+  const recordOpaqueAssignmentTarget = (target: ts.Expression): void => {
+    if (
+      ts.isParenthesizedExpression(target)
+      || ts.isAsExpression(target)
+      || ts.isSatisfiesExpression(target)
+      || ts.isNonNullExpression(target)
+    ) {
+      recordOpaqueAssignmentTarget(target.expression);
+      return;
+    }
+    if (ts.isIdentifier(target)) {
+      opaqueComputedPropertyBindings.add(target.text);
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (const element of target.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        recordOpaqueAssignmentTarget(
+          ts.isSpreadElement(element) ? element.expression : element,
+        );
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          opaqueComputedPropertyBindings.add(property.name.text);
+        } else if (ts.isPropertyAssignment(property)) {
+          recordOpaqueAssignmentTarget(property.initializer);
+        } else if (ts.isSpreadAssignment(property)) {
+          recordOpaqueAssignmentTarget(property.expression);
+        }
+      }
+      return;
+    }
+    if (
+      ts.isBinaryExpression(target)
+      && target.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) {
+      recordOpaqueAssignmentTarget(target.left);
+    }
+  };
+  const recordBindingWrite = (
+    name: string,
+    value: ts.Expression,
+    kind: StaticBindingWrite["kind"] = "value",
+  ): void => {
+    const writes = bindingWrites.get(name) ?? [];
+    writes.push({ kind, value });
+    bindingWrites.set(name, writes);
   };
   const collectBindings = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
       recordBindingName(node.name);
+      if (!ts.isIdentifier(node.name)) recordOpaqueBindingName(node.name);
     } else if (
       (ts.isFunctionDeclaration(node)
         || ts.isFunctionExpression(node)
@@ -293,7 +356,7 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       && ts.isIdentifier(node.name)
       && node.initializer !== undefined
     ) {
-      recordAssignedValue(node.name.text, node.initializer);
+      recordBindingWrite(node.name.text, node.initializer);
       if (
         ts.isVariableDeclarationList(node.parent)
         && (node.parent.flags & ts.NodeFlags.Const) !== 0
@@ -305,10 +368,29 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
       }
     } else if (
       ts.isBinaryExpression(node)
-      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && ts.isIdentifier(node.left)
+      && (
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken
+        || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken
+      )
     ) {
-      recordAssignedValue(node.left.text, node.right);
+      recordBindingWrite(
+        node.left.text,
+        node.right,
+        node.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken ? "append" : "value",
+      );
+    } else if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && (
+        ts.isArrayLiteralExpression(node.left)
+        || ts.isObjectLiteralExpression(node.left)
+      )
+    ) {
+      recordOpaqueAssignmentTarget(node.left);
     }
     ts.forEachChild(node, collectBindings);
   };
@@ -353,15 +435,36 @@ function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalys
     const direct = staticString(value);
     if (direct !== undefined) values.add(direct);
     if (ts.isIdentifier(value)) {
-      for (const assigned of assignedValues.get(value.text) ?? []) {
-        const resolved = staticString(assigned, new Set([value.text]));
-        if (resolved !== undefined) values.add(resolved);
+      const possibleValues = new Set<string>();
+      for (const write of bindingWrites.get(value.text) ?? []) {
+        const resolved = staticString(write.value, new Set([value.text]));
+        if (resolved === undefined) continue;
+        if (write.kind === "append") {
+          for (const previous of [...possibleValues]) {
+            const appended = previous + resolved;
+            possibleValues.add(appended);
+            values.add(appended);
+          }
+        } else {
+          possibleValues.add(resolved);
+          values.add(resolved);
+        }
       }
     }
     return values;
   };
   return {
     bindingCount: (name) => bindingCounts.get(name) ?? 0,
+    hasOpaqueComputedPropertyBinding: (value) => {
+      let current = value;
+      while (
+        ts.isParenthesizedExpression(current)
+        || ts.isAsExpression(current)
+        || ts.isSatisfiesExpression(current)
+        || ts.isNonNullExpression(current)
+      ) current = current.expression;
+      return ts.isIdentifier(current) && opaqueComputedPropertyBindings.has(current.text);
+    },
     staticString,
     staticStrings,
     uniqueConstantInitializer,
@@ -409,6 +512,7 @@ function extensionModuleSpecifiers(
   }
   const {
     bindingCount,
+    hasOpaqueComputedPropertyBinding,
     staticString,
     staticStrings,
     uniqueConstantInitializer,
@@ -643,6 +747,8 @@ function extensionModuleSpecifiers(
     if (
       ts.isElementAccessExpression(node)
       && (
+        hasOpaqueComputedPropertyBinding(node.argumentExpression)
+        ||
         [...staticStrings(node.argumentExpression)].some((property) =>
           UNSAFE_MODULE_LOADER_PROPERTIES.has(property)
         )
@@ -691,7 +797,10 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
       "Pi extension declared package entry must parse before its bytes are attested",
     );
   }
-  const { staticStrings } = createStaticBindingAnalysis(source);
+  const {
+    hasOpaqueComputedPropertyBinding,
+    staticStrings,
+  } = createStaticBindingAnalysis(source);
   const loaderIdentifiers = new Set([
     "Function",
     "Proxy",
@@ -748,8 +857,11 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
     ) reject();
     if (
       ts.isElementAccessExpression(node)
-      && [...staticStrings(node.argumentExpression)].some((property) =>
-        loaderProperties.has(property)
+      && (
+        hasOpaqueComputedPropertyBinding(node.argumentExpression)
+        || [...staticStrings(node.argumentExpression)].some((property) =>
+          loaderProperties.has(property)
+        )
       )
     ) reject();
     ts.forEachChild(node, visit);

@@ -391,6 +391,9 @@ describe("primary Pi resource contract", () => {
       "const g = globalThis; const key = 'Func' + 'tion'; export default g[key]('return () => 1')();\n",
       "const getter = Reflect.get; export default getter(globalThis, 'Function')('return () => 1')();\n",
       "const key = 'con' + 'structor'; export default (() => {})[key]('return () => 1')();\n",
+      "let key = 'con'; key += 'structor'; export default (() => {})[key]('return () => 1')();\n",
+      "let key = 'safe'; key ||= 'constructor'; export default (() => {})[key]('return () => 1')();\n",
+      "let key = 'safe'; ({ key } = { key: 'constructor' }); export default (() => {})[key]('return () => 1')();\n",
       "export default jitiImport('/tmp/unpinned.mjs', { default: true });\n",
       "export default jitiESMResolve('/tmp/unpinned.mjs');\n",
       "export default arguments[1]('/tmp/unpinned.mjs');\n",
@@ -509,6 +512,9 @@ describe("primary Pi resource contract", () => {
       "const key = 'con' + 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
       "let key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
       "let key = 'safe'; key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'con'; key += 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; key ||= 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; ({ key } = { key: 'constructor' }); export const parse = () => []['filter'][key]('return 42')();\n",
     ];
     for (const source of injectedPackageLoaders) {
       writeFileSync(packageEntry, source, "utf8");
