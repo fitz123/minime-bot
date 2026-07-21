@@ -508,6 +508,7 @@ describe("primary Pi resource contract", () => {
       "const key = 'require'; const value = {}; export const parse = () => value[key]('/tmp/unpinned.mjs');\n",
       "const key = 'con' + 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
       "let key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
+      "let key = 'safe'; key = 'constructor'; export const parse = () => []['filter'][key]('return 42')();\n",
     ];
     for (const source of injectedPackageLoaders) {
       writeFileSync(packageEntry, source, "utf8");
@@ -571,7 +572,10 @@ describe("primary Pi resource contract", () => {
       "import vm from 'node:vm'; const args = ['1', { importModuleDynamically() {} }]; export default new vm.Script(...args);\n",
       "const property = 'cwd'; function load(property: string) { return process[property]('node:fs'); } export default function extension() { return load('getBuiltinModule'); }\n",
       "const property = 'cwd'; try { throw 'getBuiltinModule'; } catch (property) { process[property]('node:fs'); } export default function extension() {}\n",
+      "let property = 'cwd'; property = 'getBuiltinModule'; export default process[property]('node:fs');\n",
+      "let property = 'safe'; property = 'createRequire'; const value = {}; export default value[property]('/tmp/unpinned.mjs');\n",
       "import vm from 'node:vm'; const context = vm.createContext({}); export default function extension(external: object) { let context = external; return new vm.Script('1').runInContext(context); }\n",
+      "import vm from 'node:vm'; const external = {}; let context = vm.createContext({}); context = external; export default new vm.Script('1').runInContext(context);\n",
     ];
     for (const source of rejected) {
       writeFileSync(extension, source, "utf8");

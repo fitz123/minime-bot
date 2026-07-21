@@ -108,8 +108,8 @@ pins its bundled `agents/` and `prompts/` resources.
 package aliases and resolver settings, so extension-local replacements or
 ambient Jiti configuration cannot change the executed dependency bytes.
 `node:vm` is accepted only through one default binding and a direct
-`new Script(...).runInContext(context)` chain whose context is a unique constant
-initialized by direct `createContext(...)`; other execution methods, aliases,
+`new vm.Script(...).runInContext(context)` chain whose context is a unique constant
+initialized by direct `vm.createContext(...)`; other execution methods, aliases,
 extra execution options, loader-bearing options, computed access, re-exports,
 and other VM APIs are rejected. Bare `acorn` imports require
 manifest-covered package metadata and a self-contained import entry with no

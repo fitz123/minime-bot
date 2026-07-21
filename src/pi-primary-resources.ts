@@ -232,6 +232,13 @@ interface PiExtensionModuleSpecifiers {
   declaredPackages: string[];
 }
 
+interface StaticBindingAnalysis {
+  bindingCount(name: string): number;
+  staticString(value: ts.Expression, resolving?: Set<string>): string | undefined;
+  staticStrings(value: ts.Expression): ReadonlySet<string>;
+  uniqueConstantInitializer(name: string): ts.Expression | undefined;
+}
+
 function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
   if (node.text !== "arguments") return false;
   const parent = node.parent as ts.Node & { name?: ts.Node };
@@ -240,6 +247,125 @@ function referencesJitiWrapperArguments(node: ts.Identifier): boolean {
     if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return false;
   }
   return true;
+}
+
+function createStaticBindingAnalysis(source: ts.SourceFile): StaticBindingAnalysis {
+  const bindingCounts = new Map<string, number>();
+  const constantInitializers = new Map<string, ts.Expression | null>();
+  const assignedValues = new Map<string, ts.Expression[]>();
+  const recordBindingName = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) {
+      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
+    }
+  };
+  const recordAssignedValue = (name: string, value: ts.Expression): void => {
+    const values = assignedValues.get(name) ?? [];
+    values.push(value);
+    assignedValues.set(name, values);
+  };
+  const collectBindings = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      recordBindingName(node.name);
+    } else if (
+      (ts.isFunctionDeclaration(node)
+        || ts.isFunctionExpression(node)
+        || ts.isClassDeclaration(node)
+        || ts.isClassExpression(node)
+        || ts.isEnumDeclaration(node))
+      && node.name !== undefined
+    ) {
+      recordBindingName(node.name);
+    } else if (ts.isImportClause(node) && node.name !== undefined) {
+      recordBindingName(node.name);
+    } else if (
+      ts.isImportSpecifier(node)
+      || ts.isNamespaceImport(node)
+      || ts.isImportEqualsDeclaration(node)
+    ) {
+      recordBindingName(node.name);
+    }
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.initializer !== undefined
+    ) {
+      recordAssignedValue(node.name.text, node.initializer);
+      if (
+        ts.isVariableDeclarationList(node.parent)
+        && (node.parent.flags & ts.NodeFlags.Const) !== 0
+      ) {
+        constantInitializers.set(
+          node.name.text,
+          constantInitializers.has(node.name.text) ? null : node.initializer,
+        );
+      }
+    } else if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(node.left)
+    ) {
+      recordAssignedValue(node.left.text, node.right);
+    }
+    ts.forEachChild(node, collectBindings);
+  };
+  collectBindings(source);
+  const uniqueConstantInitializer = (name: string): ts.Expression | undefined => {
+    if (bindingCounts.get(name) !== 1) return undefined;
+    return constantInitializers.get(name) ?? undefined;
+  };
+  const staticString = (
+    value: ts.Expression,
+    resolving = new Set<string>(),
+  ): string | undefined => {
+    if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
+      return value.text;
+    }
+    if (
+      ts.isParenthesizedExpression(value)
+      || ts.isAsExpression(value)
+      || ts.isSatisfiesExpression(value)
+      || ts.isNonNullExpression(value)
+    ) return staticString(value.expression, resolving);
+    if (
+      ts.isBinaryExpression(value)
+      && value.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const left = staticString(value.left, resolving);
+      const right = staticString(value.right, resolving);
+      return left === undefined || right === undefined ? undefined : left + right;
+    }
+    if (ts.isIdentifier(value) && !resolving.has(value.text)) {
+      const initializer = uniqueConstantInitializer(value.text);
+      if (initializer !== undefined) {
+        const next = new Set(resolving);
+        next.add(value.text);
+        return staticString(initializer, next);
+      }
+    }
+    return undefined;
+  };
+  const staticStrings = (value: ts.Expression): ReadonlySet<string> => {
+    const values = new Set<string>();
+    const direct = staticString(value);
+    if (direct !== undefined) values.add(direct);
+    if (ts.isIdentifier(value)) {
+      for (const assigned of assignedValues.get(value.text) ?? []) {
+        const resolved = staticString(assigned, new Set([value.text]));
+        if (resolved !== undefined) values.add(resolved);
+      }
+    }
+    return values;
+  };
+  return {
+    bindingCount: (name) => bindingCounts.get(name) ?? 0,
+    staticString,
+    staticStrings,
+    uniqueConstantInitializer,
+  };
 }
 
 function extensionModuleSpecifiers(
@@ -281,87 +407,12 @@ function extensionModuleSpecifiers(
     }
     vmBindings.add(clause.name.text);
   }
-  const bindingCounts = new Map<string, number>();
-  const constantInitializers = new Map<string, ts.Expression | null>();
-  const recordBindingName = (name: ts.BindingName): void => {
-    if (ts.isIdentifier(name)) {
-      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
-      return;
-    }
-    for (const element of name.elements) {
-      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
-    }
-  };
-  const collectBindings = (node: ts.Node): void => {
-    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
-      recordBindingName(node.name);
-    } else if (
-      (ts.isFunctionDeclaration(node)
-        || ts.isFunctionExpression(node)
-        || ts.isClassDeclaration(node)
-        || ts.isClassExpression(node)
-        || ts.isEnumDeclaration(node))
-      && node.name !== undefined
-    ) {
-      recordBindingName(node.name);
-    } else if (ts.isImportClause(node) && node.name !== undefined) {
-      recordBindingName(node.name);
-    } else if (
-      ts.isImportSpecifier(node)
-      || ts.isNamespaceImport(node)
-      || ts.isImportEqualsDeclaration(node)
-    ) {
-      recordBindingName(node.name);
-    }
-    if (
-      ts.isVariableDeclaration(node)
-      && ts.isIdentifier(node.name)
-      && node.initializer !== undefined
-      && ts.isVariableDeclarationList(node.parent)
-    ) {
-      constantInitializers.set(
-        node.name.text,
-        constantInitializers.has(node.name.text) ? null : node.initializer,
-      );
-    }
-    ts.forEachChild(node, collectBindings);
-  };
-  collectBindings(source);
-  const uniqueConstantInitializer = (name: string): ts.Expression | undefined => {
-    if (bindingCounts.get(name) !== 1) return undefined;
-    return constantInitializers.get(name) ?? undefined;
-  };
-  const staticString = (
-    value: ts.Expression,
-    resolving = new Set<string>(),
-  ): string | undefined => {
-    if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
-      return value.text;
-    }
-    if (
-      ts.isParenthesizedExpression(value)
-      || ts.isAsExpression(value)
-      || ts.isSatisfiesExpression(value)
-      || ts.isNonNullExpression(value)
-    ) return staticString(value.expression, resolving);
-    if (
-      ts.isBinaryExpression(value)
-      && value.operatorToken.kind === ts.SyntaxKind.PlusToken
-    ) {
-      const left = staticString(value.left, resolving);
-      const right = staticString(value.right, resolving);
-      return left === undefined || right === undefined ? undefined : left + right;
-    }
-    if (ts.isIdentifier(value) && !resolving.has(value.text)) {
-      const initializer = uniqueConstantInitializer(value.text);
-      if (initializer !== undefined) {
-        const next = new Set(resolving);
-        next.add(value.text);
-        return staticString(initializer, next);
-      }
-    }
-    return undefined;
-  };
+  const {
+    bindingCount,
+    staticString,
+    staticStrings,
+    uniqueConstantInitializer,
+  } = createStaticBindingAnalysis(source);
   const add = (value: ts.Expression | undefined): void => {
     if (
       value === undefined
@@ -417,7 +468,7 @@ function extensionModuleSpecifiers(
       || !ts.isIdentifier(expression.expression.expression)
     ) return false;
     const binding = expression.expression.expression.text;
-    return vmBindings.has(binding) && bindingCounts.get(binding) === 1;
+    return vmBindings.has(binding) && bindingCount(binding) === 1;
   };
   const assertSafeVmScriptExecution = (invocation: ts.NewExpression): void => {
     let expression: ts.Expression = invocation;
@@ -592,8 +643,8 @@ function extensionModuleSpecifiers(
     if (
       ts.isElementAccessExpression(node)
       && (
-        UNSAFE_MODULE_LOADER_PROPERTIES.has(
-          literalProperty(node.argumentExpression) ?? "",
+        [...staticStrings(node.argumentExpression)].some((property) =>
+          UNSAFE_MODULE_LOADER_PROPERTIES.has(property)
         )
         || (
           ts.isIdentifier(node.expression)
@@ -640,87 +691,7 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
       "Pi extension declared package entry must parse before its bytes are attested",
     );
   }
-  const bindingCounts = new Map<string, number>();
-  const constantInitializers = new Map<string, ts.Expression | null>();
-  const recordBindingName = (name: ts.BindingName): void => {
-    if (ts.isIdentifier(name)) {
-      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
-      return;
-    }
-    for (const element of name.elements) {
-      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
-    }
-  };
-  const collectBindings = (node: ts.Node): void => {
-    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
-      recordBindingName(node.name);
-    } else if (
-      (ts.isFunctionDeclaration(node)
-        || ts.isFunctionExpression(node)
-        || ts.isClassDeclaration(node)
-        || ts.isClassExpression(node)
-        || ts.isEnumDeclaration(node))
-      && node.name !== undefined
-    ) {
-      recordBindingName(node.name);
-    } else if (ts.isImportClause(node) && node.name !== undefined) {
-      recordBindingName(node.name);
-    } else if (
-      ts.isImportSpecifier(node)
-      || ts.isNamespaceImport(node)
-      || ts.isImportEqualsDeclaration(node)
-    ) {
-      recordBindingName(node.name);
-    }
-    if (
-      ts.isVariableDeclaration(node)
-      && ts.isIdentifier(node.name)
-      && node.initializer !== undefined
-      && ts.isVariableDeclarationList(node.parent)
-    ) {
-      constantInitializers.set(
-        node.name.text,
-        constantInitializers.has(node.name.text) ? null : node.initializer,
-      );
-    }
-    ts.forEachChild(node, collectBindings);
-  };
-  collectBindings(source);
-  const staticString = (
-    value: ts.Expression,
-    resolving = new Set<string>(),
-  ): string | undefined => {
-    if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
-      return value.text;
-    }
-    if (
-      ts.isParenthesizedExpression(value)
-      || ts.isAsExpression(value)
-      || ts.isSatisfiesExpression(value)
-      || ts.isNonNullExpression(value)
-    ) return staticString(value.expression, resolving);
-    if (
-      ts.isBinaryExpression(value)
-      && value.operatorToken.kind === ts.SyntaxKind.PlusToken
-    ) {
-      const left = staticString(value.left, resolving);
-      const right = staticString(value.right, resolving);
-      return left === undefined || right === undefined ? undefined : left + right;
-    }
-    if (
-      ts.isIdentifier(value)
-      && bindingCounts.get(value.text) === 1
-      && !resolving.has(value.text)
-    ) {
-      const initializer = constantInitializers.get(value.text) ?? undefined;
-      if (initializer !== undefined) {
-        const next = new Set(resolving);
-        next.add(value.text);
-        return staticString(initializer, next);
-      }
-    }
-    return undefined;
-  };
+  const { staticStrings } = createStaticBindingAnalysis(source);
   const loaderIdentifiers = new Set([
     "Function",
     "Proxy",
@@ -777,7 +748,9 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
     ) reject();
     if (
       ts.isElementAccessExpression(node)
-      && loaderProperties.has(staticString(node.argumentExpression) ?? "")
+      && [...staticStrings(node.argumentExpression)].some((property) =>
+        loaderProperties.has(property)
+      )
     ) reject();
     ts.forEachChild(node, visit);
   };
