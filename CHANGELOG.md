@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.7.21
+
 - Make ops-worker attempts and quota probes inherit the normalized primary-agent model and thinking level instead of silently falling back to the package defaults (#58).
 
 ## 2026.7.20
