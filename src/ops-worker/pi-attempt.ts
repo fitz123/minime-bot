@@ -32,7 +32,7 @@ import {
 } from "../pi-context-assembler.js";
 import {
   buildPiSpawnEnv,
-  DEFAULT_PI_MODEL,
+  normalizePiModel,
   type PiSpawnRuntimeEnvOptions,
 } from "../pi-rpc-protocol.js";
 import {
@@ -360,8 +360,8 @@ export class OpsWorkerPiAttemptRunner {
     }
     this.primaryResources = validatePiPrimaryResourceContract(options.primaryResources);
     this.abortSignal = options.abortSignal;
-    this.model = options.model ?? DEFAULT_PI_MODEL;
-    this.thinking = options.thinking ?? "medium";
+    this.model = options.model ?? normalizePiModel(this.primaryContextAgent.model);
+    this.thinking = options.thinking ?? this.primaryContextAgent.thinking ?? "medium";
     if (!SAFE_RUNTIME_VALUE.test(this.model)) {
       throw new TypeError("Ops-worker Pi model contains unsafe characters");
     }

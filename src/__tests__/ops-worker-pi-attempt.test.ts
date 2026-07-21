@@ -629,6 +629,24 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(parityEvidence.summary.includes("PRIMARY_USER_CONTEXT"), false);
   });
 
+  it("inherits the normalized primary model and thinking level by default", async (t) => {
+    const harness = await makeHarness(t);
+    harness.primaryContextAgent.model = "gpt-5.6-sol";
+    harness.primaryContextAgent.thinking = "xhigh";
+    harness.store.create(makeTask("primary-model-thinking"));
+
+    const completed = await harness.runner().runNext();
+
+    assert.equal(completed?.state, "DONE");
+    assert.equal(harness.invocations.length, 1);
+    const args = harness.invocations[0];
+    assert.equal(
+      args[args.indexOf("--model") + 1],
+      "openai-codex/gpt-5.6-sol",
+    );
+    assert.equal(args[args.indexOf("--thinking") + 1], "xhigh");
+  });
+
   it("rejects equal, overlapping, and symlinked context workspaces at construction", async (t) => {
     const harness = await makeHarness(t);
     const common = {
