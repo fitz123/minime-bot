@@ -392,6 +392,7 @@ def _dependency_closure(root: Path) -> list[dict[str, str]]:
 
 
 CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[bytes]]
+EXECUTABLE_VERSION_TIMEOUT_SECONDS = 30.0
 
 
 def _default_command_runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
@@ -431,7 +432,9 @@ def _executable_record(
     ):
         raise SlotValidationError(f"{label} executable is unsafe")
     try:
-        result = command_runner([str(path), "--version"], 5.0)
+        result = command_runner(
+            [str(path), "--version"], EXECUTABLE_VERSION_TIMEOUT_SECONDS
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SlotValidationError(f"{label} version check failed") from exc
     output = result.stdout if result.stdout.strip() else result.stderr

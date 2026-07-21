@@ -140,6 +140,29 @@ def corrupt(path: Path, content: str = "corrupted\n") -> None:
 
 
 class RecoveryCapsuleSlotTests(unittest.TestCase):
+    def test_executable_version_probe_uses_load_tolerant_bounded_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "pi"
+            write_file(executable, "#!/bin/sh\necho 0.80.6\n", executable=True)
+            observed_timeouts: list[float] = []
+
+            def runner(
+                argv: list[str], timeout: float
+            ) -> subprocess.CompletedProcess[bytes]:
+                observed_timeouts.append(timeout)
+                return subprocess.CompletedProcess(argv, 0, b"0.80.6\n", b"")
+
+            record = recovery_slots._executable_record(
+                str(executable), "0.80.6", "Pi", runner
+            )
+
+            self.assertEqual(record["version"], "0.80.6")
+            self.assertEqual(
+                observed_timeouts,
+                [recovery_slots.EXECUTABLE_VERSION_TIMEOUT_SECONDS],
+            )
+            self.assertEqual(recovery_slots.EXECUTABLE_VERSION_TIMEOUT_SECONDS, 30.0)
+
     def test_capsule_stage_copies_independent_closure_and_pins_prerequisites(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

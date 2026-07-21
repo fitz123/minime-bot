@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow bounded recovery prerequisite version probes enough time to complete on a heavily loaded host instead of failing after five seconds (#58).
+
 ## 2026.7.21
 
 - Make ops-worker attempts and quota probes inherit the normalized primary-agent model and thinking level instead of silently falling back to the package defaults (#58).
