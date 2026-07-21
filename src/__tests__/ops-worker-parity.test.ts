@@ -503,6 +503,10 @@ describe("primary Pi resource contract", () => {
       "export const parse = () => arguments[1]('/tmp/unpinned.mjs');\n",
       "const value = {}; export const parse = () => value.require('/tmp/unpinned.mjs');\n",
       "const value = {}; export const parse = () => value['require']('/tmp/unpinned.mjs');\n",
+      "const value = {}; export const parse = () => value.constructor('return 42')();\n",
+      "const value = {}; export const parse = () => value['constructor']('return 42')();\n",
+      "const key = 'require'; const value = {}; export const parse = () => value[key]('/tmp/unpinned.mjs');\n",
+      "const key = 'con' + 'structor'; export const parse = () => []['filter'][key]('return 42')();\n",
     ];
     for (const source of injectedPackageLoaders) {
       writeFileSync(packageEntry, source, "utf8");

@@ -641,6 +641,88 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
       "Pi extension declared package entry must parse before its bytes are attested",
     );
   }
+  const bindingCounts = new Map<string, number>();
+  const constantInitializers = new Map<string, ts.Expression | null>();
+  const recordBindingName = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) {
+      bindingCounts.set(name.text, (bindingCounts.get(name.text) ?? 0) + 1);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) recordBindingName(element.name);
+    }
+  };
+  const collectBindings = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      recordBindingName(node.name);
+    } else if (
+      (ts.isFunctionDeclaration(node)
+        || ts.isFunctionExpression(node)
+        || ts.isClassDeclaration(node)
+        || ts.isClassExpression(node)
+        || ts.isEnumDeclaration(node))
+      && node.name !== undefined
+    ) {
+      recordBindingName(node.name);
+    } else if (ts.isImportClause(node) && node.name !== undefined) {
+      recordBindingName(node.name);
+    } else if (
+      ts.isImportSpecifier(node)
+      || ts.isNamespaceImport(node)
+      || ts.isImportEqualsDeclaration(node)
+    ) {
+      recordBindingName(node.name);
+    }
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.initializer !== undefined
+      && ts.isVariableDeclarationList(node.parent)
+      && (node.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
+      constantInitializers.set(
+        node.name.text,
+        constantInitializers.has(node.name.text) ? null : node.initializer,
+      );
+    }
+    ts.forEachChild(node, collectBindings);
+  };
+  collectBindings(source);
+  const staticString = (
+    value: ts.Expression,
+    resolving = new Set<string>(),
+  ): string | undefined => {
+    if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
+      return value.text;
+    }
+    if (
+      ts.isParenthesizedExpression(value)
+      || ts.isAsExpression(value)
+      || ts.isSatisfiesExpression(value)
+      || ts.isNonNullExpression(value)
+    ) return staticString(value.expression, resolving);
+    if (
+      ts.isBinaryExpression(value)
+      && value.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const left = staticString(value.left, resolving);
+      const right = staticString(value.right, resolving);
+      return left === undefined || right === undefined ? undefined : left + right;
+    }
+    if (
+      ts.isIdentifier(value)
+      && bindingCounts.get(value.text) === 1
+      && !resolving.has(value.text)
+    ) {
+      const initializer = constantInitializers.get(value.text) ?? undefined;
+      if (initializer !== undefined) {
+        const next = new Set(resolving);
+        next.add(value.text);
+        return staticString(initializer, next);
+      }
+    }
+    return undefined;
+  };
   const loaderIdentifiers = new Set([
     "Function",
     "Proxy",
@@ -660,6 +742,7 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
   ]);
   const loaderProperties = new Set([
     "_load",
+    "constructor",
     "createRequire",
     "getBuiltinModule",
     "mainModule",
@@ -696,11 +779,7 @@ function assertDeclaredPackageEntrySelfContained(path: string, content: Buffer):
     ) reject();
     if (
       ts.isElementAccessExpression(node)
-      && (
-        ts.isStringLiteral(node.argumentExpression)
-        || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression)
-      )
-      && loaderProperties.has(node.argumentExpression.text)
+      && loaderProperties.has(staticString(node.argumentExpression) ?? "")
     ) reject();
     ts.forEachChild(node, visit);
   };
