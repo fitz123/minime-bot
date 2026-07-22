@@ -2046,6 +2046,71 @@ describe("ops worker supervisor", () => {
     assert.equal(notReady.custody.status, "HELD");
   });
 
+  it("routes typed incident claims through one check and blocks after five disproved claims", async (t) => {
+    let verification: "PASS" | "PRODUCT_FAILURE" = "PASS";
+    const harness = await makeHarness(t, {
+      implementation: () => ({
+        result: verification,
+        summary: verification === "PASS"
+          ? "The exact group is absent and stable."
+          : "The exact Alertmanager group is still present.",
+      }),
+    });
+
+    for (const [taskId, kind] of [
+      ["task-auto-resolved", "no-action-needed"],
+      ["task-resolved-during-repair", "remediation-complete"],
+    ] as const) {
+      harness.store.create(makeTask(taskId, {
+        sourceKind: "alertmanager",
+        maxRemediation: 5,
+      }));
+      const attemptId = `${taskId}-attempt`;
+      harness.supervisor.markRunning(
+        taskId,
+        { ...activeRun("fixture-supervisor"), attemptId },
+      );
+      const checking = harness.supervisor.recordPiAgentResult(taskId, {
+        attemptId,
+        kind,
+        summary: "The incident no longer requires action.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      });
+      assert.equal(checking.state, "CHECKING");
+      const done = await harness.supervisor.runDoneCheck(taskId);
+      assert.equal(done.state, "DONE");
+      assert.equal(done.rounds.remediation, 0);
+    }
+
+    verification = "PRODUCT_FAILURE";
+    const taskId = "task-five-false-claims";
+    harness.store.create(makeTask(taskId, {
+      sourceKind: "alertmanager",
+      maxRemediation: 5,
+    }));
+    for (let round = 1; round <= 5; round += 1) {
+      const attemptId = `incident-attempt-${round}`;
+      harness.supervisor.markRunning(
+        taskId,
+        { ...activeRun("fixture-supervisor"), attemptId },
+      );
+      harness.supervisor.recordPiAgentResult(taskId, {
+        attemptId,
+        kind: round % 2 === 0 ? "no-action-needed" : "remediation-complete",
+        summary: "The agent claimed the incident was complete.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      });
+      const checked = await harness.supervisor.runDoneCheck(taskId);
+      assert.equal(checked.rounds.remediation, round);
+      assert.equal(checked.state, round === 5 ? "BLOCKED" : "RESUMABLE");
+      assert.equal(checked.report.state, round === 5 ? "PENDING" : "NONE");
+    }
+  });
+
   it("schedules DEFER and retries check errors without rerunning Pi", async (t) => {
     let result: unknown = {
       result: "DEFER",

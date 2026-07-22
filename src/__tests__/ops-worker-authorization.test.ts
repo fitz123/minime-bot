@@ -413,6 +413,19 @@ function opsContracts(
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: reader,
     clock: () => new Date(NOW),
+    incidentMonitoringReader: {
+      readMonitoringFreshness: async () => ({
+        observedAt: NOW,
+        latestSampleAt: NOW,
+      }),
+      readResolutionStability: async () => ({
+        observedAt: NOW,
+        latestMatchingSampleAt: null,
+      }),
+    },
+    incidentAlertmanagerReader: {
+      readExactGroupState: async () => ({ observedAt: NOW, status: "ABSENT" }),
+    },
     monitoringFreshnessReader: {
       readMonitoringFreshness: async () => ({
         observedAt: NOW,

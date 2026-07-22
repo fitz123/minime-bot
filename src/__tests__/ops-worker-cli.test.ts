@@ -1287,6 +1287,22 @@ reply:
     const opsContracts = createOpsTaskContracts({
       alertmanagerAuthorizationSnapshotReader: { read: () => ({}) },
       clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      incidentMonitoringReader: {
+        readMonitoringFreshness: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        }),
+        readResolutionStability: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestMatchingSampleAt: null,
+        }),
+      },
+      incidentAlertmanagerReader: {
+        readExactGroupState: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "ABSENT",
+        }),
+      },
       monitoringFreshnessReader: {
         readMonitoringFreshness: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",
@@ -1384,6 +1400,22 @@ reply:
         }),
       },
       clock: () => new Date("2026-07-19T10:00:00.000Z"),
+      incidentMonitoringReader: {
+        readMonitoringFreshness: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestSampleAt: "2026-07-19T10:00:00.000Z",
+        }),
+        readResolutionStability: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          latestMatchingSampleAt: null,
+        }),
+      },
+      incidentAlertmanagerReader: {
+        readExactGroupState: () => ({
+          observedAt: "2026-07-19T10:00:00.000Z",
+          status: "ABSENT",
+        }),
+      },
       monitoringFreshnessReader: {
         readMonitoringFreshness: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",

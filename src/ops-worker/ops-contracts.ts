@@ -10,9 +10,14 @@ import type {
 } from "./authorization.js";
 import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
 import {
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
+  createOpsIncidentDoneCheckDefinition,
+  type OpsIncidentDoneCheckDependencies,
+} from "./incident-checks.js";
+import {
   OPS_WORKER_LIMITS,
   isOpsWorkerRegisteredName,
-  type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
@@ -20,9 +25,10 @@ import {
 export const OPS_AVAILABILITY_TEMPLATE_NAME = "ops.availability" as const;
 export const OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME =
   "ops.alertmanager-incident" as const;
-export const OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME =
-  "ops.alertmanager-incident" as const;
-export const OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION = "1" as const;
+export {
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
+};
 export const OPS_ALERTMANAGER_INCIDENT_OBJECTIVE =
   "Investigate this Alertmanager incident on the Minime host: diagnose cause and impact using the attached untrusted alert evidence, perform ordinary safe same-UID reversible remediation where useful, and finish with a typed result — completed, no-action-needed, input-needed, or impossible. A separate deterministic done check decides success." as const;
 export const OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE =
@@ -49,7 +55,7 @@ export interface OpsAlertmanagerAuthorizationSnapshotReader {
 }
 
 export interface CreateOpsTaskContractsDependencies
-  extends OpsAvailabilityDoneCheckDependencies {
+  extends OpsAvailabilityDoneCheckDependencies, OpsIncidentDoneCheckDependencies {
   alertmanagerAuthorizationSnapshotReader: OpsAlertmanagerAuthorizationSnapshotReader;
 }
 
@@ -278,27 +284,12 @@ function createAlertmanagerAuthorizationVerifier(
   });
 }
 
-function validateIncidentParams(value: unknown): JsonObject {
-  if (!isPlainObject(value) || !hasExactDataKeys(value, [])) {
-    throw new TypeError("Alertmanager incident parameters must be an empty object");
-  }
-  return {};
-}
-
 export function createOpsTaskContracts(
   deps: CreateOpsTaskContractsDependencies,
 ): OpsTaskContracts {
   const doneChecks = createOpsAvailabilityDoneCheckRegistry(deps, {
-    [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]: {
-      identity: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
-      version: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
-      timeoutMs: 5_000,
-      validateParams: validateIncidentParams,
-      run: () => ({
-        result: "QUERY_ERROR",
-        summary: "Generic incident verification is not yet connected to monitoring readers.",
-      }),
-    },
+    [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]:
+      createOpsIncidentDoneCheckDefinition(deps),
   });
   const alertmanagerAuthorizationVerifier = createAlertmanagerAuthorizationVerifier(
     deps.alertmanagerAuthorizationSnapshotReader,

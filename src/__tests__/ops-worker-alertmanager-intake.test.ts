@@ -51,6 +51,16 @@ function contracts() {
       }),
     },
     clock: () => new Date(NOW),
+    incidentMonitoringReader: {
+      readMonitoringFreshness: () => ({ observedAt: NOW, latestSampleAt: NOW }),
+      readResolutionStability: () => ({
+        observedAt: NOW,
+        latestMatchingSampleAt: null,
+      }),
+    },
+    incidentAlertmanagerReader: {
+      readExactGroupState: () => ({ observedAt: NOW, status: "ABSENT" }),
+    },
     monitoringFreshnessReader: {
       readMonitoringFreshness: () => ({
         observedAt: NOW,
@@ -250,6 +260,7 @@ describe("Alertmanager conversion and task-store submission", () => {
   it("maps every current rule family to the generic incident contract only", (t) => {
     const { intake, store } = fixture(t);
     const ruleFamilies = [
+      "MinimeBotMetricsDown",
       "BotDown",
       "SessionCrashes",
       "TelegramAPIErrors",
@@ -257,6 +268,7 @@ describe("Alertmanager conversion and task-store submission", () => {
       "HostHighCPU",
       "HostDiskFull",
       "NodeExporterDown",
+      "FutureSyntheticAlert",
     ] as const;
     const legacyObjective =
       OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective;

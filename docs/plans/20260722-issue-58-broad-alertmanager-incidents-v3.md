@@ -139,16 +139,16 @@ secrets.
 **Goal:** Give every Alertmanager group one contract and prevent false completion or passive
 custody starvation.
 
-- [ ] Add `ops.alertmanager-incident` constants, authorization snapshot v2, template registration,
+- [x] Add `ops.alertmanager-incident` constants, authorization snapshot v2, template registration,
       and intake mapping while preserving legacy availability snapshots.
-- [ ] Add bounded generic monitoring readers and the freshness/exact-absence/five-minute-stability
+- [x] Add bounded generic monitoring readers and the freshness/exact-absence/five-minute-stability
       composite check in `src/ops-worker/incident-checks.ts`.
-- [ ] Make an alert still present after a claim consume one of five remediation rounds; keep
+- [x] Make an alert still present after a claim consume one of five remediation rounds; keep
       telemetry/stability waits free and scheduled.
-- [ ] Test every current rule family plus an unknown synthetic alert, all Alertmanager states,
+- [x] Test every current rule family plus an unknown synthetic alert, all Alertmanager states,
       flaps, query errors/timeouts, auto-resolution, false claims to BLOCKED, replay/coalescing,
       and unchanged authorization scope.
-- [ ] Run focused intake/authorization/check/supervisor tests before Task 3.
+- [x] Run focused intake/authorization/check/supervisor tests before Task 3.
 
 ### Task 3: Add the native forward-first bridge [HIGH]
 

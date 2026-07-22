@@ -508,6 +508,16 @@ function availabilityContracts() {
       }),
     },
     clock: () => new Date(NOW),
+    incidentMonitoringReader: {
+      readMonitoringFreshness: () => ({ observedAt: NOW, latestSampleAt: NOW }),
+      readResolutionStability: () => ({
+        observedAt: NOW,
+        latestMatchingSampleAt: null,
+      }),
+    },
+    incidentAlertmanagerReader: {
+      readExactGroupState: () => ({ observedAt: NOW, status: "ABSENT" }),
+    },
     monitoringFreshnessReader: {
       readMonitoringFreshness: () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
     },
