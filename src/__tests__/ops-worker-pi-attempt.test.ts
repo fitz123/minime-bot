@@ -2348,9 +2348,53 @@ describe("ops worker Pi standard-session attempts", () => {
     }
   });
 
-  it("fails closed when a clean attempt has no response telemetry", async (t) => {
+  it("retries held operational telemetry uncertainty and accepts a clean exit", async (t) => {
+    let quotaChecks = 0;
+    const harness = await makeHarness(t, undefined, {
+      quotaAdmission: {
+        check: () => {
+          quotaChecks += 1;
+          return deniedQuota(new Date(Date.now() + 60 * 60_000).toISOString());
+        },
+      },
+    });
+    const task = makeTask("operational-success-without-telemetry", {
+      sourceKind: "alertmanager",
+    });
+    harness.store.create(task);
+    harness.setScenario("crash");
+    const crashed = await harness.runner().runNext();
+    assert.equal(crashed?.state, "RESUMABLE");
+    assert.equal(crashed?.custody.status, "HELD");
+    harness.supervisor.recordQuotaTelemetryError(
+      task.id,
+      "Prior operational attempt had no exact response telemetry.",
+    );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    harness.setScenario("success-missing-telemetry");
+
+    const result = await harness.runner().runNext();
+
+    assert.equal(
+      result?.state,
+      "DONE",
+      JSON.stringify({
+        outcome: result?.lastOutcome,
+        schedule: result?.schedule,
+        custody: result?.custody,
+      }),
+    );
+    assert.equal(result?.lastOutcome?.result, "PASS");
+    assert.equal(result?.custody.status, "RELEASED");
+    assert.equal(quotaChecks, 0);
+    assert.equal(harness.invocations.length, 2);
+  });
+
+  it("keeps a clean background attempt fail-closed without response telemetry", async (t) => {
     const harness = await makeHarness(t);
-    const task = makeTask("clean-exit-without-telemetry");
+    const task = makeTask("background-clean-exit-without-telemetry", {
+      sourceKind: "authorized-issue",
+    });
     harness.store.create(task);
     harness.setScenario("success-missing-telemetry");
 

@@ -541,11 +541,15 @@ export function isOpsWorkerQuotaWait(task: OpsWorkerTask): boolean {
 
 function requiresQuotaSchedulingForRun(task: OpsWorkerTask): boolean {
   if (requiresOpsWorkerInitialQuotaAdmission(task.source.kind)) return true;
-  return task.custody.status === "HELD"
-    && (
-      isOpsWorkerQuotaWait(task)
-      || task.lastOutcome?.result === "QUOTA_PROBE_PASS"
-    );
+  if (task.custody.status !== "HELD") return false;
+  // A clean operational attempt can lack exact HTTP telemetry when Pi uses
+  // the Codex WebSocket transport. That uncertainty must not turn trusted
+  // operational work back into background quota admission. Confirmed quota
+  // responses and their exact-probe recovery remain strict.
+  return task.lastOutcome?.result === "QUOTA"
+    || task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT"
+    || task.lastOutcome?.result === "QUOTA_PROBE_ERROR"
+    || task.lastOutcome?.result === "QUOTA_PROBE_PASS";
 }
 
 function hasLegacyUnclaimedOperationalAdmissionState(

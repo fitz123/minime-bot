@@ -513,7 +513,7 @@ export class OpsWorkerPiAttemptRunner {
     if (
       authorized.custody.status !== "HELD"
       || !hasFreshOpsWorkerAuthorizationPass(authorized)
-      || isOpsWorkerQuotaWait(authorized)
+      || blocksPiLaunchForQuota(authorized)
       || authorized.control.paused
     ) {
       if (preparedLaunch) cleanupOpsWorkerParityLaunch(preparedLaunch.parityLaunch);
@@ -570,7 +570,7 @@ export class OpsWorkerPiAttemptRunner {
         if (
           launchAuthorized.custody.status !== "HELD"
           || !hasFreshOpsWorkerAuthorizationPass(launchAuthorized)
-          || isOpsWorkerQuotaWait(launchAuthorized)
+          || blocksPiLaunchForQuota(launchAuthorized)
           || launchAuthorized.control.paused
         ) return launchAuthorized;
         task = launchAuthorized;
@@ -1249,7 +1249,11 @@ export class OpsWorkerPiAttemptRunner {
     const evidence = formatAttemptEvidence(exit);
     if (classification === "SUCCESS_CLAIM") {
       safeUnlink(attemptQuotaFile);
-      if (attemptQuota.status !== "OK") {
+      const operationalMissingTelemetry = attemptQuota.status === "MISSING"
+        && !requiresOpsWorkerInitialQuotaAdmission(
+          this.requireTask(taskId).source.kind,
+        );
+      if (attemptQuota.status !== "OK" && !operationalMissingTelemetry) {
         return {
           classification: "CRASH",
           task: this.supervisor.recordQuotaTelemetryError(
@@ -1261,7 +1265,9 @@ export class OpsWorkerPiAttemptRunner {
       }
       const claim = this.supervisor.recordPiSuccessClaim(
         taskId,
-        "Pi exited successfully and claimed the remediation attempt completed",
+        operationalMissingTelemetry
+          ? "Trusted operational Pi attempt exited successfully without exact response telemetry and claimed completion"
+          : "Pi exited successfully and claimed the remediation attempt completed",
         evidence,
       );
       return {
@@ -2114,6 +2120,12 @@ export const OPS_WORKER_SYSTEM_POLICY = [
   "After interruption or session resume, inspect actual state before taking further action.",
   "Your completion response is only a claim; a separate deterministic done check decides success.",
 ].join("\n");
+
+function blocksPiLaunchForQuota(task: OpsWorkerTask): boolean {
+  if (!isOpsWorkerQuotaWait(task)) return false;
+  return requiresOpsWorkerInitialQuotaAdmission(task.source.kind)
+    || task.lastOutcome?.result !== "QUOTA_TELEMETRY_ERROR";
+}
 
 export function classifyOpsWorkerPiExit(
   exit: Pick<OpsWorkerPiExit, "code" | "signal" | "error" | "stdout" | "stderr">,
