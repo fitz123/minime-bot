@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.26
+
+- Clamp future Prometheus availability sample timestamps to trusted local query time so small host/VM clock skew cannot invalidate deterministic Ops verification (#122).
+
 ## 2026.7.25
 
 - Accept clean trusted operational Pi successes without exact HTTP telemetry while keeping background tasks and confirmed provider-quota recovery strict (#119).

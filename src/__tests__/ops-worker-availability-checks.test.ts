@@ -519,6 +519,26 @@ describe("bounded loopback availability readers", () => {
     assert.equal(calls, 3);
   });
 
+  it("clamps a future Prometheus sample to the trusted local observation time", async () => {
+    const futureSample = (Date.now() + 1_000) / 1_000;
+    const reader = new OpsPrometheusHttpReader(
+      "http://127.0.0.1:9090",
+      async () => jsonResponse(prometheusVector([{ at: futureSample, value: "0" }])),
+    );
+    const before = Date.now();
+
+    const reading = await reader.readServiceAvailability(
+      OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      readerContext(),
+    );
+    const after = Date.now();
+
+    assert.equal(reading.status, "UNHEALTHY");
+    assert.ok(Date.parse(reading.observedAt) >= before);
+    assert.ok(Date.parse(reading.observedAt) <= after);
+    assert.equal(reading.healthySince, null);
+  });
+
   it("rejects remote endpoints and strict HTTP/JSON contract violations without retrying", async () => {
     assert.throws(
       () => new OpsAlertmanagerHttpReader("https://alerts.example.invalid", async () => new Response()),

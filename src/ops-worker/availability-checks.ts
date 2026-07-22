@@ -802,9 +802,16 @@ export class OpsPrometheusHttpReader implements
     if (direct.some((sample) => sample.value !== 0 && sample.value !== 1)) {
       throw new Error("Prometheus direct availability result is outside the closed contract");
     }
-    const observedAt = direct.length === 0
-      ? new Date().toISOString()
+    const localObservedAt = new Date().toISOString();
+    const directObservedAt = direct.length === 0
+      ? localObservedAt
       : direct.map((sample) => sample.observedAt).sort()[0];
+    // Prometheus can run in a VM whose clock is a few milliseconds ahead of
+    // the host. Never emit evidence observed after this trusted local query.
+    const observedAt = new Date(Math.min(
+      Date.parse(directObservedAt),
+      Date.parse(localObservedAt),
+    )).toISOString();
     if (direct.length === 0) {
       return { observedAt, status: "UNKNOWN", healthySince: null };
     }
