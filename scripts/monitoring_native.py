@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ipaddress
 import json
 import math
 import multiprocessing
@@ -23,6 +24,8 @@ from typing import Any, Callable
 TOKEN_ENV = "MINIME_TELEGRAM_BOT_TOKEN"
 SOPS_FILE_ENV = "MINIME_TELEGRAM_SOPS_FILE"
 SOPS_KEY_ENV = "MINIME_TELEGRAM_SOPS_KEY"
+OPS_INTAKE_SOPS_FILE_ENV = "MINIME_OPS_INTAKE_SOPS_FILE"
+OPS_INTAKE_SOPS_KEY_ENV = "MINIME_OPS_INTAKE_SOPS_KEY"
 SOPS_EXECUTABLE_ENV = "MINIME_SOPS_EXECUTABLE"
 API_BASE_ENV = "MINIME_TELEGRAM_API_BASE"
 INSECURE_TEST_ENV = "MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API"
@@ -30,6 +33,7 @@ DEFAULT_API_BASE = "https://api.telegram.org"
 TELEGRAM_TEXT_MAX_UTF16_UNITS = 4096
 HTTP_RESPONSE_MAX_BYTES = 1_000_000
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 class MonitoringError(Exception):
@@ -78,20 +82,29 @@ def sops_expression(dotted_key: str) -> str:
     return "".join(f"[{json.dumps(part)}]" for part in dotted_key.split("."))
 
 
-def resolve_token(
+def resolve_secret(
     *,
+    value_env: str | None,
+    sops_file_env: str,
+    sops_key_env: str,
     environ: dict[str, str] | os._Environ[str] = os.environ,
     sops_timeout: float = 5.0,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str:
-    token = environ.get(TOKEN_ENV, "")
-    if token:
-        if "\n" in token or "\r" in token:
-            raise SecretError("environment secret is invalid")
-        return token
+    env_names = [sops_file_env, sops_key_env]
+    if value_env is not None:
+        env_names.append(value_env)
+    if any(not _ENV_NAME_RE.fullmatch(name) for name in env_names):
+        raise SecretError("secret environment name is invalid")
 
-    sops_file = environ.get(SOPS_FILE_ENV, "")
-    sops_key = environ.get(SOPS_KEY_ENV, "")
+    value = environ.get(value_env, "") if value_env is not None else ""
+    if value:
+        if "\n" in value or "\r" in value:
+            raise SecretError("environment secret is invalid")
+        return value
+
+    sops_file = environ.get(sops_file_env, "")
+    sops_key = environ.get(sops_key_env, "")
     if not sops_file or not sops_key:
         raise SecretError("secret source is not configured")
     sops_executable = environ.get(SOPS_EXECUTABLE_ENV, "sops")
@@ -116,6 +129,40 @@ def resolve_token(
     if not value or "\n" in value or "\r" in value:
         raise SecretError("resolved secret is invalid")
     return value
+
+
+def resolve_token(
+    *,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+    sops_timeout: float = 5.0,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Resolve the Telegram token through the backward-compatible source names."""
+    return resolve_secret(
+        value_env=TOKEN_ENV,
+        sops_file_env=SOPS_FILE_ENV,
+        sops_key_env=SOPS_KEY_ENV,
+        environ=environ,
+        sops_timeout=sops_timeout,
+        run=run,
+    )
+
+
+def resolve_ops_intake_bearer(
+    *,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+    sops_timeout: float = 5.0,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Resolve the Ops bearer only from its named SOPS source."""
+    return resolve_secret(
+        value_env=None,
+        sops_file_env=OPS_INTAKE_SOPS_FILE_ENV,
+        sops_key_env=OPS_INTAKE_SOPS_KEY_ENV,
+        environ=environ,
+        sops_timeout=sops_timeout,
+        run=run,
+    )
 
 
 def _api_base(environ: dict[str, str] | os._Environ[str]) -> str:
@@ -163,6 +210,39 @@ class DeliveryConfig:
 class HttpResponse:
     status: int
     body: bytes
+
+
+def normalize_loopback_http_url(
+    value: str,
+    *,
+    required_path: str | None = None,
+    base_only: bool = False,
+) -> str:
+    """Validate a local HTTP endpoint without resolving an attacker-controlled host."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+        is_loopback = hostname == "localhost"
+        if hostname is not None and not is_loopback:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+    except (ValueError, UnicodeError):
+        raise DeliveryError("bridge URL is invalid") from None
+    if (
+        parsed.scheme != "http"
+        or not parsed.netloc
+        or not is_loopback
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise DeliveryError("bridge URL must use loopback HTTP")
+    if required_path is not None and parsed.path != required_path:
+        raise DeliveryError("bridge URL path is invalid")
+    if base_only and parsed.path not in {"", "/"}:
+        raise DeliveryError("bridge base URL path is invalid")
+    return value.rstrip("/") if base_only else value
 
 
 def _perform_http_request(
@@ -269,6 +349,43 @@ def request_with_deadline(
         sender.close()
         receiver.close()
         _stop_worker(process)
+
+
+def post_loopback_json_with_bearer(
+    url: str,
+    body: bytes,
+    bearer: str,
+    *,
+    timeout: float,
+    max_body: int = 64 * 1024,
+) -> HttpResponse:
+    """POST bounded JSON with an in-memory bearer to a verified loopback endpoint."""
+    normalize_loopback_http_url(url)
+    try:
+        encoded_bearer = bearer.encode("ascii")
+    except UnicodeEncodeError:
+        raise DeliveryError("bridge bearer is invalid") from None
+    if (
+        not body
+        or len(body) > 256 * 1024
+        or not 16 <= len(encoded_bearer) <= 8 * 1024
+        or any(byte < 0x21 or byte > 0x7E for byte in encoded_bearer)
+    ):
+        raise DeliveryError("bridge request is invalid")
+    response = request_with_deadline(
+        url,
+        method="POST",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json",
+        },
+        timeout=timeout,
+        max_body=max_body,
+    )
+    if len(response.body) > max_body:
+        raise DeliveryError("bridge response is too large")
+    return response
 
 
 def send_telegram(

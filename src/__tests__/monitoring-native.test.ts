@@ -28,6 +28,7 @@ const nativeScript = join(root, "scripts", "monitoring_native.py");
 const webhookScript = join(root, "scripts", "alertmanager_webhook.py");
 const doctorScript = join(root, "scripts", "runtime_doctor.py");
 const syntheticSecret = "synthetic_test_token_42";
+const syntheticOpsSecret = "synthetic_ops_bearer_58";
 const temporaryDirectories: string[] = [];
 
 interface RunResult {
@@ -103,10 +104,80 @@ function telegramEnv(base: string): NodeJS.ProcessEnv {
   };
 }
 
+function bridgeEnv(base: string): NodeJS.ProcessEnv {
+  const dir = tempDir();
+  const sops = join(dir, "synthetic-sops");
+  writeFileSync(sops, `#!/bin/sh\nprintf '%s\\n' '${syntheticOpsSecret}'\n`);
+  chmodSync(sops, 0o755);
+  return {
+    ...telegramEnv(base),
+    MINIME_OPS_INTAKE_URL: `${base}/intake/alertmanager`,
+    MINIME_ALERTMANAGER_URL: base,
+    MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "ops-secrets.sops.yaml"),
+    MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+    MINIME_SOPS_EXECUTABLE: sops,
+  };
+}
+
+function alertmanagerPayload(options: {
+  alertname: string;
+  severity?: "warning" | "critical";
+  status?: "firing" | "resolved";
+  fingerprint?: string;
+}): Record<string, unknown> {
+  const status = options.status ?? "firing";
+  const labels = {
+    alertname: options.alertname,
+    severity: options.severity ?? "warning",
+    instance: "local",
+  };
+  return {
+    receiver: "minime-native-webhook",
+    status,
+    alerts: [{
+      status,
+      labels,
+      annotations: {},
+      startsAt: "2026-07-22T00:00:00Z",
+      endsAt: status === "resolved" ? "2026-07-22T00:05:00Z" : "0001-01-01T00:00:00Z",
+      generatorURL: "http://127.0.0.1/prometheus/graph",
+      fingerprint: options.fingerprint ?? options.alertname,
+    }],
+    groupLabels: { alertname: options.alertname },
+    commonLabels: labels,
+    commonAnnotations: {},
+    externalURL: "http://127.0.0.1/alertmanager",
+    version: "4",
+    groupKey: `{}/{alertname=\"${options.alertname}\"}`,
+    truncatedAlerts: 0,
+  };
+}
+
+async function reservePort(): Promise<number> {
+  const reservation = await startServer((_request, response) => response.end());
+  const { port } = reservation;
+  await closeServer(reservation.server);
+  return port;
+}
+
+function postWebhook(port: number, payload: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/alertmanager`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 function assertSecretAbsent(result: RunResult): void {
   assert.ok(!result.args.join(" ").includes(syntheticSecret));
   assert.ok(!result.stdout.includes(syntheticSecret));
   assert.ok(!result.stderr.includes(syntheticSecret));
+}
+
+function assertOpsSecretAbsent(result: RunResult): void {
+  assert.ok(!result.args.join(" ").includes(syntheticOpsSecret));
+  assert.ok(!result.stdout.includes(syntheticOpsSecret));
+  assert.ok(!result.stderr.includes(syntheticOpsSecret));
 }
 
 function spawnWebhook(port: number, env: NodeJS.ProcessEnv, extra: string[] = []): ChildProcessWithoutNullStreams {
@@ -190,6 +261,34 @@ describe("host-native secret and Telegram delivery", () => {
     assert.notEqual(timed.status, 0);
     assert.match(timed.stderr, /timed out/);
     assertSecretAbsent(timed);
+  });
+
+  it("resolves the named Ops bearer through the generalized SOPS path", async () => {
+    const dir = tempDir();
+    const argsFile = join(dir, "ops-sops-args.json");
+    const sops = join(dir, "sops");
+    writeFileSync(
+      sops,
+      `#!/bin/sh\n/usr/bin/python3 -c 'import json,sys; open(sys.argv[1], "w").write(json.dumps(sys.argv[2:]))' "${argsFile}" "$@"\nprintf '%s\\n' '${syntheticOpsSecret}'\n`,
+    );
+    chmodSync(sops, 0o755);
+    const result = await runPython(
+      [
+        "-c",
+        "import os,sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; assert m.resolve_ops_intake_bearer() == os.environ['EXPECTED_OPS_BEARER']; print('ok')",
+      ],
+      {
+        MINIME_SOPS_EXECUTABLE: sops,
+        MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "ops.sops.yaml"),
+        MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+        EXPECTED_OPS_BEARER: syntheticOpsSecret,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assertOpsSecretAbsent(result);
+    const args = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
+    assert.deepEqual(args.slice(0, 3), ["-d", "--extract", '["intake"]["bearer"]']);
+    assert.ok(!args.join(" ").includes(syntheticOpsSecret));
   });
 
   it("requires explicit test mode for every custom Telegram API origin", async () => {
@@ -471,6 +570,243 @@ describe("Alertmanager webhook", () => {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
       await closeServer(telegram.server);
+    }
+  });
+
+  it("forwards only exact active groups to Ops and keeps noncritical success quiet", async () => {
+    const opsBodies: string[] = [];
+    const opsAuthorization: Array<string | undefined> = [];
+    const telegramMessages: string[] = [];
+    const alertmanagerQueries: string[] = [];
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts?")) {
+        alertmanagerQueries.push(request.url);
+        response.end(JSON.stringify([{
+          labels: { alertname: "ExactActive", severity: "warning", instance: "local" },
+          status: { state: "active" },
+        }]));
+        return;
+      }
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") {
+          opsBodies.push(body);
+          opsAuthorization.push(request.headers.authorization);
+          response.end(JSON.stringify({ ok: true }));
+        } else if (request.url?.includes("/sendMessage")) {
+          telegramMessages.push(new URLSearchParams(body).get("text") ?? "");
+          response.end(JSON.stringify({ ok: true }));
+        } else {
+          response.statusCode = 404;
+          response.end();
+        }
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    try {
+      await waitUntilReady(child);
+      const exact = alertmanagerPayload({ alertname: "ExactActive", fingerprint: "exact-active" });
+      assert.equal((await postWebhook(port, exact)).status, 200);
+      assert.equal((await postWebhook(port, exact)).status, 200, "completed batches must deduplicate");
+      assert.equal(opsBodies.length, 1);
+      assert.equal(opsBodies[0], JSON.stringify(exact), "the validated original body must be forwarded verbatim");
+      assert.deepEqual(opsAuthorization, [`Bearer ${syntheticOpsSecret}`]);
+      assert.equal(telegramMessages.length, 0, "noncritical Ops success must stay quiet");
+      assert.equal(alertmanagerQueries.length, 1);
+      const query = new URL(alertmanagerQueries[0], synthetic.base).searchParams;
+      for (const state of ["active", "silenced", "inhibited", "unprocessed"]) {
+        assert.equal(query.get(state), "true");
+      }
+
+      const mismatch = alertmanagerPayload({ alertname: "StaleOrForged", fingerprint: "mismatch" });
+      assert.equal((await postWebhook(port, mismatch)).status, 200);
+      assert.equal(opsBodies.length, 1, "a mismatched group must never reach authenticated Ops intake");
+      assert.equal(telegramMessages.length, 0, "a stale or forged mismatch must not page natively");
+      assert.equal(alertmanagerQueries.length, 2);
+      assert.ok(!child.spawnargs.join(" ").includes(syntheticOpsSecret));
+      assert.ok(!stderr.includes(syntheticOpsSecret));
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
+  it("retries verification and rejected Ops delivery without repeating native fallback", async () => {
+    let alertmanagerQueries = 0;
+    let opsAttempts = 0;
+    const telegramMessages: string[] = [];
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts?")) {
+        alertmanagerQueries += 1;
+        if (alertmanagerQueries === 1) {
+          response.statusCode = 503;
+          response.end("unavailable");
+        } else {
+          response.end(JSON.stringify([{
+            labels: { alertname: "RetryableWarning", severity: "warning", instance: "local" },
+            status: { state: "suppressed" },
+          }]));
+        }
+        return;
+      }
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") {
+          opsAttempts += 1;
+          response.statusCode = opsAttempts === 1 ? 503 : 200;
+          response.end(JSON.stringify({ ok: opsAttempts > 1 }));
+        } else if (request.url?.includes("/sendMessage")) {
+          telegramMessages.push(new URLSearchParams(body).get("text") ?? "");
+          response.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const payload = alertmanagerPayload({ alertname: "RetryableWarning", fingerprint: "retry-warning" });
+      assert.equal((await postWebhook(port, payload)).status, 503, "query failure must remain retryable");
+      assert.equal((await postWebhook(port, payload)).status, 503, "Ops rejection must remain retryable");
+      assert.equal((await postWebhook(port, payload)).status, 200);
+      assert.equal(alertmanagerQueries, 3);
+      assert.equal(opsAttempts, 2);
+      assert.equal(telegramMessages.length, 1, "successful fallback must deduplicate across retries");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
+  it("returns 503 for an Ops timeout even after fallback and converges on retry", async () => {
+    let opsAttempts = 0;
+    let telegramAttempts = 0;
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET") {
+        response.end(JSON.stringify([{
+          labels: { alertname: "SlowOps", severity: "warning", instance: "local" },
+          status: { state: "unprocessed" },
+        }]));
+        return;
+      }
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") {
+          opsAttempts += 1;
+          if (opsAttempts > 1) response.end(JSON.stringify({ ok: true }));
+        } else if (request.url?.includes("/sendMessage")) {
+          telegramAttempts += 1;
+          response.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, { ...bridgeEnv(synthetic.base), MINIME_BRIDGE_TIMEOUT: "0.1" });
+    try {
+      await waitUntilReady(child);
+      const payload = alertmanagerPayload({ alertname: "SlowOps", fingerprint: "slow-ops" });
+      assert.equal((await postWebhook(port, payload)).status, 503);
+      assert.equal((await postWebhook(port, payload)).status, 200);
+      assert.equal(opsAttempts, 2);
+      assert.equal(telegramAttempts, 1);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
+  it("requires critical dual delivery and handles resolved-only groups without Ops", async () => {
+    let sourceQueries = 0;
+    let opsAttempts = 0;
+    let telegramAttempts = 0;
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET") {
+        sourceQueries += 1;
+        response.end(JSON.stringify([{
+          labels: { alertname: "CriticalDual", severity: "critical", instance: "local" },
+          status: { state: "active" },
+        }]));
+        return;
+      }
+      request.resume();
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") {
+          opsAttempts += 1;
+          assert.equal(request.headers.authorization, `Bearer ${syntheticOpsSecret}`);
+          response.end(JSON.stringify({ ok: true }));
+        } else if (request.url?.includes("/sendMessage")) {
+          telegramAttempts += 1;
+          response.statusCode = telegramAttempts === 1 ? 400 : 200;
+          response.end(JSON.stringify({ ok: telegramAttempts > 1, error_code: 400 }));
+        }
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const critical = alertmanagerPayload({
+        alertname: "CriticalDual",
+        severity: "critical",
+        fingerprint: "critical-dual",
+      });
+      assert.equal((await postWebhook(port, critical)).status, 503, "native failure must fail dual delivery");
+      assert.equal((await postWebhook(port, critical)).status, 200);
+      assert.equal(opsAttempts, 2, "Ops replay must be harmless while native delivery retries");
+      assert.equal(telegramAttempts, 2);
+
+      const resolvedWarning = alertmanagerPayload({
+        alertname: "ResolvedWarning",
+        status: "resolved",
+        fingerprint: "resolved-warning",
+      });
+      assert.equal((await postWebhook(port, resolvedWarning)).status, 200);
+      const resolvedCritical = alertmanagerPayload({
+        alertname: "ResolvedCritical",
+        severity: "critical",
+        status: "resolved",
+        fingerprint: "resolved-critical",
+      });
+      assert.equal((await postWebhook(port, resolvedCritical)).status, 200);
+      assert.equal(sourceQueries, 2, "resolved-only batches must not query or forward to Ops");
+      assert.equal(opsAttempts, 2);
+      assert.equal(telegramAttempts, 3, "only critical resolved delivery uses the native path");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
+  it("rejects partial and non-loopback bridge configuration without exposing secrets", async () => {
+    const dir = tempDir();
+    const common = {
+      MINIME_TELEGRAM_BOT_TOKEN: syntheticSecret,
+      MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "private-ops-secrets.sops.yaml"),
+      MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+    };
+    const cases: NodeJS.ProcessEnv[] = [
+      { ...common, MINIME_OPS_INTAKE_URL: "http://example.invalid/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://127.0.0.1:9093" },
+      { ...common, MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://example.invalid" },
+      { MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager" },
+    ];
+    for (const env of cases) {
+      const result = await runPython([webhookScript, "--port", "0"], env);
+      assert.equal(result.status, 2);
+      assert.match(result.stderr, /bridge configuration rejected/);
+      assert.ok(!result.stderr.includes("Traceback"));
+      assertSecretAbsent(result);
+      assertOpsSecretAbsent(result);
+      assert.ok(!result.stderr.includes(dir));
     }
   });
 

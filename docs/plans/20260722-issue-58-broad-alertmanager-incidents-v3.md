@@ -154,14 +154,14 @@ custody starvation.
 
 **Goal:** Deliver genuine incidents to Ops without losing independent native escalation.
 
-- [ ] Generalize the packaged SOPS resolver for a named second secret without exposing values.
-- [ ] Add loopback-only source verification, authenticated Ops forwarding, required-sink result
+- [x] Generalize the packaged SOPS resolver for a named second secret without exposing values.
+- [x] Add loopback-only source verification, authenticated Ops forwarding, required-sink result
       semantics, critical dual delivery, retry-safe dedup, and native-only compatibility to the
       packaged webhook.
-- [ ] Test exact/mismatched groups, query failure, Ops rejection/timeout, native failure, critical
+- [x] Test exact/mismatched groups, query failure, Ops rejection/timeout, native failure, critical
       dual delivery, resolved-only handling, repeated retries, non-loopback rejection, and secret
       absence from argv/logs/errors.
-- [ ] Run focused Python/native monitoring tests before Task 4.
+- [x] Run focused Python/native monitoring tests before Task 4.
 
 ### Task 4: Verify and document the public package [HIGH]
 
