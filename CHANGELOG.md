@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Let trusted operational ops-worker sources attempt without initial quota-headroom admission while preserving reset-aware recovery after a real provider quota response (#113).
+
 ## 2026.7.22
 
 - Allow bounded recovery prerequisite version probes enough time to complete on a heavily loaded host instead of failing after five seconds (#58).

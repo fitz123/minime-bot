@@ -49,6 +49,6 @@ git diff --stat main...HEAD
 
 ### Task 3: Document and validate the bounded correction
 
-- [ ] Update `docs/ops-worker.md` to distinguish background initial admission from all-source post-attempt quota recovery, and add a concise `CHANGELOG.md` Unreleased entry for #113.
-- [ ] Run every validation command above, verify the worktree is clean after commits, and confirm `git diff --stat main...HEAD` is exactly the scope reviewed by Ralphex.
-- [ ] Leave release, private deployment/restart, existing-task progression, dedicated Ops report verification, issue/task closure, and the separately gated outage drill to the parent full-cycle custodian.
+- [x] Update `docs/ops-worker.md` to distinguish background initial admission from all-source post-attempt quota recovery, and add a concise `CHANGELOG.md` Unreleased entry for #113.
+- [x] Run every validation command above, verify the worktree is clean after commits, and confirm `git diff --stat main...HEAD` is exactly the scope reviewed by Ralphex.
+- [x] Leave release, private deployment/restart, existing-task progression, dedicated Ops report verification, issue/task closure, and the separately gated outage drill to the parent full-cycle custodian.

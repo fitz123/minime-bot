@@ -934,7 +934,7 @@ reply:
     assert.match(nonStart.stderr, /unknown worker status option: --control-config/);
   });
 
-  it("requires and applies the strict quota dependency before a CLI-started claim", async (t) => {
+  it("requires the quota dependency but bypasses closed initial admission for CLI operations", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();
     const missing = await runWorkerCli([
@@ -979,10 +979,19 @@ reply:
     const deps = dependencies(contracts, {
       quotaAdmission: notAdmitted,
       piAttemptDependencies: {
-        resolveInvocation: () => {
+        resolveInvocation: (args) => {
           piLaunched = true;
-          throw new Error("Pi must not launch without quota admission");
+          return {
+            command: process.execPath,
+            args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "success", ...args],
+          };
         },
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
       },
     });
     const submitted = await runWorkerCli(
@@ -1005,14 +1014,14 @@ reply:
       "--once",
     ], fixture.root, deps);
     assert.equal(started.code, 0, started.stderr);
-    assert.equal(piLaunched, false);
-    assert.match(started.stdout, new RegExp(`Processed ${taskId}: QUEUED`));
+    assert.equal(piLaunched, true);
+    assert.match(started.stdout, new RegExp(`Processed ${taskId}: DONE`));
     const store = new OpsWorkerTaskStore(fixture.stateDirectory, {
       registry: contracts.taskRegistry,
     });
-    const waiting = store.get(taskId);
-    assert.equal(waiting?.custody.status, "UNCLAIMED");
-    assert.equal(waiting?.lastOutcome?.result, "QUOTA_ADMISSION_WAIT");
+    const completed = store.get(taskId);
+    assert.equal(completed?.custody.status, "RELEASED");
+    assert.equal(completed?.lastOutcome?.result, "PASS");
   });
 
   it("validates Pi runner inputs before acquiring the supervisor lock or serving status", async (t) => {
@@ -1449,6 +1458,18 @@ reply:
         if (signal?.aborted) abort();
         else signal?.addEventListener("abort", abort, { once: true });
       }),
+      piAttemptDependencies: {
+        resolveInvocation: (args) => ({
+          command: process.execPath,
+          args: ["--import", TSX_IMPORT, FAKE_PI_PROCESS, "success", ...args],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+      },
     });
 
     const incompleteFixture = fixtureRoot(t);
