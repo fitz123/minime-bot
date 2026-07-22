@@ -50,6 +50,7 @@ import {
   isOpsWorkerUnclaimedQuotaProbeProcess,
   requiresOpsWorkerInitialQuotaAdmission,
   type OpsWorkerActiveRun,
+  type OpsWorkerAgentResult,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
   type OpsWorkerInterrupt,
@@ -1629,6 +1630,7 @@ export class OpsWorkerSupervisor {
       task.schedule.nextCheckAt = null;
       task.lastOutcome = null;
       task.verification = null;
+      task.agentResult = null;
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
@@ -1737,6 +1739,101 @@ export class OpsWorkerSupervisor {
     }, target === "CHECKING"
       ? "Pi claim queued deterministic done check"
       : "Pi claim retained task for pending operator steering");
+  }
+
+  recordPiAgentResult(
+    taskId: string,
+    result: OpsWorkerAgentResult,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (
+      existing.state !== "RUNNING"
+      || existing.activeRun === null
+      || existing.activeRun.attemptId !== result.attemptId
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        `Typed agent result must match the active RUNNING attempt for ${taskId}`,
+      );
+    }
+    const blocks = result.kind === "input-needed" || result.kind === "impossible";
+    const target = blocks
+      ? "BLOCKED"
+      : hasPendingPromptSteering(existing)
+      ? "RESUMABLE"
+      : "CHECKING";
+    return this.transition(taskId, target, (task, at) => {
+      if (target === "CHECKING") this.pinDoneCheckContract(task);
+      task.activeRun = null;
+      task.session.resume = true;
+      task.rounds.consecutiveInfrastructureFailures = 0;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.verification = null;
+      task.agentResult = structuredClone(result);
+      task.lastOutcome = {
+        at,
+        kind: "PI_EXIT",
+        result: blocks ? "BLOCKED" : "SUCCESS_CLAIM",
+        summary: blocks
+          ? `Agent reported durable ${result.kind}`
+          : `Agent reported ${result.kind} and requested deterministic verification`,
+      };
+      if (blocks) {
+        task.report.state = "PENDING";
+        task.report.attempts = 0;
+        task.report.lastError = null;
+      }
+      if (evidenceSummary) {
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, blocks
+      ? `Typed agent result ${result.kind} blocked task and queued report`
+      : target === "CHECKING"
+      ? `Typed agent result ${result.kind} queued deterministic done check`
+      : `Typed agent result ${result.kind} retained pending operator steering`);
+  }
+
+  recordAgentProtocolFailure(
+    taskId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "RUNNING" || existing.activeRun === null) {
+      throw new OpsWorkerSupervisorStateError(
+        `Agent protocol failure requires RUNNING, found ${existing.state}`,
+      );
+    }
+    const terminal = existing.rounds.remediation + 1 >= existing.rounds.maxRemediation;
+    return this.transition(taskId, terminal ? "BLOCKED" : "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.session.resume = true;
+      task.rounds.remediation += 1;
+      task.rounds.consecutiveInfrastructureFailures = 0;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.verification = null;
+      task.agentResult = null;
+      task.lastOutcome = {
+        at,
+        kind: "PI_EXIT",
+        result: "PROTOCOL_FAILURE",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (terminal) {
+        task.report.state = "PENDING";
+        task.report.attempts = 0;
+        task.report.lastError = null;
+      }
+      if (evidenceSummary) {
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, terminal
+      ? "Agent result protocol exhausted remediation rounds and queued report"
+      : "Agent result protocol failure consumed one remediation round");
   }
 
   recordQuotaAdmissionWait(
@@ -2575,6 +2672,7 @@ export class OpsWorkerSupervisor {
       task.report.lastError = null;
       task.lastOutcome = null;
       task.verification = null;
+      task.agentResult = null;
     }, "Operator retried blocked task", { steering });
   }
 
@@ -2606,6 +2704,7 @@ export class OpsWorkerSupervisor {
         summary,
       };
       task.verification = null;
+      task.agentResult = null;
       this.supersedeReportEpisode(
         task,
         at,
@@ -2652,6 +2751,14 @@ export class OpsWorkerSupervisor {
           result: task.lastOutcome.result,
           summary: task.lastOutcome.summary,
         },
+      agentResult: task.agentResult,
+      verification: task.verification === null
+        ? null
+        : {
+            checkedAt: task.verification.checkedAt,
+            outcome: task.verification.outcome,
+            components: task.verification.components,
+          },
     };
     const reportPayloadHash = hashOpsWorkerCanonicalPayload(reportIntent);
     const operation = {

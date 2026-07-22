@@ -140,7 +140,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: sourceKind,
@@ -168,6 +168,7 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -2948,6 +2949,7 @@ describe("ops worker supervisor", () => {
         authorizationVerification: _authorizationVerification,
         verification: _verification,
         legacyCompletion: _legacyCompletion,
+        agentResult: _agentResult,
         steering: _steering,
         control: _control,
         source,

@@ -262,7 +262,7 @@ function makeTask(
   const sourceKind = options.sourceKind ?? "operator-cli";
   const createdAt = options.createdAt ?? NOW;
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: sourceKind,
@@ -287,6 +287,7 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",

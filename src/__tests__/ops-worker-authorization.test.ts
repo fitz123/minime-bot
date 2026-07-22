@@ -83,7 +83,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
   lifecycle.canonicalTask = remote.canonicalTask;
   lifecycle.repository = remote.repository.identity;
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "authorized-issue-58",
     source: {
       kind: "authorized-issue",
@@ -108,6 +108,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -439,7 +440,7 @@ function alertmanagerTask(
 ): OpsWorkerTask {
   const lifecycle = createEmptyOpsWorkerLifecycleManifest();
   const task = withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "alertmanager-availability-fixture",
     source: {
       kind: "alertmanager",
@@ -473,6 +474,7 @@ function alertmanagerTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -660,21 +662,24 @@ describe("package-owned alertmanager authorization verifier", () => {
     assert.equal(policy.authorization.verifierCount, 1);
     assert.match(policy.authorization.contractsHash, /^sha256:[a-f0-9]{64}$/);
     assert.equal(policy.verification.contracts.length, 2);
+    const availabilityContract = policy.verification.contracts.find(
+      (contract) => contract.name === OPS_AVAILABILITY_DONE_CHECK_NAME,
+    );
+    const incidentContract = policy.verification.contracts.find(
+      (contract) => contract.name === OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    );
+    assert.ok(availabilityContract);
+    assert.ok(incidentContract);
     assert.deepEqual(
       Object.keys(policy.verification.contracts[0]).sort(),
       ["contractHash", "name", "verifierIdentity", "verifierVersion"],
     );
-    assert.equal(policy.verification.contracts[0].name, OPS_AVAILABILITY_DONE_CHECK_NAME);
-    assert.equal(policy.verification.contracts[0].verifierVersion, "1");
+    assert.equal(availabilityContract.verifierVersion, "1");
     assert.match(
-      policy.verification.contracts[0].contractHash,
+      availabilityContract.contractHash,
       /^sha256:[a-f0-9]{64}$/,
     );
-    assert.equal(
-      policy.verification.contracts[1].name,
-      OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
-    );
-    assert.equal(policy.verification.contracts[1].verifierVersion, "1");
+    assert.equal(incidentContract.verifierVersion, "1");
     const serialized = JSON.stringify(policy);
     assert.equal(serialized.includes(ALERT_SOURCE_IDENTITY), false);
     assert.equal(serialized.includes("Restore and verify"), false);

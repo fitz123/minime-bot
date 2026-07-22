@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-export const OPS_WORKER_TASK_SCHEMA_VERSION = 5 as const;
+export const OPS_WORKER_TASK_SCHEMA_VERSION = 6 as const;
+export const OPS_WORKER_TASK_V5_SCHEMA_VERSION = 5 as const;
 export const OPS_WORKER_TASK_V4_SCHEMA_VERSION = 4 as const;
 export const OPS_WORKER_TASK_V3_SCHEMA_VERSION = 3 as const;
 export const OPS_WORKER_TASK_V2_SCHEMA_VERSION = 2 as const;
@@ -121,6 +122,7 @@ export const OPS_WORKER_OUTCOME_RESULTS = [
   "CONTEXT_OVERFLOW",
   "CRASH",
   "STALL",
+  "PROTOCOL_FAILURE",
   "PREEMPTED",
   "AMBIGUOUS_ORPHAN",
   "CANCELLED",
@@ -133,6 +135,26 @@ export type OpsWorkerOutcomeResult =
 export const OPS_WORKER_REPORT_STATES = ["NONE", "PENDING", "SENT"] as const;
 
 export type OpsWorkerReportState = (typeof OPS_WORKER_REPORT_STATES)[number];
+
+export const OPS_WORKER_AGENT_RESULT_KINDS = [
+  "remediation-complete",
+  "no-action-needed",
+  "input-needed",
+  "impossible",
+] as const;
+
+export type OpsWorkerAgentResultKind =
+  (typeof OPS_WORKER_AGENT_RESULT_KINDS)[number];
+
+export const OPS_WORKER_AGENT_RESULT_REASONS = [
+  "approval",
+  "information",
+  "policy-boundary",
+  "unrecoverable",
+] as const;
+
+export type OpsWorkerAgentResultReason =
+  (typeof OPS_WORKER_AGENT_RESULT_REASONS)[number];
 
 export const OPS_WORKER_STEERING_KINDS = [
   "correction",
@@ -455,6 +477,16 @@ export interface OpsWorkerReport {
   lastError: string | null;
 }
 
+/** Bounded current claim authored by the agent; it is state, never trusted evidence. */
+export interface OpsWorkerAgentResult {
+  attemptId: string;
+  kind: OpsWorkerAgentResultKind;
+  summary: string;
+  actions: string[];
+  requestedInput: string | null;
+  reason: OpsWorkerAgentResultReason | null;
+}
+
 /**
  * Provenance for a terminal snapshot that predates composite verification.
  * This preserves a legacy DONE state without fabricating a current-schema PASS.
@@ -512,6 +544,7 @@ export interface OpsWorkerTask {
   authorizationVerification: OpsWorkerAuthorizationVerification | null;
   verification: OpsWorkerVerificationRecord | null;
   legacyCompletion: OpsWorkerLegacyCompletion | null;
+  agentResult: OpsWorkerAgentResult | null;
   steering: OpsWorkerSteeringEntry[];
   control: OpsWorkerControl;
   state: OpsWorkerTaskState;
@@ -621,6 +654,7 @@ export function hashOpsWorkerVerificationSubject(
     | "authorization"
     | "authorizationVerification"
     | "steering"
+    | "agentResult"
   >,
 ): string {
   const pendingSteering = task.steering
@@ -665,6 +699,7 @@ export function hashOpsWorkerVerificationSubject(
         status: task.authorizationVerification.status,
         evidenceHash: task.authorizationVerification.evidenceHash,
       },
+    ...(task.agentResult === null ? {} : { agentResult: task.agentResult }),
     // Keep the empty case byte-identical to the v4 verification subject so
     // exact v4 PASS snapshots remain valid during pure read migration.
     ...(pendingSteering.length === 0 ? {} : { pendingSteering }),
@@ -687,6 +722,7 @@ export type OpsWorkerTaskV1 = Omit<
   | "legacyCompletion"
   | "steering"
   | "control"
+  | "agentResult"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION;
   source: OpsWorkerTaskSourceV1;
@@ -701,6 +737,7 @@ export type OpsWorkerTaskV2 = Omit<
   | "legacyCompletion"
   | "steering"
   | "control"
+  | "agentResult"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V2_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
@@ -714,6 +751,7 @@ export type OpsWorkerTaskV3 = Omit<
   | "legacyCompletion"
   | "steering"
   | "control"
+  | "agentResult"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V3_SCHEMA_VERSION;
   lifecycle: OpsWorkerLifecycleManifestV1;
@@ -721,9 +759,16 @@ export type OpsWorkerTaskV3 = Omit<
 
 export type OpsWorkerTaskV4 = Omit<
   OpsWorkerTask,
-  "schemaVersion" | "steering" | "control"
+  "schemaVersion" | "steering" | "control" | "agentResult"
 > & {
   schemaVersion: typeof OPS_WORKER_TASK_V4_SCHEMA_VERSION;
+};
+
+export type OpsWorkerTaskV5 = Omit<
+  OpsWorkerTask,
+  "schemaVersion" | "agentResult"
+> & {
+  schemaVersion: typeof OPS_WORKER_TASK_V5_SCHEMA_VERSION;
 };
 
 export interface OpsWorkerTemplateContract {
@@ -755,7 +800,8 @@ export interface OpsWorkerTaskContractRegistry {
 export const OPS_WORKER_LIMITS = {
   maxLegacySnapshotBytes: 256 * 1024,
   maxPreV5SnapshotBytes: 512 * 1024,
-  maxSnapshotBytes: 513 * 1024,
+  maxV5SnapshotBytes: 513 * 1024,
+  maxSnapshotBytes: 545 * 1024,
   /** Space retained after steering admission for bounded lifecycle and verification growth. */
   minRuntimeMutationHeadroomBytes: 256 * 1024,
   maxObjectiveBytes: 8 * 1024,
@@ -785,6 +831,11 @@ export const OPS_WORKER_LIMITS = {
   maxSteeringTextBytes: 8 * 1024,
   maxPendingSteeringPromptBytes: 64 * 1024,
   maxInterruptReasonBytes: 4 * 1024,
+  maxAgentResultFileBytes: 32 * 1024,
+  maxAgentResultSummaryBytes: 4 * 1024,
+  maxAgentResultActions: 16,
+  maxAgentResultActionBytes: 1024,
+  maxAgentResultRequestedInputBytes: 4 * 1024,
 } as const;
 
 export interface SerializedOpsWorkerPendingSteering {
@@ -876,11 +927,17 @@ const V4_TASK_KEYS = [
   ...V3_TASK_KEYS.slice(V3_TASK_KEYS.indexOf("state")),
 ] as const;
 
-const TASK_KEYS = [
+const V5_TASK_KEYS = [
   ...V4_TASK_KEYS.slice(0, V4_TASK_KEYS.indexOf("state")),
   "steering",
   "control",
   ...V4_TASK_KEYS.slice(V4_TASK_KEYS.indexOf("state")),
+] as const;
+
+const TASK_KEYS = [
+  ...V5_TASK_KEYS.slice(0, V5_TASK_KEYS.indexOf("steering")),
+  "agentResult",
+  ...V5_TASK_KEYS.slice(V5_TASK_KEYS.indexOf("steering")),
 ] as const;
 
 const TASK_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -2518,6 +2575,97 @@ function parseReport(value: unknown): OpsWorkerReport {
   };
 }
 
+function parseAgentResultAt(
+  value: unknown,
+  path: string,
+  expectedAttemptId?: string,
+): OpsWorkerAgentResult {
+  const result = expectObject(value, path);
+  expectExactKeys(
+    result,
+    ["attemptId", "kind", "summary", "actions", "requestedInput", "reason"],
+    path,
+  );
+  const attemptId = expectBoundedText(
+    result.attemptId,
+    `${path}.attemptId`,
+    128,
+  );
+  if (!INSTANCE_ID_PATTERN.test(attemptId)) {
+    fail(`${path}.attemptId`, "contains unsafe characters");
+  }
+  if (expectedAttemptId !== undefined && attemptId !== expectedAttemptId) {
+    fail(`${path}.attemptId`, "must match the persisted attempt identity");
+  }
+  const actionsRaw = expectDensePlainArray(result.actions, `${path}.actions`);
+  if (actionsRaw.length > OPS_WORKER_LIMITS.maxAgentResultActions) {
+    fail(
+      `${path}.actions`,
+      `must contain at most ${OPS_WORKER_LIMITS.maxAgentResultActions} entries`,
+    );
+  }
+  const parsed: OpsWorkerAgentResult = {
+    attemptId,
+    kind: expectEnum(
+      result.kind,
+      OPS_WORKER_AGENT_RESULT_KINDS,
+      `${path}.kind`,
+    ),
+    summary: expectBoundedText(
+      result.summary,
+      `${path}.summary`,
+      OPS_WORKER_LIMITS.maxAgentResultSummaryBytes,
+    ),
+    actions: actionsRaw.map((action, index) => expectBoundedText(
+      action,
+      `${path}.actions[${index}]`,
+      OPS_WORKER_LIMITS.maxAgentResultActionBytes,
+    )),
+    requestedInput: result.requestedInput === null
+      ? null
+      : expectBoundedText(
+          result.requestedInput,
+          `${path}.requestedInput`,
+          OPS_WORKER_LIMITS.maxAgentResultRequestedInputBytes,
+        ),
+    reason: result.reason === null
+      ? null
+      : expectEnum(
+          result.reason,
+          OPS_WORKER_AGENT_RESULT_REASONS,
+          `${path}.reason`,
+        ),
+  };
+  if (
+    Buffer.byteLength(JSON.stringify(parsed), "utf8")
+    > OPS_WORKER_LIMITS.maxAgentResultFileBytes
+  ) {
+    fail(
+      path,
+      `must serialize to at most ${OPS_WORKER_LIMITS.maxAgentResultFileBytes} UTF-8 bytes`,
+    );
+  }
+  return parsed;
+}
+
+/** Parse an exact bounded agent-authored result and optionally bind its attempt id. */
+export function parseOpsWorkerAgentResult(
+  value: unknown,
+  expectedAttemptId?: string,
+): OpsWorkerAgentResult {
+  return parseAgentResultAt(value, "agentResult", expectedAttemptId);
+}
+
+/** Stable identity for the exact bounded agent result used by receipts and tests. */
+export function hashOpsWorkerAgentResult(result: OpsWorkerAgentResult): string {
+  const parsed = parseOpsWorkerAgentResult(result, result.attemptId);
+  return `sha256:${createHash("sha256").update(stableJson(parsed)).digest("hex")}`;
+}
+
+function parseTaskAgentResult(value: unknown): OpsWorkerAgentResult | null {
+  return value === null ? null : parseAgentResultAt(value, "task.agentResult");
+}
+
 function parseLegacyCompletion(value: unknown): OpsWorkerLegacyCompletion | null {
   if (value === null) return null;
   const legacy = expectObject(value, "task.legacyCompletion");
@@ -2565,6 +2713,7 @@ type OpsWorkerTaskCommon = Omit<
   | "legacyCompletion"
   | "steering"
   | "control"
+  | "agentResult"
 >;
 
 function parseTaskCommon(
@@ -2782,6 +2931,7 @@ export function migrateOpsWorkerTaskV1(task: OpsWorkerTaskV1): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: copy.state === "DONE" ? { sourceSchemaVersion: 1 } : null,
+    agentResult: null,
     steering: [],
     control: createEmptyOpsWorkerControl(),
     state: copy.state,
@@ -2826,6 +2976,7 @@ export function migrateOpsWorkerTaskV2(task: OpsWorkerTaskV2): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 2 } : null,
+    agentResult: null,
     steering: [],
     control: createEmptyOpsWorkerControl(),
     ...common,
@@ -2845,6 +2996,7 @@ export function migrateOpsWorkerTaskV3(task: OpsWorkerTaskV3): OpsWorkerTask {
     lifecycle: migrateLifecycleV1(lifecycle),
     verification: null,
     legacyCompletion: common.state === "DONE" ? { sourceSchemaVersion: 3 } : null,
+    agentResult: null,
     steering: [],
     control: createEmptyOpsWorkerControl(),
     ...common,
@@ -2857,8 +3009,20 @@ export function migrateOpsWorkerTaskV4(task: OpsWorkerTaskV4): OpsWorkerTask {
   const { schemaVersion: _schemaVersion, ...common } = copy;
   return {
     schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    agentResult: null,
     steering: [],
     control: createEmptyOpsWorkerControl(),
+    ...common,
+  };
+}
+
+/** Pure migration for an already validated exact v5 snapshot. */
+export function migrateOpsWorkerTaskV5(task: OpsWorkerTaskV5): OpsWorkerTask {
+  const copy = structuredClone(task);
+  const { schemaVersion: _schemaVersion, ...common } = copy;
+  return {
+    schemaVersion: OPS_WORKER_TASK_SCHEMA_VERSION,
+    agentResult: null,
     ...common,
   };
 }
@@ -3082,6 +3246,56 @@ function parseOpsWorkerTaskV5(
   task: Record<string, unknown>,
   registry: OpsWorkerTaskContractRegistry,
 ): OpsWorkerTask {
+  expectExactKeys(task, V5_TASK_KEYS, "task");
+  if (task.schemaVersion !== OPS_WORKER_TASK_V5_SCHEMA_VERSION) {
+    fail(
+      "task.schemaVersion",
+      `must equal ${OPS_WORKER_TASK_V5_SCHEMA_VERSION}`,
+    );
+  }
+  assertOpsWorkerTaskId(task.id);
+  const id = task.id;
+  const source = parseSource(task.source, registry);
+  const submissionFingerprint = expectString(
+    task.submissionFingerprint,
+    "task.submissionFingerprint",
+  );
+  if (!SHA256_PATTERN.test(submissionFingerprint)) {
+    fail(
+      "task.submissionFingerprint",
+      "must be a lowercase sha256:<hex> digest",
+    );
+  }
+  const previous: OpsWorkerTaskV5 = {
+    schemaVersion: OPS_WORKER_TASK_V5_SCHEMA_VERSION,
+    id,
+    source,
+    resource: parseResource(task.resource),
+    lifecycle: parseLifecycle(task.lifecycle),
+    currentCheckpoint: parseCheckpoint(task.currentCheckpoint),
+    mutationReceipts: parseMutationReceipts(task.mutationReceipts),
+    custody: parseCustody(task.custody),
+    submissionFingerprint,
+    authorizationVerification: parseAuthorizationVerification(
+      task.authorizationVerification,
+    ),
+    verification: parseVerification(task.verification),
+    legacyCompletion: parseLegacyCompletion(task.legacyCompletion),
+    steering: parseSteering(task.steering),
+    control: parseControl(task.control),
+    ...parseTaskCommon(task, id, source, registry),
+  };
+  const parsed = migrateOpsWorkerTaskV5(previous);
+  assertTaskVerification(parsed);
+  assertTaskCustodyMatchesState(parsed);
+  assertParsedSnapshotSize(parsed);
+  return parsed;
+}
+
+function parseOpsWorkerTaskV6(
+  task: Record<string, unknown>,
+  registry: OpsWorkerTaskContractRegistry,
+): OpsWorkerTask {
   expectExactKeys(task, TASK_KEYS, "task");
   if (task.schemaVersion !== OPS_WORKER_TASK_SCHEMA_VERSION) {
     fail(
@@ -3117,6 +3331,7 @@ function parseOpsWorkerTaskV5(
     ),
     verification: parseVerification(task.verification),
     legacyCompletion: parseLegacyCompletion(task.legacyCompletion),
+    agentResult: parseTaskAgentResult(task.agentResult),
     steering: parseSteering(task.steering),
     control: parseControl(task.control),
     ...parseTaskCommon(task, id, source, registry),
@@ -3127,7 +3342,7 @@ function parseOpsWorkerTaskV5(
   return parsed;
 }
 
-/** Parse and copy exact v1-v5 input. Unknown versions fail closed. */
+/** Parse and copy exact v1-v6 input. Unknown versions fail closed. */
 export function parseOpsWorkerTask(
   value: unknown,
   registry: OpsWorkerTaskContractRegistry,
@@ -3149,12 +3364,15 @@ export function parseOpsWorkerTask(
   if (descriptor.value === OPS_WORKER_TASK_V4_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV4(task, registry);
   }
-  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+  if (descriptor.value === OPS_WORKER_TASK_V5_SCHEMA_VERSION) {
     return parseOpsWorkerTaskV5(task, registry);
+  }
+  if (descriptor.value === OPS_WORKER_TASK_SCHEMA_VERSION) {
+    return parseOpsWorkerTaskV6(task, registry);
   }
   fail(
     "task.schemaVersion",
-    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V4_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
+    `must equal supported version ${OPS_WORKER_TASK_LEGACY_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V2_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V3_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V4_SCHEMA_VERSION}, ${OPS_WORKER_TASK_V5_SCHEMA_VERSION}, or ${OPS_WORKER_TASK_SCHEMA_VERSION}`,
   );
 }
 
@@ -3199,6 +3417,15 @@ export function parseOpsWorkerTaskJson(
     fail(
       "task",
       `pre-v5 snapshot exceeds ${OPS_WORKER_LIMITS.maxPreV5SnapshotBytes} UTF-8 bytes`,
+    );
+  }
+  if (
+    schemaVersion === OPS_WORKER_TASK_V5_SCHEMA_VERSION
+    && bytes > OPS_WORKER_LIMITS.maxV5SnapshotBytes
+  ) {
+    fail(
+      "task",
+      `v5 snapshot exceeds ${OPS_WORKER_LIMITS.maxV5SnapshotBytes} UTF-8 bytes`,
     );
   }
   return parseOpsWorkerTask(value, registry);

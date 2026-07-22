@@ -22,6 +22,7 @@ import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_SOURCE_KINDS,
   OPS_WORKER_SOURCE_PRIORITIES,
+  hashOpsWorkerAgentResult,
   hashOpsWorkerCanonicalSubmission,
   hashOpsWorkerVerificationSubject,
   OpsWorkerTaskValidationError,
@@ -38,6 +39,7 @@ import {
   type OpsWorkerTaskV2,
   type OpsWorkerTaskV3,
   type OpsWorkerTaskV4,
+  type OpsWorkerTaskV5,
 } from "../ops-worker/types.js";
 import {
   OpsWorkerDeliveryConflictError,
@@ -120,7 +122,7 @@ function makeTask(
   correlationKey = "operator:health:local",
 ): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: "operator-cli",
@@ -187,6 +189,7 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: {
       paused: false,
@@ -236,6 +239,7 @@ function makeV1Task(
     authorizationVerification: _authorizationVerification,
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    agentResult: _agentResult,
     steering: _steering,
     control: _control,
     ...legacy
@@ -257,6 +261,7 @@ function makeV2Task(
     authorizationVerification: _authorizationVerification,
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    agentResult: _agentResult,
     steering: _steering,
     control: _control,
     lifecycle,
@@ -282,6 +287,7 @@ function makeV3Task(
   const {
     verification: _verification,
     legacyCompletion: _legacyCompletion,
+    agentResult: _agentResult,
     steering: _steering,
     control: _control,
     lifecycle,
@@ -305,6 +311,7 @@ function makeV4Task(
 ): OpsWorkerTaskV4 {
   const current = makeTask(id, correlationKey);
   const {
+    agentResult: _agentResult,
     steering: _steering,
     control: _control,
     ...previous
@@ -313,6 +320,14 @@ function makeV4Task(
     ...previous,
     schemaVersion: 4,
   };
+}
+
+function makeV5Task(
+  id = "wt-20260717-v5-ab12cd",
+  correlationKey = "operator:health:v5",
+): OpsWorkerTaskV5 {
+  const { agentResult: _agentResult, ...previous } = makeTask(id, correlationKey);
+  return { ...previous, schemaVersion: 5 };
 }
 
 function clone<T>(value: T): T {
@@ -427,7 +442,7 @@ describe("ops worker task contract", () => {
     );
   });
 
-  it("strictly round-trips a complete v5 envelope into an independent value", () => {
+  it("strictly round-trips a complete v6 envelope with a typed agent result", () => {
     const input = makeTask();
     input.state = "RUNNING";
     input.activeRun = {
@@ -450,6 +465,14 @@ describe("ops worker task contract", () => {
       state: "PENDING",
       attempts: 1,
       lastError: "Fixture transport unavailable.",
+    };
+    input.agentResult = {
+      attemptId: "attempt-01",
+      kind: "remediation-complete",
+      summary: "Repaired the bounded fixture and requested verification.",
+      actions: ["Restarted the same-UID fixture process."],
+      requestedInput: null,
+      reason: null,
     };
     input.lifecycle = {
       schemaVersion: 2,
@@ -515,7 +538,8 @@ describe("ops worker task contract", () => {
 
     assert.deepEqual(input, before);
     assert.deepEqual(first, second);
-    assert.equal(first.schemaVersion, 5);
+    assert.equal(first.schemaVersion, 6);
+    assert.equal(first.agentResult, null);
     assert.deepEqual(first.steering, []);
     assert.deepEqual(first.control, {
       paused: false,
@@ -572,7 +596,7 @@ describe("ops worker task contract", () => {
 
     const migrated = parseOpsWorkerTaskJson(raw, registry);
 
-    assert.equal(migrated.schemaVersion, 5);
+    assert.equal(migrated.schemaVersion, 6);
     assert.ok(
       Buffer.byteLength(JSON.stringify(migrated), "utf8")
       > OPS_WORKER_LIMITS.maxLegacySnapshotBytes,
@@ -583,7 +607,7 @@ describe("ops worker task contract", () => {
     );
   });
 
-  it("keeps a valid near-limit v4 snapshot readable and writable after v5 expansion", (t) => {
+  it("keeps a valid near-limit v4 snapshot readable and writable after v6 expansion", (t) => {
     const input = makeV4Task("near-limit-v4", "near:limit:v4");
     const evidence = {
       at: NOW,
@@ -623,7 +647,7 @@ describe("ops worker task contract", () => {
 
     const migrated = parseOpsWorkerTaskJson(raw, registry);
 
-    assert.equal(migrated.schemaVersion, 5);
+    assert.equal(migrated.schemaVersion, 6);
     assert.ok(
       Buffer.byteLength(JSON.stringify(migrated), "utf8")
       > OPS_WORKER_LIMITS.maxPreV5SnapshotBytes,
@@ -636,11 +660,11 @@ describe("ops worker task contract", () => {
     const store = makeStore(t);
     const snapshotPath = join(store.tasksDirectory, `${input.id}.json`);
     writeFileSync(snapshotPath, `${raw}\n`, { mode: 0o600 });
-    assert.equal(store.get(input.id)?.schemaVersion, 5);
+    assert.equal(store.get(input.id)?.schemaVersion, 6);
     store.replace(migrated, { event: "UPDATED" });
     assert.equal(
       (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
-      5,
+      6,
     );
   });
 
@@ -667,7 +691,7 @@ describe("ops worker task contract", () => {
 
     assert.deepEqual(input, before);
     assert.deepEqual(first, second);
-    assert.equal(first.schemaVersion, 5);
+    assert.equal(first.schemaVersion, 6);
     assert.deepEqual(first.steering, []);
     assert.equal(first.control.paused, false);
     assert.equal(first.authorizationVerification, null);
@@ -675,14 +699,14 @@ describe("ops worker task contract", () => {
     assert.deepEqual(input.authorization.scope, ["inspect"]);
   });
 
-  it("migrates an exact v3 snapshot to an unverified v5 composite contract", () => {
+  it("migrates an exact v3 snapshot to an unverified v6 composite contract", () => {
     const input = makeV3Task();
     const before = clone(input);
 
     const migrated = parseOpsWorkerTask(input, registry);
 
     assert.deepEqual(input, before);
-    assert.equal(migrated.schemaVersion, 5);
+    assert.equal(migrated.schemaVersion, 6);
     assert.equal(migrated.lifecycle.schemaVersion, 2);
     assert.equal(migrated.lifecycle.verifier, null);
     assert.equal(migrated.lifecycle.verifierVersion, null);
@@ -712,17 +736,74 @@ describe("ops worker task contract", () => {
       releaseReason: "DONE",
     };
     attachFreshPass(current, NOW);
-    const { steering: _steering, control: _control, ...withoutControl } = current;
+    const {
+      agentResult: _agentResult,
+      steering: _steering,
+      control: _control,
+      ...withoutControl
+    } = current;
     const input: OpsWorkerTaskV4 = { ...withoutControl, schemaVersion: 4 };
     const before = clone(input);
 
     const migrated = parseOpsWorkerTask(input, registry);
 
     assert.deepEqual(input, before);
-    assert.equal(migrated.schemaVersion, 5);
+    assert.equal(migrated.schemaVersion, 6);
+    assert.equal(migrated.agentResult, null);
     assert.deepEqual(migrated.steering, []);
     assert.equal(migrated.control.paused, false);
     assert.equal(migrated.verification?.subjectHash, input.verification?.subjectHash);
+  });
+
+  it("migrates an exact v5 snapshot with null current agent result", () => {
+    const input = makeV5Task();
+    const before = clone(input);
+
+    const migrated = parseOpsWorkerTask(input, registry);
+
+    assert.deepEqual(input, before);
+    assert.equal(migrated.schemaVersion, 6);
+    assert.equal(migrated.agentResult, null);
+    assert.deepEqual(migrated.steering, input.steering);
+    assert.deepEqual(migrated.control, input.control);
+  });
+
+  it("strictly validates and canonically binds bounded typed agent results", () => {
+    const task = makeTask();
+    const beforeHash = hashOpsWorkerVerificationSubject(task);
+    task.agentResult = {
+      attemptId: "attempt-result-01",
+      kind: "input-needed",
+      summary: "Need bounded operator information.",
+      actions: ["Inspected the local fixture."],
+      requestedInput: "Which local fixture is authoritative?",
+      reason: "information",
+    };
+    const parsed = parseOpsWorkerTask(task, registry);
+    assert.deepEqual(parsed.agentResult, task.agentResult);
+    assert.equal(
+      hashOpsWorkerAgentResult(task.agentResult),
+      hashOpsWorkerAgentResult({
+        reason: "information",
+        requestedInput: "Which local fixture is authoritative?",
+        actions: ["Inspected the local fixture."],
+        summary: "Need bounded operator information.",
+        kind: "input-needed",
+        attemptId: "attempt-result-01",
+      }),
+    );
+    assert.notEqual(hashOpsWorkerVerificationSubject(task), beforeHash);
+
+    const unknown = clone(task) as unknown as Record<string, unknown>;
+    (unknown.agentResult as Record<string, unknown>).command = "sudo anything";
+    assert.throws(() => parseOpsWorkerTask(unknown, registry), /command: unknown field/);
+
+    const oversized = clone(task);
+    (oversized.agentResult as NonNullable<OpsWorkerTask["agentResult"]>).actions = Array.from(
+      { length: OPS_WORKER_LIMITS.maxAgentResultActions + 1 },
+      () => "bounded action",
+    );
+    assert.throws(() => parseOpsWorkerTask(oversized, registry), /at most 16 entries/);
   });
 
   it("strictly validates bounded opaque steering and the fixed control record", () => {
@@ -789,10 +870,10 @@ describe("ops worker task contract", () => {
   });
 
   it("rejects future versions and unknown fields in every supported schema", () => {
-    const future = { ...makeTask(), schemaVersion: 6 };
+    const future = { ...makeTask(), schemaVersion: 7 };
     assert.throws(
       () => parseOpsWorkerTask(future, registry),
-      /supported version 1, 2, 3, 4, or 5/,
+      /supported version 1, 2, 3, 4, 5, or 6/,
     );
     assert.throws(
       () => parseOpsWorkerTask({ ...makeV1Task(), resource: { kind: "host", key: "host:local" } }, registry),
@@ -809,6 +890,10 @@ describe("ops worker task contract", () => {
     assert.throws(
       () => parseOpsWorkerTask({ ...makeV4Task(), steering: [] }, registry),
       /task\.steering: unknown field/,
+    );
+    assert.throws(
+      () => parseOpsWorkerTask({ ...makeV5Task(), agentResult: null }, registry),
+      /task\.agentResult: unknown field/,
     );
     const futureLifecycle = clone(makeTask()) as unknown as Record<string, unknown>;
     (futureLifecycle.lifecycle as Record<string, unknown>).workflow = "arbitrary";
@@ -1468,13 +1553,14 @@ describe("ops worker task contract", () => {
 });
 
 describe("ops worker durable task store", () => {
-  it("loads exact v1-v4 snapshots purely on read and writes only canonical v5", (t) => {
+  it("loads exact v1-v5 snapshots purely on read and writes only canonical v6", (t) => {
     const store = makeStore(t);
     const previousTasks = [
       makeV1Task("read-migrate-v1", "read:migrate:v1"),
       makeV2Task("read-migrate-v2", "read:migrate:v2"),
       makeV3Task("read-migrate-v3", "read:migrate:v3"),
       makeV4Task("read-migrate-v4", "read:migrate:v4"),
+      makeV5Task("read-migrate-v5", "read:migrate:v5"),
     ];
 
     for (const previous of previousTasks) {
@@ -1484,7 +1570,8 @@ describe("ops worker durable task store", () => {
 
       const loaded = store.get(previous.id);
       assert.ok(loaded);
-      assert.equal(loaded.schemaVersion, 5);
+      assert.equal(loaded.schemaVersion, 6);
+      assert.equal(loaded.agentResult, null);
       assert.deepEqual(loaded.steering, []);
       assert.deepEqual(loaded.control, {
         paused: false,
@@ -1496,13 +1583,13 @@ describe("ops worker durable task store", () => {
       assert.equal(readFileSync(snapshotPath, "utf8"), rawLegacy);
 
       store.replace(loaded, { event: "UPDATED" });
-      const canonicalV5 = readFileSync(snapshotPath, "utf8");
+      const canonicalV6 = readFileSync(snapshotPath, "utf8");
       assert.equal(
-        (JSON.parse(canonicalV5) as OpsWorkerTask).schemaVersion,
-        5,
+        (JSON.parse(canonicalV6) as OpsWorkerTask).schemaVersion,
+        6,
       );
       assert.deepEqual(store.get(previous.id), loaded);
-      assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV5);
+      assert.equal(readFileSync(snapshotPath, "utf8"), canonicalV6);
     }
   });
 
@@ -1821,7 +1908,7 @@ describe("ops worker durable task store", () => {
       assert.equal(store.get(previous.id)?.report.attempts, 1);
       assert.equal(
         (JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask).schemaVersion,
-        5,
+        6,
       );
     }
   });

@@ -338,7 +338,7 @@ describe("Alertmanager conversion and task-store submission", () => {
 
     const loaded = store.get(legacy.id);
 
-    assert.equal(loaded?.schemaVersion, 5);
+    assert.equal(loaded?.schemaVersion, 6);
     assert.equal(loaded?.source.template, OPS_AVAILABILITY_TEMPLATE_NAME);
     assert.equal(loaded?.doneCheck.name, OPS_AVAILABILITY_DONE_CHECK_NAME);
     assert.equal(readFileSync(snapshotPath, "utf8"), serialized);
@@ -592,7 +592,7 @@ describe("authenticated loopback Alertmanager route", () => {
     assert.deepEqual(await health.json(), {
       ok: true,
       service: "minime-ops-worker",
-      schemaVersion: 5,
+      schemaVersion: 6,
     });
   });
 

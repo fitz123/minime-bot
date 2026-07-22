@@ -123,16 +123,16 @@ Alertmanager credential mount is introduced.
 **Goal:** Persist one current untrusted agent result and report it without leaking configured
 secrets.
 
-- [ ] Add schema-v6 `agentResult` parsing, canonical hashing, v1-v5 compatibility, and round-trip
+- [x] Add schema-v6 `agentResult` parsing, canonical hashing, v1-v5 compatibility, and round-trip
       tests in `src/ops-worker/types.ts` and task-store fixtures.
-- [ ] Add result-file creation after persisted attempt identity, exact bounded validation, cleanup,
+- [x] Add result-file creation after persisted attempt identity, exact bounded validation, cleanup,
       protocol-failure accounting, typed blocker transition, and retry clearing in
       `pi-attempt.ts` / `supervisor.ts`.
-- [ ] Add a shared field redactor and result-bearing Telegram report with per-field/total budgets.
-- [ ] Test all four result kinds, malformed/missing/id-mismatch files, restart/fault boundaries,
+- [x] Add a shared field redactor and result-bearing Telegram report with per-field/total budgets.
+- [x] Test all four result kinds, malformed/missing/id-mismatch files, restart/fault boundaries,
       five protocol failures, `/answer` + `/retry`, legacy exits, exact-secret redaction, and one
       durable report receipt.
-- [ ] Run the focused type/store/attempt/supervisor/report tests before Task 2.
+- [x] Run the focused type/store/attempt/supervisor/report tests before Task 2.
 
 ### Task 2: Add the generic contract and convergent done check [HIGH]
 

@@ -212,7 +212,56 @@ async function emitProviderResponse(status, headers) {
   }
 }
 
+function writeAgentResult(kind, overrides = {}) {
+  const resultFile = process.env.OPS_WORKER_RESULT_FILE;
+  const attemptId = process.env.OPS_WORKER_ATTEMPT_ID;
+  if (!resultFile || !attemptId) {
+    process.stderr.write("fake Pi requires the typed result environment\n");
+    process.exit(64);
+  }
+  writeFileSync(resultFile, JSON.stringify({
+    attemptId,
+    kind,
+    summary: `Typed ${kind} fixture result.`,
+    actions: ["Inspected the local fixture."],
+    requestedInput: kind === "input-needed" ? "Provide the fixture choice." : null,
+    reason: kind === "input-needed"
+      ? "information"
+      : kind === "impossible"
+      ? "unrecoverable"
+      : null,
+    ...overrides,
+  }), "utf8");
+}
+
 switch (scenario) {
+  case "agent-result-remediation-complete":
+    await emitProviderResponse(200, {});
+    writeAgentResult("remediation-complete");
+    break;
+  case "agent-result-no-action-needed":
+    await emitProviderResponse(200, {});
+    writeAgentResult("no-action-needed", { actions: [] });
+    break;
+  case "agent-result-input-needed":
+    await emitProviderResponse(200, {});
+    writeAgentResult("input-needed");
+    break;
+  case "agent-result-impossible":
+    await emitProviderResponse(200, {});
+    writeAgentResult("impossible");
+    break;
+  case "agent-result-missing":
+    await emitProviderResponse(200, {});
+    break;
+  case "agent-result-malformed":
+    await emitProviderResponse(200, {});
+    writeFileSync(process.env.OPS_WORKER_RESULT_FILE, "{not-json", "utf8");
+    break;
+  case "agent-result-id-mismatch":
+    await emitProviderResponse(200, {});
+    writeAgentResult("no-action-needed", { attemptId: "attempt-wrong" });
+    break;
   case "success":
     await emitProviderResponse(200, {});
     process.stdout.write("fake Pi success claim\n");
