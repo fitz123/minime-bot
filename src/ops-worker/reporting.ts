@@ -4,6 +4,7 @@ const TRUNCATION_MARKER = "… [truncated]";
 const REDACTED = "[REDACTED]";
 
 export const OPS_WORKER_REPORT_FIELD_LIMITS = Object.freeze({
+  incidentIdentityBytes: 1024,
   agentSummaryBytes: 1024,
   agentActionBytes: 512,
   agentActions: 8,
@@ -65,6 +66,58 @@ interface ReportLine {
   minimum: string;
 }
 
+function plainStringMap(value: unknown): Record<string, string> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.some(([key, entry]) => key.length === 0 || typeof entry !== "string")) {
+    return null;
+  }
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function alertmanagerIncidentIdentity(task: Readonly<OpsWorkerTask>): string | null {
+  if (task.source.kind !== "alertmanager" || !Array.isArray(task.evidence)) return null;
+  let groupLabels: Record<string, string> | null = null;
+  const alertNames = new Set<string>();
+  const episodeStarts: string[] = [];
+  for (const evidence of task.evidence) {
+    if (evidence.kind !== "alert") continue;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(evidence.summary) as unknown;
+    } catch {
+      continue;
+    }
+    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) continue;
+    const record = decoded as Record<string, unknown>;
+    if (
+      record.type === "alertmanager-group-correlation-v1"
+      && record.correlationKey === task.source.correlationKey
+    ) {
+      groupLabels = plainStringMap(record.groupLabels);
+      continue;
+    }
+    if (record.status !== "firing" || typeof record.startsAt !== "string") continue;
+    const labels = plainStringMap(record.labels);
+    if (labels === null) continue;
+    if (typeof labels.alertname === "string" && labels.alertname.length > 0) {
+      alertNames.add(labels.alertname);
+    }
+    if (Number.isFinite(Date.parse(record.startsAt))) episodeStarts.push(record.startsAt);
+  }
+  if (groupLabels === null) return null;
+  const canonicalGroup = Object.fromEntries(
+    Object.entries(groupLabels).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return [
+    `alertname=${[...alertNames].sort().join(",") || "unknown"}`,
+    `groupLabels=${JSON.stringify(canonicalGroup)}`,
+    `episodeStart=${episodeStarts.sort()[0] ?? "unknown"}`,
+  ].join(" ");
+}
+
 function fitReportLines(lines: readonly ReportLine[], maxBytes: number): string {
   const newlineBytes = Math.max(0, lines.length - 1);
   const minimumBytes = lines.reduce(
@@ -124,6 +177,17 @@ export function buildOpsWorkerTelegramReport(
     },
     { prefix: "state=", value: task.state, minimum: task.state },
   ];
+  const incidentIdentity = alertmanagerIncidentIdentity(task);
+  if (incidentIdentity !== null) {
+    lines.splice(2, 0, {
+      prefix: "incident=",
+      value: options.redact(
+        incidentIdentity,
+        OPS_WORKER_REPORT_FIELD_LIMITS.incidentIdentityBytes,
+      ),
+      minimum: "…",
+    });
+  }
   const result = task.agentResult;
   if (result === null) {
     lines.push(

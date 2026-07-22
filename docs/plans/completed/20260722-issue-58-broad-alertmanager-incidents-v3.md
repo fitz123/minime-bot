@@ -75,9 +75,11 @@ A new composite done check uses existing bounded loopback readers:
    previous five minutes.
 
 Query errors, stale telemetry, and the five-minute stability wait stay in `CHECKING` with bounded
-rechecks and do not spend remediation rounds. If the exact alert is still present after a
-completion/no-action claim, that claim is disproved: spend one remediation round and resume the
-agent. Five disproved claims or protocol failures end in reported `BLOCKED`. The agent may work
+rechecks and do not spend remediation rounds when no component reports `PRODUCT_FAILURE`. A
+conclusive still-present exact group takes aggregate precedence over a simultaneous query or
+verifier failure: after a completion/no-action claim it spends one remediation round and resumes
+the agent. Every accepted refire invalidates an older absence window. Five disproved claims or
+protocol failures end in reported `BLOCKED`. The agent may work
 and resume for any duration before making a claim; global custody cannot be held forever by a
 passive false-completion wait.
 

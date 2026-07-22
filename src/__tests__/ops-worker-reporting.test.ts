@@ -116,4 +116,50 @@ describe("ops worker result reporting", () => {
     assert.equal(result.includes("EXACT_CANARY"), false);
     assert.match(result, /… \[truncated\]$/);
   });
+
+  it("renders bounded redacted Alertmanager group and episode identity", () => {
+    const configuredCanary = "REPORT_IDENTITY_CANARY_58";
+    const correlationKey = `lab-alertmanager:group:${"b".repeat(64)}`;
+    const task = {
+      id: "report-identity-fixture",
+      source: {
+        kind: "alertmanager",
+        template: "ops.alertmanager-incident",
+        correlationKey,
+      },
+      evidence: [
+        {
+          kind: "alert",
+          summary: JSON.stringify({
+            type: "alertmanager-group-correlation-v1",
+            correlationKey,
+            groupLabels: { alertname: "HostHighCPU", cluster: configuredCanary },
+          }),
+        },
+        {
+          kind: "alert",
+          summary: JSON.stringify({
+            status: "firing",
+            startsAt: "2026-07-22T11:55:00.000Z",
+            labels: { alertname: "HostHighCPU", cluster: configuredCanary },
+          }),
+        },
+      ],
+      state: "BLOCKED",
+      agentResult: null,
+      verification: null,
+      lastOutcome: null,
+      updatedAt: "2026-07-22T12:00:00.000Z",
+    } as unknown as OpsWorkerTask;
+
+    const report = buildOpsWorkerTelegramReport(task, {
+      redact: createOpsWorkerFieldRedactor([configuredCanary]),
+      maxBytes: 4_096,
+    });
+
+    assert.match(report, /incident=alertname=HostHighCPU/);
+    assert.match(report, /groupLabels=\{"alertname":"HostHighCPU","cluster":"\[REDACTED\]"\}/);
+    assert.match(report, /episodeStart=2026-07-22T11:55:00.000Z/);
+    assert.equal(report.includes(configuredCanary), false);
+  });
 });

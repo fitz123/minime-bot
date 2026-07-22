@@ -43,7 +43,7 @@ const LATER = "2026-07-19T10:01:00.000Z";
 const SOURCE_IDENTITY = "lab-alertmanager";
 const CONTENT_TYPE = "application/json; charset=utf-8";
 
-function contracts() {
+function contracts(now: () => Date = () => new Date(NOW)) {
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: {
       read: () => ({
@@ -54,17 +54,25 @@ function contracts() {
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
       }),
     },
-    clock: () => new Date(NOW),
+    clock: now,
     incidentMonitoringReader: {
-      readMonitoringFreshness: () => ({ observedAt: NOW, latestSampleAt: NOW }),
-      readResolutionStability: () => ({
-        observedAt: NOW,
-        latestMatchingSampleAt: null,
-        monitoringWindowStartedAt: "2026-07-19T09:55:00.000Z",
-      }),
+      readMonitoringFreshness: () => {
+        const observedAt = now().toISOString();
+        return { observedAt, latestSampleAt: observedAt };
+      },
+      readResolutionStability: () => {
+        const observedAt = now().toISOString();
+        return {
+          observedAt,
+          latestMatchingSampleAt: null,
+          monitoringWindowStartedAt: new Date(
+            Date.parse(observedAt) - 5 * 60_000,
+          ).toISOString(),
+        };
+      },
     },
     incidentAlertmanagerReader: {
-      readExactGroupState: () => ({ observedAt: NOW, status: "ABSENT" }),
+      readExactGroupState: () => ({ observedAt: now().toISOString(), status: "ABSENT" }),
     },
     monitoringFreshnessReader: {
       readMonitoringFreshness: () => ({
@@ -88,19 +96,19 @@ function contracts() {
   });
 }
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, now: () => Date = () => new Date(NOW)) {
   const directory = mkdtempSync(join(tmpdir(), "minime-alertmanager-intake-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const taskContracts = contracts();
+  const taskContracts = contracts(now);
   const store = new OpsWorkerTaskStore(directory, {
     registry: taskContracts.taskRegistry,
-    now: () => new Date(NOW),
+    now,
   });
   const intake = new OpsWorkerAlertmanagerIntake({
     store,
     doneChecks: taskContracts.doneChecks,
     sourceIdentity: SOURCE_IDENTITY,
-    now: () => new Date(NOW),
+    now,
   });
   return { directory, intake, store, taskContracts };
 }
@@ -351,7 +359,25 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(task.evidence.length, 64);
     assert.match(task.evidence[0].summary, /"groupLabels":\{\}/);
     assert.match(task.evidence.at(-1)?.summary ?? "", /"omittedAlerts":2/);
-    assert.match(task.evidence.at(-1)?.summary ?? "", /"totalFiringAlerts":64/);
+    assert.match(task.evidence.at(-1)?.summary ?? "", /"locallyOmittedFiringAlerts":2/);
+    assert.match(task.evidence.at(-1)?.summary ?? "", /"upstreamOmittedAlerts":0/);
+    assert.match(task.evidence.at(-1)?.summary ?? "", /"deliveredFiringAlerts":64/);
+  });
+
+  it("retains Alertmanager's upstream truncation count even when local evidence fits", (t) => {
+    const { intake, store } = fixture(t);
+
+    const result = intake.submit(body(webhook({ truncatedAlerts: 7 })), CONTENT_TYPE);
+
+    const task = store.get(result.taskId ?? "");
+    assert.ok(task);
+    const omission = task.evidence.find((entry) =>
+      entry.summary.includes("alertmanager-alert-omission-v1"));
+    assert.ok(omission);
+    assert.match(omission.summary, /"includedAlerts":1/);
+    assert.match(omission.summary, /"omittedAlerts":7/);
+    assert.match(omission.summary, /"locallyOmittedFiringAlerts":0/);
+    assert.match(omission.summary, /"upstreamOmittedAlerts":7/);
   });
 
   it("loads and claims a persisted v5 legacy availability snapshot under v2 contracts", async (t) => {
@@ -428,10 +454,10 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(JSON.parse(readFileSync(snapshotPath, "utf8")).schemaVersion, 6);
   });
 
-  it("returns identical delivery replay without another row or audit append", (t) => {
+  it("records active delivery replays without creating another task", (t) => {
     const { intake, store } = fixture(t);
     const first = intake.submit(body(webhook()), CONTENT_TYPE);
-    const journalBefore = readFileSync(store.journalPath, "utf8");
+    const journalEntriesBefore = readFileSync(store.journalPath, "utf8").trim().split("\n").length;
 
     const replay = intake.submit(body(webhook()), CONTENT_TYPE);
     const changedOpaqueGroupKey = intake.submit(body(webhook({
@@ -445,7 +471,46 @@ describe("Alertmanager conversion and task-store submission", () => {
       replayed: true,
     });
     assert.equal(store.list().length, 1);
-    assert.equal(readFileSync(store.journalPath, "utf8"), journalBefore);
+    const persisted = store.get(first.taskId ?? "");
+    assert.ok(persisted);
+    assert.equal(persisted.evidence.filter((entry) =>
+      entry.summary.includes("alertmanager-firing-observation-v1")).length, 1);
+    assert.equal(
+      readFileSync(store.journalPath, "utf8").trim().split("\n").length,
+      journalEntriesBefore + 2,
+    );
+  });
+
+  it("starts a new durable absence window after an accepted refire", async (t) => {
+    let current = new Date(NOW);
+    const now = () => new Date(current);
+    const { intake, store, taskContracts } = fixture(t, now);
+    const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "refire-absence-window",
+      processStartToken: "refire-absence-window-start",
+      now,
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+    await supervisor.requestDoneCheck(first.taskId ?? "");
+    const initialAbsence = await supervisor.runDoneCheck(first.taskId ?? "");
+    assert.equal(initialAbsence.verification?.outcome, "NOT_READY");
+    assert.equal(initialAbsence.schedule.nextCheckAt, "2026-07-19T10:05:00.000Z");
+
+    current = new Date("2026-07-19T10:04:00.000Z");
+    const replay = intake.submit(body(webhook()), CONTENT_TYPE);
+    assert.equal(replay.replayed, true);
+    const invalidated = store.get(first.taskId ?? "");
+    assert.equal(invalidated?.verification, null);
+    assert.equal(invalidated?.schedule.nextCheckAt, current.toISOString());
+
+    const restartedAbsence = await supervisor.runDoneCheck(first.taskId ?? "");
+    assert.equal(restartedAbsence.verification?.outcome, "NOT_READY");
+    assert.equal(restartedAbsence.schedule.nextCheckAt, "2026-07-19T10:09:00.000Z");
   });
 
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {

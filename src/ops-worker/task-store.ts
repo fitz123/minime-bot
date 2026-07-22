@@ -151,6 +151,31 @@ interface OpsWorkerDeliveryReceipt {
   submissionFingerprint: string;
 }
 
+interface OpsWorkerFiringObservation {
+  type: "alertmanager-firing-observation-v1";
+  correlationKey: string;
+  deliveryKey: string;
+}
+
+function parseFiringObservation(evidence: OpsWorkerTask["evidence"][number]):
+OpsWorkerFiringObservation | undefined {
+  if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).length !== 3
+      || record.type !== "alertmanager-firing-observation-v1"
+      || typeof record.correlationKey !== "string"
+      || typeof record.deliveryKey !== "string"
+    ) return undefined;
+    return record as unknown as OpsWorkerFiringObservation;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseDeliveryReceipt(evidence: OpsWorkerTask["evidence"][number]):
 OpsWorkerDeliveryReceipt | undefined {
   if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
@@ -821,6 +846,25 @@ export class OpsWorkerTaskStore {
           .has(task.submissionFingerprint)
       ) {
         this.assertGlobalInvariants(currentTasks);
+        if (!isOpsWorkerTerminalState(deliveryOwner.state)) {
+          const working = structuredClone(deliveryOwner);
+          this.refreshAcceptedFiringObservation(working, task);
+          compactOpsWorkerEvidenceForSnapshot(working);
+          const persisted = parseOpsWorkerTask(working, this.registry);
+          this.assertImmutableIdentity(deliveryOwner, persisted);
+          this.assertReplaySafety(deliveryOwner, persisted);
+          this.assertJournalSafe();
+          this.assertGlobalInvariants(this.withReplacement(currentTasks, persisted));
+          this.injectFault("after-correlation-check");
+          return {
+            task: persisted,
+            created: false,
+            ...this.write(persisted, this.snapshotPath(persisted.id), {
+              event: "EVIDENCE",
+              summary: "Refreshed accepted Alertmanager firing observation",
+            }),
+          };
+        }
         return {
           task: deliveryOwner,
           created: false,
@@ -858,9 +902,10 @@ export class OpsWorkerTaskStore {
           deliveryKey: task.source.deliveryKey,
           submissionFingerprint: task.submissionFingerprint,
         };
+        const observedAt = this.refreshAcceptedFiringObservation(working, task);
         try {
           appendOpsWorkerEvidence(working, {
-            at: this.nextUpdatedAt(working),
+            at: observedAt,
             kind: "system",
             trust: "trusted",
             summary: JSON.stringify(receipt),
@@ -872,7 +917,6 @@ export class OpsWorkerTaskStore {
             `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
           );
         }
-        working.updatedAt = this.nextUpdatedAt(working);
         compactOpsWorkerEvidenceForSnapshot(working);
         const persisted = parseOpsWorkerTask(working, this.registry);
         this.assertImmutableIdentity(activeOwner, persisted);
@@ -1168,6 +1212,34 @@ export class OpsWorkerTaskStore {
       this.now().getTime(),
       Date.parse(task.updatedAt) + 1,
     )).toISOString();
+  }
+
+  private refreshAcceptedFiringObservation(
+    task: OpsWorkerTask,
+    submission: Readonly<OpsWorkerTask>,
+  ): string {
+    const observedAt = new Date(Math.max(
+      this.now().getTime(),
+      Date.parse(submission.createdAt),
+      Date.parse(task.updatedAt) + 1,
+    )).toISOString();
+    task.evidence = task.evidence.filter((entry) =>
+      parseFiringObservation(entry) === undefined);
+    appendOpsWorkerEvidence(task, {
+      at: observedAt,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "alertmanager-firing-observation-v1",
+        correlationKey: task.source.correlationKey,
+        deliveryKey: submission.source.deliveryKey,
+      } satisfies OpsWorkerFiringObservation),
+      artifact: null,
+    });
+    task.verification = null;
+    if (task.state === "CHECKING") task.schedule.nextCheckAt = observedAt;
+    task.updatedAt = observedAt;
+    return observedAt;
   }
 
   private appendSteeringEntry(

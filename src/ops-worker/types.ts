@@ -583,6 +583,22 @@ export function hashOpsWorkerPiLaunchSubject(task: OpsWorkerTask): string {
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
+/** Exact persisted fields that determine one user-visible terminal report. */
+export function hashOpsWorkerReportPayload(
+  task: Pick<
+    OpsWorkerTask,
+    "state" | "lastOutcome" | "agentResult" | "verification"
+  >,
+): string {
+  const canonical = stableJson({
+    taskState: task.state,
+    lastOutcome: task.lastOutcome,
+    agentResult: task.agentResult,
+    verification: task.verification,
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 /** Immutable fingerprint of the adapter-supplied semantic task envelope. */
 export function hashOpsWorkerCanonicalSubmission(
   task: Pick<

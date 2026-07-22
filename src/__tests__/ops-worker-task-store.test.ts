@@ -769,6 +769,47 @@ describe("ops worker task contract", () => {
     assert.deepEqual(migrated.control, input.control);
   });
 
+  it("accepts the exact v5 byte limit and rejects one additional byte", () => {
+    const input = makeV5Task();
+    const evidence = {
+      at: NOW,
+      kind: "operator" as const,
+      trust: "trusted" as const,
+      summary: "x",
+      artifact: null,
+    };
+    input.evidence = Array.from(
+      { length: OPS_WORKER_LIMITS.maxEvidenceEntries },
+      () => ({ ...evidence }),
+    );
+    let remaining = OPS_WORKER_LIMITS.maxV5SnapshotBytes
+      - Buffer.byteLength(JSON.stringify(input), "utf8");
+    for (const entry of input.evidence) {
+      if (remaining === 0) break;
+      const escapedCharacters = Math.min(
+        OPS_WORKER_LIMITS.maxEvidenceSummaryBytes - 1,
+        Math.floor(remaining / 6),
+      );
+      entry.summary += "\u0001".repeat(escapedCharacters);
+      remaining -= escapedCharacters * 6;
+      if (remaining > 0 && remaining < 6) {
+        entry.summary += "x".repeat(remaining);
+        remaining = 0;
+      }
+    }
+    assert.equal(remaining, 0);
+    const raw = JSON.stringify(input);
+    assert.equal(Buffer.byteLength(raw, "utf8"), OPS_WORKER_LIMITS.maxV5SnapshotBytes);
+
+    const migrated = parseOpsWorkerTaskJson(raw, registry);
+    assert.equal(migrated.schemaVersion, 6);
+    assert.equal(migrated.agentResult, null);
+    assert.throws(
+      () => parseOpsWorkerTaskJson(`${raw} `, registry),
+      /v5 snapshot exceeds/,
+    );
+  });
+
   it("strictly validates and canonically binds bounded typed agent results", () => {
     const task = makeTask();
     const beforeHash = hashOpsWorkerVerificationSubject(task);

@@ -999,6 +999,8 @@ describe("Alertmanager webhook", () => {
       { ...common, MINIME_OPS_INTAKE_URL: "http://example.invalid/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://127.0.0.1:9093" },
       { ...common, MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://example.invalid" },
       { MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager" },
+      { MINIME_BRIDGE_TIMEOUT: "5" },
+      { MINIME_BRIDGE_TIMEOUT: "nan" },
     ];
     for (const env of cases) {
       const result = await runPython([webhookScript, "--port", "0"], env);
@@ -1008,6 +1010,77 @@ describe("Alertmanager webhook", () => {
       assertSecretAbsent(result);
       assertOpsSecretAbsent(result);
       assert.ok(!result.stderr.includes(dir));
+    }
+  });
+
+  it("rejects malformed bridge batches and retries malformed or oversized source responses", async () => {
+    let sourceResponse = "[]";
+    let sourceQueries = 0;
+    let opsAttempts = 0;
+    let telegramAttempts = 0;
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET") {
+        sourceQueries += 1;
+        response.end(sourceResponse);
+        return;
+      }
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") opsAttempts += 1;
+        if (request.url?.includes("/sendMessage")) telegramAttempts += 1;
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const inconsistent = alertmanagerPayload({ alertname: "Inconsistent" });
+      inconsistent.status = "resolved";
+      const invalidGroupLabel = alertmanagerPayload({ alertname: "InvalidLabel" });
+      invalidGroupLabel.groupLabels = { "invalid-label": "value" };
+      const tooManyAlerts = {
+        receiver: "minime-native-webhook",
+        status: "firing",
+        alerts: Array.from({ length: 1_025 }, () => ({
+          status: "firing",
+          labels: {},
+          startsAt: "2026-07-22T00:00:00Z",
+        })),
+        groupLabels: {},
+        version: "4",
+        groupKey: "{}:{}",
+      };
+      for (const invalid of [
+        { ...alertmanagerPayload({ alertname: "MissingDescriptor" }), groupLabels: undefined },
+        inconsistent,
+        invalidGroupLabel,
+        tooManyAlerts,
+      ]) {
+        assert.equal((await postWebhook(port, invalid)).status, 400);
+      }
+      assert.equal(sourceQueries, 0);
+      assert.equal(opsAttempts, 0);
+      assert.equal(telegramAttempts, 0);
+
+      sourceResponse = "{";
+      assert.equal(
+        (await postWebhook(port, alertmanagerPayload({ alertname: "MalformedSource" }))).status,
+        503,
+      );
+      sourceResponse = "x".repeat(1_000_001);
+      assert.equal(
+        (await postWebhook(port, alertmanagerPayload({ alertname: "OversizedSource" }))).status,
+        503,
+      );
+      assert.equal(sourceQueries, 2);
+      assert.equal(opsAttempts, 0);
+      assert.equal(telegramAttempts, 2, "each distinct failed source query uses native fallback");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
     }
   });
 

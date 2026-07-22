@@ -487,13 +487,15 @@ function alertGroupCorrelationEvidence(
 
 function boundedAlertEvidence(
   firingAlerts: readonly OpsAlertmanagerWebhookAlert[],
+  upstreamOmittedAlerts: number,
   at: string,
 ): OpsWorkerEvidence[] {
   const directCapacity = OPS_WORKER_LIMITS.maxEvidenceEntries - 1;
-  if (firingAlerts.length <= directCapacity) {
+  if (upstreamOmittedAlerts === 0 && firingAlerts.length <= directCapacity) {
     return firingAlerts.map((entry) => alertEvidence(entry, at));
   }
   const retained = firingAlerts.slice(0, directCapacity - 1);
+  const locallyOmittedFiringAlerts = firingAlerts.length - retained.length;
   return [
     ...retained.map((entry) => alertEvidence(entry, at)),
     {
@@ -503,8 +505,10 @@ function boundedAlertEvidence(
       summary: JSON.stringify({
         type: "alertmanager-alert-omission-v1",
         includedAlerts: retained.length,
-        omittedAlerts: firingAlerts.length - retained.length,
-        totalFiringAlerts: firingAlerts.length,
+        omittedAlerts: locallyOmittedFiringAlerts + upstreamOmittedAlerts,
+        locallyOmittedFiringAlerts,
+        upstreamOmittedAlerts,
+        deliveredFiringAlerts: firingAlerts.length,
       }),
       artifact: null,
     },
@@ -568,6 +572,7 @@ export class OpsWorkerAlertmanagerIntake {
       deliveryKey,
       deliveryDigest,
       webhook.groupLabels,
+      webhook.truncatedAlerts ?? 0,
     );
     const created = this.store.createOrReuseActiveCorrelation(task, {
       event: "CREATED",
@@ -582,6 +587,7 @@ export class OpsWorkerAlertmanagerIntake {
     deliveryKey: string,
     deliveryDigest: string,
     groupLabels: Record<string, string> | undefined,
+    upstreamOmittedAlerts: number,
   ): OpsWorkerTask {
     const current = this.now();
     if (!(current instanceof Date) || !Number.isFinite(current.getTime())) {
@@ -619,7 +625,7 @@ export class OpsWorkerAlertmanagerIntake {
       objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       evidence: [
         alertGroupCorrelationEvidence(correlationKey, groupLabels, now),
-        ...boundedAlertEvidence(firingAlerts, now),
+        ...boundedAlertEvidence(firingAlerts, upstreamOmittedAlerts, now),
       ],
       doneCheck: {
         name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,

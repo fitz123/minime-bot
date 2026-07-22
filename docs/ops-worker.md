@@ -366,8 +366,11 @@ Component and aggregate outcomes are `PASS`, `NOT_READY`, `PRODUCT_FAILURE`,
 `DEFER`, `VERIFIER_INVALID`, `QUERY_ERROR`, and `TIMEOUT`. Every required
 component must PASS for aggregate PASS. `DEFER` is reserved for passive external
 convergence. Product work resumes remediation; verifier invalidity, query
-failure, and timeout retry verification without consuming remediation. The
-aggregate subject hash includes the current task, checkpoint, authorization,
+failure, and timeout retry verification without consuming remediation when no
+required component has conclusively returned `PRODUCT_FAILURE`. A required
+`PRODUCT_FAILURE` has aggregate precedence over simultaneous query or verifier
+failures because the trusted product observation already disproves completion.
+The aggregate subject hash includes the current task, checkpoint, authorization,
 and pending steering state, so stale or partial PASS evidence is discarded.
 Only a fresh aggregate PASS recorded atomically with the terminal transition
 can produce `DONE` and release custody. Repeated diagnostic failures remain
@@ -392,7 +395,8 @@ snapshots, but Alertmanager intake no longer selects it.
 
 The bounded intake accepts up to 1,024 alerts within the 256 KiB body limit.
 Task evidence retains the exact group descriptor, a bounded alert subset, and
-an omission count when the group is larger than the task evidence capacity. An
+separate local and upstream omission counts when either the group exceeds task
+evidence capacity or Alertmanager reports a truncated delivery. An
 empty `groupLabels` map represents Alertmanager's single ungrouped route group;
 absence and stability then apply to all active alerts.
 Correlation and delivery identities are derived from the canonical verified
@@ -400,6 +404,10 @@ group-label descriptor and source-verified episode start rather than the opaque
 webhook `groupKey`, so changing unverified opaque text cannot split one
 incident. The native bridge likewise excludes `groupKey` from its delivery
 deduplication identity.
+Every accepted firing delivery for an active correlation, including an exact
+replay, records a fresh durable observation and invalidates any older absence
+window. A refire therefore requires a new five-minute absence proof after the
+latest accepted firing observation.
 
 For this template, the harness creates a fresh result-file path only after the
 attempt identity is persisted and passes it as `OPS_WORKER_RESULT_FILE`. The
@@ -455,8 +463,10 @@ The generic check requires all three package-owned components to pass:
 
 Stale telemetry, query errors, timeouts, and the five-minute convergence wait
 remain in `CHECKING`, schedule bounded rechecks, and do not spend remediation
-rounds. A still-present exact group disproves a completion or no-action claim,
-spends one of five remediation rounds, and resumes the same agent session.
+rounds when no component returns `PRODUCT_FAILURE`. A still-present exact group
+is conclusive even if another component errors: it disproves a completion or
+no-action claim, spends one of five remediation rounds, and resumes the same
+agent session.
 Thus passive convergence cannot become `DONE`, but it also cannot starve future
 work indefinitely behind a false completion claim.
 
@@ -467,7 +477,9 @@ changes are outside ordinary repair policy, must be disclosed in the typed
 result, and remain subject to the existing approval gates.
 
 Terminal Telegram reports are built only from persisted task, result, and
-verification state. They include incident identity, typed outcome, diagnosis,
+verification state. Alertmanager reports render bounded/redacted alert names,
+exact group labels, and an available persisted episode start in addition to the
+task and correlation identities. Reports also include typed outcome, diagnosis,
 actions, requested input when blocked, verifier components, and `checkedAt`.
 Every agent-authored field is redacted for configured sensitive values,
 credential assignments, bearer tokens, URL credentials and secret query

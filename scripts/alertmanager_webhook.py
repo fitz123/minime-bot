@@ -746,7 +746,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bridge-timeout",
         type=float,
-        default=os.environ.get(BRIDGE_TIMEOUT_ENV, "5"),
+        default=os.environ.get(BRIDGE_TIMEOUT_ENV),
     )
     return parser
 
@@ -758,9 +758,11 @@ def _load_bridge(args: argparse.Namespace) -> BridgeConfig | None:
         os.environ.get(OPS_INTAKE_SOPS_FILE_ENV, ""),
         os.environ.get(OPS_INTAKE_SOPS_KEY_ENV, ""),
     ]
-    if not any(sources):
+    timeout_supplied = args.bridge_timeout is not None
+    if not any(sources) and not timeout_supplied:
         return None
-    if not all(sources) or not math.isfinite(args.bridge_timeout) or not 0 < args.bridge_timeout <= 30:
+    timeout = 5.0 if args.bridge_timeout is None else args.bridge_timeout
+    if not all(sources) or not math.isfinite(timeout) or not 0 < timeout <= 30:
         raise DeliveryError("bridge configuration is incomplete")
     ops_intake_url = normalize_loopback_http_url(
         args.ops_intake_url,
@@ -784,7 +786,7 @@ def _load_bridge(args: argparse.Namespace) -> BridgeConfig | None:
         ops_intake_url=ops_intake_url,
         alertmanager_url=alertmanager_url,
         bearer=bearer,
-        timeout=args.bridge_timeout,
+        timeout=timeout,
     )
 
 

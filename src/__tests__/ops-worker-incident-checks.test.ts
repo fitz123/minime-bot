@@ -250,6 +250,36 @@ describe("generic Alertmanager incident done check", () => {
     assert.equal(flapResult.components[2].outcome, "NOT_READY");
   });
 
+  it("independently rejects stale and impossible Alertmanager and stability observations", async () => {
+    const staleAlerts = healthyReadings();
+    staleAlerts.alerts.observedAt = "2026-07-22T11:57:59.999Z";
+    assert.equal((await runIncident(staleAlerts)).result, "NOT_READY");
+
+    const futureAlerts = healthyReadings();
+    futureAlerts.alerts.observedAt = "2026-07-22T12:00:00.001Z";
+    assert.equal((await runIncident(futureAlerts)).result, "VERIFIER_INVALID");
+
+    const staleStability = healthyReadings();
+    staleStability.stability.observedAt = "2026-07-22T11:57:59.999Z";
+    assert.equal((await runIncident(staleStability)).result, "NOT_READY");
+
+    for (const mutate of [
+      (readings: ReturnType<typeof healthyReadings>) => {
+        readings.stability.observedAt = "2026-07-22T12:00:00.001Z";
+      },
+      (readings: ReturnType<typeof healthyReadings>) => {
+        readings.stability.latestMatchingSampleAt = "2026-07-22T12:00:00.001Z";
+      },
+      (readings: ReturnType<typeof healthyReadings>) => {
+        readings.stability.monitoringWindowStartedAt = "2026-07-22T12:00:00.001Z";
+      },
+    ]) {
+      const impossible = healthyReadings();
+      mutate(impossible);
+      assert.equal((await runIncident(impossible)).result, "VERIFIER_INVALID");
+    }
+  });
+
   it("types reader errors, invalid output, and the fixed component timeout", async () => {
     const queryErrorRegistry = createOpsIncidentDoneCheckRegistry({
       clock: () => new Date(NOW),
@@ -666,5 +696,104 @@ describe("bounded generic monitoring readers", () => {
       }),
       /byte bound/,
     );
+
+    const context = {
+      signal: new AbortController().signal,
+      taskId: "invalid-reader-boundary",
+      sourceKind: "alertmanager" as const,
+      sourceCorrelationKey: CORRELATION_KEY,
+      sourceEvidence: correlationEvidence("InvalidReaderBoundary"),
+    };
+    const prometheusEnvelope = (result: unknown) => ({
+      status: "success",
+      data: { resultType: "matrix", result },
+    });
+    const cases: Array<{
+      name: string;
+      response: Response;
+      reader: "alertmanager" | "prometheus";
+    }> = [
+      {
+        name: "non-success status",
+        response: jsonResponse({}, 503),
+        reader: "prometheus",
+      },
+      {
+        name: "wrong content type",
+        response: new Response("{}", { headers: { "content-type": "text/plain" } }),
+        reader: "prometheus",
+      },
+      {
+        name: "malformed JSON",
+        response: new Response("{", { headers: { "content-type": "application/json" } }),
+        reader: "prometheus",
+      },
+      {
+        name: "excessive Alertmanager cardinality",
+        response: jsonResponse(Array.from(
+          { length: OPS_INCIDENT_CHECK_LIMITS.maxAlertCount + 1 },
+          () => ({ labels: {}, status: { state: "active" } }),
+        )),
+        reader: "alertmanager",
+      },
+      {
+        name: "invalid Alertmanager labels",
+        response: jsonResponse([{ labels: { "": "invalid" }, status: { state: "active" } }]),
+        reader: "alertmanager",
+      },
+      {
+        name: "invalid Alertmanager state",
+        response: jsonResponse([{ labels: {}, status: { state: "resolved" } }]),
+        reader: "alertmanager",
+      },
+      {
+        name: "excessive Prometheus series",
+        response: jsonResponse(prometheusEnvelope([
+          { metric: { series: "one" }, values: [] },
+          { metric: { series: "two" }, values: [] },
+        ])),
+        reader: "prometheus",
+      },
+      {
+        name: "excessive Prometheus samples",
+        response: jsonResponse(prometheusEnvelope([{
+          metric: {},
+          values: Array.from(
+            { length: OPS_INCIDENT_CHECK_LIMITS.maxPrometheusSamplesPerSeries + 1 },
+            () => [Date.now() / 1_000, "1"],
+          ),
+        }])),
+        reader: "prometheus",
+      },
+    ];
+    for (const boundary of cases) {
+      const invalidReaders = createOpsMonitoringReaders(
+        "http://127.0.0.1:9090",
+        "http://127.0.0.1:9093",
+        async () => boundary.response.clone(),
+      );
+      await assert.rejects(async () => {
+        if (boundary.reader === "alertmanager") {
+          await invalidReaders.incidentAlertmanagerReader.readExactGroupState(context);
+        } else {
+          await invalidReaders.incidentMonitoringReader.readMonitoringFreshness(context);
+        }
+      }, boundary.name);
+    }
+
+    const failingReaders = createOpsMonitoringReaders(
+      "http://127.0.0.1:9090",
+      "http://127.0.0.1:9093",
+      async () => jsonResponse({}, 503),
+    );
+    const registry = createOpsIncidentDoneCheckRegistry({
+      clock: () => new Date(NOW),
+      ...failingReaders,
+    });
+    const result = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      { ...context, checkedAt: NOW, now: () => new Date(NOW) },
+    );
+    assert.equal(result.result, "QUERY_ERROR");
   });
 });

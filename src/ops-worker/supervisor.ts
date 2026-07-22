@@ -45,6 +45,7 @@ import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
   hashOpsWorkerPiLaunchSubject,
+  hashOpsWorkerReportPayload,
   hashOpsWorkerVerificationSubject,
   isOpsWorkerTerminalState,
   isOpsWorkerUnclaimedQuotaProbeProcess,
@@ -2743,30 +2744,15 @@ export class OpsWorkerSupervisor {
       deliveryKey: task.source.deliveryKey,
       createdAt: task.createdAt,
     });
+    const reportPayloadHash = hashOpsWorkerReportPayload(task);
     const reportIntent = {
       reportIdentity,
-      taskState: task.state,
-      lastOutcome: task.lastOutcome === null
-        ? null
-        : {
-          at: task.lastOutcome.at,
-          kind: task.lastOutcome.kind,
-          result: task.lastOutcome.result,
-          summary: task.lastOutcome.summary,
-        },
-      agentResult: task.agentResult,
-      verification: task.verification === null
-        ? null
-        : {
-            checkedAt: task.verification.checkedAt,
-            outcome: task.verification.outcome,
-            components: task.verification.components,
-          },
+      reportPayloadHash,
     };
-    const reportPayloadHash = hashOpsWorkerCanonicalPayload(reportIntent);
+    const reportIntentHash = hashOpsWorkerCanonicalPayload(reportIntent);
     const operation = {
       boundary: "report" as const,
-      operationId: `report:${reportPayloadHash.slice("sha256:".length, 31)}`,
+      operationId: `report:${reportIntentHash.slice("sha256:".length, 31)}`,
       intent: reportIntent,
     };
     task = this.lifecycle.updateLifecycleIdentity(taskId, {
@@ -2832,7 +2818,7 @@ export class OpsWorkerSupervisor {
         if (
           receipt === null
           || receipt.operationId !== operation.operationId
-          || receipt.intentHash !== reportPayloadHash
+          || receipt.intentHash !== reportIntentHash
           || receipt.mutationStartedAt === null
           || receipt.outcome !== null
         ) {

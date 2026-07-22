@@ -1755,6 +1755,35 @@ describe("ops worker supervisor", () => {
     assert.equal(persisted?.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
+  it("records a report receipt for a maximum-sized valid typed result", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-maximum-report-result", { sourceKind: "alertmanager" });
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const blocked = harness.supervisor.recordPiAgentResult(task.id, {
+      attemptId: "attempt-01",
+      kind: "input-needed",
+      summary: "s".repeat(OPS_WORKER_LIMITS.maxAgentResultSummaryBytes),
+      actions: Array.from(
+        { length: OPS_WORKER_LIMITS.maxAgentResultActions },
+        () => "a".repeat(OPS_WORKER_LIMITS.maxAgentResultActionBytes),
+      ),
+      requestedInput: "i".repeat(OPS_WORKER_LIMITS.maxAgentResultRequestedInputBytes),
+      reason: "information",
+    });
+    assert.ok(Buffer.byteLength(JSON.stringify(blocked.agentResult), "utf8") > 16 * 1024);
+
+    let attempts = 0;
+    const sent = await harness.supervisor.recordReportAttempt(task.id, async () => {
+      attempts += 1;
+      return { sent: true };
+    });
+
+    assert.equal(attempts, 1);
+    assert.equal(sent.report.state, "SENT");
+    assert.match(sent.mutationReceipts.report?.intentHash ?? "", /^sha256:[a-f0-9]{64}$/);
+  });
+
   it("revalidates after the external query and before claiming a mutation receipt", async (t) => {
     let checks = 0;
     let sends = 0;

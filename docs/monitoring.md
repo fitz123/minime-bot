@@ -113,8 +113,9 @@ Bridge mode is opt-in and requires all of the following settings:
 - Optional `MINIME_BRIDGE_TIMEOUT` sets the source-query and Ops-forward
   deadline above zero and no more than 30 seconds.
 
-Partial or non-loopback bridge configuration fails startup. The named Ops
-secret is decrypted alone into process memory. Its value is never written to
+Partial or non-loopback bridge configuration fails startup; setting only the
+optional bridge timeout also counts as partial bridge configuration. The named
+Ops secret is decrypted alone into process memory. Its value is never written to
 arguments, logs, errors, or forwarded payloads. Bridge mode preserves the
 256 KiB body ceiling and forwards the original validated Alertmanager v4 body
 with bearer authentication.
