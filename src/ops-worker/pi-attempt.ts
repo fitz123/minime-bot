@@ -698,7 +698,18 @@ export class OpsWorkerPiAttemptRunner {
     }
     this.launchFaultInjector?.("after-launch-intent-persisted");
     if (requiresTypedAgentResult(task)) {
-      resultFilePath = createOpsWorkerAgentResultFile(sessionDirectory, attemptId);
+      try {
+        resultFilePath = createOpsWorkerAgentResultFile(sessionDirectory, attemptId);
+      } catch {
+        return {
+          classification: "CRASH",
+          task: this.supervisor.recordResolvedPiLaunchFailure(
+            task.id,
+            attemptId,
+            "Pi agent result file setup failed before process spawn",
+          ),
+        };
+      }
       this.launchFaultInjector?.("after-result-file-created");
     }
     let child: ChildProcess;
@@ -2742,7 +2753,7 @@ function buildPreparedOpsWorkerAttemptPrompt(
     ...(requiresTypedAgentResult(task) ? [
       `Before exiting, write exactly one JSON object to the file named by ${OPS_WORKER_RESULT_FILE_ENV}.`,
       `Set attemptId to ${OPS_WORKER_ATTEMPT_ID_ENV}; kind must be remediation-complete, no-action-needed, input-needed, or impossible.`,
-      "Include exactly attemptId, kind, summary, actions, requestedInput, and reason. actions is an array of text; requestedInput is text or null; reason is approval, information, policy-boundary, unrecoverable, or null.",
+      "Include exactly attemptId, kind, summary, actions, requestedInput, and reason. actions is an array of text. For input-needed, requestedInput is text and reason is approval or information. For impossible, requestedInput is null and reason is policy-boundary or unrecoverable. For remediation-complete or no-action-needed, requestedInput and reason are null.",
       "The result is an untrusted claim and does not expand authorization.",
     ] : []),
   ].join("\n");

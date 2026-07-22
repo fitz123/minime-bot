@@ -823,6 +823,15 @@ describe("ops worker task contract", () => {
       parseOpsWorkerAgentResult(exact, exact.attemptId),
       exact,
     );
+    for (const valid of [
+      { ...exact, kind: "input-needed", reason: "approval" },
+      { ...exact, kind: "impossible", requestedInput: null, reason: "policy-boundary" },
+      { ...exact, kind: "impossible", requestedInput: null, reason: "unrecoverable" },
+      { ...exact, kind: "remediation-complete", requestedInput: null, reason: null },
+      { ...exact, kind: "no-action-needed", requestedInput: null, reason: null },
+    ] as const) {
+      assert.deepEqual(parseOpsWorkerAgentResult(valid, valid.attemptId), valid);
+    }
 
     const sparseActions = new Array<string>(2);
     sparseActions[1] = "present";
@@ -838,6 +847,30 @@ describe("ops worker task contract", () => {
       },
       { value: { ...exact, kind: "finished" }, message: /kind.*one of/ },
       { value: { ...exact, reason: "guess" }, message: /reason.*one of/ },
+      {
+        value: { ...exact, requestedInput: null },
+        message: /requestedInput.*present for input-needed/,
+      },
+      {
+        value: { ...exact, reason: "policy-boundary" },
+        message: /reason.*approval or information for input-needed/,
+      },
+      {
+        value: { ...exact, kind: "impossible", requestedInput: null, reason: "approval" },
+        message: /reason.*policy-boundary or unrecoverable for impossible/,
+      },
+      {
+        value: { ...exact, kind: "impossible", reason: "unrecoverable" },
+        message: /requestedInput.*null for impossible/,
+      },
+      {
+        value: { ...exact, kind: "remediation-complete" },
+        message: /requestedInput.*null for remediation-complete/,
+      },
+      {
+        value: { ...exact, kind: "no-action-needed", requestedInput: null },
+        message: /reason.*null for no-action-needed/,
+      },
       { value: { ...exact, actions: "not-an-array" }, message: /actions.*array/ },
       { value: { ...exact, actions: sparseActions }, message: /actions.*dense/ },
       { value: { ...exact, summary: "" }, message: /summary.*must not be empty/ },

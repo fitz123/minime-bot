@@ -21,12 +21,12 @@ export const OPS_INCIDENT_CHECK_LIMITS = Object.freeze({
   monitoringFreshnessMs: 2 * 60_000,
   stabilityWindowMs: 5 * 60_000,
   recheckMs: 60_000,
-  maxResponseBytes: 256 * 1024,
-  maxAlertCount: 256,
+  maxResponseBytes: 2 * 1024 * 1024,
+  maxAlertCount: 1_024,
   maxAlertFields: 24,
   maxAlertLabels: 64,
   maxLabelBytes: 2 * 1024,
-  maxPrometheusSeries: 16,
+  maxPrometheusSeries: 1,
   maxPrometheusSamplesPerSeries: 64,
 } as const);
 
@@ -92,7 +92,7 @@ export type OpsIncidentFetch = (
 const TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
-const PROMETHEUS_UP_RANGE_QUERY = "up[2m]";
+const PROMETHEUS_UP_RANGE_QUERY = "(max(timestamp(up)))[2m:5s]";
 const PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -592,7 +592,22 @@ function alertRangeQuery(groupLabels: Record<string, string>): string {
       return `${key}=${promqlString(value)}`;
     });
   matchers.push('alertstate=~"pending|firing"');
-  return `ALERTS{${matchers.join(",")}}[5m]`;
+  return `(max(timestamp(ALERTS{${matchers.join(",")}})))[5m:5s]`;
+}
+
+function latestMetricTimestamp(series: readonly PrometheusMatrixEntry[]): string | null {
+  const timestamps = series.flatMap((entry) => entry.samples).map((sample) => {
+    const milliseconds = sample.value * 1_000;
+    if (!Number.isFinite(milliseconds)) {
+      throw new Error("Prometheus returned an invalid metric timestamp");
+    }
+    try {
+      return new Date(milliseconds).toISOString();
+    } catch {
+      throw new Error("Prometheus returned an invalid metric timestamp");
+    }
+  });
+  return timestamps.length === 0 ? null : timestamps.sort().at(-1) as string;
 }
 
 class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
@@ -627,12 +642,9 @@ class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
       observedAt,
       context.signal,
     );
-    const samples = series.flatMap((entry) => entry.samples);
     return {
       observedAt,
-      latestSampleAt: samples.length === 0
-        ? null
-        : samples.map((sample) => sample.observedAt).sort().at(-1) as string,
+      latestSampleAt: latestMetricTimestamp(series),
     };
   }
 
@@ -646,15 +658,9 @@ class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
       observedAt,
       context.signal,
     );
-    const samples = series.flatMap((entry) => entry.samples);
-    if (samples.some((sample) => sample.value !== 1)) {
-      throw new Error("Prometheus ALERTS result is outside the closed contract");
-    }
     return {
       observedAt,
-      latestMatchingSampleAt: samples.length === 0
-        ? null
-        : samples.map((sample) => sample.observedAt).sort().at(-1) as string,
+      latestMatchingSampleAt: latestMetricTimestamp(series),
     };
   }
 }
@@ -674,6 +680,14 @@ class OpsIncidentAlertmanagerHttpReader implements OpsIncidentAlertmanagerReader
     url.searchParams.set("silenced", "true");
     url.searchParams.set("inhibited", "true");
     url.searchParams.set("unprocessed", "true");
+    for (const [key, value] of Object.entries(groupLabels).sort(
+      ([left], [right]) => left.localeCompare(right),
+    )) {
+      if (!PROMETHEUS_LABEL_NAME_PATTERN.test(key)) {
+        throw new Error("Alert group contains a label name unsafe for an Alertmanager query");
+      }
+      url.searchParams.append("filter", `${key}=${promqlString(value)}`);
+    }
     const response = await this.fetch(url, {
       method: "GET",
       headers: { accept: "application/json" },

@@ -51,6 +51,10 @@ The harness creates a fresh result-file path only after the attempt id is persis
 `OPS_WORKER_RESULT_FILE`, validates exact keys/types/id/bounds on exit, atomically stores only the
 latest result, and deletes the temporary file. Agent content stays untrusted.
 
+`input-needed` requires requested input with an `approval` or `information` reason;
+`impossible` requires null requested input with a `policy-boundary` or `unrecoverable` reason;
+completion and no-action results require both fields to be null.
+
 - `remediation-complete` and `no-action-needed` are claims and enter the same deterministic check.
 - `input-needed` and `impossible` become durable `BLOCKED`, release custody, and queue a report;
   they grant no authority.

@@ -2636,6 +2636,28 @@ function parseAgentResultAt(
           `${path}.reason`,
         ),
   };
+  if (parsed.kind === "input-needed") {
+    if (parsed.requestedInput === null) {
+      fail(`${path}.requestedInput`, "must be present for input-needed");
+    }
+    if (parsed.reason !== "approval" && parsed.reason !== "information") {
+      fail(`${path}.reason`, "must be approval or information for input-needed");
+    }
+  } else if (parsed.kind === "impossible") {
+    if (parsed.requestedInput !== null) {
+      fail(`${path}.requestedInput`, "must be null for impossible");
+    }
+    if (parsed.reason !== "policy-boundary" && parsed.reason !== "unrecoverable") {
+      fail(`${path}.reason`, "must be policy-boundary or unrecoverable for impossible");
+    }
+  } else {
+    if (parsed.requestedInput !== null) {
+      fail(`${path}.requestedInput`, `must be null for ${parsed.kind}`);
+    }
+    if (parsed.reason !== null) {
+      fail(`${path}.reason`, `must be null for ${parsed.kind}`);
+    }
+  }
   if (
     Buffer.byteLength(JSON.stringify(parsed), "utf8")
     > OPS_WORKER_LIMITS.maxAgentResultFileBytes

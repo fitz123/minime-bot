@@ -1337,6 +1337,44 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(existsSync(resultPath), false);
   });
 
+  it("resolves the launch fence when typed result file setup fails before spawn", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-result-file-setup-failure", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    let spawnAttempted = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "after-launch-intent-persisted") return;
+          const attemptId = harness.store.get(task.id)?.unverifiedRun?.attemptId;
+          assert.ok(attemptId);
+          const identity = createHash("sha256").update(attemptId).digest("hex").slice(0, 32);
+          writeFileSync(join(
+            harness.supervisor.stateDirectory,
+            "sessions",
+            task.id,
+            `agent-result-${identity}.json`,
+          ), "synthetic collision", "utf8");
+        },
+        spawnProcess: () => {
+          spawnAttempted = true;
+          throw new Error("spawn must not be attempted after result-file setup failure");
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(spawnAttempted, false);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(result.activeRun, null);
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /result file setup failed before process spawn/);
+  });
+
   it("cleans the fresh typed result file when launch faults after file creation", async (t) => {
     const harness = await makeHarness(t);
     const task = makeTask("typed-result-file-fault", {

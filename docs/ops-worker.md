@@ -420,6 +420,12 @@ The result file contains exactly these six keys:
 }
 ```
 
+The fields are kind-dependent. `input-needed` requires non-null requested input
+and an `approval` or `information` reason. `impossible` requires null requested
+input and a `policy-boundary` or `unrecoverable` reason. Completion and
+no-action results require both fields to be null. Contradictory combinations
+are protocol failures rather than durable, non-actionable blockers.
+
 The UTF-8 JSON file is at most 32 KiB. `summary` and `requestedInput` are each
 at most 4 KiB; `actions` contains at most 16 entries of at most 1 KiB each.
 `attemptId` must exactly match the persisted attempt identity supplied by the

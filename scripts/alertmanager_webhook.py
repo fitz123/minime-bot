@@ -102,7 +102,11 @@ def _decode_alertmanager_payload(body: bytes) -> dict[str, Any]:
     return payload
 
 
-def _native_payload_fields(payload: dict[str, Any]) -> tuple[str, str]:
+def _native_payload_fields(
+    payload: dict[str, Any],
+    *,
+    episode_group_key: str | None = None,
+) -> tuple[str, str]:
     alerts = payload["alerts"]
     if not alerts:
         raise ValueError("invalid alert batch")
@@ -123,7 +127,18 @@ def _native_payload_fields(payload: dict[str, Any]) -> tuple[str, str]:
             identity = fingerprint
         else:
             identity = json.dumps([status, name, severity, instance], separators=(",", ":"))
-        identities.append(f"{status}:{identity}")
+        if episode_group_key is None:
+            identities.append(f"{status}:{identity}")
+        else:
+            starts_at = _bounded_string(
+                item.get("startsAt"),
+                limit=128,
+                allow_empty=False,
+            )
+            identities.append(json.dumps(
+                [episode_group_key, status, identity, starts_at],
+                separators=(",", ":"),
+            ))
 
     try:
         identity_bytes = "\n".join(sorted(identities)).encode("utf-8")
@@ -163,7 +178,6 @@ def _bounded_string_map(value: Any, *, max_entries: int, max_value_bytes: int) -
 def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     """Validate fields needed to authenticate and forward one Alertmanager v4 group."""
     payload = _decode_alertmanager_payload(body)
-    native_key, message = _native_payload_fields(payload)
     alerts = payload["alerts"]
     if (
         payload.get("version") != "4"
@@ -172,7 +186,15 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         or not 1 <= len(alerts) <= MAX_ACTIVE_ALERTS
     ):
         raise ValueError("invalid bridge payload")
-    _bounded_string(payload.get("groupKey"), limit=8 * 1024, allow_empty=False)
+    group_key = _bounded_string(
+        payload.get("groupKey"),
+        limit=8 * 1024,
+        allow_empty=False,
+    )
+    native_key, message = _native_payload_fields(
+        payload,
+        episode_group_key=group_key,
+    )
     if "groupLabels" not in payload:
         raise ValueError("invalid bridge payload")
     group_labels = _bounded_string_map(

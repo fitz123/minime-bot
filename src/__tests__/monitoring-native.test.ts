@@ -124,6 +124,7 @@ function alertmanagerPayload(options: {
   severity?: "warning" | "critical";
   status?: "firing" | "resolved";
   fingerprint?: string;
+  startsAt?: string;
 }): Record<string, unknown> {
   const status = options.status ?? "firing";
   const labels = {
@@ -138,7 +139,7 @@ function alertmanagerPayload(options: {
       status,
       labels,
       annotations: {},
-      startsAt: "2026-07-22T00:00:00Z",
+      startsAt: options.startsAt ?? "2026-07-22T00:00:00Z",
       endsAt: status === "resolved" ? "2026-07-22T00:05:00Z" : "0001-01-01T00:00:00Z",
       generatorURL: "http://127.0.0.1/prometheus/graph",
       fingerprint: options.fingerprint ?? options.alertname,
@@ -819,22 +820,33 @@ describe("Alertmanager webhook", () => {
       assert.equal(opsAttempts, 2, "Ops replay must be harmless while native delivery retries");
       assert.equal(telegramAttempts, 2);
 
+      const resolvedEpisode = alertmanagerPayload({
+        alertname: "CriticalDual",
+        severity: "critical",
+        status: "resolved",
+        fingerprint: "critical-dual",
+      });
+      assert.equal((await postWebhook(port, resolvedEpisode)).status, 200);
+      const refiredEpisode = alertmanagerPayload({
+        alertname: "CriticalDual",
+        severity: "critical",
+        fingerprint: "critical-dual",
+        startsAt: "2026-07-22T01:00:00Z",
+      });
+      assert.equal((await postWebhook(port, refiredEpisode)).status, 200);
+      assert.equal((await postWebhook(port, refiredEpisode)).status, 200);
+      assert.equal(opsAttempts, 3, "the new firing episode must reach Ops exactly once");
+      assert.equal(telegramAttempts, 4, "the resolved and re-fired episodes must both notify");
+
       const resolvedWarning = alertmanagerPayload({
         alertname: "ResolvedWarning",
         status: "resolved",
         fingerprint: "resolved-warning",
       });
       assert.equal((await postWebhook(port, resolvedWarning)).status, 200);
-      const resolvedCritical = alertmanagerPayload({
-        alertname: "ResolvedCritical",
-        severity: "critical",
-        status: "resolved",
-        fingerprint: "resolved-critical",
-      });
-      assert.equal((await postWebhook(port, resolvedCritical)).status, 200);
-      assert.equal(sourceQueries, 2, "resolved-only batches must not query or forward to Ops");
-      assert.equal(opsAttempts, 2);
-      assert.equal(telegramAttempts, 3, "only critical resolved delivery uses the native path");
+      assert.equal(sourceQueries, 3, "resolved-only batches must not query or forward to Ops");
+      assert.equal(opsAttempts, 3);
+      assert.equal(telegramAttempts, 4, "only critical resolved delivery uses the native path");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));

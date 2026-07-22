@@ -242,7 +242,7 @@ describe("bounded generic monitoring readers", () => {
     );
     assert.equal(
       urls.at(-1)?.searchParams.get("query"),
-      'ALERTS{alertstate=~"pending|firing"}[5m]',
+      '(max(timestamp(ALERTS{alertstate=~"pending|firing"})))[5m:5s]',
     );
   });
 
@@ -278,6 +278,10 @@ describe("bounded generic monitoring readers", () => {
       for (const parameter of ["active", "silenced", "inhibited", "unprocessed"]) {
         assert.equal(requested?.searchParams.get(parameter), "true");
       }
+      assert.deepEqual(
+        requested?.searchParams.getAll("filter"),
+        ['alertname="HostHighCPU"', 'instance="local"'],
+      );
     }
   });
 
@@ -297,12 +301,15 @@ describe("bounded generic monitoring readers", () => {
         urls.push(url);
         if (url.port === "9093") return jsonResponse(alertResponse);
         const query = url.searchParams.get("query");
-        if (query === "up[2m]") {
+        if (query === "(max(timestamp(up)))[2m:5s]") {
           return jsonResponse({
             status: "success",
             data: {
               resultType: "matrix",
-              result: [{ metric: { job: "prometheus" }, values: [[(now - 30_000) / 1_000, "1"]] }],
+              result: [{
+                metric: {},
+                values: [[now / 1_000, String((now - 30_000) / 1_000)]],
+              }],
             },
           });
         }
@@ -313,11 +320,7 @@ describe("bounded generic monitoring readers", () => {
             result: stabilityValues.length === 0
               ? []
               : [{
-                  metric: {
-                    alertname: "FutureSyntheticAlert",
-                    instance: "local",
-                    alertstate: "firing",
-                  },
+                  metric: {},
                   values: stabilityValues,
                 }],
           },
@@ -351,14 +354,14 @@ describe("bounded generic monitoring readers", () => {
       null,
     );
     const stabilityQuery = urls.map((url) => url.searchParams.get("query")).find(
-      (query) => query?.startsWith("ALERTS{"),
+      (query) => query?.includes("ALERTS{"),
     );
     assert.equal(
       stabilityQuery,
-      'ALERTS{alertname="FutureSyntheticAlert",instance="local",alertstate=~"pending|firing"}[5m]',
+      '(max(timestamp(ALERTS{alertname="FutureSyntheticAlert",instance="local",alertstate=~"pending|firing"})))[5m:5s]',
     );
 
-    stabilityValues = [[(now - 60_000) / 1_000, "1"]];
+    stabilityValues = [[now / 1_000, String((now - 60_000) / 1_000)]];
     const latest = await readers.incidentMonitoringReader.readResolutionStability(context);
     assert.equal(latest.latestMatchingSampleAt, new Date(now - 60_000).toISOString());
     alertResponse = [{
@@ -380,7 +383,10 @@ describe("bounded generic monitoring readers", () => {
     assert.equal(waiting.result, "NOT_READY");
     assert.equal(waiting.nextCheckAt, new Date(now + 4 * 60_000).toISOString());
 
-    stabilityValues = [[(now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000, "1"]];
+    stabilityValues = [[
+      now / 1_000,
+      String((now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000),
+    ]];
     const boundary = await registry.run(
       { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
       {
@@ -391,10 +397,69 @@ describe("bounded generic monitoring readers", () => {
     );
     assert.equal(boundary.result, "PASS");
 
-    stabilityValues = [[(now - 60_000) / 1_000, "not-a-number"]];
+    stabilityValues = [[now / 1_000, "not-a-number"]];
     await assert.rejects(
       async () => await readers.incidentMonitoringReader.readResolutionStability(context),
       /non-finite sample/,
+    );
+  });
+
+  it("aggregates global Prometheus freshness and accepts the full intake alert bound", async () => {
+    const now = Date.now();
+    const urls: URL[] = [];
+    const readers = createOpsMonitoringReaders(
+      "http://127.0.0.1:9090",
+      "http://127.0.0.1:9093",
+      async (input) => {
+        const url = new URL(input);
+        urls.push(url);
+        if (url.port === "9093") {
+          return jsonResponse(Array.from(
+            { length: OPS_INCIDENT_CHECK_LIMITS.maxAlertCount },
+            (_, index) => ({
+              labels: { alertname: `BoundedAlert${index}` },
+              status: { state: "active" },
+            }),
+          ));
+        }
+        return jsonResponse({
+          status: "success",
+          data: {
+            resultType: "matrix",
+            result: [{
+              metric: {},
+              values: [[now / 1_000, String((now - 15_000) / 1_000)]],
+            }],
+          },
+        });
+      },
+    );
+    const context = {
+      signal: new AbortController().signal,
+      taskId: "full-cardinality-reader",
+      sourceKind: "alertmanager" as const,
+      sourceCorrelationKey: CORRELATION_KEY,
+      sourceEvidence: [{
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey: CORRELATION_KEY,
+          groupLabels: {},
+        }),
+        artifact: null,
+      }],
+    };
+
+    assert.ok((await readers.incidentMonitoringReader.readMonitoringFreshness(context)).latestSampleAt);
+    assert.equal(
+      (await readers.incidentAlertmanagerReader.readExactGroupState(context)).status,
+      "PRESENT",
+    );
+    assert.equal(
+      urls.find((url) => url.port === "9090")?.searchParams.get("query"),
+      "(max(timestamp(up)))[2m:5s]",
     );
   });
 
