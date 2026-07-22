@@ -1,16 +1,13 @@
 import { createHash } from "node:crypto";
-import {
-  OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_INVARIANTS,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-} from "./availability-checks.js";
 import type {
   OpsWorkerDoneCheckContractIdentity,
   OpsWorkerDoneCheckRegistry,
 } from "./done-checks.js";
 import {
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_AVAILABILITY_RESOURCE_KEY,
-  OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   hashOpsAlertmanagerAuthorizationSnapshot,
 } from "./ops-contracts.js";
@@ -487,9 +484,11 @@ export class OpsWorkerAlertmanagerIntake {
     if (!options.store || typeof options.store.create !== "function") {
       throw new TypeError("Alertmanager intake requires an ops-worker task store");
     }
-    const doneCheck = options.doneChecks?.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
+    const doneCheck = options.doneChecks?.describe(OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME);
     if (!doneCheck) {
-      throw new TypeError("Alertmanager intake requires the package-owned availability done check");
+      throw new TypeError(
+        "Alertmanager intake requires the package-owned generic incident done check",
+      );
     }
     this.store = options.store;
     this.doneCheck = doneCheck;
@@ -555,8 +554,9 @@ export class OpsWorkerAlertmanagerIntake {
     lifecycle.verifierContractHash = doneCheck.contractHash;
     const authorizationClaim = {
       sourceIdentity: this.sourceIdentity,
-      invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-      template: OPS_AVAILABILITY_TEMPLATE_NAME,
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+      objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
     } as const;
     const id = `am-${deliveryDigest.slice(0, 48)}`;
@@ -567,7 +567,7 @@ export class OpsWorkerAlertmanagerIntake {
         kind: "alertmanager",
         correlationKey,
         deliveryKey,
-        template: OPS_AVAILABILITY_TEMPLATE_NAME,
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
       },
       resource: { kind: "host", key: OPS_AVAILABILITY_RESOURCE_KEY },
       lifecycle,
@@ -575,15 +575,14 @@ export class OpsWorkerAlertmanagerIntake {
       mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
       custody: createUnclaimedOpsWorkerCustody(),
       priority: OPS_WORKER_SOURCE_PRIORITIES.alertmanager,
-      objective:
-        OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective,
+      objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       evidence: [
         alertGroupCorrelationEvidence(correlationKey, groupLabels, now),
         ...firingAlerts.map((entry) => alertEvidence(entry, now)),
       ],
       doneCheck: {
-        name: OPS_AVAILABILITY_DONE_CHECK_NAME,
-        params: { invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT },
+        name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+        params: {},
       },
       authorization: {
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
@@ -598,7 +597,7 @@ export class OpsWorkerAlertmanagerIntake {
       state: "QUEUED",
       rounds: {
         remediation: 0,
-        maxRemediation: 3,
+        maxRemediation: 5,
         consecutiveInfrastructureFailures: 0,
       },
       schedule: { nextRunAt: null, nextCheckAt: null },

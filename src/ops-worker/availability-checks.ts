@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   OpsWorkerDoneCheckRegistry,
+  type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckContext,
 } from "./done-checks.js";
 import type {
@@ -259,8 +260,15 @@ function assertDependencies(deps: OpsAvailabilityDoneCheckDependencies): void {
 
 export function createOpsAvailabilityDoneCheckRegistry(
   deps: OpsAvailabilityDoneCheckDependencies,
+  additionalDefinitions: Readonly<Record<string, OpsWorkerDoneCheckDefinition>> = {},
 ): OpsWorkerDoneCheckRegistry {
   assertDependencies(deps);
+  if (Object.prototype.hasOwnProperty.call(
+    additionalDefinitions,
+    OPS_AVAILABILITY_DONE_CHECK_NAME,
+  )) {
+    throw new TypeError("Additional done checks cannot replace ops.minime-availability");
+  }
   return new OpsWorkerDoneCheckRegistry({
     [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
       identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
@@ -445,6 +453,7 @@ export function createOpsAvailabilityDoneCheckRegistry(
         },
       ],
     },
+    ...additionalDefinitions,
   });
 }
 

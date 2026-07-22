@@ -20,9 +20,6 @@ import {
   OpsWorkerDoneCheckRegistry,
 } from "../ops-worker/done-checks.js";
 import {
-  OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_DONE_CHECK_VERSION,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   type OpsAlertStateReading,
   type OpsMonitoringFreshnessReading,
   type OpsServiceAvailabilityReading,
@@ -30,7 +27,10 @@ import {
 import {
   OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
   OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
-  OPS_AVAILABILITY_TEMPLATE_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   assertOpsAlertmanagerIntakeContracts,
   createOpsTaskContracts,
@@ -1329,9 +1329,9 @@ reply:
     );
 
     const counterfeitDoneChecks = new OpsWorkerDoneCheckRegistry({
-      [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
-        identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
-        version: OPS_AVAILABILITY_DONE_CHECK_VERSION,
+      [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]: {
+        identity: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+        version: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
         timeoutMs: 100,
         validateParams: () => ({}),
         run: () => ({ result: "PASS", summary: "Counterfeit verifier passed." }),
@@ -1344,7 +1344,7 @@ reply:
           doneChecks,
           opsContracts.authorizationVerifiers,
         ),
-        /package-owned availability done check/,
+        /package-owned generic incident done check/,
       );
     }
 
@@ -1376,8 +1376,9 @@ reply:
       alertmanagerAuthorizationSnapshotReader: {
         read: () => ({
           sourceIdentity: "lab-alertmanager",
-          invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-          template: OPS_AVAILABILITY_TEMPLATE_NAME,
+          template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+          doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+          objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
           profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
         }),
       },
@@ -1499,7 +1500,7 @@ reply:
     assert.equal(incomplete.code, 1);
     assert.match(
       incomplete.stderr,
-      /requires the fixed ops\.availability template for alertmanager/,
+      /requires the fixed ops\.alertmanager-incident template/,
     );
 
     const running = runCliAsync([

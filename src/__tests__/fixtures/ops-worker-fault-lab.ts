@@ -31,7 +31,9 @@ import {
 } from "../../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../../ops-worker/lifecycle.js";
 import {
-  OPS_AVAILABILITY_TEMPLATE_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
 } from "../../ops-worker/ops-contracts.js";
@@ -498,8 +500,9 @@ function availabilityContracts() {
     alertmanagerAuthorizationSnapshotReader: {
       read: () => ({
         sourceIdentity: SOURCE_IDENTITY,
-        invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-        template: OPS_AVAILABILITY_TEMPLATE_NAME,
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+        doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+        objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
       }),
     },

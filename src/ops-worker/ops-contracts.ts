@@ -1,12 +1,7 @@
 import { createHash } from "node:crypto";
 import {
-  OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_DONE_CHECK_VERSION,
-  OPS_AVAILABILITY_INVARIANTS,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   createOpsAvailabilityDoneCheckRegistry,
   type OpsAvailabilityDoneCheckDependencies,
-  type OpsAvailabilityInvariantName,
 } from "./availability-checks.js";
 import type {
   OpsWorkerAuthorizationVerifier,
@@ -15,27 +10,37 @@ import type {
 } from "./authorization.js";
 import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
 import {
+  OPS_WORKER_LIMITS,
   isOpsWorkerRegisteredName,
+  type JsonObject,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
 } from "./types.js";
 
 export const OPS_AVAILABILITY_TEMPLATE_NAME = "ops.availability" as const;
+export const OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME =
+  "ops.alertmanager-incident" as const;
+export const OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME =
+  "ops.alertmanager-incident" as const;
+export const OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION = "1" as const;
+export const OPS_ALERTMANAGER_INCIDENT_OBJECTIVE =
+  "Investigate this Alertmanager incident on the Minime host: diagnose cause and impact using the attached untrusted alert evidence, perform ordinary safe same-UID reversible remediation where useful, and finish with a typed result — completed, no-action-needed, input-needed, or impossible. A separate deterministic done check decides success." as const;
 export const OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE =
   "ops.host-availability" as const;
 export const OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY =
   "ops-alertmanager-authorization" as const;
-export const OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION = "1" as const;
+export const OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION = "2" as const;
 export const OPS_AVAILABILITY_RESOURCE_KEY = "host:local" as const;
 
-const PACKAGE_OWNED_AVAILABILITY_REGISTRIES = new WeakSet<OpsWorkerDoneCheckRegistry>();
+const PACKAGE_OWNED_OPS_REGISTRIES = new WeakSet<OpsWorkerDoneCheckRegistry>();
 const PACKAGE_OWNED_ALERTMANAGER_VERIFIERS =
   new WeakSet<OpsWorkerAuthorizationVerifier>();
 
 export interface OpsAlertmanagerAuthorizationSnapshot {
   sourceIdentity: string;
-  invariant: OpsAvailabilityInvariantName;
   template: string;
+  doneCheck: string;
+  objective: string;
   profile: string;
 }
 
@@ -60,10 +65,10 @@ export function assertOpsAlertmanagerIntakeContracts(
   doneChecks: OpsWorkerDoneCheckRegistry,
   authorizationVerifiers: OpsWorkerAuthorizationVerifierRegistry | undefined,
 ): void {
-  const template = taskRegistry.templates[OPS_AVAILABILITY_TEMPLATE_NAME];
+  const template = taskRegistry.templates[OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME];
   if (!template?.sourceKinds.includes("alertmanager")) {
     throw new TypeError(
-      "Alertmanager intake requires the fixed ops.availability template for alertmanager",
+      "Alertmanager intake requires the fixed ops.alertmanager-incident template",
     );
   }
   const profile = taskRegistry.authorizationProfiles[
@@ -79,14 +84,14 @@ export function assertOpsAlertmanagerIntakeContracts(
       "Alertmanager intake requires the fixed ops.host-availability authorization profile",
     );
   }
-  const doneCheck = doneChecks.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
+  const doneCheck = doneChecks.describe(OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME);
   if (
-    !PACKAGE_OWNED_AVAILABILITY_REGISTRIES.has(doneChecks)
-    || doneCheck?.verifierIdentity !== OPS_AVAILABILITY_DONE_CHECK_NAME
-    || doneCheck.verifierVersion !== OPS_AVAILABILITY_DONE_CHECK_VERSION
+    !PACKAGE_OWNED_OPS_REGISTRIES.has(doneChecks)
+    || doneCheck?.verifierIdentity !== OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME
+    || doneCheck.verifierVersion !== OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION
   ) {
     throw new TypeError(
-      "Alertmanager intake requires the package-owned availability done check",
+      "Alertmanager intake requires the package-owned generic incident done check",
     );
   }
   const verifier = authorizationVerifiers?.alertmanager;
@@ -144,8 +149,9 @@ export function hashOpsAlertmanagerAuthorizationSnapshot(
   return hashCanonical({
     sourceKind: "alertmanager",
     sourceIdentity: snapshot.sourceIdentity,
-    invariant: snapshot.invariant,
     template: snapshot.template,
+    doneCheck: snapshot.doneCheck,
+    objective: snapshot.objective,
     profile: snapshot.profile,
   });
 }
@@ -153,16 +159,24 @@ export function hashOpsAlertmanagerAuthorizationSnapshot(
 function parseTrustedSnapshot(value: unknown): OpsAlertmanagerAuthorizationSnapshot | null {
   if (
     !isPlainObject(value)
-    || !hasExactDataKeys(value, ["sourceIdentity", "invariant", "template", "profile"])
+    || !hasExactDataKeys(
+      value,
+      ["sourceIdentity", "template", "doneCheck", "objective", "profile"],
+    )
     || !isOpsWorkerRegisteredName(value.sourceIdentity)
-    || value.invariant !== OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT
     || !isOpsWorkerRegisteredName(value.template)
+    || !isOpsWorkerRegisteredName(value.doneCheck)
+    || typeof value.objective !== "string"
+    || value.objective.length === 0
+    || value.objective.includes("\0")
+    || Buffer.byteLength(value.objective, "utf8") > OPS_WORKER_LIMITS.maxObjectiveBytes
     || !isOpsWorkerRegisteredName(value.profile)
   ) return null;
   return {
     sourceIdentity: value.sourceIdentity,
-    invariant: value.invariant,
     template: value.template,
+    doneCheck: value.doneCheck,
+    objective: value.objective,
     profile: value.profile,
   };
 }
@@ -180,26 +194,26 @@ function claimedSnapshot(task: Readonly<OpsWorkerTask>): OpsAlertmanagerAuthoriz
     || task.resource.kind !== "host"
     || task.resource.key !== OPS_AVAILABILITY_RESOURCE_KEY
     || task.priority !== 0
-    || task.source.template !== OPS_AVAILABILITY_TEMPLATE_NAME
-    || task.doneCheck.name !== OPS_AVAILABILITY_DONE_CHECK_NAME
+    || task.source.template !== OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME
+    || task.doneCheck.name !== OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME
     || task.authorization.profile !== OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE
     || task.authorization.scope.length !== 2
     || task.authorization.scope[0] !== "inspect"
     || task.authorization.scope[1] !== "local-reversible-repair"
     || task.authorization.snapshotHash === null
     || !isPlainObject(task.doneCheck.params)
-    || !hasExactDataKeys(task.doneCheck.params, ["invariant"])
-    || task.doneCheck.params.invariant !== OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT
-    || task.objective
-      !== OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective
+    || !hasExactDataKeys(task.doneCheck.params, [])
+    || task.rounds.maxRemediation !== 5
+    || task.objective !== OPS_ALERTMANAGER_INCIDENT_OBJECTIVE
   ) return null;
   const correlationIdentity = sourceIdentityFromKey(task.source.correlationKey);
   const deliveryIdentity = sourceIdentityFromKey(task.source.deliveryKey);
   if (correlationIdentity === null || correlationIdentity !== deliveryIdentity) return null;
   return {
     sourceIdentity: correlationIdentity,
-    invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-    template: OPS_AVAILABILITY_TEMPLATE_NAME,
+    template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
     profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   };
 }
@@ -264,19 +278,40 @@ function createAlertmanagerAuthorizationVerifier(
   });
 }
 
+function validateIncidentParams(value: unknown): JsonObject {
+  if (!isPlainObject(value) || !hasExactDataKeys(value, [])) {
+    throw new TypeError("Alertmanager incident parameters must be an empty object");
+  }
+  return {};
+}
+
 export function createOpsTaskContracts(
   deps: CreateOpsTaskContractsDependencies,
 ): OpsTaskContracts {
-  const doneChecks = createOpsAvailabilityDoneCheckRegistry(deps);
+  const doneChecks = createOpsAvailabilityDoneCheckRegistry(deps, {
+    [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]: {
+      identity: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+      version: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
+      timeoutMs: 5_000,
+      validateParams: validateIncidentParams,
+      run: () => ({
+        result: "QUERY_ERROR",
+        summary: "Generic incident verification is not yet connected to monitoring readers.",
+      }),
+    },
+  });
   const alertmanagerAuthorizationVerifier = createAlertmanagerAuthorizationVerifier(
     deps.alertmanagerAuthorizationSnapshotReader,
   );
-  PACKAGE_OWNED_AVAILABILITY_REGISTRIES.add(doneChecks);
+  PACKAGE_OWNED_OPS_REGISTRIES.add(doneChecks);
   PACKAGE_OWNED_ALERTMANAGER_VERIFIERS.add(alertmanagerAuthorizationVerifier);
   const taskRegistry: OpsWorkerTaskContractRegistry = Object.freeze({
     templates: Object.freeze({
       [OPS_AVAILABILITY_TEMPLATE_NAME]: Object.freeze({
         sourceKinds: Object.freeze(["alertmanager", "operator-cli"] as const),
+      }),
+      [OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME]: Object.freeze({
+        sourceKinds: Object.freeze(["alertmanager"] as const),
       }),
     }),
     authorizationProfiles: Object.freeze({

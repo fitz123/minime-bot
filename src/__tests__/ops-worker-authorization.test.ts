@@ -16,14 +16,16 @@ import {
 } from "../ops-worker/types.js";
 import {
   OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_INVARIANTS,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   type OpsAlertStateReading,
   type OpsMonitoringFreshnessReading,
   type OpsServiceAvailabilityReading,
 } from "../ops-worker/availability-checks.js";
 import {
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
   OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
@@ -397,8 +399,9 @@ function alertmanagerSnapshot(
 ): OpsAlertmanagerAuthorizationSnapshot {
   return {
     sourceIdentity,
-    invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-    template: OPS_AVAILABILITY_TEMPLATE_NAME,
+    template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
     profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   };
 }
@@ -450,7 +453,7 @@ function alertmanagerTask(
     mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
     custody: createUnclaimedOpsWorkerCustody(),
     priority: 0,
-    objective: OPS_AVAILABILITY_INVARIANTS[claimed.invariant].objective,
+    objective: claimed.objective,
     evidence: [{
       at: NOW,
       kind: "alert",
@@ -459,8 +462,8 @@ function alertmanagerTask(
       artifact: null,
     }],
     doneCheck: {
-      name: OPS_AVAILABILITY_DONE_CHECK_NAME,
-      params: { invariant: claimed.invariant },
+      name: claimed.doneCheck,
+      params: {},
     },
     authorization: {
       profile: claimed.profile,
@@ -475,7 +478,7 @@ function alertmanagerTask(
     state: "QUEUED",
     rounds: {
       remediation: 0,
-      maxRemediation: 3,
+      maxRemediation: 5,
       consecutiveInfrastructureFailures: 0,
     },
     schedule: { nextRunAt: null, nextCheckAt: null },
@@ -549,7 +552,8 @@ describe("package-owned alertmanager authorization verifier", () => {
       null,
       { ...alertmanagerSnapshot(), extra: true },
       { ...alertmanagerSnapshot(), sourceIdentity: "INVALID IDENTITY" },
-      { ...alertmanagerSnapshot(), invariant: "unknown-invariant" },
+      { ...alertmanagerSnapshot(), doneCheck: "INVALID CHECK" },
+      { ...alertmanagerSnapshot(), objective: "" },
     ]) {
       const contracts = opsContracts({ read: () => malformed });
       assert.equal(
@@ -574,10 +578,17 @@ describe("package-owned alertmanager authorization verifier", () => {
     sourceIdentity.submissionFingerprint = hashOpsWorkerCanonicalSubmission(sourceIdentity);
     cases.push(sourceIdentity);
 
-    const invariant = alertmanagerTask();
-    invariant.doneCheck.params = { invariant: "unknown-invariant" };
-    invariant.submissionFingerprint = hashOpsWorkerCanonicalSubmission(invariant);
-    cases.push(invariant);
+    const params = alertmanagerTask();
+    params.doneCheck.params = { alertname: "payload-selected-check" };
+    params.submissionFingerprint = hashOpsWorkerCanonicalSubmission(params);
+    cases.push(params);
+
+    const remediationBudget = alertmanagerTask();
+    remediationBudget.rounds.maxRemediation = 3;
+    remediationBudget.submissionFingerprint = hashOpsWorkerCanonicalSubmission(
+      remediationBudget,
+    );
+    cases.push(remediationBudget);
 
     const scope = alertmanagerTask();
     scope.authorization.scope = ["inspect"];
@@ -600,6 +611,9 @@ describe("package-owned alertmanager authorization verifier", () => {
       [OPS_AVAILABILITY_TEMPLATE_NAME]: {
         sourceKinds: ["alertmanager", "operator-cli"],
       },
+      [OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME]: {
+        sourceKinds: ["alertmanager"],
+      },
     });
     assert.deepEqual(contracts.taskRegistry.authorizationProfiles, {
       [OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE]: {
@@ -609,6 +623,7 @@ describe("package-owned alertmanager authorization verifier", () => {
     });
     assert.deepEqual(Object.keys(contracts.taskRegistry.doneChecks), [
       OPS_AVAILABILITY_DONE_CHECK_NAME,
+      OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
     ]);
 
     assert.throws(
@@ -640,11 +655,11 @@ describe("package-owned alertmanager authorization verifier", () => {
     assert.deepEqual(policy.authorization.contracts, [{
       source: "alertmanager",
       verifierIdentity: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
-      verifierVersion: "1",
+      verifierVersion: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
     }]);
     assert.equal(policy.authorization.verifierCount, 1);
     assert.match(policy.authorization.contractsHash, /^sha256:[a-f0-9]{64}$/);
-    assert.equal(policy.verification.contracts.length, 1);
+    assert.equal(policy.verification.contracts.length, 2);
     assert.deepEqual(
       Object.keys(policy.verification.contracts[0]).sort(),
       ["contractHash", "name", "verifierIdentity", "verifierVersion"],
@@ -655,6 +670,11 @@ describe("package-owned alertmanager authorization verifier", () => {
       policy.verification.contracts[0].contractHash,
       /^sha256:[a-f0-9]{64}$/,
     );
+    assert.equal(
+      policy.verification.contracts[1].name,
+      OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    );
+    assert.equal(policy.verification.contracts[1].verifierVersion, "1");
     const serialized = JSON.stringify(policy);
     assert.equal(serialized.includes(ALERT_SOURCE_IDENTITY), false);
     assert.equal(serialized.includes("Restore and verify"), false);
