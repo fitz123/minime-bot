@@ -443,8 +443,10 @@ The generic check requires all three package-owned components to pass:
   active, silenced, inhibited, or unprocessed Alertmanager alert.
 - `resolution-stability` requires Prometheus `ALERTS` to contain no pending or
   firing sample with those exact group labels during the previous five minutes
-  and requires `up` history to cover that complete window. Missing monitoring
-  history cannot prove stability after a restart or history loss.
+  and requires a complete five-second `up` evaluation grid across that window,
+  with every underlying sample no more than two minutes old at its evaluation
+  time. Missing, sparse, or carried-stale monitoring history cannot prove
+  stability after an outage, restart, or history loss.
 
 Stale telemetry, query errors, timeouts, and the five-minute convergence wait
 remain in `CHECKING`, schedule bounded rechecks, and do not spend remediation
@@ -593,23 +595,25 @@ local task store.
 
 Ops intake does not replace the Node-independent native webhook. Optional
 forward-first bridge mode in `scripts/alertmanager_webhook.py` verifies the
-current exact group and forwards the original bounded body to this route while
-retaining native fallback and critical escalation. With bridge configuration
-unset, the webhook and `scripts/monitoring_native.py` retain native-only
-behavior. See `docs/monitoring.md` for the sink and rollback contract.
+current exact routed group and receiver through Alertmanager's grouped API,
+then forwards the original bounded body to this route while retaining native
+fallback and critical escalation. With bridge configuration unset, the webhook
+and `scripts/monitoring_native.py` retain native-only behavior. See
+`docs/monitoring.md` for the sink and rollback contract.
 
 The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a
 constant-time matched bearer token. The 256 KiB body limit mirrors the native
 receiver. Firing episodes derive their delivery and correlation keys from the
-trusted source identity, group key, and episode start. Identical delivery or an
-already-active correlation replays the existing task. Coalescing first records
-a durable delivery receipt in that task, preserving exact replay after the task
-becomes terminal. Resolved-only groups do not create work. A firing group must
-include non-empty group labels that fit the
-bounded correlation descriptor; intake rejects a group it could not later query
-exactly. Alert labels and annotations are stored only as bounded
-untrusted evidence. Responses expose only `ok`, `taskId`, and `replayed`, while
-authentication, media, syntax, method, and size failures use bounded typed JSON.
+trusted source identity, canonical verified group-label descriptor, and episode
+start; the opaque webhook group key cannot split an incident. Identical
+delivery or an already-active correlation replays the existing task. Coalescing
+first records a durable delivery receipt in that task, preserving exact replay
+after the task becomes terminal. Resolved-only groups do not create work. A
+firing group must include a bounded group-label descriptor; an empty map is the
+valid single group from an ungrouped route. Alert labels and annotations are
+stored only as bounded untrusted evidence. Responses expose only `ok`, `taskId`,
+and `replayed`, while authentication, media, syntax, method, and size failures
+use bounded typed JSON.
 
 Clients send `POST /intake/alertmanager` with `Authorization: Bearer <token>`
 and `Content-Type: application/json`; the body is the Alertmanager v4 webhook.

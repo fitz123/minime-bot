@@ -154,6 +154,19 @@ function alertmanagerPayload(options: {
   };
 }
 
+function alertmanagerApiGroup(
+  groupLabels: Record<string, string>,
+  alerts: readonly Record<string, unknown>[],
+  receiver = "minime-native-webhook",
+): Record<string, unknown> {
+  return {
+    labels: groupLabels,
+    routeLabels: {},
+    receiver: { name: receiver },
+    alerts,
+  };
+}
+
 async function reservePort(): Promise<number> {
   const reservation = await startServer((_request, response) => response.end());
   const { port } = reservation;
@@ -580,12 +593,26 @@ describe("Alertmanager webhook", () => {
     const telegramMessages: string[] = [];
     const alertmanagerQueries: string[] = [];
     const synthetic = await startServer((request, response) => {
-      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts?")) {
+      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
         alertmanagerQueries.push(request.url);
-        response.end(JSON.stringify([{
-          labels: { alertname: "ExactActive", severity: "warning", instance: "local" },
-          status: { state: "active" },
-        }]));
+        const query = new URL(request.url, "http://127.0.0.1").searchParams;
+        if (query.getAll("filter").length === 0) {
+          response.end(JSON.stringify(Array.from(
+            { length: 1_025 },
+            (_, index) => alertmanagerApiGroup(
+              { alertname: `Unrelated${index}` },
+              [],
+            ),
+          )));
+          return;
+        }
+        response.end(JSON.stringify([alertmanagerApiGroup(
+          { alertname: "ExactActive" },
+          [{
+            labels: { alertname: "ExactActive", severity: "warning", instance: "local" },
+            status: { state: "active" },
+          }],
+        )]));
         return;
       }
       let body = "";
@@ -619,9 +646,11 @@ describe("Alertmanager webhook", () => {
       assert.equal(telegramMessages.length, 0, "noncritical Ops success must stay quiet");
       assert.equal(alertmanagerQueries.length, 1);
       const query = new URL(alertmanagerQueries[0], synthetic.base).searchParams;
-      for (const state of ["active", "silenced", "inhibited", "unprocessed"]) {
+      for (const state of ["active", "silenced", "inhibited", "muted"]) {
         assert.equal(query.get(state), "true");
       }
+      assert.deepEqual(query.getAll("filter"), ['alertname="ExactActive"']);
+      assert.equal(query.get("receiver"), "^(?:minime-native-webhook)$");
 
       const mismatch = alertmanagerPayload({ alertname: "StaleOrForged", fingerprint: "mismatch" });
       assert.equal((await postWebhook(port, mismatch)).status, 200);
@@ -641,6 +670,19 @@ describe("Alertmanager webhook", () => {
       );
       assert.equal(telegramMessages.length, 0, "an unverified critical member must not page");
       assert.equal(alertmanagerQueries.length, 3);
+
+      const forgedDescriptor = alertmanagerPayload({
+        alertname: "ExactActive",
+        fingerprint: "forged-descriptor",
+      });
+      forgedDescriptor.groupLabels = { alertname: "ExactActive", instance: "local" };
+      assert.equal((await postWebhook(port, forgedDescriptor)).status, 200);
+      assert.equal(
+        opsBodies.length,
+        1,
+        "real member labels must not authenticate a descriptor Alertmanager never grouped by",
+      );
+      assert.equal(alertmanagerQueries.length, 4);
       assert.ok(!child.spawnargs.join(" ").includes(syntheticOpsSecret));
       assert.ok(!stderr.includes(syntheticOpsSecret));
     } finally {
@@ -654,14 +696,17 @@ describe("Alertmanager webhook", () => {
     const opsBodies: string[] = [];
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
-        response.end(JSON.stringify(Array.from({ length: 64 }, (_, index) => ({
-          labels: {
-            alertname: `UngroupedLarge${index}`,
-            severity: "warning",
-            instance: "local",
-          },
-          status: { state: "active" },
-        }))));
+        response.end(JSON.stringify([alertmanagerApiGroup(
+          {},
+          Array.from({ length: 64 }, (_, index) => ({
+            labels: {
+              alertname: `UngroupedLarge${index}`,
+              severity: "warning",
+              instance: "local",
+            },
+            status: { state: "active" },
+          })),
+        )]));
         return;
       }
       let body = "";
@@ -714,16 +759,19 @@ describe("Alertmanager webhook", () => {
     let opsAttempts = 0;
     const telegramMessages: string[] = [];
     const synthetic = await startServer((request, response) => {
-      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts?")) {
+      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
         alertmanagerQueries += 1;
         if (alertmanagerQueries === 1) {
           response.statusCode = 503;
           response.end("unavailable");
         } else {
-          response.end(JSON.stringify([{
-            labels: { alertname: "RetryableWarning", severity: "warning", instance: "local" },
-            status: { state: "suppressed" },
-          }]));
+          response.end(JSON.stringify([alertmanagerApiGroup(
+            { alertname: "RetryableWarning" },
+            [{
+              labels: { alertname: "RetryableWarning", severity: "warning", instance: "local" },
+              status: { state: "suppressed" },
+            }],
+          )]));
         }
         return;
       }
@@ -763,10 +811,13 @@ describe("Alertmanager webhook", () => {
     let telegramAttempts = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
-        response.end(JSON.stringify([{
-          labels: { alertname: "SlowOps", severity: "warning", instance: "local" },
-          status: { state: "unprocessed" },
-        }]));
+        response.end(JSON.stringify([alertmanagerApiGroup(
+          { alertname: "SlowOps" },
+          [{
+            labels: { alertname: "SlowOps", severity: "warning", instance: "local" },
+            status: { state: "unprocessed" },
+          }],
+        )]));
         return;
       }
       let body = "";
@@ -804,10 +855,13 @@ describe("Alertmanager webhook", () => {
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
         sourceQueries += 1;
-        response.end(JSON.stringify([{
-          labels: { alertname: "CriticalDual", severity: "critical", instance: "local" },
-          status: { state: "active" },
-        }]));
+        response.end(JSON.stringify([alertmanagerApiGroup(
+          { alertname: "CriticalDual" },
+          [{
+            labels: { alertname: "CriticalDual", severity: "critical", instance: "local" },
+            status: { state: "active" },
+          }],
+        )]));
         return;
       }
       request.resume();

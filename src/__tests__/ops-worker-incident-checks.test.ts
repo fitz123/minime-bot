@@ -308,6 +308,15 @@ describe("bounded generic monitoring readers", () => {
     const now = Date.now();
     const urls: URL[] = [];
     let stabilityValues: unknown[] = [];
+    const completeMonitoringCoverage = () => Array.from(
+      { length: OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs / 5_000 + 1 },
+      (_, index) => {
+        const evaluatedAt = now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
+          + index * 5_000;
+        return [evaluatedAt / 1_000, String((evaluatedAt - 1_000) / 1_000)];
+      },
+    );
+    let monitoringCoverageValues: unknown[] = completeMonitoringCoverage();
     let alertResponse: unknown = [{
       labels: { alertname: "Unrelated", instance: "local" },
       status: { state: "active" },
@@ -339,10 +348,7 @@ describe("bounded generic monitoring readers", () => {
               resultType: "matrix",
               result: [{
                 metric: {},
-                values: [[
-                  (now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000,
-                  String((now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000),
-                ]],
+                values: monitoringCoverageValues,
               }],
             },
           });
@@ -387,8 +393,39 @@ describe("bounded generic monitoring readers", () => {
     assert.equal(stableReading.latestMatchingSampleAt, null);
     assert.equal(
       stableReading.monitoringWindowStartedAt,
-      new Date(now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs).toISOString(),
+      new Date(
+        Date.parse(stableReading.observedAt)
+          - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
+      ).toISOString(),
     );
+    monitoringCoverageValues = [
+      completeMonitoringCoverage()[0],
+      completeMonitoringCoverage().at(-1),
+    ];
+    assert.equal(
+      (await readers.incidentMonitoringReader.readResolutionStability(context))
+        .monitoringWindowStartedAt,
+      null,
+      "a sparse start/end pair must not prove continuous monitoring coverage",
+    );
+    monitoringCoverageValues = completeMonitoringCoverage();
+    const staleIndex = Math.floor(monitoringCoverageValues.length / 2);
+    const staleEvaluation = monitoringCoverageValues[staleIndex] as [number, string];
+    monitoringCoverageValues[staleIndex] = [
+      staleEvaluation[0],
+      String(
+        staleEvaluation[0]
+          - OPS_INCIDENT_CHECK_LIMITS.monitoringFreshnessMs / 1_000
+          - 1,
+      ),
+    ];
+    assert.equal(
+      (await readers.incidentMonitoringReader.readResolutionStability(context))
+        .monitoringWindowStartedAt,
+      null,
+      "a carried stale up value must not prove monitoring coverage through an outage",
+    );
+    monitoringCoverageValues = completeMonitoringCoverage();
     const stabilityQuery = urls.map((url) => url.searchParams.get("query")).find(
       (query) => query?.includes("ALERTS{"),
     );

@@ -95,6 +95,7 @@ const TIMESTAMP_PATTERN =
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const PROMETHEUS_UP_RANGE_QUERY = "(max(timestamp(up)))[2m:5s]";
 const PROMETHEUS_UP_STABILITY_COVERAGE_QUERY = "(max(timestamp(up)))[5m:5s]";
+const PROMETHEUS_SUBQUERY_STEP_MS = 5_000;
 const PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -633,19 +634,46 @@ function latestMetricTimestamp(series: readonly PrometheusMatrixEntry[]): string
   return timestamps.length === 0 ? null : timestamps.sort().at(-1) as string;
 }
 
-function earliestMetricTimestamp(series: readonly PrometheusMatrixEntry[]): string | null {
-  const timestamps = series.flatMap((entry) => entry.samples).map((sample) => {
-    const milliseconds = sample.value * 1_000;
-    if (!Number.isFinite(milliseconds)) {
-      throw new Error("Prometheus returned an invalid metric timestamp");
-    }
-    try {
-      return new Date(milliseconds).toISOString();
-    } catch {
-      throw new Error("Prometheus returned an invalid metric timestamp");
-    }
-  });
-  return timestamps.length === 0 ? null : timestamps.sort().at(0) as string;
+function completeMonitoringWindowStartedAt(
+  series: readonly PrometheusMatrixEntry[],
+  observedAt: string,
+): string | null {
+  if (series.length !== 1 || series[0].samples.length === 0) return null;
+  const observedAtMs = Date.parse(observedAt);
+  const windowStartedAtMs = observedAtMs - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs;
+  const samples = [...series[0].samples].sort(
+    (left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt),
+  );
+  const firstObservedAtMs = Date.parse(samples[0].observedAt);
+  const lastObservedAtMs = Date.parse(samples.at(-1)!.observedAt);
+  if (
+    firstObservedAtMs > windowStartedAtMs + PROMETHEUS_SUBQUERY_STEP_MS
+    || lastObservedAtMs < observedAtMs - PROMETHEUS_SUBQUERY_STEP_MS
+    || lastObservedAtMs > observedAtMs
+  ) return null;
+
+  let previousObservedAtMs: number | null = null;
+  for (const sample of samples) {
+    const sampleObservedAtMs = Date.parse(sample.observedAt);
+    const metricTimestampMs = sample.value * 1_000;
+    if (
+      !Number.isFinite(metricTimestampMs)
+      || metricTimestampMs > sampleObservedAtMs
+      || sampleObservedAtMs - metricTimestampMs
+        > OPS_INCIDENT_CHECK_LIMITS.monitoringFreshnessMs
+      || sampleObservedAtMs < windowStartedAtMs - PROMETHEUS_SUBQUERY_STEP_MS
+      || sampleObservedAtMs > observedAtMs
+      || (
+        previousObservedAtMs !== null
+        && (
+          sampleObservedAtMs <= previousObservedAtMs
+          || sampleObservedAtMs - previousObservedAtMs > PROMETHEUS_SUBQUERY_STEP_MS
+        )
+      )
+    ) return null;
+    previousObservedAtMs = sampleObservedAtMs;
+  }
+  return new Date(windowStartedAtMs).toISOString();
 }
 
 class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
@@ -706,7 +734,10 @@ class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
     return {
       observedAt,
       latestMatchingSampleAt: latestMetricTimestamp(series),
-      monitoringWindowStartedAt: earliestMetricTimestamp(monitoringSeries),
+      monitoringWindowStartedAt: completeMonitoringWindowStartedAt(
+        monitoringSeries,
+        observedAt,
+      ),
     };
   }
 }

@@ -41,10 +41,13 @@ MAX_ALERT_FIELDS = 32
 MAX_LABELS = 64
 MAX_LABEL_BYTES = 2 * 1024
 MAX_KEY_BYTES = 256
+MAX_RECEIVER_BYTES = 1024
 OPS_INTAKE_URL_ENV = "MINIME_OPS_INTAKE_URL"
 ALERTMANAGER_URL_ENV = "MINIME_ALERTMANAGER_URL"
 BRIDGE_TIMEOUT_ENV = "MINIME_BRIDGE_TIMEOUT"
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
+_LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RE2_META_CHARACTERS = frozenset(r"\.+*?()|[]{}^$")
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,7 @@ class ParsedAlertmanagerBatch:
     message: str
     has_firing: bool
     critical: bool
+    receiver: str
     group_labels: dict[str, str]
     firing_labels: tuple[dict[str, str], ...]
 
@@ -202,6 +206,13 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         max_entries=MAX_LABELS,
         max_value_bytes=MAX_LABEL_BYTES,
     )
+    if any(not _LABEL_NAME.fullmatch(key) for key in group_labels):
+        raise ValueError("invalid bridge group labels")
+    receiver = _bounded_string(
+        payload.get("receiver"),
+        limit=MAX_RECEIVER_BYTES,
+        allow_empty=False,
+    )
     firing_count = 0
     firing_labels: list[dict[str, str]] = []
     critical = False
@@ -234,6 +245,7 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         message=message,
         has_firing=firing_count > 0,
         critical=critical,
+        receiver=receiver,
         group_labels=group_labels,
         firing_labels=tuple(firing_labels),
     )
@@ -280,27 +292,43 @@ class BatchDeduplicator:
             self._seen.pop(key, None)
 
 
-def _active_alerts_url(base_url: str) -> str:
-    query = urllib.parse.urlencode(
-        {
-            "active": "true",
-            "silenced": "true",
-            "inhibited": "true",
-            "unprocessed": "true",
-        }
+def _active_alert_groups_url(
+    base_url: str,
+    receiver: str,
+    group_labels: dict[str, str],
+) -> str:
+    quoted_receiver = "".join(
+        f"\\{character}" if character in _RE2_META_CHARACTERS else character
+        for character in receiver
     )
-    return f"{base_url}/api/v2/alerts?{query}"
+    parameters = [
+        ("active", "true"),
+        ("silenced", "true"),
+        ("inhibited", "true"),
+        ("muted", "true"),
+        ("receiver", f"^(?:{quoted_receiver})$"),
+    ]
+    parameters.extend(
+        ("filter", f"{key}={json.dumps(value, ensure_ascii=False)}")
+        for key, value in sorted(group_labels.items())
+    )
+    return f"{base_url}/api/v2/alerts/groups?{urllib.parse.urlencode(parameters)}"
 
 
 def alertmanager_has_exact_group(
     config: BridgeConfig,
+    receiver: str,
     group_labels: dict[str, str],
     firing_labels: tuple[dict[str, str], ...],
 ) -> bool:
-    """Require every delivered firing alert to be current in the exact group."""
+    """Require an exact routed group containing every delivered firing alert."""
     try:
         response = request_with_deadline(
-            _active_alerts_url(config.alertmanager_url),
+            _active_alert_groups_url(
+                config.alertmanager_url,
+                receiver,
+                group_labels,
+            ),
             method="GET",
             headers={"Accept": "application/json"},
             timeout=config.timeout,
@@ -311,32 +339,55 @@ def alertmanager_has_exact_group(
     if not 200 <= response.status <= 299 or len(response.body) > HTTP_RESPONSE_MAX_BYTES:
         raise DeliveryError("Alertmanager source verification failed")
     try:
-        alerts = json.loads(response.body.decode("utf-8"))
+        groups = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise DeliveryError("Alertmanager source verification failed") from None
-    if not isinstance(alerts, list) or len(alerts) > MAX_ACTIVE_ALERTS:
+    if not isinstance(groups, list) or len(groups) > MAX_ACTIVE_ALERTS:
         raise DeliveryError("Alertmanager source verification failed")
     current_group_members: set[tuple[tuple[str, str], ...]] = set()
-    for alert in alerts:
-        if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
+    for group in groups:
+        if not isinstance(group, dict) or len(group) > MAX_ALERT_FIELDS:
             raise DeliveryError("Alertmanager source verification failed")
         try:
             labels = _bounded_string_map(
-                alert.get("labels"),
+                group.get("labels"),
                 max_entries=MAX_LABELS,
                 max_value_bytes=MAX_LABEL_BYTES,
             )
+            group_receiver = group.get("receiver")
+            if not isinstance(group_receiver, dict) or len(group_receiver) > MAX_ALERT_FIELDS:
+                raise ValueError("invalid receiver")
+            receiver_name = _bounded_string(
+                group_receiver.get("name"),
+                limit=MAX_RECEIVER_BYTES,
+                allow_empty=False,
+            )
         except ValueError:
             raise DeliveryError("Alertmanager source verification failed") from None
-        status = alert.get("status")
-        if not isinstance(status, dict) or status.get("state") not in {
-            "active",
-            "suppressed",
-            "unprocessed",
-        }:
+        if labels != group_labels or receiver_name != receiver:
+            continue
+        alerts = group.get("alerts")
+        if not isinstance(alerts, list) or len(alerts) > MAX_ACTIVE_ALERTS:
             raise DeliveryError("Alertmanager source verification failed")
-        if all(labels.get(key) == value for key, value in group_labels.items()):
-            current_group_members.add(tuple(sorted(labels.items())))
+        for alert in alerts:
+            if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
+                raise DeliveryError("Alertmanager source verification failed")
+            try:
+                alert_labels = _bounded_string_map(
+                    alert.get("labels"),
+                    max_entries=MAX_LABELS,
+                    max_value_bytes=MAX_LABEL_BYTES,
+                )
+            except ValueError:
+                raise DeliveryError("Alertmanager source verification failed") from None
+            status = alert.get("status")
+            if not isinstance(status, dict) or status.get("state") not in {
+                "active",
+                "suppressed",
+                "unprocessed",
+            }:
+                raise DeliveryError("Alertmanager source verification failed")
+            current_group_members.add(tuple(sorted(alert_labels.items())))
     return bool(firing_labels) and all(
         tuple(sorted(candidate.items())) in current_group_members
         for candidate in firing_labels
@@ -368,7 +419,7 @@ class WebhookApplication:
         bridge: BridgeConfig | None = None,
         native_deduplicator: BatchDeduplicator | None = None,
         verify_group: Callable[
-            [BridgeConfig, dict[str, str], tuple[dict[str, str], ...]], bool
+            [BridgeConfig, str, dict[str, str], tuple[dict[str, str], ...]], bool
         ] = alertmanager_has_exact_group,
         forward: Callable[[BridgeConfig, bytes], bool] = forward_to_ops,
     ):
@@ -419,6 +470,7 @@ def _deliver_bridge_batch(
     try:
         source_present = app.verify_group(
             bridge,
+            batch.receiver,
             batch.group_labels,
             batch.firing_labels,
         )

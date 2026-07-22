@@ -105,9 +105,10 @@ the existing SOPS mechanism into process memory, and never prints it or places i
 
 For a firing delivery:
 
-1. Query loopback Alertmanager and require an exact currently active group-label match. A mismatch
-   is stale/forged and is acknowledged without forwarding; query failure takes native fallback
-   and returns `503` so Alertmanager retries.
+1. Query loopback Alertmanager's grouped API with bounded group-label and receiver filters, then
+   require an exact currently routed group-label/receiver match containing every delivered firing
+   label set. A mismatch is stale/forged and is acknowledged without forwarding; query failure
+   takes native fallback and returns `503` so Alertmanager retries.
 2. POST the original validated bounded body to Ops with bearer auth.
 3. Noncritical: Ops acceptance is required; if Ops fails, send native fallback but still return
    `503` so Alertmanager retries Ops.

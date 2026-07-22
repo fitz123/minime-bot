@@ -124,13 +124,15 @@ Ops intake. An empty `groupLabels` map is the valid single group produced by an
 ungrouped route; source verification still requires every delivered firing
 label set to remain current.
 
-For each firing delivery, the webhook first queries loopback Alertmanager for
-an exact current group-label match across active, silenced, inhibited, and
-unprocessed alerts and requires every delivered firing label set to match a
-current alert exactly. A mismatch is treated as stale or forged input
-and is acknowledged without forwarding. A source-query failure uses native
-fallback and returns 503 so Alertmanager retries. Once the source is verified,
-required sinks are:
+For each firing delivery, the webhook first queries loopback Alertmanager's
+grouped API with group-label and exact-receiver filters. The returned routed
+group must have exactly the delivered `groupLabels` and receiver, and every
+delivered firing label set must exactly match a current active, suppressed, or
+unprocessed member. The server-side filters keep unrelated global alert
+cardinality outside the bounded response. A mismatch is treated as stale or
+forged input and is acknowledged without forwarding. A source-query failure
+uses native fallback and returns 503 so Alertmanager retries. Once the source
+is verified, required sinks are:
 
 - Noncritical: Ops acceptance is required. Success is quiet. Rejection,
   timeout, or outage sends native fallback but still returns 503.
