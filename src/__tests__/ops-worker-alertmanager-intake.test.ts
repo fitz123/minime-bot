@@ -25,14 +25,18 @@ import {
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
   hashOpsAlertmanagerAuthorizationSnapshot,
+  hashOpsLegacyAlertmanagerAuthorizationSnapshot,
 } from "../ops-worker/ops-contracts.js";
 import {
   inspectOpsWorkerPolicy,
   startOpsWorkerStatusServer,
 } from "../ops-worker/status-server.js";
-import type { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
+import { OpsWorkerSupervisor } from "../ops-worker/supervisor.js";
 import { OpsWorkerTaskStore } from "../ops-worker/task-store.js";
-import { hashOpsWorkerCanonicalSubmission } from "../ops-worker/types.js";
+import {
+  hashOpsWorkerCanonicalSubmission,
+  type OpsWorkerTaskV5,
+} from "../ops-worker/types.js";
 
 const NOW = "2026-07-19T10:00:00.000Z";
 const LATER = "2026-07-19T10:01:00.000Z";
@@ -203,7 +207,12 @@ describe("strict bounded Alertmanager v4 intake parsing", () => {
       () => parseOpsAlertmanagerWebhook(body(webhook({
         alerts: Array.from(
           { length: OPS_ALERTMANAGER_INTAKE_LIMITS.maxAlerts + 1 },
-          () => alert(),
+          () => ({
+            status: "firing",
+            labels: { alertname: "MinimeBotUnavailable" },
+            annotations: {},
+            startsAt: "2026-07-19T09:59:00Z",
+          }),
         ),
       })), CONTENT_TYPE),
       "INVALID_PAYLOAD",
@@ -322,12 +331,46 @@ describe("Alertmanager conversion and task-store submission", () => {
     }
   });
 
-  it("loads a persisted v5 legacy availability snapshot without rewriting it", (t) => {
+  it("accepts ungrouped and large firing groups with bounded omission evidence", (t) => {
+    const { intake, store } = fixture(t);
+    const alerts = Array.from({ length: 64 }, (_, index) => ({
+      ...alert(undefined, "firing", `SyntheticAlert${index}`),
+      fingerprint: `synthetic-${index}`,
+    }));
+
+    const result = intake.submit(body(webhook({
+      groupKey: "{}:{}",
+      groupLabels: {},
+      commonLabels: {},
+      alerts,
+    })), CONTENT_TYPE);
+
+    const task = store.get(result.taskId ?? "");
+    assert.ok(task);
+    assert.equal(task.evidence.length, 64);
+    assert.match(task.evidence[0].summary, /"groupLabels":\{\}/);
+    assert.match(task.evidence.at(-1)?.summary ?? "", /"omittedAlerts":2/);
+    assert.match(task.evidence.at(-1)?.summary ?? "", /"totalFiringAlerts":64/);
+  });
+
+  it("loads and claims a persisted v5 legacy availability snapshot under v2 contracts", async (t) => {
     const { intake, store, taskContracts } = fixture(t);
     const submitted = intake.submit(body(webhook()), CONTENT_TYPE);
     const legacy = structuredClone(store.get(submitted.taskId ?? ""));
     assert.ok(legacy);
+    const current = store.get(submitted.taskId ?? "");
+    assert.ok(current);
+    current.state = "CANCELLED";
+    current.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    };
+    store.replace(current, { event: "TRANSITION", summary: "Closed setup task" });
     legacy.id = "legacy-alertmanager-v5";
+    legacy.source.correlationKey = `${SOURCE_IDENTITY}:group:legacy-v5`;
+    legacy.source.deliveryKey = `${SOURCE_IDENTITY}:episode:legacy-v5`;
     legacy.source.template = OPS_AVAILABILITY_TEMPLATE_NAME;
     legacy.objective =
       OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective;
@@ -335,7 +378,12 @@ describe("Alertmanager conversion and task-store submission", () => {
       name: OPS_AVAILABILITY_DONE_CHECK_NAME,
       params: { invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT },
     };
-    legacy.authorization.snapshotHash = `sha256:${"a".repeat(64)}`;
+    legacy.authorization.snapshotHash = hashOpsLegacyAlertmanagerAuthorizationSnapshot({
+      sourceIdentity: SOURCE_IDENTITY,
+      invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      template: OPS_AVAILABILITY_TEMPLATE_NAME,
+      profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+    });
     legacy.rounds.maxRemediation = 3;
     legacy.session.directory = "sessions/legacy-alertmanager-v5";
     const legacyContract = taskContracts.doneChecks.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
@@ -344,8 +392,13 @@ describe("Alertmanager conversion and task-store submission", () => {
     legacy.lifecycle.verifierVersion = legacyContract.verifierVersion;
     legacy.lifecycle.verifierContractHash = legacyContract.contractHash;
     legacy.submissionFingerprint = hashOpsWorkerCanonicalSubmission(legacy);
+    const { agentResult: _agentResult, ...withoutAgentResult } = legacy;
+    const legacyV5: OpsWorkerTaskV5 = {
+      ...withoutAgentResult,
+      schemaVersion: 5,
+    };
     const snapshotPath = join(store.tasksDirectory, `${legacy.id}.json`);
-    const serialized = `${JSON.stringify(legacy)}\n`;
+    const serialized = `${JSON.stringify(legacyV5)}\n`;
     writeFileSync(snapshotPath, serialized, { mode: 0o600 });
 
     const loaded = store.get(legacy.id);
@@ -354,6 +407,24 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(loaded?.source.template, OPS_AVAILABILITY_TEMPLATE_NAME);
     assert.equal(loaded?.doneCheck.name, OPS_AVAILABILITY_DONE_CHECK_NAME);
     assert.equal(readFileSync(snapshotPath, "utf8"), serialized);
+
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "legacy-alertmanager-claimer",
+      processStartToken: "legacy-alertmanager-claimer-start",
+      now: () => new Date(NOW),
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+    const claimed = await supervisor.claimNextTask();
+    assert.equal(claimed?.task.id, legacy.id);
+    assert.equal(claimed?.action, "RUN");
+    assert.equal(claimed?.task.state, "QUEUED");
+    assert.equal(claimed?.task.custody.status, "HELD");
+    assert.equal(claimed?.task.authorizationVerification?.status, "PASS");
+    assert.equal(JSON.parse(readFileSync(snapshotPath, "utf8")).schemaVersion, 6);
   });
 
   it("returns identical delivery replay without another row or audit append", (t) => {

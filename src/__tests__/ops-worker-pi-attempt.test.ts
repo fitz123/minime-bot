@@ -1232,12 +1232,14 @@ describe("ops worker Pi standard-session attempts", () => {
     }
   });
 
-  it("bounds missing, malformed, and mismatched result files as remediation failures", async (t) => {
+  it("bounds missing, malformed, mismatched, oversized, and unsafe result files as remediation failures", async (t) => {
     const harness = await makeHarness(t);
     for (const scenario of [
       "agent-result-missing",
       "agent-result-malformed",
       "agent-result-id-mismatch",
+      "agent-result-oversized",
+      "agent-result-symlink",
     ]) {
       const task = makeTask(`typed-${scenario}`, {
         sourceKind: "alertmanager",
@@ -1263,6 +1265,24 @@ describe("ops worker Pi standard-session attempts", () => {
       );
       harness.supervisor.cancelTask(task.id, "Release protocol fixture custody");
     }
+  });
+
+  it("rejects a valid typed result when final attempt telemetry is invalid", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-invalid-final-telemetry", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    harness.setScenario("agent-result-invalid-telemetry");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.agentResult, null);
+    assert.equal(result.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
   });
 
   it("converges five missing typed results to one reported BLOCKED task", async (t) => {

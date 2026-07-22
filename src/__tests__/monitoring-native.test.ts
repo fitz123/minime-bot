@@ -636,6 +636,61 @@ describe("Alertmanager webhook", () => {
     }
   });
 
+  it("forwards an ungrouped 64-alert firing batch instead of rejecting the required Ops sink", async () => {
+    const opsBodies: string[] = [];
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET") {
+        response.end(JSON.stringify([{
+          labels: { alertname: "UngroupedLarge0", severity: "warning", instance: "local" },
+          status: { state: "active" },
+        }]));
+        return;
+      }
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") {
+          opsBodies.push(body);
+          response.end(JSON.stringify({ ok: true }));
+        } else if (request.url?.includes("/sendMessage")) {
+          response.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const payload = alertmanagerPayload({ alertname: "UngroupedLarge" });
+      payload.groupKey = "{}:{}";
+      payload.groupLabels = {};
+      payload.commonLabels = {};
+      payload.alerts = Array.from({ length: 64 }, (_, index) => ({
+        ...(payload.alerts as Array<Record<string, unknown>>)[0],
+        labels: {
+          alertname: `UngroupedLarge${index}`,
+          severity: "warning",
+          instance: "local",
+        },
+        fingerprint: `ungrouped-large-${index}`,
+      }));
+
+      assert.equal((await postWebhook(port, payload)).status, 200);
+      assert.equal(opsBodies.length, 1);
+      assert.equal(opsBodies[0], JSON.stringify(payload));
+
+      const stale = alertmanagerPayload({ alertname: "ForgedUngrouped" });
+      stale.groupKey = "{}:{}";
+      stale.groupLabels = {};
+      assert.equal((await postWebhook(port, stale)).status, 200);
+      assert.equal(opsBodies.length, 1, "ungrouped source verification must not be vacuous");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
   it("retries verification and rejected Ops delivery without repeating native fallback", async () => {
     let alertmanagerQueries = 0;
     let opsAttempts = 0;

@@ -401,20 +401,10 @@ export function createOpsIncidentDoneCheckDefinition(
 
 export function createOpsIncidentDoneCheckRegistry(
   deps: OpsIncidentDoneCheckDependencies,
-  additionalDefinitions: Readonly<Record<string, OpsWorkerDoneCheckDefinition>> = {},
 ): OpsWorkerDoneCheckRegistry {
-  if (Object.prototype.hasOwnProperty.call(
-    additionalDefinitions,
-    OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
-  )) {
-    throw new TypeError(
-      "Additional done checks cannot replace ops.alertmanager-incident",
-    );
-  }
   return new OpsWorkerDoneCheckRegistry({
     [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]:
       createOpsIncidentDoneCheckDefinition(deps),
-    ...additionalDefinitions,
   });
 }
 
@@ -522,7 +512,6 @@ function correlatedGroupLabels(
       || decoded.correlationKey !== context.sourceCorrelationKey
     ) continue;
     assertBoundedLabelMap(decoded.groupLabels);
-    if (Object.keys(decoded.groupLabels).length === 0) break;
     return decoded.groupLabels;
   }
   throw new Error("Incident task lacks a usable exact group-label descriptor");

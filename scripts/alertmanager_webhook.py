@@ -55,6 +55,7 @@ class ParsedAlertmanagerBatch:
     has_firing: bool
     critical: bool
     group_labels: dict[str, str]
+    firing_labels: tuple[dict[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -172,12 +173,15 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     ):
         raise ValueError("invalid bridge payload")
     _bounded_string(payload.get("groupKey"), limit=8 * 1024, allow_empty=False)
+    if "groupLabels" not in payload:
+        raise ValueError("invalid bridge payload")
     group_labels = _bounded_string_map(
-        payload.get("groupLabels", {}),
+        payload["groupLabels"],
         max_entries=MAX_LABELS,
         max_value_bytes=MAX_LABEL_BYTES,
     )
     firing_count = 0
+    firing_labels: list[dict[str, str]] = []
     critical = False
     for alert in alerts:
         if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
@@ -192,12 +196,13 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         )
         if status == "firing":
             firing_count += 1
+            firing_labels.append(labels)
             if any(labels.get(key) != value for key, value in group_labels.items()):
                 raise ValueError("group labels do not match firing alert")
         if labels.get("severity") == "critical":
             critical = True
     if (
-        (payload["status"] == "firing" and (firing_count == 0 or not group_labels))
+        (payload["status"] == "firing" and firing_count == 0)
         or (payload["status"] == "resolved" and firing_count != 0)
     ):
         raise ValueError("bridge batch status is inconsistent")
@@ -208,6 +213,7 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         has_firing=firing_count > 0,
         critical=critical,
         group_labels=group_labels,
+        firing_labels=tuple(firing_labels),
     )
 
 
@@ -267,10 +273,9 @@ def _active_alerts_url(base_url: str) -> str:
 def alertmanager_has_exact_group(
     config: BridgeConfig,
     group_labels: dict[str, str],
+    firing_labels: tuple[dict[str, str], ...],
 ) -> bool:
     """Require one bounded current alert containing every exact group label."""
-    if not group_labels:
-        raise DeliveryError("Alertmanager group is invalid")
     try:
         response = request_with_deadline(
             _active_alerts_url(config.alertmanager_url),
@@ -307,7 +312,11 @@ def alertmanager_has_exact_group(
             "unprocessed",
         }:
             raise DeliveryError("Alertmanager source verification failed")
-        if all(labels.get(key) == value for key, value in group_labels.items()):
+        if group_labels and all(
+            labels.get(key) == value for key, value in group_labels.items()
+        ):
+            return True
+        if not group_labels and any(labels == candidate for candidate in firing_labels):
             return True
     return False
 
@@ -336,7 +345,9 @@ class WebhookApplication:
         deduplicator: BatchDeduplicator | None = None,
         bridge: BridgeConfig | None = None,
         native_deduplicator: BatchDeduplicator | None = None,
-        verify_group: Callable[[BridgeConfig, dict[str, str]], bool] = alertmanager_has_exact_group,
+        verify_group: Callable[
+            [BridgeConfig, dict[str, str], tuple[dict[str, str], ...]], bool
+        ] = alertmanager_has_exact_group,
         forward: Callable[[BridgeConfig, bytes], bool] = forward_to_ops,
     ):
         self.path = path
@@ -384,7 +395,11 @@ def _deliver_bridge_batch(
             else True
         )
     try:
-        source_present = app.verify_group(bridge, batch.group_labels)
+        source_present = app.verify_group(
+            bridge,
+            batch.group_labels,
+            batch.firing_labels,
+        )
     except Exception:
         # Verification must be retried even when the independent fallback succeeds.
         _deliver_native_once(app, batch.native_key, batch.message)

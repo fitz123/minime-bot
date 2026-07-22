@@ -119,6 +119,11 @@ arguments, logs, errors, or forwarded payloads. Bridge mode preserves the
 256 KiB body ceiling and forwards the original validated Alertmanager v4 body
 with bearer authentication.
 
+Bridge validation accepts up to 1,024 alerts within that byte ceiling, matching
+Ops intake. An empty `groupLabels` map is the valid single group produced by an
+ungrouped route; source verification then requires at least one exact delivered
+firing label set to remain current.
+
 For each firing delivery, the webhook first queries loopback Alertmanager for
 an exact current group-label match across active, silenced, inhibited, and
 unprocessed alerts. A mismatch is treated as stale or forged input and is
@@ -156,10 +161,23 @@ loaded rules and firing state, then Alertmanager health, loaded configuration,
 routing and notification status. Check that each configured bind mount points
 to the intended current file.
 
-Post controlled synthetic firing and resolved Alertmanager payloads using
-placeholder labels and confirm one Telegram message for each transition.
-Repost the same payload to confirm batch deduplication. A delivery failure
-returns a non-2xx response so Alertmanager can retry.
+With bridge mode disabled, post controlled synthetic firing and resolved
+Alertmanager payloads using placeholder labels and confirm one Telegram message
+for each transition. Repost the same payload to confirm batch deduplication.
+
+Validate bridge mode with a real controlled group that is active in the queried
+Alertmanager; an arbitrary manually posted firing body is intentionally treated
+as stale unless its exact group is current. Check the complete delivery matrix:
+
+- a noncritical firing creates or replays one Ops task and stays quiet on
+  Telegram;
+- a critical firing reaches both Ops and Telegram;
+- a noncritical resolved-only delivery is quiet;
+- source-query or Ops failure sends one native fallback, returns 503, and does
+  not repeat the successful fallback while the same body retries.
+
+A required delivery failure returns a non-2xx response so Alertmanager can
+retry.
 Deduplication is process-local, retains at most 1,024 successful batch digests
 for one hour, and resets when the webhook restarts. It suppresses immediate
 retries; it is not durable exactly-once delivery. Large batches are summarized

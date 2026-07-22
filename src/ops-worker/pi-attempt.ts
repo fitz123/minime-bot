@@ -1274,6 +1274,18 @@ export class OpsWorkerPiAttemptRunner {
     if (classification === "SUCCESS_CLAIM") {
       safeUnlink(attemptQuotaFile);
       const current = this.requireTask(taskId);
+      const operationalMissingTelemetry = attemptQuota.status === "MISSING"
+        && !requiresOpsWorkerInitialQuotaAdmission(current.source.kind);
+      if (attemptQuota.status !== "OK" && !operationalMissingTelemetry) {
+        return {
+          classification: "CRASH",
+          task: this.supervisor.recordQuotaTelemetryError(
+            taskId,
+            `Pi exited successfully without valid attempt response telemetry (${attemptQuota.status})`,
+            evidence,
+          ),
+        };
+      }
       if (requiresTypedAgentResult(current)) {
         const read = resultFilePath === undefined
           ? { status: "INVALID" as const, summary: "Agent result file was not prepared" }
@@ -1296,20 +1308,6 @@ export class OpsWorkerPiAttemptRunner {
             || claim.state === "RESUMABLE"
             ? claim
             : await this.runDoneCheckOrCurrent(taskId),
-        };
-      }
-      const operationalMissingTelemetry = attemptQuota.status === "MISSING"
-        && !requiresOpsWorkerInitialQuotaAdmission(
-          this.requireTask(taskId).source.kind,
-        );
-      if (attemptQuota.status !== "OK" && !operationalMissingTelemetry) {
-        return {
-          classification: "CRASH",
-          task: this.supervisor.recordQuotaTelemetryError(
-            taskId,
-            `Pi exited successfully without valid attempt response telemetry (${attemptQuota.status})`,
-            evidence,
-          ),
         };
       }
       const claim = this.supervisor.recordPiSuccessClaim(

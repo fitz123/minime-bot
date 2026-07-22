@@ -1004,7 +1004,15 @@ describe("ops worker dedicated Telegram control", () => {
       }).tick(),
       /synthetic crash before receipt finish/,
     );
-    assert.match(String(transport.messages[0].text), /… \[truncated\]$/);
+    assert.ok(Buffer.byteLength(String(transport.messages[0].text), "utf8") <= 1_024);
+    for (const required of [
+      "typedOutcome=input-needed reason=information",
+      "diagnosis=",
+      "actions=Inspected",
+      "requestedInput=Provide",
+      "verification=not-run",
+      `checkedAt=${NOW}`,
+    ]) assert.match(String(transport.messages[0].text), new RegExp(required));
     assert.doesNotMatch(String(transport.messages[0].text), new RegExp(config.telegram.token));
     assert.doesNotMatch(String(transport.messages[0].text), /ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/);
     const claimed = first.store.get("task-report")?.mutationReceipts.report;

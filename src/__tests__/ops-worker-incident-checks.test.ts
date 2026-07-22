@@ -196,6 +196,56 @@ describe("generic Alertmanager incident done check", () => {
 });
 
 describe("bounded generic monitoring readers", () => {
+  it("treats an empty persisted group label set as the single ungrouped Alertmanager group", async () => {
+    const urls: URL[] = [];
+    const readers = createOpsMonitoringReaders(
+      "http://127.0.0.1:9090",
+      "http://127.0.0.1:9093",
+      async (input) => {
+        const url = new URL(input);
+        urls.push(url);
+        if (url.port === "9093") {
+          return jsonResponse([{
+            labels: { alertname: "AnyActiveAlert", instance: "local" },
+            status: { state: "active" },
+          }]);
+        }
+        return jsonResponse({ status: "success", data: { resultType: "matrix", result: [] } });
+      },
+    );
+    const context = {
+      signal: new AbortController().signal,
+      taskId: "ungrouped-reader",
+      sourceKind: "alertmanager" as const,
+      sourceCorrelationKey: CORRELATION_KEY,
+      sourceEvidence: [{
+        at: NOW,
+        kind: "alert" as const,
+        trust: "untrusted" as const,
+        summary: JSON.stringify({
+          type: "alertmanager-group-correlation-v1",
+          correlationKey: CORRELATION_KEY,
+          groupLabels: {},
+        }),
+        artifact: null,
+      }],
+    };
+
+    assert.equal(
+      (await readers.incidentAlertmanagerReader.readExactGroupState(context)).status,
+      "PRESENT",
+    );
+    assert.equal(
+      (await readers.incidentMonitoringReader.readResolutionStability(context))
+        .latestMatchingSampleAt,
+      null,
+    );
+    assert.equal(
+      urls.at(-1)?.searchParams.get("query"),
+      'ALERTS{alertstate=~"pending|firing"}[5m]',
+    );
+  });
+
   it("queries all Alertmanager states and treats every matching state as present", async () => {
     const states = [
       { state: "active" },
@@ -234,6 +284,7 @@ describe("bounded generic monitoring readers", () => {
   it("matches only the exact persisted group labels and builds bounded Prometheus queries", async () => {
     const now = Date.now();
     const urls: URL[] = [];
+    let stabilityValues: unknown[] = [];
     let alertResponse: unknown = [{
       labels: { alertname: "Unrelated", instance: "local" },
       status: { state: "active" },
@@ -257,7 +308,19 @@ describe("bounded generic monitoring readers", () => {
         }
         return jsonResponse({
           status: "success",
-          data: { resultType: "matrix", result: [] },
+          data: {
+            resultType: "matrix",
+            result: stabilityValues.length === 0
+              ? []
+              : [{
+                  metric: {
+                    alertname: "FutureSyntheticAlert",
+                    instance: "local",
+                    alertstate: "firing",
+                  },
+                  values: stabilityValues,
+                }],
+          },
         });
       },
     );
@@ -293,6 +356,45 @@ describe("bounded generic monitoring readers", () => {
     assert.equal(
       stabilityQuery,
       'ALERTS{alertname="FutureSyntheticAlert",instance="local",alertstate=~"pending|firing"}[5m]',
+    );
+
+    stabilityValues = [[(now - 60_000) / 1_000, "1"]];
+    const latest = await readers.incidentMonitoringReader.readResolutionStability(context);
+    assert.equal(latest.latestMatchingSampleAt, new Date(now - 60_000).toISOString());
+    alertResponse = [{
+      labels: { alertname: "Unrelated", instance: "local" },
+      status: { state: "active" },
+    }];
+    const registry = createOpsIncidentDoneCheckRegistry({
+      clock: () => new Date(now + 1_000),
+      ...readers,
+    });
+    const waiting = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      {
+        ...context,
+        checkedAt: new Date(now + 1_000).toISOString(),
+        now: () => new Date(now + 1_000),
+      },
+    );
+    assert.equal(waiting.result, "NOT_READY");
+    assert.equal(waiting.nextCheckAt, new Date(now + 4 * 60_000).toISOString());
+
+    stabilityValues = [[(now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000, "1"]];
+    const boundary = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      {
+        ...context,
+        checkedAt: new Date(now + 1_000).toISOString(),
+        now: () => new Date(now + 1_000),
+      },
+    );
+    assert.equal(boundary.result, "PASS");
+
+    stabilityValues = [[(now - 60_000) / 1_000, "not-a-number"]];
+    await assert.rejects(
+      async () => await readers.incidentMonitoringReader.readResolutionStability(context),
+      /non-finite sample/,
     );
   });
 

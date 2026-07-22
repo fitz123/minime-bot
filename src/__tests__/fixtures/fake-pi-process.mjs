@@ -4,6 +4,8 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawn } from "node:child_process";
@@ -212,14 +214,13 @@ async function emitProviderResponse(status, headers) {
   }
 }
 
-function writeAgentResult(kind, overrides = {}) {
-  const resultFile = process.env.OPS_WORKER_RESULT_FILE;
+function agentResult(kind, overrides = {}) {
   const attemptId = process.env.OPS_WORKER_ATTEMPT_ID;
-  if (!resultFile || !attemptId) {
+  if (!attemptId) {
     process.stderr.write("fake Pi requires the typed result environment\n");
     process.exit(64);
   }
-  writeFileSync(resultFile, JSON.stringify({
+  return {
     attemptId,
     kind,
     summary: `Typed ${kind} fixture result.`,
@@ -231,7 +232,16 @@ function writeAgentResult(kind, overrides = {}) {
       ? "unrecoverable"
       : null,
     ...overrides,
-  }), "utf8");
+  };
+}
+
+function writeAgentResult(kind, overrides = {}) {
+  const resultFile = process.env.OPS_WORKER_RESULT_FILE;
+  if (!resultFile) {
+    process.stderr.write("fake Pi requires the typed result environment\n");
+    process.exit(64);
+  }
+  writeFileSync(resultFile, JSON.stringify(agentResult(kind, overrides)), "utf8");
 }
 
 switch (scenario) {
@@ -261,6 +271,25 @@ switch (scenario) {
   case "agent-result-id-mismatch":
     await emitProviderResponse(200, {});
     writeAgentResult("no-action-needed", { attemptId: "attempt-wrong" });
+    break;
+  case "agent-result-oversized":
+    await emitProviderResponse(200, {});
+    writeAgentResult("no-action-needed");
+    appendFileSync(process.env.OPS_WORKER_RESULT_FILE, " ".repeat(32 * 1024), "utf8");
+    break;
+  case "agent-result-symlink": {
+    await emitProviderResponse(200, {});
+    const resultFile = process.env.OPS_WORKER_RESULT_FILE;
+    const target = join(sessionDirectory, "unsafe-result-target.json");
+    writeFileSync(target, JSON.stringify(agentResult("no-action-needed")), "utf8");
+    unlinkSync(resultFile);
+    symlinkSync(target, resultFile);
+    break;
+  }
+  case "agent-result-invalid-telemetry":
+    await emitProviderResponse(200, {});
+    writeFileSync(process.env.CODEX_QUOTA_ATTEMPT_FILE, "{not-json", "utf8");
+    writeAgentResult("no-action-needed");
     break;
   case "success":
     await emitProviderResponse(200, {});

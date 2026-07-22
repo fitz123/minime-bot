@@ -26,6 +26,7 @@ import {
   hashOpsWorkerCanonicalSubmission,
   hashOpsWorkerVerificationSubject,
   OpsWorkerTaskValidationError,
+  parseOpsWorkerAgentResult,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
   requiresOpsWorkerInitialQuotaAdmission,
@@ -804,6 +805,50 @@ describe("ops worker task contract", () => {
       () => "bounded action",
     );
     assert.throws(() => parseOpsWorkerTask(oversized, registry), /at most 16 entries/);
+  });
+
+  it("enforces every typed agent-result field boundary and exact enum/type contract", () => {
+    const exact = {
+      attemptId: "attempt-result-boundaries",
+      kind: "input-needed",
+      summary: "s".repeat(OPS_WORKER_LIMITS.maxAgentResultSummaryBytes),
+      actions: Array.from(
+        { length: OPS_WORKER_LIMITS.maxAgentResultActions },
+        () => "a".repeat(OPS_WORKER_LIMITS.maxAgentResultActionBytes),
+      ),
+      requestedInput: "i".repeat(OPS_WORKER_LIMITS.maxAgentResultRequestedInputBytes),
+      reason: "information",
+    } as const;
+    assert.deepEqual(
+      parseOpsWorkerAgentResult(exact, exact.attemptId),
+      exact,
+    );
+
+    const sparseActions = new Array<string>(2);
+    sparseActions[1] = "present";
+    const invalid: Array<{ value: unknown; message: RegExp }> = [
+      { value: { ...exact, summary: `${exact.summary}x` }, message: /summary.*at most 4096/ },
+      {
+        value: { ...exact, actions: [`${"a".repeat(OPS_WORKER_LIMITS.maxAgentResultActionBytes)}x`] },
+        message: /actions\[0\].*at most 1024/,
+      },
+      {
+        value: { ...exact, requestedInput: `${exact.requestedInput}x` },
+        message: /requestedInput.*at most 4096/,
+      },
+      { value: { ...exact, kind: "finished" }, message: /kind.*one of/ },
+      { value: { ...exact, reason: "guess" }, message: /reason.*one of/ },
+      { value: { ...exact, actions: "not-an-array" }, message: /actions.*array/ },
+      { value: { ...exact, actions: sparseActions }, message: /actions.*dense/ },
+      { value: { ...exact, summary: "" }, message: /summary.*must not be empty/ },
+      { value: { ...exact, attemptId: "unsafe attempt" }, message: /attemptId.*unsafe/ },
+    ];
+    for (const candidate of invalid) {
+      assert.throws(
+        () => parseOpsWorkerAgentResult(candidate.value),
+        candidate.message,
+      );
+    }
   });
 
   it("strictly validates bounded opaque steering and the fixed control record", () => {

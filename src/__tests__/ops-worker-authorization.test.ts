@@ -30,6 +30,7 @@ import {
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
   hashOpsAlertmanagerAuthorizationSnapshot,
+  hashOpsLegacyAlertmanagerAuthorizationSnapshot,
   type OpsAlertmanagerAuthorizationSnapshot,
 } from "../ops-worker/ops-contracts.js";
 import { inspectOpsWorkerPolicy } from "../ops-worker/status-server.js";
@@ -512,6 +513,25 @@ function alertmanagerTask(
   return task;
 }
 
+function legacyAlertmanagerTask(): OpsWorkerTask {
+  const task = alertmanagerTask();
+  task.source.template = OPS_AVAILABILITY_TEMPLATE_NAME;
+  task.objective = "Restore and verify Minime bot host availability.";
+  task.doneCheck = {
+    name: OPS_AVAILABILITY_DONE_CHECK_NAME,
+    params: { invariant: "minime-bot-host" },
+  };
+  task.authorization.snapshotHash = hashOpsLegacyAlertmanagerAuthorizationSnapshot({
+    sourceIdentity: ALERT_SOURCE_IDENTITY,
+    invariant: "minime-bot-host",
+    template: OPS_AVAILABILITY_TEMPLATE_NAME,
+    profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+  });
+  task.rounds.maxRemediation = 3;
+  task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+  return task;
+}
+
 describe("package-owned alertmanager authorization verifier", () => {
   it("passes the exact trusted task after store-owned runtime evidence changes", async () => {
     const contracts = opsContracts({ read: () => alertmanagerSnapshot() });
@@ -618,6 +638,35 @@ describe("package-owned alertmanager authorization verifier", () => {
     for (const candidate of cases) {
       assert.equal((await verifier.verify(candidate)).status, "INVALID_CLAIM");
     }
+  });
+
+  it("accepts only the exact closed legacy Alertmanager claim under current trusted identity", async () => {
+    const verifier = opsContracts({ read: () => alertmanagerSnapshot() })
+      .alertmanagerAuthorizationVerifier;
+    assert.equal((await verifier.verify(legacyAlertmanagerTask())).status, "PASS");
+
+    for (const mutate of [
+      (task: OpsWorkerTask) => { task.rounds.maxRemediation = 5; },
+      (task: OpsWorkerTask) => { task.doneCheck.params = {}; },
+      (task: OpsWorkerTask) => { task.agentResult = {
+        attemptId: "attempt-forged-legacy",
+        kind: "no-action-needed",
+        summary: "Forged legacy typed result.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      }; },
+      (task: OpsWorkerTask) => { task.authorization.snapshotHash = `sha256:${"e".repeat(64)}`; },
+    ]) {
+      const candidate = legacyAlertmanagerTask();
+      mutate(candidate);
+      assert.equal((await verifier.verify(candidate)).status, "INVALID_CLAIM");
+    }
+
+    const drifted = opsContracts({
+      read: () => alertmanagerSnapshot("replacement-alertmanager"),
+    }).alertmanagerAuthorizationVerifier;
+    assert.equal((await drifted.verify(legacyAlertmanagerTask())).status, "DRIFT");
   });
 
   it("registers closed production contracts and fails start policy without every source verifier", () => {

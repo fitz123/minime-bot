@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import {
-  createOpsAvailabilityDoneCheckRegistry,
+  OPS_AVAILABILITY_DONE_CHECK_NAME,
+  OPS_AVAILABILITY_INVARIANTS,
+  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+  createOpsAvailabilityDoneCheckDefinition,
   type OpsAvailabilityDoneCheckDependencies,
 } from "./availability-checks.js";
 import type {
@@ -8,7 +11,7 @@ import type {
   OpsWorkerAuthorizationVerifierRegistry,
   OpsWorkerAuthorizationVerifierResult,
 } from "./authorization.js";
-import type { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
+import { OpsWorkerDoneCheckRegistry } from "./done-checks.js";
 import {
   OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
   OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION,
@@ -48,6 +51,13 @@ export interface OpsAlertmanagerAuthorizationSnapshot {
   doneCheck: string;
   objective: string;
   profile: string;
+}
+
+export interface OpsLegacyAlertmanagerAuthorizationSnapshot {
+  sourceIdentity: string;
+  invariant: typeof OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT;
+  template: typeof OPS_AVAILABILITY_TEMPLATE_NAME;
+  profile: typeof OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE;
 }
 
 export interface OpsAlertmanagerAuthorizationSnapshotReader {
@@ -162,6 +172,19 @@ export function hashOpsAlertmanagerAuthorizationSnapshot(
   });
 }
 
+/** Exact v1 authorization digest retained only for persisted Alertmanager task compatibility. */
+export function hashOpsLegacyAlertmanagerAuthorizationSnapshot(
+  snapshot: OpsLegacyAlertmanagerAuthorizationSnapshot,
+): string {
+  return hashCanonical({
+    sourceKind: "alertmanager",
+    sourceIdentity: snapshot.sourceIdentity,
+    invariant: snapshot.invariant,
+    template: snapshot.template,
+    profile: snapshot.profile,
+  });
+}
+
 function parseTrustedSnapshot(value: unknown): OpsAlertmanagerAuthorizationSnapshot | null {
   if (
     !isPlainObject(value)
@@ -194,7 +217,11 @@ function sourceIdentityFromKey(value: string): string | null {
   return isOpsWorkerRegisteredName(identity) ? identity : null;
 }
 
-function claimedSnapshot(task: Readonly<OpsWorkerTask>): OpsAlertmanagerAuthorizationSnapshot | null {
+type ClaimedAlertmanagerAuthorization =
+  | { kind: "current"; snapshot: OpsAlertmanagerAuthorizationSnapshot }
+  | { kind: "legacy"; snapshot: OpsLegacyAlertmanagerAuthorizationSnapshot };
+
+function claimedSnapshot(task: Readonly<OpsWorkerTask>): ClaimedAlertmanagerAuthorization | null {
   if (
     task.source.kind !== "alertmanager"
     || task.resource.kind !== "host"
@@ -211,16 +238,56 @@ function claimedSnapshot(task: Readonly<OpsWorkerTask>): OpsAlertmanagerAuthoriz
     || !hasExactDataKeys(task.doneCheck.params, [])
     || task.rounds.maxRemediation !== 5
     || task.objective !== OPS_ALERTMANAGER_INCIDENT_OBJECTIVE
+  ) return claimedLegacySnapshot(task);
+  const correlationIdentity = sourceIdentityFromKey(task.source.correlationKey);
+  const deliveryIdentity = sourceIdentityFromKey(task.source.deliveryKey);
+  if (correlationIdentity === null || correlationIdentity !== deliveryIdentity) return null;
+  return {
+    kind: "current",
+    snapshot: {
+      sourceIdentity: correlationIdentity,
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+      objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+      profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+    },
+  };
+}
+
+function claimedLegacySnapshot(
+  task: Readonly<OpsWorkerTask>,
+): ClaimedAlertmanagerAuthorization | null {
+  if (
+    task.source.kind !== "alertmanager"
+    || task.resource.kind !== "host"
+    || task.resource.key !== OPS_AVAILABILITY_RESOURCE_KEY
+    || task.priority !== 0
+    || task.source.template !== OPS_AVAILABILITY_TEMPLATE_NAME
+    || task.doneCheck.name !== OPS_AVAILABILITY_DONE_CHECK_NAME
+    || task.authorization.profile !== OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE
+    || task.authorization.scope.length !== 2
+    || task.authorization.scope[0] !== "inspect"
+    || task.authorization.scope[1] !== "local-reversible-repair"
+    || task.authorization.snapshotHash === null
+    || !isPlainObject(task.doneCheck.params)
+    || !hasExactDataKeys(task.doneCheck.params, ["invariant"])
+    || task.doneCheck.params.invariant !== OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT
+    || task.rounds.maxRemediation !== 3
+    || task.objective
+      !== OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective
+    || task.agentResult !== null
   ) return null;
   const correlationIdentity = sourceIdentityFromKey(task.source.correlationKey);
   const deliveryIdentity = sourceIdentityFromKey(task.source.deliveryKey);
   if (correlationIdentity === null || correlationIdentity !== deliveryIdentity) return null;
   return {
-    sourceIdentity: correlationIdentity,
-    template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
-    doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
-    objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
-    profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+    kind: "legacy",
+    snapshot: {
+      sourceIdentity: correlationIdentity,
+      invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
+      template: OPS_AVAILABILITY_TEMPLATE_NAME,
+      profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+    },
   };
 }
 
@@ -263,7 +330,9 @@ function createAlertmanagerAuthorizationVerifier(
       }
       if (
         task.authorization.snapshotHash
-        !== hashOpsAlertmanagerAuthorizationSnapshot(claimed)
+        !== (claimed.kind === "current"
+          ? hashOpsAlertmanagerAuthorizationSnapshot(claimed.snapshot)
+          : hashOpsLegacyAlertmanagerAuthorizationSnapshot(claimed.snapshot))
       ) return result("INVALID_CLAIM", "snapshot-hash-mismatch", task);
 
       let configuredRaw: unknown;
@@ -276,7 +345,11 @@ function createAlertmanagerAuthorizationVerifier(
       if (configured === null) {
         return result("QUERY_ERROR", "snapshot-reader-invalid", task);
       }
-      if (canonicalJson(configured) !== canonicalJson(claimed)) {
+      const configuredMatches = claimed.kind === "current"
+        ? canonicalJson(configured) === canonicalJson(claimed.snapshot)
+        : configured.sourceIdentity === claimed.snapshot.sourceIdentity
+          && configured.profile === claimed.snapshot.profile;
+      if (!configuredMatches) {
         return result("DRIFT", "configured-snapshot-drift", task);
       }
       return result("PASS", "configured-snapshot-pass", task);
@@ -287,7 +360,9 @@ function createAlertmanagerAuthorizationVerifier(
 export function createOpsTaskContracts(
   deps: CreateOpsTaskContractsDependencies,
 ): OpsTaskContracts {
-  const doneChecks = createOpsAvailabilityDoneCheckRegistry(deps, {
+  const doneChecks = new OpsWorkerDoneCheckRegistry({
+    [OPS_AVAILABILITY_DONE_CHECK_NAME]:
+      createOpsAvailabilityDoneCheckDefinition(deps),
     [OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME]:
       createOpsIncidentDoneCheckDefinition(deps),
   });

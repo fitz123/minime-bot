@@ -258,19 +258,11 @@ function assertDependencies(deps: OpsAvailabilityDoneCheckDependencies): void {
   ) throw new TypeError("Availability done check requires all trusted read-only dependencies");
 }
 
-export function createOpsAvailabilityDoneCheckRegistry(
+export function createOpsAvailabilityDoneCheckDefinition(
   deps: OpsAvailabilityDoneCheckDependencies,
-  additionalDefinitions: Readonly<Record<string, OpsWorkerDoneCheckDefinition>> = {},
-): OpsWorkerDoneCheckRegistry {
+): OpsWorkerDoneCheckDefinition {
   assertDependencies(deps);
-  if (Object.prototype.hasOwnProperty.call(
-    additionalDefinitions,
-    OPS_AVAILABILITY_DONE_CHECK_NAME,
-  )) {
-    throw new TypeError("Additional done checks cannot replace ops.minime-availability");
-  }
-  return new OpsWorkerDoneCheckRegistry({
-    [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
+  return {
       identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
       version: OPS_AVAILABILITY_DONE_CHECK_VERSION,
       validateParams,
@@ -452,8 +444,14 @@ export function createOpsAvailabilityDoneCheckRegistry(
           },
         },
       ],
-    },
-    ...additionalDefinitions,
+  };
+}
+
+export function createOpsAvailabilityDoneCheckRegistry(
+  deps: OpsAvailabilityDoneCheckDependencies,
+): OpsWorkerDoneCheckRegistry {
+  return new OpsWorkerDoneCheckRegistry({
+    [OPS_AVAILABILITY_DONE_CHECK_NAME]: createOpsAvailabilityDoneCheckDefinition(deps),
   });
 }
 

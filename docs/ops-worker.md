@@ -390,6 +390,12 @@ untrusted evidence and cannot expand authority. The legacy `ops.availability`
 contract remains registered for compatible local CLI tasks and stored
 snapshots, but Alertmanager intake no longer selects it.
 
+The bounded intake accepts up to 1,024 alerts within the 256 KiB body limit.
+Task evidence retains the exact group descriptor, a bounded alert subset, and
+an omission count when the group is larger than the task evidence capacity. An
+empty `groupLabels` map represents Alertmanager's single ungrouped route group;
+absence and stability then apply to all active alerts.
+
 For this template, the harness creates a fresh result-file path only after the
 attempt identity is persisted and passes it as `OPS_WORKER_RESULT_FILE`. The
 agent must write exactly one schema-valid result for that attempt. The harness
@@ -400,6 +406,25 @@ the latest result, and removes the temporary file. `remediation-complete` and
 report. A missing, malformed, or mismatched result consumes a remediation round;
 five protocol failures end in reported `BLOCKED`. Legacy templates keep their
 existing clean-exit behavior.
+
+The result file contains exactly these six keys:
+
+```json
+{
+  "attemptId": "the exact OPS_WORKER_ATTEMPT_ID value",
+  "kind": "remediation-complete | no-action-needed | input-needed | impossible",
+  "summary": "non-empty diagnosis text",
+  "actions": ["non-empty action text"],
+  "requestedInput": "non-empty text or null",
+  "reason": "approval | information | policy-boundary | unrecoverable | null"
+}
+```
+
+The UTF-8 JSON file is at most 32 KiB. `summary` and `requestedInput` are each
+at most 4 KiB; `actions` contains at most 16 entries of at most 1 KiB each.
+`attemptId` must exactly match the persisted attempt identity supplied by the
+harness. Unknown keys, wrong types, sparse arrays, invalid enum values, empty
+required text, and over-limit data are protocol failures.
 
 The generic check requires all three package-owned components to pass:
 

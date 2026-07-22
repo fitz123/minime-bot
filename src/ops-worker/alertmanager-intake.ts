@@ -27,7 +27,7 @@ import {
 
 export const OPS_ALERTMANAGER_INTAKE_LIMITS = Object.freeze({
   maxBodyBytes: 256 * 1024,
-  maxAlerts: OPS_WORKER_LIMITS.maxEvidenceEntries - 1,
+  maxAlerts: 1_024,
   maxLabelEntries: 64,
   maxAnnotationEntries: 64,
   maxKeyBytes: 256,
@@ -444,10 +444,10 @@ function alertGroupCorrelationEvidence(
   groupLabels: Record<string, string> | undefined,
   at: string,
 ): OpsWorkerEvidence {
-  if (!groupLabels || Object.keys(groupLabels).length === 0) {
+  if (groupLabels === undefined) {
     fail(
       "INVALID_PAYLOAD",
-      "Alertmanager firing groups require non-empty groupLabels for exact correlation",
+      "Alertmanager firing groups require groupLabels for exact correlation",
     );
   }
   const value = {
@@ -469,6 +469,32 @@ function alertGroupCorrelationEvidence(
     summary,
     artifact: null,
   };
+}
+
+function boundedAlertEvidence(
+  firingAlerts: readonly OpsAlertmanagerWebhookAlert[],
+  at: string,
+): OpsWorkerEvidence[] {
+  const directCapacity = OPS_WORKER_LIMITS.maxEvidenceEntries - 1;
+  if (firingAlerts.length <= directCapacity) {
+    return firingAlerts.map((entry) => alertEvidence(entry, at));
+  }
+  const retained = firingAlerts.slice(0, directCapacity - 1);
+  return [
+    ...retained.map((entry) => alertEvidence(entry, at)),
+    {
+      at,
+      kind: "alert",
+      trust: "untrusted",
+      summary: JSON.stringify({
+        type: "alertmanager-alert-omission-v1",
+        includedAlerts: retained.length,
+        omittedAlerts: firingAlerts.length - retained.length,
+        totalFiringAlerts: firingAlerts.length,
+      }),
+      artifact: null,
+    },
+  ];
 }
 
 export class OpsWorkerAlertmanagerIntake {
@@ -578,7 +604,7 @@ export class OpsWorkerAlertmanagerIntake {
       objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       evidence: [
         alertGroupCorrelationEvidence(correlationKey, groupLabels, now),
-        ...firingAlerts.map((entry) => alertEvidence(entry, now)),
+        ...boundedAlertEvidence(firingAlerts, now),
       ],
       doneCheck: {
         name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
