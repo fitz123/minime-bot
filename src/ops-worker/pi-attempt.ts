@@ -97,6 +97,7 @@ export const OPS_WORKER_PI_LIMITS = {
   maxPromptBytes: 128 * 1024,
   maxSteeringPromptBytes: OPS_WORKER_LIMITS.maxPendingSteeringPromptBytes,
   maxSessionFiles: 64,
+  maxSessionIdCharacters: 64,
   defaultAttemptTimeoutMs: 30 * 60 * 1_000,
   defaultStallTimeoutMs: 20 * 60 * 1_000,
   defaultTermGraceMs: 5_000,
@@ -535,6 +536,17 @@ export class OpsWorkerPiAttemptRunner {
             this.newSessionId(task.id),
             false,
           );
+        } else if (
+          Array.from(task.session.sessionId).length
+            > OPS_WORKER_PI_LIMITS.maxSessionIdCharacters
+        ) {
+          task = this.supervisor.resetPiSession(
+            task.id,
+            this.newSessionId(task.id),
+            sessionIdLimitResetSummary(),
+          );
+          if (sessionResetCount === 1) return task;
+          continue;
         }
         if (task.session.resume) {
           const invalidFiles = inspectStandardSession(
@@ -1956,7 +1968,14 @@ export class OpsWorkerPiAttemptRunner {
   }
 
   private newSessionId(taskId: string): string {
-    return `ops-${taskId}-${this.randomId()}`;
+    // Pi 0.80.6 forwards its session id through Codex request headers whose
+    // effective prompt-cache key is limited to 64 characters by the provider.
+    const taskDigest = createHash("sha256").update(taskId).digest("hex").slice(0, 16);
+    const prefix = `ops-${taskDigest}-`;
+    const suffixBudget = OPS_WORKER_PI_LIMITS.maxSessionIdCharacters
+      - Array.from(prefix).length;
+    const suffix = Array.from(this.randomId()).slice(0, suffixBudget).join("");
+    return `${prefix}${suffix}`;
   }
 
   private requireTask(taskId: string): OpsWorkerTask {
@@ -2719,6 +2738,14 @@ function fsyncDirectory(path: string): void {
   } finally {
     closeSync(descriptor);
   }
+}
+
+function sessionIdLimitResetSummary(): string {
+  return [
+    "Reset an overlength standard Pi session id before provider launch;",
+    `the transport limit is ${OPS_WORKER_PI_LIMITS.maxSessionIdCharacters} characters.`,
+    "The task remains resumable with bounded loss of prior conversation context.",
+  ].join(" ");
 }
 
 function sessionResetSummary(quarantinedFiles: number): string {

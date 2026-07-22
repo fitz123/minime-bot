@@ -483,6 +483,11 @@ describe("ops worker Pi standard-session attempts", () => {
       join(packageRoot, "dist/cli/initial-message.js"),
       "utf8",
     );
+    const piAiEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
+    const codexTransportSource = readFileSync(
+      join(dirname(piAiEntry), "api", "openai-codex-responses.js"),
+      "utf8",
+    );
 
     assert.equal(manifest.version, "0.80.6");
     assert.match(mainSource, /if \(parsed\.sessionId\)/);
@@ -492,6 +497,14 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(mainSource, /stdinContent = await readPipedStdin\(\)/);
     assert.match(initialMessageSource, /parts\.push\(stdinContent\)/);
     assert.match(sessionSource, /Session file is not a valid pi session/);
+    assert.match(
+      codexTransportSource,
+      /prompt_cache_key: clampOpenAIPromptCacheKey\(options\?\.sessionId\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /headers\.set\("session-id", sessionId\)/,
+    );
   });
 
   it("returns a task cancelled while pre-launch authorization is in flight", async (t) => {
@@ -2216,6 +2229,54 @@ describe("ops worker Pi standard-session attempts", () => {
       /before parent persistence and acknowledgement/,
     );
     assert.equal(checkCalls, 0);
+  });
+
+  it("bounds production-shaped Ops Pi session ids to the Codex transport limit", async (t) => {
+    const harness = await makeHarness(t);
+    const taskId = `am-${"a".repeat(48)}`;
+    harness.store.create(makeTask(taskId));
+
+    const completed = await harness.runner().runAttempt(taskId);
+
+    assert.equal(completed.state, "DONE");
+    assert.ok(completed.session.sessionId);
+    assert.ok(
+      Array.from(completed.session.sessionId).length
+        <= OPS_WORKER_PI_LIMITS.maxSessionIdCharacters,
+    );
+    const args = harness.invocations[0];
+    assert.equal(
+      args[args.indexOf("--session-id") + 1],
+      completed.session.sessionId,
+    );
+  });
+
+  it("resets a pre-fix overlength session before provider launch", async (t) => {
+    const harness = await makeHarness(t);
+    const taskId = `am-${"b".repeat(48)}`;
+    const legacySessionId = `ops-${taskId}-8f7fb8e1-4fd6-4391-81b3-ca2071830003`;
+    harness.store.create(makeTask(taskId));
+    harness.supervisor.preparePiSession(taskId, legacySessionId, true);
+    assert.ok(
+      Array.from(legacySessionId).length
+        > OPS_WORKER_PI_LIMITS.maxSessionIdCharacters,
+    );
+
+    const completed = await harness.runner().runAttempt(taskId);
+
+    assert.equal(completed.state, "DONE");
+    assert.notEqual(completed.session.sessionId, legacySessionId);
+    assert.ok(completed.session.sessionId);
+    assert.ok(
+      Array.from(completed.session.sessionId).length
+        <= OPS_WORKER_PI_LIMITS.maxSessionIdCharacters,
+    );
+    assert.equal(harness.invocations.length, 1);
+    assert.ok(harness.invocations[0].includes("--session-id"));
+    assert.equal(
+      completed.evidence.some((entry) => /transport limit is 64/.test(entry.summary)),
+      true,
+    );
   });
 
   it("preserves and resumes the same standard Pi session after a crash", async (t) => {
