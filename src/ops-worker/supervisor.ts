@@ -2580,6 +2580,9 @@ export class OpsWorkerSupervisor {
         sourceKind: task.source.kind,
         sourceCorrelationKey: task.source.correlationKey,
         sourceEvidence: task.evidence,
+        previousVerification: task.verification === null
+          ? undefined
+          : structuredClone(task.verification),
         expectedContract,
         now: this.now,
       }, signal);

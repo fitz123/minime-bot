@@ -192,6 +192,20 @@ def _bridge_native_key(
     return hashlib.sha256(identity_bytes).hexdigest()
 
 
+def _bridge_native_message(
+    members: list[tuple[str, AlertmanagerMemberIdentity]],
+) -> str:
+    lines: list[str] = []
+    for status, member in members:
+        labels = dict(member.labels)
+        lines.append(
+            f"{status.upper()} alert={safe_field(labels.get('alertname'))} "
+            f"severity={safe_field(labels.get('severity'))} "
+            f"instance={safe_field(labels.get('instance'))}"
+        )
+    return _bounded_alert_message(lines)
+
+
 def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     """Validate fields needed to authenticate and forward one Alertmanager v4 group."""
     payload = _decode_alertmanager_payload(body)
@@ -225,7 +239,6 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     firing_count = 0
     members: list[tuple[str, AlertmanagerMemberIdentity]] = []
     firing_members: list[AlertmanagerMemberIdentity] = []
-    critical = False
     for alert in alerts:
         if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
             raise ValueError("invalid bridge alert")
@@ -263,18 +276,29 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
             firing_members.append(member)
             if any(labels.get(key) != value for key, value in group_labels.items()):
                 raise ValueError("group labels do not match firing alert")
-        if labels.get("severity") == "critical":
-            critical = True
     if (
         (payload["status"] == "firing" and firing_count == 0)
         or (payload["status"] == "resolved" and firing_count != 0)
     ):
         raise ValueError("bridge batch status is inconsistent")
-    _, message = _native_payload_fields(payload)
+    decision_members_by_identity: dict[
+        tuple[str, tuple[tuple[str, str], ...], str],
+        tuple[str, AlertmanagerMemberIdentity],
+    ] = {}
+    for status, member in members:
+        if firing_count > 0 and status != "firing":
+            continue
+        identity = (status, member.labels, member.starts_at)
+        decision_members_by_identity.setdefault(identity, (status, member))
+    decision_members = list(decision_members_by_identity.values())
+    critical = any(
+        dict(member.labels).get("severity") == "critical"
+        for _, member in decision_members
+    )
     return ParsedAlertmanagerBatch(
-        native_key=_bridge_native_key(receiver, group_labels, members),
+        native_key=_bridge_native_key(receiver, group_labels, decision_members),
         bridge_key=hashlib.sha256(body).hexdigest(),
-        message=message,
+        message=_bridge_native_message(decision_members),
         has_firing=firing_count > 0,
         critical=critical,
         receiver=receiver,

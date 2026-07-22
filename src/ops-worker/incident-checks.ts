@@ -97,6 +97,8 @@ const PROMETHEUS_UP_RANGE_QUERY = "(max(timestamp(up)))[2m:5s]";
 const PROMETHEUS_UP_STABILITY_COVERAGE_QUERY = "(max(timestamp(up)))[5m:5s]";
 const PROMETHEUS_SUBQUERY_STEP_MS = 5_000;
 const PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const STABILITY_WAIT_SUMMARY =
+  "The exact alert group has not yet been absent with five minutes of monitoring coverage.";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -228,6 +230,31 @@ function readerContext(context: OpsWorkerDoneCheckContext): OpsIncidentReaderCon
     sourceCorrelationKey: context.sourceCorrelationKey,
     sourceEvidence: context.sourceEvidence,
   };
+}
+
+function previousAbsenceWindowReadyAt(
+  context: OpsWorkerDoneCheckContext,
+): number | null {
+  const previous = context.previousVerification;
+  if (
+    previous === undefined
+    || previous.verifierIdentity !== OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME
+    || previous.verifierVersion !== OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_VERSION
+    || previous.outcome !== "NOT_READY"
+  ) return null;
+  const absence = previous.components.find(
+    (component) => component.identity === "exact-group-absence",
+  );
+  const stability = previous.components.find(
+    (component) => component.identity === "resolution-stability",
+  );
+  if (
+    absence?.outcome !== "PASS"
+    || stability?.outcome !== "NOT_READY"
+    || stability.summary !== STABILITY_WAIT_SUMMARY
+    || stability.nextCheckAt === null
+  ) return null;
+  return Date.parse(stability.nextCheckAt);
 }
 
 function validateParams(value: unknown): JsonObject {
@@ -387,13 +414,15 @@ export function createOpsIncidentDoneCheckDefinition(
               scheduledAt(observedAt),
             );
           }
+          const priorAbsenceReadyAt = previousAbsenceWindowReadyAt(context);
           const readyAt = Math.max(
             reading.monitoringWindowStartedAt === null
               ? Date.parse(scheduledAt(observedAt))
               : Date.parse(reading.monitoringWindowStartedAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
             reading.latestMatchingSampleAt === null
-              ? Number.NEGATIVE_INFINITY
+              ? priorAbsenceReadyAt
+                ?? Date.parse(observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
               : Date.parse(reading.latestMatchingSampleAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
           );
@@ -405,7 +434,7 @@ export function createOpsIncidentDoneCheckDefinition(
               "NOT_READY",
               reading.monitoringWindowStartedAt === null
                 ? "Prometheus lacks monitoring history for the five-minute stability window."
-                : "The exact alert group has not yet been absent with five minutes of monitoring coverage.",
+                : STABILITY_WAIT_SUMMARY,
               observedAt,
               reading,
               new Date(readyAt).toISOString(),
@@ -413,7 +442,9 @@ export function createOpsIncidentDoneCheckDefinition(
           }
           return componentResult(
             "PASS",
-            "Prometheus has no pending or firing sample for the exact group in five minutes.",
+            reading.latestMatchingSampleAt === null && priorAbsenceReadyAt !== null
+              ? "The durable exact-group absence window elapsed with complete monitoring coverage and no matching local samples."
+              : "Prometheus has no pending or firing sample for the exact group in five minutes.",
             observedAt,
             reading,
           );

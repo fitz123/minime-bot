@@ -447,8 +447,11 @@ The generic check requires all three package-owned components to pass:
   firing sample with those exact group labels during the previous five minutes
   and requires a complete five-second `up` evaluation grid across that window,
   with every underlying sample no more than two minutes old at its evaluation
-  time. Missing, sparse, or carried-stale monitoring history cannot prove
-  stability after an outage, restart, or history loss.
+  time. Because external labels and alert relabeling can make notification
+  labels absent from local `ALERTS`, an empty exact-label query also requires a
+  durable prior exact-group absence check whose five-minute window has elapsed.
+  Missing, sparse, or carried-stale monitoring history cannot prove stability
+  after an outage, restart, or history loss.
 
 Stale telemetry, query errors, timeouts, and the five-minute convergence wait
 remain in `CHECKING`, schedule bounded rechecks, and do not spend remediation

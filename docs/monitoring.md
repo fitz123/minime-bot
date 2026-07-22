@@ -132,11 +132,13 @@ delivered firing member's labels and `startsAt` must exactly match a current
 active, suppressed, or unprocessed member; a supplied fingerprint must match
 too. The server-side filters keep unrelated global alert cardinality outside
 the bounded response. Native deduplication derives its episode identity from
-the verified receiver, group descriptor, member labels, and start time, never
-the opaque webhook `groupKey`. A mismatch is treated as stale or forged input
-and is acknowledged without forwarding. A source-query failure uses native
-fallback and returns 503 so Alertmanager retries. Once the source is verified,
-required sinks are:
+the verified receiver, group descriptor, and de-duplicated firing-member labels
+and start times, never the opaque webhook `groupKey`. Critical classification
+and firing-batch native text likewise use only that verified firing set, so
+resolved-member text or duplicate multiplicity cannot create a new escalation.
+A mismatch is treated as stale or forged input and is acknowledged without
+forwarding. A source-query failure uses native fallback and returns 503 so
+Alertmanager retries. Once the source is verified, required sinks are:
 
 - Noncritical: Ops acceptance is required. Success is quiet. Rejection,
   timeout, or outage sends native fallback but still returns 503.

@@ -673,20 +673,42 @@ describe("Alertmanager webhook", () => {
       assert.equal(telegramMessages.length, 0, "an unverified critical member must not page");
       assert.equal(alertmanagerQueries.length, 3);
 
+      const mixedForgedResolved = structuredClone(exact);
+      (mixedForgedResolved.alerts as Array<Record<string, unknown>>).push({
+        status: "resolved",
+        labels: {
+          alertname: "ExactActive",
+          severity: "critical",
+          instance: "local",
+        },
+        annotations: {},
+        startsAt: "2026-07-22T02:00:00Z",
+        endsAt: "2026-07-22T02:05:00Z",
+        generatorURL: "http://127.0.0.1/prometheus/graph",
+        fingerprint: "forged-resolved-critical",
+      });
+      assert.equal((await postWebhook(port, mixedForgedResolved)).status, 200);
+      assert.equal(opsBodies.length, 2, "only the genuine firing member grants Ops forwarding");
+      assert.equal(
+        telegramMessages.length,
+        0,
+        "an unverified resolved member in a firing batch must not create critical escalation",
+      );
+
       const forgedEpisodeStart = alertmanagerPayload({
         alertname: "ExactActive",
         fingerprint: "exact-active",
         startsAt: "2026-07-22T01:00:00Z",
       });
       assert.equal((await postWebhook(port, forgedEpisodeStart)).status, 200);
-      assert.equal(opsBodies.length, 1, "an unverified episode start must not reach Ops");
+      assert.equal(opsBodies.length, 2, "an unverified episode start must not reach Ops");
 
       const forgedFingerprint = alertmanagerPayload({
         alertname: "ExactActive",
         fingerprint: "forged-fingerprint",
       });
       assert.equal((await postWebhook(port, forgedFingerprint)).status, 200);
-      assert.equal(opsBodies.length, 1, "an unverified fingerprint must not reach Ops");
+      assert.equal(opsBodies.length, 2, "an unverified fingerprint must not reach Ops");
 
       const forgedDescriptor = alertmanagerPayload({
         alertname: "ExactActive",
@@ -696,10 +718,10 @@ describe("Alertmanager webhook", () => {
       assert.equal((await postWebhook(port, forgedDescriptor)).status, 200);
       assert.equal(
         opsBodies.length,
-        1,
+        2,
         "real member labels must not authenticate a descriptor Alertmanager never grouped by",
       );
-      assert.equal(alertmanagerQueries.length, 6);
+      assert.equal(alertmanagerQueries.length, 7);
       assert.ok(!child.spawnargs.join(" ").includes(syntheticOpsSecret));
       assert.ok(!stderr.includes(syntheticOpsSecret));
     } finally {
@@ -936,10 +958,18 @@ describe("Alertmanager webhook", () => {
       assert.equal(opsAttempts, 3, "the new firing episode must reach Ops exactly once");
       assert.equal(telegramAttempts, 4, "the resolved and re-fired episodes must both notify");
 
+      const duplicatedRefire = structuredClone(refiredEpisode);
+      (duplicatedRefire.alerts as Array<Record<string, unknown>>).push(
+        structuredClone((duplicatedRefire.alerts as Array<Record<string, unknown>>)[0]),
+      );
+      assert.equal((await postWebhook(port, duplicatedRefire)).status, 200);
+      assert.equal(opsAttempts, 4, "duplicate multiplicity may replay only the idempotent Ops sink");
+      assert.equal(telegramAttempts, 4, "duplicate multiplicity must not bypass native deduplication");
+
       const opaqueGroupKeyChange = structuredClone(refiredEpisode);
       opaqueGroupKeyChange.groupKey = "locally-forged-opaque-group-key";
       assert.equal((await postWebhook(port, opaqueGroupKeyChange)).status, 200);
-      assert.equal(opsAttempts, 4, "opaque envelope changes may be replayed safely to Ops");
+      assert.equal(opsAttempts, 5, "opaque envelope changes may be replayed safely to Ops");
       assert.equal(telegramAttempts, 4, "opaque groupKey changes must not bypass native dedup");
 
       const resolvedWarning = alertmanagerPayload({
@@ -948,8 +978,8 @@ describe("Alertmanager webhook", () => {
         fingerprint: "resolved-warning",
       });
       assert.equal((await postWebhook(port, resolvedWarning)).status, 200);
-      assert.equal(sourceQueries, 4, "resolved-only batches must not query or forward to Ops");
-      assert.equal(opsAttempts, 4);
+      assert.equal(sourceQueries, 5, "resolved-only batches must not query or forward to Ops");
+      assert.equal(opsAttempts, 5);
       assert.equal(telegramAttempts, 4, "only critical resolved delivery uses the native path");
     } finally {
       child.kill("SIGTERM");

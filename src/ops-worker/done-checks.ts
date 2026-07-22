@@ -8,6 +8,7 @@ import {
   type OpsWorkerDoneCheck,
   type OpsWorkerDoneCheckContract,
   type OpsWorkerSourceKind,
+  type OpsWorkerVerificationRecord,
   type OpsWorkerVerificationComponentEvidence,
   type OpsWorkerVerificationConvergenceKind,
   type OpsWorkerVerificationOutcome,
@@ -42,6 +43,8 @@ export interface OpsWorkerDoneCheckContext {
   sourceKind?: OpsWorkerSourceKind;
   sourceCorrelationKey?: string;
   sourceEvidence?: readonly OpsWorkerEvidence[];
+  /** Last durable result for the same validated task subject, when one exists. */
+  previousVerification?: Readonly<OpsWorkerVerificationRecord>;
 }
 
 export interface OpsWorkerDoneCheckComponentDefinition {

@@ -9,12 +9,16 @@ import {
   type OpsIncidentMonitoringFreshnessReading,
   type OpsIncidentResolutionStabilityReading,
 } from "../ops-worker/incident-checks.js";
-import type { OpsWorkerEvidence } from "../ops-worker/types.js";
+import type {
+  OpsWorkerEvidence,
+  OpsWorkerVerificationRecord,
+} from "../ops-worker/types.js";
 
 const NOW = "2026-07-22T12:00:00.000Z";
 const FIVE_MINUTES_AGO = "2026-07-22T11:55:00.000Z";
 const ONE_MINUTE_AGO = "2026-07-22T11:59:00.000Z";
 const FOUR_MINUTES_LATER = "2026-07-22T12:04:00.000Z";
+const FIVE_MINUTES_LATER = "2026-07-22T12:05:00.000Z";
 const RECHECK = "2026-07-22T12:01:00.000Z";
 const CORRELATION_KEY = `lab-alertmanager:group:${"a".repeat(64)}`;
 const RULE_FAMILIES = [
@@ -29,7 +33,10 @@ const RULE_FAMILIES = [
   "FutureSyntheticAlert",
 ] as const;
 
-function correlationEvidence(alertname: string): OpsWorkerEvidence[] {
+function correlationEvidence(
+  alertname: string,
+  groupLabels: Record<string, string> = { alertname, instance: "local" },
+): OpsWorkerEvidence[] {
   return [{
     at: NOW,
     kind: "alert",
@@ -37,7 +44,7 @@ function correlationEvidence(alertname: string): OpsWorkerEvidence[] {
     summary: JSON.stringify({
       type: "alertmanager-group-correlation-v1",
       correlationKey: CORRELATION_KEY,
-      groupLabels: { alertname, instance: "local" },
+      groupLabels,
     }),
     artifact: null,
   }];
@@ -59,9 +66,50 @@ function healthyReadings(): {
   };
 }
 
+function completedAbsenceWindow(): OpsWorkerVerificationRecord {
+  return {
+    verifierIdentity: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    verifierVersion: "1",
+    contractHash: `sha256:${"a".repeat(64)}`,
+    subjectHash: `sha256:${"b".repeat(64)}`,
+    checkedAt: FIVE_MINUTES_AGO,
+    completedAt: FIVE_MINUTES_AGO,
+    outcome: "NOT_READY",
+    summary: "synthetic prior stability wait",
+    nextCheckAt: NOW,
+    components: [
+      {
+        identity: "exact-group-absence",
+        version: "1",
+        required: true,
+        convergence: "PRODUCT",
+        outcome: "PASS",
+        observedAt: FIVE_MINUTES_AGO,
+        evidenceHash: `sha256:${"c".repeat(64)}`,
+        summary: "The exact Alertmanager group is absent in every queried state.",
+        nextCheckAt: null,
+      },
+      {
+        identity: "resolution-stability",
+        version: "1",
+        required: true,
+        convergence: "PRODUCT",
+        outcome: "NOT_READY",
+        observedAt: FIVE_MINUTES_AGO,
+        evidenceHash: `sha256:${"d".repeat(64)}`,
+        summary:
+          "The exact alert group has not yet been absent with five minutes of monitoring coverage.",
+        nextCheckAt: NOW,
+      },
+    ],
+  };
+}
+
 async function runIncident(
   readings: ReturnType<typeof healthyReadings>,
   alertname = "FutureSyntheticAlert",
+  withCompletedAbsenceWindow = true,
+  groupLabels?: Record<string, string>,
 ) {
   const registry = createOpsIncidentDoneCheckRegistry({
     clock: () => new Date(NOW),
@@ -81,7 +129,10 @@ async function runIncident(
       now: () => new Date(NOW),
       sourceKind: "alertmanager",
       sourceCorrelationKey: CORRELATION_KEY,
-      sourceEvidence: correlationEvidence(alertname),
+      sourceEvidence: correlationEvidence(alertname, groupLabels),
+      ...(withCompletedAbsenceWindow
+        ? { previousVerification: completedAbsenceWindow() }
+        : {}),
     },
   );
 }
@@ -110,6 +161,21 @@ describe("generic Alertmanager incident done check", () => {
         alertname,
       );
     }
+  });
+
+  it("starts a durable five-minute absence window when the exact-label query is empty", async () => {
+    const firstAbsentCheck = await runIncident(
+      healthyReadings(),
+      "ExternalLabelAlert",
+      false,
+      { alertname: "ExternalLabelAlert", cluster: "production" },
+    );
+
+    assert.equal(firstAbsentCheck.result, "NOT_READY");
+    assert.equal(firstAbsentCheck.nextCheckAt, FIVE_MINUTES_LATER);
+    assert.equal(firstAbsentCheck.components[1].outcome, "PASS");
+    assert.equal(firstAbsentCheck.components[2].outcome, "NOT_READY");
+    assert.equal(firstAbsentCheck.components[2].nextCheckAt, FIVE_MINUTES_LATER);
   });
 
   it("disproves a claim while the exact group remains present", async () => {
@@ -153,7 +219,7 @@ describe("generic Alertmanager incident done check", () => {
     assert.equal(result.result, "PRODUCT_FAILURE");
     assert.deepEqual(
       result.components.map((component) => component.outcome),
-      ["QUERY_ERROR", "PRODUCT_FAILURE", "PASS"],
+      ["QUERY_ERROR", "PRODUCT_FAILURE", "NOT_READY"],
     );
   });
 
