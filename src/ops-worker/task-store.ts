@@ -1236,7 +1236,9 @@ export class OpsWorkerTaskStore {
       } satisfies OpsWorkerFiringObservation),
       artifact: null,
     });
-    task.verification = null;
+    // BLOCKED verification is part of the pending durable report identity.
+    // The explicit retry transition clears it before checks can resume.
+    if (task.state !== "BLOCKED") task.verification = null;
     if (task.state === "CHECKING") task.schedule.nextCheckAt = observedAt;
     task.updatedAt = observedAt;
     return observedAt;

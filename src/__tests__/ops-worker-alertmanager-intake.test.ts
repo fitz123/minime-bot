@@ -43,7 +43,10 @@ const LATER = "2026-07-19T10:01:00.000Z";
 const SOURCE_IDENTITY = "lab-alertmanager";
 const CONTENT_TYPE = "application/json; charset=utf-8";
 
-function contracts(now: () => Date = () => new Date(NOW)) {
+function contracts(
+  now: () => Date = () => new Date(NOW),
+  incidentStatus: "PRESENT" | "ABSENT" = "ABSENT",
+) {
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: {
       read: () => ({
@@ -72,7 +75,7 @@ function contracts(now: () => Date = () => new Date(NOW)) {
       },
     },
     incidentAlertmanagerReader: {
-      readExactGroupState: () => ({ observedAt: now().toISOString(), status: "ABSENT" }),
+      readExactGroupState: () => ({ observedAt: now().toISOString(), status: incidentStatus }),
     },
     monitoringFreshnessReader: {
       readMonitoringFreshness: () => ({
@@ -96,10 +99,14 @@ function contracts(now: () => Date = () => new Date(NOW)) {
   });
 }
 
-function fixture(t: TestContext, now: () => Date = () => new Date(NOW)) {
+function fixture(
+  t: TestContext,
+  now: () => Date = () => new Date(NOW),
+  incidentStatus: "PRESENT" | "ABSENT" = "ABSENT",
+) {
   const directory = mkdtempSync(join(tmpdir(), "minime-alertmanager-intake-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const taskContracts = contracts(now);
+  const taskContracts = contracts(now, incidentStatus);
   const store = new OpsWorkerTaskStore(directory, {
     registry: taskContracts.taskRegistry,
     now,
@@ -511,6 +518,51 @@ describe("Alertmanager conversion and task-store submission", () => {
     const restartedAbsence = await supervisor.runDoneCheck(first.taskId ?? "");
     assert.equal(restartedAbsence.verification?.outcome, "NOT_READY");
     assert.equal(restartedAbsence.schedule.nextCheckAt, "2026-07-19T10:09:00.000Z");
+  });
+
+  it("preserves a blocked report proof and receipt across an accepted replay", async (t) => {
+    let current = new Date(NOW);
+    const now = () => new Date(current);
+    const { intake, store, taskContracts } = fixture(t, now, "PRESENT");
+    const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    const taskId = first.taskId ?? "";
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "blocked-replay-report",
+      processStartToken: "blocked-replay-report-start",
+      now,
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+
+    let blocked = store.get(taskId);
+    for (let claim = 0; claim < 5; claim += 1) {
+      await supervisor.requestDoneCheck(taskId);
+      blocked = await supervisor.runDoneCheck(taskId);
+      current = new Date(current.getTime() + 1_000);
+    }
+    assert.equal(blocked?.state, "BLOCKED");
+    assert.equal(blocked?.verification?.outcome, "PRODUCT_FAILURE");
+    const proof = structuredClone(blocked?.verification);
+
+    const failed = await supervisor.recordReportAttempt(taskId, async () => ({
+      sent: false,
+      error: "Synthetic ambiguous report failure",
+    }));
+    assert.equal(failed.mutationReceipts.report?.outcome, null);
+
+    const replay = intake.submit(body(webhook()), CONTENT_TYPE);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual(store.get(taskId)?.verification, proof);
+
+    const sent = await supervisor.recordReportAttempt(
+      taskId,
+      async () => ({ sent: true }),
+    );
+    assert.equal(sent.report.state, "SENT");
+    assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {

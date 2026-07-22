@@ -348,6 +348,9 @@ async function runComponent(
       );
     }
   } finally {
+    // Component implementations may start more than one read. Abort any
+    // sibling work that is still pending after an early result or failure.
+    controller.abort();
     if (timer !== undefined) clearTimeout(timer);
     removeExternalAbort?.();
   }

@@ -342,6 +342,64 @@ describe("generic Alertmanager incident done check", () => {
 });
 
 describe("bounded generic monitoring readers", () => {
+  it("aborts a pending paired Prometheus read when its sibling query fails", async () => {
+    let coverageAborted = false;
+    const readers = createOpsMonitoringReaders(
+      "http://127.0.0.1:9090",
+      "http://127.0.0.1:9093",
+      async (input, init) => {
+        const url = new URL(input);
+        if (url.port === "9093") return jsonResponse([]);
+        const query = url.searchParams.get("query");
+        if (query === "(max(timestamp(up)))[2m:5s]") {
+          const now = Date.now() / 1_000;
+          return jsonResponse({
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [{ metric: {}, values: [[now, String(now)]] }],
+            },
+          });
+        }
+        if (query === "(max(timestamp(up)))[5m:5s]") {
+          return await new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            const abort = (): void => {
+              coverageAborted = true;
+              reject(new Error("paired query aborted"));
+            };
+            if (signal?.aborted) abort();
+            else signal?.addEventListener("abort", abort, { once: true });
+          });
+        }
+        throw new Error("synthetic alert-range query failure");
+      },
+    );
+    const registry = createOpsIncidentDoneCheckRegistry({
+      clock: () => new Date(),
+      ...readers,
+    });
+    const checkedAt = new Date().toISOString();
+    const result = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      {
+        taskId: "paired-prometheus-cleanup",
+        checkedAt,
+        now: () => new Date(),
+        sourceKind: "alertmanager",
+        sourceCorrelationKey: CORRELATION_KEY,
+        sourceEvidence: correlationEvidence("FutureSyntheticAlert"),
+      },
+    );
+
+    assert.equal(
+      result.components.find((component) =>
+        component.identity === "resolution-stability")?.outcome,
+      "QUERY_ERROR",
+    );
+    assert.equal(coverageAborted, true);
+  });
+
   it("treats an empty persisted group label set as the single ungrouped Alertmanager group", async () => {
     const urls: URL[] = [];
     const readers = createOpsMonitoringReaders(
