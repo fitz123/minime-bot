@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.25
+
+- Accept clean trusted operational Pi successes without exact HTTP telemetry while keeping background tasks and confirmed provider-quota recovery strict (#119).
+
 ## 2026.7.24
 
 - Keep Ops Pi session IDs within the Codex 64-character transport limit and durably reset pre-fix overlength sessions before provider launch (#116).
