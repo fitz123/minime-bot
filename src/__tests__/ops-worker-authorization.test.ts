@@ -422,6 +422,7 @@ function opsContracts(
       readResolutionStability: async () => ({
         observedAt: NOW,
         latestMatchingSampleAt: null,
+        monitoringWindowStartedAt: "2026-07-18T11:55:00.000Z",
       }),
     },
     incidentAlertmanagerReader: {

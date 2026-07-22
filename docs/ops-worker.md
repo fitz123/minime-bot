@@ -395,6 +395,9 @@ Task evidence retains the exact group descriptor, a bounded alert subset, and
 an omission count when the group is larger than the task evidence capacity. An
 empty `groupLabels` map represents Alertmanager's single ungrouped route group;
 absence and stability then apply to all active alerts.
+Correlation and delivery identities are derived from the canonical verified
+group-label descriptor and episode start rather than the opaque webhook
+`groupKey`, so changing unverified opaque text cannot split one incident.
 
 For this template, the harness creates a fresh result-file path only after the
 attempt identity is persisted and passes it as `OPS_WORKER_RESULT_FILE`. The
@@ -439,7 +442,9 @@ The generic check requires all three package-owned components to pass:
 - `exact-group-absence` requires the task's exact group labels to match no
   active, silenced, inhibited, or unprocessed Alertmanager alert.
 - `resolution-stability` requires Prometheus `ALERTS` to contain no pending or
-  firing sample with those exact group labels during the previous five minutes.
+  firing sample with those exact group labels during the previous five minutes
+  and requires `up` history to cover that complete window. Missing monitoring
+  history cannot prove stability after a restart or history loss.
 
 Stale telemetry, query errors, timeouts, and the five-minute convergence wait
 remain in `CHECKING`, schedule bounded rechecks, and do not spend remediation

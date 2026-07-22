@@ -297,7 +297,7 @@ def alertmanager_has_exact_group(
     group_labels: dict[str, str],
     firing_labels: tuple[dict[str, str], ...],
 ) -> bool:
-    """Require one bounded current alert containing every exact group label."""
+    """Require every delivered firing alert to be current in the exact group."""
     try:
         response = request_with_deadline(
             _active_alerts_url(config.alertmanager_url),
@@ -316,6 +316,7 @@ def alertmanager_has_exact_group(
         raise DeliveryError("Alertmanager source verification failed") from None
     if not isinstance(alerts, list) or len(alerts) > MAX_ACTIVE_ALERTS:
         raise DeliveryError("Alertmanager source verification failed")
+    current_group_members: set[tuple[tuple[str, str], ...]] = set()
     for alert in alerts:
         if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
             raise DeliveryError("Alertmanager source verification failed")
@@ -334,13 +335,12 @@ def alertmanager_has_exact_group(
             "unprocessed",
         }:
             raise DeliveryError("Alertmanager source verification failed")
-        if group_labels and all(
-            labels.get(key) == value for key, value in group_labels.items()
-        ):
-            return True
-        if not group_labels and any(labels == candidate for candidate in firing_labels):
-            return True
-    return False
+        if all(labels.get(key) == value for key, value in group_labels.items()):
+            current_group_members.add(tuple(sorted(labels.items())))
+    return bool(firing_labels) and all(
+        tuple(sorted(candidate.items())) in current_group_members
+        for candidate in firing_labels
+    )
 
 
 def forward_to_ops(config: BridgeConfig, body: bytes) -> bool:

@@ -51,6 +51,7 @@ export interface OpsIncidentAlertStateReading {
 export interface OpsIncidentResolutionStabilityReading {
   observedAt: string;
   latestMatchingSampleAt: string | null;
+  monitoringWindowStartedAt: string | null;
 }
 
 export interface OpsIncidentMonitoringReader {
@@ -93,6 +94,7 @@ const TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const PROMETHEUS_UP_RANGE_QUERY = "(max(timestamp(up)))[2m:5s]";
+const PROMETHEUS_UP_STABILITY_COVERAGE_QUERY = "(max(timestamp(up)))[5m:5s]";
 const PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -191,16 +193,24 @@ function parseStabilityReading(
 ): OpsIncidentResolutionStabilityReading | null {
   if (
     !isPlainObject(raw)
-    || !hasExactDataKeys(raw, ["observedAt", "latestMatchingSampleAt"])
+    || !hasExactDataKeys(
+      raw,
+      ["observedAt", "latestMatchingSampleAt", "monitoringWindowStartedAt"],
+    )
     || !validTimestamp(raw.observedAt)
     || (
       raw.latestMatchingSampleAt !== null
       && !validTimestamp(raw.latestMatchingSampleAt)
     )
+    || (
+      raw.monitoringWindowStartedAt !== null
+      && !validTimestamp(raw.monitoringWindowStartedAt)
+    )
   ) return null;
   return {
     observedAt: raw.observedAt,
     latestMatchingSampleAt: raw.latestMatchingSampleAt,
+    monitoringWindowStartedAt: raw.monitoringWindowStartedAt,
   };
 }
 
@@ -358,6 +368,10 @@ export function createOpsIncidentDoneCheckDefinition(
               reading.latestMatchingSampleAt !== null
               && Date.parse(reading.latestMatchingSampleAt) > Date.parse(reading.observedAt)
             )
+            || (
+              reading.monitoringWindowStartedAt !== null
+              && Date.parse(reading.monitoringWindowStartedAt) > Date.parse(reading.observedAt)
+            )
           ) return invalidReaderResult();
           if (!isFresh(
             reading.observedAt,
@@ -372,20 +386,29 @@ export function createOpsIncidentDoneCheckDefinition(
               scheduledAt(observedAt),
             );
           }
-          if (reading.latestMatchingSampleAt !== null) {
-            const stableAt = new Date(
-              Date.parse(reading.latestMatchingSampleAt)
+          const readyAt = Math.max(
+            reading.monitoringWindowStartedAt === null
+              ? Date.parse(scheduledAt(observedAt))
+              : Date.parse(reading.monitoringWindowStartedAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
-            ).toISOString();
-            if (Date.parse(stableAt) > Date.parse(observedAt)) {
-              return componentResult(
-                "NOT_READY",
-                "The exact alert group has not yet been absent for five stable minutes.",
-                observedAt,
-                reading,
-                stableAt,
-              );
-            }
+            reading.latestMatchingSampleAt === null
+              ? Number.NEGATIVE_INFINITY
+              : Date.parse(reading.latestMatchingSampleAt)
+                + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
+          );
+          if (
+            reading.monitoringWindowStartedAt === null
+            || readyAt > Date.parse(observedAt)
+          ) {
+            return componentResult(
+              "NOT_READY",
+              reading.monitoringWindowStartedAt === null
+                ? "Prometheus lacks monitoring history for the five-minute stability window."
+                : "The exact alert group has not yet been absent with five minutes of monitoring coverage.",
+              observedAt,
+              reading,
+              new Date(readyAt).toISOString(),
+            );
           }
           return componentResult(
             "PASS",
@@ -610,6 +633,21 @@ function latestMetricTimestamp(series: readonly PrometheusMatrixEntry[]): string
   return timestamps.length === 0 ? null : timestamps.sort().at(-1) as string;
 }
 
+function earliestMetricTimestamp(series: readonly PrometheusMatrixEntry[]): string | null {
+  const timestamps = series.flatMap((entry) => entry.samples).map((sample) => {
+    const milliseconds = sample.value * 1_000;
+    if (!Number.isFinite(milliseconds)) {
+      throw new Error("Prometheus returned an invalid metric timestamp");
+    }
+    try {
+      return new Date(milliseconds).toISOString();
+    } catch {
+      throw new Error("Prometheus returned an invalid metric timestamp");
+    }
+  });
+  return timestamps.length === 0 ? null : timestamps.sort().at(0) as string;
+}
+
 class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
   constructor(
     private readonly baseUrl: URL,
@@ -653,14 +691,22 @@ class OpsIncidentPrometheusHttpReader implements OpsIncidentMonitoringReader {
   ): Promise<OpsIncidentResolutionStabilityReading> {
     const groupLabels = correlatedGroupLabels(context);
     const observedAt = new Date().toISOString();
-    const series = await this.queryRange(
-      alertRangeQuery(groupLabels),
-      observedAt,
-      context.signal,
-    );
+    const [series, monitoringSeries] = await Promise.all([
+      this.queryRange(
+        alertRangeQuery(groupLabels),
+        observedAt,
+        context.signal,
+      ),
+      this.queryRange(
+        PROMETHEUS_UP_STABILITY_COVERAGE_QUERY,
+        observedAt,
+        context.signal,
+      ),
+    ]);
     return {
       observedAt,
       latestMatchingSampleAt: latestMetricTimestamp(series),
+      monitoringWindowStartedAt: earliestMetricTimestamp(monitoringSeries),
     };
   }
 }

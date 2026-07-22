@@ -60,6 +60,7 @@ function contracts() {
       readResolutionStability: () => ({
         observedAt: NOW,
         latestMatchingSampleAt: null,
+        monitoringWindowStartedAt: "2026-07-19T09:55:00.000Z",
       }),
     },
     incidentAlertmanagerReader: {
@@ -433,8 +434,16 @@ describe("Alertmanager conversion and task-store submission", () => {
     const journalBefore = readFileSync(store.journalPath, "utf8");
 
     const replay = intake.submit(body(webhook()), CONTENT_TYPE);
+    const changedOpaqueGroupKey = intake.submit(body(webhook({
+      groupKey: "locally-forged-opaque-group-key",
+    })), CONTENT_TYPE);
 
     assert.deepEqual(replay, { ok: true, taskId: first.taskId, replayed: true });
+    assert.deepEqual(changedOpaqueGroupKey, {
+      ok: true,
+      taskId: first.taskId,
+      replayed: true,
+    });
     assert.equal(store.list().length, 1);
     assert.equal(readFileSync(store.journalPath, "utf8"), journalBefore);
   });

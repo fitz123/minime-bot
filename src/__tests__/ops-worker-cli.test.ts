@@ -1295,6 +1295,7 @@ reply:
         readResolutionStability: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",
           latestMatchingSampleAt: null,
+          monitoringWindowStartedAt: "2026-07-19T09:55:00.000Z",
         }),
       },
       incidentAlertmanagerReader: {
@@ -1408,6 +1409,7 @@ reply:
         readResolutionStability: () => ({
           observedAt: "2026-07-19T10:00:00.000Z",
           latestMatchingSampleAt: null,
+          monitoringWindowStartedAt: "2026-07-19T09:55:00.000Z",
         }),
       },
       incidentAlertmanagerReader: {

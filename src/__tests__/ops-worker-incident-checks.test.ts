@@ -12,6 +12,7 @@ import {
 import type { OpsWorkerEvidence } from "../ops-worker/types.js";
 
 const NOW = "2026-07-22T12:00:00.000Z";
+const FIVE_MINUTES_AGO = "2026-07-22T11:55:00.000Z";
 const ONE_MINUTE_AGO = "2026-07-22T11:59:00.000Z";
 const FOUR_MINUTES_LATER = "2026-07-22T12:04:00.000Z";
 const RECHECK = "2026-07-22T12:01:00.000Z";
@@ -50,7 +51,11 @@ function healthyReadings(): {
   return {
     freshness: { observedAt: NOW, latestSampleAt: ONE_MINUTE_AGO },
     alerts: { observedAt: NOW, status: "ABSENT" },
-    stability: { observedAt: NOW, latestMatchingSampleAt: null },
+    stability: {
+      observedAt: NOW,
+      latestMatchingSampleAt: null,
+      monitoringWindowStartedAt: FIVE_MINUTES_AGO,
+    },
   };
 }
 
@@ -125,6 +130,18 @@ describe("generic Alertmanager incident done check", () => {
     const staleResult = await runIncident(stale);
     assert.equal(staleResult.result, "NOT_READY");
     assert.equal(staleResult.nextCheckAt, RECHECK);
+
+    const missingHistory = healthyReadings();
+    missingHistory.stability.monitoringWindowStartedAt = null;
+    const missingHistoryResult = await runIncident(missingHistory);
+    assert.equal(missingHistoryResult.result, "NOT_READY");
+    assert.equal(missingHistoryResult.nextCheckAt, RECHECK);
+
+    const shortHistory = healthyReadings();
+    shortHistory.stability.monitoringWindowStartedAt = ONE_MINUTE_AGO;
+    const shortHistoryResult = await runIncident(shortHistory);
+    assert.equal(shortHistoryResult.result, "NOT_READY");
+    assert.equal(shortHistoryResult.nextCheckAt, FOUR_MINUTES_LATER);
 
     const flap = healthyReadings();
     flap.stability.latestMatchingSampleAt = ONE_MINUTE_AGO;
@@ -241,7 +258,9 @@ describe("bounded generic monitoring readers", () => {
       null,
     );
     assert.equal(
-      urls.at(-1)?.searchParams.get("query"),
+      urls.map((url) => url.searchParams.get("query")).find(
+        (query) => query?.includes("ALERTS{"),
+      ),
       '(max(timestamp(ALERTS{alertstate=~"pending|firing"})))[5m:5s]',
     );
   });
@@ -313,6 +332,21 @@ describe("bounded generic monitoring readers", () => {
             },
           });
         }
+        if (query === "(max(timestamp(up)))[5m:5s]") {
+          return jsonResponse({
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [{
+                metric: {},
+                values: [[
+                  (now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000,
+                  String((now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs) / 1_000),
+                ]],
+              }],
+            },
+          });
+        }
         return jsonResponse({
           status: "success",
           data: {
@@ -348,10 +382,12 @@ describe("bounded generic monitoring readers", () => {
       "PRESENT",
     );
     assert.ok((await readers.incidentMonitoringReader.readMonitoringFreshness(context)).latestSampleAt);
+    const stableReading = await readers.incidentMonitoringReader
+      .readResolutionStability(context);
+    assert.equal(stableReading.latestMatchingSampleAt, null);
     assert.equal(
-      (await readers.incidentMonitoringReader.readResolutionStability(context))
-        .latestMatchingSampleAt,
-      null,
+      stableReading.monitoringWindowStartedAt,
+      new Date(now - OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs).toISOString(),
     );
     const stabilityQuery = urls.map((url) => url.searchParams.get("query")).find(
       (query) => query?.includes("ALERTS{"),

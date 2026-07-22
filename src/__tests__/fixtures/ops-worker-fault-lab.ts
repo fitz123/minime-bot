@@ -513,6 +513,7 @@ function availabilityContracts() {
       readResolutionStability: () => ({
         observedAt: NOW,
         latestMatchingSampleAt: null,
+        monitoringWindowStartedAt: "2026-07-19T11:55:00.000Z",
       }),
     },
     incidentAlertmanagerReader: {

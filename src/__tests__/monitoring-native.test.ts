@@ -627,7 +627,20 @@ describe("Alertmanager webhook", () => {
       assert.equal((await postWebhook(port, mismatch)).status, 200);
       assert.equal(opsBodies.length, 1, "a mismatched group must never reach authenticated Ops intake");
       assert.equal(telegramMessages.length, 0, "a stale or forged mismatch must not page natively");
-      assert.equal(alertmanagerQueries.length, 2);
+
+      const forgedMember = alertmanagerPayload({
+        alertname: "ExactActive",
+        severity: "critical",
+        fingerprint: "forged-member",
+      });
+      assert.equal((await postWebhook(port, forgedMember)).status, 200);
+      assert.equal(
+        opsBodies.length,
+        1,
+        "a current group-label subset must not authenticate different firing labels",
+      );
+      assert.equal(telegramMessages.length, 0, "an unverified critical member must not page");
+      assert.equal(alertmanagerQueries.length, 3);
       assert.ok(!child.spawnargs.join(" ").includes(syntheticOpsSecret));
       assert.ok(!stderr.includes(syntheticOpsSecret));
     } finally {
@@ -641,10 +654,14 @@ describe("Alertmanager webhook", () => {
     const opsBodies: string[] = [];
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
-        response.end(JSON.stringify([{
-          labels: { alertname: "UngroupedLarge0", severity: "warning", instance: "local" },
+        response.end(JSON.stringify(Array.from({ length: 64 }, (_, index) => ({
+          labels: {
+            alertname: `UngroupedLarge${index}`,
+            severity: "warning",
+            instance: "local",
+          },
           status: { state: "active" },
-        }]));
+        }))));
         return;
       }
       let body = "";

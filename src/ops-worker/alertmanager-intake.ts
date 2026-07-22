@@ -410,6 +410,20 @@ function hashIdentity(domain: string, ...parts: string[]): string {
   return hash.digest("hex");
 }
 
+function canonicalGroupIdentity(
+  groupLabels: Record<string, string> | undefined,
+): string {
+  if (groupLabels === undefined) {
+    fail(
+      "INVALID_PAYLOAD",
+      "Alertmanager firing groups require groupLabels for exact correlation",
+    );
+  }
+  return JSON.stringify(Object.fromEntries(
+    Object.entries(groupLabels).sort(([left], [right]) => left.localeCompare(right)),
+  ));
+}
+
 function truncateUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   const contentLimit = maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
@@ -534,15 +548,16 @@ export class OpsWorkerAlertmanagerIntake {
     const episodeStart = firingAlerts
       .map((entry) => entry.startsAt)
       .sort()[0];
+    const groupIdentity = canonicalGroupIdentity(webhook.groupLabels);
     const correlationDigest = hashIdentity(
-      "minime-ops-alertmanager-correlation-v1",
+      "minime-ops-alertmanager-correlation-v2",
       this.sourceIdentity,
-      webhook.groupKey,
+      groupIdentity,
     );
     const deliveryDigest = hashIdentity(
-      "minime-ops-alertmanager-delivery-v1",
+      "minime-ops-alertmanager-delivery-v2",
       this.sourceIdentity,
-      webhook.groupKey,
+      groupIdentity,
       episodeStart,
     );
     const correlationKey = `${this.sourceIdentity}:group:${correlationDigest}`;

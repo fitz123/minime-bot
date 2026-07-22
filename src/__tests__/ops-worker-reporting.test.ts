@@ -11,6 +11,8 @@ describe("ops worker result reporting", () => {
   it("redacts configured and patterned secrets from every bounded agent field", () => {
     const configuredCanary = "CANARY_CONFIGURED_SECRET_58";
     const opaqueCanary = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef";
+    const paddedOpaqueCanary = "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234=";
+    const slashOpaqueCanary = "/ABCDEFGHIJKLMNOPQRSTUVWXYZ01234";
     const redact = createOpsWorkerFieldRedactor([configuredCanary]);
     const raw = [
       configuredCanary,
@@ -22,6 +24,8 @@ describe("ops worker result reporting", () => {
       "https://private-user:private-password@example.invalid/path?token=query-canary",
       "/Users/private-user/control/workspace/file.txt",
       opaqueCanary,
+      paddedOpaqueCanary,
+      slashOpaqueCanary,
       "line-one\nline-two\u0000tail",
     ].join(" | ");
 
@@ -39,6 +43,8 @@ describe("ops worker result reporting", () => {
       "private-password",
       "query-canary",
       opaqueCanary,
+      paddedOpaqueCanary,
+      slashOpaqueCanary,
     ]) {
       assert.equal(result.includes(secret), false, secret);
     }
