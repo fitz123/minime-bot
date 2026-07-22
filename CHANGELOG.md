@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.7.24
+
+- Keep Ops Pi session IDs within the Codex 64-character transport limit and durably reset pre-fix overlength sessions before provider launch (#116).
+
 ## 2026.7.23
 
 - Let trusted operational ops-worker sources attempt without initial quota-headroom admission while preserving reset-aware recovery after a real provider quota response (#113).
