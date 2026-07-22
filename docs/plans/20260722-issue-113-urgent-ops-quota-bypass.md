@@ -39,13 +39,13 @@ git diff --stat main...HEAD
 
 ### Task 2: Separate initial admission from held runtime quota recovery
 
-- [ ] Update `src/ops-worker/supervisor.ts` so unclaimed operational tasks bypass quota admission at scheduler selection, `claimNextTask`, `ensureTaskCustody`, and the atomic custody mutation while background tasks retain current fail-closed checks and exact proof requirements.
-- [ ] Normalize only legacy unclaimed operational admission outcomes/proofs during the successful authorized custody claim so a persisted `QUOTA_ADMISSION_WAIT`, admission-time `QUOTA_TELEMETRY_ERROR`/`QUOTA_PROBE_ERROR`, `QUOTA`, or `QUOTA_PROBE_PASS` cannot trap the upgraded task; preserve evidence/journal integrity and never clear a held runtime quota wait.
-- [ ] Keep quota scheduling active for held tasks after a real provider quota response, regardless of source, so authoritative reset waits, exact smoke probes, rolling resets, and resumable custody continue unchanged.
-- [ ] Update `src/ops-worker/pi-attempt.ts` only where needed so unclaimed operational legacy probe state cannot trigger proof preparation or pre-launch wait rejection, while background proof binding and runtime response classification remain fail-closed.
-- [ ] Add table-driven supervisor/Pi-attempt regression coverage for all three operational sources under low, missing/malformed, stale, resetless, and contradictory admission decisions; cover initial and repeated custody fences plus persisted legacy admission wait/probe state.
-- [ ] Add regression coverage proving both background sources remain not-admitted under the same decisions, fresh proof mismatch still fails closed, authorization still revalidates before custody, and an operational task's actual provider quota response remains held/resumable and uses the existing reset-aware probe path.
-- [ ] Run the focused supervisor, Pi-attempt, quota, authorization, lifecycle, and task-store suites before proceeding.
+- [x] Update `src/ops-worker/supervisor.ts` so unclaimed operational tasks bypass quota admission at scheduler selection, `claimNextTask`, `ensureTaskCustody`, and the atomic custody mutation while background tasks retain current fail-closed checks and exact proof requirements.
+- [x] Normalize only legacy unclaimed operational admission outcomes/proofs during the successful authorized custody claim so a persisted `QUOTA_ADMISSION_WAIT`, admission-time `QUOTA_TELEMETRY_ERROR`/`QUOTA_PROBE_ERROR`, `QUOTA`, or `QUOTA_PROBE_PASS` cannot trap the upgraded task; preserve evidence/journal integrity and never clear a held runtime quota wait.
+- [x] Keep quota scheduling active for held tasks after a real provider quota response, regardless of source, so authoritative reset waits, exact smoke probes, rolling resets, and resumable custody continue unchanged.
+- [x] Update `src/ops-worker/pi-attempt.ts` only where needed so unclaimed operational legacy probe state cannot trigger proof preparation or pre-launch wait rejection, while background proof binding and runtime response classification remain fail-closed.
+- [x] Add table-driven supervisor/Pi-attempt regression coverage for all three operational sources under low, missing/malformed, stale, resetless, and contradictory admission decisions; cover initial and repeated custody fences plus persisted legacy admission wait/probe state.
+- [x] Add regression coverage proving both background sources remain not-admitted under the same decisions, fresh proof mismatch still fails closed, authorization still revalidates before custody, and an operational task's actual provider quota response remains held/resumable and uses the existing reset-aware probe path.
+- [x] Run the focused supervisor, Pi-attempt, quota, authorization, lifecycle, and task-store suites before proceeding.
 
 ### Task 3: Document and validate the bounded correction
 

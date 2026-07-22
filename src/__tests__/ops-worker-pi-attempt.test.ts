@@ -169,6 +169,7 @@ function registry(
         sourceKinds: [
           "alertmanager",
           "operator-cli",
+          "operator-telegram",
           "registered-cron",
           "authorized-issue",
         ],
@@ -179,6 +180,7 @@ function registry(
         sourceKinds: [
           "alertmanager",
           "operator-cli",
+          "operator-telegram",
           "registered-cron",
           "authorized-issue",
         ],
@@ -1273,6 +1275,84 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(quotaResult?.rounds.consecutiveInfrastructureFailures, 0);
   });
 
+  it("runs all operational sources without preparing legacy admission proof binding", async (t) => {
+    let quotaChecks = 0;
+    const harness = await makeHarness(t, undefined, {
+      quotaAdmission: {
+        check: () => {
+          quotaChecks += 1;
+          return deniedQuota(new Date(Date.now() + 60 * 60_000).toISOString());
+        },
+      },
+    });
+
+    for (const sourceKind of [
+      "alertmanager",
+      "operator-cli",
+      "operator-telegram",
+    ] as const) {
+      const task = makeTask(`operational-legacy-proof-${sourceKind}`, { sourceKind });
+      task.schedule.nextRunAt = new Date(Date.now() + 60 * 60_000).toISOString();
+      task.lastOutcome = {
+        at: task.updatedAt,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_PROBE_PASS",
+        summary: "Legacy initial admission proof for a different launch contract.",
+        quotaProbeProof: {
+          version: 1,
+          subjectHash: `sha256:${"f".repeat(64)}`,
+        },
+      };
+      harness.store.create(task);
+      harness.setScenario("success");
+
+      const result = await harness.runner().runNext();
+      assert.equal(result?.state, "DONE");
+      assert.equal(result?.lastOutcome?.result, "PASS");
+      assert.equal(result?.custody.status, "RELEASED");
+    }
+
+    assert.equal(quotaChecks, 0);
+    assert.equal(harness.children.length, 3);
+  });
+
+  it("keeps an operational provider quota response held and resumes through the exact probe path", async (t) => {
+    let quota = deniedQuota(new Date(Date.now() + 60 * 60_000).toISOString());
+    const harness = await makeHarness(t, undefined, {
+      quotaAdmission: { check: () => quota },
+    });
+    const task = makeTask("operational-runtime-quota-recovery", {
+      sourceKind: "operator-telegram",
+    });
+    harness.store.create(task);
+    harness.setScenario("quota");
+
+    const waiting = await harness.runner().runNext();
+    assert.equal(waiting?.state, "RESUMABLE");
+    assert.equal(waiting?.custody.status, "HELD");
+    assert.equal(waiting?.lastOutcome?.result, "QUOTA");
+    assert.ok(waiting?.schedule.nextRunAt);
+
+    quota = admittedQuota();
+    const proof = await harness.runner({
+      dependencies: { runQuotaProbe: async () => ({ status: "SUCCESS" }) },
+    }).runNext();
+    assert.equal(proof?.state, "RESUMABLE");
+    assert.equal(proof?.custody.status, "HELD");
+    assert.equal(proof?.lastOutcome?.result, "QUOTA_PROBE_PASS");
+    assert.match(
+      proof?.lastOutcome?.quotaProbeProof?.subjectHash ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+
+    quota = deniedQuota(new Date(Date.now() + 60 * 60_000).toISOString());
+    harness.setScenario("success");
+    const resumed = await harness.runner().runNext();
+    assert.equal(resumed?.state, "DONE");
+    assert.equal(resumed?.lastOutcome?.result, "PASS");
+    assert.equal(resumed?.custody.status, "RELEASED");
+  });
+
   it("binds a fresh quota probe proof to exact launch configuration and consumes it once", async (t) => {
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => admittedQuota() };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
@@ -1345,7 +1425,9 @@ describe("ops worker Pi standard-session attempts", () => {
     let quota = deniedQuota(dueAt);
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
-    const task = makeTask("unclaimed-bound-quota-proof");
+    const task = makeTask("unclaimed-bound-quota-proof", {
+      sourceKind: "registered-cron",
+    });
     task.schedule.nextRunAt = dueAt;
     task.lastOutcome = {
       at: task.updatedAt,
@@ -1376,7 +1458,9 @@ describe("ops worker Pi standard-session attempts", () => {
     let quota = deniedQuota(dueAt);
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => quota };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
-    const task = makeTask("prepared-snapshot-session-retry");
+    const task = makeTask("prepared-snapshot-session-retry", {
+      sourceKind: "registered-cron",
+    });
     task.schedule.nextRunAt = dueAt;
     task.lastOutcome = {
       at: task.updatedAt,
@@ -1460,7 +1544,9 @@ describe("ops worker Pi standard-session attempts", () => {
     const dueAt = new Date(Date.now() - 1_000).toISOString();
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
-    const task = makeTask("atomic-quota-probe-launch-fence");
+    const task = makeTask("atomic-quota-probe-launch-fence", {
+      sourceKind: "registered-cron",
+    });
     task.schedule.nextRunAt = dueAt;
     task.lastOutcome = {
       at: task.updatedAt,
@@ -1523,6 +1609,7 @@ describe("ops worker Pi standard-session attempts", () => {
       authorizationVerifiers: {
         ...fixtureAuthorizationVerifiers,
         "operator-cli": verifier,
+        "registered-cron": verifier,
       },
       quotaAdmission: { check: () => quota },
     });
@@ -1551,7 +1638,9 @@ describe("ops worker Pi standard-session attempts", () => {
 
     const dueAt = new Date(Date.now() - 1_000).toISOString();
     quota = deniedQuota(dueAt);
-    const unclaimed = makeTask("unclaimed-quota-probe-revalidation");
+    const unclaimed = makeTask("unclaimed-quota-probe-revalidation", {
+      sourceKind: "registered-cron",
+    });
     unclaimed.schedule.nextRunAt = dueAt;
     unclaimed.lastOutcome = {
       at: unclaimed.updatedAt,
@@ -1575,7 +1664,9 @@ describe("ops worker Pi standard-session attempts", () => {
     const dueAt = new Date(Date.now() - 1_000).toISOString();
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => deniedQuota(dueAt) };
     const harness = await makeHarness(t, undefined, { quotaAdmission: gate });
-    const task = makeTask("unclaimed-quota-reset-probe");
+    const task = makeTask("unclaimed-quota-reset-probe", {
+      sourceKind: "registered-cron",
+    });
     task.schedule.nextRunAt = dueAt;
     task.lastOutcome = {
       at: task.updatedAt,
@@ -1634,7 +1725,9 @@ describe("ops worker Pi standard-session attempts", () => {
     harness.supervisor.cancelTask(held.id, "Exercise unclaimed preparation failure");
     const dueAt = new Date(Date.now() - 1_000).toISOString();
     quota = deniedQuota(dueAt);
-    const unclaimed = makeTask("unclaimed-quota-preparation-error");
+    const unclaimed = makeTask("unclaimed-quota-preparation-error", {
+      sourceKind: "registered-cron",
+    });
     unclaimed.schedule.nextRunAt = dueAt;
     unclaimed.lastOutcome = {
       at: unclaimed.updatedAt,

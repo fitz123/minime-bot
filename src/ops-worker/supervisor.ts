@@ -48,6 +48,7 @@ import {
   hashOpsWorkerVerificationSubject,
   isOpsWorkerTerminalState,
   isOpsWorkerUnclaimedQuotaProbeProcess,
+  requiresOpsWorkerInitialQuotaAdmission,
   type OpsWorkerActiveRun,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
@@ -538,6 +539,29 @@ export function isOpsWorkerQuotaWait(task: OpsWorkerTask): boolean {
     || task.lastOutcome?.result === "QUOTA_PROBE_ERROR";
 }
 
+function requiresQuotaSchedulingForRun(task: OpsWorkerTask): boolean {
+  if (requiresOpsWorkerInitialQuotaAdmission(task.source.kind)) return true;
+  return task.custody.status === "HELD"
+    && (
+      isOpsWorkerQuotaWait(task)
+      || task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+    );
+}
+
+function hasLegacyUnclaimedOperationalAdmissionState(
+  task: OpsWorkerTask,
+): boolean {
+  if (
+    task.custody.status !== "UNCLAIMED"
+    || requiresOpsWorkerInitialQuotaAdmission(task.source.kind)
+  ) return false;
+  return task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT"
+    || task.lastOutcome?.result === "QUOTA_TELEMETRY_ERROR"
+    || task.lastOutcome?.result === "QUOTA_PROBE_ERROR"
+    || task.lastOutcome?.result === "QUOTA"
+    || task.lastOutcome?.result === "QUOTA_PROBE_PASS";
+}
+
 function isAuthoritativePersistedQuotaWait(task: OpsWorkerTask): boolean {
   return task.lastOutcome?.result === "QUOTA"
     || task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT";
@@ -986,6 +1010,7 @@ export class OpsWorkerSupervisor {
       if (
         scheduled.action === "RUN"
         && current.custody.status === "UNCLAIMED"
+        && requiresOpsWorkerInitialQuotaAdmission(current.source.kind)
         && this.hasFreshQuotaProbePass(current)
       ) {
         // Exact proof binding depends on the live model/context/resource contract,
@@ -1018,11 +1043,13 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     if (action === "RUN" && this.quotaAdmission) {
       const current = this.requireTask(taskId);
-      const quotaScheduled = await this.applyQuotaScheduling(
-        { action, task: current },
-        false,
-      );
-      if (quotaScheduled) return quotaScheduled.task;
+      if (requiresQuotaSchedulingForRun(current)) {
+        const quotaScheduled = await this.applyQuotaScheduling(
+          { action, task: current },
+          false,
+        );
+        if (quotaScheduled) return quotaScheduled.task;
+      }
     }
     if (
       options.quotaProbeSubjectHash !== undefined
@@ -1088,9 +1115,16 @@ export class OpsWorkerSupervisor {
           task.schedule.nextRunAt !== null
           && Date.parse(task.schedule.nextRunAt) > now
         ) {
+          const bypassesInitialAdmission = task.custody.status === "UNCLAIMED"
+            && !requiresOpsWorkerInitialQuotaAdmission(task.source.kind);
+          const hasBypassableLegacyAdmissionState =
+            hasLegacyUnclaimedOperationalAdmissionState(task);
           if (
-            !isOpsWorkerQuotaWait(task)
-            || this.quotaAdmission?.check().status !== "ADMITTED"
+            (!isOpsWorkerQuotaWait(task) && !hasBypassableLegacyAdmissionState)
+            || (
+              !bypassesInitialAdmission
+              && this.quotaAdmission?.check().status !== "ADMITTED"
+            )
           ) return [];
         }
         return [{ action: "RUN", task }];
@@ -1173,6 +1207,7 @@ export class OpsWorkerSupervisor {
         }
         if (
           task.custody.status === "UNCLAIMED"
+          && requiresOpsWorkerInitialQuotaAdmission(task.source.kind)
           && task.lastOutcome?.result === "QUOTA_PROBE_PASS"
         ) {
           const proofMatches = quotaProbeSubjectHash !== undefined
@@ -1197,6 +1232,7 @@ export class OpsWorkerSupervisor {
         }
         if (
           task.custody.status === "UNCLAIMED"
+          && requiresOpsWorkerInitialQuotaAdmission(task.source.kind)
           && this.quotaAdmission !== undefined
           && this.quotaAdmission.check().status !== "ADMITTED"
         ) {
@@ -1204,7 +1240,8 @@ export class OpsWorkerSupervisor {
           return OPS_WORKER_TASK_STORE_NO_CHANGE;
         }
         if (
-          task.lastOutcome?.result === "QUOTA_PROBE_PASS"
+          requiresOpsWorkerInitialQuotaAdmission(task.source.kind)
+          && task.lastOutcome?.result === "QUOTA_PROBE_PASS"
           && !this.hasFreshQuotaProbePass(task)
           && this.quotaAdmission?.check().status !== "ADMITTED"
         ) {
@@ -1213,6 +1250,11 @@ export class OpsWorkerSupervisor {
         }
         const claimedAt = this.nextUpdatedAt(task);
         task.updatedAt = claimedAt;
+        if (hasLegacyUnclaimedOperationalAdmissionState(task)) {
+          task.schedule.nextRunAt = null;
+          task.schedule.nextCheckAt = null;
+          task.lastOutcome = null;
+        }
         task.custody = {
           status: "HELD",
           claimedAt,
@@ -1230,6 +1272,7 @@ export class OpsWorkerSupervisor {
   ): Promise<OpsWorkerScheduledTask | undefined> {
     if (scheduled.action !== "RUN" || !this.quotaAdmission) return undefined;
     let task = this.requireTask(scheduled.task.id);
+    if (!requiresQuotaSchedulingForRun(task)) return undefined;
     if (task.lastOutcome?.result === "QUOTA_PROBE_PASS") {
       if (this.hasFreshQuotaProbePass(task)) {
         if (task.custody.status === "HELD") return undefined;
