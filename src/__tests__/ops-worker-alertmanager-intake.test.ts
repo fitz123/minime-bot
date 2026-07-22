@@ -371,6 +371,35 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.match(task.evidence.at(-1)?.summary ?? "", /"deliveredFiringAlerts":64/);
   });
 
+  it("persists an exact group descriptor larger than the ordinary evidence bound", (t) => {
+    const { intake, store } = fixture(t);
+    const groupLabels = {
+      alertname: "MinimeBotUnavailable",
+      first: "a".repeat(2 * 1024),
+      second: "b".repeat(2 * 1024),
+    };
+    const firing = alert();
+    const payload = webhook({
+      groupLabels,
+      alerts: [{
+        ...firing,
+        labels: { ...firing.labels, ...groupLabels },
+      }],
+    });
+    assert.ok(body(payload).byteLength < OPS_ALERTMANAGER_INTAKE_LIMITS.maxBodyBytes);
+
+    const result = intake.submit(body(payload), CONTENT_TYPE);
+    const task = store.get(result.taskId ?? "");
+
+    assert.ok(task);
+    const descriptor = task.evidence[0].summary;
+    assert.ok(
+      Buffer.byteLength(descriptor, "utf8")
+      > 4 * 1024,
+    );
+    assert.deepEqual(JSON.parse(descriptor).groupLabels, groupLabels);
+  });
+
   it("retains Alertmanager's upstream truncation count even when local evidence fits", (t) => {
     const { intake, store } = fixture(t);
 
@@ -655,15 +684,6 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.throws(() => intake.submit(body(webhook({ version: "3" })), CONTENT_TYPE));
     expectIntakeError(
       () => intake.submit(body(webhook({ groupLabels: undefined })), CONTENT_TYPE),
-      "INVALID_PAYLOAD",
-    );
-    expectIntakeError(
-      () => intake.submit(body(webhook({
-        groupLabels: {
-          first: "a".repeat(2 * 1024),
-          second: "b".repeat(2 * 1024),
-        },
-      })), CONTENT_TYPE),
       "INVALID_PAYLOAD",
     );
     assert.equal(store.list().length, 0);

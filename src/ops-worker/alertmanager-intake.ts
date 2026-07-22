@@ -28,10 +28,10 @@ import {
 export const OPS_ALERTMANAGER_INTAKE_LIMITS = Object.freeze({
   maxBodyBytes: 256 * 1024,
   maxAlerts: 1_024,
-  maxLabelEntries: 64,
+  maxLabelEntries: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelEntries,
   maxAnnotationEntries: 64,
-  maxKeyBytes: 256,
-  maxLabelValueBytes: 2 * 1024,
+  maxKeyBytes: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelKeyBytes,
+  maxLabelValueBytes: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelValueBytes,
   maxAnnotationValueBytes: 8 * 1024,
   maxGroupKeyBytes: 8 * 1024,
   maxReceiverBytes: 1024,
@@ -470,7 +470,10 @@ function alertGroupCorrelationEvidence(
     groupLabels,
   };
   const summary = JSON.stringify(value);
-  if (Buffer.byteLength(summary, "utf8") > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+  if (
+    Buffer.byteLength(summary, "utf8")
+    > OPS_WORKER_LIMITS.maxAlertmanagerGroupCorrelationEvidenceBytes
+  ) {
     fail(
       "INVALID_PAYLOAD",
       "Alertmanager groupLabels exceed the exact correlation evidence bound",

@@ -823,6 +823,10 @@ export const OPS_WORKER_LIMITS = {
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
+  maxAlertmanagerGroupCorrelationEvidenceBytes: 256 * 1024,
+  maxAlertmanagerGroupLabelEntries: 64,
+  maxAlertmanagerGroupLabelKeyBytes: 256,
+  maxAlertmanagerGroupLabelValueBytes: 2 * 1024,
   maxOutcomeSummaryBytes: 4 * 1024,
   maxReportAttempts: 1_000,
   maxReportErrorBytes: 2 * 1024,
@@ -1838,7 +1842,68 @@ function parseCustody(value: unknown): OpsWorkerCustody {
   return { status, claimedAt, releasedAt, releaseReason };
 }
 
-function parseEvidence(value: unknown): OpsWorkerEvidence[] {
+function parseEvidenceSummary(
+  value: unknown,
+  path: string,
+  source: OpsWorkerTaskSource | OpsWorkerTaskSourceV1,
+  kind: OpsWorkerEvidence["kind"],
+  trust: OpsWorkerEvidence["trust"],
+): string {
+  const summary = expectBoundedText(
+    value,
+    path,
+    OPS_WORKER_LIMITS.maxAlertmanagerGroupCorrelationEvidenceBytes,
+  );
+  if (
+    Buffer.byteLength(summary, "utf8")
+    <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes
+  ) return summary;
+  if (
+    source.kind !== "alertmanager"
+    || kind !== "alert"
+    || trust !== "untrusted"
+  ) {
+    fail(path, `must be at most ${OPS_WORKER_LIMITS.maxEvidenceSummaryBytes} UTF-8 bytes`);
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(summary) as unknown;
+  } catch {
+    return fail(path, "oversized Alertmanager correlation evidence must be valid JSON");
+  }
+  const descriptor = expectObject(decoded, path);
+  expectExactKeys(descriptor, ["type", "correlationKey", "groupLabels"], path);
+  if (
+    descriptor.type !== "alertmanager-group-correlation-v1"
+    || descriptor.correlationKey !== source.correlationKey
+  ) {
+    fail(path, "oversized evidence must be the task's exact Alertmanager group descriptor");
+  }
+  const groupLabels = expectObject(descriptor.groupLabels, `${path}.groupLabels`);
+  const entries = Object.entries(groupLabels);
+  if (entries.length > OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelEntries) {
+    fail(`${path}.groupLabels`, "contains too many entries");
+  }
+  for (const [key, label] of entries) {
+    expectBoundedText(
+      key,
+      `${path}.groupLabels key`,
+      OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelKeyBytes,
+    );
+    expectBoundedText(
+      label,
+      `${path}.groupLabels.${key}`,
+      OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelValueBytes,
+      { allowEmpty: true },
+    );
+  }
+  return summary;
+}
+
+function parseEvidence(
+  value: unknown,
+  source: OpsWorkerTaskSource | OpsWorkerTaskSourceV1,
+): OpsWorkerEvidence[] {
   const evidenceEntries = expectDensePlainArray(value, "task.evidence");
   if (evidenceEntries.length > OPS_WORKER_LIMITS.maxEvidenceEntries) {
     fail(
@@ -1846,25 +1911,37 @@ function parseEvidence(value: unknown): OpsWorkerEvidence[] {
       `must contain at most ${OPS_WORKER_LIMITS.maxEvidenceEntries} entries`,
     );
   }
-  return evidenceEntries.map((item, index) => {
+  const parsed = evidenceEntries.map((item, index) => {
     const path = `task.evidence[${index}]`;
     const evidence = expectObject(item, path);
     expectExactKeys(evidence, ["at", "kind", "trust", "summary", "artifact"], path);
     const artifact = evidence.artifact === null
       ? null
       : parseArtifactPath(evidence.artifact, `${path}.artifact`);
+    const kind = expectEnum(evidence.kind, OPS_WORKER_EVIDENCE_KINDS, `${path}.kind`);
+    const trust = expectEnum(evidence.trust, OPS_WORKER_EVIDENCE_TRUST, `${path}.trust`);
     return {
       at: expectTimestamp(evidence.at, `${path}.at`),
-      kind: expectEnum(evidence.kind, OPS_WORKER_EVIDENCE_KINDS, `${path}.kind`),
-      trust: expectEnum(evidence.trust, OPS_WORKER_EVIDENCE_TRUST, `${path}.trust`),
-      summary: expectBoundedText(
+      kind,
+      trust,
+      summary: parseEvidenceSummary(
         evidence.summary,
         `${path}.summary`,
-        OPS_WORKER_LIMITS.maxEvidenceSummaryBytes,
+        source,
+        kind,
+        trust,
       ),
       artifact,
     };
   });
+  if (
+    parsed.filter((evidence) =>
+      Buffer.byteLength(evidence.summary, "utf8")
+      > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes).length > 1
+  ) {
+    fail("task.evidence", "must contain at most one oversized Alertmanager group descriptor");
+  }
+  return parsed;
 }
 
 function parseArtifactPath(value: unknown, path: string): string {
@@ -2821,7 +2898,7 @@ function parseTaskCommon(
       "task.objective",
       OPS_WORKER_LIMITS.maxObjectiveBytes,
     ),
-    evidence: parseEvidence(task.evidence),
+    evidence: parseEvidence(task.evidence, source),
     doneCheck: parseDoneCheck(task.doneCheck, registry),
     authorization: parseAuthorization(task.authorization, source.kind, registry),
     state,

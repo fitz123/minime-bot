@@ -117,6 +117,31 @@ describe("ops worker result reporting", () => {
     assert.match(result, /… \[truncated\]$/);
   });
 
+  it("redacts configured values from the persisted source identity", () => {
+    const configuredCanary = "SOURCE_IDENTITY_CANARY_58";
+    const task = {
+      id: "report-source-identity-fixture",
+      source: {
+        kind: "operator-cli",
+        template: "ops.availability",
+        correlationKey: `operator:${configuredCanary}`,
+      },
+      state: "BLOCKED",
+      agentResult: null,
+      verification: null,
+      lastOutcome: null,
+      updatedAt: "2026-07-22T12:00:00.000Z",
+    } as unknown as OpsWorkerTask;
+
+    const report = buildOpsWorkerTelegramReport(task, {
+      redact: createOpsWorkerFieldRedactor([configuredCanary]),
+      maxBytes: 4_096,
+    });
+
+    assert.match(report, /identity=operator-cli\/ops\.availability correlation=operator:\[REDACTED\]/);
+    assert.equal(report.includes(configuredCanary), false);
+  });
+
   it("renders bounded redacted Alertmanager group and episode identity", () => {
     const configuredCanary = "REPORT_IDENTITY_CANARY_58";
     const correlationKey = `lab-alertmanager:group:${"b".repeat(64)}`;

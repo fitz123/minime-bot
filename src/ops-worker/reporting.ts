@@ -4,6 +4,7 @@ const TRUNCATION_MARKER = "… [truncated]";
 const REDACTED = "[REDACTED]";
 
 export const OPS_WORKER_REPORT_FIELD_LIMITS = Object.freeze({
+  sourceIdentityBytes: 512,
   incidentIdentityBytes: 1024,
   agentSummaryBytes: 1024,
   agentActionBytes: 512,
@@ -172,7 +173,10 @@ export function buildOpsWorkerTelegramReport(
     { prefix: "Ops incident: ", value: task.id, minimum: "…" },
     {
       prefix: "identity=",
-      value: `${task.source.kind}/${task.source.template} correlation=${task.source.correlationKey}`,
+      value: options.redact(
+        `${task.source.kind}/${task.source.template} correlation=${task.source.correlationKey}`,
+        OPS_WORKER_REPORT_FIELD_LIMITS.sourceIdentityBytes,
+      ),
       minimum: "…",
     },
     { prefix: "state=", value: task.state, minimum: task.state },

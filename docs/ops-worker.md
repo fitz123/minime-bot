@@ -394,9 +394,11 @@ contract remains registered for compatible local CLI tasks and stored
 snapshots, but Alertmanager intake no longer selects it.
 
 The bounded intake accepts up to 1,024 alerts within the 256 KiB body limit.
-Task evidence retains the exact group descriptor, a bounded alert subset, and
-separate local and upstream omission counts when either the group exceeds task
-evidence capacity or Alertmanager reports a truncated delivery. An
+Task evidence retains the exact group descriptor, including descriptors larger
+than the ordinary per-evidence limit but still within the authenticated intake
+body bound, a bounded alert subset, and separate local and upstream omission
+counts when either the group exceeds task evidence capacity or Alertmanager
+reports a truncated delivery. An
 empty `groupLabels` map represents Alertmanager's single ungrouped route group;
 absence and stability then apply to all active alerts.
 Correlation and delivery identities are derived from the canonical verified
@@ -481,7 +483,8 @@ verification state. Alertmanager reports render bounded/redacted alert names,
 exact group labels, and an available persisted episode start in addition to the
 task and correlation identities. Reports also include typed outcome, diagnosis,
 actions, requested input when blocked, verifier components, and `checkedAt`.
-Every agent-authored field is redacted for configured sensitive values,
+Source and incident identities plus every agent-authored field are redacted for
+configured sensitive values,
 credential assignments, bearer tokens, URL credentials and secret query
 parameters, absolute home paths, control characters, and long opaque tokens.
 Per-field byte limits apply before the total reply limit. The existing durable
