@@ -53,6 +53,7 @@ import {
 } from "../ops-worker/types.js";
 
 const NOW = "2026-07-17T12:00:00.000Z";
+const RECHECK = "2026-07-17T12:00:01.000Z";
 const LATER = "2026-07-17T12:05:00.000Z";
 const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
 const AUTHORIZATION_EVIDENCE_HASH = `sha256:${"b".repeat(64)}`;
@@ -99,6 +100,7 @@ function taskRegistry(
         sourceKinds: [
           "alertmanager",
           "operator-cli",
+          "operator-telegram",
           "registered-cron",
           "authorized-issue",
         ],
@@ -109,6 +111,7 @@ function taskRegistry(
         sourceKinds: [
           "alertmanager",
           "operator-cli",
+          "operator-telegram",
           "registered-cron",
           "authorized-issue",
         ],
@@ -300,8 +303,12 @@ function quotaDecision(
     observedAt: input.observedAt ?? NOW,
     sampledAt: NOW,
     activeWindows: ["5h"],
-    nextResetAt: input.nextResetAt ?? (admitted ? null : LATER),
-    nextProbeAt: input.nextProbeAt ?? (admitted ? null : LATER),
+    nextResetAt: input.nextResetAt !== undefined
+      ? input.nextResetAt
+      : admitted ? null : LATER,
+    nextProbeAt: input.nextProbeAt !== undefined
+      ? input.nextProbeAt
+      : admitted ? null : LATER,
     evidenceHash: `sha256:${(admitted ? "c" : "d").repeat(64)}`,
     summary: admitted
       ? "Codex quota admission passed for 5h"
@@ -687,7 +694,9 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
     harness.supervisor.cancelTask(checking.id, "Release paused CHECK fixture custody.");
 
-    const quotaWait = makeTask("task-paused-quota");
+    const quotaWait = makeTask("task-paused-quota", {
+      sourceKind: "registered-cron",
+    });
     quotaWait.lastOutcome = {
       at: NOW,
       kind: "INFRASTRUCTURE",
@@ -1056,7 +1065,9 @@ describe("ops worker supervisor", () => {
     let current = quotaDecision("NOT_ADMITTED");
     const gate: OpsWorkerQuotaAdmissionGate = { check: () => current };
     const harness = await makeHarness(t, { quotaAdmission: gate });
-    harness.store.create(makeTask("task-quota-admission"));
+    harness.store.create(makeTask("task-quota-admission", {
+      sourceKind: "registered-cron",
+    }));
 
     const waiting = await harness.supervisor.claimNextTask();
     assert.equal(waiting?.action, "WAIT");
@@ -1088,6 +1099,248 @@ describe("ops worker supervisor", () => {
     assert.equal(runnable?.task.lastOutcome?.result, "QUOTA_PROBE_PASS");
   });
 
+  it("bypasses every closed initial-admission decision for all operational sources and normalizes legacy state atomically", async (t) => {
+    let checks = 0;
+    let current = quotaDecision("NOT_ADMITTED");
+    const harness = await makeHarness(t, {
+      quotaAdmission: {
+        check: () => {
+          checks += 1;
+          return current;
+        },
+      },
+    });
+    const sourceKinds = [
+      "alertmanager",
+      "operator-cli",
+      "operator-telegram",
+    ] as const;
+    const reasons = [
+      "LOW_REMAINING",
+      "MISSING",
+      "INVALID",
+      "STALE",
+      "RESETLESS",
+      "CONTRADICTORY",
+    ] as const;
+    const legacyOutcomes: readonly NonNullable<OpsWorkerTask["lastOutcome"]>[] = [
+      {
+        at: NOW,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_ADMISSION_WAIT",
+        summary: "Legacy initial admission wait.",
+      },
+      {
+        at: NOW,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_TELEMETRY_ERROR",
+        summary: "Legacy initial admission telemetry error.",
+      },
+      {
+        at: NOW,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_PROBE_ERROR",
+        summary: "Legacy initial admission probe error.",
+      },
+      {
+        at: NOW,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA",
+        summary: "Legacy unclaimed admission probe remained quota-limited.",
+      },
+      {
+        at: NOW,
+        kind: "INFRASTRUCTURE",
+        result: "QUOTA_PROBE_PASS",
+        summary: "Legacy initial admission probe passed.",
+        quotaProbeProof: {
+          version: 1,
+          subjectHash: QUOTA_PROBE_SUBJECT_HASH,
+        },
+      },
+    ];
+
+    for (const [sourceIndex, sourceKind] of sourceKinds.entries()) {
+      for (const [reasonIndex, reason] of reasons.entries()) {
+        current = quotaDecision("NOT_ADMITTED", {
+          reason,
+          nextResetAt: reason === "LOW_REMAINING" ? LATER : null,
+          nextProbeAt: reason === "LOW_REMAINING" ? LATER : null,
+        });
+        const task = makeTask(
+          `task-operational-${sourceIndex}-${reasonIndex}`,
+          { sourceKind },
+        );
+        task.schedule.nextRunAt = LATER;
+        task.schedule.nextCheckAt = LATER;
+        task.lastOutcome = structuredClone(
+          legacyOutcomes[reasonIndex % legacyOutcomes.length],
+        );
+        task.evidence = [{
+          at: NOW,
+          kind: "system",
+          trust: "trusted",
+          summary: "Evidence retained while legacy admission state is normalized.",
+          artifact: null,
+        }];
+        harness.store.create(task);
+
+        assert.equal(harness.supervisor.selectNextTask()?.task.id, task.id);
+        const claimed = await harness.supervisor.claimNextTask();
+        assert.equal(claimed?.action, "RUN");
+        assert.equal(claimed?.task.custody.status, "HELD");
+        assert.equal(claimed?.task.lastOutcome, null);
+        assert.equal(claimed?.task.schedule.nextRunAt, null);
+        assert.equal(claimed?.task.schedule.nextCheckAt, null);
+        assert.deepEqual(claimed?.task.evidence, task.evidence);
+
+        const repeated = await harness.supervisor.ensureTaskCustody(task.id, "RUN");
+        assert.equal(repeated.custody.status, "HELD");
+        assert.equal(repeated.lastOutcome, null);
+        harness.supervisor.cancelTask(task.id, "Release operational admission fixture.");
+      }
+    }
+
+    assert.equal(checks, 0);
+    const journal = readFileSync(join(harness.directory, "journal.jsonl"), "utf8");
+    assert.match(journal, /Revalidated authorization and claimed exclusive custody/);
+  });
+
+  it("keeps both background sources fail-closed for closed admission and exact proof mismatch", async (t) => {
+    let current = quotaDecision("NOT_ADMITTED");
+    const harness = await makeHarness(t, {
+      quotaAdmission: { check: () => current },
+    });
+    const sourceKinds = ["registered-cron", "authorized-issue"] as const;
+    const cases = [
+      {
+        reason: "LOW_REMAINING",
+        nextResetAt: LATER,
+        nextProbeAt: LATER,
+        expectedResult: "QUOTA_ADMISSION_WAIT",
+        expectedNextRunAt: LATER,
+      },
+      {
+        reason: "MISSING",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "INVALID",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "STALE",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "RESETLESS",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "CONTRADICTORY",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+    ] as const;
+
+    for (const sourceKind of sourceKinds) {
+      for (const [index, testCase] of cases.entries()) {
+        current = quotaDecision("NOT_ADMITTED", {
+          reason: testCase.reason,
+          nextResetAt: testCase.nextResetAt,
+          nextProbeAt: testCase.nextProbeAt,
+        });
+        const task = makeTask(`task-background-${sourceKind}-${index}`, {
+          sourceKind,
+        });
+        harness.store.create(task);
+        const waiting = await harness.supervisor.claimNextTask();
+        assert.equal(waiting?.action, "WAIT");
+        assert.equal(waiting?.task.custody.status, "UNCLAIMED");
+        assert.equal(waiting?.task.lastOutcome?.result, testCase.expectedResult);
+        assert.equal(waiting?.task.schedule.nextRunAt, testCase.expectedNextRunAt);
+        assert.equal(waiting?.task.schedule.nextCheckAt, null);
+        harness.supervisor.cancelTask(task.id, "Release background admission fixture.");
+      }
+
+      current = quotaDecision("ADMITTED");
+      const proofTask = makeTask(`task-background-proof-${sourceKind}`, {
+        sourceKind,
+      });
+      harness.store.create(proofTask);
+      harness.supervisor.recordQuotaProbeSuccess(
+        proofTask.id,
+        "Synthetic exact proof for mismatch coverage.",
+        QUOTA_PROBE_SUBJECT_HASH,
+      );
+      const mismatch = await harness.supervisor.ensureTaskCustody(
+        proofTask.id,
+        "RUN",
+        { quotaProbeSubjectHash: `sha256:${"d".repeat(64)}` },
+      );
+      assert.equal(mismatch.custody.status, "UNCLAIMED");
+      assert.equal(mismatch.lastOutcome?.result, "QUOTA_PROBE_ERROR");
+      harness.supervisor.cancelTask(proofTask.id, "Release proof mismatch fixture.");
+    }
+  });
+
+  it("revalidates authorization before operational custody while admission stays bypassed", async (t) => {
+    let quotaChecks = 0;
+    const verifier: OpsWorkerAuthorizationVerifier = {
+      identity: "operational-drift-authorization",
+      version: "1",
+      verify: () => ({
+        status: "DRIFT",
+        evidenceHash: `sha256:${"e".repeat(64)}`,
+        summary: "Synthetic operational authorization drift.",
+      }),
+    };
+    const harness = await makeHarness(t, {
+      authorizationVerifiers: {
+        ...fixtureAuthorizationVerifiers,
+        "operator-telegram": verifier,
+      },
+      quotaAdmission: {
+        check: () => {
+          quotaChecks += 1;
+          return quotaDecision("NOT_ADMITTED");
+        },
+      },
+    });
+    const task = makeTask("task-operational-authorization-drift", {
+      sourceKind: "operator-telegram",
+    });
+    task.schedule.nextRunAt = LATER;
+    task.lastOutcome = {
+      at: NOW,
+      kind: "INFRASTRUCTURE",
+      result: "QUOTA_ADMISSION_WAIT",
+      summary: "Legacy admission wait must not bypass authorization.",
+    };
+    harness.store.create(task);
+
+    assert.equal(await harness.supervisor.claimNextTask(), undefined);
+    const blocked = harness.store.get(task.id);
+    assert.equal(blocked?.state, "BLOCKED");
+    assert.equal(blocked?.custody.status, "RELEASED");
+    assert.equal(blocked?.authorizationVerification?.status, "DRIFT");
+    assert.equal(quotaChecks, 0);
+  });
+
   it("revalidates authorization before held and unclaimed quota probes", async (t) => {
     let authorizationStatus: "PASS" | "DRIFT" | "QUERY_ERROR" = "PASS";
     const verifier: OpsWorkerAuthorizationVerifier = {
@@ -1104,6 +1357,7 @@ describe("ops worker supervisor", () => {
       authorizationVerifiers: {
         ...fixtureAuthorizationVerifiers,
         "operator-cli": verifier,
+        "registered-cron": verifier,
       },
       quotaAdmission: { check: () => current },
     });
@@ -1130,7 +1384,9 @@ describe("ops worker supervisor", () => {
     assert.equal(blocked?.task.custody.status, "RELEASED");
     assert.equal(blocked?.task.authorizationVerification?.status, "DRIFT");
 
-    const unclaimed = makeTask("task-unclaimed-quota-authorization");
+    const unclaimed = makeTask("task-unclaimed-quota-authorization", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(unclaimed);
     current = quotaDecision("NOT_ADMITTED");
     const waiting = await harness.supervisor.claimNextTask();
@@ -1257,7 +1513,9 @@ describe("ops worker supervisor", () => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => denied },
     });
-    const task = makeTask("task-unclaimed-reset-probe");
+    const task = makeTask("task-unclaimed-reset-probe", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(task);
     const initial = await harness.supervisor.claimNextTask();
     assert.equal(initial?.action, "WAIT");
@@ -1281,7 +1539,9 @@ describe("ops worker supervisor", () => {
     assert.equal(refreshed.lastOutcome?.result, "QUOTA");
 
     harness.supervisor.cancelTask(task.id, "Exercise unclaimed probe telemetry error");
-    const telemetryTask = makeTask("task-unclaimed-probe-telemetry");
+    const telemetryTask = makeTask("task-unclaimed-probe-telemetry", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(telemetryTask);
     const telemetry = harness.supervisor.recordQuotaResponseWait(telemetryTask.id, {
       status: "TELEMETRY_ERROR",
@@ -1313,7 +1573,9 @@ describe("ops worker supervisor", () => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => decision },
     });
-    const fresh = makeTask("task-fresh-unclaimed-probe-pass");
+    const fresh = makeTask("task-fresh-unclaimed-probe-pass", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(fresh);
     harness.supervisor.recordQuotaProbeSuccess(
       fresh.id,
@@ -1329,7 +1591,9 @@ describe("ops worker supervisor", () => {
 
     harness.supervisor.cancelTask(fresh.id, "Exercise stale probe admission");
     decision = quotaDecision("NOT_ADMITTED");
-    const stale = makeTask("task-stale-unclaimed-probe-pass");
+    const stale = makeTask("task-stale-unclaimed-probe-pass", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(stale);
     harness.supervisor.recordQuotaProbeSuccess(
       stale.id,
@@ -1354,7 +1618,9 @@ describe("ops worker supervisor", () => {
         },
       },
     });
-    const task = makeTask("task-atomic-unclaimed-quota-admission");
+    const task = makeTask("task-atomic-unclaimed-quota-admission", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(task);
     harness.supervisor.recordQuotaProbeSuccess(
       task.id,
@@ -1376,7 +1642,9 @@ describe("ops worker supervisor", () => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => quotaDecision("ADMITTED") },
     });
-    const task = makeTask("task-expired-probe-current-admission");
+    const task = makeTask("task-expired-probe-current-admission", {
+      sourceKind: "registered-cron",
+    });
     harness.store.create(task);
     harness.supervisor.recordQuotaProbeSuccess(
       task.id,

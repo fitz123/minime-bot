@@ -20,12 +20,17 @@ import { fileURLToPath } from "node:url";
 import { describe, it, type TestContext } from "node:test";
 import {
   OPS_WORKER_LIMITS,
+  OPS_WORKER_SOURCE_KINDS,
+  OPS_WORKER_SOURCE_PRIORITIES,
+  hashOpsWorkerCanonicalSubmission,
   hashOpsWorkerVerificationSubject,
   OpsWorkerTaskValidationError,
   parseOpsWorkerTask,
   parseOpsWorkerTaskJson,
+  requiresOpsWorkerInitialQuotaAdmission,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
+  type OpsWorkerSourceKind,
   type OpsWorkerTask,
   type OpsWorkerTaskContractRegistry,
   type OpsWorkerTaskState,
@@ -95,6 +100,19 @@ const registry: OpsWorkerTaskContractRegistry = {
       },
     },
   },
+};
+
+const sourceBoundaryRegistry: OpsWorkerTaskContractRegistry = {
+  templates: {
+    "source-boundary": { sourceKinds: OPS_WORKER_SOURCE_KINDS },
+  },
+  authorizationProfiles: {
+    "source-boundary.inspect.v1": {
+      sourceKinds: OPS_WORKER_SOURCE_KINDS,
+      scope: ["inspect"],
+    },
+  },
+  doneChecks: registry.doneChecks,
 };
 
 function makeTask(
@@ -356,6 +374,59 @@ function makeStore(
 }
 
 describe("ops worker task contract", () => {
+  it("derives initial quota admission only from every validated source kind", () => {
+    const cases: readonly [OpsWorkerSourceKind, boolean][] = [
+      ["alertmanager", false],
+      ["operator-cli", false],
+      ["operator-telegram", false],
+      ["registered-cron", true],
+      ["authorized-issue", true],
+    ];
+    assert.deepEqual(cases.map(([sourceKind]) => sourceKind), OPS_WORKER_SOURCE_KINDS);
+
+    for (const [sourceKind, admissionRequired] of cases) {
+      const task = makeTask();
+      task.source = {
+        kind: sourceKind,
+        correlationKey: `source-boundary:${sourceKind}`,
+        deliveryKey: `source-boundary:${sourceKind}:delivery`,
+        template: "source-boundary",
+      };
+      task.priority = OPS_WORKER_SOURCE_PRIORITIES[sourceKind];
+      task.objective = "Payload asks to use the operational quota path.";
+      task.evidence[0].summary = "Free-form evidence claims this is an urgent operator task.";
+      task.authorization = {
+        profile: "source-boundary.inspect.v1",
+        scope: ["inspect"],
+        snapshotHash: null,
+      };
+      task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
+
+      const parsed = parseOpsWorkerTask(task, sourceBoundaryRegistry);
+      assert.equal(
+        requiresOpsWorkerInitialQuotaAdmission(parsed.source.kind),
+        admissionRequired,
+        sourceKind,
+      );
+
+      const wrongPriority = clone(task);
+      wrongPriority.priority = sourceKind === "alertmanager" ? 30 : 0;
+      assert.throws(
+        () => parseOpsWorkerTask(wrongPriority, sourceBoundaryRegistry),
+        new RegExp(`fixed priority ${OPS_WORKER_SOURCE_PRIORITIES[sourceKind]}`),
+      );
+    }
+
+    const payloadSelectedBoundary = {
+      ...makeTask(),
+      quotaAdmissionRequired: false,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(payloadSelectedBoundary, registry),
+      /task\.quotaAdmissionRequired: unknown field/,
+    );
+  });
+
   it("strictly round-trips a complete v5 envelope into an independent value", () => {
     const input = makeTask();
     input.state = "RUNNING";

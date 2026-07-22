@@ -83,6 +83,7 @@ import {
 import {
   OPS_WORKER_LIMITS,
   hashOpsWorkerPiLaunchSubject,
+  requiresOpsWorkerInitialQuotaAdmission,
   serializeOpsWorkerPendingSteering,
   type OpsWorkerActiveRun,
   type OpsWorkerInterrupt,
@@ -477,6 +478,7 @@ export class OpsWorkerPiAttemptRunner {
     let quotaProbeSubjectHash: string | undefined;
     if (
       current.custody.status === "UNCLAIMED"
+      && requiresOpsWorkerInitialQuotaAdmission(current.source.kind)
       && current.lastOutcome?.result === "QUOTA_PROBE_PASS"
     ) {
       try {

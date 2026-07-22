@@ -304,11 +304,22 @@ snapshot manifests before acknowledging parity.
 
 ## Quota admission and waits
 
-Initial admission evaluates every active window in the existing server-reported
-Codex quota snapshot. Each window must have at least 50 percent remaining and
-usage no more than the window percentage elapsed at `sampledAt` plus 10 points. Missing, stale,
-contradictory, durationless, resetless, unreadable, or malformed telemetry is a
-typed not-admitted result. Admission runs before an unheld task is claimed.
+Initial admission applies only to the autonomous/background `registered-cron`
+and `authorized-issue` source kinds. It evaluates every active window in the
+existing server-reported Codex quota snapshot. Each window must have at least
+50 percent remaining and usage no more than the window percentage elapsed at
+`sampledAt` plus 10 points. Missing, stale, contradictory, durationless,
+resetless, unreadable, or malformed telemetry is a typed not-admitted result,
+and admission runs before an unheld background task is claimed.
+
+The operational `alertmanager`, `operator-cli`, and `operator-telegram` source
+kinds bypass only that initial admission gate and may attempt immediately after
+the existing scheduling, authorization, and custody checks. This boundary is
+derived exclusively from the validated package task's `source.kind`; priority
+and free-form task data cannot select it. A successful authorized custody claim
+also normalizes legacy admission wait/probe state on an unclaimed operational
+task so a pre-upgrade task is not trapped. It never clears a held runtime quota
+wait.
 
 After custody, quota never displaces the task or increments its terminal
 infrastructure-failure count. A real quota response selects the reset named by
@@ -322,12 +333,12 @@ tool call. Success records a short-lived, single-use proof bound to the exact
 model, thinking level, primary context, parity contract, and resource digest.
 The real launch validates and consumes that proof atomically with its durable
 pre-spawn fence; an expired or mismatched proof returns to the probe flow without
-spawning. A successful deadline probe for an unclaimed task does not bypass
+spawning. A successful deadline probe for an unclaimed background task does not bypass
 all-window admission or reuse the elapsed reset; if admission remains closed,
 the worker schedules a bounded host-native telemetry recheck. Another quota
-response refreshes the reset; invalid telemetry and
-probe infrastructure errors remain distinct bounded outcomes. No LLM is parked
-and no blind polling or guessed reset deadline is used.
+response refreshes the reset; invalid telemetry and probe infrastructure errors
+remain distinct bounded outcomes. No LLM is parked and no blind polling or
+guessed reset deadline is used.
 
 A normal attempt likewise requires valid attempt-scoped response telemetry: a
 captured 429 enters the reset-aware quota path, another non-2xx response is an

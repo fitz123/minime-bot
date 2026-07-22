@@ -24,6 +24,21 @@ export const OPS_WORKER_SOURCE_PRIORITIES = {
   "authorized-issue": 30,
 } as const satisfies Record<OpsWorkerSourceKind, number>;
 
+const OPS_WORKER_INITIAL_QUOTA_ADMISSION_REQUIRED = {
+  alertmanager: false,
+  "operator-cli": false,
+  "operator-telegram": false,
+  "registered-cron": true,
+  "authorized-issue": true,
+} as const satisfies Record<OpsWorkerSourceKind, boolean>;
+
+/** Initial quota admission applies only to autonomous/background task sources. */
+export function requiresOpsWorkerInitialQuotaAdmission(
+  sourceKind: OpsWorkerSourceKind,
+): boolean {
+  return OPS_WORKER_INITIAL_QUOTA_ADMISSION_REQUIRED[sourceKind];
+}
+
 export type OpsWorkerPriority =
   (typeof OPS_WORKER_SOURCE_PRIORITIES)[OpsWorkerSourceKind];
 
