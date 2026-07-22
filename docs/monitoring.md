@@ -92,12 +92,54 @@ and restrict it with the host firewall where appropriate.
 
 The webhook flags are `--host` (default `127.0.0.1`), `--port` (default 9876),
 `--path` (default `/alertmanager`), `--max-body` (default 256 KiB), and
-`--body-timeout` (default 5 seconds, capped at 30). `GET /healthz` is its local
-readiness endpoint. Only IPv4 loopback or `localhost` bind hosts are accepted.
+`--body-timeout` (default 5 seconds, capped at 30). Optional bridge flags are
+`--ops-intake-url`, `--alertmanager-url`, and `--bridge-timeout` (default 5
+seconds, capped at 30). `GET /healthz` is its local readiness endpoint. Only
+IPv4 loopback or `localhost` bind hosts are accepted.
 `MINIME_WEBHOOK_HOST`, `MINIME_WEBHOOK_PORT`, and `MINIME_WEBHOOK_PATH` provide
 the corresponding launchd environment settings. The body timeout is an
 absolute input deadline, and the receiver caps concurrent requests so slow
 local clients cannot create unbounded request threads.
+
+Bridge mode is opt-in and requires all of the following settings:
+
+- `MINIME_OPS_INTAKE_URL` is the loopback HTTP URL ending in
+  `/intake/alertmanager`.
+- `MINIME_ALERTMANAGER_URL` is a loopback HTTP base URL with no credentials,
+  query, fragment, or non-root path.
+- `MINIME_OPS_INTAKE_SOPS_FILE` and `MINIME_OPS_INTAKE_SOPS_KEY` identify the
+  existing Ops intake bearer in SOPS; the key uses the same dotted-identifier
+  grammar as the Telegram key.
+- Optional `MINIME_BRIDGE_TIMEOUT` sets the source-query and Ops-forward
+  deadline above zero and no more than 30 seconds.
+
+Partial or non-loopback bridge configuration fails startup. The named Ops
+secret is decrypted alone into process memory. Its value is never written to
+arguments, logs, errors, or forwarded payloads. Bridge mode preserves the
+256 KiB body ceiling and forwards the original validated Alertmanager v4 body
+with bearer authentication.
+
+For each firing delivery, the webhook first queries loopback Alertmanager for
+an exact current group-label match across active, silenced, inhibited, and
+unprocessed alerts. A mismatch is treated as stale or forged input and is
+acknowledged without forwarding. A source-query failure uses native fallback
+and returns 503 so Alertmanager retries. Once the source is verified, required
+sinks are:
+
+- Noncritical: Ops acceptance is required. Success is quiet. Rejection,
+  timeout, or outage sends native fallback but still returns 503.
+- Critical: both Ops acceptance and native Telegram delivery are required;
+  failure of either returns 503.
+- Resolved-only: nothing is forwarded to Ops. Noncritical input is
+  acknowledged quietly; critical input uses native Telegram and requires it to
+  succeed.
+
+The webhook returns 2xx only after every required sink succeeds. Its separate
+process-local Ops and native deduplication state prevents a successful fallback
+or escalation from being repeated while Alertmanager retries an incomplete Ops
+delivery. Ops intake replay and coalescing provide durable task idempotency;
+native deduplication remains the bounded process-local contract described
+below. Setting none of the bridge variables preserves native-only delivery.
 
 Merge the example Alertmanager receiver into the active configuration rather
 than replacing operator configuration. Validate the active configuration,
@@ -215,7 +257,13 @@ the configured key without printing its value. Check launchd with
 `launchctl print`, then verify Prometheus targets and rules and Alertmanager
 routing. Revalidate Compose configuration before recreating services.
 
-Rollback is additive: boot out and remove the two copied launchd plists, remove
-the added Alertmanager receiver/routing and Prometheus rule/scrape entries, and
-recreate the monitoring services from the validated prior configuration.
-Removing these helpers does not change the bot runtime.
+Bridge-only rollback keeps native delivery live: remove all four required
+bridge settings (and optional `MINIME_BRIDGE_TIMEOUT`) together, restart the
+webhook, verify a controlled native notification, and only then remove unused
+Ops-side wiring. No Alertmanager receiver change is needed because the same
+Node-independent webhook remains its receiver.
+
+Full monitoring rollback is additive: boot out and remove the two copied
+launchd plists, remove the added Alertmanager receiver/routing and Prometheus
+rule/scrape entries, and recreate the monitoring services from the validated
+prior configuration. Removing these helpers does not change the bot runtime.

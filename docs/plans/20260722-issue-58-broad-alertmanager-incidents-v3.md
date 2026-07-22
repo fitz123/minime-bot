@@ -78,7 +78,7 @@ and resume for any duration before making a claim; global custody cannot be held
 passive false-completion wait.
 
 Deleting, weakening, or rerouting monitoring can still make an alert disappear; this detector-
-blinding risk is explicitly accepted by Ninja's trusted-agent/YAGNI correction. Monitoring
+blinding risk is explicitly accepted by the operator's trusted-agent/YAGNI correction. Monitoring
 changes remain outside ordinary repair policy and must appear in the result report.
 
 ### 4. Bounded redacted report
@@ -167,13 +167,21 @@ custody starvation.
 
 **Goal:** Prove the public implementation is compatible, minimal, and releasable.
 
-- [ ] Update `docs/ops-worker.md`, monitoring docs, and `CHANGELOG.md` with the generic lifecycle,
+- [x] Update `docs/ops-worker.md`, monitoring docs, and `CHANGELOG.md` with the generic lifecycle,
       bridge contract, accepted detector-blinding risk, and rollback behavior.
-- [ ] Run `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, schema-guard,
+- [x] Run `npm test`, `npm run lint`, `npm run build`, `npm pack --dry-run`, schema-guard,
       minimal-workspace, CLI-help, gitleaks, public PII/identity, and branch-diff checks.
-- [ ] Confirm no per-alert remediation code, new service, workflow capability, or unrelated change
+- [x] Confirm no per-alert remediation code, new service, workflow capability, or unrelated change
       entered the diff.
-- [ ] Commit a clean current-head review verdict with no unresolved Critical/Major findings.
+- [x] Commit a clean current-head review verdict with no unresolved Critical/Major findings.
+
+Validation evidence (2026-07-22): clean `npm ci`; full `npm test`; lint/typecheck;
+build; 285-file package dry-run; schema-guard; built CLI help; minimal-workspace;
+configured gitleaks branch scan; tracked-path, public PII, noreply author/committer,
+inactivity, diffstat, and `git diff --check` gates all passed. The current-tree
+review verdict is PASS with no unresolved Critical or Major findings. The diff
+contains no per-alert remediation branch, new service definition, workflow
+capability, startup activation, or unrelated runtime change.
 
 ## Acceptance
 
@@ -191,9 +199,9 @@ custody starvation.
 
 ## Logical-run budget and continuation
 
-Ninja approved exactly **+2 logical Ralphex runs** on 2026-07-22:
+The operator approved exactly **+2 logical Ralphex runs** on 2026-07-22:
 
-1. **Run #3 — public package:** this plan, repository `fitz123/minime-bot`, branch
+1. **Run #3 — public package:** this plan, the public package repository, branch
    `issue-58-broad-alertmanager-incidents`, base `main`.
 2. **Run #4 — private integration:** a separate short plan in a fresh private control worktree,
    created after the public API/release is frozen. Scope: package pin/composition, bridge wiring,

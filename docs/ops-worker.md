@@ -89,7 +89,7 @@ coalesce an evolving notification into the task that currently owns the same
 active correlation. Each accepted coalesced delivery key and submission
 fingerprint is retained as bounded protected trusted receipt evidence, so its exact
 replay still returns that task after termination; an unrecorded conflicting
-payload fails closed. Each v5 snapshot retains a store-owned
+payload fails closed. Each v6 snapshot retains a store-owned
 immutable submission fingerprint, so later runtime evidence updates or bounded
 evidence eviction cannot make a conflicting delivery look identical. The
 correlation key has a different role:
@@ -190,11 +190,12 @@ redelivery; it never invents a false unsent or sent state.
 
 ## Schema and migration
 
-Schema v5 is the only write format. Exact schema v1, v2, v3, and v4 snapshots
-remain readable through deterministic pure migrations. Reading, listing, or
-inspecting an older snapshot does not rewrite it; its first successful store
-mutation writes one canonical v5 snapshot. Unknown fields, v5-only fields on an
-older version, and future schema versions are rejected.
+Schema v6 is the only write format. Exact schema v1, v2, v3, v4, and v5
+snapshots remain readable through deterministic pure migrations. Reading,
+listing, or inspecting an older snapshot does not rewrite it; its first
+successful store mutation writes one canonical v6 snapshot. Unknown fields,
+fields introduced after a snapshot's declared version, and future schema
+versions are rejected.
 
 V3 added one fixed authorization-verification record: validator identity and
 version, checked authorization snapshot hash, checked time, closed status, and
@@ -213,6 +214,15 @@ pause and pending interrupt state. Older snapshots migrate with no steering,
 `paused: false`, and no interrupt. Steering ids are replay-safe, conflicting id
 reuse and overflow fail closed, and pending steering contributes to the
 verification subject hash so it invalidates stale aggregate evidence.
+
+V6 adds one bounded current `agentResult` with `agent` provenance. Older
+snapshots migrate with no result. The result is bound to the exact persisted
+attempt id and has one of four kinds: `remediation-complete`, `no-action-needed`,
+`input-needed`, or `impossible`. It carries a bounded summary and action list,
+plus bounded requested input and a closed reason when applicable. It is task
+state and an untrusted claim, not verification evidence or authority. A new
+attempt may replace it; `/answer` followed by `/retry` clears it before work
+resumes.
 
 The v1 migration derives a task-unique legacy delivery key and non-shareable
 legacy host resource. It also derives custody conservatively: active, checking,
@@ -363,13 +373,69 @@ Only a fresh aggregate PASS recorded atomically with the terminal transition
 can produce `DONE` and release custody. Repeated diagnostic failures remain
 retryable with custody held; only product evidence can exhaust remediation and
 block the task. This package exports the `ops.minime-availability` version 1
-composite and its task contract factory for a trusted worker embedding; no
-production embedding is constructed or activated by the installed binary.
+and `ops.alertmanager-incident` version 1 composites and their task contract
+factory for a trusted worker embedding; no production embedding is constructed
+or activated by the installed binary.
+
+## Generic Alertmanager incident contract
+
+Every authenticated Alertmanager firing group maps to the same package-owned
+template and done check, `ops.alertmanager-incident`, at priority 0 on
+`host:local`. The fixed `ops.host-availability` profile grants only `inspect`
+and `local-reversible-repair`. The generic objective permits investigation and
+ordinary safe same-UID reversible repair; it does not create per-alert
+profiles, runbooks, command lists, or action allowlists. Alert names,
+severities, annotations, URLs, and all other payload text remain bounded
+untrusted evidence and cannot expand authority. The legacy `ops.availability`
+contract remains registered for compatible local CLI tasks and stored
+snapshots, but Alertmanager intake no longer selects it.
+
+For this template, the harness creates a fresh result-file path only after the
+attempt identity is persisted and passes it as `OPS_WORKER_RESULT_FILE`. The
+agent must write exactly one schema-valid result for that attempt. The harness
+validates exact keys, types, byte bounds, and attempt identity, persists only
+the latest result, and removes the temporary file. `remediation-complete` and
+`no-action-needed` enter the same deterministic check. `input-needed` and
+`impossible` become durable `BLOCKED` tasks, release custody, and queue one
+report. A missing, malformed, or mismatched result consumes a remediation round;
+five protocol failures end in reported `BLOCKED`. Legacy templates keep their
+existing clean-exit behavior.
+
+The generic check requires all three package-owned components to pass:
+
+- `monitoring-freshness` requires a latest Prometheus `up` sample no more than
+  two minutes old from a fresh bounded query.
+- `exact-group-absence` requires the task's exact group labels to match no
+  active, silenced, inhibited, or unprocessed Alertmanager alert.
+- `resolution-stability` requires Prometheus `ALERTS` to contain no pending or
+  firing sample with those exact group labels during the previous five minutes.
+
+Stale telemetry, query errors, timeouts, and the five-minute convergence wait
+remain in `CHECKING`, schedule bounded rechecks, and do not spend remediation
+rounds. A still-present exact group disproves a completion or no-action claim,
+spends one of five remediation rounds, and resumes the same agent session.
+Thus passive convergence cannot become `DONE`, but it also cannot starve future
+work indefinitely behind a false completion claim.
+
+This verifier intentionally accepts one trusted-agent limitation: an agent
+could make the alert disappear by deleting, weakening, or rerouting monitoring.
+There is no separate routing-integrity or detector-blinding verifier. Monitoring
+changes are outside ordinary repair policy, must be disclosed in the typed
+result, and remain subject to the existing approval gates.
+
+Terminal Telegram reports are built only from persisted task, result, and
+verification state. They include incident identity, typed outcome, diagnosis,
+actions, requested input when blocked, verifier components, and `checkedAt`.
+Every agent-authored field is redacted for configured sensitive values,
+credential assignments, bearer tokens, URL credentials and secret query
+parameters, absolute home paths, control characters, and long opaque tokens.
+Per-field byte limits apply before the total reply limit. The existing durable
+report receipt and retry contract remains unchanged.
 
 ## Availability contract
 
-`createOpsTaskContracts` registers template `ops.availability` for authenticated
-Alertmanager and local CLI submissions, authorization profile
+`createOpsTaskContracts` retains template `ops.availability` for compatible
+local CLI submissions and legacy snapshots, authorization profile
 `ops.host-availability`, and invariant `minime-bot-host`. The invariant fixes
 the host resource, objective, scopes, and composite parameters in package code.
 Alert payloads and task text cannot select probes or policy.
@@ -481,7 +547,7 @@ route:
   receipts, quota summaries, or credentials.
 - `POST /intake/alertmanager`, when explicitly configured, requires the
   configured bearer token and accepts only a bounded Alertmanager v4 webhook.
-  It can submit only the package-owned availability task contract; alert text,
+  It can submit only the package-owned generic incident contract; alert text,
   labels, and annotations remain bounded untrusted evidence. The route is
   absent when intake is not configured.
 
@@ -489,10 +555,12 @@ There is no generic HTTP task intake, retry, cancellation, command, or arbitrary
 proxy route. Both the fixed adapter and CLI submission write through the strict
 local task store.
 
-Ops intake is an additional Alertmanager receiver. It never replaces or
-forwards through the independent native Alertmanager-to-Telegram delivery in
-`scripts/alertmanager_webhook.py`; that path and `scripts/monitoring_native.py`
-remain separate and unchanged.
+Ops intake does not replace the Node-independent native webhook. Optional
+forward-first bridge mode in `scripts/alertmanager_webhook.py` verifies the
+current exact group and forwards the original bounded body to this route while
+retaining native fallback and critical escalation. With bridge configuration
+unset, the webhook and `scripts/monitoring_native.py` retain native-only
+behavior. See `docs/monitoring.md` for the sink and rollback contract.
 
 The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a
 constant-time matched bearer token. The 256 KiB body limit mirrors the native

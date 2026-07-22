@@ -28,7 +28,7 @@ const nativeScript = join(root, "scripts", "monitoring_native.py");
 const webhookScript = join(root, "scripts", "alertmanager_webhook.py");
 const doctorScript = join(root, "scripts", "runtime_doctor.py");
 const syntheticSecret = "synthetic_test_token_42";
-const syntheticOpsSecret = "synthetic_ops_bearer_58";
+const syntheticOpsSecret = "synthetic_ops_bearer_58"; // gitleaks:allow -- test-only canary
 const temporaryDirectories: string[] = [];
 
 interface RunResult {

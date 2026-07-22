@@ -1,8 +1,8 @@
 # Issue #58: Broad Generic Alertmanager Incident Handling for Minime Ops (v2, trimmed)
 
-## Ninja-supplied outcome and constraints (authoritative, 2026-07-22)
+## Operator-supplied outcome and constraints (authoritative, 2026-07-22)
 
-- The bot receives ALL relevant Alertmanager problems instead of Ninja and handles them
+- The bot receives ALL relevant Alertmanager problems instead of the operator and handles them
   autonomously — equivalent to launching a full-capability agent from an independent
   environment (not broken when the primary bot's environment is broken), pasting it the alert,
   and asking it to investigate and fix end-to-end where safely possible.
@@ -11,7 +11,7 @@
   allowlists are rejected.
 - 2026-07-22 scope correction (supersedes the heavier v1 draft of this plan): do NOT build the
   adversarial anti-cheat verification layer (rule pinning, expression re-evaluation, scrape
-  baseline, routing integrity). The agent has operator-level trust; DONE means what Ninja would
+  baseline, routing integrity). The agent has operator-level trust; DONE means what the operator would
   check manually — the alert is really gone, stayed gone, and monitoring is alive. The plan
   must not reduce how long/persistently the agent can work.
 - Existing global gates remain: exact confirmation before literal `sudo`; separate approval for
@@ -24,7 +24,7 @@
 - Governance preserved: ADR-099, ADR-100, ADR-102. Issue #58 controls; #70 is out of scope.
 
 Everything below is planner-selected technical design derived from source; none of it is
-Ninja-supplied acceptance criteria.
+Operator-supplied acceptance criteria.
 
 ## Minime source-review corrections (binding before Ralphex)
 
@@ -42,7 +42,7 @@ preserve the loose trusted-agent design while closing source/lifecycle gaps:
   `ops.availability` compatibility; generic incidents cannot silently lose diagnosis/actions or
   input-needed semantics.
 - Private runtime-doctor coverage must detect persistent Ops `/healthz` failure and accepted-task
-  liveness loss, then notify Ninja through the Node/Ops-independent native path. Intake success
+  liveness loss, then notify the operator through the Node/Ops-independent native path. Intake success
   cannot make a later permanent worker failure silent until Alertmanager's four-hour repeat.
 - The live canary proves one real Prometheus→Alertmanager→bridge→Ops episode and report. Exact
   replay/coalescing remains deterministic-test evidence; live acceptance does not wait four
@@ -181,7 +181,7 @@ registrations; a rule added to `rules.yml` later flows through unchanged):
 Accepted residual risks (explicit, per the 2026-07-22 trust correction): detector blinding —
 deleting/weakening a rule or scrape job makes the alert resolve and the harness will not
 detect it. Mitigations: the fixed attempt policy prohibits treating monitoring changes as
-repair, the recovered report lists every action taken (Ninja reads what happened), and a dead
+repair, the recovered report lists every action taken (the operator reads what happened), and a dead
 scrape target surfaces as its own `BotDown`/`NodeExporterDown` incident. Non-Prometheus future
 senders degrade gracefully: components 1–2 still apply; component 3 is vacuous for groups that
 never produce `ALERTS` series (documented).
@@ -248,7 +248,7 @@ Direct `webhook_config.http_config.authorization` (supported by pinned v0.31.1, 
 `credentials_file`) was evaluated and rejected: it requires a plaintext bearer file on disk
 mounted into the Alertmanager container (a genuine credential-exposure change that would trip
 the credential gate) and leaves no independent escalation branch when Ops is down short of
-duplicating every notification to Ninja.
+duplicating every notification to the operator.
 
 Selected: the packaged native webhook (`scripts/alertmanager_webhook.py`, loopback :9095,
 validated/bounded/deduplicating :58-134,:246-290) gains a forward-first bridge mode;
@@ -298,7 +298,7 @@ untouched. Concretely, with citations:
    (ADR-100 exhausted-handling), operator `/retry` resumes with context.
 4. v2 removes every verifier-induced dead end that v1 had (rule-drift PRODUCT_FAILURE,
    rules-API QUERY_ERROR loops, missing-alertname BLOCKED, pre-launch pin failures).
-5. Typed BLOCKED occurs only when the agent itself declares input-needed/impossible — Ninja's
+5. Typed BLOCKED occurs only when the agent itself declares input-needed/impossible — the operator's
    own requirement — and `/answer` + `/retry` resume the same task with steering context.
 
 ### Non-goals (YAGNI, explicit)
@@ -455,7 +455,7 @@ Steps with restart/reload notes:
    existing private suites (`ops/test/*.test.mjs`, `verify-native-alertmanager.mjs`,
    `smoke-ops-worker.sh`). Extend the independent runtime doctor to verify Ops `/healthz` and
    accepted-task liveness, with native escalation on persistent loss. If this reveals
-   substantive new private code, stop and ask Ninja for one additional logical run per ADR-102.
+   substantive new private code, stop and ask the operator for one additional logical run per ADR-102.
 3. Add the bridge env (loopback Ops intake URL + existing SOPS intake-bearer key reference) to
    the private webhook entry point and its LaunchAgent plist; correct the stale private
    README/deploy text; no plaintext secrets, no destination identifiers in the public repo.
@@ -482,7 +482,7 @@ remove the rule, reload, verify. Branches unsafe to exercise live (typed BLOCKED
 both-paths-down fallback, crash points) are covered by the fake/fault-lab suites; this canary —
 unlike a forged intake POST — proves the real Prometheus→Alertmanager→bridge→intake route.
 
-**Reversible outage drill (separately gated — requires Ninja's explicit go immediately before
+**Reversible outage drill (separately gated — requires the operator's explicit go immediately before
 execution).** Reversible primary-bot outage via its existing user-scope launchd wrapper (no
 sudo, no data risk). Pre-armed independent fallback: a one-shot host-native timer job armed
 before the outage that kickstarts the primary after the maximum outage duration (proposed 15
@@ -492,7 +492,7 @@ HELD custody. Evidence chain: real `BotDown` fires → one generic incident owns
 diagnoses and restarts the bot → group resolves and stays stable → composite PASS → DONE → one
 recovered report → tail audit healthy → critical-severity native escalation observed
 independently while routine noise stayed quiet. Abort on fallback-timer failure, custody
-conflict, VPN loss, or Ninja abort. No legacy recovery-supervisor revival.
+conflict, VPN loss, or operator abort. No legacy recovery-supervisor revival.
 
 **Rollback (executable, evidence-preserving).** Unset the bridge env and restart the webhook
 LaunchAgent first — this alone restores today's exact direct-Telegram behavior; repin previous
@@ -511,7 +511,7 @@ logical Ralphex run.**
 
 | # | Repository | Scope | Plan / lineage | Why Ralphex | Why not mechanics |
 |---|---|---|---|---|---|
-| 1 | `fitz123/minime-bot` (public) | Generic incident contract, three-component verifier, typed agent results, result reports, native bridge, tests/docs | `docs/plans/20260722-issue-58-broad-alertmanager-incidents.md` (this file, v2), branch `issue-58-broad-alertmanager-incidents`, base `main` | ~6 coherent code tasks across intake/contracts/verifier/protocol/native script with regression + lifecycle + autonomy test load — the substantial iterative shape ADR-102 budgets | New data contracts and lifecycle transitions; not reducible to deploy/config steps |
+| 1 | public package repository | Generic incident contract, three-component verifier, typed agent results, result reports, native bridge, tests/docs | `docs/plans/20260722-issue-58-broad-alertmanager-incidents.md` (this file, v2), branch `issue-58-broad-alertmanager-incidents`, base `main` | ~6 coherent code tasks across intake/contracts/verifier/protocol/native script with regression + lifecycle + autonomy test load — the substantial iterative shape ADR-102 budgets | New data contracts and lifecycle transitions; not reducible to deploy/config steps |
 
 Zero additional runs are consumed by: feature-PR follow-through, release PR/tag, private
 worktree/branch, package pins and validate-only deploys, the `runtime-dependencies.mjs`
@@ -519,12 +519,12 @@ recomposition + private config/plist edits (bounded, covered by existing private
 executed by the parent supervisor), monitoring config checks, staged activation, the synthetic
 canary, the separately gated outage drill, and rollback verification. No second (private) run:
 the private delta is composition of already-packaged capability; if that proves wrong during
-rollout, custody is preserved and Ninja is asked once with evidence, per ADR-102.
+rollout, custody is preserved and the operator is asked once with evidence, per ADR-102.
 
-**No run is authorized by this plan.** Required before launch: Ninja's explicit approval of
+**No run is authorized by this plan.** Required before launch: the operator's explicit approval of
 "+1 logical Ralphex run for issue #58 (public repo, this plan v2)".
 
-## Remaining Ninja decisions / gates
+## Remaining operator decisions / gates
 
 1. Logical-run budget approval: the exact "+1 public run" above (required before any Ralphex
    launch).

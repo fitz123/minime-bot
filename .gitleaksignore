@@ -1,0 +1,2 @@
+# Intentional synthetic secret used to prove the native bridge never exposes its bearer.
+cb2d3d658ef6777b3d201c403c5914f70c2a6aea:src/__tests__/monitoring-native.test.ts:generic-api-key:31
