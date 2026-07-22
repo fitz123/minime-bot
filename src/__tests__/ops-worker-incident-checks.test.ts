@@ -124,6 +124,39 @@ describe("generic Alertmanager incident done check", () => {
     assert.match(result.summary, /exact-group-absence=PRODUCT_FAILURE/);
   });
 
+  it("keeps a conclusive present group decisive when Prometheus also fails", async () => {
+    const readings = healthyReadings();
+    readings.alerts.status = "PRESENT";
+    const registry = createOpsIncidentDoneCheckRegistry({
+      clock: () => new Date(NOW),
+      incidentMonitoringReader: {
+        readMonitoringFreshness: () => { throw new Error("offline"); },
+        readResolutionStability: () => readings.stability,
+      },
+      incidentAlertmanagerReader: {
+        readExactGroupState: () => readings.alerts,
+      },
+    });
+
+    const result = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      {
+        taskId: "incident-present-during-prometheus-failure",
+        checkedAt: NOW,
+        now: () => new Date(NOW),
+        sourceKind: "alertmanager",
+        sourceCorrelationKey: CORRELATION_KEY,
+        sourceEvidence: correlationEvidence("FutureSyntheticAlert"),
+      },
+    );
+
+    assert.equal(result.result, "PRODUCT_FAILURE");
+    assert.deepEqual(
+      result.components.map((component) => component.outcome),
+      ["QUERY_ERROR", "PRODUCT_FAILURE", "PASS"],
+    );
+  });
+
   it("schedules stale telemetry and flap stability waits without a failure outcome", async () => {
     const stale = healthyReadings();
     stale.freshness.latestSampleAt = "2026-07-22T11:57:59.999Z";

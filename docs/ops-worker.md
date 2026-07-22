@@ -396,8 +396,10 @@ an omission count when the group is larger than the task evidence capacity. An
 empty `groupLabels` map represents Alertmanager's single ungrouped route group;
 absence and stability then apply to all active alerts.
 Correlation and delivery identities are derived from the canonical verified
-group-label descriptor and episode start rather than the opaque webhook
-`groupKey`, so changing unverified opaque text cannot split one incident.
+group-label descriptor and source-verified episode start rather than the opaque
+webhook `groupKey`, so changing unverified opaque text cannot split one
+incident. The native bridge likewise excludes `groupKey` from its delivery
+deduplication identity.
 
 For this template, the harness creates a fresh result-file path only after the
 attempt identity is persisted and passes it as `OPS_WORKER_RESULT_FILE`. The

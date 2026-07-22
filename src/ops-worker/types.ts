@@ -2083,11 +2083,13 @@ export function aggregateOpsWorkerVerificationOutcome(
 ): OpsWorkerVerificationOutcome {
   const required = components.filter((component) => component.required);
   if (required.length === 0) return "VERIFIER_INVALID";
+  // One trusted product failure conclusively disproves completion even when an
+  // unrelated required component cannot produce evidence in the same query.
   const precedence: readonly OpsWorkerVerificationOutcome[] = [
+    "PRODUCT_FAILURE",
     "VERIFIER_INVALID",
     "TIMEOUT",
     "QUERY_ERROR",
-    "PRODUCT_FAILURE",
     "NOT_READY",
     "DEFER",
   ];

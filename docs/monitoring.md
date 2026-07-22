@@ -122,17 +122,21 @@ with bearer authentication.
 Bridge validation accepts up to 1,024 alerts within that byte ceiling, matching
 Ops intake. An empty `groupLabels` map is the valid single group produced by an
 ungrouped route; source verification still requires every delivered firing
-label set to remain current.
+member's label set and episode start to remain current, plus its fingerprint
+when supplied.
 
 For each firing delivery, the webhook first queries loopback Alertmanager's
 grouped API with group-label and exact-receiver filters. The returned routed
 group must have exactly the delivered `groupLabels` and receiver, and every
-delivered firing label set must exactly match a current active, suppressed, or
-unprocessed member. The server-side filters keep unrelated global alert
-cardinality outside the bounded response. A mismatch is treated as stale or
-forged input and is acknowledged without forwarding. A source-query failure
-uses native fallback and returns 503 so Alertmanager retries. Once the source
-is verified, required sinks are:
+delivered firing member's labels and `startsAt` must exactly match a current
+active, suppressed, or unprocessed member; a supplied fingerprint must match
+too. The server-side filters keep unrelated global alert cardinality outside
+the bounded response. Native deduplication derives its episode identity from
+the verified receiver, group descriptor, member labels, and start time, never
+the opaque webhook `groupKey`. A mismatch is treated as stale or forged input
+and is acknowledged without forwarding. A source-query failure uses native
+fallback and returns 503 so Alertmanager retries. Once the source is verified,
+required sinks are:
 
 - Noncritical: Ops acceptance is required. Success is quiet. Rejection,
   timeout, or outage sends native fallback but still returns 503.

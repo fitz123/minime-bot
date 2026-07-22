@@ -59,7 +59,14 @@ class ParsedAlertmanagerBatch:
     critical: bool
     receiver: str
     group_labels: dict[str, str]
-    firing_labels: tuple[dict[str, str], ...]
+    firing_members: tuple[AlertmanagerMemberIdentity, ...]
+
+
+@dataclass(frozen=True)
+class AlertmanagerMemberIdentity:
+    labels: tuple[tuple[str, str], ...]
+    starts_at: str
+    fingerprint: str | None
 
 
 @dataclass(frozen=True)
@@ -106,11 +113,7 @@ def _decode_alertmanager_payload(body: bytes) -> dict[str, Any]:
     return payload
 
 
-def _native_payload_fields(
-    payload: dict[str, Any],
-    *,
-    episode_group_key: str | None = None,
-) -> tuple[str, str]:
+def _native_payload_fields(payload: dict[str, Any]) -> tuple[str, str]:
     alerts = payload["alerts"]
     if not alerts:
         raise ValueError("invalid alert batch")
@@ -131,18 +134,7 @@ def _native_payload_fields(
             identity = fingerprint
         else:
             identity = json.dumps([status, name, severity, instance], separators=(",", ":"))
-        if episode_group_key is None:
-            identities.append(f"{status}:{identity}")
-        else:
-            starts_at = _bounded_string(
-                item.get("startsAt"),
-                limit=128,
-                allow_empty=False,
-            )
-            identities.append(json.dumps(
-                [episode_group_key, status, identity, starts_at],
-                separators=(",", ":"),
-            ))
+        identities.append(f"{status}:{identity}")
 
     try:
         identity_bytes = "\n".join(sorted(identities)).encode("utf-8")
@@ -179,6 +171,27 @@ def _bounded_string_map(value: Any, *, max_entries: int, max_value_bytes: int) -
     return result
 
 
+def _bridge_native_key(
+    receiver: str,
+    group_labels: dict[str, str],
+    members: list[tuple[str, AlertmanagerMemberIdentity]],
+) -> str:
+    group_identity = [receiver, sorted(group_labels.items())]
+    identities = sorted(
+        json.dumps(
+            [group_identity, status, member.labels, member.starts_at],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for status, member in members
+    )
+    try:
+        identity_bytes = "\n".join(identities).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid alert identity") from None
+    return hashlib.sha256(identity_bytes).hexdigest()
+
+
 def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     """Validate fields needed to authenticate and forward one Alertmanager v4 group."""
     payload = _decode_alertmanager_payload(body)
@@ -190,14 +203,10 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         or not 1 <= len(alerts) <= MAX_ACTIVE_ALERTS
     ):
         raise ValueError("invalid bridge payload")
-    group_key = _bounded_string(
+    _bounded_string(
         payload.get("groupKey"),
         limit=8 * 1024,
         allow_empty=False,
-    )
-    native_key, message = _native_payload_fields(
-        payload,
-        episode_group_key=group_key,
     )
     if "groupLabels" not in payload:
         raise ValueError("invalid bridge payload")
@@ -214,7 +223,8 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         allow_empty=False,
     )
     firing_count = 0
-    firing_labels: list[dict[str, str]] = []
+    members: list[tuple[str, AlertmanagerMemberIdentity]] = []
+    firing_members: list[AlertmanagerMemberIdentity] = []
     critical = False
     for alert in alerts:
         if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
@@ -227,9 +237,30 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
             max_entries=MAX_LABELS,
             max_value_bytes=MAX_LABEL_BYTES,
         )
+        starts_at = _bounded_string(
+            alert.get("startsAt"),
+            limit=128,
+            allow_empty=False,
+        )
+        raw_fingerprint = alert.get("fingerprint")
+        fingerprint = (
+            None
+            if raw_fingerprint is None or raw_fingerprint == ""
+            else _bounded_string(
+                raw_fingerprint,
+                limit=512,
+                allow_empty=False,
+            )
+        )
+        member = AlertmanagerMemberIdentity(
+            labels=tuple(sorted(labels.items())),
+            starts_at=starts_at,
+            fingerprint=fingerprint,
+        )
+        members.append((status, member))
         if status == "firing":
             firing_count += 1
-            firing_labels.append(labels)
+            firing_members.append(member)
             if any(labels.get(key) != value for key, value in group_labels.items()):
                 raise ValueError("group labels do not match firing alert")
         if labels.get("severity") == "critical":
@@ -239,15 +270,16 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         or (payload["status"] == "resolved" and firing_count != 0)
     ):
         raise ValueError("bridge batch status is inconsistent")
+    _, message = _native_payload_fields(payload)
     return ParsedAlertmanagerBatch(
-        native_key=native_key,
+        native_key=_bridge_native_key(receiver, group_labels, members),
         bridge_key=hashlib.sha256(body).hexdigest(),
         message=message,
         has_firing=firing_count > 0,
         critical=critical,
         receiver=receiver,
         group_labels=group_labels,
-        firing_labels=tuple(firing_labels),
+        firing_members=tuple(firing_members),
     )
 
 
@@ -319,7 +351,7 @@ def alertmanager_has_exact_group(
     config: BridgeConfig,
     receiver: str,
     group_labels: dict[str, str],
-    firing_labels: tuple[dict[str, str], ...],
+    firing_members: tuple[AlertmanagerMemberIdentity, ...],
 ) -> bool:
     """Require an exact routed group containing every delivered firing alert."""
     try:
@@ -344,7 +376,10 @@ def alertmanager_has_exact_group(
         raise DeliveryError("Alertmanager source verification failed") from None
     if not isinstance(groups, list) or len(groups) > MAX_ACTIVE_ALERTS:
         raise DeliveryError("Alertmanager source verification failed")
-    current_group_members: set[tuple[tuple[str, str], ...]] = set()
+    current_group_members: dict[
+        tuple[tuple[tuple[str, str], ...], str],
+        set[str | None],
+    ] = {}
     for group in groups:
         if not isinstance(group, dict) or len(group) > MAX_ALERT_FIELDS:
             raise DeliveryError("Alertmanager source verification failed")
@@ -378,6 +413,21 @@ def alertmanager_has_exact_group(
                     max_entries=MAX_LABELS,
                     max_value_bytes=MAX_LABEL_BYTES,
                 )
+                starts_at = _bounded_string(
+                    alert.get("startsAt"),
+                    limit=128,
+                    allow_empty=False,
+                )
+                raw_fingerprint = alert.get("fingerprint")
+                fingerprint = (
+                    None
+                    if raw_fingerprint is None or raw_fingerprint == ""
+                    else _bounded_string(
+                        raw_fingerprint,
+                        limit=512,
+                        allow_empty=False,
+                    )
+                )
             except ValueError:
                 raise DeliveryError("Alertmanager source verification failed") from None
             status = alert.get("status")
@@ -387,10 +437,18 @@ def alertmanager_has_exact_group(
                 "unprocessed",
             }:
                 raise DeliveryError("Alertmanager source verification failed")
-            current_group_members.add(tuple(sorted(alert_labels.items())))
-    return bool(firing_labels) and all(
-        tuple(sorted(candidate.items())) in current_group_members
-        for candidate in firing_labels
+            member_key = (tuple(sorted(alert_labels.items())), starts_at)
+            current_group_members.setdefault(member_key, set()).add(fingerprint)
+    return bool(firing_members) and all(
+        (
+            member.labels,
+            member.starts_at,
+        ) in current_group_members
+        and (
+            member.fingerprint is None
+            or member.fingerprint in current_group_members[(member.labels, member.starts_at)]
+        )
+        for member in firing_members
     )
 
 
@@ -419,7 +477,7 @@ class WebhookApplication:
         bridge: BridgeConfig | None = None,
         native_deduplicator: BatchDeduplicator | None = None,
         verify_group: Callable[
-            [BridgeConfig, str, dict[str, str], tuple[dict[str, str], ...]], bool
+            [BridgeConfig, str, dict[str, str], tuple[AlertmanagerMemberIdentity, ...]], bool
         ] = alertmanager_has_exact_group,
         forward: Callable[[BridgeConfig, bytes], bool] = forward_to_ops,
     ):
@@ -472,7 +530,7 @@ def _deliver_bridge_batch(
             bridge,
             batch.receiver,
             batch.group_labels,
-            batch.firing_labels,
+            batch.firing_members,
         )
     except Exception:
         # Verification must be retried even when the independent fallback succeeds.
