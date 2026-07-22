@@ -1043,13 +1043,11 @@ export class OpsWorkerSupervisor {
     this.assertStarted();
     if (action === "RUN" && this.quotaAdmission) {
       const current = this.requireTask(taskId);
-      if (requiresQuotaSchedulingForRun(current)) {
-        const quotaScheduled = await this.applyQuotaScheduling(
-          { action, task: current },
-          false,
-        );
-        if (quotaScheduled) return quotaScheduled.task;
-      }
+      const quotaScheduled = await this.applyQuotaScheduling(
+        { action, task: current },
+        false,
+      );
+      if (quotaScheduled) return quotaScheduled.task;
     }
     if (
       options.quotaProbeSubjectHash !== undefined

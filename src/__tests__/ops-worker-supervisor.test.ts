@@ -53,6 +53,7 @@ import {
 } from "../ops-worker/types.js";
 
 const NOW = "2026-07-17T12:00:00.000Z";
+const RECHECK = "2026-07-17T12:00:01.000Z";
 const LATER = "2026-07-17T12:05:00.000Z";
 const AUTHORIZATION_CLAIM_HASH = `sha256:${"a".repeat(64)}`;
 const AUTHORIZATION_EVIDENCE_HASH = `sha256:${"b".repeat(64)}`;
@@ -302,8 +303,12 @@ function quotaDecision(
     observedAt: input.observedAt ?? NOW,
     sampledAt: NOW,
     activeWindows: ["5h"],
-    nextResetAt: input.nextResetAt ?? (admitted ? null : LATER),
-    nextProbeAt: input.nextProbeAt ?? (admitted ? null : LATER),
+    nextResetAt: input.nextResetAt !== undefined
+      ? input.nextResetAt
+      : admitted ? null : LATER,
+    nextProbeAt: input.nextProbeAt !== undefined
+      ? input.nextProbeAt
+      : admitted ? null : LATER,
     evidenceHash: `sha256:${(admitted ? "c" : "d").repeat(64)}`,
     summary: admitted
       ? "Codex quota admission passed for 5h"
@@ -1167,6 +1172,7 @@ describe("ops worker supervisor", () => {
           { sourceKind },
         );
         task.schedule.nextRunAt = LATER;
+        task.schedule.nextCheckAt = LATER;
         task.lastOutcome = structuredClone(
           legacyOutcomes[reasonIndex % legacyOutcomes.length],
         );
@@ -1206,21 +1212,57 @@ describe("ops worker supervisor", () => {
       quotaAdmission: { check: () => current },
     });
     const sourceKinds = ["registered-cron", "authorized-issue"] as const;
-    const reasons = [
-      "LOW_REMAINING",
-      "MISSING",
-      "INVALID",
-      "STALE",
-      "RESETLESS",
-      "CONTRADICTORY",
+    const cases = [
+      {
+        reason: "LOW_REMAINING",
+        nextResetAt: LATER,
+        nextProbeAt: LATER,
+        expectedResult: "QUOTA_ADMISSION_WAIT",
+        expectedNextRunAt: LATER,
+      },
+      {
+        reason: "MISSING",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "INVALID",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "STALE",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "RESETLESS",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
+      {
+        reason: "CONTRADICTORY",
+        nextResetAt: null,
+        nextProbeAt: null,
+        expectedResult: "QUOTA_TELEMETRY_ERROR",
+        expectedNextRunAt: RECHECK,
+      },
     ] as const;
 
     for (const sourceKind of sourceKinds) {
-      for (const [index, reason] of reasons.entries()) {
+      for (const [index, testCase] of cases.entries()) {
         current = quotaDecision("NOT_ADMITTED", {
-          reason,
-          nextResetAt: null,
-          nextProbeAt: null,
+          reason: testCase.reason,
+          nextResetAt: testCase.nextResetAt,
+          nextProbeAt: testCase.nextProbeAt,
         });
         const task = makeTask(`task-background-${sourceKind}-${index}`, {
           sourceKind,
@@ -1229,10 +1271,9 @@ describe("ops worker supervisor", () => {
         const waiting = await harness.supervisor.claimNextTask();
         assert.equal(waiting?.action, "WAIT");
         assert.equal(waiting?.task.custody.status, "UNCLAIMED");
-        assert.ok(
-          waiting?.task.lastOutcome?.result === "QUOTA_ADMISSION_WAIT"
-          || waiting?.task.lastOutcome?.result === "QUOTA_TELEMETRY_ERROR",
-        );
+        assert.equal(waiting?.task.lastOutcome?.result, testCase.expectedResult);
+        assert.equal(waiting?.task.schedule.nextRunAt, testCase.expectedNextRunAt);
+        assert.equal(waiting?.task.schedule.nextCheckAt, null);
         harness.supervisor.cancelTask(task.id, "Release background admission fixture.");
       }
 
