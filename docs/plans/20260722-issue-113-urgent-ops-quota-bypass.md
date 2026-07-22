@@ -32,10 +32,10 @@ git diff --stat main...HEAD
 
 ### Task 1: Define the trusted source-kind admission boundary
 
-- [ ] Add a minimum-sufficient package-owned source-kind classifier in `src/ops-worker/types.ts` that returns admission-required only for `registered-cron` and `authorized-issue`; do not derive policy from priority or task payload fields.
-- [ ] Add focused tests covering all five source kinds and preserving fixed source-priority/task parsing rejection so priority or free-form field manipulation cannot select the operational path.
-- [ ] Keep the task schema and source-kind set unchanged; no migration, new policy framework, configuration toggle, or issue #61 quota-model work.
-- [ ] Run the focused type/task-store tests before proceeding.
+- [x] Add a minimum-sufficient package-owned source-kind classifier in `src/ops-worker/types.ts` that returns admission-required only for `registered-cron` and `authorized-issue`; do not derive policy from priority or task payload fields.
+- [x] Add focused tests covering all five source kinds and preserving fixed source-priority/task parsing rejection so priority or free-form field manipulation cannot select the operational path.
+- [x] Keep the task schema and source-kind set unchanged; no migration, new policy framework, configuration toggle, or issue #61 quota-model work.
+- [x] Run the focused type/task-store tests before proceeding.
 
 ### Task 2: Separate initial admission from held runtime quota recovery
 
