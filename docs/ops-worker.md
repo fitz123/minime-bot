@@ -401,6 +401,10 @@ counts when either the group exceeds task evidence capacity or Alertmanager
 reports a truncated delivery. An
 empty `groupLabels` map represents Alertmanager's single ungrouped route group;
 absence and stability then apply to all active alerts.
+When an evolving delivery coalesces into an active task, its bounded alert and
+omission evidence is merged into the task with de-duplication and oldest
+nonessential-evidence eviction; the exact group descriptor and durable delivery
+receipts remain protected.
 Correlation and delivery identities are derived from the canonical verified
 group-label descriptor and source-verified episode start rather than the opaque
 webhook `groupKey`, so changing unverified opaque text cannot split one

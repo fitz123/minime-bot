@@ -195,6 +195,22 @@ OpsWorkerDeliveryReceipt | undefined {
   }
 }
 
+function isAlertmanagerGroupCorrelationEvidence(
+  evidence: OpsWorkerTask["evidence"][number],
+  correlationKey: string,
+): boolean {
+  if (evidence.kind !== "alert" || evidence.trust !== "untrusted") return false;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    return record.type === "alertmanager-group-correlation-v1"
+      && record.correlationKey === correlationKey;
+  } catch {
+    return false;
+  }
+}
+
 function deliveryFingerprints(task: OpsWorkerTask, deliveryKey: string): Set<string> {
   const fingerprints = new Set<string>();
   if (task.source.deliveryKey === deliveryKey) {
@@ -903,6 +919,7 @@ export class OpsWorkerTaskStore {
           submissionFingerprint: task.submissionFingerprint,
         };
         const observedAt = this.refreshAcceptedFiringObservation(working, task);
+        this.mergeCoalescedAlertEvidence(working, task);
         try {
           appendOpsWorkerEvidence(working, {
             at: observedAt,
@@ -1246,6 +1263,29 @@ export class OpsWorkerTaskStore {
     if (task.state === "CHECKING") task.schedule.nextCheckAt = observedAt;
     task.updatedAt = observedAt;
     return observedAt;
+  }
+
+  private mergeCoalescedAlertEvidence(
+    task: OpsWorkerTask,
+    submission: Readonly<OpsWorkerTask>,
+  ): void {
+    for (const evidence of submission.evidence) {
+      if (
+        evidence.kind !== "alert"
+        || evidence.trust !== "untrusted"
+        || isAlertmanagerGroupCorrelationEvidence(
+          evidence,
+          submission.source.correlationKey,
+        )
+      ) continue;
+      const duplicate = task.evidence.findIndex((candidate) =>
+        candidate.kind === evidence.kind
+        && candidate.trust === evidence.trust
+        && candidate.summary === evidence.summary
+        && candidate.artifact === evidence.artifact);
+      if (duplicate >= 0) task.evidence.splice(duplicate, 1);
+      appendOpsWorkerEvidence(task, structuredClone(evidence));
+    }
   }
 
   private appendSteeringEntry(

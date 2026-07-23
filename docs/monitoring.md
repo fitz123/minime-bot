@@ -124,7 +124,8 @@ Bridge validation accepts up to 1,024 alerts within that byte ceiling, matching
 Ops intake. An empty `groupLabels` map is the valid single group produced by an
 ungrouped route; source verification still requires every delivered firing
 member's label set and episode start to remain current, plus its fingerprint
-when supplied.
+when supplied. Valid UTF-8 group-label names are accepted and quoted in
+Prometheus and Alertmanager matchers when they are not legacy-compatible names.
 
 For each firing delivery, the webhook first queries loopback Alertmanager's
 grouped API with group-label and exact-receiver filters. The returned routed

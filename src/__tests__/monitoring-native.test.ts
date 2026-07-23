@@ -587,6 +587,40 @@ describe("Alertmanager webhook", () => {
     }
   });
 
+  it("accepts and quotes UTF-8 group-label names for bridge source verification", async () => {
+    const payload = alertmanagerPayload({ alertname: "Utf8Group" });
+    const groupLabels = { "service.name": "edge", "团队": "值" };
+    payload.groupLabels = groupLabels;
+    const member = (payload.alerts as Array<Record<string, unknown>>)[0];
+    member.labels = { ...(member.labels as Record<string, string>), ...groupLabels };
+    payload.commonLabels = member.labels;
+
+    const result = await runPython([
+      "-c",
+      [
+        "import json,sys",
+        "sys.path.insert(0, 'scripts')",
+        "import alertmanager_webhook as webhook",
+        "payload=sys.argv[1].encode('utf-8')",
+        "batch=webhook.parse_bridge_alertmanager_payload(payload)",
+        "url=webhook._active_alert_groups_url('http://127.0.0.1:9093', batch.receiver, batch.group_labels)",
+        "print(json.dumps({'groupLabels': batch.group_labels, 'url': url}, ensure_ascii=False))",
+      ].join(";"),
+      JSON.stringify(payload),
+    ], {});
+
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout) as {
+      groupLabels: Record<string, string>;
+      url: string;
+    };
+    assert.deepEqual(parsed.groupLabels, groupLabels);
+    assert.deepEqual(
+      new Set(new URL(parsed.url).searchParams.getAll("filter")),
+      new Set(['"service.name"="edge"', '"团队"="值"']),
+    );
+  });
+
   it("forwards only exact active groups to Ops and keeps noncritical success quiet", async () => {
     const opsBodies: string[] = [];
     const opsAuthorization: Array<string | undefined> = [];

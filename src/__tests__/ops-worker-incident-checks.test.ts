@@ -15,6 +15,7 @@ import type {
 } from "../ops-worker/types.js";
 
 const NOW = "2026-07-22T12:00:00.000Z";
+const TEN_MINUTES_AGO = "2026-07-22T11:50:00.000Z";
 const FIVE_MINUTES_AGO = "2026-07-22T11:55:00.000Z";
 const ONE_MINUTE_AGO = "2026-07-22T11:59:00.000Z";
 const FOUR_MINUTES_LATER = "2026-07-22T12:04:00.000Z";
@@ -48,6 +49,20 @@ function correlationEvidence(
     }),
     artifact: null,
   }];
+}
+
+function firingObservation(at: string): OpsWorkerEvidence {
+  return {
+    at,
+    kind: "system",
+    trust: "trusted",
+    summary: JSON.stringify({
+      type: "alertmanager-firing-observation-v1",
+      correlationKey: CORRELATION_KEY,
+      deliveryKey: "lab-alertmanager:episode:fixture",
+    }),
+    artifact: null,
+  };
 }
 
 function healthyReadings(): {
@@ -110,6 +125,7 @@ async function runIncident(
   alertname = "FutureSyntheticAlert",
   withCompletedAbsenceWindow = true,
   groupLabels?: Record<string, string>,
+  additionalEvidence: readonly OpsWorkerEvidence[] = [],
 ) {
   const registry = createOpsIncidentDoneCheckRegistry({
     clock: () => new Date(NOW),
@@ -129,7 +145,10 @@ async function runIncident(
       now: () => new Date(NOW),
       sourceKind: "alertmanager",
       sourceCorrelationKey: CORRELATION_KEY,
-      sourceEvidence: correlationEvidence(alertname, groupLabels),
+      sourceEvidence: [
+        ...correlationEvidence(alertname, groupLabels),
+        ...additionalEvidence,
+      ],
       ...(withCompletedAbsenceWindow
         ? { previousVerification: completedAbsenceWindow() }
         : {}),
@@ -176,6 +195,26 @@ describe("generic Alertmanager incident done check", () => {
     assert.equal(firstAbsentCheck.components[1].outcome, "PASS");
     assert.equal(firstAbsentCheck.components[2].outcome, "NOT_READY");
     assert.equal(firstAbsentCheck.components[2].nextCheckAt, FIVE_MINUTES_LATER);
+  });
+
+  it("does not substitute a firing receipt for the first exact-absence observation", async () => {
+    for (const [priorWindow, firingObservedAt] of [
+      [false, TEN_MINUTES_AGO],
+      [true, ONE_MINUTE_AGO],
+    ] as const) {
+      const result = await runIncident(
+        healthyReadings(),
+        "ExternalLabelAlert",
+        priorWindow,
+        { alertname: "ExternalLabelAlert", cluster: "production" },
+        [firingObservation(firingObservedAt)],
+      );
+
+      assert.equal(result.result, "NOT_READY");
+      assert.equal(result.components[1].outcome, "PASS");
+      assert.equal(result.components[2].outcome, "NOT_READY");
+      assert.equal(result.components[2].nextCheckAt, FIVE_MINUTES_LATER);
+    }
   });
 
   it("disproves a claim while the exact group remains present", async () => {
@@ -620,6 +659,28 @@ describe("bounded generic monitoring readers", () => {
       stabilityQuery,
       '(max(timestamp(ALERTS{alertname="FutureSyntheticAlert",instance="local",alertstate=~"pending|firing"})))[5m:5s]',
     );
+
+    const quotedLabelContext = {
+      ...context,
+      sourceEvidence: correlationEvidence(
+        "FutureSyntheticAlert",
+        { "service.name": "edge", "团队": "值" },
+      ),
+    };
+    const quotedRequestStart = urls.length;
+    await readers.incidentAlertmanagerReader.readExactGroupState(quotedLabelContext);
+    await readers.incidentMonitoringReader.readResolutionStability(quotedLabelContext);
+    const quotedRequests = urls.slice(quotedRequestStart);
+    const alertmanagerRequest = quotedRequests.find((url) => url.port === "9093");
+    assert.deepEqual(
+      new Set(alertmanagerRequest?.searchParams.getAll("filter")),
+      new Set(['"service.name"="edge"', '"团队"="值"']),
+    );
+    const quotedPrometheusQuery = quotedRequests
+      .map((url) => url.searchParams.get("query"))
+      .find((query) => query?.includes("ALERTS{"));
+    assert.match(quotedPrometheusQuery ?? "", /"service\.name"="edge"/);
+    assert.match(quotedPrometheusQuery ?? "", /"团队"="值"/);
 
     stabilityValues = [[now / 1_000, String((now - 60_000) / 1_000)]];
     const latest = await readers.incidentMonitoringReader.readResolutionStability(context);

@@ -95,7 +95,7 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const PROMETHEUS_UP_RANGE_QUERY = "(max(timestamp(up)))[2m:5s]";
 const PROMETHEUS_UP_STABILITY_COVERAGE_QUERY = "(max(timestamp(up)))[5m:5s]";
 const PROMETHEUS_SUBQUERY_STEP_MS = 5_000;
-const PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const LEGACY_PROMETHEUS_LABEL_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const STABILITY_WAIT_SUMMARY =
   "The exact alert group has not yet been absent with five minutes of monitoring coverage.";
 
@@ -233,6 +233,7 @@ function readerContext(context: OpsWorkerDoneCheckContext): OpsIncidentReaderCon
 
 function previousAbsenceWindowReadyAt(
   context: OpsWorkerDoneCheckContext,
+  latestFiringObservedAt: number | null,
 ): number | null {
   const previous = context.previousVerification;
   if (
@@ -252,6 +253,10 @@ function previousAbsenceWindowReadyAt(
     || stability?.outcome !== "NOT_READY"
     || stability.summary !== STABILITY_WAIT_SUMMARY
     || stability.nextCheckAt === null
+    || (
+      latestFiringObservedAt !== null
+      && latestFiringObservedAt >= Date.parse(absence.observedAt)
+    )
   ) return null;
   return Date.parse(stability.nextCheckAt);
 }
@@ -449,8 +454,11 @@ export function createOpsIncidentDoneCheckDefinition(
               scheduledAt(observedAt),
             );
           }
-          const priorAbsenceReadyAt = previousAbsenceWindowReadyAt(context);
           const latestFiringObservedAt = latestAcceptedFiringObservedAt(context);
+          const priorAbsenceReadyAt = previousAbsenceWindowReadyAt(
+            context,
+            latestFiringObservedAt,
+          );
           const readyAt = Math.max(
             reading.monitoringWindowStartedAt === null
               ? Date.parse(scheduledAt(observedAt))
@@ -460,12 +468,12 @@ export function createOpsIncidentDoneCheckDefinition(
               ? Number.NEGATIVE_INFINITY
               : Date.parse(reading.latestMatchingSampleAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
-            latestFiringObservedAt === null
-              ? reading.latestMatchingSampleAt === null
-                ? priorAbsenceReadyAt
-                  ?? Date.parse(observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
-                : Number.NEGATIVE_INFINITY
-              : latestFiringObservedAt + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
+            reading.latestMatchingSampleAt === null
+              ? priorAbsenceReadyAt
+                ?? Date.parse(observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
+              : latestFiringObservedAt === null
+                ? Number.NEGATIVE_INFINITY
+                : latestFiringObservedAt + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
           );
           if (
             reading.monitoringWindowStartedAt === null
@@ -678,15 +686,16 @@ function promqlString(value: string): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
+function matcherLabelName(value: string): string {
+  return LEGACY_PROMETHEUS_LABEL_NAME_PATTERN.test(value)
+    ? value
+    : promqlString(value);
+}
+
 function alertRangeQuery(groupLabels: Record<string, string>): string {
   const matchers = Object.entries(groupLabels)
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => {
-      if (!PROMETHEUS_LABEL_NAME_PATTERN.test(key)) {
-        throw new Error("Alert group contains a label name unsafe for a Prometheus query");
-      }
-      return `${key}=${promqlString(value)}`;
-    });
+    .map(([key, value]) => `${matcherLabelName(key)}=${promqlString(value)}`);
   matchers.push('alertstate=~"pending|firing"');
   return `(max(timestamp(ALERTS{${matchers.join(",")}})))[5m:5s]`;
 }
@@ -832,10 +841,10 @@ class OpsIncidentAlertmanagerHttpReader implements OpsIncidentAlertmanagerReader
     for (const [key, value] of Object.entries(groupLabels).sort(
       ([left], [right]) => left.localeCompare(right),
     )) {
-      if (!PROMETHEUS_LABEL_NAME_PATTERN.test(key)) {
-        throw new Error("Alert group contains a label name unsafe for an Alertmanager query");
-      }
-      url.searchParams.append("filter", `${key}=${promqlString(value)}`);
+      url.searchParams.append(
+        "filter",
+        `${matcherLabelName(key)}=${promqlString(value)}`,
+      );
     }
     const response = await this.fetch(url, {
       method: "GET",

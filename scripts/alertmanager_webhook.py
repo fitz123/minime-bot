@@ -47,7 +47,7 @@ OPS_INTAKE_URL_ENV = "MINIME_OPS_INTAKE_URL"
 ALERTMANAGER_URL_ENV = "MINIME_ALERTMANAGER_URL"
 BRIDGE_TIMEOUT_ENV = "MINIME_BRIDGE_TIMEOUT"
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
-_LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LEGACY_LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RE2_META_CHARACTERS = frozenset(r"\.+*?()|[]{}^$")
 _RFC3339_TIMESTAMP = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<clock>\d{2}:\d{2}:\d{2})"
@@ -204,6 +204,10 @@ def _bounded_string_map(value: Any, *, max_entries: int, max_value_bytes: int) -
     return result
 
 
+def _matcher_label_name(value: str) -> str:
+    return value if _LEGACY_LABEL_NAME.fullmatch(value) else json.dumps(value, ensure_ascii=False)
+
+
 def _bridge_native_key(
     receiver: str,
     group_labels: dict[str, str],
@@ -262,8 +266,6 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         max_entries=MAX_LABELS,
         max_value_bytes=MAX_LABEL_BYTES,
     )
-    if any(not _LABEL_NAME.fullmatch(key) for key in group_labels):
-        raise ValueError("invalid bridge group labels")
     receiver = _bounded_string(
         payload.get("receiver"),
         limit=MAX_RECEIVER_BYTES,
@@ -394,7 +396,10 @@ def _active_alert_groups_url(
         ("receiver", f"^(?:{quoted_receiver})$"),
     ]
     parameters.extend(
-        ("filter", f"{key}={json.dumps(value, ensure_ascii=False)}")
+        (
+            "filter",
+            f"{_matcher_label_name(key)}={json.dumps(value, ensure_ascii=False)}",
+        )
         for key, value in sorted(group_labels.items())
     )
     return f"{base_url}/api/v2/alerts/groups?{urllib.parse.urlencode(parameters)}"

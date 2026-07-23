@@ -641,6 +641,11 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.deepEqual(activeReuse, { ok: true, taskId: first.taskId, replayed: true });
     assert.deepEqual(evolvingReuse, { ok: true, taskId: first.taskId, replayed: true });
     assert.equal(store.list().length, 1);
+    const evolvedTask = store.get(first.taskId ?? "");
+    assert.ok(evolvedTask?.evidence.some((entry) =>
+      entry.kind === "alert"
+      && entry.trust === "untrusted"
+      && entry.summary.includes("The active group gained updated evidence.")));
     assert.throws(
       () => store.mutate(
         first.taskId ?? "",

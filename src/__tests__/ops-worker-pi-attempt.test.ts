@@ -931,6 +931,64 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(prompt, /telegram:update:3030/);
     assert.ok(prompt.includes('"text":"\\u0001'));
     assert.match(prompt, /Perform one bounded remediation attempt/);
+    assert.match(prompt, /ops-worker-prompt-evidence-omission-v1/);
+  });
+
+  it("keeps alert evidence usable when the exact group descriptor exceeds the prompt", () => {
+    const task = makeTask("large-alertmanager-descriptor-prompt", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    const groupLabels = Object.fromEntries(Array.from(
+      { length: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelEntries },
+      (_, index) => [
+        `group_label_${String(index).padStart(2, "0")}`,
+        `${index}:`.padEnd(OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelValueBytes, "g"),
+      ],
+    ));
+    const descriptor = JSON.stringify({
+      type: "alertmanager-group-correlation-v1",
+      correlationKey: task.source.correlationKey,
+      groupLabels,
+    });
+    assert.ok(Buffer.byteLength(descriptor, "utf8") > OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    task.evidence = [
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: descriptor,
+        artifact: null,
+      },
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          status: "firing",
+          labels: { alertname: "PromptEvidenceMustRemainVisible" },
+        }),
+        artifact: null,
+      },
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-alert-omission-v1",
+          omittedAlerts: 7,
+        }),
+        artifact: null,
+      },
+    ];
+
+    const prompt = buildOpsWorkerAttemptPrompt(task);
+
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    assert.match(prompt, /alertmanager-group-correlation-prompt-v1/);
+    assert.match(prompt, /PromptEvidenceMustRemainVisible/);
+    assert.match(prompt, /alertmanager-alert-omission-v1/);
+    assert.doesNotMatch(prompt, /"group_label_63"/);
   });
 
   it("delivers and consumes a complete maximum escape-heavy steering entry", async (t) => {
