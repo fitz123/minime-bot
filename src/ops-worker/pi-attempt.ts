@@ -23,7 +23,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
   assemblePiContext,
@@ -1204,7 +1204,7 @@ export class OpsWorkerPiAttemptRunner {
     };
     } finally {
       operatorInterruptMonitor?.close();
-      if (resultFilePath !== undefined) safeUnlink(resultFilePath);
+      if (resultFilePath !== undefined) discardOpsWorkerAgentResultPath(resultFilePath);
       const currentTask = this.supervisor.getTask(task.id);
       if (
         ownsLaunch
@@ -2215,7 +2215,7 @@ function createOpsWorkerAgentResultFile(
       closeSync(descriptor);
     }
   } catch (error) {
-    safeUnlink(path);
+    discardOpsWorkerAgentResultPath(path);
     throw error;
   }
   return path;
@@ -2224,7 +2224,7 @@ function createOpsWorkerAgentResultFile(
 export function cleanupOpsWorkerAgentResultFiles(sessionDirectory: string): void {
   for (const name of readdirSync(sessionDirectory)) {
     if (/^agent-result-[a-f0-9]{32}\.json$/.test(name)) {
-      safeUnlink(join(sessionDirectory, name));
+      discardOpsWorkerAgentResultPath(join(sessionDirectory, name));
     }
   }
 }
@@ -2845,6 +2845,26 @@ function ensureOwnedDirectory(path: string): void {
 function safeUnlink(path: string): void {
   try {
     unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function discardOpsWorkerAgentResultPath(path: string): void {
+  try {
+    unlinkSync(path);
+    return;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    if (code !== "EISDIR" && code !== "EPERM") throw error;
+  }
+  // A same-UID child can replace its reserved file with a directory. Move that
+  // object out of the reserved namespace in one operation so the bounded
+  // protocol-failure path and future attempts cannot be wedged by recursive IO.
+  const quarantine = join(dirname(path), `.invalid-agent-result-${randomUUID()}`);
+  try {
+    renameSync(path, quarantine);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

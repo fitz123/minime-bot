@@ -286,6 +286,13 @@ switch (scenario) {
     symlinkSync(target, resultFile);
     break;
   }
+  case "agent-result-directory": {
+    await emitProviderResponse(200, {});
+    const resultFile = process.env.OPS_WORKER_RESULT_FILE;
+    unlinkSync(resultFile);
+    mkdirSync(resultFile);
+    break;
+  }
   case "agent-result-invalid-telemetry":
     await emitProviderResponse(200, {});
     writeFileSync(process.env.CODEX_QUOTA_ATTEMPT_FILE, "{not-json", "utf8");

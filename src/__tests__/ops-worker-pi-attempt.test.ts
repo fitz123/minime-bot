@@ -1240,6 +1240,7 @@ describe("ops worker Pi standard-session attempts", () => {
       "agent-result-id-mismatch",
       "agent-result-oversized",
       "agent-result-symlink",
+      "agent-result-directory",
     ]) {
       const task = makeTask(`typed-${scenario}`, {
         sourceKind: "alertmanager",
@@ -1285,14 +1286,14 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.equal(result.custody.status, "HELD");
   });
 
-  it("converges five missing typed results to one reported BLOCKED task", async (t) => {
+  it("converges five directory-substituted typed results to one reported BLOCKED task", async (t) => {
     const harness = await makeHarness(t);
     const task = makeTask("typed-five-protocol-failures", {
       sourceKind: "alertmanager",
       template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
     });
     harness.store.create(task);
-    harness.setScenario("agent-result-missing");
+    harness.setScenario("agent-result-directory");
 
     let result: OpsWorkerTask = task;
     for (let attempt = 1; attempt <= 5; attempt += 1) {

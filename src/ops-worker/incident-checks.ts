@@ -22,7 +22,6 @@ export const OPS_INCIDENT_CHECK_LIMITS = Object.freeze({
   stabilityWindowMs: 5 * 60_000,
   recheckMs: 60_000,
   maxResponseBytes: 2 * 1024 * 1024,
-  maxAlertCount: 1_024,
   maxAlertFields: 24,
   maxAlertLabels: 64,
   maxLabelBytes: 2 * 1024,
@@ -806,7 +805,6 @@ class OpsIncidentAlertmanagerHttpReader implements OpsIncidentAlertmanagerReader
     if (
       !Array.isArray(raw)
       || Object.getPrototypeOf(raw) !== Array.prototype
-      || raw.length > OPS_INCIDENT_CHECK_LIMITS.maxAlertCount
     ) throw new Error("Alertmanager returned an invalid bounded alerts result");
     for (const item of raw) {
       if (

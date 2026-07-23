@@ -664,7 +664,7 @@ describe("bounded generic monitoring readers", () => {
     );
   });
 
-  it("aggregates global Prometheus freshness and accepts the full intake alert bound", async () => {
+  it("aggregates global Prometheus freshness and accepts source cardinality above the intake bound", async () => {
     const now = Date.now();
     const urls: URL[] = [];
     const readers = createOpsMonitoringReaders(
@@ -675,7 +675,7 @@ describe("bounded generic monitoring readers", () => {
         urls.push(url);
         if (url.port === "9093") {
           return jsonResponse(Array.from(
-            { length: OPS_INCIDENT_CHECK_LIMITS.maxAlertCount },
+            { length: 1_025 },
             (_, index) => ({
               labels: { alertname: `BoundedAlert${index}` },
               status: { state: "active" },
@@ -785,14 +785,6 @@ describe("bounded generic monitoring readers", () => {
         name: "malformed JSON",
         response: new Response("{", { headers: { "content-type": "application/json" } }),
         reader: "prometheus",
-      },
-      {
-        name: "excessive Alertmanager cardinality",
-        response: jsonResponse(Array.from(
-          { length: OPS_INCIDENT_CHECK_LIMITS.maxAlertCount + 1 },
-          () => ({ labels: {}, status: { state: "active" } }),
-        )),
-        reader: "alertmanager",
       },
       {
         name: "invalid Alertmanager labels",

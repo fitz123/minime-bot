@@ -611,7 +611,7 @@ describe("Alertmanager webhook", () => {
           [{
             labels: { alertname: "ExactActive", severity: "warning", instance: "local" },
             status: { state: "active" },
-            startsAt: "2026-07-22T00:00:00Z",
+            startsAt: "2026-07-22T00:00:00.000Z",
             fingerprint: "exact-active",
           }],
         )]));
@@ -737,7 +737,7 @@ describe("Alertmanager webhook", () => {
       if (request.method === "GET") {
         response.end(JSON.stringify([alertmanagerApiGroup(
           {},
-          Array.from({ length: 64 }, (_, index) => ({
+          Array.from({ length: 1_025 }, (_, index) => ({
             labels: {
               alertname: `UngroupedLarge${index}`,
               severity: "warning",

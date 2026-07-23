@@ -16,6 +16,7 @@ import time
 import urllib.parse
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -36,7 +37,7 @@ from monitoring_native import (
 
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 32
-MAX_ACTIVE_ALERTS = 1024
+MAX_INTAKE_ALERTS = 1024
 MAX_ALERT_FIELDS = 32
 MAX_LABELS = 64
 MAX_LABEL_BYTES = 2 * 1024
@@ -48,6 +49,10 @@ BRIDGE_TIMEOUT_ENV = "MINIME_BRIDGE_TIMEOUT"
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
 _LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RE2_META_CHARACTERS = frozenset(r"\.+*?()|[]{}^$")
+_RFC3339_TIMESTAMP = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<clock>\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d{1,9})?(?P<zone>Z|[+-]\d{2}:\d{2})$"
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +70,7 @@ class ParsedAlertmanagerBatch:
 @dataclass(frozen=True)
 class AlertmanagerMemberIdentity:
     labels: tuple[tuple[str, str], ...]
-    starts_at: str
+    starts_at: int
     fingerprint: str | None
 
 
@@ -111,6 +116,34 @@ def _decode_alertmanager_payload(body: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("alerts"), list):
         raise ValueError("malformed Alertmanager payload")
     return payload
+
+
+def _rfc3339_nanos(value: Any) -> int:
+    """Parse one strict RFC3339 timestamp into a representation-independent instant."""
+    encoded = _bounded_string(value, limit=128, allow_empty=False)
+    match = _RFC3339_TIMESTAMP.fullmatch(encoded)
+    if match is None:
+        raise ValueError("invalid RFC3339 timestamp")
+    try:
+        local = datetime.strptime(
+            f"{match.group('date')}T{match.group('clock')}",
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        zone = match.group("zone")
+        offset_minutes = 0
+        if zone != "Z":
+            hours = int(zone[1:3])
+            minutes = int(zone[4:6])
+            if hours > 23 or minutes > 59:
+                raise ValueError("invalid RFC3339 offset")
+            offset_minutes = (hours * 60 + minutes) * (1 if zone[0] == "+" else -1)
+        utc = local - timedelta(minutes=offset_minutes)
+    except (OverflowError, ValueError):
+        raise ValueError("invalid RFC3339 timestamp") from None
+    fraction = (match.group("fraction") or ".")[1:].ljust(9, "0")
+    epoch = datetime(1970, 1, 1)
+    delta = utc - epoch
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + int(fraction or "0")
 
 
 def _native_payload_fields(payload: dict[str, Any]) -> tuple[str, str]:
@@ -214,7 +247,7 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         payload.get("version") != "4"
         or payload.get("status") not in {"firing", "resolved"}
         or not isinstance(alerts, list)
-        or not 1 <= len(alerts) <= MAX_ACTIVE_ALERTS
+        or not 1 <= len(alerts) <= MAX_INTAKE_ALERTS
     ):
         raise ValueError("invalid bridge payload")
     _bounded_string(
@@ -250,11 +283,7 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
             max_entries=MAX_LABELS,
             max_value_bytes=MAX_LABEL_BYTES,
         )
-        starts_at = _bounded_string(
-            alert.get("startsAt"),
-            limit=128,
-            allow_empty=False,
-        )
+        starts_at = _rfc3339_nanos(alert.get("startsAt"))
         raw_fingerprint = alert.get("fingerprint")
         fingerprint = (
             None
@@ -282,7 +311,7 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     ):
         raise ValueError("bridge batch status is inconsistent")
     decision_members_by_identity: dict[
-        tuple[str, tuple[tuple[str, str], ...], str],
+        tuple[str, tuple[tuple[str, str], ...], int],
         tuple[str, AlertmanagerMemberIdentity],
     ] = {}
     for status, member in members:
@@ -398,10 +427,10 @@ def alertmanager_has_exact_group(
         groups = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise DeliveryError("Alertmanager source verification failed") from None
-    if not isinstance(groups, list) or len(groups) > MAX_ACTIVE_ALERTS:
+    if not isinstance(groups, list):
         raise DeliveryError("Alertmanager source verification failed")
     current_group_members: dict[
-        tuple[tuple[tuple[str, str], ...], str],
+        tuple[tuple[tuple[str, str], ...], int],
         set[str | None],
     ] = {}
     for group in groups:
@@ -426,7 +455,7 @@ def alertmanager_has_exact_group(
         if labels != group_labels or receiver_name != receiver:
             continue
         alerts = group.get("alerts")
-        if not isinstance(alerts, list) or len(alerts) > MAX_ACTIVE_ALERTS:
+        if not isinstance(alerts, list):
             raise DeliveryError("Alertmanager source verification failed")
         for alert in alerts:
             if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
@@ -437,11 +466,7 @@ def alertmanager_has_exact_group(
                     max_entries=MAX_LABELS,
                     max_value_bytes=MAX_LABEL_BYTES,
                 )
-                starts_at = _bounded_string(
-                    alert.get("startsAt"),
-                    limit=128,
-                    allow_empty=False,
-                )
+                starts_at = _rfc3339_nanos(alert.get("startsAt"))
                 raw_fingerprint = alert.get("fingerprint")
                 fingerprint = (
                     None

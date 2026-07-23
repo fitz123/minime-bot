@@ -13,6 +13,7 @@ describe("ops worker result reporting", () => {
     const opaqueCanary = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef";
     const paddedOpaqueCanary = "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234=";
     const slashOpaqueCanary = "/ABCDEFGHIJKLMNOPQRSTUVWXYZ01234";
+    const punctuatedOpaqueCanary = "abcdefghijklmnopqrst.uvwxyz:ABCDEFGHIJKLMN";
     const redact = createOpsWorkerFieldRedactor([configuredCanary]);
     const raw = [
       configuredCanary,
@@ -26,6 +27,7 @@ describe("ops worker result reporting", () => {
       opaqueCanary,
       paddedOpaqueCanary,
       slashOpaqueCanary,
+      punctuatedOpaqueCanary,
       "line-one\nline-two\u0000tail",
     ].join(" | ");
 
@@ -45,6 +47,7 @@ describe("ops worker result reporting", () => {
       opaqueCanary,
       paddedOpaqueCanary,
       slashOpaqueCanary,
+      punctuatedOpaqueCanary,
     ]) {
       assert.equal(result.includes(secret), false, secret);
     }

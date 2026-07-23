@@ -54,7 +54,7 @@ export function createOpsWorkerFieldRedactor(
       .replace(/\b(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, `$1${REDACTED}`)
       .replace(/\b((?:access[_-]?token|api[_-]?key|authorization|credential|password|passwd|secret|token)\s*[:=]\s*)(?:\\[^\r\n]|[^\s,;])+/gi, `$1${REDACTED}`)
       .replace(/\/(?:Users|home)\/[^/\s]+(?:\/[^\s]*)?/g, "[REDACTED_HOME_PATH]")
-      .replace(/(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])/g, REDACTED)
+      .replace(/(?<![A-Za-z0-9._~+/:-])(?=[A-Za-z0-9._~+/=:-]{32,}(?![A-Za-z0-9._~+/=:-]))[A-Za-z0-9._~+/:-]+={0,2}(?![A-Za-z0-9._~+/=:-])/g, REDACTED)
       .replace(/[ \t]+/g, " ")
       .trim();
     return truncateUtf8(result, maxBytes);
