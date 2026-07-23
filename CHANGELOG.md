@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.7.27
+
 - Route every Alertmanager firing group through one generic Ops incident with
   schema-v6 typed agent results, deterministic fresh absence and five-minute
   stability verification, bounded redacted reports, and unchanged approval
