@@ -1,7 +1,19 @@
+import { homedir } from "node:os";
 import type { OpsWorkerTask } from "./types.js";
 
 const TRUNCATION_MARKER = "… [truncated]";
 const REDACTED = "[REDACTED]";
+const SENSITIVE_KEY =
+  String.raw`(?:[a-z0-9]+[._-])*(?:auth(?:orization)?|credential|password|passwd|secret|signature|token|key)`;
+const URL_SECRET_PATTERN = new RegExp(`([?&]${SENSITIVE_KEY}=)[^&#\\s]*`, "gi");
+const QUOTED_SECRET_PATTERN = new RegExp(
+  String.raw`\b((${SENSITIVE_KEY})\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')`,
+  "gi",
+);
+const ASSIGNED_SECRET_PATTERN = new RegExp(
+  String.raw`\b((${SENSITIVE_KEY})\s*[:=]\s*)(?:\\[^\r\n]|[^\s,;])+`,
+  "gi",
+);
 
 export const OPS_WORKER_REPORT_FIELD_LIMITS = Object.freeze({
   sourceIdentityBytes: 512,
@@ -37,23 +49,38 @@ function replaceExact(value: string, sensitive: readonly string[]): string {
   return redacted;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Shared sanitizer for every agent-authored field before it enters a report. */
 export function createOpsWorkerFieldRedactor(
   configuredSensitiveValues: readonly string[] = [],
 ): OpsWorkerFieldRedactor {
   const sensitive = [...new Set(configuredSensitiveValues.filter((value) => value.length > 0))]
     .sort((left, right) => right.length - left.length);
+  const homeDirectory = homedir();
+  const homePathPattern = homeDirectory.length > 1
+    ? new RegExp(
+        `${escapeRegExp(homeDirectory)}(?=$|[\\\\/\\s])(?:[\\\\/][^\\s]*)?`,
+        process.platform === "win32" ? "gi" : "g",
+      )
+    : null;
   return (value, maxBytes) => {
     let result = replaceExact(value, sensitive);
     result = result
       .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
       .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`)
-      .replace(/([?&](?:access[_-]?token|api[_-]?key|auth|authorization|credential|password|secret|signature|token)=)[^&#\s]*/gi, `$1${REDACTED}`)
-      .replace(/\b((?:access[_-]?token|api[_-]?key|authorization|credential|password|passwd|secret|token)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/gi, `$1${REDACTED}`)
+      .replace(URL_SECRET_PATTERN, `$1${REDACTED}`)
+      .replace(QUOTED_SECRET_PATTERN, `$1${REDACTED}`)
       .replace(/\b(authorization\s*[:=]\s*)(?:basic|bearer|digest|token)\s+[^\s,;]+/gi, `$1${REDACTED}`)
       .replace(/\b(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, `$1${REDACTED}`)
-      .replace(/\b((?:access[_-]?token|api[_-]?key|authorization|credential|password|passwd|secret|token)\s*[:=]\s*)(?:\\[^\r\n]|[^\s,;])+/gi, `$1${REDACTED}`)
-      .replace(/\/(?:Users|home)\/[^/\s]+(?:\/[^\s]*)?/g, "[REDACTED_HOME_PATH]")
+      .replace(ASSIGNED_SECRET_PATTERN, `$1${REDACTED}`);
+    if (homePathPattern !== null) {
+      result = result.replace(homePathPattern, "[REDACTED_HOME_PATH]");
+    }
+    result = result
+      .replace(/\/(?:Users|home)\/[^/\s]+(?:\/[^\s]*)?|\/root(?:\/[^\s]*)?/g, "[REDACTED_HOME_PATH]")
       .replace(/(?<![A-Za-z0-9._~+/:-])(?=[A-Za-z0-9._~+/=:-]{32,}(?![A-Za-z0-9._~+/=:-]))[A-Za-z0-9._~+/:-]+={0,2}(?![A-Za-z0-9._~+/=:-])/g, REDACTED)
       .replace(/[ \t]+/g, " ")
       .trim();

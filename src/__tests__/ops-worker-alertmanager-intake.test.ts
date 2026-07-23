@@ -3,6 +3,7 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, type TestContext } from "node:test";
+import type { OpsWorkerAuthorizationVerifier } from "../ops-worker/authorization.js";
 import {
   OPS_ALERTMANAGER_INTAKE_LIMITS,
   OpsWorkerAlertmanagerIntake,
@@ -294,9 +295,38 @@ describe("strict bounded Alertmanager v4 intake parsing", () => {
       "INVALID_PAYLOAD",
     );
   });
+
+  it("canonicalizes offsets without discarding sub-millisecond timestamp precision", () => {
+    const precise = parseOpsAlertmanagerWebhook(body(webhook({
+      alerts: [alert("2026-07-19T09:59:00.123000001Z")],
+    })), CONTENT_TYPE);
+    const offset = parseOpsAlertmanagerWebhook(body(webhook({
+      alerts: [alert("2026-07-19T10:59:00.123000001+01:00")],
+    })), CONTENT_TYPE);
+
+    assert.equal(precise.alerts[0].startsAt, "2026-07-19T09:59:00.123000001Z");
+    assert.equal(offset.alerts[0].startsAt, precise.alerts[0].startsAt);
+  });
 });
 
 describe("Alertmanager conversion and task-store submission", () => {
+  it("keeps distinct sub-millisecond episode starts in distinct delivery identities", (t) => {
+    const first = fixture(t);
+    const second = fixture(t);
+    const firstResult = first.intake.submit(body(webhook({
+      alerts: [alert("2026-07-19T09:59:00.123000001Z")],
+    })), CONTENT_TYPE);
+    const secondResult = second.intake.submit(body(webhook({
+      alerts: [alert("2026-07-19T09:59:00.123999999Z")],
+    })), CONTENT_TYPE);
+
+    assert.notEqual(firstResult.taskId, secondResult.taskId);
+    assert.notEqual(
+      first.store.get(firstResult.taskId ?? "")?.source.deliveryKey,
+      second.store.get(secondResult.taskId ?? "")?.source.deliveryKey,
+    );
+  });
+
   it("canonicalizes distinct Unicode label names independently of JSON key order", (t) => {
     const { intake, store } = fixture(t);
     const firstLabels = Object.fromEntries([
@@ -708,6 +738,90 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
     assert.equal(intake.submit(body(evolving), CONTENT_TYPE).replayed, true);
+  });
+
+  it("retries the latest report after evolving evidence supersedes an unclaimed receipt", async (t) => {
+    let current = new Date(NOW);
+    const now = () => new Date(current);
+    const { intake, store, taskContracts } = fixture(t, now, "PRESENT");
+    const baseVerifier = taskContracts.authorizationVerifiers.alertmanager;
+    assert.ok(baseVerifier);
+    let delayNextVerification = false;
+    let enteredVerification: (() => void) | undefined;
+    let releaseVerification: (() => void) | undefined;
+    const verificationEntered = new Promise<void>((resolve) => {
+      enteredVerification = resolve;
+    });
+    const verificationRelease = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+    const delayedVerifier: OpsWorkerAuthorizationVerifier = {
+      identity: baseVerifier.identity,
+      version: baseVerifier.version,
+      verify: async (task) => {
+        const result = await baseVerifier.verify(task);
+        if (delayNextVerification) {
+          delayNextVerification = false;
+          enteredVerification?.();
+          await verificationRelease;
+        }
+        return result;
+      },
+    };
+    const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    const taskId = first.taskId ?? "";
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: {
+        ...taskContracts.authorizationVerifiers,
+        alertmanager: delayedVerifier,
+      },
+      instanceId: "evolving-query-only-report",
+      processStartToken: "evolving-query-only-report-start",
+      now,
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+    for (let claim = 0; claim < 5; claim += 1) {
+      await supervisor.requestDoneCheck(taskId);
+      await supervisor.runDoneCheck(taskId);
+      current = new Date(current.getTime() + 1_000);
+    }
+    assert.equal(store.get(taskId)?.state, "BLOCKED");
+
+    let sends = 0;
+    delayNextVerification = true;
+    const pending = supervisor.recordReportAttempt(taskId, async () => {
+      sends += 1;
+      return { sent: true };
+    });
+    await verificationEntered;
+    const evolving = webhook({
+      alerts: [{
+        ...alert(),
+        annotations: { summary: "The pending report gained current evidence." },
+      }],
+    });
+    assert.equal(intake.submit(body(evolving), CONTENT_TYPE).replayed, true);
+    releaseVerification?.();
+
+    const superseded = await pending;
+    assert.equal(sends, 0);
+    assert.equal(superseded.report.state, "PENDING");
+    assert.equal(superseded.mutationReceipts.report?.outcome?.result, "NOT_NEEDED");
+
+    const sent = await supervisor.recordReportAttempt(taskId, async (prepared) => {
+      sends += 1;
+      assert.equal(
+        prepared.evidence.some((entry) =>
+          entry.summary.includes("The pending report gained current evidence.")),
+        true,
+      );
+      return { sent: true };
+    });
+    assert.equal(sends, 1);
+    assert.equal(sent.report.state, "SENT");
   });
 
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {

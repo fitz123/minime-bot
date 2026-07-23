@@ -187,7 +187,7 @@ Historical validation evidence (2026-07-22): clean `npm ci`; full `npm test`; li
 build; 285-file package dry-run; schema-guard; built CLI help; minimal-workspace;
 configured gitleaks branch scan; tracked-path, public PII, noreply author/committer,
 inactivity, diffstat, and `git diff --check` gates all passed at `f7c34fc`.
-Current review-fix validation (2026-07-23): clean `npm ci`; the 2,291-test full
+Current review-fix validation (2026-07-23): clean `npm ci`; the 2,295-test full
 suite; lint/typecheck; build; 285-file package dry-run; schema-guard; built CLI
 help; minimal-workspace; and `git diff --check` all passed. The clean current-head
 review verdict remains pending because this iteration found and fixed issues and

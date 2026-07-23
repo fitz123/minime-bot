@@ -2902,6 +2902,36 @@ describe("ops worker supervisor", () => {
     assert.equal(cancelled?.custody.status, "RELEASED");
   });
 
+  it("clears a typed result when an idle interrupt completes cancellation", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-cancel-typed-result", { sourceKind: "alertmanager" });
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const blocked = harness.supervisor.recordPiAgentResult(task.id, {
+      attemptId: "attempt-01",
+      kind: "input-needed",
+      summary: "The agent needs an operator answer.",
+      actions: [],
+      requestedInput: "Provide the missing information.",
+      reason: "information",
+    });
+    assert.equal(blocked.agentResult?.kind, "input-needed");
+
+    const cancelled = harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Operator cancelled instead of supplying the requested input.",
+    );
+
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.agentResult, null);
+    assert.equal(
+      cancelled.lastOutcome?.summary,
+      "Operator cancelled instead of supplying the requested input.",
+    );
+    assert.equal(cancelled.report.state, "PENDING");
+  });
+
   it("keeps public interrupt resolution fenced until the supervisor proves the group stopped", async (t) => {
     let resolution: OpsWorkerStartupRunResult = {
       status: "AMBIGUOUS",

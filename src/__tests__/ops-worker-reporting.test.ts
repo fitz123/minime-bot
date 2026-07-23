@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
 import { describe, it } from "node:test";
 import {
   buildOpsWorkerTelegramReport,
@@ -23,7 +24,11 @@ describe("ops worker result reporting", () => {
       "passwd=escaped-canary\\ continuation-canary",
       "Authorization: Basic dXNlcjpwYXNz",
       "https://private-user:private-password@example.invalid/path?token=query-canary",
+      "client_secret=short-client-secret-canary",
+      "https://example.invalid/callback?oauth.client-secret=query-client-secret-canary",
       "/Users/private-user/control/workspace/file.txt",
+      "/root/private/control.yaml",
+      `${homedir()}/private/control.yaml`,
       opaqueCanary,
       paddedOpaqueCanary,
       slashOpaqueCanary,
@@ -44,6 +49,10 @@ describe("ops worker result reporting", () => {
       "private-user",
       "private-password",
       "query-canary",
+      "short-client-secret-canary",
+      "query-client-secret-canary",
+      "/root/private/control.yaml",
+      `${homedir()}/private/control.yaml`,
       opaqueCanary,
       paddedOpaqueCanary,
       slashOpaqueCanary,

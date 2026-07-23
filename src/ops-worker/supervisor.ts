@@ -905,6 +905,7 @@ export class OpsWorkerSupervisor {
         ),
       };
       task.verification = null;
+      if (interrupt.mode === "cancel") task.agentResult = null;
       this.supersedeReportEpisode(
         task,
         at,
@@ -2827,6 +2828,18 @@ export class OpsWorkerSupervisor {
     });
     if (!authorization.authorized) return authorization.task;
     if (!claimed) {
+      const latestReceipt = authorization.task.mutationReceipts.report;
+      if (
+        authorization.task.report.state !== "PENDING"
+        || (
+          latestReceipt?.operationId === operation.operationId
+          && latestReceipt.intentHash === reportIntentHash
+          && latestReceipt.mutationStartedAt === null
+          && latestReceipt.outcome?.result === "NOT_NEEDED"
+          && hashOpsWorkerReportPayload(authorization.task)
+            !== hashOpsWorkerReportPayload(reportTask)
+        )
+      ) return authorization.task;
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
       );

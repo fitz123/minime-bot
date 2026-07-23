@@ -200,7 +200,8 @@ function expectTimestamp(value: unknown, path: string): string {
   const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  const parsed = Date.parse(timestamp);
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${match[8]}`;
+  const parsed = Date.parse(wholeSecond);
   if (
     month < 1
     || month > 12
@@ -213,7 +214,15 @@ function expectTimestamp(value: unknown, path: string): string {
     || offsetMinute > 59
     || !Number.isFinite(parsed)
   ) fail("INVALID_PAYLOAD", `${path} must be a valid RFC3339 timestamp`);
-  return new Date(parsed).toISOString();
+  const utcSecond = new Date(parsed).toISOString();
+  const fractionalNanoseconds = (match[7] ?? "").padEnd(9, "0");
+  const significantFraction = fractionalNanoseconds.replace(/0+$/, "");
+  if (significantFraction.length === 0) return utcSecond;
+  const canonicalFraction = significantFraction.padEnd(
+    Math.max(3, significantFraction.length),
+    "0",
+  );
+  return utcSecond.replace(".000Z", `.${canonicalFraction}Z`);
 }
 
 function expectStringMap(
