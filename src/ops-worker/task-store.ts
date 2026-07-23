@@ -946,13 +946,16 @@ export class OpsWorkerTaskStore {
           `Refusing to replace existing task ${task.id} through create`,
         );
       }
+      this.refreshAcceptedFiringObservation(task, task, true);
+      compactOpsWorkerEvidenceForSnapshot(task);
+      const persisted = parseOpsWorkerTask(task, this.registry);
       this.assertJournalSafe();
-      this.assertGlobalInvariants([...currentTasks, task]);
+      this.assertGlobalInvariants([...currentTasks, persisted]);
       this.injectFault("after-correlation-check");
       return {
-        task,
+        task: persisted,
         created: true,
-        ...this.write(task, snapshotPath, audit),
+        ...this.write(persisted, snapshotPath, audit),
       };
     });
   }
@@ -1217,11 +1220,12 @@ export class OpsWorkerTaskStore {
   private refreshAcceptedFiringObservation(
     task: OpsWorkerTask,
     submission: Readonly<OpsWorkerTask>,
+    initial = false,
   ): string {
     const observedAt = new Date(Math.max(
       this.now().getTime(),
       Date.parse(submission.createdAt),
-      Date.parse(task.updatedAt) + 1,
+      Date.parse(task.updatedAt) + (initial ? 0 : 1),
     )).toISOString();
     task.evidence = task.evidence.filter((entry) =>
       parseFiringObservation(entry) === undefined);

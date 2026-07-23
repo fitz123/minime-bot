@@ -493,7 +493,9 @@ function boundedAlertEvidence(
   upstreamOmittedAlerts: number,
   at: string,
 ): OpsWorkerEvidence[] {
-  const directCapacity = OPS_WORKER_LIMITS.maxEvidenceEntries - 1;
+  // Reserve one entry for the group descriptor and one for the store-owned
+  // accepted-firing observation added when the task is persisted.
+  const directCapacity = OPS_WORKER_LIMITS.maxEvidenceEntries - 2;
   if (upstreamOmittedAlerts === 0 && firingAlerts.length <= directCapacity) {
     return firingAlerts.map((entry) => alertEvidence(entry, at));
   }

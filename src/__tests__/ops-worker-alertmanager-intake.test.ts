@@ -46,6 +46,7 @@ const CONTENT_TYPE = "application/json; charset=utf-8";
 function contracts(
   now: () => Date = () => new Date(NOW),
   incidentStatus: "PRESENT" | "ABSENT" = "ABSENT",
+  latestMatchingSampleAt: string | null = null,
 ) {
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: {
@@ -67,7 +68,7 @@ function contracts(
         const observedAt = now().toISOString();
         return {
           observedAt,
-          latestMatchingSampleAt: null,
+          latestMatchingSampleAt,
           monitoringWindowStartedAt: new Date(
             Date.parse(observedAt) - 5 * 60_000,
           ).toISOString(),
@@ -103,10 +104,11 @@ function fixture(
   t: TestContext,
   now: () => Date = () => new Date(NOW),
   incidentStatus: "PRESENT" | "ABSENT" = "ABSENT",
+  latestMatchingSampleAt: string | null = null,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "minime-alertmanager-intake-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const taskContracts = contracts(now, incidentStatus);
+  const taskContracts = contracts(now, incidentStatus, latestMatchingSampleAt);
   const store = new OpsWorkerTaskStore(directory, {
     registry: taskContracts.taskRegistry,
     now,
@@ -340,10 +342,16 @@ describe("Alertmanager conversion and task-store submission", () => {
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
       }), alertname);
       assert.ok(task.evidence.length > 0, alertname);
-      assert.ok(task.evidence.every((entry) =>
+      const alertEvidence = task.evidence.filter((entry) => entry.kind === "alert");
+      assert.ok(alertEvidence.length > 0, alertname);
+      assert.ok(alertEvidence.every((entry) =>
         entry.kind === "alert"
         && entry.trust === "untrusted"
         && Buffer.byteLength(entry.summary, "utf8") <= 4 * 1024), alertname);
+      assert.equal(task.evidence.filter((entry) =>
+        entry.kind === "system"
+        && entry.trust === "trusted"
+        && entry.summary.includes("alertmanager-firing-observation-v1")).length, 1);
     }
   });
 
@@ -365,10 +373,14 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.ok(task);
     assert.equal(task.evidence.length, 64);
     assert.match(task.evidence[0].summary, /"groupLabels":\{\}/);
-    assert.match(task.evidence.at(-1)?.summary ?? "", /"omittedAlerts":2/);
-    assert.match(task.evidence.at(-1)?.summary ?? "", /"locallyOmittedFiringAlerts":2/);
-    assert.match(task.evidence.at(-1)?.summary ?? "", /"upstreamOmittedAlerts":0/);
-    assert.match(task.evidence.at(-1)?.summary ?? "", /"deliveredFiringAlerts":64/);
+    const omission = task.evidence.find((entry) =>
+      entry.summary.includes("alertmanager-alert-omission-v1"));
+    assert.ok(omission);
+    assert.match(omission.summary, /"includedAlerts":61/);
+    assert.match(omission.summary, /"omittedAlerts":3/);
+    assert.match(omission.summary, /"locallyOmittedFiringAlerts":3/);
+    assert.match(omission.summary, /"upstreamOmittedAlerts":0/);
+    assert.match(omission.summary, /"deliveredFiringAlerts":64/);
   });
 
   it("persists an exact group descriptor larger than the ordinary evidence bound", (t) => {
@@ -517,11 +529,18 @@ describe("Alertmanager conversion and task-store submission", () => {
     );
   });
 
-  it("starts a new durable absence window after an accepted refire", async (t) => {
+  it("starts a new durable absence window after initial delivery and an accepted refire", async (t) => {
     let current = new Date(NOW);
     const now = () => new Date(current);
-    const { intake, store, taskContracts } = fixture(t, now);
+    const { intake, store, taskContracts } = fixture(
+      t,
+      now,
+      "ABSENT",
+      "2026-07-19T09:56:00.000Z",
+    );
     const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    assert.equal(store.get(first.taskId ?? "")?.evidence.filter((entry) =>
+      entry.summary.includes("alertmanager-firing-observation-v1")).length, 1);
     const supervisor = new OpsWorkerSupervisor({
       store,
       doneChecks: taskContracts.doneChecks,

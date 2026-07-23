@@ -256,6 +256,42 @@ function previousAbsenceWindowReadyAt(
   return Date.parse(stability.nextCheckAt);
 }
 
+function latestAcceptedFiringObservedAt(
+  context: OpsWorkerDoneCheckContext,
+): number | null {
+  if (
+    context.sourceKind !== "alertmanager"
+    || context.sourceCorrelationKey === undefined
+    || !Array.isArray(context.sourceEvidence)
+  ) return null;
+  let latest: number | null = null;
+  for (const evidence of context.sourceEvidence) {
+    if (
+      evidence.kind !== "system"
+      || evidence.trust !== "trusted"
+      || !validTimestamp(evidence.at)
+    ) continue;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(evidence.summary) as unknown;
+    } catch {
+      continue;
+    }
+    if (
+      !isPlainObject(decoded)
+      || !hasExactDataKeys(
+        decoded,
+        ["type", "correlationKey", "deliveryKey"],
+      )
+      || decoded.type !== "alertmanager-firing-observation-v1"
+      || decoded.correlationKey !== context.sourceCorrelationKey
+      || typeof decoded.deliveryKey !== "string"
+    ) continue;
+    latest = Math.max(latest ?? Number.NEGATIVE_INFINITY, Date.parse(evidence.at));
+  }
+  return latest;
+}
+
 function validateParams(value: unknown): JsonObject {
   if (!isPlainObject(value) || !hasExactDataKeys(value, [])) {
     throw new TypeError("Alertmanager incident parameters must be an empty object");
@@ -414,16 +450,22 @@ export function createOpsIncidentDoneCheckDefinition(
             );
           }
           const priorAbsenceReadyAt = previousAbsenceWindowReadyAt(context);
+          const latestFiringObservedAt = latestAcceptedFiringObservedAt(context);
           const readyAt = Math.max(
             reading.monitoringWindowStartedAt === null
               ? Date.parse(scheduledAt(observedAt))
               : Date.parse(reading.monitoringWindowStartedAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
             reading.latestMatchingSampleAt === null
-              ? priorAbsenceReadyAt
-                ?? Date.parse(observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
+              ? Number.NEGATIVE_INFINITY
               : Date.parse(reading.latestMatchingSampleAt)
                 + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
+            latestFiringObservedAt === null
+              ? reading.latestMatchingSampleAt === null
+                ? priorAbsenceReadyAt
+                  ?? Date.parse(observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs
+                : Number.NEGATIVE_INFINITY
+              : latestFiringObservedAt + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
           );
           if (
             reading.monitoringWindowStartedAt === null
