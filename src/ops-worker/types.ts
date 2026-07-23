@@ -587,14 +587,29 @@ export function hashOpsWorkerPiLaunchSubject(task: OpsWorkerTask): string {
 export function hashOpsWorkerReportPayload(
   task: Pick<
     OpsWorkerTask,
-    "state" | "lastOutcome" | "agentResult" | "verification"
+    | "id"
+    | "source"
+    | "evidence"
+    | "state"
+    | "lastOutcome"
+    | "agentResult"
+    | "verification"
+    | "updatedAt"
   >,
 ): string {
   const canonical = stableJson({
+    taskId: task.id,
+    source: task.source,
+    alertEvidence: task.source.kind === "alertmanager"
+      ? task.evidence
+          .filter((entry) => entry.kind === "alert")
+          .map((entry) => entry.summary)
+      : [],
     taskState: task.state,
     lastOutcome: task.lastOutcome,
     agentResult: task.agentResult,
     verification: task.verification,
+    checkedAt: task.verification?.checkedAt ?? task.lastOutcome?.at ?? task.updatedAt,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -2773,7 +2788,7 @@ export function parseOpsWorkerAgentResult(
   return parseAgentResultAt(value, "agentResult", expectedAttemptId);
 }
 
-/** Stable identity for the exact bounded agent result used by receipts and tests. */
+/** Stable identity for the exact bounded agent result contract. */
 export function hashOpsWorkerAgentResult(result: OpsWorkerAgentResult): string {
   const parsed = parseOpsWorkerAgentResult(result, result.attemptId);
   return `sha256:${createHash("sha256").update(stableJson(parsed)).digest("hex")}`;

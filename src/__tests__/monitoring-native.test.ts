@@ -765,6 +765,57 @@ describe("Alertmanager webhook", () => {
     }
   });
 
+  it("requires one routed group to contain every delivered firing member", async () => {
+    let opsForwards = 0;
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
+        const member = (instance: string, fingerprint: string) => ({
+          labels: { alertname: "SplitGroup", severity: "warning", instance },
+          status: { state: "active" },
+          startsAt: "2026-07-22T00:00:00Z",
+          fingerprint,
+        });
+        response.end(JSON.stringify([
+          alertmanagerApiGroup({ alertname: "SplitGroup" }, [member("first", "split-first")]),
+          alertmanagerApiGroup({ alertname: "SplitGroup" }, [member("second", "split-second")]),
+        ]));
+        return;
+      }
+      request.resume();
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") opsForwards += 1;
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const payload = alertmanagerPayload({
+        alertname: "SplitGroup",
+        fingerprint: "split-first",
+      });
+      const second = structuredClone(
+        (payload.alerts as Array<Record<string, unknown>>)[0],
+      );
+      second.labels = { alertname: "SplitGroup", severity: "warning", instance: "second" };
+      second.fingerprint = "split-second";
+      (payload.alerts as Array<Record<string, unknown>>)[0].labels = {
+        alertname: "SplitGroup",
+        severity: "warning",
+        instance: "first",
+      };
+      (payload.alerts as Array<Record<string, unknown>>).push(second);
+
+      assert.equal((await postWebhook(port, payload)).status, 200);
+      assert.equal(opsForwards, 0, "members split across groups must not authenticate a batch");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
   it("forwards an ungrouped 64-alert firing batch instead of rejecting the required Ops sink", async () => {
     const opsBodies: string[] = [];
     const synthetic = await startServer((request, response) => {

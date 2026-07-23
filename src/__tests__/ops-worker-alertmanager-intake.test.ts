@@ -274,6 +274,19 @@ describe("strict bounded Alertmanager v4 intake parsing", () => {
       })), CONTENT_TYPE),
       "INVALID_PAYLOAD",
     );
+    for (const startsAt of [
+      "2026-02-29T00:00:00Z",
+      "2026-04-31T00:00:00Z",
+      "2026-07-19T24:00:00Z",
+      "2026-07-19T00:00:00+24:00",
+    ]) {
+      expectIntakeError(
+        () => parseOpsAlertmanagerWebhook(body(webhook({
+          alerts: [{ ...alert(), startsAt }],
+        })), CONTENT_TYPE),
+        "INVALID_PAYLOAD",
+      );
+    }
     expectIntakeError(
       () => parseOpsAlertmanagerWebhook(body(webhook({
         alerts: [{ ...alert(), labels: [] }],
@@ -284,6 +297,28 @@ describe("strict bounded Alertmanager v4 intake parsing", () => {
 });
 
 describe("Alertmanager conversion and task-store submission", () => {
+  it("canonicalizes distinct Unicode label names independently of JSON key order", (t) => {
+    const { intake, store } = fixture(t);
+    const firstLabels = Object.fromEntries([
+      ["alertname", "UnicodeIdentity"],
+      ["é", "composed"],
+      ["e\u0301", "decomposed"],
+    ]);
+    const reversedLabels = Object.fromEntries(Object.entries(firstLabels).reverse());
+    const payload = (labels: Record<string, string>) => webhook({
+      groupLabels: labels,
+      commonLabels: labels,
+      alerts: [{ ...alert(), labels }],
+    });
+
+    const first = intake.submit(body(payload(firstLabels)), CONTENT_TYPE);
+    const replay = intake.submit(body(payload(reversedLabels)), CONTENT_TYPE);
+
+    assert.equal(replay.taskId, first.taskId);
+    assert.equal(replay.replayed, true);
+    assert.equal(store.list().length, 1);
+  });
+
   it("maps every current rule family to the generic incident contract only", (t) => {
     const { intake, store } = fixture(t);
     const ruleFamilies = [
@@ -410,6 +445,42 @@ describe("Alertmanager conversion and task-store submission", () => {
       > 4 * 1024,
     );
     assert.deepEqual(JSON.parse(descriptor).groupLabels, groupLabels);
+  });
+
+  it("keeps oversized alert evidence valid while preserving report identity fields", (t) => {
+    const { intake, store } = fixture(t);
+    const firing = alert();
+    const result = intake.submit(body(webhook({
+      alerts: [{
+        ...firing,
+        annotations: {
+          summary: "x".repeat(OPS_ALERTMANAGER_INTAKE_LIMITS.maxAnnotationValueBytes),
+        },
+      }],
+    })), CONTENT_TYPE);
+    const task = store.get(result.taskId ?? "");
+    const summary = task?.evidence.find((entry) => {
+      if (entry.kind !== "alert") return false;
+      try {
+        const value = JSON.parse(entry.summary) as { type?: unknown };
+        return value.type === "alertmanager-alert-v1";
+      } catch {
+        return false;
+      }
+    })?.summary;
+
+    assert.ok(summary);
+    assert.ok(Buffer.byteLength(summary, "utf8") <= 4 * 1024);
+    const decoded = JSON.parse(summary) as {
+      status: string;
+      startsAt: string;
+      labels: Record<string, string>;
+      omittedAnnotations: number;
+    };
+    assert.equal(decoded.status, "firing");
+    assert.equal(decoded.startsAt, "2026-07-19T09:59:00.000Z");
+    assert.equal(decoded.labels.alertname, "MinimeBotUnavailable");
+    assert.equal(decoded.omittedAnnotations, 1);
   });
 
   it("retains Alertmanager's upstream truncation count even when local evidence fits", (t) => {
@@ -595,22 +666,48 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(blocked?.verification?.outcome, "PRODUCT_FAILURE");
     const proof = structuredClone(blocked?.verification);
 
-    const failed = await supervisor.recordReportAttempt(taskId, async () => ({
-      sent: false,
-      error: "Synthetic ambiguous report failure",
-    }));
+    let firstReportAlerts: string[] = [];
+    const failed = await supervisor.recordReportAttempt(taskId, async (prepared) => {
+      firstReportAlerts = prepared.evidence
+        .filter((entry) => entry.kind === "alert")
+        .map((entry) => entry.summary);
+      return {
+        sent: false,
+        error: "Synthetic ambiguous report failure",
+      };
+    });
     assert.equal(failed.mutationReceipts.report?.outcome, null);
 
     const replay = intake.submit(body(webhook()), CONTENT_TYPE);
     assert.equal(replay.replayed, true);
     assert.deepEqual(store.get(taskId)?.verification, proof);
 
+    const evolving = webhook({
+      alerts: [{
+        ...alert(),
+        annotations: { summary: "The blocked incident gained new evidence." },
+      }],
+    });
+    assert.throws(
+      () => intake.submit(body(evolving), CONTENT_TYPE),
+      /cannot change report evidence while its report delivery is unresolved/,
+    );
+
     const sent = await supervisor.recordReportAttempt(
       taskId,
-      async () => ({ sent: true }),
+      async (prepared) => {
+        assert.deepEqual(
+          prepared.evidence
+            .filter((entry) => entry.kind === "alert")
+            .map((entry) => entry.summary),
+          firstReportAlerts,
+        );
+        return { sent: true };
+      },
     );
     assert.equal(sent.report.state, "SENT");
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+    assert.equal(intake.submit(body(evolving), CONTENT_TYPE).replayed, true);
   });
 
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {

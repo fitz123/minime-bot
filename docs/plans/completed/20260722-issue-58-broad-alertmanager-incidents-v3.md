@@ -181,15 +181,19 @@ custody starvation.
       minimal-workspace, CLI-help, gitleaks, public PII/identity, and branch-diff checks.
 - [x] Confirm no per-alert remediation code, new service, workflow capability, or unrelated change
       entered the diff.
-- [x] Commit a clean current-head review verdict with no unresolved Critical/Major findings.
+- [ ] Commit a clean current-head review verdict with no unresolved Critical/Major findings.
 
-Validation evidence (2026-07-22): clean `npm ci`; full `npm test`; lint/typecheck;
+Historical validation evidence (2026-07-22): clean `npm ci`; full `npm test`; lint/typecheck;
 build; 285-file package dry-run; schema-guard; built CLI help; minimal-workspace;
 configured gitleaks branch scan; tracked-path, public PII, noreply author/committer,
-inactivity, diffstat, and `git diff --check` gates all passed. The current-tree
-review verdict is PASS with no unresolved Critical or Major findings. The diff
-contains no per-alert remediation branch, new service definition, workflow
-capability, startup activation, or unrelated runtime change.
+inactivity, diffstat, and `git diff --check` gates all passed at `f7c34fc`.
+Current review-fix validation (2026-07-23): clean `npm ci`; the 2,291-test full
+suite; lint/typecheck; build; 285-file package dry-run; schema-guard; built CLI
+help; minimal-workspace; and `git diff --check` all passed. The clean current-head
+review verdict remains pending because this iteration found and fixed issues and
+requires a fresh follow-up review. The diff contains no per-alert remediation
+branch, new service definition, workflow capability, startup activation, or
+unrelated runtime change.
 
 ## Acceptance
 

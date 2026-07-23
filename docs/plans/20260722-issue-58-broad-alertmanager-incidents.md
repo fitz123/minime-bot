@@ -1,7 +1,8 @@
 # Issue #58: Broad Generic Alertmanager Incident Handling for Minime Ops (v2, trimmed)
 
 Status: Superseded by
-`20260722-issue-58-broad-alertmanager-incidents-v3.md`. Do not execute or use
+[`completed/20260722-issue-58-broad-alertmanager-incidents-v3.md`](completed/20260722-issue-58-broad-alertmanager-incidents-v3.md).
+Do not execute or use
 the task, acceptance, or delivery details below; they are retained only as
 historical design context.
 

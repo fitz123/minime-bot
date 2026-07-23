@@ -258,7 +258,10 @@ function previousAbsenceWindowReadyAt(
       && latestFiringObservedAt >= Date.parse(absence.observedAt)
     )
   ) return null;
-  return Date.parse(stability.nextCheckAt);
+  return Math.max(
+    Date.parse(stability.nextCheckAt),
+    Date.parse(absence.observedAt) + OPS_INCIDENT_CHECK_LIMITS.stabilityWindowMs,
+  );
 }
 
 function latestAcceptedFiringObservedAt(
@@ -645,7 +648,7 @@ function parsePrometheusSample(value: unknown): { observedAt: string; value: num
 
 function canonicalLabelIdentity(labels: Record<string, string>): string {
   return JSON.stringify(Object.fromEntries(
-    Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(labels).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
   ));
 }
 
@@ -694,7 +697,7 @@ function matcherLabelName(value: string): string {
 
 function alertRangeQuery(groupLabels: Record<string, string>): string {
   const matchers = Object.entries(groupLabels)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
     .map(([key, value]) => `${matcherLabelName(key)}=${promqlString(value)}`);
   matchers.push('alertstate=~"pending|firing"');
   return `(max(timestamp(ALERTS{${matchers.join(",")}})))[5m:5s]`;
@@ -839,7 +842,7 @@ class OpsIncidentAlertmanagerHttpReader implements OpsIncidentAlertmanagerReader
     url.searchParams.set("inhibited", "true");
     url.searchParams.set("unprocessed", "true");
     for (const [key, value] of Object.entries(groupLabels).sort(
-      ([left], [right]) => left.localeCompare(right),
+      ([left], [right]) => left < right ? -1 : left > right ? 1 : 0,
     )) {
       url.searchParams.append(
         "filter",

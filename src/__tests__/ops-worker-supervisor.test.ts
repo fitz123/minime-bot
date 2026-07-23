@@ -23,7 +23,10 @@ import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
 } from "../ops-worker/done-checks.js";
-import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import {
+  OpsWorkerLifecycle,
+  hashOpsWorkerCanonicalPayload,
+} from "../ops-worker/lifecycle.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
   OpsWorkerQuotaAdmissionGate,
@@ -1753,6 +1756,73 @@ describe("ops worker supervisor", () => {
     assert.equal(persisted?.report.state, "SENT");
     assert.equal(persisted?.report.attempts, 1);
     assert.equal(persisted?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("continues an unfinished schema-v5 report receipt after migration", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-v5-report-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-first",
+    });
+    const task = makeTask("task-v5-report");
+    first.store.create(task);
+    await first.supervisor.requestDoneCheck(task.id);
+    const done = await first.supervisor.runDoneCheck(task.id);
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: done.id,
+      deliveryKey: done.source.deliveryKey,
+      createdAt: done.createdAt,
+    });
+    const legacyIntent = {
+      reportIdentity,
+      taskState: done.state,
+      lastOutcome: done.lastOutcome,
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    const snapshotPath = join(first.store.tasksDirectory, `${task.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.schemaVersion = 5;
+    delete snapshot.agentResult;
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({
+        state: "PENDING",
+        attempts: 0,
+        lastError: null,
+      }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(
+      snapshotPath,
+      `${JSON.stringify(snapshot)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-restarted",
+    });
+    restarted.setNow(LATER);
+    assert.equal(restarted.store.get(task.id)?.schemaVersion, 6);
+
+    const sent = await restarted.supervisor.recordReportAttempt(
+      task.id,
+      async () => ({ sent: true }),
+    );
+
+    assert.equal(sent.report.state, "SENT");
+    assert.equal(sent.report.attempts, 1);
+    assert.equal(sent.mutationReceipts.report?.operationId, receipts.report
+      && (receipts.report as { operationId: string }).operationId);
+    assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
   it("records a report receipt for a maximum-sized valid typed result", async (t) => {

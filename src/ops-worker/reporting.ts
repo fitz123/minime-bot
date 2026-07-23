@@ -110,7 +110,7 @@ function alertmanagerIncidentIdentity(task: Readonly<OpsWorkerTask>): string | n
   }
   if (groupLabels === null) return null;
   const canonicalGroup = Object.fromEntries(
-    Object.entries(groupLabels).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(groupLabels).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
   );
   return [
     `alertname=${[...alertNames].sort().join(",") || "unknown"}`,

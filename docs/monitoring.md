@@ -138,6 +138,10 @@ the verified receiver, group descriptor, and de-duplicated firing-member labels
 and start times, never the opaque webhook `groupKey`. Critical classification
 and firing-batch native text likewise use only that verified firing set, so
 resolved-member text or duplicate multiplicity cannot create a new escalation.
+A batch is critical when at least one de-duplicated decision member has the
+exact, case-sensitive label `severity="critical"`. Firing batches consider only
+verified firing members; resolved-only batches consider their resolved members.
+All other values and casing are noncritical.
 A mismatch is treated as stale or forged input and is acknowledged without
 forwarding. A source-query failure uses native fallback and returns 503 so
 Alertmanager retries. Once the source is verified, required sinks are:

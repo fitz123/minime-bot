@@ -434,10 +434,12 @@ def alertmanager_has_exact_group(
         raise DeliveryError("Alertmanager source verification failed") from None
     if not isinstance(groups, list):
         raise DeliveryError("Alertmanager source verification failed")
-    current_group_members: dict[
-        tuple[tuple[tuple[str, str], ...], int],
-        set[str | None],
-    ] = {}
+    matching_group_members: list[
+        dict[
+            tuple[tuple[tuple[str, str], ...], int],
+            set[str | None],
+        ]
+    ] = []
     for group in groups:
         if not isinstance(group, dict) or len(group) > MAX_ALERT_FIELDS:
             raise DeliveryError("Alertmanager source verification failed")
@@ -462,6 +464,10 @@ def alertmanager_has_exact_group(
         alerts = group.get("alerts")
         if not isinstance(alerts, list):
             raise DeliveryError("Alertmanager source verification failed")
+        current_group_members: dict[
+            tuple[tuple[tuple[str, str], ...], int],
+            set[str | None],
+        ] = {}
         for alert in alerts:
             if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
                 raise DeliveryError("Alertmanager source verification failed")
@@ -493,16 +499,20 @@ def alertmanager_has_exact_group(
                 raise DeliveryError("Alertmanager source verification failed")
             member_key = (tuple(sorted(alert_labels.items())), starts_at)
             current_group_members.setdefault(member_key, set()).add(fingerprint)
-    return bool(firing_members) and all(
-        (
-            member.labels,
-            member.starts_at,
-        ) in current_group_members
-        and (
-            member.fingerprint is None
-            or member.fingerprint in current_group_members[(member.labels, member.starts_at)]
+        matching_group_members.append(current_group_members)
+    return bool(firing_members) and any(
+        all(
+            (
+                member.labels,
+                member.starts_at,
+            ) in current_group
+            and (
+                member.fingerprint is None
+                or member.fingerprint in current_group[(member.labels, member.starts_at)]
+            )
+            for member in firing_members
         )
-        for member in firing_members
+        for current_group in matching_group_members
     )
 
 

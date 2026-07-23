@@ -20,6 +20,7 @@ const FIVE_MINUTES_AGO = "2026-07-22T11:55:00.000Z";
 const ONE_MINUTE_AGO = "2026-07-22T11:59:00.000Z";
 const FOUR_MINUTES_LATER = "2026-07-22T12:04:00.000Z";
 const FIVE_MINUTES_LATER = "2026-07-22T12:05:00.000Z";
+const FIVE_SECONDS_LATER = "2026-07-22T12:00:05.000Z";
 const RECHECK = "2026-07-22T12:01:00.000Z";
 const CORRELATION_KEY = `lab-alertmanager:group:${"a".repeat(64)}`;
 const RULE_FAMILIES = [
@@ -195,6 +196,39 @@ describe("generic Alertmanager incident done check", () => {
     assert.equal(firstAbsentCheck.components[1].outcome, "PASS");
     assert.equal(firstAbsentCheck.components[2].outcome, "NOT_READY");
     assert.equal(firstAbsentCheck.components[2].nextCheckAt, FIVE_MINUTES_LATER);
+  });
+
+  it("measures the durable window from the later exact-absence observation", async () => {
+    const readings = healthyReadings();
+    const prior = completedAbsenceWindow();
+    prior.components[0].observedAt = "2026-07-22T11:55:05.000Z";
+    const registry = createOpsIncidentDoneCheckRegistry({
+      clock: () => new Date(NOW),
+      incidentMonitoringReader: {
+        readMonitoringFreshness: () => structuredClone(readings.freshness),
+        readResolutionStability: () => structuredClone(readings.stability),
+      },
+      incidentAlertmanagerReader: {
+        readExactGroupState: () => structuredClone(readings.alerts),
+      },
+    });
+
+    const result = await registry.run(
+      { name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME, params: {} },
+      {
+        taskId: "delayed-absence-fixture",
+        checkedAt: NOW,
+        now: () => new Date(NOW),
+        sourceKind: "alertmanager",
+        sourceCorrelationKey: CORRELATION_KEY,
+        sourceEvidence: correlationEvidence("ExternalLabelAlert"),
+        previousVerification: prior,
+      },
+    );
+
+    assert.equal(result.result, "NOT_READY");
+    assert.equal(result.nextCheckAt, FIVE_SECONDS_LATER);
+    assert.equal(result.components[2].nextCheckAt, FIVE_SECONDS_LATER);
   });
 
   it("does not substitute a firing receipt for the first exact-absence observation", async () => {

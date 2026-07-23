@@ -405,6 +405,12 @@ When an evolving delivery coalesces into an active task, its bounded alert and
 omission evidence is merged into the task with de-duplication and oldest
 nonessential-evidence eviction; the exact group descriptor and durable delivery
 receipts remain protected.
+Persistence and prompt exposure differ. The exact descriptor remains available
+to package-owned verification and reporting, but a descriptor larger than 4 KiB
+is represented in the agent prompt only by its label count and SHA-256 digest.
+If the total prompt evidence budget is exceeded, entries are priority-selected
+and an explicit omitted-entry marker is included. An agent must not assume that
+every persisted evidence entry appeared in its prompt.
 Correlation and delivery identities are derived from the canonical verified
 group-label descriptor and source-verified episode start rather than the opaque
 webhook `groupKey`, so changing unverified opaque text cannot split one
@@ -488,11 +494,28 @@ exact group labels, and an available persisted episode start in addition to the
 task and correlation identities. Reports also include typed outcome, diagnosis,
 actions, requested input when blocked, verifier components, and `checkedAt`.
 Source and incident identities plus every agent-authored field are redacted for
-configured sensitive values,
-credential assignments, bearer tokens, URL credentials and secret query
-parameters, absolute home paths, control characters, and long opaque tokens.
+the resolved Ops Telegram token and optional intake bearer, credential
+assignments, bearer tokens, URL credentials and secret query parameters,
+absolute home paths, control characters, and long opaque tokens. Direct
+embeddings may add exact values through the programmatic-only
+`OpsWorkerTelegramControlOptions.sensitiveValues` option; there is no YAML or
+CLI setting for additional values. Pattern redaction is defense in depth, not a
+substitute for keeping secrets out of alert payloads and agent-authored results.
 Per-field byte limits apply before the total reply limit. The existing durable
 report receipt and retry contract remains unchanged.
+
+### Trusted embedding upgrade
+
+The generic incident contract changes the source-level embedding API even
+though persisted schema-v1 through schema-v5 snapshots remain readable.
+Embeddings must spread `createOpsMonitoringReaders(prometheusBaseUrl,
+alertmanagerBaseUrl, fetch)` into the availability dependencies supplied to
+`createOpsTaskContracts`. Their Alertmanager authorization snapshot reader must
+return validator-v2's exact `sourceIdentity`, `template`, `doneCheck`,
+`objective`, and `profile` fields for the fixed generic contract. Any embedding
+that constructs schema-v6 tasks directly must also initialize `agentResult` to
+`null`. Snapshot migration compatibility does not make these TypeScript API
+changes source-compatible.
 
 ## Availability contract
 

@@ -117,8 +117,7 @@ const ALERT_KEYS = [
 ] as const;
 const ALERT_REQUIRED_KEYS = ["status", "labels", "annotations", "startsAt"] as const;
 const RFC3339_PATTERN =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-const TRUNCATION_MARKER = "… [truncated]";
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 function fail(
   code: OpsWorkerAlertmanagerIntakeErrorCode,
@@ -187,10 +186,34 @@ function expectStatus(value: unknown, path: string): "firing" | "resolved" {
 
 function expectTimestamp(value: unknown, path: string): string {
   const timestamp = expectString(value, path, 128);
-  if (!RFC3339_PATTERN.test(timestamp) || !Number.isFinite(Date.parse(timestamp))) {
+  const match = RFC3339_PATTERN.exec(timestamp);
+  if (match === null) {
     fail("INVALID_PAYLOAD", `${path} must be a valid RFC3339 timestamp`);
   }
-  return new Date(timestamp).toISOString();
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+  const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const parsed = Date.parse(timestamp);
+  if (
+    month < 1
+    || month > 12
+    || day < 1
+    || day > daysInMonth[month - 1]
+    || hour > 23
+    || minute > 59
+    || second > 59
+    || offsetHour > 23
+    || offsetMinute > 59
+    || !Number.isFinite(parsed)
+  ) fail("INVALID_PAYLOAD", `${path} must be a valid RFC3339 timestamp`);
+  return new Date(parsed).toISOString();
 }
 
 function expectStringMap(
@@ -420,23 +443,14 @@ function canonicalGroupIdentity(
     );
   }
   return JSON.stringify(Object.fromEntries(
-    Object.entries(groupLabels).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(groupLabels).sort(
+      ([left], [right]) => left < right ? -1 : left > right ? 1 : 0,
+    ),
   ));
 }
 
-function truncateUtf8(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  const contentLimit = maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
-  let result = "";
-  for (const character of value) {
-    if (Buffer.byteLength(result + character, "utf8") > contentLimit) break;
-    result += character;
-  }
-  return `${result}${TRUNCATION_MARKER}`;
-}
-
-function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorkerEvidence {
-  const summary = JSON.stringify({
+function boundedAlertSummary(alert: OpsAlertmanagerWebhookAlert): string {
+  const complete = JSON.stringify({
     status: alert.status,
     startsAt: alert.startsAt,
     labels: alert.labels,
@@ -444,11 +458,92 @@ function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorke
     generatorURL: alert.generatorURL ?? null,
     fingerprint: alert.fingerprint ?? null,
   });
+  if (Buffer.byteLength(complete, "utf8") <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+    return complete;
+  }
+
+  let labels: Record<string, string> = Object.create(null) as Record<string, string>;
+  let annotations: Record<string, string> = Object.create(null) as Record<string, string>;
+  let omittedLabels = Object.keys(alert.labels).length;
+  let omittedAnnotations = Object.keys(alert.annotations).length;
+  let generatorURL: string | null = null;
+  let fingerprint: string | null = null;
+  let omittedOptionalFields = [
+    ...(alert.generatorURL === undefined ? [] : ["generatorURL"]),
+    ...(alert.fingerprint === undefined ? [] : ["fingerprint"]),
+  ];
+  const record = () => ({
+    type: "alertmanager-alert-v1",
+    status: alert.status,
+    startsAt: alert.startsAt,
+    labels,
+    annotations,
+    generatorURL,
+    fingerprint,
+    omittedLabels,
+    omittedAnnotations,
+    omittedOptionalFields,
+  });
+  const fits = (candidate: unknown): boolean => Buffer.byteLength(
+    JSON.stringify(candidate),
+    "utf8",
+  ) <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes;
+  const labelEntries = Object.entries(alert.labels).sort(([left], [right]) => {
+    if (left === "alertname" && right !== "alertname") return -1;
+    if (right === "alertname" && left !== "alertname") return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  for (const [key, value] of labelEntries) {
+    const candidate = { ...labels, [key]: value };
+    const previous = labels;
+    labels = candidate;
+    omittedLabels -= 1;
+    if (!fits(record())) {
+      labels = previous;
+      omittedLabels += 1;
+    }
+  }
+  for (const [key, value] of Object.entries(alert.annotations).sort(
+    ([left], [right]) => left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    const candidate = { ...annotations, [key]: value };
+    const previous = annotations;
+    annotations = candidate;
+    omittedAnnotations -= 1;
+    if (!fits(record())) {
+      annotations = previous;
+      omittedAnnotations += 1;
+    }
+  }
+  if (alert.generatorURL !== undefined) {
+    generatorURL = alert.generatorURL;
+    omittedOptionalFields = omittedOptionalFields.filter((field) => field !== "generatorURL");
+    if (!fits(record())) {
+      generatorURL = null;
+      omittedOptionalFields = [...omittedOptionalFields, "generatorURL"];
+    }
+  }
+  if (alert.fingerprint !== undefined) {
+    fingerprint = alert.fingerprint;
+    omittedOptionalFields = omittedOptionalFields.filter((field) => field !== "fingerprint");
+    if (!fits(record())) {
+      fingerprint = null;
+      omittedOptionalFields = [...omittedOptionalFields, "fingerprint"];
+    }
+  }
+  const bounded = JSON.stringify(record());
+  if (Buffer.byteLength(bounded, "utf8") > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+    throw new RangeError("Bounded Alertmanager alert evidence exceeds its summary limit");
+  }
+  return bounded;
+}
+
+function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorkerEvidence {
   return {
     at,
     kind: "alert",
     trust: "untrusted",
-    summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxEvidenceSummaryBytes),
+    summary: boundedAlertSummary(alert),
     artifact: null,
   };
 }

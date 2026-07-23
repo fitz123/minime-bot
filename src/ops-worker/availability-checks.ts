@@ -648,7 +648,7 @@ interface PrometheusMatrixEntry {
 
 function canonicalLabelIdentity(labels: Record<string, string>): string {
   return JSON.stringify(Object.fromEntries(
-    Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(labels).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
   ));
 }
 

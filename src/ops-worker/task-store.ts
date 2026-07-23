@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
   hashOpsWorkerCanonicalSubmission,
+  hashOpsWorkerReportPayload,
   isOpsWorkerTerminalState,
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
@@ -906,6 +907,7 @@ export class OpsWorkerTaskStore {
       }
       if (activeOwner) {
         const working = structuredClone(activeOwner);
+        const reportPayloadHash = hashOpsWorkerReportPayload(working);
         const receiptCount = working.evidence.filter((evidence) =>
           parseDeliveryReceipt(evidence) !== undefined).length;
         if (receiptCount >= MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS) {
@@ -920,6 +922,11 @@ export class OpsWorkerTaskStore {
         };
         const observedAt = this.refreshAcceptedFiringObservation(working, task);
         this.mergeCoalescedAlertEvidence(working, task);
+        this.reconcileUnclaimedReportForEvidenceChange(
+          working,
+          reportPayloadHash,
+          observedAt,
+        );
         try {
           appendOpsWorkerEvidence(working, {
             at: observedAt,
@@ -1286,6 +1293,35 @@ export class OpsWorkerTaskStore {
       if (duplicate >= 0) task.evidence.splice(duplicate, 1);
       appendOpsWorkerEvidence(task, structuredClone(evidence));
     }
+  }
+
+  private reconcileUnclaimedReportForEvidenceChange(
+    task: OpsWorkerTask,
+    previousPayloadHash: string,
+    observedAt: string,
+  ): void {
+    if (hashOpsWorkerReportPayload(task) === previousPayloadHash) return;
+    const receipt = task.mutationReceipts.report;
+    if (task.report.state !== "PENDING" || receipt === null || receipt.outcome !== null) return;
+    if (receipt.mutationStartedAt !== null) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Task ${task.id} cannot change report evidence while its report delivery is unresolved`,
+      );
+    }
+    receipt.outcome = {
+      recordedAt: new Date(Math.max(
+        Date.parse(observedAt),
+        Date.parse(receipt.queryObservedAt),
+      )).toISOString(),
+      result: "NOT_NEEDED",
+      evidenceHash: `sha256:${createHash("sha256").update(JSON.stringify({
+        taskId: task.id,
+        operationId: receipt.operationId,
+        reason: "unclaimed report payload superseded by evolving Alertmanager evidence",
+      })).digest("hex")}`,
+    };
+    task.report.attempts = 0;
+    task.report.lastError = null;
   }
 
   private appendSteeringEntry(

@@ -587,6 +587,42 @@ function timestampAtOrAfter(now: Date, floor: string): string {
   return new Date(Math.max(now.getTime(), Date.parse(floor))).toISOString();
 }
 
+function reportOperation(intent: unknown): {
+  boundary: "report";
+  operationId: string;
+  intent: unknown;
+} {
+  const intentHash = hashOpsWorkerCanonicalPayload(intent);
+  return {
+    boundary: "report",
+    operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+    intent,
+  };
+}
+
+function compatibleReportOperations(
+  task: Readonly<OpsWorkerTask>,
+  reportIdentity: string,
+): Array<ReturnType<typeof reportOperation>> {
+  const current = reportOperation({
+    reportIdentity,
+    reportPayloadHash: hashOpsWorkerReportPayload(task),
+  });
+  const v5 = reportOperation({
+    reportIdentity,
+    taskState: task.state,
+    lastOutcome: task.lastOutcome === null
+      ? null
+      : {
+          at: task.lastOutcome.at,
+          kind: task.lastOutcome.kind,
+          result: task.lastOutcome.result,
+          summary: task.lastOutcome.summary,
+        },
+  });
+  return [current, v5];
+}
+
 export class OpsWorkerSupervisor {
   private readonly store: OpsWorkerTaskStore;
   private readonly doneChecks: OpsWorkerDoneCheckRegistry;
@@ -2744,17 +2780,16 @@ export class OpsWorkerSupervisor {
       deliveryKey: task.source.deliveryKey,
       createdAt: task.createdAt,
     });
-    const reportPayloadHash = hashOpsWorkerReportPayload(task);
-    const reportIntent = {
-      reportIdentity,
-      reportPayloadHash,
-    };
-    const reportIntentHash = hashOpsWorkerCanonicalPayload(reportIntent);
-    const operation = {
-      boundary: "report" as const,
-      operationId: `report:${reportIntentHash.slice("sha256:".length, 31)}`,
-      intent: reportIntent,
-    };
+    const reportTask = structuredClone(task);
+    const operations = compatibleReportOperations(reportTask, reportIdentity);
+    const unfinishedReceipt = task.mutationReceipts.report;
+    const operation = unfinishedReceipt?.outcome === null
+      ? operations.find((candidate) =>
+          candidate.operationId === unfinishedReceipt.operationId
+          && hashOpsWorkerCanonicalPayload(candidate.intent) === unfinishedReceipt.intentHash)
+        ?? operations[0]
+      : operations[0];
+    const reportIntentHash = hashOpsWorkerCanonicalPayload(operation.intent);
     task = this.lifecycle.updateLifecycleIdentity(taskId, {
       report: reportIdentity,
     });
@@ -2796,7 +2831,7 @@ export class OpsWorkerSupervisor {
         `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
       );
     }
-    const result = await attempt(authorization.task);
+    const result = await attempt(reportTask);
     return this.store.mutate(
       taskId,
       {
