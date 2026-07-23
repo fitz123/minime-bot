@@ -9,6 +9,11 @@ import {
   type OpsWorkerPolicySnapshot,
 } from "./status-server.js";
 import {
+  buildOpsWorkerTelegramReport,
+  createOpsWorkerFieldRedactor,
+  type OpsWorkerFieldRedactor,
+} from "./reporting.js";
+import {
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -44,6 +49,7 @@ export interface OpsWorkerTelegramControlOptions {
   inspectPolicy: () => OpsWorkerPolicySnapshot;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  sensitiveValues?: readonly string[];
   /** Test-only durable-boundary hook. Production callers should leave this unset. */
   faultInjector?: (
     point: OpsWorkerTelegramControlFaultPoint,
@@ -245,16 +251,6 @@ function taskSummary(task: OpsWorkerTask): string {
   ].join("\n");
 }
 
-function reportSummary(task: OpsWorkerTask): string {
-  return [
-    `Ops task report: ${task.id}`,
-    `state=${task.state}`,
-    task.lastOutcome === null
-      ? "outcome=none"
-      : `outcome=${task.lastOutcome.kind}/${task.lastOutcome.result}: ${task.lastOutcome.summary}`,
-  ].join("\n");
-}
-
 function usage(): string {
   return "Usage: /status | /tasks | /task <id> | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>";
 }
@@ -272,6 +268,7 @@ export class OpsWorkerTelegramControl {
   private readonly inspectPolicy: () => OpsWorkerPolicySnapshot;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly redactAgentField: OpsWorkerFieldRedactor;
   private pendingReply: string | undefined;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
@@ -288,6 +285,11 @@ export class OpsWorkerTelegramControl {
     this.inspectPolicy = options.inspectPolicy;
     this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? defaultSleep;
+    this.redactAgentField = createOpsWorkerFieldRedactor([
+      options.config.telegram.token,
+      options.config.intake?.bearerToken ?? "",
+      ...(options.sensitiveValues ?? []),
+    ]);
     this.faultInjector = options.faultInjector;
   }
 
@@ -611,7 +613,10 @@ export class OpsWorkerTelegramControl {
     if (!task) return null;
     await this.supervisor.recordReportAttempt(task.id, async (prepared) => {
       try {
-        await this.sendMessage(reportSummary(prepared), signal);
+        await this.sendMessage(buildOpsWorkerTelegramReport(prepared, {
+          redact: this.redactAgentField,
+          maxBytes: this.config.reply.maxBytes,
+        }), signal);
       } catch (error) {
         return { sent: false, error: safeError(error) };
       }

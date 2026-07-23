@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   OpsWorkerDoneCheckRegistry,
+  type OpsWorkerDoneCheckDefinition,
   type OpsWorkerDoneCheckContext,
 } from "./done-checks.js";
 import type {
@@ -257,12 +258,11 @@ function assertDependencies(deps: OpsAvailabilityDoneCheckDependencies): void {
   ) throw new TypeError("Availability done check requires all trusted read-only dependencies");
 }
 
-export function createOpsAvailabilityDoneCheckRegistry(
+export function createOpsAvailabilityDoneCheckDefinition(
   deps: OpsAvailabilityDoneCheckDependencies,
-): OpsWorkerDoneCheckRegistry {
+): OpsWorkerDoneCheckDefinition {
   assertDependencies(deps);
-  return new OpsWorkerDoneCheckRegistry({
-    [OPS_AVAILABILITY_DONE_CHECK_NAME]: {
+  return {
       identity: OPS_AVAILABILITY_DONE_CHECK_NAME,
       version: OPS_AVAILABILITY_DONE_CHECK_VERSION,
       validateParams,
@@ -444,7 +444,14 @@ export function createOpsAvailabilityDoneCheckRegistry(
           },
         },
       ],
-    },
+  };
+}
+
+export function createOpsAvailabilityDoneCheckRegistry(
+  deps: OpsAvailabilityDoneCheckDependencies,
+): OpsWorkerDoneCheckRegistry {
+  return new OpsWorkerDoneCheckRegistry({
+    [OPS_AVAILABILITY_DONE_CHECK_NAME]: createOpsAvailabilityDoneCheckDefinition(deps),
   });
 }
 
@@ -641,7 +648,7 @@ interface PrometheusMatrixEntry {
 
 function canonicalLabelIdentity(labels: Record<string, string>): string {
   return JSON.stringify(Object.fromEntries(
-    Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(labels).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
   ));
 }
 

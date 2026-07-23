@@ -38,6 +38,7 @@ import {
   type OpsWorkerDoneCheckDefinition,
 } from "../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import { OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME } from "../ops-worker/ops-contracts.js";
 import { cleanupOpsWorkerParitySessionSnapshots } from "../ops-worker/parity.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
@@ -174,6 +175,9 @@ function registry(
           "authorized-issue",
         ],
       },
+      [OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME]: {
+        sourceKinds: ["alertmanager"],
+      },
     },
     authorizationProfiles: {
       "fixture.inspect.v1": {
@@ -196,6 +200,7 @@ function makeTask(
   options: {
     sourceKind?: OpsWorkerSourceKind;
     objective?: string;
+    template?: string;
   } = {},
 ): OpsWorkerTask {
   const sourceKind = options.sourceKind ?? "operator-cli";
@@ -208,13 +213,13 @@ function makeTask(
   }[sourceKind] as OpsWorkerTask["priority"];
   const now = new Date().toISOString();
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: sourceKind,
       correlationKey: `fixture:${id}`,
       deliveryKey: `fixture:${id}`,
-      template: "fixture-task",
+      template: options.template ?? "fixture-task",
     },
     resource: { kind: "host", key: "host:local" },
     lifecycle: createEmptyOpsWorkerLifecycleManifest(),
@@ -236,12 +241,13 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,
-      maxRemediation: 3,
+      maxRemediation: options.template === OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME ? 5 : 3,
       consecutiveInfrastructureFailures: 0,
     },
     schedule: { nextRunAt: null, nextCheckAt: null },
@@ -925,6 +931,64 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(prompt, /telegram:update:3030/);
     assert.ok(prompt.includes('"text":"\\u0001'));
     assert.match(prompt, /Perform one bounded remediation attempt/);
+    assert.match(prompt, /ops-worker-prompt-evidence-omission-v1/);
+  });
+
+  it("keeps alert evidence usable when the exact group descriptor exceeds the prompt", () => {
+    const task = makeTask("large-alertmanager-descriptor-prompt", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    const groupLabels = Object.fromEntries(Array.from(
+      { length: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelEntries },
+      (_, index) => [
+        `group_label_${String(index).padStart(2, "0")}`,
+        `${index}:`.padEnd(OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelValueBytes, "g"),
+      ],
+    ));
+    const descriptor = JSON.stringify({
+      type: "alertmanager-group-correlation-v1",
+      correlationKey: task.source.correlationKey,
+      groupLabels,
+    });
+    assert.ok(Buffer.byteLength(descriptor, "utf8") > OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    task.evidence = [
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: descriptor,
+        artifact: null,
+      },
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          status: "firing",
+          labels: { alertname: "PromptEvidenceMustRemainVisible" },
+        }),
+        artifact: null,
+      },
+      {
+        at: task.createdAt,
+        kind: "alert",
+        trust: "untrusted",
+        summary: JSON.stringify({
+          type: "alertmanager-alert-omission-v1",
+          omittedAlerts: 7,
+        }),
+        artifact: null,
+      },
+    ];
+
+    const prompt = buildOpsWorkerAttemptPrompt(task);
+
+    assert.ok(Buffer.byteLength(prompt, "utf8") <= OPS_WORKER_PI_LIMITS.maxPromptBytes);
+    assert.match(prompt, /alertmanager-group-correlation-prompt-v1/);
+    assert.match(prompt, /PromptEvidenceMustRemainVisible/);
+    assert.match(prompt, /alertmanager-alert-omission-v1/);
+    assert.doesNotMatch(prompt, /"group_label_63"/);
   });
 
   it("delivers and consumes a complete maximum escape-heavy steering entry", async (t) => {
@@ -1183,6 +1247,224 @@ describe("ops worker Pi standard-session attempts", () => {
 
     assert.equal(result.state, "DONE");
     assert.equal(result.lastOutcome?.result, "PASS");
+  });
+
+  it("persists both typed completion claims and runs the same deterministic check", async (t) => {
+    const harness = await makeHarness(t);
+    for (const kind of ["remediation-complete", "no-action-needed"] as const) {
+      const task = makeTask(`typed-${kind}`, {
+        sourceKind: "alertmanager",
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      });
+      harness.store.create(task);
+      harness.setScenario(`agent-result-${kind}`);
+
+      const result = await harness.runner().runAttempt(task.id);
+
+      assert.equal(result.state, "DONE");
+      assert.equal(result.agentResult?.kind, kind);
+      assert.match(result.agentResult?.attemptId ?? "", /^attempt-/);
+      assert.equal(result.lastOutcome?.result, "PASS");
+      assert.equal(result.custody.status, "RELEASED");
+    }
+  });
+
+  it("turns typed input-needed and impossible results into durable reported blockers", async (t) => {
+    const harness = await makeHarness(t);
+    for (const kind of ["input-needed", "impossible"] as const) {
+      const task = makeTask(`typed-${kind}`, {
+        sourceKind: "alertmanager",
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      });
+      harness.store.create(task);
+      harness.setScenario(`agent-result-${kind}`);
+
+      const result = await harness.runner().runAttempt(task.id);
+
+      assert.equal(result.state, "BLOCKED");
+      assert.equal(result.agentResult?.kind, kind);
+      assert.equal(result.lastOutcome?.result, "BLOCKED");
+      assert.equal(result.custody.status, "RELEASED");
+      assert.equal(result.custody.releaseReason, "BLOCKED");
+      assert.equal(result.report.state, "PENDING");
+    }
+  });
+
+  it("bounds missing, malformed, mismatched, oversized, and unsafe result files as remediation failures", async (t) => {
+    const harness = await makeHarness(t);
+    for (const scenario of [
+      "agent-result-missing",
+      "agent-result-malformed",
+      "agent-result-id-mismatch",
+      "agent-result-oversized",
+      "agent-result-symlink",
+      "agent-result-directory",
+    ]) {
+      const task = makeTask(`typed-${scenario}`, {
+        sourceKind: "alertmanager",
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      });
+      harness.store.create(task);
+      harness.setScenario(scenario);
+
+      const result = await harness.runner().runAttempt(task.id);
+
+      assert.equal(result.state, "RESUMABLE");
+      assert.equal(result.agentResult, null);
+      assert.equal(result.lastOutcome?.result, "PROTOCOL_FAILURE");
+      assert.equal(result.rounds.remediation, 1);
+      const sessionDirectory = join(
+        harness.supervisor.stateDirectory,
+        "sessions",
+        task.id,
+      );
+      assert.deepEqual(
+        readdirSync(sessionDirectory).filter((name) => name.startsWith("agent-result-")),
+        [],
+      );
+      harness.supervisor.cancelTask(task.id, "Release protocol fixture custody");
+    }
+  });
+
+  it("rejects a valid typed result when final attempt telemetry is invalid", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-invalid-final-telemetry", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    harness.setScenario("agent-result-invalid-telemetry");
+
+    const result = await harness.runner().runAttempt(task.id);
+
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.agentResult, null);
+    assert.equal(result.lastOutcome?.result, "QUOTA_TELEMETRY_ERROR");
+    assert.equal(result.rounds.remediation, 0);
+    assert.equal(result.custody.status, "HELD");
+  });
+
+  it("converges five directory-substituted typed results to one reported BLOCKED task", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-five-protocol-failures", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    harness.setScenario("agent-result-directory");
+
+    let result: OpsWorkerTask = task;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      result = await harness.runner().runAttempt(task.id);
+      assert.equal(result.rounds.remediation, attempt);
+    }
+
+    assert.equal(result.state, "BLOCKED");
+    assert.equal(result.report.state, "PENDING");
+    assert.equal(result.custody.status, "RELEASED");
+    assert.equal(result.agentResult, null);
+  });
+
+  it("creates the typed result path only after persisting the attempt identity", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-result-launch-order", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    harness.setScenario("agent-result-no-action-needed");
+    let resultPath: string | undefined;
+    let persistedAttemptId: string | undefined;
+
+    const result = await harness.runner({
+      dependencies: {
+        spawnProcess: (command, args, options) => {
+          const env = options.env as Record<string, string>;
+          resultPath = env.OPS_WORKER_RESULT_FILE;
+          persistedAttemptId = harness.store.get(task.id)?.unverifiedRun?.attemptId;
+          assert.equal(env.OPS_WORKER_ATTEMPT_ID, persistedAttemptId);
+          assert.ok(resultPath && existsSync(resultPath));
+          const child = spawn(command, args, options);
+          harness.children.push(child);
+          return child;
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(result.state, "DONE");
+    assert.ok(resultPath);
+    assert.equal(existsSync(resultPath), false);
+  });
+
+  it("resolves the launch fence when typed result file setup fails before spawn", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-result-file-setup-failure", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+    let spawnAttempted = false;
+
+    const result = await harness.runner({
+      dependencies: {
+        launchFaultInjector: (point) => {
+          if (point !== "after-launch-intent-persisted") return;
+          const attemptId = harness.store.get(task.id)?.unverifiedRun?.attemptId;
+          assert.ok(attemptId);
+          const identity = createHash("sha256").update(attemptId).digest("hex").slice(0, 32);
+          writeFileSync(join(
+            harness.supervisor.stateDirectory,
+            "sessions",
+            task.id,
+            `agent-result-${identity}.json`,
+          ), "synthetic collision", "utf8");
+        },
+        spawnProcess: () => {
+          spawnAttempted = true;
+          throw new Error("spawn must not be attempted after result-file setup failure");
+        },
+      },
+    }).runAttempt(task.id);
+
+    assert.equal(spawnAttempted, false);
+    assert.equal(result.state, "RESUMABLE");
+    assert.equal(result.unverifiedRun, null);
+    assert.equal(result.activeRun, null);
+    assert.equal(result.lastOutcome?.result, "CRASH");
+    assert.match(result.lastOutcome?.summary ?? "", /result file setup failed before process spawn/);
+  });
+
+  it("cleans the fresh typed result file when launch faults after file creation", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("typed-result-file-fault", {
+      sourceKind: "alertmanager",
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    });
+    harness.store.create(task);
+
+    await assert.rejects(
+      harness.runner({
+        dependencies: {
+          launchFaultInjector: (point) => {
+            if (point === "after-result-file-created") {
+              throw new Error("synthetic typed result file crash boundary");
+            }
+          },
+        },
+      }).runAttempt(task.id),
+      /synthetic typed result file crash boundary/,
+    );
+
+    const sessionDirectory = join(
+      harness.supervisor.stateDirectory,
+      "sessions",
+      task.id,
+    );
+    assert.deepEqual(
+      readdirSync(sessionDirectory).filter((name) => name.startsWith("agent-result-")),
+      [],
+    );
+    assert.equal(harness.store.get(task.id)?.unverifiedRun?.pid, null);
   });
 
   it("runs a ready deterministic check without requiring a Pi success claim", async (t) => {

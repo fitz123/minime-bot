@@ -1,16 +1,13 @@
 import { createHash } from "node:crypto";
-import {
-  OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_INVARIANTS,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-} from "./availability-checks.js";
 import type {
   OpsWorkerDoneCheckContractIdentity,
   OpsWorkerDoneCheckRegistry,
 } from "./done-checks.js";
 import {
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_AVAILABILITY_RESOURCE_KEY,
-  OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   hashOpsAlertmanagerAuthorizationSnapshot,
 } from "./ops-contracts.js";
@@ -30,11 +27,11 @@ import {
 
 export const OPS_ALERTMANAGER_INTAKE_LIMITS = Object.freeze({
   maxBodyBytes: 256 * 1024,
-  maxAlerts: OPS_WORKER_LIMITS.maxEvidenceEntries - 1,
-  maxLabelEntries: 64,
+  maxAlerts: 1_024,
+  maxLabelEntries: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelEntries,
   maxAnnotationEntries: 64,
-  maxKeyBytes: 256,
-  maxLabelValueBytes: 2 * 1024,
+  maxKeyBytes: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelKeyBytes,
+  maxLabelValueBytes: OPS_WORKER_LIMITS.maxAlertmanagerGroupLabelValueBytes,
   maxAnnotationValueBytes: 8 * 1024,
   maxGroupKeyBytes: 8 * 1024,
   maxReceiverBytes: 1024,
@@ -120,8 +117,7 @@ const ALERT_KEYS = [
 ] as const;
 const ALERT_REQUIRED_KEYS = ["status", "labels", "annotations", "startsAt"] as const;
 const RFC3339_PATTERN =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-const TRUNCATION_MARKER = "… [truncated]";
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 function fail(
   code: OpsWorkerAlertmanagerIntakeErrorCode,
@@ -190,10 +186,43 @@ function expectStatus(value: unknown, path: string): "firing" | "resolved" {
 
 function expectTimestamp(value: unknown, path: string): string {
   const timestamp = expectString(value, path, 128);
-  if (!RFC3339_PATTERN.test(timestamp) || !Number.isFinite(Date.parse(timestamp))) {
+  const match = RFC3339_PATTERN.exec(timestamp);
+  if (match === null) {
     fail("INVALID_PAYLOAD", `${path} must be a valid RFC3339 timestamp`);
   }
-  return new Date(timestamp).toISOString();
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+  const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${match[8]}`;
+  const parsed = Date.parse(wholeSecond);
+  if (
+    month < 1
+    || month > 12
+    || day < 1
+    || day > daysInMonth[month - 1]
+    || hour > 23
+    || minute > 59
+    || second > 59
+    || offsetHour > 23
+    || offsetMinute > 59
+    || !Number.isFinite(parsed)
+  ) fail("INVALID_PAYLOAD", `${path} must be a valid RFC3339 timestamp`);
+  const utcSecond = new Date(parsed).toISOString();
+  const fractionalNanoseconds = (match[7] ?? "").padEnd(9, "0");
+  const significantFraction = fractionalNanoseconds.replace(/0+$/, "");
+  if (significantFraction.length === 0) return utcSecond;
+  const canonicalFraction = significantFraction.padEnd(
+    Math.max(3, significantFraction.length),
+    "0",
+  );
+  return utcSecond.replace(".000Z", `.${canonicalFraction}Z`);
 }
 
 function expectStringMap(
@@ -413,19 +442,24 @@ function hashIdentity(domain: string, ...parts: string[]): string {
   return hash.digest("hex");
 }
 
-function truncateUtf8(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  const contentLimit = maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
-  let result = "";
-  for (const character of value) {
-    if (Buffer.byteLength(result + character, "utf8") > contentLimit) break;
-    result += character;
+function canonicalGroupIdentity(
+  groupLabels: Record<string, string> | undefined,
+): string {
+  if (groupLabels === undefined) {
+    fail(
+      "INVALID_PAYLOAD",
+      "Alertmanager firing groups require groupLabels for exact correlation",
+    );
   }
-  return `${result}${TRUNCATION_MARKER}`;
+  return JSON.stringify(Object.fromEntries(
+    Object.entries(groupLabels).sort(
+      ([left], [right]) => left < right ? -1 : left > right ? 1 : 0,
+    ),
+  ));
 }
 
-function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorkerEvidence {
-  const summary = JSON.stringify({
+function boundedAlertSummary(alert: OpsAlertmanagerWebhookAlert): string {
+  const complete = JSON.stringify({
     status: alert.status,
     startsAt: alert.startsAt,
     labels: alert.labels,
@@ -433,11 +467,92 @@ function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorke
     generatorURL: alert.generatorURL ?? null,
     fingerprint: alert.fingerprint ?? null,
   });
+  if (Buffer.byteLength(complete, "utf8") <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+    return complete;
+  }
+
+  let labels: Record<string, string> = Object.create(null) as Record<string, string>;
+  let annotations: Record<string, string> = Object.create(null) as Record<string, string>;
+  let omittedLabels = Object.keys(alert.labels).length;
+  let omittedAnnotations = Object.keys(alert.annotations).length;
+  let generatorURL: string | null = null;
+  let fingerprint: string | null = null;
+  let omittedOptionalFields = [
+    ...(alert.generatorURL === undefined ? [] : ["generatorURL"]),
+    ...(alert.fingerprint === undefined ? [] : ["fingerprint"]),
+  ];
+  const record = () => ({
+    type: "alertmanager-alert-v1",
+    status: alert.status,
+    startsAt: alert.startsAt,
+    labels,
+    annotations,
+    generatorURL,
+    fingerprint,
+    omittedLabels,
+    omittedAnnotations,
+    omittedOptionalFields,
+  });
+  const fits = (candidate: unknown): boolean => Buffer.byteLength(
+    JSON.stringify(candidate),
+    "utf8",
+  ) <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes;
+  const labelEntries = Object.entries(alert.labels).sort(([left], [right]) => {
+    if (left === "alertname" && right !== "alertname") return -1;
+    if (right === "alertname" && left !== "alertname") return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  for (const [key, value] of labelEntries) {
+    const candidate = { ...labels, [key]: value };
+    const previous = labels;
+    labels = candidate;
+    omittedLabels -= 1;
+    if (!fits(record())) {
+      labels = previous;
+      omittedLabels += 1;
+    }
+  }
+  for (const [key, value] of Object.entries(alert.annotations).sort(
+    ([left], [right]) => left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    const candidate = { ...annotations, [key]: value };
+    const previous = annotations;
+    annotations = candidate;
+    omittedAnnotations -= 1;
+    if (!fits(record())) {
+      annotations = previous;
+      omittedAnnotations += 1;
+    }
+  }
+  if (alert.generatorURL !== undefined) {
+    generatorURL = alert.generatorURL;
+    omittedOptionalFields = omittedOptionalFields.filter((field) => field !== "generatorURL");
+    if (!fits(record())) {
+      generatorURL = null;
+      omittedOptionalFields = [...omittedOptionalFields, "generatorURL"];
+    }
+  }
+  if (alert.fingerprint !== undefined) {
+    fingerprint = alert.fingerprint;
+    omittedOptionalFields = omittedOptionalFields.filter((field) => field !== "fingerprint");
+    if (!fits(record())) {
+      fingerprint = null;
+      omittedOptionalFields = [...omittedOptionalFields, "fingerprint"];
+    }
+  }
+  const bounded = JSON.stringify(record());
+  if (Buffer.byteLength(bounded, "utf8") > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+    throw new RangeError("Bounded Alertmanager alert evidence exceeds its summary limit");
+  }
+  return bounded;
+}
+
+function alertEvidence(alert: OpsAlertmanagerWebhookAlert, at: string): OpsWorkerEvidence {
   return {
     at,
     kind: "alert",
     trust: "untrusted",
-    summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxEvidenceSummaryBytes),
+    summary: boundedAlertSummary(alert),
     artifact: null,
   };
 }
@@ -447,10 +562,10 @@ function alertGroupCorrelationEvidence(
   groupLabels: Record<string, string> | undefined,
   at: string,
 ): OpsWorkerEvidence {
-  if (!groupLabels || Object.keys(groupLabels).length === 0) {
+  if (groupLabels === undefined) {
     fail(
       "INVALID_PAYLOAD",
-      "Alertmanager firing groups require non-empty groupLabels for exact correlation",
+      "Alertmanager firing groups require groupLabels for exact correlation",
     );
   }
   const value = {
@@ -459,7 +574,10 @@ function alertGroupCorrelationEvidence(
     groupLabels,
   };
   const summary = JSON.stringify(value);
-  if (Buffer.byteLength(summary, "utf8") > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes) {
+  if (
+    Buffer.byteLength(summary, "utf8")
+    > OPS_WORKER_LIMITS.maxAlertmanagerGroupCorrelationEvidenceBytes
+  ) {
     fail(
       "INVALID_PAYLOAD",
       "Alertmanager groupLabels exceed the exact correlation evidence bound",
@@ -472,6 +590,38 @@ function alertGroupCorrelationEvidence(
     summary,
     artifact: null,
   };
+}
+
+function boundedAlertEvidence(
+  firingAlerts: readonly OpsAlertmanagerWebhookAlert[],
+  upstreamOmittedAlerts: number,
+  at: string,
+): OpsWorkerEvidence[] {
+  // Reserve one entry for the group descriptor and one for the store-owned
+  // accepted-firing observation added when the task is persisted.
+  const directCapacity = OPS_WORKER_LIMITS.maxEvidenceEntries - 2;
+  if (upstreamOmittedAlerts === 0 && firingAlerts.length <= directCapacity) {
+    return firingAlerts.map((entry) => alertEvidence(entry, at));
+  }
+  const retained = firingAlerts.slice(0, directCapacity - 1);
+  const locallyOmittedFiringAlerts = firingAlerts.length - retained.length;
+  return [
+    ...retained.map((entry) => alertEvidence(entry, at)),
+    {
+      at,
+      kind: "alert",
+      trust: "untrusted",
+      summary: JSON.stringify({
+        type: "alertmanager-alert-omission-v1",
+        includedAlerts: retained.length,
+        omittedAlerts: locallyOmittedFiringAlerts + upstreamOmittedAlerts,
+        locallyOmittedFiringAlerts,
+        upstreamOmittedAlerts,
+        deliveredFiringAlerts: firingAlerts.length,
+      }),
+      artifact: null,
+    },
+  ];
 }
 
 export class OpsWorkerAlertmanagerIntake {
@@ -487,9 +637,11 @@ export class OpsWorkerAlertmanagerIntake {
     if (!options.store || typeof options.store.create !== "function") {
       throw new TypeError("Alertmanager intake requires an ops-worker task store");
     }
-    const doneCheck = options.doneChecks?.describe(OPS_AVAILABILITY_DONE_CHECK_NAME);
+    const doneCheck = options.doneChecks?.describe(OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME);
     if (!doneCheck) {
-      throw new TypeError("Alertmanager intake requires the package-owned availability done check");
+      throw new TypeError(
+        "Alertmanager intake requires the package-owned generic incident done check",
+      );
     }
     this.store = options.store;
     this.doneCheck = doneCheck;
@@ -509,15 +661,16 @@ export class OpsWorkerAlertmanagerIntake {
     const episodeStart = firingAlerts
       .map((entry) => entry.startsAt)
       .sort()[0];
+    const groupIdentity = canonicalGroupIdentity(webhook.groupLabels);
     const correlationDigest = hashIdentity(
-      "minime-ops-alertmanager-correlation-v1",
+      "minime-ops-alertmanager-correlation-v2",
       this.sourceIdentity,
-      webhook.groupKey,
+      groupIdentity,
     );
     const deliveryDigest = hashIdentity(
-      "minime-ops-alertmanager-delivery-v1",
+      "minime-ops-alertmanager-delivery-v2",
       this.sourceIdentity,
-      webhook.groupKey,
+      groupIdentity,
       episodeStart,
     );
     const correlationKey = `${this.sourceIdentity}:group:${correlationDigest}`;
@@ -528,6 +681,7 @@ export class OpsWorkerAlertmanagerIntake {
       deliveryKey,
       deliveryDigest,
       webhook.groupLabels,
+      webhook.truncatedAlerts ?? 0,
     );
     const created = this.store.createOrReuseActiveCorrelation(task, {
       event: "CREATED",
@@ -542,6 +696,7 @@ export class OpsWorkerAlertmanagerIntake {
     deliveryKey: string,
     deliveryDigest: string,
     groupLabels: Record<string, string> | undefined,
+    upstreamOmittedAlerts: number,
   ): OpsWorkerTask {
     const current = this.now();
     if (!(current instanceof Date) || !Number.isFinite(current.getTime())) {
@@ -555,8 +710,9 @@ export class OpsWorkerAlertmanagerIntake {
     lifecycle.verifierContractHash = doneCheck.contractHash;
     const authorizationClaim = {
       sourceIdentity: this.sourceIdentity,
-      invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-      template: OPS_AVAILABILITY_TEMPLATE_NAME,
+      template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+      doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+      objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
     } as const;
     const id = `am-${deliveryDigest.slice(0, 48)}`;
@@ -567,7 +723,7 @@ export class OpsWorkerAlertmanagerIntake {
         kind: "alertmanager",
         correlationKey,
         deliveryKey,
-        template: OPS_AVAILABILITY_TEMPLATE_NAME,
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
       },
       resource: { kind: "host", key: OPS_AVAILABILITY_RESOURCE_KEY },
       lifecycle,
@@ -575,15 +731,14 @@ export class OpsWorkerAlertmanagerIntake {
       mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
       custody: createUnclaimedOpsWorkerCustody(),
       priority: OPS_WORKER_SOURCE_PRIORITIES.alertmanager,
-      objective:
-        OPS_AVAILABILITY_INVARIANTS[OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT].objective,
+      objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
       evidence: [
         alertGroupCorrelationEvidence(correlationKey, groupLabels, now),
-        ...firingAlerts.map((entry) => alertEvidence(entry, now)),
+        ...boundedAlertEvidence(firingAlerts, upstreamOmittedAlerts, now),
       ],
       doneCheck: {
-        name: OPS_AVAILABILITY_DONE_CHECK_NAME,
-        params: { invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT },
+        name: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+        params: {},
       },
       authorization: {
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
@@ -593,12 +748,13 @@ export class OpsWorkerAlertmanagerIntake {
       authorizationVerification: null,
       verification: null,
       legacyCompletion: null,
+      agentResult: null,
       steering: [],
       control: { paused: false, pausedAt: null, interrupt: null },
       state: "QUEUED",
       rounds: {
         remediation: 0,
-        maxRemediation: 3,
+        maxRemediation: 5,
         consecutiveInfrastructureFailures: 0,
       },
       schedule: { nextRunAt: null, nextCheckAt: null },

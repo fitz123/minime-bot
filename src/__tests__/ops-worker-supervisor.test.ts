@@ -23,7 +23,10 @@ import {
   OpsWorkerDoneCheckRegistry,
   type OpsWorkerDoneCheckDefinition,
 } from "../ops-worker/done-checks.js";
-import { OpsWorkerLifecycle } from "../ops-worker/lifecycle.js";
+import {
+  OpsWorkerLifecycle,
+  hashOpsWorkerCanonicalPayload,
+} from "../ops-worker/lifecycle.js";
 import type {
   OpsWorkerQuotaAdmissionDecision,
   OpsWorkerQuotaAdmissionGate,
@@ -140,7 +143,7 @@ function makeTask(
     "authorized-issue": 30,
   }[sourceKind] as OpsWorkerTask["priority"];
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: sourceKind,
@@ -168,6 +171,7 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -1754,6 +1758,102 @@ describe("ops worker supervisor", () => {
     assert.equal(persisted?.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
+  it("continues an unfinished schema-v5 report receipt after migration", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-v5-report-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-first",
+    });
+    const task = makeTask("task-v5-report");
+    first.store.create(task);
+    await first.supervisor.requestDoneCheck(task.id);
+    const done = await first.supervisor.runDoneCheck(task.id);
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: done.id,
+      deliveryKey: done.source.deliveryKey,
+      createdAt: done.createdAt,
+    });
+    const legacyIntent = {
+      reportIdentity,
+      taskState: done.state,
+      lastOutcome: done.lastOutcome,
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    const snapshotPath = join(first.store.tasksDirectory, `${task.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.schemaVersion = 5;
+    delete snapshot.agentResult;
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({
+        state: "PENDING",
+        attempts: 0,
+        lastError: null,
+      }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(
+      snapshotPath,
+      `${JSON.stringify(snapshot)}\n`,
+      { mode: 0o600 },
+    );
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-restarted",
+    });
+    restarted.setNow(LATER);
+    assert.equal(restarted.store.get(task.id)?.schemaVersion, 6);
+
+    const sent = await restarted.supervisor.recordReportAttempt(
+      task.id,
+      async () => ({ sent: true }),
+    );
+
+    assert.equal(sent.report.state, "SENT");
+    assert.equal(sent.report.attempts, 1);
+    assert.equal(sent.mutationReceipts.report?.operationId, receipts.report
+      && (receipts.report as { operationId: string }).operationId);
+    assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("records a report receipt for a maximum-sized valid typed result", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-maximum-report-result", { sourceKind: "alertmanager" });
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const blocked = harness.supervisor.recordPiAgentResult(task.id, {
+      attemptId: "attempt-01",
+      kind: "input-needed",
+      summary: "s".repeat(OPS_WORKER_LIMITS.maxAgentResultSummaryBytes),
+      actions: Array.from(
+        { length: OPS_WORKER_LIMITS.maxAgentResultActions },
+        () => "a".repeat(OPS_WORKER_LIMITS.maxAgentResultActionBytes),
+      ),
+      requestedInput: "i".repeat(OPS_WORKER_LIMITS.maxAgentResultRequestedInputBytes),
+      reason: "information",
+    });
+    assert.ok(Buffer.byteLength(JSON.stringify(blocked.agentResult), "utf8") > 16 * 1024);
+
+    let attempts = 0;
+    const sent = await harness.supervisor.recordReportAttempt(task.id, async () => {
+      attempts += 1;
+      return { sent: true };
+    });
+
+    assert.equal(attempts, 1);
+    assert.equal(sent.report.state, "SENT");
+    assert.match(sent.mutationReceipts.report?.intentHash ?? "", /^sha256:[a-f0-9]{64}$/);
+  });
+
   it("revalidates after the external query and before claiming a mutation receipt", async (t) => {
     let checks = 0;
     let sends = 0;
@@ -2043,6 +2143,71 @@ describe("ops worker supervisor", () => {
     assert.equal(notReady.rounds.remediation, 1);
     assert.equal(notReady.verification?.outcome, "NOT_READY");
     assert.equal(notReady.custody.status, "HELD");
+  });
+
+  it("routes typed incident claims through one check and blocks after five disproved claims", async (t) => {
+    let verification: "PASS" | "PRODUCT_FAILURE" = "PASS";
+    const harness = await makeHarness(t, {
+      implementation: () => ({
+        result: verification,
+        summary: verification === "PASS"
+          ? "The exact group is absent and stable."
+          : "The exact Alertmanager group is still present.",
+      }),
+    });
+
+    for (const [taskId, kind] of [
+      ["task-auto-resolved", "no-action-needed"],
+      ["task-resolved-during-repair", "remediation-complete"],
+    ] as const) {
+      harness.store.create(makeTask(taskId, {
+        sourceKind: "alertmanager",
+        maxRemediation: 5,
+      }));
+      const attemptId = `${taskId}-attempt`;
+      harness.supervisor.markRunning(
+        taskId,
+        { ...activeRun("fixture-supervisor"), attemptId },
+      );
+      const checking = harness.supervisor.recordPiAgentResult(taskId, {
+        attemptId,
+        kind,
+        summary: "The incident no longer requires action.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      });
+      assert.equal(checking.state, "CHECKING");
+      const done = await harness.supervisor.runDoneCheck(taskId);
+      assert.equal(done.state, "DONE");
+      assert.equal(done.rounds.remediation, 0);
+    }
+
+    verification = "PRODUCT_FAILURE";
+    const taskId = "task-five-false-claims";
+    harness.store.create(makeTask(taskId, {
+      sourceKind: "alertmanager",
+      maxRemediation: 5,
+    }));
+    for (let round = 1; round <= 5; round += 1) {
+      const attemptId = `incident-attempt-${round}`;
+      harness.supervisor.markRunning(
+        taskId,
+        { ...activeRun("fixture-supervisor"), attemptId },
+      );
+      harness.supervisor.recordPiAgentResult(taskId, {
+        attemptId,
+        kind: round % 2 === 0 ? "no-action-needed" : "remediation-complete",
+        summary: "The agent claimed the incident was complete.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      });
+      const checked = await harness.supervisor.runDoneCheck(taskId);
+      assert.equal(checked.rounds.remediation, round);
+      assert.equal(checked.state, round === 5 ? "BLOCKED" : "RESUMABLE");
+      assert.equal(checked.report.state, round === 5 ? "PENDING" : "NONE");
+    }
   });
 
   it("schedules DEFER and retries check errors without rerunning Pi", async (t) => {
@@ -2737,6 +2902,36 @@ describe("ops worker supervisor", () => {
     assert.equal(cancelled?.custody.status, "RELEASED");
   });
 
+  it("clears a typed result when an idle interrupt completes cancellation", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-cancel-typed-result", { sourceKind: "alertmanager" });
+    harness.store.create(task);
+    harness.supervisor.markRunning(task.id, activeRun("fixture-supervisor"));
+    const blocked = harness.supervisor.recordPiAgentResult(task.id, {
+      attemptId: "attempt-01",
+      kind: "input-needed",
+      summary: "The agent needs an operator answer.",
+      actions: [],
+      requestedInput: "Provide the missing information.",
+      reason: "information",
+    });
+    assert.equal(blocked.agentResult?.kind, "input-needed");
+
+    const cancelled = harness.supervisor.requestOperatorInterrupt(
+      task.id,
+      "cancel",
+      "Operator cancelled instead of supplying the requested input.",
+    );
+
+    assert.equal(cancelled.state, "CANCELLED");
+    assert.equal(cancelled.agentResult, null);
+    assert.equal(
+      cancelled.lastOutcome?.summary,
+      "Operator cancelled instead of supplying the requested input.",
+    );
+    assert.equal(cancelled.report.state, "PENDING");
+  });
+
   it("keeps public interrupt resolution fenced until the supervisor proves the group stopped", async (t) => {
     let resolution: OpsWorkerStartupRunResult = {
       status: "AMBIGUOUS",
@@ -2948,6 +3143,7 @@ describe("ops worker supervisor", () => {
         authorizationVerification: _authorizationVerification,
         verification: _verification,
         legacyCompletion: _legacyCompletion,
+        agentResult: _agentResult,
         steering: _steering,
         control: _control,
         source,

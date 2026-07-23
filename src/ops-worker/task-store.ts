@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
   assertOpsWorkerTaskId,
   hashOpsWorkerCanonicalSubmission,
+  hashOpsWorkerReportPayload,
   isOpsWorkerTerminalState,
   OPS_WORKER_LIMITS,
   parseOpsWorkerTask,
@@ -151,6 +152,31 @@ interface OpsWorkerDeliveryReceipt {
   submissionFingerprint: string;
 }
 
+interface OpsWorkerFiringObservation {
+  type: "alertmanager-firing-observation-v1";
+  correlationKey: string;
+  deliveryKey: string;
+}
+
+function parseFiringObservation(evidence: OpsWorkerTask["evidence"][number]):
+OpsWorkerFiringObservation | undefined {
+  if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).length !== 3
+      || record.type !== "alertmanager-firing-observation-v1"
+      || typeof record.correlationKey !== "string"
+      || typeof record.deliveryKey !== "string"
+    ) return undefined;
+    return record as unknown as OpsWorkerFiringObservation;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseDeliveryReceipt(evidence: OpsWorkerTask["evidence"][number]):
 OpsWorkerDeliveryReceipt | undefined {
   if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
@@ -167,6 +193,22 @@ OpsWorkerDeliveryReceipt | undefined {
     return record as unknown as OpsWorkerDeliveryReceipt;
   } catch {
     return undefined;
+  }
+}
+
+function isAlertmanagerGroupCorrelationEvidence(
+  evidence: OpsWorkerTask["evidence"][number],
+  correlationKey: string,
+): boolean {
+  if (evidence.kind !== "alert" || evidence.trust !== "untrusted") return false;
+  try {
+    const value = JSON.parse(evidence.summary) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    return record.type === "alertmanager-group-correlation-v1"
+      && record.correlationKey === correlationKey;
+  } catch {
+    return false;
   }
 }
 
@@ -821,6 +863,25 @@ export class OpsWorkerTaskStore {
           .has(task.submissionFingerprint)
       ) {
         this.assertGlobalInvariants(currentTasks);
+        if (!isOpsWorkerTerminalState(deliveryOwner.state)) {
+          const working = structuredClone(deliveryOwner);
+          this.refreshAcceptedFiringObservation(working, task);
+          compactOpsWorkerEvidenceForSnapshot(working);
+          const persisted = parseOpsWorkerTask(working, this.registry);
+          this.assertImmutableIdentity(deliveryOwner, persisted);
+          this.assertReplaySafety(deliveryOwner, persisted);
+          this.assertJournalSafe();
+          this.assertGlobalInvariants(this.withReplacement(currentTasks, persisted));
+          this.injectFault("after-correlation-check");
+          return {
+            task: persisted,
+            created: false,
+            ...this.write(persisted, this.snapshotPath(persisted.id), {
+              event: "EVIDENCE",
+              summary: "Refreshed accepted Alertmanager firing observation",
+            }),
+          };
+        }
         return {
           task: deliveryOwner,
           created: false,
@@ -846,6 +907,7 @@ export class OpsWorkerTaskStore {
       }
       if (activeOwner) {
         const working = structuredClone(activeOwner);
+        const reportPayloadHash = hashOpsWorkerReportPayload(working);
         const receiptCount = working.evidence.filter((evidence) =>
           parseDeliveryReceipt(evidence) !== undefined).length;
         if (receiptCount >= MAX_ACTIVE_CORRELATION_DELIVERY_RECEIPTS) {
@@ -858,9 +920,16 @@ export class OpsWorkerTaskStore {
           deliveryKey: task.source.deliveryKey,
           submissionFingerprint: task.submissionFingerprint,
         };
+        const observedAt = this.refreshAcceptedFiringObservation(working, task);
+        this.mergeCoalescedAlertEvidence(working, task);
+        this.reconcileUnclaimedReportForEvidenceChange(
+          working,
+          reportPayloadHash,
+          observedAt,
+        );
         try {
           appendOpsWorkerEvidence(working, {
-            at: this.nextUpdatedAt(working),
+            at: observedAt,
             kind: "system",
             trust: "trusted",
             summary: JSON.stringify(receipt),
@@ -872,7 +941,6 @@ export class OpsWorkerTaskStore {
             `Task ${activeOwner.id} has no durable delivery-receipt capacity`,
           );
         }
-        working.updatedAt = this.nextUpdatedAt(working);
         compactOpsWorkerEvidenceForSnapshot(working);
         const persisted = parseOpsWorkerTask(working, this.registry);
         this.assertImmutableIdentity(activeOwner, persisted);
@@ -902,13 +970,16 @@ export class OpsWorkerTaskStore {
           `Refusing to replace existing task ${task.id} through create`,
         );
       }
+      this.refreshAcceptedFiringObservation(task, task, true);
+      compactOpsWorkerEvidenceForSnapshot(task);
+      const persisted = parseOpsWorkerTask(task, this.registry);
       this.assertJournalSafe();
-      this.assertGlobalInvariants([...currentTasks, task]);
+      this.assertGlobalInvariants([...currentTasks, persisted]);
       this.injectFault("after-correlation-check");
       return {
-        task,
+        task: persisted,
         created: true,
-        ...this.write(task, snapshotPath, audit),
+        ...this.write(persisted, snapshotPath, audit),
       };
     });
   }
@@ -1168,6 +1239,89 @@ export class OpsWorkerTaskStore {
       this.now().getTime(),
       Date.parse(task.updatedAt) + 1,
     )).toISOString();
+  }
+
+  private refreshAcceptedFiringObservation(
+    task: OpsWorkerTask,
+    submission: Readonly<OpsWorkerTask>,
+    initial = false,
+  ): string {
+    const observedAt = new Date(Math.max(
+      this.now().getTime(),
+      Date.parse(submission.createdAt),
+      Date.parse(task.updatedAt) + (initial ? 0 : 1),
+    )).toISOString();
+    task.evidence = task.evidence.filter((entry) =>
+      parseFiringObservation(entry) === undefined);
+    appendOpsWorkerEvidence(task, {
+      at: observedAt,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "alertmanager-firing-observation-v1",
+        correlationKey: task.source.correlationKey,
+        deliveryKey: submission.source.deliveryKey,
+      } satisfies OpsWorkerFiringObservation),
+      artifact: null,
+    });
+    // BLOCKED verification is part of the pending durable report identity.
+    // The explicit retry transition clears it before checks can resume.
+    if (task.state !== "BLOCKED") task.verification = null;
+    if (task.state === "CHECKING") task.schedule.nextCheckAt = observedAt;
+    task.updatedAt = observedAt;
+    return observedAt;
+  }
+
+  private mergeCoalescedAlertEvidence(
+    task: OpsWorkerTask,
+    submission: Readonly<OpsWorkerTask>,
+  ): void {
+    for (const evidence of submission.evidence) {
+      if (
+        evidence.kind !== "alert"
+        || evidence.trust !== "untrusted"
+        || isAlertmanagerGroupCorrelationEvidence(
+          evidence,
+          submission.source.correlationKey,
+        )
+      ) continue;
+      const duplicate = task.evidence.findIndex((candidate) =>
+        candidate.kind === evidence.kind
+        && candidate.trust === evidence.trust
+        && candidate.summary === evidence.summary
+        && candidate.artifact === evidence.artifact);
+      if (duplicate >= 0) task.evidence.splice(duplicate, 1);
+      appendOpsWorkerEvidence(task, structuredClone(evidence));
+    }
+  }
+
+  private reconcileUnclaimedReportForEvidenceChange(
+    task: OpsWorkerTask,
+    previousPayloadHash: string,
+    observedAt: string,
+  ): void {
+    if (hashOpsWorkerReportPayload(task) === previousPayloadHash) return;
+    const receipt = task.mutationReceipts.report;
+    if (task.report.state !== "PENDING" || receipt === null || receipt.outcome !== null) return;
+    if (receipt.mutationStartedAt !== null) {
+      throw new OpsWorkerTaskStoreSafetyError(
+        `Task ${task.id} cannot change report evidence while its report delivery is unresolved`,
+      );
+    }
+    receipt.outcome = {
+      recordedAt: new Date(Math.max(
+        Date.parse(observedAt),
+        Date.parse(receipt.queryObservedAt),
+      )).toISOString(),
+      result: "NOT_NEEDED",
+      evidenceHash: `sha256:${createHash("sha256").update(JSON.stringify({
+        taskId: task.id,
+        operationId: receipt.operationId,
+        reason: "unclaimed report payload superseded by evolving Alertmanager evidence",
+      })).digest("hex")}`,
+    };
+    task.report.attempts = 0;
+    task.report.lastError = null;
   }
 
   private appendSteeringEntry(

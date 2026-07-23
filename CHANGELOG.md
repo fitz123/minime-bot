@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Route every Alertmanager firing group through one generic Ops incident with
+  schema-v6 typed agent results, deterministic fresh absence and five-minute
+  stability verification, bounded redacted reports, and unchanged approval
+  gates. Trusted embeddings must add the incident monitoring readers, use the
+  validator-v2 authorization snapshot, and initialize direct schema-v6 task
+  construction with `agentResult: null` (#58).
+- Add opt-in forward-first delivery to the Node-independent Alertmanager
+  webhook with exact source verification, authenticated Ops forwarding,
+  retry-preserving native fallback, and required critical dual delivery (#58).
+
 ## 2026.7.26
 
 - Clamp future Prometheus availability sample timestamps to trusted local query time so small host/VM clock skew cannot invalidate deterministic Ops verification (#122).

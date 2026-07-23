@@ -92,12 +92,74 @@ and restrict it with the host firewall where appropriate.
 
 The webhook flags are `--host` (default `127.0.0.1`), `--port` (default 9876),
 `--path` (default `/alertmanager`), `--max-body` (default 256 KiB), and
-`--body-timeout` (default 5 seconds, capped at 30). `GET /healthz` is its local
-readiness endpoint. Only IPv4 loopback or `localhost` bind hosts are accepted.
+`--body-timeout` (default 5 seconds, capped at 30). Optional bridge flags are
+`--ops-intake-url`, `--alertmanager-url`, and `--bridge-timeout` (default 5
+seconds, capped at 30). `GET /healthz` is its local readiness endpoint. Only
+IPv4 loopback or `localhost` bind hosts are accepted.
 `MINIME_WEBHOOK_HOST`, `MINIME_WEBHOOK_PORT`, and `MINIME_WEBHOOK_PATH` provide
 the corresponding launchd environment settings. The body timeout is an
 absolute input deadline, and the receiver caps concurrent requests so slow
 local clients cannot create unbounded request threads.
+
+Bridge mode is opt-in and requires all of the following settings:
+
+- `MINIME_OPS_INTAKE_URL` is the loopback HTTP URL ending in
+  `/intake/alertmanager`.
+- `MINIME_ALERTMANAGER_URL` is a loopback HTTP base URL with no credentials,
+  query, fragment, or non-root path.
+- `MINIME_OPS_INTAKE_SOPS_FILE` and `MINIME_OPS_INTAKE_SOPS_KEY` identify the
+  existing Ops intake bearer in SOPS; the key uses the same dotted-identifier
+  grammar as the Telegram key.
+- Optional `MINIME_BRIDGE_TIMEOUT` sets the source-query and Ops-forward
+  deadline above zero and no more than 30 seconds.
+
+Partial or non-loopback bridge configuration fails startup; setting only the
+optional bridge timeout also counts as partial bridge configuration. The named
+Ops secret is decrypted alone into process memory. Its value is never written to
+arguments, logs, errors, or forwarded payloads. Bridge mode preserves the
+256 KiB body ceiling and forwards the original validated Alertmanager v4 body
+with bearer authentication.
+
+Bridge validation accepts up to 1,024 alerts within that byte ceiling, matching
+Ops intake. An empty `groupLabels` map is the valid single group produced by an
+ungrouped route; source verification still requires every delivered firing
+member's label set and episode start to remain current, plus its fingerprint
+when supplied. Valid UTF-8 group-label names are accepted and quoted in
+Prometheus and Alertmanager matchers when they are not legacy-compatible names.
+
+For each firing delivery, the webhook first queries loopback Alertmanager's
+grouped API with group-label and exact-receiver filters. The returned routed
+group must have exactly the delivered `groupLabels` and receiver, and every
+delivered firing member's labels and `startsAt` must exactly match a current
+active, suppressed, or unprocessed member; a supplied fingerprint must match
+too. The server-side filters keep unrelated global alert cardinality outside
+the bounded response. Native deduplication derives its episode identity from
+the verified receiver, group descriptor, and de-duplicated firing-member labels
+and start times, never the opaque webhook `groupKey`. Critical classification
+and firing-batch native text likewise use only that verified firing set, so
+resolved-member text or duplicate multiplicity cannot create a new escalation.
+A batch is critical when at least one de-duplicated decision member has the
+exact, case-sensitive label `severity="critical"`. Firing batches consider only
+verified firing members; resolved-only batches consider their resolved members.
+All other values and casing are noncritical.
+A mismatch is treated as stale or forged input and is acknowledged without
+forwarding. A source-query failure uses native fallback and returns 503 so
+Alertmanager retries. Once the source is verified, required sinks are:
+
+- Noncritical: Ops acceptance is required. Success is quiet. Rejection,
+  timeout, or outage sends native fallback but still returns 503.
+- Critical: both Ops acceptance and native Telegram delivery are required;
+  failure of either returns 503.
+- Resolved-only: nothing is forwarded to Ops. Noncritical input is
+  acknowledged quietly; critical input uses native Telegram and requires it to
+  succeed.
+
+The webhook returns 2xx only after every required sink succeeds. Its separate
+process-local Ops and native deduplication state prevents a successful fallback
+or escalation from being repeated while Alertmanager retries an incomplete Ops
+delivery. Ops intake replay and coalescing provide durable task idempotency;
+native deduplication remains the bounded process-local contract described
+below. Setting none of the bridge variables preserves native-only delivery.
 
 Merge the example Alertmanager receiver into the active configuration rather
 than replacing operator configuration. Validate the active configuration,
@@ -114,10 +176,23 @@ loaded rules and firing state, then Alertmanager health, loaded configuration,
 routing and notification status. Check that each configured bind mount points
 to the intended current file.
 
-Post controlled synthetic firing and resolved Alertmanager payloads using
-placeholder labels and confirm one Telegram message for each transition.
-Repost the same payload to confirm batch deduplication. A delivery failure
-returns a non-2xx response so Alertmanager can retry.
+With bridge mode disabled, post controlled synthetic firing and resolved
+Alertmanager payloads using placeholder labels and confirm one Telegram message
+for each transition. Repost the same payload to confirm batch deduplication.
+
+Validate bridge mode with a real controlled group that is active in the queried
+Alertmanager; an arbitrary manually posted firing body is intentionally treated
+as stale unless its exact group is current. Check the complete delivery matrix:
+
+- a noncritical firing creates or replays one Ops task and stays quiet on
+  Telegram;
+- a critical firing reaches both Ops and Telegram;
+- a noncritical resolved-only delivery is quiet;
+- source-query or Ops failure sends one native fallback, returns 503, and does
+  not repeat the successful fallback while the same body retries.
+
+A required delivery failure returns a non-2xx response so Alertmanager can
+retry.
 Deduplication is process-local, retains at most 1,024 successful batch digests
 for one hour, and resets when the webhook restarts. It suppresses immediate
 retries; it is not durable exactly-once delivery. Large batches are summarized
@@ -215,7 +290,13 @@ the configured key without printing its value. Check launchd with
 `launchctl print`, then verify Prometheus targets and rules and Alertmanager
 routing. Revalidate Compose configuration before recreating services.
 
-Rollback is additive: boot out and remove the two copied launchd plists, remove
-the added Alertmanager receiver/routing and Prometheus rule/scrape entries, and
-recreate the monitoring services from the validated prior configuration.
-Removing these helpers does not change the bot runtime.
+Bridge-only rollback keeps native delivery live: remove all four required
+bridge settings (and optional `MINIME_BRIDGE_TIMEOUT`) together, restart the
+webhook, verify a controlled native notification, and only then remove unused
+Ops-side wiring. No Alertmanager receiver change is needed because the same
+Node-independent webhook remains its receiver.
+
+Full monitoring rollback is additive: boot out and remove the two copied
+launchd plists, remove the added Alertmanager receiver/routing and Prometheus
+rule/scrape entries, and recreate the monitoring services from the validated
+prior configuration. Removing these helpers does not change the bot runtime.

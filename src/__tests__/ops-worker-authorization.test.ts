@@ -16,18 +16,21 @@ import {
 } from "../ops-worker/types.js";
 import {
   OPS_AVAILABILITY_DONE_CHECK_NAME,
-  OPS_AVAILABILITY_INVARIANTS,
-  OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
   type OpsAlertStateReading,
   type OpsMonitoringFreshnessReading,
   type OpsServiceAvailabilityReading,
 } from "../ops-worker/availability-checks.js";
 import {
+  OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
   OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_AVAILABILITY_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
   hashOpsAlertmanagerAuthorizationSnapshot,
+  hashOpsLegacyAlertmanagerAuthorizationSnapshot,
   type OpsAlertmanagerAuthorizationSnapshot,
 } from "../ops-worker/ops-contracts.js";
 import { inspectOpsWorkerPolicy } from "../ops-worker/status-server.js";
@@ -81,7 +84,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
   lifecycle.canonicalTask = remote.canonicalTask;
   lifecycle.repository = remote.repository.identity;
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "authorized-issue-58",
     source: {
       kind: "authorized-issue",
@@ -106,6 +109,7 @@ function task(remote: Adr091AuthorizedIssueSnapshot): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -397,8 +401,9 @@ function alertmanagerSnapshot(
 ): OpsAlertmanagerAuthorizationSnapshot {
   return {
     sourceIdentity,
-    invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-    template: OPS_AVAILABILITY_TEMPLATE_NAME,
+    template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+    doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
     profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   };
 }
@@ -409,6 +414,20 @@ function opsContracts(
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: reader,
     clock: () => new Date(NOW),
+    incidentMonitoringReader: {
+      readMonitoringFreshness: async () => ({
+        observedAt: NOW,
+        latestSampleAt: NOW,
+      }),
+      readResolutionStability: async () => ({
+        observedAt: NOW,
+        latestMatchingSampleAt: null,
+        monitoringWindowStartedAt: "2026-07-18T11:55:00.000Z",
+      }),
+    },
+    incidentAlertmanagerReader: {
+      readExactGroupState: async () => ({ observedAt: NOW, status: "ABSENT" }),
+    },
     monitoringFreshnessReader: {
       readMonitoringFreshness: async () => ({
         observedAt: NOW,
@@ -436,7 +455,7 @@ function alertmanagerTask(
 ): OpsWorkerTask {
   const lifecycle = createEmptyOpsWorkerLifecycleManifest();
   const task = withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "alertmanager-availability-fixture",
     source: {
       kind: "alertmanager",
@@ -450,7 +469,7 @@ function alertmanagerTask(
     mutationReceipts: createEmptyOpsWorkerMutationReceipts(),
     custody: createUnclaimedOpsWorkerCustody(),
     priority: 0,
-    objective: OPS_AVAILABILITY_INVARIANTS[claimed.invariant].objective,
+    objective: claimed.objective,
     evidence: [{
       at: NOW,
       kind: "alert",
@@ -459,8 +478,8 @@ function alertmanagerTask(
       artifact: null,
     }],
     doneCheck: {
-      name: OPS_AVAILABILITY_DONE_CHECK_NAME,
-      params: { invariant: claimed.invariant },
+      name: claimed.doneCheck,
+      params: {},
     },
     authorization: {
       profile: claimed.profile,
@@ -470,12 +489,13 @@ function alertmanagerTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
     rounds: {
       remediation: 0,
-      maxRemediation: 3,
+      maxRemediation: 5,
       consecutiveInfrastructureFailures: 0,
     },
     schedule: { nextRunAt: null, nextCheckAt: null },
@@ -491,6 +511,25 @@ function alertmanagerTask(
     createdAt: NOW,
     updatedAt: NOW,
   });
+  return task;
+}
+
+function legacyAlertmanagerTask(): OpsWorkerTask {
+  const task = alertmanagerTask();
+  task.source.template = OPS_AVAILABILITY_TEMPLATE_NAME;
+  task.objective = "Restore and verify Minime bot host availability.";
+  task.doneCheck = {
+    name: OPS_AVAILABILITY_DONE_CHECK_NAME,
+    params: { invariant: "minime-bot-host" },
+  };
+  task.authorization.snapshotHash = hashOpsLegacyAlertmanagerAuthorizationSnapshot({
+    sourceIdentity: ALERT_SOURCE_IDENTITY,
+    invariant: "minime-bot-host",
+    template: OPS_AVAILABILITY_TEMPLATE_NAME,
+    profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
+  });
+  task.rounds.maxRemediation = 3;
+  task.submissionFingerprint = hashOpsWorkerCanonicalSubmission(task);
   return task;
 }
 
@@ -549,7 +588,8 @@ describe("package-owned alertmanager authorization verifier", () => {
       null,
       { ...alertmanagerSnapshot(), extra: true },
       { ...alertmanagerSnapshot(), sourceIdentity: "INVALID IDENTITY" },
-      { ...alertmanagerSnapshot(), invariant: "unknown-invariant" },
+      { ...alertmanagerSnapshot(), doneCheck: "INVALID CHECK" },
+      { ...alertmanagerSnapshot(), objective: "" },
     ]) {
       const contracts = opsContracts({ read: () => malformed });
       assert.equal(
@@ -574,10 +614,17 @@ describe("package-owned alertmanager authorization verifier", () => {
     sourceIdentity.submissionFingerprint = hashOpsWorkerCanonicalSubmission(sourceIdentity);
     cases.push(sourceIdentity);
 
-    const invariant = alertmanagerTask();
-    invariant.doneCheck.params = { invariant: "unknown-invariant" };
-    invariant.submissionFingerprint = hashOpsWorkerCanonicalSubmission(invariant);
-    cases.push(invariant);
+    const params = alertmanagerTask();
+    params.doneCheck.params = { alertname: "payload-selected-check" };
+    params.submissionFingerprint = hashOpsWorkerCanonicalSubmission(params);
+    cases.push(params);
+
+    const remediationBudget = alertmanagerTask();
+    remediationBudget.rounds.maxRemediation = 3;
+    remediationBudget.submissionFingerprint = hashOpsWorkerCanonicalSubmission(
+      remediationBudget,
+    );
+    cases.push(remediationBudget);
 
     const scope = alertmanagerTask();
     scope.authorization.scope = ["inspect"];
@@ -594,11 +641,43 @@ describe("package-owned alertmanager authorization verifier", () => {
     }
   });
 
+  it("accepts only the exact closed legacy Alertmanager claim under current trusted identity", async () => {
+    const verifier = opsContracts({ read: () => alertmanagerSnapshot() })
+      .alertmanagerAuthorizationVerifier;
+    assert.equal((await verifier.verify(legacyAlertmanagerTask())).status, "PASS");
+
+    for (const mutate of [
+      (task: OpsWorkerTask) => { task.rounds.maxRemediation = 5; },
+      (task: OpsWorkerTask) => { task.doneCheck.params = {}; },
+      (task: OpsWorkerTask) => { task.agentResult = {
+        attemptId: "attempt-forged-legacy",
+        kind: "no-action-needed",
+        summary: "Forged legacy typed result.",
+        actions: [],
+        requestedInput: null,
+        reason: null,
+      }; },
+      (task: OpsWorkerTask) => { task.authorization.snapshotHash = `sha256:${"e".repeat(64)}`; },
+    ]) {
+      const candidate = legacyAlertmanagerTask();
+      mutate(candidate);
+      assert.equal((await verifier.verify(candidate)).status, "INVALID_CLAIM");
+    }
+
+    const drifted = opsContracts({
+      read: () => alertmanagerSnapshot("replacement-alertmanager"),
+    }).alertmanagerAuthorizationVerifier;
+    assert.equal((await drifted.verify(legacyAlertmanagerTask())).status, "DRIFT");
+  });
+
   it("registers closed production contracts and fails start policy without every source verifier", () => {
     const contracts = opsContracts({ read: () => alertmanagerSnapshot() });
     assert.deepEqual(contracts.taskRegistry.templates, {
       [OPS_AVAILABILITY_TEMPLATE_NAME]: {
         sourceKinds: ["alertmanager", "operator-cli"],
+      },
+      [OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME]: {
+        sourceKinds: ["alertmanager"],
       },
     });
     assert.deepEqual(contracts.taskRegistry.authorizationProfiles, {
@@ -609,6 +688,7 @@ describe("package-owned alertmanager authorization verifier", () => {
     });
     assert.deepEqual(Object.keys(contracts.taskRegistry.doneChecks), [
       OPS_AVAILABILITY_DONE_CHECK_NAME,
+      OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
     ]);
 
     assert.throws(
@@ -640,21 +720,29 @@ describe("package-owned alertmanager authorization verifier", () => {
     assert.deepEqual(policy.authorization.contracts, [{
       source: "alertmanager",
       verifierIdentity: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_IDENTITY,
-      verifierVersion: "1",
+      verifierVersion: OPS_ALERTMANAGER_AUTHORIZATION_VALIDATOR_VERSION,
     }]);
     assert.equal(policy.authorization.verifierCount, 1);
     assert.match(policy.authorization.contractsHash, /^sha256:[a-f0-9]{64}$/);
-    assert.equal(policy.verification.contracts.length, 1);
+    assert.equal(policy.verification.contracts.length, 2);
+    const availabilityContract = policy.verification.contracts.find(
+      (contract) => contract.name === OPS_AVAILABILITY_DONE_CHECK_NAME,
+    );
+    const incidentContract = policy.verification.contracts.find(
+      (contract) => contract.name === OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+    );
+    assert.ok(availabilityContract);
+    assert.ok(incidentContract);
     assert.deepEqual(
       Object.keys(policy.verification.contracts[0]).sort(),
       ["contractHash", "name", "verifierIdentity", "verifierVersion"],
     );
-    assert.equal(policy.verification.contracts[0].name, OPS_AVAILABILITY_DONE_CHECK_NAME);
-    assert.equal(policy.verification.contracts[0].verifierVersion, "1");
+    assert.equal(availabilityContract.verifierVersion, "1");
     assert.match(
-      policy.verification.contracts[0].contractHash,
+      availabilityContract.contractHash,
       /^sha256:[a-f0-9]{64}$/,
     );
+    assert.equal(incidentContract.verifierVersion, "1");
     const serialized = JSON.stringify(policy);
     assert.equal(serialized.includes(ALERT_SOURCE_IDENTITY), false);
     assert.equal(serialized.includes("Restore and verify"), false);

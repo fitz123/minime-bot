@@ -31,7 +31,9 @@ import {
 } from "../../ops-worker/done-checks.js";
 import { OpsWorkerLifecycle } from "../../ops-worker/lifecycle.js";
 import {
-  OPS_AVAILABILITY_TEMPLATE_NAME,
+  OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+  OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
+  OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
   OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
   createOpsTaskContracts,
 } from "../../ops-worker/ops-contracts.js";
@@ -260,7 +262,7 @@ function makeTask(
   const sourceKind = options.sourceKind ?? "operator-cli";
   const createdAt = options.createdAt ?? NOW;
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: sourceKind,
@@ -285,6 +287,7 @@ function makeTask(
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -498,12 +501,24 @@ function availabilityContracts() {
     alertmanagerAuthorizationSnapshotReader: {
       read: () => ({
         sourceIdentity: SOURCE_IDENTITY,
-        invariant: OPS_MINIME_BOT_HOST_AVAILABILITY_INVARIANT,
-        template: OPS_AVAILABILITY_TEMPLATE_NAME,
+        template: OPS_ALERTMANAGER_INCIDENT_TEMPLATE_NAME,
+        doneCheck: OPS_ALERTMANAGER_INCIDENT_DONE_CHECK_NAME,
+        objective: OPS_ALERTMANAGER_INCIDENT_OBJECTIVE,
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
       }),
     },
     clock: () => new Date(NOW),
+    incidentMonitoringReader: {
+      readMonitoringFreshness: () => ({ observedAt: NOW, latestSampleAt: NOW }),
+      readResolutionStability: () => ({
+        observedAt: NOW,
+        latestMatchingSampleAt: null,
+        monitoringWindowStartedAt: "2026-07-19T11:55:00.000Z",
+      }),
+    },
+    incidentAlertmanagerReader: {
+      readExactGroupState: () => ({ observedAt: NOW, status: "ABSENT" }),
+    },
     monitoringFreshnessReader: {
       readMonitoringFreshness: () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
     },

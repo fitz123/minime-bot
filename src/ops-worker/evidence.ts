@@ -28,6 +28,12 @@ function isProtectedAlertmanagerEvidence(
       && typed.type === "alertmanager-delivery-receipt-v1"
       && typeof typed.deliveryKey === "string"
       && typeof typed.submissionFingerprint === "string"
+    ) || (
+      evidence.kind === "system"
+      && evidence.trust === "trusted"
+      && typed.type === "alertmanager-firing-observation-v1"
+      && typed.correlationKey === task.source.correlationKey
+      && typeof typed.deliveryKey === "string"
     );
   } catch {
     return false;

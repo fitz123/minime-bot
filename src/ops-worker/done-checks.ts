@@ -8,6 +8,7 @@ import {
   type OpsWorkerDoneCheck,
   type OpsWorkerDoneCheckContract,
   type OpsWorkerSourceKind,
+  type OpsWorkerVerificationRecord,
   type OpsWorkerVerificationComponentEvidence,
   type OpsWorkerVerificationConvergenceKind,
   type OpsWorkerVerificationOutcome,
@@ -42,6 +43,8 @@ export interface OpsWorkerDoneCheckContext {
   sourceKind?: OpsWorkerSourceKind;
   sourceCorrelationKey?: string;
   sourceEvidence?: readonly OpsWorkerEvidence[];
+  /** Last durable result for the same validated task subject, when one exists. */
+  previousVerification?: Readonly<OpsWorkerVerificationRecord>;
 }
 
 export interface OpsWorkerDoneCheckComponentDefinition {
@@ -345,6 +348,9 @@ async function runComponent(
       );
     }
   } finally {
+    // Component implementations may start more than one read. Abort any
+    // sibling work that is still pending after an early result or failure.
+    controller.abort();
     if (timer !== undefined) clearTimeout(timer);
     removeExternalAbort?.();
   }

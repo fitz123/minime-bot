@@ -45,11 +45,13 @@ import {
   OPS_WORKER_LIMITS,
   OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
   hashOpsWorkerPiLaunchSubject,
+  hashOpsWorkerReportPayload,
   hashOpsWorkerVerificationSubject,
   isOpsWorkerTerminalState,
   isOpsWorkerUnclaimedQuotaProbeProcess,
   requiresOpsWorkerInitialQuotaAdmission,
   type OpsWorkerActiveRun,
+  type OpsWorkerAgentResult,
   type OpsWorkerCustodyReleaseReason,
   type OpsWorkerEvidence,
   type OpsWorkerInterrupt,
@@ -585,6 +587,42 @@ function timestampAtOrAfter(now: Date, floor: string): string {
   return new Date(Math.max(now.getTime(), Date.parse(floor))).toISOString();
 }
 
+function reportOperation(intent: unknown): {
+  boundary: "report";
+  operationId: string;
+  intent: unknown;
+} {
+  const intentHash = hashOpsWorkerCanonicalPayload(intent);
+  return {
+    boundary: "report",
+    operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+    intent,
+  };
+}
+
+function compatibleReportOperations(
+  task: Readonly<OpsWorkerTask>,
+  reportIdentity: string,
+): Array<ReturnType<typeof reportOperation>> {
+  const current = reportOperation({
+    reportIdentity,
+    reportPayloadHash: hashOpsWorkerReportPayload(task),
+  });
+  const v5 = reportOperation({
+    reportIdentity,
+    taskState: task.state,
+    lastOutcome: task.lastOutcome === null
+      ? null
+      : {
+          at: task.lastOutcome.at,
+          kind: task.lastOutcome.kind,
+          result: task.lastOutcome.result,
+          summary: task.lastOutcome.summary,
+        },
+  });
+  return [current, v5];
+}
+
 export class OpsWorkerSupervisor {
   private readonly store: OpsWorkerTaskStore;
   private readonly doneChecks: OpsWorkerDoneCheckRegistry;
@@ -867,6 +905,7 @@ export class OpsWorkerSupervisor {
         ),
       };
       task.verification = null;
+      if (interrupt.mode === "cancel") task.agentResult = null;
       this.supersedeReportEpisode(
         task,
         at,
@@ -1629,6 +1668,7 @@ export class OpsWorkerSupervisor {
       task.schedule.nextCheckAt = null;
       task.lastOutcome = null;
       task.verification = null;
+      task.agentResult = null;
       task.report.state = "NONE";
       task.report.attempts = 0;
       task.report.lastError = null;
@@ -1737,6 +1777,101 @@ export class OpsWorkerSupervisor {
     }, target === "CHECKING"
       ? "Pi claim queued deterministic done check"
       : "Pi claim retained task for pending operator steering");
+  }
+
+  recordPiAgentResult(
+    taskId: string,
+    result: OpsWorkerAgentResult,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (
+      existing.state !== "RUNNING"
+      || existing.activeRun === null
+      || existing.activeRun.attemptId !== result.attemptId
+    ) {
+      throw new OpsWorkerSupervisorStateError(
+        `Typed agent result must match the active RUNNING attempt for ${taskId}`,
+      );
+    }
+    const blocks = result.kind === "input-needed" || result.kind === "impossible";
+    const target = blocks
+      ? "BLOCKED"
+      : hasPendingPromptSteering(existing)
+      ? "RESUMABLE"
+      : "CHECKING";
+    return this.transition(taskId, target, (task, at) => {
+      if (target === "CHECKING") this.pinDoneCheckContract(task);
+      task.activeRun = null;
+      task.session.resume = true;
+      task.rounds.consecutiveInfrastructureFailures = 0;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.verification = null;
+      task.agentResult = structuredClone(result);
+      task.lastOutcome = {
+        at,
+        kind: "PI_EXIT",
+        result: blocks ? "BLOCKED" : "SUCCESS_CLAIM",
+        summary: blocks
+          ? `Agent reported durable ${result.kind}`
+          : `Agent reported ${result.kind} and requested deterministic verification`,
+      };
+      if (blocks) {
+        task.report.state = "PENDING";
+        task.report.attempts = 0;
+        task.report.lastError = null;
+      }
+      if (evidenceSummary) {
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, blocks
+      ? `Typed agent result ${result.kind} blocked task and queued report`
+      : target === "CHECKING"
+      ? `Typed agent result ${result.kind} queued deterministic done check`
+      : `Typed agent result ${result.kind} retained pending operator steering`);
+  }
+
+  recordAgentProtocolFailure(
+    taskId: string,
+    summary: string,
+    evidenceSummary?: string,
+  ): OpsWorkerTask {
+    this.assertStarted();
+    const existing = this.requireTask(taskId);
+    if (existing.state !== "RUNNING" || existing.activeRun === null) {
+      throw new OpsWorkerSupervisorStateError(
+        `Agent protocol failure requires RUNNING, found ${existing.state}`,
+      );
+    }
+    const terminal = existing.rounds.remediation + 1 >= existing.rounds.maxRemediation;
+    return this.transition(taskId, terminal ? "BLOCKED" : "RESUMABLE", (task, at) => {
+      task.activeRun = null;
+      task.session.resume = true;
+      task.rounds.remediation += 1;
+      task.rounds.consecutiveInfrastructureFailures = 0;
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      task.verification = null;
+      task.agentResult = null;
+      task.lastOutcome = {
+        at,
+        kind: "PI_EXIT",
+        result: "PROTOCOL_FAILURE",
+        summary: truncateUtf8(summary, OPS_WORKER_LIMITS.maxOutcomeSummaryBytes),
+      };
+      if (terminal) {
+        task.report.state = "PENDING";
+        task.report.attempts = 0;
+        task.report.lastError = null;
+      }
+      if (evidenceSummary) {
+        appendOpsWorkerEvidence(task, this.piEvidence(at, evidenceSummary));
+      }
+    }, terminal
+      ? "Agent result protocol exhausted remediation rounds and queued report"
+      : "Agent result protocol failure consumed one remediation round");
   }
 
   recordQuotaAdmissionWait(
@@ -2483,6 +2618,9 @@ export class OpsWorkerSupervisor {
         sourceKind: task.source.kind,
         sourceCorrelationKey: task.source.correlationKey,
         sourceEvidence: task.evidence,
+        previousVerification: task.verification === null
+          ? undefined
+          : structuredClone(task.verification),
         expectedContract,
         now: this.now,
       }, signal);
@@ -2575,6 +2713,7 @@ export class OpsWorkerSupervisor {
       task.report.lastError = null;
       task.lastOutcome = null;
       task.verification = null;
+      task.agentResult = null;
     }, "Operator retried blocked task", { steering });
   }
 
@@ -2606,6 +2745,7 @@ export class OpsWorkerSupervisor {
         summary,
       };
       task.verification = null;
+      task.agentResult = null;
       this.supersedeReportEpisode(
         task,
         at,
@@ -2641,24 +2781,16 @@ export class OpsWorkerSupervisor {
       deliveryKey: task.source.deliveryKey,
       createdAt: task.createdAt,
     });
-    const reportIntent = {
-      reportIdentity,
-      taskState: task.state,
-      lastOutcome: task.lastOutcome === null
-        ? null
-        : {
-          at: task.lastOutcome.at,
-          kind: task.lastOutcome.kind,
-          result: task.lastOutcome.result,
-          summary: task.lastOutcome.summary,
-        },
-    };
-    const reportPayloadHash = hashOpsWorkerCanonicalPayload(reportIntent);
-    const operation = {
-      boundary: "report" as const,
-      operationId: `report:${reportPayloadHash.slice("sha256:".length, 31)}`,
-      intent: reportIntent,
-    };
+    const reportTask = structuredClone(task);
+    const operations = compatibleReportOperations(reportTask, reportIdentity);
+    const unfinishedReceipt = task.mutationReceipts.report;
+    const operation = unfinishedReceipt?.outcome === null
+      ? operations.find((candidate) =>
+          candidate.operationId === unfinishedReceipt.operationId
+          && hashOpsWorkerCanonicalPayload(candidate.intent) === unfinishedReceipt.intentHash)
+        ?? operations[0]
+      : operations[0];
+    const reportIntentHash = hashOpsWorkerCanonicalPayload(operation.intent);
     task = this.lifecycle.updateLifecycleIdentity(taskId, {
       report: reportIdentity,
     });
@@ -2696,11 +2828,23 @@ export class OpsWorkerSupervisor {
     });
     if (!authorization.authorized) return authorization.task;
     if (!claimed) {
+      const latestReceipt = authorization.task.mutationReceipts.report;
+      if (
+        authorization.task.report.state !== "PENDING"
+        || (
+          latestReceipt?.operationId === operation.operationId
+          && latestReceipt.intentHash === reportIntentHash
+          && latestReceipt.mutationStartedAt === null
+          && latestReceipt.outcome?.result === "NOT_NEEDED"
+          && hashOpsWorkerReportPayload(authorization.task)
+            !== hashOpsWorkerReportPayload(reportTask)
+        )
+      ) return authorization.task;
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} report receipt cannot claim another bookkeeping mutation`,
       );
     }
-    const result = await attempt(authorization.task);
+    const result = await attempt(reportTask);
     return this.store.mutate(
       taskId,
       {
@@ -2722,7 +2866,7 @@ export class OpsWorkerSupervisor {
         if (
           receipt === null
           || receipt.operationId !== operation.operationId
-          || receipt.intentHash !== reportPayloadHash
+          || receipt.intentHash !== reportIntentHash
           || receipt.mutationStartedAt === null
           || receipt.outcome !== null
         ) {

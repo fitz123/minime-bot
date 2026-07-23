@@ -86,7 +86,7 @@ const config: OpsWorkerControlConfig = {
 
 function makeTask(id: string): OpsWorkerTask {
   return withOpsWorkerSubmissionFingerprint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id,
     source: {
       kind: "operator-cli",
@@ -111,6 +111,7 @@ function makeTask(id: string): OpsWorkerTask {
     authorizationVerification: null,
     verification: null,
     legacyCompletion: null,
+    agentResult: null,
     steering: [],
     control: { paused: false, pausedAt: null, interrupt: null },
     state: "QUEUED",
@@ -884,6 +885,14 @@ describe("ops worker dedicated Telegram control", () => {
     };
     retryTask.rounds.remediation = retryTask.rounds.maxRemediation;
     retryTask.lastOutcome = { at: NOW, kind: "OPERATOR", result: "BLOCKED", summary: "Fixture blocked." };
+    retryTask.agentResult = {
+      attemptId: "attempt-blocked-fixture",
+      kind: "input-needed",
+      summary: "Need an operator answer.",
+      actions: [],
+      requestedInput: "Which bounded fixture should be used?",
+      reason: "information",
+    };
     retryTask.report.state = "PENDING";
     fixture.store.create(retryTask);
     const transport = new FakeTelegramTransport();
@@ -893,19 +902,22 @@ describe("ops worker dedicated Telegram control", () => {
       [update(33, "/task task-safe")],
       [update(34, "/pause task-safe")],
       [update(35, "/resume task-safe")],
-      [update(36, "/retry task-retry")],
-      [update(37, "/cancel task-safe planned operator cancellation")],
-      [update(38, "/unknown")],
+      [update(36, "/answer task-retry use the blue fixture")],
+      [update(37, "/retry task-retry")],
+      [update(38, "/cancel task-safe planned operator cancellation")],
+      [update(39, "/unknown")],
     );
     const client = control(fixture, transport);
 
-    for (let index = 0; index < 8; index += 1) await client.tick();
+    for (let index = 0; index < 9; index += 1) await client.tick();
 
     assert.equal(fixture.store.get("task-safe")?.state, "CANCELLED");
     assert.equal(fixture.store.get("task-safe")?.control.paused, false);
     assert.equal(fixture.store.get("task-retry")?.state, "RESUMABLE");
+    assert.equal(fixture.store.get("task-retry")?.agentResult, null);
+    assert.equal(fixture.store.get("task-retry")?.steering.some((entry) => entry.kind === "answer"), true);
     assert.equal(fixture.store.get("task-retry")?.steering.at(-1)?.kind, "resume");
-    assert.equal(transport.messages.length, 10); // two terminal reports plus eight command replies
+    assert.equal(transport.messages.length, 11); // two terminal reports plus nine command replies
     assert.ok(transport.messages.every((message) =>
       Buffer.byteLength(String(message.text), "utf8") <= config.reply.maxBytes));
     assert.match(String(transport.messages.at(-1)?.text), /Usage:/);
@@ -959,18 +971,26 @@ describe("ops worker dedicated Telegram control", () => {
       instanceId: "report-first",
     });
     const pending = makeTask("task-report");
-    pending.state = "CANCELLED";
+    pending.state = "BLOCKED";
     pending.custody = {
       status: "RELEASED",
       claimedAt: null,
       releasedAt: NOW,
-      releaseReason: "CANCELLED",
+      releaseReason: "BLOCKED",
     };
     pending.lastOutcome = {
       at: NOW,
-      kind: "OPERATOR",
-      result: "CANCELLED",
-      summary: "bounded-report-evidence ".repeat(100),
+      kind: "PI_EXIT",
+      result: "BLOCKED",
+      summary: "Agent reported durable input-needed",
+    };
+    pending.agentResult = {
+      attemptId: "attempt-report-fixture",
+      kind: "input-needed",
+      summary: `Configured secret ${config.telegram.token}; bearer ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789; /Users/private/person/file ${"bounded-report-evidence ".repeat(100)}`,
+      actions: ["Inspected https://user:password@example.invalid/?token=query-secret"],
+      requestedInput: "Provide password=operator-secret for the approved non-secret fixture.",
+      reason: "information",
     };
     pending.report.state = "PENDING";
     first.store.create(pending);
@@ -984,7 +1004,17 @@ describe("ops worker dedicated Telegram control", () => {
       }).tick(),
       /synthetic crash before receipt finish/,
     );
-    assert.match(String(transport.messages[0].text), /… \[truncated\]$/);
+    assert.ok(Buffer.byteLength(String(transport.messages[0].text), "utf8") <= 1_024);
+    for (const required of [
+      "typedOutcome=input-needed reason=information",
+      "diagnosis=",
+      "actions=Inspected",
+      "requestedInput=Provide",
+      "verification=not-run",
+      `checkedAt=${NOW}`,
+    ]) assert.match(String(transport.messages[0].text), new RegExp(required));
+    assert.doesNotMatch(String(transport.messages[0].text), new RegExp(config.telegram.token));
+    assert.doesNotMatch(String(transport.messages[0].text), /ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/);
     const claimed = first.store.get("task-report")?.mutationReceipts.report;
     assert.ok(claimed?.mutationStartedAt);
     assert.equal(claimed.outcome, null);

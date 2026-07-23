@@ -45,8 +45,10 @@ The package also includes an inactive-by-default ops-worker foundation. It
 exposes strict local submission and lifecycle evidence helpers plus loopback
 health/status. Its opt-in feature surface adds continuous authorization,
 primary context/capability attestation, quota-aware waits, typed availability
-verification, a dedicated second-token Telegram control plane, authenticated
-loopback Alertmanager intake, and a deterministic fake fault lab. Nothing
+verification, a generic all-group Alertmanager incident contract with schema-v6
+typed outcomes and redacted reports, a dedicated second-token Telegram control
+plane, authenticated loopback Alertmanager intake, and a deterministic fake
+fault lab. Nothing
 starts automatically: control and intake exist only under an explicit
 `worker start --control-config` with trusted embedding dependencies. See
 [Ops-worker policy, control, intake, and fault lab](docs/ops-worker.md).
@@ -515,6 +517,10 @@ package JavaScript, and the doctor can report failures of the container
 monitoring stack itself. See [Host-native monitoring and Telegram alerts](docs/monitoring.md)
 for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
+
+The webhook can optionally verify current Alertmanager groups and forward them
+to the generic Ops incident intake while retaining native fallback and required
+critical dual delivery. Direct native Telegram delivery remains the default.
 
 An opt-in same-host recovery supervisor can durably correlate and verify those
 native signals while exposing bounded controls and native fallback. `observe`
