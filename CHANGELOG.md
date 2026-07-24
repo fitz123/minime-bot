@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.30
+
+- Keep non-activation slot staging from reconciling pending selector
+  transitions, and assemble frozen nested dependency closures for the first
+  relocation cutover (#58, #137).
+
 ## 2026.7.29
 
 - Make bot slots self-contained with the installed dependency closure, recover
