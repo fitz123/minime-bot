@@ -214,6 +214,7 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/deliver.sh",
     "scripts/monitoring_native.py",
     "scripts/alertmanager_webhook.py",
+    "scripts/bot_slots.py",
     "scripts/runtime_doctor.py",
     "scripts/recovery_config.py",
     "scripts/recovery_ledger.py",

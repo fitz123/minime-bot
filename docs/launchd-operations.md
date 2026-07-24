@@ -149,6 +149,45 @@ left alone temporarily.
 Cron sync never owns the bot service label. It must not bootout, bootstrap,
 kill, signal, or otherwise restart `ai.minime.telegram-bot`.
 
+### Package-owned bot release slots
+
+`scripts/bot_slots.py` manages immutable local bot release copies independently
+of the restart helper:
+
+```text
+/path/to/bot-slots/
+  releases/<release-id>/
+  current -> releases/<release-id>
+  previous -> releases/<release-id>
+  state/active.json
+```
+
+Stage copies an already-installed bot tree into a temporary release directory,
+writes and re-verifies its bounded SHA-256 manifest, and publishes the release
+with an atomic rename. Activation verifies the selected release before
+replacing each `previous` and `current` selector symlink with an atomic rename.
+Rollback verifies and selects the local `previous` release without network or
+package manager access. Prune retains every release referenced by either
+selector or the activation state.
+
+```bash
+python3 scripts/bot_slots.py stage \
+  --slots-root /path/to/bot-slots \
+  --source /path/to/installed-bot \
+  --release-id bot-2026.7.28-example
+python3 scripts/bot_slots.py activate \
+  --slots-root /path/to/bot-slots \
+  --release-id bot-2026.7.28-example
+python3 scripts/bot_slots.py status \
+  --slots-root /path/to/bot-slots --json
+python3 scripts/bot_slots.py rollback --slots-root /path/to/bot-slots
+python3 scripts/bot_slots.py prune --slots-root /path/to/bot-slots
+```
+
+The slot helper does not restart services or rewrite launchd plists. Deployment
+wrappers keep those actions separate and continue to use the validated
+`restart-bot.sh --plist` path described above.
+
 ### Explicit cron runner for atomic release slots
 
 Ordinary installations should not set `--run-cron-script`. When the option is
@@ -161,9 +200,9 @@ and sync:
 
 ```bash
 minime-bot launchd crons sync --workspace /path/to/control-workspace --dry-run \
-  --run-cron-script /path/to/deployment/current/scripts/run-cron.sh
+  --run-cron-script /path/to/bot-slots/current/scripts/run-cron.sh
 minime-bot launchd crons sync --workspace /path/to/control-workspace \
-  --run-cron-script=/path/to/deployment/current/scripts/run-cron.sh
+  --run-cron-script=/path/to/bot-slots/current/scripts/run-cron.sh
 ```
 
 Both split and `=` forms are supported. The caller's validated lexical path is
