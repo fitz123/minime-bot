@@ -162,18 +162,24 @@ of the restart helper:
   state/active.json
 ```
 
-Stage copies an already-installed bot tree into a temporary release directory,
-writes and re-verifies its bounded SHA-256 manifest, and publishes the release
-with an atomic rename. Activation verifies the selected release before
-replacing each `previous` and `current` selector symlink with an atomic rename.
-Rollback verifies and selects the local `previous` release without network or
-package manager access. Prune retains every release referenced by either
-selector or the activation state.
+`scripts/assemble_bot_package.py` first copies the package and its complete
+installed dependency closure into a self-contained source without network
+access. Stage copies that source into a temporary release directory, writes and
+re-verifies its bounded SHA-256 manifest, and publishes the release with an
+atomic rename. Activation and rollback journal their selector transition before
+changing `previous` and `current`; the next operation restores the last
+committed pair after an interruption. Rollback verifies and selects only the
+local `previous` release, so a corrupt `current` does not block recovery. Prune
+retains every release referenced by either selector or activation state and
+removes abandoned staging directories while holding the slot lock.
 
 ```bash
+python3 scripts/assemble_bot_package.py \
+  --package-root /path/to/node_modules/minime-bot \
+  --destination /private/tmp/self-contained-bot
 python3 scripts/bot_slots.py stage \
   --slots-root /path/to/bot-slots \
-  --source /path/to/installed-bot \
+  --source /private/tmp/self-contained-bot \
   --release-id bot-2026.7.28-example
 python3 scripts/bot_slots.py activate \
   --slots-root /path/to/bot-slots \

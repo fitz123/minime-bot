@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make bot slots self-contained with the installed dependency closure, recover
+  interrupted selector transitions, keep rollback independent of a corrupt
+  active release, and prune abandoned staging copies (#58).
+
 ## 2026.7.28
 
 - Add a package-owned, manifest-verified bot release-slot helper with atomic

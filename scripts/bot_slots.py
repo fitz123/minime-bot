@@ -21,6 +21,7 @@ from typing import Any, Iterator
 SCHEMA_VERSION = 1
 MANIFEST_NAME = ".slot-manifest.json"
 STATE_NAME = "active.json"
+TRANSITION_NAME = "transition.json"
 EXIT_OPERATION_FAILED = 1
 EXIT_USAGE = 2
 EXIT_VERIFICATION_FAILED = 3
@@ -542,6 +543,34 @@ def _state(state_dir: Path) -> dict[str, Any] | None:
     return value
 
 
+def _transition(state_dir: Path) -> dict[str, Any] | None:
+    path = state_dir / TRANSITION_NAME
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    value = _read_json(path, max_bytes=_MAX_MANIFEST_BYTES)
+    if set(value) != {
+        "fromCurrentReleaseId",
+        "fromPreviousReleaseId",
+        "toCurrentReleaseId",
+        "toPreviousReleaseId",
+        "startedAt",
+    }:
+        raise VerificationError("slot transition state is invalid")
+    for key in (
+        "fromCurrentReleaseId",
+        "fromPreviousReleaseId",
+        "toCurrentReleaseId",
+        "toPreviousReleaseId",
+    ):
+        if value[key] is not None:
+            _safe_id(value[key])
+    if not isinstance(value["startedAt"], str):
+        raise VerificationError("slot transition state is invalid")
+    return value
+
+
 def _selector(root: Path, name: str) -> str | None:
     path = root / name
     try:
@@ -590,6 +619,111 @@ def _replace_selector(root: Path, name: str, release_id: str) -> None:
             pass
 
 
+def _remove_private_file(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or not _same_owner(details)
+        or stat.S_IMODE(details.st_mode) != 0o600
+    ):
+        raise VerificationError("slot metadata file is unsafe")
+    try:
+        path.unlink()
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        raise VerificationError("slot metadata file cannot be removed") from exc
+
+
+def _set_selector(root: Path, name: str, release_id: str | None) -> None:
+    if release_id is not None:
+        _replace_selector(root, name, release_id)
+        return
+    path = root / name
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISLNK(details.st_mode) or not _same_owner(details):
+        raise VerificationError("slot selector is unsafe")
+    try:
+        path.unlink()
+        _fsync_dir(root)
+    except OSError as exc:
+        raise VerificationError("slot selector cannot be removed") from exc
+
+
+def _begin_transition(
+    state_dir: Path,
+    *,
+    current: str | None,
+    previous: str | None,
+    target_current: str,
+    target_previous: str | None,
+) -> None:
+    if _transition(state_dir) is not None:
+        raise VerificationError("slot transition is already active")
+    _atomic_private_json(
+        state_dir / TRANSITION_NAME,
+        {
+            "fromCurrentReleaseId": current,
+            "fromPreviousReleaseId": previous,
+            "toCurrentReleaseId": target_current,
+            "toPreviousReleaseId": target_previous,
+            "startedAt": _utc_now(),
+        },
+    )
+
+
+def _finish_transition(
+    state_dir: Path, *, current: str, previous: str | None
+) -> None:
+    _atomic_private_json(
+        state_dir / STATE_NAME,
+        {
+            "releaseId": current,
+            "previousReleaseId": previous,
+            "activatedAt": _utc_now(),
+        },
+    )
+    _remove_private_file(state_dir / TRANSITION_NAME)
+
+
+def _reconcile_transition(root: Path, state_dir: Path) -> None:
+    pending = _transition(state_dir)
+    if pending is None:
+        return
+    active = _state(state_dir)
+    committed = (
+        active is not None
+        and active["releaseId"] == pending["toCurrentReleaseId"]
+        and active["previousReleaseId"] == pending["toPreviousReleaseId"]
+    )
+    current = pending[
+        "toCurrentReleaseId" if committed else "fromCurrentReleaseId"
+    ]
+    previous = pending[
+        "toPreviousReleaseId" if committed else "fromPreviousReleaseId"
+    ]
+    _set_selector(root, "previous", previous)
+    _set_selector(root, "current", current)
+    if current is None:
+        _remove_private_file(state_dir / STATE_NAME)
+    else:
+        _atomic_private_json(
+            state_dir / STATE_NAME,
+            {
+                "releaseId": current,
+                "previousReleaseId": previous,
+                "activatedAt": _utc_now(),
+            },
+        )
+    _remove_private_file(state_dir / TRANSITION_NAME)
+
+
 def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
     identifier = _safe_id(release_id, usage=True)
     try:
@@ -610,6 +744,7 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
 
     _root, releases, state_dir = _layout(slots_root, create=True)
     with _lock(state_dir):
+        _reconcile_transition(_root, state_dir)
         destination = releases / identifier
         try:
             destination.lstat()
@@ -665,6 +800,7 @@ def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
     identifier = _safe_id(release_id, usage=True)
     root, releases, state_dir = _layout(slots_root, create=False)
     with _lock(state_dir):
+        _reconcile_transition(root, state_dir)
         _verify_release(releases, identifier)
         current = _selector(root, "current")
         previous = _selector(root, "previous")
@@ -693,15 +829,20 @@ def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
             raise VerificationError("slot selectors are inconsistent")
         if current is not None:
             _verify_release(releases, current)
+        _begin_transition(
+            state_dir,
+            current=current,
+            previous=previous,
+            target_current=identifier,
+            target_previous=current,
+        )
+        if current is not None:
             _replace_selector(root, "previous", current)
         _replace_selector(root, "current", identifier)
-        _atomic_private_json(
-            state_dir / STATE_NAME,
-            {
-                "releaseId": identifier,
-                "previousReleaseId": current,
-                "activatedAt": _utc_now(),
-            },
+        _finish_transition(
+            state_dir,
+            current=identifier,
+            previous=current,
         )
         return {
             "ok": True,
@@ -714,20 +855,25 @@ def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
 def rollback(slots_root: Path) -> dict[str, Any]:
     root, releases, state_dir = _layout(slots_root, create=False)
     with _lock(state_dir):
+        _reconcile_transition(root, state_dir)
         current = _selector(root, "current")
         previous = _selector(root, "previous")
         if current is None or previous is None:
             raise VerificationError("rollback requires current and previous releases")
         _verify_release(releases, previous)
+        _begin_transition(
+            state_dir,
+            current=current,
+            previous=previous,
+            target_current=previous,
+            target_previous=current,
+        )
         _replace_selector(root, "previous", current)
         _replace_selector(root, "current", previous)
-        _atomic_private_json(
-            state_dir / STATE_NAME,
-            {
-                "releaseId": previous,
-                "previousReleaseId": current,
-                "activatedAt": _utc_now(),
-            },
+        _finish_transition(
+            state_dir,
+            current=previous,
+            previous=current,
         )
         return {
             "ok": True,
@@ -739,6 +885,7 @@ def rollback(slots_root: Path) -> dict[str, Any]:
 def prune(slots_root: Path) -> dict[str, Any]:
     root, releases, state_dir = _layout(slots_root, create=False)
     with _lock(state_dir):
+        _reconcile_transition(root, state_dir)
         referenced = {
             value
             for value in (_selector(root, "current"), _selector(root, "previous"))
@@ -752,8 +899,20 @@ def prune(slots_root: Path) -> dict[str, Any]:
                 if value is not None
             )
         removed: list[str] = []
+        removed_temporary: list[str] = []
         for entry in sorted(os.scandir(releases), key=lambda item: item.name):
             if re.fullmatch(r".+\.tmp\.[0-9]+", entry.name):
+                temporary = Path(entry.path)
+                details = temporary.lstat()
+                if (
+                    not stat.S_ISDIR(details.st_mode)
+                    or stat.S_ISLNK(details.st_mode)
+                    or not _same_owner(details)
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    raise VerificationError("abandoned staging directory is unsafe")
+                shutil.rmtree(temporary)
+                removed_temporary.append(entry.name)
                 continue
             identifier = _safe_id(entry.name)
             if identifier in referenced:
@@ -763,12 +922,17 @@ def prune(slots_root: Path) -> dict[str, Any]:
             shutil.rmtree(release)
             removed.append(identifier)
         _fsync_dir(releases)
-        return {"ok": True, "removedReleaseIds": removed}
+        return {
+            "ok": True,
+            "removedReleaseIds": removed,
+            "removedTemporaryDirectories": removed_temporary,
+        }
 
 
 def status(slots_root: Path) -> tuple[dict[str, Any], bool]:
     root, releases, state_dir = _layout(slots_root, create=False)
     with _lock(state_dir):
+        _reconcile_transition(root, state_dir)
         current = _selector(root, "current")
         previous = _selector(root, "previous")
         _state(state_dir)

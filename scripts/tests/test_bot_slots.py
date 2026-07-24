@@ -203,6 +203,106 @@ class BotSlotHappyPathTests(unittest.TestCase):
                 ("release-2", "release-1"),
             )
 
+    def test_interrupted_selector_transitions_restore_last_committed_pair(
+        self,
+    ) -> None:
+        for operation in ("activate", "rollback"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                slots = root / "bot-slots"
+                stage(slots, source_tree(root, "first"), "release-1")
+                activate(slots, "release-1")
+                stage(slots, source_tree(root, "second"), "release-2")
+                if operation == "rollback":
+                    activate(slots, "release-2")
+                    expected = ("releases/release-2", "releases/release-1")
+                else:
+                    expected = ("releases/release-1", None)
+
+                original_replace = bot_slots._replace_selector
+                calls = 0
+
+                def interrupt_after_first(
+                    selector_root: Path, name: str, release_id: str
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    original_replace(selector_root, name, release_id)
+                    if calls == 1:
+                        raise RuntimeError("simulated interruption")
+
+                with mock.patch.object(
+                    bot_slots, "_replace_selector", interrupt_after_first
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                        if operation == "rollback":
+                            bot_slots.rollback(slots)
+                        else:
+                            bot_slots.activate(slots, "release-2")
+
+                self.assertTrue((slots / "state/transition.json").is_file())
+                status, ok = bot_slots.status(slots)
+                self.assertTrue(ok)
+                self.assertEqual(os.readlink(slots / "current"), expected[0])
+                if expected[1] is None:
+                    self.assertFalse((slots / "previous").exists())
+                else:
+                    self.assertEqual(os.readlink(slots / "previous"), expected[1])
+                self.assertFalse((slots / "state/transition.json").exists())
+                self.assertEqual(
+                    (status["currentReleaseId"], status["previousReleaseId"]),
+                    (
+                        Path(expected[0]).name,
+                        Path(expected[1]).name if expected[1] is not None else None,
+                    ),
+                )
+
+    def test_interrupted_transition_cleanup_preserves_committed_pair(self) -> None:
+        for operation in ("activate", "rollback"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                slots = root / "bot-slots"
+                stage(slots, source_tree(root, "first"), "release-1")
+                activate(slots, "release-1")
+                stage(slots, source_tree(root, "second"), "release-2")
+                if operation == "rollback":
+                    activate(slots, "release-2")
+                    expected = ("release-1", "release-2")
+                else:
+                    expected = ("release-2", "release-1")
+
+                original_remove = bot_slots._remove_private_file
+                interrupted = False
+
+                def interrupt_transition_cleanup(path: Path) -> None:
+                    nonlocal interrupted
+                    if path.name == bot_slots.TRANSITION_NAME and not interrupted:
+                        interrupted = True
+                        raise RuntimeError("simulated cleanup interruption")
+                    original_remove(path)
+
+                with mock.patch.object(
+                    bot_slots,
+                    "_remove_private_file",
+                    interrupt_transition_cleanup,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "simulated cleanup interruption"
+                    ):
+                        if operation == "rollback":
+                            bot_slots.rollback(slots)
+                        else:
+                            bot_slots.activate(slots, "release-2")
+
+                self.assertTrue((slots / "state/transition.json").is_file())
+                status, ok = bot_slots.status(slots)
+                self.assertTrue(ok)
+                self.assertEqual(
+                    (status["currentReleaseId"], status["previousReleaseId"]),
+                    expected,
+                )
+                self.assertFalse((slots / "state/transition.json").exists())
+
 
 class BotSlotSafetyTests(unittest.TestCase):
     def test_manifest_corruption_is_reported_with_verification_exit_code(self) -> None:
@@ -428,6 +528,28 @@ class BotSlotPruneTests(unittest.TestCase):
             self.assertTrue((slots / "releases/two").is_dir())
             self.assertTrue((slots / "releases/state-only").is_dir())
             self.assertFalse((slots / "releases/unused").exists())
+
+    def test_prune_removes_abandoned_staging_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = root / "bot-slots"
+            stage(slots, source_tree(root, "source"), "release-1")
+            activate(slots, "release-1")
+            abandoned = slots / "releases/release-2.tmp.12345"
+            abandoned.mkdir(mode=0o700)
+            partial = abandoned / "partial"
+            partial.write_bytes(b"incomplete")
+            partial.chmod(0o600)
+
+            code, stdout, stderr = call_cli(
+                "prune", "--slots-root", str(slots)
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(
+                json.loads(stdout)["removedTemporaryDirectories"],
+                ["release-2.tmp.12345"],
+            )
+            self.assertFalse(abandoned.exists())
 
 
 if __name__ == "__main__":
