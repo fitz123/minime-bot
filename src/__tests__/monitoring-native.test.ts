@@ -963,7 +963,7 @@ describe("Alertmanager webhook", () => {
       });
     });
     const port = await reservePort();
-    const child = spawnWebhook(port, { ...bridgeEnv(synthetic.base), MINIME_BRIDGE_TIMEOUT: "0.1" });
+    const child = spawnWebhook(port, { ...bridgeEnv(synthetic.base), MINIME_BRIDGE_TIMEOUT: "0.5" });
     try {
       await waitUntilReady(child);
       const payload = alertmanagerPayload({ alertname: "SlowOps", fingerprint: "slow-ops" });

@@ -744,7 +744,6 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
 
     _root, releases, state_dir = _layout(slots_root, create=True)
     with _lock(state_dir):
-        _reconcile_transition(_root, state_dir)
         destination = releases / identifier
         try:
             destination.lstat()

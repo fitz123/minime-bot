@@ -175,6 +175,46 @@ class BotSlotHappyPathTests(unittest.TestCase):
             self.assertEqual(code, bot_slots.EXIT_VERIFICATION_FAILED)
             self.assertIn("verification failed", stderr)
 
+    def test_stage_does_not_reconcile_an_interrupted_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = root / "bot-slots"
+            stage(slots, source_tree(root, "first"), "release-1")
+            activate(slots, "release-1")
+            stage(slots, source_tree(root, "second"), "release-2")
+
+            state_dir = slots / "state"
+            bot_slots._begin_transition(
+                state_dir,
+                current="release-1",
+                previous=None,
+                target_current="release-2",
+                target_previous="release-1",
+            )
+            bot_slots._replace_selector(slots, "previous", "release-1")
+            bot_slots._replace_selector(slots, "current", "release-2")
+            selectors_before = (
+                os.readlink(slots / "current"),
+                os.readlink(slots / "previous"),
+            )
+            state_before = (state_dir / "active.json").read_bytes()
+            transition_before = (state_dir / "transition.json").read_bytes()
+
+            stage(slots, source_tree(root, "third"), "release-3")
+
+            self.assertEqual(
+                (
+                    os.readlink(slots / "current"),
+                    os.readlink(slots / "previous"),
+                ),
+                selectors_before,
+            )
+            self.assertEqual((state_dir / "active.json").read_bytes(), state_before)
+            self.assertEqual(
+                (state_dir / "transition.json").read_bytes(),
+                transition_before,
+            )
+
     def test_idempotent_activate_reconciles_state_after_interrupted_activation(
         self,
     ) -> None:
