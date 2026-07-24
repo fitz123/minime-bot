@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.28
+
+- Add a package-owned, manifest-verified bot release-slot helper with atomic
+  current/previous selection, fully offline rollback, and pruning of
+  unreferenced releases (#58, #133).
+
 ## 2026.7.27
 
 - Route every Alertmanager firing group through one generic Ops incident with
