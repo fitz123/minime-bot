@@ -127,6 +127,7 @@ def _copy_tree(source: Path, target: Path, *, omit_modules: bool) -> None:
         ignore=ignored,
         dirs_exist_ok=True,
     )
+    target.chmod(0o700)
 
 
 def assemble(package_root: Path, destination: Path) -> None:

@@ -134,6 +134,49 @@ class AssembleBotPackageTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_assembles_frozen_nested_dependency_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modules = root / "node_modules"
+            modules.mkdir()
+            bot = package(
+                modules,
+                "minime-bot",
+                dependencies={"fixture-dep": "1.0.0"},
+            )
+            write(bot / "dist/main.js", "export {};\n")
+            write(bot / "scripts/start-bot.sh", "#!/bin/bash\n", 0o755)
+            dependency = package(
+                modules,
+                "fixture-dep",
+                dependencies={"nested-dep": "1.0.0"},
+            )
+            package(
+                dependency / "node_modules",
+                "nested-dep",
+                source='export default "nested";\n',
+            )
+
+            for path in root.rglob("*"):
+                if path.is_file():
+                    path.chmod(0o555 if path.stat().st_mode & 0o100 else 0o444)
+            for path in sorted(
+                (candidate for candidate in root.rglob("*") if candidate.is_dir()),
+                key=lambda candidate: len(candidate.parts),
+                reverse=True,
+            ):
+                path.chmod(0o555)
+
+            destination = root / "assembled"
+            ASSEMBLER.assemble(bot, destination)
+
+            self.assertTrue(
+                (
+                    destination
+                    / "node_modules/fixture-dep/node_modules/nested-dep/index.js"
+                ).is_file()
+            )
+
     def test_rejects_missing_dependencies_and_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
