@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.7.31
+
 - Remove the superseded recovery supervisor and capsule surface after migration
   to package-owned bot slots (#58).
 
