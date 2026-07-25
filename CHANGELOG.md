@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Remove the superseded recovery supervisor and capsule surface after migration
+  to package-owned bot slots (#58).
+
 ## 2026.7.30
 
 - Keep non-activation slot staging from reconciling pending selector

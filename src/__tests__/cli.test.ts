@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCli, type CliRunOptions, type RecoveryCommandRunner } from "../cli.js";
+import { runCli, type CliRunOptions } from "../cli.js";
 import {
   generateLaunchdCronPlists,
   type LaunchdCommandRunner,
@@ -108,7 +108,7 @@ function runWithCapture(
   args: readonly string[],
   workspace?: string,
   env: NodeJS.ProcessEnv = {},
-  cliOptions?: Pick<CliRunOptions, "launchdCommandRunner" | "launchdHomeDir" | "launchdUid" | "recoveryCommandRunner">,
+  cliOptions?: Pick<CliRunOptions, "launchdCommandRunner" | "launchdHomeDir" | "launchdUid">,
 ): {
   code: number;
   stdout: string;
@@ -171,11 +171,7 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
     assert.match(result.stdout, /--run-cron-script <absolute-path>/);
     assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
-    assert.match(result.stdout, /minime-bot recovery config validate/);
-    assert.match(result.stdout, /never SQL or shell/);
-    assert.match(result.stdout, /closed observe, diagnose, and enabled mode gates/);
-    assert.match(result.stdout, /recovery capsule-stage\|bot-stage/);
-    assert.match(result.stdout, /recovery-only wrapper/);
+    assert.doesNotMatch(result.stdout, /minime-bot recovery/);
     assert.match(result.stdout, /Knowledge commands do not resolve config secrets/);
     assert.match(result.stdout, /Control\/app workspace root/);
     assert.match(result.stdout, /MINIME_CONTROL_WORKSPACE_ROOT, then source repo root or package cwd\./);
@@ -184,121 +180,16 @@ describe("minime-bot CLI", () => {
     assert.equal(result.stderr, "");
   });
 
-  it("forwards bounded recovery operations to the installed standard-library CLI", () => {
+  it("rejects the retired recovery command", () => {
     const workspace = createWorkspace();
-    const calls: CommandCall[] = [];
-    const recoveryCommandRunner: RecoveryCommandRunner = (command, args) => {
-      calls.push({ command, args: [...args] });
-      return { status: 0, stdout: '{"ok":true}\n', stderr: "" };
-    };
     try {
       const result = runWithCapture(
-        [
-          "recovery",
-          "dispatch",
-          "disable",
-          "--actor",
-          "operator",
-          "--reason",
-          "maintenance",
-          "--ttl",
-          "60",
-          "--config=recovery-shadow.json",
-          "--workspace",
-          workspace,
-        ],
+        ["recovery", "status", "--workspace", workspace],
         workspace,
-        { PYTHON: "/usr/bin/python3" },
-        { recoveryCommandRunner },
       );
-
-      assert.equal(result.code, 0);
-      assert.equal(result.stdout, '{"ok":true}\n');
-      assert.equal(result.stderr, "");
-      assert.equal(calls.length, 1);
-      assert.equal(calls[0].command, "/usr/bin/python3");
-      assert.match(calls[0].args[0], /scripts\/recovery_cli\.py$/);
-      assert.deepEqual(calls[0].args.slice(1), [
-        "--workspace",
-        workspace,
-        "--config",
-        "recovery-shadow.json",
-        "dispatch",
-        "disable",
-        "--actor",
-        "operator",
-        "--reason",
-        "maintenance",
-        "--ttl",
-        "60",
-      ]);
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
-  });
-
-  it("forwards recovery subcommand help to the recovery CLI", () => {
-    const workspace = createWorkspace();
-    const calls: CommandCall[] = [];
-    const recoveryCommandRunner: RecoveryCommandRunner = (command, args) => {
-      calls.push({ command, args: [...args] });
-      return { status: 0, stdout: "recovery incidents help\n", stderr: "" };
-    };
-    try {
-      const result = runWithCapture(
-        ["recovery", "incidents", "--help", "--workspace", workspace],
-        workspace,
-        { PYTHON: "/usr/bin/python3" },
-        { recoveryCommandRunner },
-      );
-      assert.equal(result.code, 0);
-      assert.equal(result.stdout, "recovery incidents help\n");
-      assert.deepEqual(calls[0].args.slice(1), [
-        "--workspace",
-        workspace,
-        "incidents",
-        "--help",
-      ]);
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
-  });
-
-  it("forwards capsule and bot slot operations to the packaged offline slot CLI", () => {
-    const workspace = createWorkspace();
-    const calls: CommandCall[] = [];
-    const recoveryCommandRunner: RecoveryCommandRunner = (command, args) => {
-      calls.push({ command, args: [...args] });
-      return { status: 0, stdout: '{"ok":true}\n', stderr: "" };
-    };
-    try {
-      const result = runWithCapture(
-        [
-          "recovery",
-          "bot-rollback",
-          "--restart-operation-id",
-          "restart-bot",
-          "--config",
-          "recovery.json",
-          "--workspace",
-          workspace,
-        ],
-        workspace,
-        { PYTHON: "/usr/bin/python3" },
-        { recoveryCommandRunner },
-      );
-      assert.equal(result.code, 0);
-      assert.equal(result.stdout, '{"ok":true}\n');
-      assert.match(calls[0].args[0], /scripts\/recovery_slots\.py$/);
-      assert.deepEqual(calls[0].args.slice(1), [
-        "--workspace",
-        workspace,
-        "--config",
-        "recovery.json",
-        "bot-rollback",
-        "--restart-operation-id",
-        "restart-bot",
-      ]);
+      assert.equal(result.code, 2);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /unknown command: recovery status/);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
