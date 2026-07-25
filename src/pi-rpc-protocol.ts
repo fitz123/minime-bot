@@ -49,13 +49,6 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "ask-agent/index.ts",
 ] as const;
 
-/** Recovery must not expose wrappers that spawn an unfenced Pi child. */
-export const PI_RECOVERY_WRAPPER_RELPATHS = [
-  "codex-transport-overflow.ts",
-  "web-tools.ts",
-  "knowledge-tools.ts",
-] as const;
-
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "codex-transport-overflow.js",
   "web-tools.js",
@@ -143,22 +136,6 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 export interface PiSpawnRuntimeEnvOptions {
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
-  /** Fixed recovery-only child contract. Arbitrary environment injection is deliberately unsupported. */
-  recovery?: {
-    endpoint: string;
-    fixerCredentialFile: string;
-    mode: "diagnose" | "enabled";
-    invocationId: number;
-    incidentId: number;
-    generation: number;
-    evidenceHash: string;
-    policyRevision: number;
-    leaseToken: string;
-    sessionDirectory: string;
-    piExecutable: string;
-    preimageDirectory: string;
-    preimageMaxBytes: number;
-  };
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -653,21 +630,6 @@ function buildAllowedPiChildEnv(
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
-  const recovery = runtimeEnvOptions?.recovery;
-  if (recovery) {
-    env.PI_CODING_AGENT_SESSION_DIR = recovery.sessionDirectory;
-    env.MINIME_RECOVERY_ENDPOINT = recovery.endpoint;
-    env.MINIME_RECOVERY_FIXER_CREDENTIAL_FILE = recovery.fixerCredentialFile;
-    env.MINIME_RECOVERY_MODE = recovery.mode;
-    env.MINIME_RECOVERY_INVOCATION_ID = String(recovery.invocationId);
-    env.MINIME_RECOVERY_INCIDENT_ID = String(recovery.incidentId);
-    env.MINIME_RECOVERY_GENERATION = String(recovery.generation);
-    env.MINIME_RECOVERY_EVIDENCE_HASH = recovery.evidenceHash;
-    env.MINIME_RECOVERY_POLICY_REVISION = String(recovery.policyRevision);
-    env.MINIME_RECOVERY_LEASE_TOKEN = recovery.leaseToken;
-    env.MINIME_RECOVERY_PREIMAGE_DIRECTORY = recovery.preimageDirectory;
-    env.MINIME_RECOVERY_PREIMAGE_MAX_BYTES = String(recovery.preimageMaxBytes);
-  }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
@@ -712,15 +674,8 @@ export function spawnPiRpcSession(
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
   const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions);
-  const configuredRecoveryPi = runtimeEnvOptions?.recovery?.piExecutable;
-  const invocation = configuredRecoveryPi
-    ? { command: configuredRecoveryPi, args }
-    : resolvePackageOwnedPiInvocation("rpc", args);
-  if ("diagnostic" in invocation) {
-    log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
-  } else {
-    log.info("pi-rpc", "using manifest-validated recovery Pi prerequisite");
-  }
+  const invocation = resolvePackageOwnedPiInvocation("rpc", args);
+  log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {
     env,
     cwd: workspaceCwd,

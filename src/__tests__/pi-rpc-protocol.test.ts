@@ -26,7 +26,6 @@ import {
   PI_CRON_WRAPPER_RELPATHS,
   PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
   PI_EXTENSION_WRAPPER_RELPATHS,
-  PI_RECOVERY_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
@@ -515,7 +514,6 @@ describe("Pi extension loading (--extension)", () => {
       subagent: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
       askAgent: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
       cron: PI_CRON_WRAPPER_RELPATHS,
-      recovery: PI_RECOVERY_WRAPPER_RELPATHS,
     };
 
     for (const [runtime, relpaths] of Object.entries(inventories)) {

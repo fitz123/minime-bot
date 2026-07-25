@@ -139,10 +139,10 @@ Responses endpoint. It does not read `OPENAI_API_KEY`, accept a configurable
 endpoint, switch providers, retry automatically, or apply a package-specific
 search quota.
 
-Interactive sessions, cron runs, package subagents, ask-agent children, and the
-recovery runtime each load the canonical `dist/extensions/pi/web-tools.js`
-wrapper once. Dynamic-workflow sessions inherit the same globally deployed
-wrapper. Search-only bundled roles keep `web_search` without receiving Bash.
+Interactive sessions, cron runs, package subagents, and ask-agent children each
+load the canonical `dist/extensions/pi/web-tools.js` wrapper once.
+Dynamic-workflow sessions inherit the same globally deployed wrapper.
+Search-only bundled roles keep `web_search` without receiving Bash.
 
 Search queries pass a bounded content-safety check before leaving the host.
 Responses expose bounded answer text, citations, web-action metadata, response
@@ -521,20 +521,6 @@ rollback.
 The webhook can optionally verify current Alertmanager groups and forward them
 to the generic Ops incident intake while retaining native fallback and required
 critical dual delivery. Direct native Telegram delivery remains the default.
-
-An opt-in same-host recovery supervisor can durably correlate and verify those
-native signals while exposing bounded controls and native fallback. `observe`
-keeps fixer dispatch off, `diagnose` permits the exact-session fixer to inspect
-and reconcile without mutation, and `enabled` permits durably journaled repair.
-Fresh host-native probes and active-slot validation, not the model's finish
-claim, decide recovery. The package also ships a stable two-slot recovery
-capsule plus manifest-verified bot staging and offline rollback commands.
-Direct Telegram remains the default monitoring path.
-Start with `minime-bot recovery config validate --workspace /path/to/control-workspace`
-and `minime-bot recovery status --workspace /path/to/control-workspace`; see
-[Same-host recovery supervisor](docs/recovery.md) for configuration, safety
-boundaries, `capsule-stage`/`capsule-bootstrap`, `bot-stage`/`bot-rollback`,
-drills, and rollback.
 
 ## Repository Boundaries
 
