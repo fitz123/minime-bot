@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Prefer a stable official Node runtime for bot and cron launch wrappers while
+  retaining PATH fallback and an explicit runtime-root override, and ship a
+  checksum-, signature-, and trust-verified install, upgrade, rollback, process
+  verification, and manual TCC-consent procedure (#41).
+
 ## 2026.7.31
 
 - Remove the superseded recovery supervisor and capsule surface after migration

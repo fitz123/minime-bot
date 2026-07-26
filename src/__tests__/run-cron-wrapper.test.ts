@@ -75,6 +75,7 @@ function runLaunchWrapper(
   wrapper: LaunchWrapper,
   fixture: string,
   envOverrides: NodeJS.ProcessEnv,
+  options: { omitHome?: boolean } = {},
 ): string {
   const captureFile = join(fixture, `${wrapper.label}-capture.txt`);
   const env: NodeJS.ProcessEnv = {
@@ -82,6 +83,9 @@ function runLaunchWrapper(
     HOME: fixture,
     CAPTURE_FILE: captureFile,
   };
+  if (options.omitHome) {
+    delete env.HOME;
+  }
   delete env.MINIME_NODE_RUNTIME_ROOT;
   Object.assign(env, envOverrides);
 
@@ -235,17 +239,6 @@ function assertChunksWithinTelegramLimit(payloads: TelegramPayload[]): void {
 }
 
 describe("start-bot.sh", () => {
-  it("uses a generic stable runtime root without embedding a private host path", () => {
-    const script = readFileSync(startBotScript, "utf8");
-
-    assert.match(script, /MINIME_NODE_RUNTIME_ROOT/);
-    assert.match(script, /\$HOME\/\.minime\/runtime\/node/);
-    assert.match(script, /exec node "\$BOT_DIR\/dist\/main\.js"/);
-    if (process.env.HOME) {
-      assert.equal(script.includes(process.env.HOME), false);
-    }
-  });
-
   it("does not read Claude OAuth credentials or export Claude runtime flags", () => {
     const script = readFileSync(startBotScript, "utf8");
 
@@ -305,17 +298,6 @@ describe("start-bot.sh", () => {
 });
 
 describe("run-cron.sh", () => {
-  it("uses a generic stable runtime root without embedding a private host path", () => {
-    const script = readFileSync(runCronScript, "utf8");
-
-    assert.match(script, /MINIME_NODE_RUNTIME_ROOT/);
-    assert.match(script, /\$HOME\/\.minime\/runtime\/node/);
-    assert.match(script, /exec node "\$BOT_DIR\/dist\/cron-runner\.js" --task "\$TASK_NAME"/);
-    if (process.env.HOME) {
-      assert.equal(script.includes(process.env.HOME), false);
-    }
-  });
-
   it("does not read Keychain credentials and scrubs inherited legacy runtime env", () => {
     const fixture = mkdtempSync(join(tmpdir(), "run-cron-wrapper-"));
     const binDir = join(fixture, "bin");
@@ -396,6 +378,11 @@ describe("run-cron.sh", () => {
 
 describe("launch wrapper Node runtime selection", () => {
   for (const wrapper of launchWrappers) {
+    it(`${wrapper.label} contains no literal macOS user home`, () => {
+      const script = readFileSync(wrapper.script, "utf8");
+      assert.doesNotMatch(script, /\/Users\/[A-Za-z0-9._-]+(?:\/|["'\s])/);
+    });
+
     it(`${wrapper.label} prefers the default stable runtime over later PATH entries`, () => {
       const fixture = mkdtempSync(join(tmpdir(), "stable-node-runtime-"));
       const stableBin = join(fixture, ".minime", "runtime", "node", "bin");
@@ -471,6 +458,44 @@ describe("launch wrapper Node runtime selection", () => {
 
         assert.match(capture, /^marker=override$/m);
         assert.match(capture, new RegExp(`^path=${overrideBin}:${pathPrefix}:/usr/bin:/bin:/usr/sbin:/sbin$`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} derives the stable runtime from the recovered launchd home`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "recovered-home-node-runtime-"));
+      const recoveredHome = join(fixture, "recovered-home");
+      const lookupBin = join(fixture, "lookup-bin");
+      const stableBin = join(recoveredHome, ".minime", "runtime", "node", "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedPath = `${lookupBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        mkdirSync(lookupBin, { recursive: true });
+        writeFileSync(
+          join(lookupBin, "dscl"),
+          `#!/bin/bash
+printf 'NFSHomeDirectory: %s\n' "$RECOVERED_HOME"
+`,
+        );
+        chmodSync(join(lookupBin, "dscl"), 0o755);
+        writeMarkerNode(stableBin, "recovered-home-stable");
+        writeMarkerNode(prefixBin, "prefix");
+
+        const capture = runLaunchWrapper(
+          wrapper,
+          fixture,
+          {
+            RECOVERED_HOME: recoveredHome,
+            MINIME_PATH_PREFIX: `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+            PATH: inheritedPath,
+          },
+          { omitHome: true },
+        );
+
+        assert.match(capture, /^marker=recovered-home-stable$/m);
+        assert.match(capture, new RegExp(`^path=${stableBin}:`, "m"));
       } finally {
         rmSync(fixture, { recursive: true, force: true });
       }

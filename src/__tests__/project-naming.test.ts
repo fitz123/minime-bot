@@ -143,8 +143,10 @@ describe("project naming", () => {
       "README.md should link the official Node launch runtime procedure",
     );
     for (const expected of [
+      "set -euo pipefail",
       "SHASUMS256.txt",
       "codesign -v --strict",
+      "certificate leaf[subject.OU]",
       "Identifier=node",
       "TeamIdentifier=HX7739G8FX",
       "/opt/homebrew/",
@@ -164,6 +166,14 @@ describe("project naming", () => {
     assert.ok(
       packageJson.files?.includes("docs/launchd-operations.md"),
       "npm package should include the linked launchd operations guide",
+    );
+    const failFast = launchdOperations.indexOf("set -euo pipefail");
+    const checksum = launchdOperations.indexOf("shasum -a 256 -c");
+    const trustCheck = launchdOperations.indexOf("codesign -v --strict -R");
+    const activation = launchdOperations.indexOf('mv "$NEXT_NODE" "$STABLE_NODE"');
+    assert.ok(
+      failFast >= 0 && failFast < checksum && checksum < trustCheck && trustCheck < activation,
+      "launchd operations should fail fast and complete checksum/trust checks before activation",
     );
   });
 

@@ -47,6 +47,7 @@ export const BOT_LAUNCHD_LABEL = "ai.minime.telegram-bot";
 export const DEFAULT_LAUNCHCTL_BIN = "/bin/launchctl";
 export const DEFAULT_PLUTIL_BIN = "/usr/bin/plutil";
 const DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const MINIME_NODE_RUNTIME_ROOT_ENV = "MINIME_NODE_RUNTIME_ROOT";
 const PLIST_CONVERSION_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const BOOTSTRAP_MAX_ATTEMPTS = 5;
 const BOOTSTRAP_RETRY_DELAY_MS = 500;
@@ -206,7 +207,7 @@ export function isOwnedCronLaunchdLabel(label: string): boolean {
 
 export function renderLaunchdCronPlist(
   cron: CronPlistDef,
-  context: Pick<LaunchdCronContext, "runCronScript" | "logDir" | "homeDir" | "contract">,
+  context: Pick<LaunchdCronContext, "runCronScript" | "logDir" | "homeDir" | "contract" | "env">,
 ): string {
   const label = cronLaunchdLabel(cron.name);
   const intervals = parseCronToCalendarIntervals(cron.schedule);
@@ -258,7 +259,7 @@ ${scheduleSection}
       <string>${xmlEscape(context.homeDir)}</string>
       <key>${MINIME_CONTROL_WORKSPACE_ROOT_ENV}</key>
       <string>${xmlEscape(controlWorkspaceRoot)}</string>
-${renderExplicitPathEnvEntries(context.contract)}
+${renderExplicitEnvEntries(context)}
       <key>LOG_DIR</key>
       <string>${xmlEscape(context.logDir)}</string>
       <key>PATH</key>
@@ -1005,13 +1006,20 @@ function restorePreviousPlist(plistPath: string, previousContent: string | undef
   writeFileSync(plistPath, previousContent, "utf8");
 }
 
-function renderExplicitPathEnvEntries(contract: ResolvedWorkspaceContract): string {
+function renderExplicitEnvEntries(
+  context: Pick<LaunchdCronContext, "contract" | "env">,
+): string {
   const entries: string[] = [];
+  const { contract, env } = context;
   if (contract.effectivePaths.configPath.source === "env") {
     entries.push(renderEnvEntry(MINIME_CONFIG_PATH_ENV, contract.paths.configPath));
   }
   if (contract.effectivePaths.cronsPath.source === "env") {
     entries.push(renderEnvEntry(MINIME_CRONS_PATH_ENV, contract.paths.cronsPath));
+  }
+  const nodeRuntimeRoot = env[MINIME_NODE_RUNTIME_ROOT_ENV];
+  if (nodeRuntimeRoot?.trim()) {
+    entries.push(renderEnvEntry(MINIME_NODE_RUNTIME_ROOT_ENV, nodeRuntimeRoot));
   }
   return entries.join("");
 }
