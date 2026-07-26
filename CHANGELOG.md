@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.7.32
+
 - Prefer a stable official Node runtime for bot and cron launch wrappers while
   retaining PATH fallback and an explicit runtime-root override, and ship a
   checksum-, signature-, and trust-verified install, upgrade, rollback, process
