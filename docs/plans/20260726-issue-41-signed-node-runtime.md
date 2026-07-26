@@ -37,11 +37,11 @@ git diff --check
 
 ### Task 2: Document verified install, upgrade, rollback, and consent boundaries
 
-- [ ] Add a minimum-sufficient official-Node runtime section to `docs/launchd-operations.md` and link it from the launchd/runtime section of `README.md`.
-- [ ] Document architecture/version selection, official `SHASUMS256.txt` verification, `codesign -v --strict`, exact `Identifier=node` and TeamIdentifier `HX7739G8FX` checks, and an `otool -L` guard rejecting `/opt/homebrew` dependencies before activation.
-- [ ] Document owner-only staging, stable-path replacement with one bounded rollback copy, canonical restart, process executable verification, and rollback; keep commands generic and free of private identifiers.
-- [ ] State explicitly that TCC consent is a one-time manual System Settings/prompt action, direct TCC database writes are forbidden, and OS resets/upstream certificate changes/manual revocation are outside the survival guarantee.
-- [ ] Re-run the focused wrapper tests and documentation-sensitive package build/pack checks before Task 3.
+- [x] Add a minimum-sufficient official-Node runtime section to `docs/launchd-operations.md` and link it from the launchd/runtime section of `README.md`.
+- [x] Document architecture/version selection, official `SHASUMS256.txt` verification, `codesign -v --strict`, exact `Identifier=node` and TeamIdentifier `HX7739G8FX` checks, and an `otool -L` guard rejecting `/opt/homebrew` dependencies before activation.
+- [x] Document owner-only staging, stable-path replacement with one bounded rollback copy, canonical restart, process executable verification, and rollback; keep commands generic and free of private identifiers.
+- [x] State explicitly that TCC consent is a one-time manual System Settings/prompt action, direct TCC database writes are forbidden, and OS resets/upstream certificate changes/manual revocation are outside the survival guarantee.
+- [x] Re-run the focused wrapper tests and documentation-sensitive package build/pack checks before Task 3.
 
 ### Task 3: Verify package acceptance and scope
 

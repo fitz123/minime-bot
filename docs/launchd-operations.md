@@ -61,6 +61,165 @@ The `--request-id`, `--status-path`, and `--log-path` flags are supervisor
 automation arguments used when request mode launches worker mode. Operators
 should normally call `scripts/restart-bot.sh --plist` without these flags.
 
+## Official Node launch runtime
+
+`scripts/start-bot.sh` and `scripts/run-cron.sh` prefer
+`$HOME/.minime/runtime/node/bin/node` before the package's existing PATH
+fallbacks. `MINIME_NODE_RUNTIME_ROOT` is the narrow override for an isolated
+test or a deliberately non-default installation. Do not use it as an automatic
+version selector: upgrades should replace the verified tree at one stable
+runtime root.
+
+Use only an official macOS archive from `nodejs.org`. Choose a supported Node
+release that satisfies `package.json`'s `engines.node` range and the host
+architecture. Pin the complete version for each maintenance operation; do not
+resolve `latest` during activation. Map Apple silicon (`arm64`) to
+`darwin-arm64` and Intel (`x86_64`) to `darwin-x64`:
+
+```bash
+umask 077
+RUNTIME_BASE="${HOME:?HOME must be set}/.minime/runtime"
+STABLE_NODE="$RUNTIME_BASE/node"
+NODE_VERSION=vX.Y.Z
+test "$NODE_VERSION" != vX.Y.Z
+
+case "$(uname -m)" in
+  arm64) NODE_PLATFORM=darwin-arm64 ;;
+  x86_64) NODE_PLATFORM=darwin-x64 ;;
+  *) echo "unsupported macOS architecture" >&2; exit 1 ;;
+esac
+
+NODE_ARCHIVE="node-${NODE_VERSION}-${NODE_PLATFORM}.tar.gz"
+install -d -m 700 "$RUNTIME_BASE"
+STAGE_DIR="$(mktemp -d "$RUNTIME_BASE/.node-stage.XXXXXX")"
+cd "$STAGE_DIR"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --remote-name "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --remote-name "https://nodejs.org/dist/${NODE_VERSION}/${NODE_ARCHIVE}"
+```
+
+Replace `vX.Y.Z` before running the commands. Keep the staging directory
+owner-only and abort on any failed check. Select the archive's exact entry from
+the official `SHASUMS256.txt`, require exactly one match, and verify it before
+extraction:
+
+```bash
+awk -v name="$NODE_ARCHIVE" '$2 == name { print }' \
+  SHASUMS256.txt > SHASUMS256.selected
+test "$(wc -l < SHASUMS256.selected | tr -d ' ')" = 1
+shasum -a 256 -c SHASUMS256.selected
+
+tar -xzf "$NODE_ARCHIVE"
+STAGED_TREE="$STAGE_DIR/${NODE_ARCHIVE%.tar.gz}"
+STAGED_NODE="$STAGED_TREE/bin/node"
+test -x "$STAGED_NODE"
+```
+
+Verify the extracted executable with macOS's trust tools. `codesign` validation
+must succeed, and its reported identity must contain the exact standalone
+lines `Identifier=node` and `TeamIdentifier=HX7739G8FX`. Reject a Homebrew
+dependency and any other dependency outside the macOS system library roots:
+
+```bash
+codesign -v --strict "$STAGED_NODE"
+codesign -dv --verbose=4 "$STAGED_NODE" 2> codesign-details.txt
+grep -Fx 'Identifier=node' codesign-details.txt
+grep -Fx 'TeamIdentifier=HX7739G8FX' codesign-details.txt
+
+otool -L "$STAGED_NODE" > node-dependencies.txt
+if grep -Fq '/opt/homebrew/' node-dependencies.txt; then
+  echo "refusing Node with Homebrew dependencies" >&2
+  exit 1
+fi
+if tail -n +2 node-dependencies.txt | awk '{print $1}' \
+  | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+  echo "refusing Node with non-system dependencies" >&2
+  exit 1
+fi
+```
+
+Only after every check passes, move the staged tree next to the stable path.
+Refuse an unexplained stale `node.next`; inspect and remove it separately
+rather than overwriting it during this procedure.
+
+```bash
+NEXT_NODE="$RUNTIME_BASE/node.next"
+test ! -e "$NEXT_NODE"
+mv "$STAGED_TREE" "$NEXT_NODE"
+cd "$HOME"
+rm -rf "$STAGE_DIR"
+test -x "$NEXT_NODE/bin/node"
+```
+
+For activation, preserve at most one rollback tree. A fresh install has no
+current `node`; an upgrade moves the current verified tree to `node.rollback`
+before putting `node.next` at the stable path. Run these commands as the
+launchd user:
+
+```bash
+if test -e "$STABLE_NODE"; then
+  rm -rf "$RUNTIME_BASE/node.rollback"
+  mv "$STABLE_NODE" "$RUNTIME_BASE/node.rollback"
+fi
+if ! mv "$NEXT_NODE" "$STABLE_NODE"; then
+  if test -d "$RUNTIME_BASE/node.rollback" && test ! -e "$STABLE_NODE"; then
+    mv "$RUNTIME_BASE/node.rollback" "$STABLE_NODE"
+  fi
+  exit 1
+fi
+```
+
+Restart the bot only through the canonical package helper. Wait for its
+one-shot supervisor to finish, then verify that the live process text
+executable is the stable runtime rather than merely checking shell PATH:
+
+```bash
+cd /path/to/installed/minime-bot
+scripts/restart-bot.sh --plist
+
+BOT_LABEL=ai.minime.telegram-bot
+BOT_PID="$(launchctl print "gui/$(id -u)/$BOT_LABEL" \
+  | awk '/pid = / { print $3; exit }')"
+test -n "$BOT_PID"
+lsof -a -p "$BOT_PID" -d txt -Fn \
+  | grep -Fx "n$RUNTIME_BASE/node/bin/node"
+```
+
+The cron wrapper uses the same stable runtime on its next launch. If bot
+startup or verification fails, restore the bounded rollback tree, discard the
+failed tree only after the restore succeeds, run the same canonical restart,
+and repeat the process-executable check:
+
+```bash
+test -x "$RUNTIME_BASE/node.rollback/bin/node"
+mv "$STABLE_NODE" "$RUNTIME_BASE/node.failed"
+if mv "$RUNTIME_BASE/node.rollback" "$STABLE_NODE"; then
+  rm -rf "$RUNTIME_BASE/node.failed"
+else
+  mv "$RUNTIME_BASE/node.failed" "$STABLE_NODE"
+  exit 1
+fi
+
+cd /path/to/installed/minime-bot
+scripts/restart-bot.sh --plist
+```
+
+### TCC consent boundary
+
+Consent for a protected macOS resource is a one-time manual operator action
+through the system prompt or System Settings for the exact required resource.
+The package, installation procedure, and operators must never read, edit, or
+write the TCC database directly. They must not attempt to pre-seed consent.
+
+Keeping the stable path and the official Node signing identity is intended to
+preserve an existing grant across a verified official Node upgrade, but it is
+not an unconditional guarantee. An OS or privacy-settings reset, an upstream
+certificate, TeamIdentifier, or designated-requirement change, and manual
+certificate revocation are outside that survival guarantee. If macOS requests
+consent after one of those events, stop and perform the exact manual consent
+action again.
+
 ## Foreground worker mode
 
 Foreground worker mode exists for operator debugging:

@@ -45,6 +45,7 @@
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
+    "docs/launchd-operations.md",
     "docs/monitoring.md",
     "docs/ops-worker.md",
     "examples/monitoring/*"

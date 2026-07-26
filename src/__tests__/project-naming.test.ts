@@ -17,10 +17,12 @@ describe("project naming", () => {
   const readme = readPackageFile("README.md");
   const changelog = readPackageFile("CHANGELOG.md");
   const agentsDoc = readPackageFile("AGENTS.md");
+  const launchdOperations = readPackageFile("docs/launchd-operations.md");
   const packageJson = JSON.parse(readPackageFile("package.json")) as {
     name: string;
     description: string;
     version: string;
+    files?: string[];
     bin?: Record<string, string>;
     repository?: {
       type?: string;
@@ -131,6 +133,38 @@ describe("project naming", () => {
     ]) {
       assert.ok(readme.includes(command), `README.md should include ${command}`);
     }
+  });
+
+  it("documents and packages the official Node launch runtime procedure", () => {
+    assert.ok(
+      readme.includes(
+        "[Official Node launch runtime](docs/launchd-operations.md#official-node-launch-runtime)",
+      ),
+      "README.md should link the official Node launch runtime procedure",
+    );
+    for (const expected of [
+      "SHASUMS256.txt",
+      "codesign -v --strict",
+      "Identifier=node",
+      "TeamIdentifier=HX7739G8FX",
+      "/opt/homebrew/",
+      "node.rollback",
+      "scripts/restart-bot.sh --plist",
+    ]) {
+      assert.ok(
+        launchdOperations.includes(expected),
+        `launchd operations should document ${expected}`,
+      );
+    }
+    assert.match(
+      launchdOperations,
+      /must never read, edit, or\s+write the TCC database directly/,
+      "launchd operations should forbid direct TCC database access",
+    );
+    assert.ok(
+      packageJson.files?.includes("docs/launchd-operations.md"),
+      "npm package should include the linked launchd operations guide",
+    );
   });
 
   it("README states that private workspace files are not bundled", () => {

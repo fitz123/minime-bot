@@ -244,6 +244,7 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/run-cron.sh",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
+    "docs/launchd-operations.md",
     "docs/monitoring.md",
     "examples/monitoring/ai.minime.alertmanager-webhook.plist",
     "examples/monitoring/ai.minime.runtime-doctor.plist",
