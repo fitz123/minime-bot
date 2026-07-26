@@ -465,7 +465,7 @@ describe("ops worker dedicated Telegram control", () => {
 
     await control(fixture, transport).tick();
     assert.equal(fixture.store.get("task-crash")?.steering.length, 1);
-    assert.equal(fixture.ledger.nextOffset(), 22);
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 22);
     assert.equal(transport.messages.length, 1);
   });
 
@@ -534,7 +534,7 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(replayed?.report.state, "SENT");
     assert.equal(replayed?.lastOutcome?.summary, "Fixture later blocked episode.");
     assert.equal(replayed?.steering.length, 1);
-    assert.equal(fixture.ledger.nextOffset(), 23);
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 23);
   });
 
   it("durably rejects steering that would exceed the whole snapshot bound", async (t) => {
@@ -565,7 +565,7 @@ describe("ops worker dedicated Telegram control", () => {
     await control(fixture, transport).tick();
 
     assert.equal(fixture.store.get(nearCapacity.id)?.steering.length, before.steering.length);
-    assert.equal(fixture.ledger.nextOffset(), 24);
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 24);
     assert.equal(transport.messages.length, 1);
     assert.match(String(transport.messages[0].text), /no remaining steering capacity/);
   });
@@ -654,7 +654,7 @@ describe("ops worker dedicated Telegram control", () => {
       assert.equal(converged?.steering.length, 1);
       assert.equal(converged?.state, expected.expectedState);
       assert.equal(converged?.control.paused, expected.expectedPaused);
-      assert.equal(restarted.ledger.nextOffset(), 41 + index);
+      assert.equal(restarted.ledger.nextOffset(new Date(NOW)), 41 + index);
       restarted.close();
     }
   });
@@ -849,7 +849,7 @@ describe("ops worker dedicated Telegram control", () => {
 
     await control(fixture, transport).tick();
 
-    assert.equal(fixture.ledger.nextOffset(), 30);
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 30);
     assert.equal(transport.messages.length, 1);
     assert.match(String(transport.messages[0].text), /^Usage:/);
   });
@@ -1169,7 +1169,7 @@ describe("ops worker dedicated Telegram control", () => {
       OPS_WORKER_LIMITS.maxReportAttempts,
     );
     assert.equal(fixture.store.get("task-b-sendable")?.report.state, "SENT");
-    assert.equal(fixture.ledger.nextOffset(), 51);
+    assert.equal(fixture.ledger.nextOffset(new Date(NOW)), 51);
     assert.equal(transport.sendCalls, 2);
   });
 });

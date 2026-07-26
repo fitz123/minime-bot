@@ -45,10 +45,19 @@ git diff --check
 
 ### Task 3: Verify package acceptance and scope
 
-- [ ] Run every command in `Validation Commands` and resolve failures.
-- [ ] Confirm the packed package contains the changed wrappers and launchd documentation but no runtime archive, generated output, private path, credential, chat/user identifier, or deployment state.
-- [ ] Confirm the implementation changes no launchd labels/schedules, private deployment wrapper, package manager, TCC database, custom signer, or interactive terminal identity.
-- [ ] Record concise validation evidence in the final commit/PR handoff and ensure the worktree is clean.
+- [x] Run every command in `Validation Commands` and resolve failures.
+- [x] Confirm the packed package contains the changed wrappers and launchd documentation but no runtime archive, generated output, private path, credential, chat/user identifier, or deployment state.
+- [x] Confirm the implementation changes no launchd labels/schedules, private deployment wrapper, package manager, TCC database, custom signer, or interactive terminal identity.
+- [x] Record concise validation evidence in the final commit/PR handoff and ensure the worktree is clean.
+
+Validation evidence (2026-07-26): the focused wrapper suite passed 21/21 and
+the full suite passed 2273/2273 after fixing six fixed-clock assertions that
+crossed their one-week fixture boundary. Build, pack dry-run, schema-contract,
+CLI help, fixture workspace validation, and `git diff --check` all passed. A
+temporary extracted package contained 267 files including both changed wrappers
+and `docs/launchd-operations.md`; inventory, private-path/credential, and scope
+scans found no prohibited runtime, deployment, identity, signer, schedule, or
+TCC-mutation material.
 
 ## Technical Details
 
