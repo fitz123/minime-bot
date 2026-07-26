@@ -12,6 +12,28 @@ const startBotScript = resolve(__dirname, "../../scripts/start-bot.sh");
 const deliverScript = resolve(__dirname, "../../scripts/deliver.sh");
 const telegramMaxUtf16Length = 4096;
 
+type LaunchWrapper = {
+  args: string[];
+  expectedArgs: RegExp;
+  label: string;
+  script: string;
+};
+
+const launchWrappers: LaunchWrapper[] = [
+  {
+    args: [],
+    expectedArgs: /args=.*\/dist\/main\.js$/m,
+    label: "start-bot.sh",
+    script: startBotScript,
+  },
+  {
+    args: ["pi-task"],
+    expectedArgs: /args=.*\/dist\/cron-runner\.js --task pi-task$/m,
+    label: "run-cron.sh",
+    script: runCronScript,
+  },
+];
+
 type TelegramPayload = {
   chat_id: number;
   text: string;
@@ -31,6 +53,47 @@ function hasUnpairedSurrogate(text: string): boolean {
     }
   }
   return false;
+}
+
+function writeMarkerNode(binDir: string, marker: string): void {
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "node"),
+    `#!/bin/bash
+{
+  printf 'marker=${marker}\\n'
+  printf 'args=%s\\n' "$*"
+  printf 'path=%s\\n' "$PATH"
+} > "$CAPTURE_FILE"
+`,
+    "utf8",
+  );
+  chmodSync(join(binDir, "node"), 0o755);
+}
+
+function runLaunchWrapper(
+  wrapper: LaunchWrapper,
+  fixture: string,
+  envOverrides: NodeJS.ProcessEnv,
+): string {
+  const captureFile = join(fixture, `${wrapper.label}-capture.txt`);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: fixture,
+    CAPTURE_FILE: captureFile,
+  };
+  delete env.MINIME_NODE_RUNTIME_ROOT;
+  Object.assign(env, envOverrides);
+
+  const result = spawnSync("/bin/bash", [wrapper.script, ...wrapper.args], {
+    encoding: "utf8",
+    env,
+  });
+
+  assert.strictEqual(result.status, 0, result.stderr || result.stdout || `${wrapper.label} failed`);
+  const capture = readFileSync(captureFile, "utf8");
+  assert.match(capture, wrapper.expectedArgs);
+  return capture;
 }
 
 function runDeliverWithFakeTelegram(
@@ -172,6 +235,17 @@ function assertChunksWithinTelegramLimit(payloads: TelegramPayload[]): void {
 }
 
 describe("start-bot.sh", () => {
+  it("uses a generic stable runtime root without embedding a private host path", () => {
+    const script = readFileSync(startBotScript, "utf8");
+
+    assert.match(script, /MINIME_NODE_RUNTIME_ROOT/);
+    assert.match(script, /\$HOME\/\.minime\/runtime\/node/);
+    assert.match(script, /exec node "\$BOT_DIR\/dist\/main\.js"/);
+    if (process.env.HOME) {
+      assert.equal(script.includes(process.env.HOME), false);
+    }
+  });
+
   it("does not read Claude OAuth credentials or export Claude runtime flags", () => {
     const script = readFileSync(startBotScript, "utf8");
 
@@ -210,6 +284,7 @@ describe("start-bot.sh", () => {
           HOME: fixture,
           PATH: "",
           MINIME_PATH_PREFIX: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          MINIME_NODE_RUNTIME_ROOT: join(fixture, "missing-runtime"),
           CAPTURE_FILE: captureFile,
           CLAUDE_CODE_OAUTH_TOKEN: "stale-token",
           ANTHROPIC_API_KEY: "stale-anthropic-key",
@@ -230,6 +305,17 @@ describe("start-bot.sh", () => {
 });
 
 describe("run-cron.sh", () => {
+  it("uses a generic stable runtime root without embedding a private host path", () => {
+    const script = readFileSync(runCronScript, "utf8");
+
+    assert.match(script, /MINIME_NODE_RUNTIME_ROOT/);
+    assert.match(script, /\$HOME\/\.minime\/runtime\/node/);
+    assert.match(script, /exec node "\$BOT_DIR\/dist\/cron-runner\.js" --task "\$TASK_NAME"/);
+    if (process.env.HOME) {
+      assert.equal(script.includes(process.env.HOME), false);
+    }
+  });
+
   it("does not read Keychain credentials and scrubs inherited legacy runtime env", () => {
     const fixture = mkdtempSync(join(tmpdir(), "run-cron-wrapper-"));
     const binDir = join(fixture, "bin");
@@ -271,6 +357,7 @@ describe("run-cron.sh", () => {
           HOME: fixture,
           PATH: "",
           MINIME_PATH_PREFIX: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          MINIME_NODE_RUNTIME_ROOT: join(fixture, "missing-runtime"),
           CAPTURE_FILE: captureFile,
           SECURITY_CALLS_FILE: securityCallsFile,
           CLAUDE_CODE_OAUTH_TOKEN: "stale-token",
@@ -297,11 +384,98 @@ describe("run-cron.sh", () => {
       assert.match(capture, /^exit_delay=__unset__$/m);
       assert.match(capture, /^telemetry=__unset__$/m);
       const pathLine = capture.split("\n").find((line) => line.startsWith("path="));
-      assert.strictEqual(pathLine, `path=${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`);
+      assert.strictEqual(
+        pathLine,
+        `path=${join(fixture, "missing-runtime", "bin")}:${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      );
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }
   });
+});
+
+describe("launch wrapper Node runtime selection", () => {
+  for (const wrapper of launchWrappers) {
+    it(`${wrapper.label} prefers the default stable runtime over later PATH entries`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "stable-node-runtime-"));
+      const stableBin = join(fixture, ".minime", "runtime", "node", "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedBin = join(fixture, "inherited-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+      const inheritedPath = `${inheritedBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(stableBin, "stable");
+        writeMarkerNode(prefixBin, "prefix");
+        writeMarkerNode(inheritedBin, "inherited");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: inheritedPath,
+        });
+
+        assert.match(capture, /^marker=stable$/m);
+        assert.match(capture, new RegExp(`^path=${stableBin}:${pathPrefix}:${inheritedPath}$`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} falls back to MINIME_PATH_PREFIX when the stable runtime is absent`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "missing-node-runtime-"));
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedBin = join(fixture, "inherited-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+      const inheritedPath = `${inheritedBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(prefixBin, "prefix");
+        writeMarkerNode(inheritedBin, "inherited");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: inheritedPath,
+        });
+
+        assert.match(capture, /^marker=prefix$/m);
+        assert.match(
+          capture,
+          new RegExp(
+            `^path=${join(fixture, ".minime", "runtime", "node", "bin")}:${pathPrefix}:${inheritedPath}$`,
+            "m",
+          ),
+        );
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} honors the isolated runtime-root override`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "override-node-runtime-"));
+      const defaultStableBin = join(fixture, ".minime", "runtime", "node", "bin");
+      const overrideRoot = join(fixture, "runtime-override");
+      const overrideBin = join(overrideRoot, "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(defaultStableBin, "default-stable");
+        writeMarkerNode(overrideBin, "override");
+        writeMarkerNode(prefixBin, "prefix");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_NODE_RUNTIME_ROOT: overrideRoot,
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        });
+
+        assert.match(capture, /^marker=override$/m);
+        assert.match(capture, new RegExp(`^path=${overrideBin}:${pathPrefix}:/usr/bin:/bin:/usr/sbin:/sbin$`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("deliver.sh", () => {

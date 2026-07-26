@@ -29,11 +29,11 @@ git diff --check
 
 ### Task 1: Prefer the stable official runtime in both launch wrappers
 
-- [ ] Update `scripts/start-bot.sh` and `scripts/run-cron.sh` so the default stable runtime bin directory (`$HOME/.minime/runtime/node/bin`) is prepended before the existing package path fallback; allow a narrowly named runtime-root override for isolated tests and non-default installations without hard-coding a user or production path.
-- [ ] Preserve existing `MINIME_PATH_PREFIX`, inherited-path, environment-scrubbing, working-directory, argument, and `exec node` behavior outside the new precedence rule.
-- [ ] Extend `src/__tests__/run-cron-wrapper.test.ts` with isolated fixtures proving both wrappers select the stable runtime even when another `node` is available later in `PATH`.
-- [ ] Add fallback/override coverage proving installations without the stable runtime retain current behavior and no private host path is embedded.
-- [ ] Run the focused wrapper test command and fix all failures before Task 2.
+- [x] Update `scripts/start-bot.sh` and `scripts/run-cron.sh` so the default stable runtime bin directory (`$HOME/.minime/runtime/node/bin`) is prepended before the existing package path fallback; allow a narrowly named runtime-root override for isolated tests and non-default installations without hard-coding a user or production path.
+- [x] Preserve existing `MINIME_PATH_PREFIX`, inherited-path, environment-scrubbing, working-directory, argument, and `exec node` behavior outside the new precedence rule.
+- [x] Extend `src/__tests__/run-cron-wrapper.test.ts` with isolated fixtures proving both wrappers select the stable runtime even when another `node` is available later in `PATH`.
+- [x] Add fallback/override coverage proving installations without the stable runtime retain current behavior and no private host path is embedded.
+- [x] Run the focused wrapper test command and fix all failures before Task 2.
 
 ### Task 2: Document verified install, upgrade, rollback, and consent boundaries
 
