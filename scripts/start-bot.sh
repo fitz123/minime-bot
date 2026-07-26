@@ -6,8 +6,9 @@ set -euo pipefail
 
 # Ensure HOME and PATH are set (launchd context may not have them)
 export HOME="${HOME:-$(dscl . -read /Users/$(whoami) NFSHomeDirectory | awk '{print $2}')}"
+NODE_RUNTIME_ROOT="${MINIME_NODE_RUNTIME_ROOT:-$HOME/.minime/runtime/node}"
 PATH_PREFIX="${MINIME_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
-export PATH="${PATH_PREFIX}${PATH:+:${PATH}}"
+export PATH="$NODE_RUNTIME_ROOT/bin:${PATH_PREFIX}${PATH:+:${PATH}}"
 
 # Drop inherited legacy AI runtime environment before boot
 for env_name in ${!CLAUDE_CODE_@} ${!ANTHROPIC_@}; do

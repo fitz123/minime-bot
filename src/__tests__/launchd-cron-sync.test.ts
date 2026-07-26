@@ -1060,6 +1060,33 @@ fi
     }
   });
 
+  it("persists an explicit Node runtime root in rendered plists", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const runtimeRoot = join(fixture.root, "official & node");
+
+      const result = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: {
+          ...fixture.env,
+          MINIME_NODE_RUNTIME_ROOT: runtimeRoot,
+        },
+        homeDir: fixture.home,
+      });
+
+      assert.match(
+        result.plists[0].content,
+        new RegExp(
+          `<key>MINIME_NODE_RUNTIME_ROOT</key>\\s*<string>${escapeRegex(xmlEscapeFixture(runtimeRoot))}</string>`,
+        ),
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("dry-run plans create and prune actions without writing files or running commands", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];

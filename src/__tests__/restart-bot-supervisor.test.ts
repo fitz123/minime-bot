@@ -390,12 +390,16 @@ describe("restart-bot.sh supervisor mode", () => {
       const logPath = join(h.dir, "status & logs", "request.log");
       const configPath = "settings/config.yaml";
       const cronsPath = join(controlWorkspace, "settings", "crons.yaml");
+      const nodeRuntimeRoot = join(h.dir, "official node");
+      const pathPrefix = join(h.dir, "fallback bin");
       mkdirSync(controlWorkspace, { recursive: true });
 
       const { status, stderr } = h.run(["--plist"], {
         MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
         MINIME_CONFIG_PATH: configPath,
         MINIME_CRONS_PATH: cronsPath,
+        MINIME_NODE_RUNTIME_ROOT: nodeRuntimeRoot,
+        MINIME_PATH_PREFIX: pathPrefix,
         RESTART_REQUEST_ID: "request-special",
         RESTART_STATUS_PATH: statusPath,
         RESTART_LOG_PATH: logPath,
@@ -441,6 +445,8 @@ describe("restart-bot.sh supervisor mode", () => {
           MINIME_CONTROL_WORKSPACE_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_CONTROL_WORKSPACE_ROOT,
           MINIME_CONFIG_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CONFIG_PATH,
           MINIME_CRONS_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CRONS_PATH,
+          MINIME_NODE_RUNTIME_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_NODE_RUNTIME_ROOT,
+          MINIME_PATH_PREFIX: plistStringDict(plist, "EnvironmentVariables").MINIME_PATH_PREFIX,
           HOME: plistStringDict(plist, "EnvironmentVariables").HOME,
           RESTART_REQUEST_ID: plistStringDict(plist, "EnvironmentVariables").RESTART_REQUEST_ID,
           RESTART_STATUS_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_STATUS_PATH,
@@ -453,6 +459,8 @@ describe("restart-bot.sh supervisor mode", () => {
           MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
           MINIME_CONFIG_PATH: configPath,
           MINIME_CRONS_PATH: cronsPath,
+          MINIME_NODE_RUNTIME_ROOT: nodeRuntimeRoot,
+          MINIME_PATH_PREFIX: pathPrefix,
           HOME: h.dir,
           RESTART_REQUEST_ID: "request-special",
           RESTART_STATUS_PATH: statusPath,
@@ -460,6 +468,7 @@ describe("restart-bot.sh supervisor mode", () => {
         },
       );
       const env = plistStringDict(plist, "EnvironmentVariables");
+      assert.equal(env.PATH.startsWith(`${join(nodeRuntimeRoot, "bin")}:${pathPrefix}:`), true);
       assert.ok(env.PATH.includes("/usr/bin"));
       assert.equal("BOT_DOMAIN" in env, false);
       assert.equal("RESTART_WORKER_ARGS" in env, false);
@@ -471,6 +480,34 @@ describe("restart-bot.sh supervisor mode", () => {
         h.readPlutilCommands().some((line) => line === `-lint\t${supervisorPlist}`),
         `expected supervisor plist lint, got ${JSON.stringify(h.readPlutilCommands())}`,
       );
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("validates config with the selected stable Node runtime", () => {
+    const h = createHarness();
+    try {
+      const runtimeRoot = join(h.dir, "runtime");
+      const nodeBin = join(runtimeRoot, "bin");
+      const capturePath = join(h.dir, "node-capture.txt");
+      mkdirSync(nodeBin, { recursive: true });
+      writeFileSync(
+        join(nodeBin, "node"),
+        `#!/bin/bash
+printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
+`,
+      );
+      chmodSync(join(nodeBin, "node"), 0o755);
+
+      const { status, stderr } = h.run(["--plist"], {
+        CONFIG_VALIDATE_BIN: "",
+        MINIME_NODE_RUNTIME_ROOT: runtimeRoot,
+        NODE_CAPTURE: capturePath,
+      });
+
+      assert.strictEqual(status, 0, `expected request success: ${stderr}`);
+      assert.match(readFileSync(capturePath, "utf8"), /dist\/cli\.js config validate/);
     } finally {
       cleanup(h);
     }

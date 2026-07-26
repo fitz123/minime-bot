@@ -12,6 +12,28 @@ const startBotScript = resolve(__dirname, "../../scripts/start-bot.sh");
 const deliverScript = resolve(__dirname, "../../scripts/deliver.sh");
 const telegramMaxUtf16Length = 4096;
 
+type LaunchWrapper = {
+  args: string[];
+  expectedArgs: RegExp;
+  label: string;
+  script: string;
+};
+
+const launchWrappers: LaunchWrapper[] = [
+  {
+    args: [],
+    expectedArgs: /args=.*\/dist\/main\.js$/m,
+    label: "start-bot.sh",
+    script: startBotScript,
+  },
+  {
+    args: ["pi-task"],
+    expectedArgs: /args=.*\/dist\/cron-runner\.js --task pi-task$/m,
+    label: "run-cron.sh",
+    script: runCronScript,
+  },
+];
+
 type TelegramPayload = {
   chat_id: number;
   text: string;
@@ -31,6 +53,51 @@ function hasUnpairedSurrogate(text: string): boolean {
     }
   }
   return false;
+}
+
+function writeMarkerNode(binDir: string, marker: string): void {
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "node"),
+    `#!/bin/bash
+{
+  printf 'marker=${marker}\\n'
+  printf 'args=%s\\n' "$*"
+  printf 'path=%s\\n' "$PATH"
+} > "$CAPTURE_FILE"
+`,
+    "utf8",
+  );
+  chmodSync(join(binDir, "node"), 0o755);
+}
+
+function runLaunchWrapper(
+  wrapper: LaunchWrapper,
+  fixture: string,
+  envOverrides: NodeJS.ProcessEnv,
+  options: { omitHome?: boolean } = {},
+): string {
+  const captureFile = join(fixture, `${wrapper.label}-capture.txt`);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: fixture,
+    CAPTURE_FILE: captureFile,
+  };
+  if (options.omitHome) {
+    delete env.HOME;
+  }
+  delete env.MINIME_NODE_RUNTIME_ROOT;
+  Object.assign(env, envOverrides);
+
+  const result = spawnSync("/bin/bash", [wrapper.script, ...wrapper.args], {
+    encoding: "utf8",
+    env,
+  });
+
+  assert.strictEqual(result.status, 0, result.stderr || result.stdout || `${wrapper.label} failed`);
+  const capture = readFileSync(captureFile, "utf8");
+  assert.match(capture, wrapper.expectedArgs);
+  return capture;
 }
 
 function runDeliverWithFakeTelegram(
@@ -210,6 +277,7 @@ describe("start-bot.sh", () => {
           HOME: fixture,
           PATH: "",
           MINIME_PATH_PREFIX: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          MINIME_NODE_RUNTIME_ROOT: join(fixture, "missing-runtime"),
           CAPTURE_FILE: captureFile,
           CLAUDE_CODE_OAUTH_TOKEN: "stale-token",
           ANTHROPIC_API_KEY: "stale-anthropic-key",
@@ -271,6 +339,7 @@ describe("run-cron.sh", () => {
           HOME: fixture,
           PATH: "",
           MINIME_PATH_PREFIX: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          MINIME_NODE_RUNTIME_ROOT: join(fixture, "missing-runtime"),
           CAPTURE_FILE: captureFile,
           SECURITY_CALLS_FILE: securityCallsFile,
           CLAUDE_CODE_OAUTH_TOKEN: "stale-token",
@@ -297,11 +366,141 @@ describe("run-cron.sh", () => {
       assert.match(capture, /^exit_delay=__unset__$/m);
       assert.match(capture, /^telemetry=__unset__$/m);
       const pathLine = capture.split("\n").find((line) => line.startsWith("path="));
-      assert.strictEqual(pathLine, `path=${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`);
+      assert.strictEqual(
+        pathLine,
+        `path=${join(fixture, "missing-runtime", "bin")}:${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      );
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }
   });
+});
+
+describe("launch wrapper Node runtime selection", () => {
+  for (const wrapper of launchWrappers) {
+    it(`${wrapper.label} contains no literal macOS user home`, () => {
+      const script = readFileSync(wrapper.script, "utf8");
+      assert.doesNotMatch(script, /\/Users\/[A-Za-z0-9._-]+(?:\/|["'\s])/);
+    });
+
+    it(`${wrapper.label} prefers the default stable runtime over later PATH entries`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "stable-node-runtime-"));
+      const stableBin = join(fixture, ".minime", "runtime", "node", "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedBin = join(fixture, "inherited-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+      const inheritedPath = `${inheritedBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(stableBin, "stable");
+        writeMarkerNode(prefixBin, "prefix");
+        writeMarkerNode(inheritedBin, "inherited");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: inheritedPath,
+        });
+
+        assert.match(capture, /^marker=stable$/m);
+        assert.match(capture, new RegExp(`^path=${stableBin}:${pathPrefix}:${inheritedPath}$`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} falls back to MINIME_PATH_PREFIX when the stable runtime is absent`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "missing-node-runtime-"));
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedBin = join(fixture, "inherited-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+      const inheritedPath = `${inheritedBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(prefixBin, "prefix");
+        writeMarkerNode(inheritedBin, "inherited");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: inheritedPath,
+        });
+
+        assert.match(capture, /^marker=prefix$/m);
+        assert.match(
+          capture,
+          new RegExp(
+            `^path=${join(fixture, ".minime", "runtime", "node", "bin")}:${pathPrefix}:${inheritedPath}$`,
+            "m",
+          ),
+        );
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} honors the isolated runtime-root override`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "override-node-runtime-"));
+      const defaultStableBin = join(fixture, ".minime", "runtime", "node", "bin");
+      const overrideRoot = join(fixture, "runtime-override");
+      const overrideBin = join(overrideRoot, "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const pathPrefix = `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        writeMarkerNode(defaultStableBin, "default-stable");
+        writeMarkerNode(overrideBin, "override");
+        writeMarkerNode(prefixBin, "prefix");
+
+        const capture = runLaunchWrapper(wrapper, fixture, {
+          MINIME_NODE_RUNTIME_ROOT: overrideRoot,
+          MINIME_PATH_PREFIX: pathPrefix,
+          PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        });
+
+        assert.match(capture, /^marker=override$/m);
+        assert.match(capture, new RegExp(`^path=${overrideBin}:${pathPrefix}:/usr/bin:/bin:/usr/sbin:/sbin$`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+
+    it(`${wrapper.label} derives the stable runtime from the recovered launchd home`, () => {
+      const fixture = mkdtempSync(join(tmpdir(), "recovered-home-node-runtime-"));
+      const recoveredHome = join(fixture, "recovered-home");
+      const lookupBin = join(fixture, "lookup-bin");
+      const stableBin = join(recoveredHome, ".minime", "runtime", "node", "bin");
+      const prefixBin = join(fixture, "prefix-bin");
+      const inheritedPath = `${lookupBin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+
+      try {
+        mkdirSync(lookupBin, { recursive: true });
+        writeFileSync(
+          join(lookupBin, "dscl"),
+          `#!/bin/bash
+printf 'NFSHomeDirectory: %s\n' "$RECOVERED_HOME"
+`,
+        );
+        chmodSync(join(lookupBin, "dscl"), 0o755);
+        writeMarkerNode(stableBin, "recovered-home-stable");
+        writeMarkerNode(prefixBin, "prefix");
+
+        const capture = runLaunchWrapper(
+          wrapper,
+          fixture,
+          {
+            RECOVERED_HOME: recoveredHome,
+            MINIME_PATH_PREFIX: `${prefixBin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+            PATH: inheritedPath,
+          },
+          { omitHome: true },
+        );
+
+        assert.match(capture, /^marker=recovered-home-stable$/m);
+        assert.match(capture, new RegExp(`^path=${stableBin}:`, "m"));
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("deliver.sh", () => {

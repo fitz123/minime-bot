@@ -29,7 +29,9 @@ if [ -z "$HOME" ]; then
   echo "[restart-bot] Error: could not determine HOME from environment or fallback lookups" >&2
   exit 1
 fi
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+NODE_RUNTIME_ROOT="${MINIME_NODE_RUNTIME_ROOT:-$HOME/.minime/runtime/node}"
+PATH_PREFIX="${MINIME_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+export PATH="$NODE_RUNTIME_ROOT/bin:${PATH_PREFIX}${PATH:+:${PATH}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -391,6 +393,8 @@ generate_supervisor_plist() {
     write_env_entry "MINIME_CONTROL_WORKSPACE_ROOT" "${MINIME_CONTROL_WORKSPACE_ROOT:-}"
     write_env_entry_if_set "MINIME_CONFIG_PATH" "${MINIME_CONFIG_PATH:-}"
     write_env_entry_if_set "MINIME_CRONS_PATH" "${MINIME_CRONS_PATH:-}"
+    write_env_entry_if_set "MINIME_NODE_RUNTIME_ROOT" "${MINIME_NODE_RUNTIME_ROOT:-}"
+    write_env_entry_if_set "MINIME_PATH_PREFIX" "${MINIME_PATH_PREFIX:-}"
     write_env_entry "HOME" "$HOME"
     write_env_entry "PATH" "$PATH"
     write_env_entry "RESTART_REQUEST_ID" "$request_id"

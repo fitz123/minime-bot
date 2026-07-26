@@ -61,6 +61,245 @@ The `--request-id`, `--status-path`, and `--log-path` flags are supervisor
 automation arguments used when request mode launches worker mode. Operators
 should normally call `scripts/restart-bot.sh --plist` without these flags.
 
+## Official Node launch runtime
+
+`scripts/start-bot.sh` and `scripts/run-cron.sh` prefer
+`$HOME/.minime/runtime/node/bin/node` before the package's existing PATH
+fallbacks. `MINIME_NODE_RUNTIME_ROOT` is the narrow override for an isolated
+test or a deliberately non-default installation. Do not use it as an automatic
+version selector: upgrades should replace the verified tree at one stable
+runtime root.
+
+Use only an official macOS archive from `nodejs.org`. Choose a supported Node
+release that satisfies `package.json`'s `engines.node` range and the host
+architecture. Pin the complete version for each maintenance operation; do not
+resolve `latest` during activation. Map Apple silicon (`arm64`) to
+`darwin-arm64` and Intel (`x86_64`) to `darwin-x64`. Run every block through
+activation in the same Bash shell; the fail-fast settings in the first block
+must remain active, and any non-zero command means stop rather than continuing
+to a later block:
+
+```bash
+set -euo pipefail
+umask 077
+RUNTIME_BASE="${HOME:?HOME must be set}/.minime/runtime"
+STABLE_NODE="$RUNTIME_BASE/node"
+NODE_VERSION=vX.Y.Z
+test "$NODE_VERSION" != vX.Y.Z
+
+case "$(uname -m)" in
+  arm64) NODE_PLATFORM=darwin-arm64 ;;
+  x86_64) NODE_PLATFORM=darwin-x64 ;;
+  *) echo "unsupported macOS architecture" >&2; exit 1 ;;
+esac
+
+NODE_ARCHIVE="node-${NODE_VERSION}-${NODE_PLATFORM}.tar.gz"
+install -d -m 700 "$RUNTIME_BASE"
+STAGE_DIR="$(mktemp -d "$RUNTIME_BASE/.node-stage.XXXXXX")"
+cd "$STAGE_DIR"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --remote-name "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --remote-name "https://nodejs.org/dist/${NODE_VERSION}/${NODE_ARCHIVE}"
+```
+
+Replace `vX.Y.Z` before running the commands. Keep the staging directory
+owner-only and abort on any failed check. Select the archive's exact entry from
+the official `SHASUMS256.txt`, require exactly one match, and verify it before
+extraction:
+
+```bash
+awk -v name="$NODE_ARCHIVE" '$2 == name { print }' \
+  SHASUMS256.txt > SHASUMS256.selected
+test "$(wc -l < SHASUMS256.selected | tr -d ' ')" = 1
+shasum -a 256 -c SHASUMS256.selected
+
+tar -xzf "$NODE_ARCHIVE"
+STAGED_TREE="$STAGE_DIR/${NODE_ARCHIVE%.tar.gz}"
+STAGED_NODE="$STAGED_TREE/bin/node"
+test -x "$STAGED_NODE"
+```
+
+Verify the extracted executable with macOS's trust tools. The explicit
+requirement authenticates the Apple Developer ID chain, Node identifier, and
+expected Node.js team rather than trusting identity metadata supplied by the
+candidate signature itself. `codesign` validation must succeed, and its
+reported identity must also contain the exact standalone lines
+`Identifier=node` and `TeamIdentifier=HX7739G8FX`. Reject a Homebrew dependency
+and any other dependency outside the macOS system library roots:
+
+```bash
+NODE_REQUIREMENT='=identifier "node" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "HX7739G8FX"'
+codesign -v --strict -R "$NODE_REQUIREMENT" "$STAGED_NODE"
+codesign -dv --verbose=4 "$STAGED_NODE" 2> codesign-details.txt
+grep -Fx 'Identifier=node' codesign-details.txt
+grep -Fx 'TeamIdentifier=HX7739G8FX' codesign-details.txt
+
+otool -L "$STAGED_NODE" > node-dependencies.txt
+if grep -Fq '/opt/homebrew/' node-dependencies.txt; then
+  echo "refusing Node with Homebrew dependencies" >&2
+  exit 1
+fi
+if tail -n +2 node-dependencies.txt | awk '{print $1}' \
+  | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+  echo "refusing Node with non-system dependencies" >&2
+  exit 1
+fi
+```
+
+Only after every check passes, move the staged tree next to the stable path.
+Refuse an unexplained stale `node.next`; inspect and remove it separately
+rather than overwriting it during this procedure.
+
+```bash
+NEXT_NODE="$RUNTIME_BASE/node.next"
+test ! -e "$NEXT_NODE"
+mv "$STAGED_TREE" "$NEXT_NODE"
+cd "$HOME"
+rm -rf "$STAGE_DIR"
+test -x "$NEXT_NODE/bin/node"
+```
+
+For activation, preserve at most one rollback tree. A fresh install has no
+current `node`; an upgrade moves the current verified tree to `node.rollback`
+before putting `node.next` at the stable path. Run these commands as the
+launchd user:
+
+```bash
+if test -e "$STABLE_NODE"; then
+  rm -rf "$RUNTIME_BASE/node.rollback"
+  mv "$STABLE_NODE" "$RUNTIME_BASE/node.rollback"
+fi
+if ! mv "$NEXT_NODE" "$STABLE_NODE"; then
+  if test -d "$RUNTIME_BASE/node.rollback" && test ! -e "$STABLE_NODE"; then
+    mv "$RUNTIME_BASE/node.rollback" "$STABLE_NODE"
+  fi
+  exit 1
+fi
+```
+
+Restart the bot only through the canonical package helper. Its default
+`--plist` request returns after scheduling the one-shot supervisor, so poll the
+request's status file with a bounded deadline before inspecting the process.
+The helper below fails on an explicit worker failure or after four minutes and
+prints the terminal status as evidence:
+
+```bash
+restart_and_wait() {
+  local package_root="$1"
+  local request_id="node-runtime-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+  local restart_dir="$HOME/Library/Logs/minime-bot/restart"
+  local status_path="$restart_dir/${request_id}.status"
+  local log_path="$restart_dir/${request_id}.log"
+  local deadline status
+
+  (
+    cd "$package_root"
+    scripts/restart-bot.sh --plist \
+      --request-id "$request_id" \
+      --status-path "$status_path" \
+      --log-path "$log_path"
+  )
+
+  deadline=$((SECONDS + 240))
+  while :; do
+    status=""
+    if test -f "$status_path"; then
+      status="$(awk -F= '$1 == "status" { print $2 }' "$status_path")"
+    fi
+    case "$status" in
+      success) break ;;
+      failure)
+        grep -E '^(requestId|status|error)=' "$status_path" >&2
+        return 1
+        ;;
+    esac
+    if test "$SECONDS" -ge "$deadline"; then
+      echo "timeout waiting for restart request $request_id" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  grep -E '^(requestId|newPid|status)=' "$status_path"
+}
+
+PACKAGE_ROOT=/path/to/installed/minime-bot
+restart_and_wait "$PACKAGE_ROOT"
+BOT_LABEL=ai.minime.telegram-bot
+BOT_PID="$(launchctl print "gui/$(id -u)/$BOT_LABEL" \
+  | awk '/pid = / { print $3; exit }')"
+test -n "$BOT_PID"
+lsof -a -p "$BOT_PID" -d txt -Fn \
+  | grep -Fx "n$RUNTIME_BASE/node/bin/node"
+```
+
+The cron wrapper uses the same stable runtime on its next launch. A deliberate
+non-default `MINIME_NODE_RUNTIME_ROOT` must also be present in the bot launchd
+environment; launchd cron sync preserves the variable in generated cron
+plists.
+
+If bot startup or verification fails, start a fresh Bash shell, enable
+fail-fast mode, and re-enter the `restart_and_wait` function above. Then move
+the failed tree aside. An upgrade restores `node.rollback`; a fresh
+installation has no rollback tree, so leaving the stable path absent restores
+the existing PATH fallback. Delete the failed tree only after the replacement
+or fallback process is running and verified:
+
+```bash
+set -euo pipefail
+RUNTIME_BASE="${HOME:?HOME must be set}/.minime/runtime"
+STABLE_NODE="$RUNTIME_BASE/node"
+ROLLBACK_NODE="$RUNTIME_BASE/node.rollback"
+FAILED_NODE="$RUNTIME_BASE/node.failed"
+PACKAGE_ROOT=/path/to/installed/minime-bot
+
+test -x "$STABLE_NODE/bin/node"
+test ! -e "$FAILED_NODE"
+mv "$STABLE_NODE" "$FAILED_NODE"
+if test -e "$ROLLBACK_NODE"; then
+  test -x "$ROLLBACK_NODE/bin/node"
+  if mv "$ROLLBACK_NODE" "$STABLE_NODE"; then
+    EXPECTED_NODE="$STABLE_NODE/bin/node"
+  else
+    mv "$FAILED_NODE" "$STABLE_NODE"
+    exit 1
+  fi
+else
+  EXPECTED_NODE=""
+fi
+
+restart_and_wait "$PACKAGE_ROOT"
+BOT_LABEL=ai.minime.telegram-bot
+BOT_PID="$(launchctl print "gui/$(id -u)/$BOT_LABEL" \
+  | awk '/pid = / { print $3; exit }')"
+test -n "$BOT_PID"
+LIVE_NODE="$(lsof -a -p "$BOT_PID" -d txt -Fn \
+  | awk '/^n/ { print substr($0, 2); exit }')"
+test -n "$LIVE_NODE"
+if test -n "$EXPECTED_NODE"; then
+  test "$LIVE_NODE" = "$EXPECTED_NODE"
+else
+  test "$LIVE_NODE" != "$FAILED_NODE/bin/node"
+fi
+printf 'live_node=%s\n' "$LIVE_NODE"
+rm -rf "$FAILED_NODE"
+```
+
+### TCC consent boundary
+
+Consent for a protected macOS resource is a one-time manual operator action
+through the system prompt or System Settings for the exact required resource.
+The package, installation procedure, and operators must never read, edit, or
+write the TCC database directly. They must not attempt to pre-seed consent.
+
+Keeping the stable path and the official Node signing identity is intended to
+preserve an existing grant across a verified official Node upgrade, but it is
+not an unconditional guarantee. An OS or privacy-settings reset, an upstream
+certificate, TeamIdentifier, or designated-requirement change, certificate
+revocation, and manual revocation of the TCC grant are outside that survival
+guarantee. If macOS requests consent after one of those events, stop and
+perform the exact manual consent action again.
+
 ## Foreground worker mode
 
 Foreground worker mode exists for operator debugging:

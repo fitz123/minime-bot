@@ -417,6 +417,12 @@ use `--plist` without `--worker` so the request can return before launchd tears
 down the bot service. The implementation intentionally uses the fixed helper
 label for stale-registration cleanup instead of custom lock files.
 
+The bot and cron launch wrappers prefer the stable official Node runtime at
+`$HOME/.minime/runtime/node`, with their existing PATH behavior as a fallback.
+See [Official Node launch runtime](docs/launchd-operations.md#official-node-launch-runtime)
+for the checksum- and signature-verified install, upgrade, process verification,
+rollback, and manual TCC consent procedure.
+
 Cron schedule deployment is separate from bot restart. Cron prompt and timeout
 changes are read by the cron runner from the merged workspace cron files at
 each execution, so they do not require restarting `ai.minime.telegram-bot`.
