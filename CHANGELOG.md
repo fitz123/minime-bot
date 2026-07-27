@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.33
+
+- Bound the package test suite and every Node test, emit actionable timeout
+  diagnostics, and clean the owned process group on every terminal path so a
+  stalled test cannot leave release validation running indefinitely (#79).
+
 ## 2026.7.32
 
 - Prefer a stable official Node runtime for bot and cron launch wrappers while
