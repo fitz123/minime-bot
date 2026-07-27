@@ -1102,6 +1102,9 @@ function markCompletedRunReset(
  *   terminal `ResultMessage` for the accepted prompt.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end is retained until settlement.
+ * - `summarization_retry_scheduled` / `summarization_retry_attempt_start` /
+ *   `summarization_retry_finished` → nonterminal lifecycle activity. The stream
+ *   reader refreshes its watchdog before these records are intentionally filtered.
  * - `turn_end` → `null`. It is a per-turn boundary that fires once PER turn, so a
  *   multi-turn (tool-using) response emits several `turn_end`s before `agent_end`.
  *   Neither boundary settles the accepted prompt.
@@ -1272,6 +1275,13 @@ export function parsePiEvent(
         state.pendingOutcome = buildOverflowAwareErrorResult(state, rawEvent);
         clearPendingOverflow(state);
       }
+      return null;
+
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
+      // Pi owns the summarization retry lifecycle. These records keep the
+      // accepted prompt alive and must not settle it or disturb overflow state.
       return null;
 
     case "response": {
