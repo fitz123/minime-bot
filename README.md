@@ -366,6 +366,37 @@ receives a coalesced resend-later notice, at most once per chat every 30 seconds
 `bot_message_queue_rejection_notices_total` records `sent`, `failed`, and
 `rate_limited` notice outcomes without identifying the chat.
 
+Ordinary Telegram inputs received during an active Pi turn remain bot-owned
+queue entries until a first-party Pi lifecycle gate atomically accepts and
+enqueues the exact correlated correction. The queue offers entries serially in
+arrival order: matching enqueue acceptance opens the next offer so Pi's
+configured steering mode can group already-waiting corrections, but ownership
+does not transfer yet. Only the matching consumption result transfers that
+exact entry to Pi and removes it from fallback collection. Rejection, write or
+child failure, or turn settlement before consumption leaves it for the existing
+ordered follow-up drain. This keeps the process-lifetime
+no-known-loss/no-duplicate boundary without an independent acknowledgement
+timeout or retry loop. When first-party Pi extensions are deliberately
+disabled, the queue uses fallback instead of attempting acknowledged steering.
+Acknowledged media keeps session-lifetime file ownership, while fallback and
+dropped entries retain their existing cleanup behavior.
+
+The acknowledged path applies to text (including source, reply, and forward
+framing), voice transcripts, photos, documents, supported media, and reaction
+context. Both `/reconnect` and `/clean` explicitly clear pending and mid-turn
+queue entries, including an acknowledgement currently in flight, and late
+results cannot restore those dropped entries. `/reconnect` preserves stored
+conversation state; `/clean` deletes it.
+
+Native Pi steering takes effect after the current complete tool-call batch and
+before the next model call; it does not interrupt a running tool or its sibling
+calls. The child lifecycle gate remains available through retry backoff,
+compaction, and queued continuations until `agent_settled`. Pi's configured
+steering mode remains authoritative. Telegram's idle 3-second debounce, queue
+cap and saturation policy, draft/final delivery, and outbox behavior are
+unchanged. Passive echo and shutdown steering remain best-effort, and Discord
+message-queue behavior is unchanged.
+
 Media downloads retry transient network or stream failures and HTTP 408, 429,
 and 5xx responses up to three attempts, honoring a bounded `Retry-After` value.
 `bot_media_download_retries_total` records bounded `recovered` and `exhausted`

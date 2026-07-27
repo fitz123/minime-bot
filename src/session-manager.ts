@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -147,6 +147,14 @@ export interface ActiveSession {
   restartCount: number;
   /** Per-session outbox directory for file delivery. */
   outboxPath: string;
+  /** Correlated steer requests still owned by the bot pending Pi response. */
+  pendingSteers: Map<string, PendingSteer>;
+}
+
+export interface PendingSteer {
+  resolve: (acknowledged: boolean) => void;
+  onEnqueued?: () => void;
+  enqueued: boolean;
 }
 
 export interface SessionHealth {
@@ -801,6 +809,7 @@ export class SessionManager {
       lastSuccessAt: null,
       restartCount,
       outboxPath,
+      pendingSteers: new Map(),
     };
 
     this.active.set(chatId, session);
@@ -919,8 +928,19 @@ export class SessionManager {
         // histogram. processingStartedAt is reset to null after the loop, so
         // capture it now while it is still set.
         const turnStartedAt = session.processingStartedAt ?? Date.now();
-        const stream = readPiStream(session.child, resetActivityTimer, promptId);
+        const stream = readPiStream(
+          session.child,
+          resetActivityTimer,
+          promptId,
+          (result) => this.observeAcknowledgedSteerResult(session, result),
+        );
         for await (const line of stream) {
+          if (line.type === "result") {
+            // `agent_settled` is an existing ownership boundary. Any steer that
+            // was not acknowledged before this result remains bot-owned and
+            // must be eligible for the normal follow-up path.
+            this.settlePendingSteers(session);
+          }
           push(line);
           // Pi auto-retry telemetry: increment once per retry on auto_retry_start
           // (auto_retry_end signals recovery — counting it too would double-count).
@@ -948,6 +968,7 @@ export class SessionManager {
         clearActivityTimers();
         session.processingStartedAt = null;
         if (!gotResult) {
+          this.settlePendingSteers(session);
           finish(new Error("Pi stream ended without an agent_settled result"));
           return;
         }
@@ -955,6 +976,7 @@ export class SessionManager {
       } catch (err) {
         clearActivityTimers();
         session.processingStartedAt = null;
+        this.settlePendingSteers(session);
         finish(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -972,6 +994,94 @@ export class SessionManager {
     } finally {
       // Ensure queue bookkeeping completes even if consumer stops early
       await taskPromise;
+    }
+  }
+
+  /**
+   * Attempt first-party Pi steering for an active turn. The returned promise is
+   * true only after the existing stdout reader observes the exact correlated
+   * consumption event from the child lifecycle gate. `onEnqueued` observes the
+   * earlier atomic enqueue acceptance without transferring bot ownership.
+   * Every other terminal resolution preserves bot ownership.
+   */
+  steerSessionMessage(
+    chatId: string,
+    agentId: string,
+    text: string,
+    onEnqueued?: () => void,
+  ): Promise<boolean> {
+    const session = this.active.get(chatId);
+    if (
+      !session ||
+      session.agentId !== agentId ||
+      session.processingStartedAt === null ||
+      process.env[PI_EXTENSIONS_DISABLED_ENV] === "1" ||
+      hasExited(session.child) ||
+      session.child.killed ||
+      !session.child.stdout ||
+      session.child.stdout.destroyed
+    ) {
+      return Promise.resolve(false);
+    }
+
+    const id = `minime-steer-${randomUUID()}`;
+    return new Promise<boolean>((resolveSteer) => {
+      session.pendingSteers.set(id, {
+        resolve: resolveSteer,
+        onEnqueued,
+        enqueued: false,
+      });
+      try {
+        sendPiAcknowledgedSteer(session.child, text, id, (error) => {
+          log.warn(
+            "session-manager",
+            `Pi steer write failed for chat ${chatId}: ${error.message}`,
+          );
+          this.settlePendingSteer(session, id, false);
+        });
+      } catch (err) {
+        log.warn(
+          "session-manager",
+          `Pi steer write failed for chat ${chatId}: ${(err as Error).message}`,
+        );
+        this.settlePendingSteer(session, id, false);
+      }
+    });
+  }
+
+  private observeAcknowledgedSteerResult(
+    session: ActiveSession,
+    result: PiAcknowledgedSteerResult,
+  ): void {
+    if (result.status === "enqueued") {
+      const pending = session.pendingSteers.get(result.id);
+      if (!pending || pending.enqueued) return;
+      pending.enqueued = true;
+      try {
+        pending.onEnqueued?.();
+      } catch {
+        log.warn("session-manager", "Pi steer enqueue callback failed");
+      }
+      return;
+    }
+    this.settlePendingSteer(session, result.id, result.status === "consumed");
+  }
+
+  private settlePendingSteer(
+    session: ActiveSession,
+    id: string,
+    acknowledged: boolean,
+  ): void {
+    const pending = session.pendingSteers.get(id);
+    if (!pending) return;
+    session.pendingSteers.delete(id);
+    pending.resolve(acknowledged);
+  }
+
+  private settlePendingSteers(session: ActiveSession): void {
+    if (!session.pendingSteers) return;
+    for (const id of [...session.pendingSteers.keys()]) {
+      this.settlePendingSteer(session, id, false);
     }
   }
 
@@ -1037,7 +1147,9 @@ export class SessionManager {
       this.store.setSession(chatId, this.toSessionState(chatId, session));
     }
 
-    // Remove from active map first to prevent re-entry
+    // Remove from active first to reject new steering attempts. The current
+    // stdout reader still owns existing correlations and must drain any success
+    // record buffered before termination; its result/EOF path settles the rest.
     this.active.delete(chatId);
     sessionsActive.dec();
 
@@ -1240,12 +1352,15 @@ export class SessionManager {
         clearTimeout(session.idleTimer);
       }
 
-      // Remove from active map (not from store — session can be resumed)
+      // Remove from active (not from store — session can be resumed) so no new
+      // steering starts. The current stdout reader must first drain any success
+      // record buffered before this exit event, then settle unresolved entries.
       this.active.delete(chatId);
       sessionsActive.dec();
 
-      // Clean up media directory — files are scoped to this session's lifetime
-      try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
+      // Reclaim session-owned media, but preserve bot-owned in-flight files for
+      // the ordered fallback that runs after pending steer settlement.
+      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
 
       if (code !== 0 && signal !== "SIGTERM" && signal !== "SIGKILL") {
         sessionCrashes.inc({ agent_id: session.agentId });

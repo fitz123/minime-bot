@@ -378,6 +378,8 @@ mock.module("../pi-rpc-protocol.js", {
     },
     sendPiPrompt() {},
     sendPiSteer() {},
+    sendPiAcknowledgedSteer() {},
+    PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     normalizePiModel,
     async *readPiStream(): AsyncGenerator<StreamLine> {
       // Message-path reader (unused by the spawn-path capture, which now reads
@@ -1505,6 +1507,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: oldOutbox,
+      pendingSteers: new Map(),
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
     sessionsActive.inc();
@@ -1590,6 +1593,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: oldOutbox,
+      pendingSteers: new Map(),
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
     const before = await activeGauge();

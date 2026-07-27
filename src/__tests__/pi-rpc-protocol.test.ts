@@ -29,6 +29,7 @@ import {
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
   buildGetStateCommand,
+  buildPiAcknowledgedSteerCommand,
   buildPiExtensionUiCancellationCommand,
   buildPiAskAgentChildSpawnEnv,
   buildPiPromptCommand,
@@ -46,6 +47,7 @@ import {
   resolvePiAskAgentChildExtensionArgs,
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
+  sendPiAcknowledgedSteer,
   sendPiGetState,
   sendPiPrompt,
   sendPiSteer,
@@ -55,6 +57,11 @@ import {
   type PiRpcParseState,
   type PiSpawnExtensionOptions,
 } from "../pi-rpc-protocol.js";
+import {
+  PI_ACKNOWLEDGED_STEER_COMMAND,
+  buildPiAcknowledgedSteerResultNotice,
+  parsePiAcknowledgedSteerEnvelope,
+} from "../pi-extensions/acknowledged-steer.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
@@ -374,7 +381,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -436,6 +443,7 @@ describe("Pi extension loading (--extension)", () => {
 
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
+      "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -444,14 +452,14 @@ describe("Pi extension loading (--extension)", () => {
     ]);
   });
 
-  it("defaults the wrapper list to codex overflow normalization, web-tools, knowledge-tools, subagent, and ask-agent", () => {
+  it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -467,6 +475,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(parentArgs, [
+      "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -502,8 +511,10 @@ describe("Pi extension loading (--extension)", () => {
   it("the ask-agent child wrapper subset omits recursive handoff wrappers", () => {
     const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
     const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
+    assert.ok(!sourceRelpaths.includes("acknowledged-steer.ts"));
     assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
     assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
+    assert.ok(!artifactRelpaths.includes("acknowledged-steer.js"));
     assert.ok(!artifactRelpaths.includes("subagent/index.js"));
     assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
   });
@@ -685,6 +696,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args, [
+      "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -702,6 +714,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -723,6 +736,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -760,7 +774,8 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 5);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
@@ -775,6 +790,7 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -791,7 +807,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -809,6 +825,7 @@ describe("Pi extension loading (--extension)", () => {
     });
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
+      "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -938,10 +955,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 5, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 6, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 5);
+    assert.strictEqual(paths.length, 6);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -1669,6 +1686,19 @@ describe("Pi RPC prompt and steer commands", () => {
     });
   });
 
+  it("builds a correlated extension command for atomic acknowledged steering", () => {
+    const command = buildPiAcknowledgedSteerCommand("focus", "steer-17");
+    assert.strictEqual(command.type, "prompt");
+    assert.strictEqual(command.id, "steer-17");
+    assert.ok(!("streamingBehavior" in command));
+    const [invocation, encoded] = command.message.split(" ");
+    assert.strictEqual(invocation, `/${PI_ACKNOWLEDGED_STEER_COMMAND}`);
+    assert.deepStrictEqual(parsePiAcknowledgedSteerEnvelope(encoded), {
+      id: "steer-17",
+      text: "focus",
+    });
+  });
+
   it("attaches streamingBehavior to a prompt command only when requested (Defect B)", () => {
     // followUp variant: the queue-driven send path delivers every Pi prompt with
     // followUp so a desynced bare prompt can never collide with a live turn.
@@ -1823,6 +1853,33 @@ describe("Pi RPC prompt and steer commands", () => {
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "steer",
       message: "focus",
+    });
+  });
+
+  it("writes an explicitly correlated acknowledged-steer command to stdin", () => {
+    const chunks: Buffer[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    const child = createMockChild({ stdin });
+
+    sendPiAcknowledgedSteer(child, "focus now", "steer-18");
+
+    const command = JSON.parse(Buffer.concat(chunks).toString().trim()) as {
+      type: string;
+      message: string;
+      id: string;
+      streamingBehavior?: string;
+    };
+    assert.strictEqual(command.type, "prompt");
+    assert.strictEqual(command.id, "steer-18");
+    assert.strictEqual(command.streamingBehavior, undefined);
+    assert.deepStrictEqual(parsePiAcknowledgedSteerEnvelope(command.message.split(" ")[1]), {
+      id: "steer-18",
+      text: "focus now",
     });
   });
 
@@ -2403,6 +2460,71 @@ describe("readPiStream", () => {
     );
     assert.strictEqual(extractPiTextDelta(lines[1]), "hi");
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
+  });
+
+  it("observes only valid acknowledged-steer extension results without making them terminal", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notice-1",
+        method: "notify",
+        notifyType: "info",
+        message: buildPiAcknowledgedSteerResultNotice("steer-later", "consumed"),
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "set_model",
+        id: "unrelated-command",
+        success: true,
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notice-2",
+        method: "notify",
+        notifyType: "info",
+        message: buildPiAcknowledgedSteerResultNotice("steer-earlier", "rejected"),
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notice-3",
+        method: "notify",
+        notifyType: "warning",
+        message: buildPiAcknowledgedSteerResultNotice("wrong-notify-type", "enqueued"),
+      }),
+      JSON.stringify({
+        type: "extension_ui_request",
+        id: "notice-4",
+        method: "notify",
+        notifyType: "info",
+        message: "unrelated notification",
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "turn result" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    const observed: Array<{
+      id: string;
+      status: "enqueued" | "consumed" | "rejected";
+    }> = [];
+    const lines: StreamLine[] = [];
+
+    for await (const line of readPiStream(child, undefined, undefined, (response) => {
+      observed.push({
+        id: response.id,
+        status: response.status,
+      });
+    })) {
+      lines.push(line);
+    }
+
+    assert.deepStrictEqual(observed, [
+      { id: "steer-later", status: "consumed" },
+      { id: "steer-earlier", status: "rejected" },
+    ]);
+    assert.deepStrictEqual(lines.map((line) => line.type), ["result"]);
+    assert.strictEqual((lines[0] as { result: string }).result, "turn result");
   });
 
   for (const handledBy of ["extension command", "input handler"]) {

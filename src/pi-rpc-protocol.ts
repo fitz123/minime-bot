@@ -27,12 +27,19 @@ import {
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
+import {
+  PI_ACKNOWLEDGED_STEER_RESULT_EVENT,
+  buildPiAcknowledgedSteerInvocation,
+  parsePiAcknowledgedSteerResultNotice,
+} from "./pi-extensions/acknowledged-steer.js";
 
 export const PI_PROVIDER = "openai-codex";
 export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
 
 /**
- * Wrapper entrypoints loaded into EVERY Pi spawn, in load order:
+ * Wrapper entrypoints loaded into every primary interactive Pi spawn, in load
+ * order:
+ *   acknowledged-steer (atomic active-lifecycle steering gate),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
@@ -42,6 +49,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * ask-agent are multi-file DIRECTORIES whose entrypoint is `index.ts`.
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
+  "acknowledged-steer.ts",
   "codex-transport-overflow.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
@@ -50,6 +58,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 ] as const;
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
+  "acknowledged-steer.js",
   "codex-transport-overflow.js",
   "web-tools.js",
   "knowledge-tools.js",
@@ -75,7 +84,11 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
  * full target agent with the target's normal first-party tool surface, except
  * recursive handoff tools stay disabled for MVP.
  */
-const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>(["subagent/index.ts", "ask-agent/index.ts"]);
+const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>([
+  "acknowledged-steer.ts",
+  "subagent/index.ts",
+  "ask-agent/index.ts",
+]);
 export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
   PI_EXTENSION_WRAPPER_RELPATHS.filter((relpath) => !PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS.has(relpath)),
 );
@@ -92,6 +105,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
   "knowledge-tools.js",
 ] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
+  "acknowledged-steer.js",
   "subagent/index.js",
   "ask-agent/index.js",
 ]);
@@ -727,6 +741,17 @@ export function buildPiSteerCommand(text: string): PiSteerCommand {
   return { type: "steer", message: text };
 }
 
+export function buildPiAcknowledgedSteerCommand(
+  text: string,
+  id: string,
+): PiPromptCommand {
+  return {
+    type: "prompt",
+    message: buildPiAcknowledgedSteerInvocation(id, text),
+    id,
+  };
+}
+
 export function buildGetStateCommand(id?: string): PiGetStateCommand {
   return id ? { type: "get_state", id } : { type: "get_state" };
 }
@@ -784,6 +809,15 @@ export function sendPiSteer(child: ChildProcess, text: string): void {
   writePiCommand(child, buildPiSteerCommand(text));
 }
 
+export function sendPiAcknowledgedSteer(
+  child: ChildProcess,
+  text: string,
+  id: string,
+  onWriteError?: (error: Error) => void,
+): void {
+  writePiCommand(child, buildPiAcknowledgedSteerCommand(text, id), onWriteError);
+}
+
 /**
  * Issue a `get_state` command. Its successful `response` carries the Pi-minted
  * session id, which `parsePiEvent` surfaces as a `SystemInit` — the bot's only
@@ -795,11 +829,22 @@ export function sendPiGetState(child: ChildProcess, id?: string): void {
 
 let piPromptCommandSequence = 0;
 
-function writePiCommand(child: ChildProcess, command: PiRpcCommand): void {
+function writePiCommand(
+  child: ChildProcess,
+  command: PiRpcCommand,
+  onWriteError?: (error: Error) => void,
+): void {
   if (!child.stdin || child.stdin.destroyed || child.exitCode !== null || child.killed) {
     throw new Error("Pi RPC child process is not available");
   }
-  child.stdin.write(`${JSON.stringify(command)}\n`);
+  const frame = `${JSON.stringify(command)}\n`;
+  if (onWriteError) {
+    child.stdin.write(frame, (error) => {
+      if (error) onWriteError(error);
+    });
+    return;
+  }
+  child.stdin.write(frame);
 }
 
 /**
@@ -840,6 +885,30 @@ export interface PiRpcEvent {
   toolName?: string;
   tool?: { name?: string; [key: string]: unknown };
   [key: string]: unknown;
+}
+
+/** Result emitted by the first-party atomic acknowledged-steer extension. */
+export interface PiAcknowledgedSteerResult extends PiRpcEvent {
+  type: typeof PI_ACKNOWLEDGED_STEER_RESULT_EVENT;
+  id: string;
+  status: "enqueued" | "consumed" | "rejected";
+}
+
+function asPiAcknowledgedSteerResult(
+  event: PiRpcEvent,
+): PiAcknowledgedSteerResult | null {
+  if (
+    event.type !== "extension_ui_request" ||
+    event.method !== "notify" ||
+    event.notifyType !== "info" ||
+    typeof event.message !== "string"
+  ) {
+    return null;
+  }
+  const result = parsePiAcknowledgedSteerResultNotice(event.message);
+  return result
+    ? { type: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, ...result }
+    : null;
 }
 
 /**
@@ -1510,12 +1579,17 @@ function handlePiStreamRecord(
   record: string,
   state: PiRpcParseState,
   onActivity?: () => void,
+  onAcknowledgedSteerResult?: (result: PiAcknowledgedSteerResult) => void,
 ): StreamLine | null {
   const event = parsePiJsonlRecord(record);
   if (!event) {
     return null;
   }
   onActivity?.();
+  const acknowledgedSteerResult = asPiAcknowledgedSteerResult(event);
+  if (acknowledgedSteerResult) {
+    onAcknowledgedSteerResult?.(acknowledgedSteerResult);
+  }
   if (handlePiExtensionUiRequest(child, event) !== "not_ui") {
     return null;
   }
@@ -1596,11 +1670,15 @@ function handlePiPromptCompletionProbe(
  * including lifecycle and UI records that do not become user-facing lines, so
  * callers can maintain an accurate inactivity watchdog. Malformed JSON records
  * and untranslatable events are skipped (never throw mid-stream).
+ * `onAcknowledgedSteerResult` observes structurally valid results from the
+ * first-party atomic steering gate before normal nonterminal translation; it
+ * does not add another stdout reader.
  */
 export async function* readPiStream(
   child: ChildProcess,
   onActivity?: () => void,
   expectedPromptId?: string,
+  onAcknowledgedSteerResult?: (result: PiAcknowledgedSteerResult) => void,
 ): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
   if (!stdout) {
@@ -1614,7 +1692,13 @@ export async function* readPiStream(
     let chunk: Buffer | string | null;
     while ((chunk = stdout.read()) !== null) {
       for (const record of splitter.push(chunk)) {
-        const line = handlePiStreamRecord(child, record, parseState, onActivity);
+        const line = handlePiStreamRecord(
+          child,
+          record,
+          parseState,
+          onActivity,
+          onAcknowledgedSteerResult,
+        );
         if (line) {
           yield line;
           if (line.type === "result") {
@@ -1631,7 +1715,13 @@ export async function* readPiStream(
   }
 
   for (const record of splitter.end()) {
-    const line = handlePiStreamRecord(child, record, parseState, onActivity);
+    const line = handlePiStreamRecord(
+      child,
+      record,
+      parseState,
+      onActivity,
+      onAcknowledgedSteerResult,
+    );
     if (line) {
       yield line;
       if (line.type === "result") {

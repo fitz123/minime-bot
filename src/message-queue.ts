@@ -29,8 +29,26 @@ export type ProcessFn = (
   onAgentOwnership: () => void,
 ) => Promise<void>;
 
+/**
+ * Attempt native steering and resolve true only after correlated consumption.
+ * `onEnqueued` fires after atomic child-side enqueue acceptance so the queue can
+ * offer the next entry without transferring ownership early.
+ */
+export type AcknowledgedSteerFn = (
+  chatId: string,
+  agentId: string,
+  text: string,
+  onEnqueued?: () => void,
+) => Promise<boolean>;
+
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
 export type CleanupFn = () => void;
+
+interface CollectEntry {
+  text: string;
+  cleanup?: CleanupFn;
+  dropCleanup?: CleanupFn;
+}
 
 interface ChatQueueState {
   /** Messages pending debounce timer (pre-send) */
@@ -46,15 +64,17 @@ interface ChatQueueState {
   pendingDropCleanups: CleanupFn[];
   debounceTimer: ReturnType<typeof setTimeout> | null;
 
-  /** Messages collected during active processing (mid-turn) */
-  collectBuffer: string[];
-  /** Cleanup callbacks for collected messages (fire on successful delivery) */
-  collectCleanups: CleanupFn[];
-  /** Drop-only cleanup callbacks for collected messages (see pendingDropCleanups). */
-  collectDropCleanups: CleanupFn[];
+  /** Bot-owned messages collected during active processing (mid-turn). */
+  collectEntries: CollectEntry[];
 
   /** Whether a message is currently being processed */
   busy: boolean;
+  /** Exact entry currently waiting for correlated enqueue acceptance. */
+  steerSubmitting: CollectEntry | null;
+  /** Entries submitted to Pi whose consumption result is still pending. */
+  steerPending: Set<CollectEntry>;
+  /** Stop attempting later entries after the first failure in this busy turn. */
+  steerBlocked: boolean;
 
   /** Latest platform context for sending responses */
   latestPlatform: PlatformContext | null;
@@ -100,11 +120,20 @@ export class MessageQueue {
   private debounceMs: number;
   private queueCap: number;
   private processFn: ProcessFn;
+  private acknowledgedSteerFn?: AcknowledgedSteerFn;
 
-  constructor(processFn: ProcessFn, options?: { debounceMs?: number; queueCap?: number }) {
+  constructor(
+    processFn: ProcessFn,
+    options?: {
+      debounceMs?: number;
+      queueCap?: number;
+      acknowledgedSteerFn?: AcknowledgedSteerFn;
+    },
+  ) {
     this.processFn = processFn;
     this.debounceMs = options?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.queueCap = options?.queueCap ?? DEFAULT_QUEUE_CAP;
+    this.acknowledgedSteerFn = options?.acknowledgedSteerFn;
   }
 
   private getState(chatId: string, agentId: string): ChatQueueState {
@@ -115,10 +144,11 @@ export class MessageQueue {
         pendingCleanups: [],
         pendingDropCleanups: [],
         debounceTimer: null,
-        collectBuffer: [],
-        collectCleanups: [],
-        collectDropCleanups: [],
+        collectEntries: [],
         busy: false,
+        steerSubmitting: null,
+        steerPending: new Set(),
+        steerBlocked: false,
         latestPlatform: null,
         agentId,
         nextRejectionNoticeAt: 0,
@@ -160,19 +190,18 @@ export class MessageQueue {
     state.latestPlatform = platform;
 
     if (state.busy) {
-      // Mid-turn collect: buffer user messages for reliable follow-up delivery.
-      // Pi `steer` has no usable delivery acknowledgement in the stream, so a
-      // normal user prompt must not be removed from the queue just because a
-      // steer command was written to stdin.
-      if (state.collectBuffer.length < this.queueCap) {
-        state.collectBuffer.push(text);
-        state.collectCleanups.push(cleanup ?? (() => {}));
-        state.collectDropCleanups.push(dropCleanup ?? (() => {}));
+      if (state.collectEntries.length < this.queueCap) {
+        state.collectEntries.push({
+          text,
+          cleanup,
+          dropCleanup,
+        });
 
         log.debug(
           "message-queue",
-          `Queued mid-turn message for ${chatId} (${state.collectBuffer.length} in buffer)`,
+          `Queued mid-turn message for ${chatId} (${state.collectEntries.length} in buffer)`,
         );
+        this.attemptAcknowledgedSteer(chatId, state);
       } else {
         this.rejectSaturatedInput(chatId, state, "collect", platform, cleanup, dropCleanup);
       }
@@ -211,7 +240,7 @@ export class MessageQueue {
     // own drop-cleanup loop won't double-fire them.
     const dropCleanups = state.pendingDropCleanups.splice(0);
     state.debounceTimer = null;
-    state.busy = true;
+    this.beginBusyGeneration(state);
 
     const combinedText = texts.length === 1 ? texts[0] : texts.join("\n\n");
 
@@ -234,7 +263,13 @@ export class MessageQueue {
 
     try {
       if (state.latestPlatform) {
-        await this.processFn(chatId, state.agentId, combinedText, state.latestPlatform, transferOwnership);
+        try {
+          await this.processFn(chatId, state.agentId, combinedText, state.latestPlatform, transferOwnership);
+        } finally {
+          this.settleBusyGeneration(state);
+        }
+      } else {
+        this.settleBusyGeneration(state);
       }
     } catch (err) {
       log.error("message-queue", `Send error for ${chatId}:`, err);
@@ -270,21 +305,22 @@ export class MessageQueue {
 
   private async drainCollectBuffer(chatId: string): Promise<void> {
     const state = this.queues.get(chatId);
-    if (!state || state.collectBuffer.length === 0) return;
+    if (!state || state.collectEntries.length === 0) return;
 
     // Loop to drain messages that arrive during processing (avoids recursion)
-    while (state.collectBuffer.length > 0) {
-      const collected = state.collectBuffer.splice(0);
-      const cleanups = state.collectCleanups.splice(0);
+    while (state.collectEntries.length > 0) {
+      const entries = state.collectEntries.splice(0);
+      const collected = entries.map(({ text }) => text);
+      const cleanups = entries.map(({ cleanup }) => cleanup);
       // Hold drop cleanups locally for exactly this batch. If processFn
       // throws or the queue is cleared mid-drain, we must run them. Any
       // drop cleanups added during processing (new mid-turn collect) stay
       // in state — they'll be processed on the next loop iteration, or
       // handled by clear().
-      const dropCleanups = state.collectDropCleanups.splice(0, collected.length);
+      const dropCleanups = entries.map(({ dropCleanup }) => dropCleanup);
       const prompt = buildCollectPrompt(collected);
 
-      state.busy = true;
+      this.beginBusyGeneration(state);
       log.debug(
         "message-queue",
         `Draining ${collected.length} collected message(s) for ${chatId}`,
@@ -292,7 +328,7 @@ export class MessageQueue {
 
       this.startPreStreamTyping(state.latestPlatform);
 
-      let liveDropCleanups: CleanupFn[] | null = dropCleanups;
+      let liveDropCleanups: Array<CleanupFn | undefined> | null = dropCleanups;
       const transferOwnership = () => {
         if (this.queues.get(chatId) !== state) return;
         liveDropCleanups = null;
@@ -300,7 +336,13 @@ export class MessageQueue {
 
       try {
         if (state.latestPlatform) {
-          await this.processFn(chatId, state.agentId, prompt, state.latestPlatform, transferOwnership);
+          try {
+            await this.processFn(chatId, state.agentId, prompt, state.latestPlatform, transferOwnership);
+          } finally {
+            this.settleBusyGeneration(state);
+          }
+        } else {
+          this.settleBusyGeneration(state);
         }
       } catch (err) {
         log.error("message-queue", `Collect drain error for ${chatId}:`, err);
@@ -324,6 +366,111 @@ export class MessageQueue {
     }
   }
 
+  private beginBusyGeneration(state: ChatQueueState): void {
+    state.busy = true;
+    state.steerSubmitting = null;
+    state.steerPending.clear();
+    state.steerBlocked = false;
+  }
+
+  private settleBusyGeneration(state: ChatQueueState): void {
+    state.steerSubmitting = null;
+    state.steerPending.clear();
+    state.steerBlocked = true;
+  }
+
+  private attemptAcknowledgedSteer(chatId: string, state: ChatQueueState): void {
+    if (
+      !this.acknowledgedSteerFn ||
+      this.queues.get(chatId) !== state ||
+      !state.busy ||
+      state.steerBlocked ||
+      state.steerSubmitting
+    ) {
+      return;
+    }
+
+    const entry = state.collectEntries.find(
+      (candidate) => !state.steerPending.has(candidate),
+    );
+    if (!entry) return;
+
+    state.steerSubmitting = entry;
+    state.steerPending.add(entry);
+
+    let acknowledgement: Promise<boolean>;
+    try {
+      acknowledgement = this.acknowledgedSteerFn(
+        chatId,
+        state.agentId,
+        entry.text,
+        () => this.finishSteerEnqueue(chatId, state, entry),
+      );
+    } catch {
+      this.finishAcknowledgedSteer(chatId, state, entry, false);
+      return;
+    }
+
+    void acknowledgement.then(
+      (acknowledged) => {
+        this.finishAcknowledgedSteer(chatId, state, entry, acknowledged);
+      },
+      () => {
+        this.finishAcknowledgedSteer(chatId, state, entry, false);
+      },
+    );
+  }
+
+  private finishSteerEnqueue(
+    chatId: string,
+    state: ChatQueueState,
+    entry: CollectEntry,
+  ): void {
+    if (
+      this.queues.get(chatId) !== state ||
+      !state.busy ||
+      state.steerBlocked ||
+      state.steerSubmitting !== entry ||
+      !state.steerPending.has(entry) ||
+      !state.collectEntries.includes(entry)
+    ) {
+      return;
+    }
+
+    state.steerSubmitting = null;
+    this.attemptAcknowledgedSteer(chatId, state);
+  }
+
+  private finishAcknowledgedSteer(
+    chatId: string,
+    state: ChatQueueState,
+    entry: CollectEntry,
+    acknowledged: boolean,
+  ): void {
+    if (
+      this.queues.get(chatId) !== state ||
+      !state.busy ||
+      !state.steerPending.has(entry)
+    ) {
+      return;
+    }
+
+    state.steerPending.delete(entry);
+    if (state.steerSubmitting === entry) {
+      state.steerSubmitting = null;
+    }
+    if (!acknowledged) {
+      state.steerBlocked = true;
+      return;
+    }
+
+    const entryIndex = state.collectEntries.indexOf(entry);
+    if (entryIndex === -1) return;
+    state.collectEntries.splice(entryIndex, 1);
+    this.runCleanups([entry.cleanup]);
+    this.attemptAcknowledgedSteer(chatId, state);
+  }
+
   /** Check if a chat is currently busy processing. */
   isBusy(chatId: string): boolean {
     return this.queues.get(chatId)?.busy ?? false;
@@ -336,7 +483,7 @@ export class MessageQueue {
 
   /** Get mid-turn collect buffer count. */
   getCollectCount(chatId: string): number {
-    return this.queues.get(chatId)?.collectBuffer.length ?? 0;
+    return this.queues.get(chatId)?.collectEntries.length ?? 0;
   }
 
   /** Clear a chat's queue state (e.g., on /reconnect). */
@@ -352,8 +499,7 @@ export class MessageQueue {
       state.rejectionNoticeScheduled = false;
       this.runCleanups(state.pendingCleanups);
       this.runCleanups(state.pendingDropCleanups);
-      this.runCleanups(state.collectCleanups);
-      this.runCleanups(state.collectDropCleanups);
+      this.dropCollectEntries(state);
       this.queues.delete(chatId);
     }
   }
@@ -384,10 +530,19 @@ export class MessageQueue {
       state.rejectionNoticeScheduled = false;
       this.runCleanups(state.pendingCleanups);
       this.runCleanups(state.pendingDropCleanups);
-      this.runCleanups(state.collectCleanups);
-      this.runCleanups(state.collectDropCleanups);
+      this.dropCollectEntries(state);
     }
     this.queues.clear();
+  }
+
+  private dropCollectEntries(state: ChatQueueState): void {
+    state.steerSubmitting = null;
+    state.steerPending.clear();
+    state.steerBlocked = true;
+    const entries = state.collectEntries.splice(0);
+    for (const entry of entries) {
+      this.runCleanups([entry.cleanup, entry.dropCleanup]);
+    }
   }
 
   /** Start pre-stream typing indicator on the platform context. */
@@ -464,7 +619,7 @@ export class MessageQueue {
       state &&
       !state.busy &&
       state.pendingTexts.length === 0 &&
-      state.collectBuffer.length === 0 &&
+      state.collectEntries.length === 0 &&
       !state.debounceTimer
     ) {
       const cooldownRemaining = state.nextRejectionNoticeAt - Date.now();
