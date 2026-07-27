@@ -98,6 +98,28 @@ describe("knowledge tools", () => {
     assert.equal(response.results[1].sourceKind, "index");
   });
 
+  it("matches mixed Cyrillic and Latin query tokens regardless of case, punctuation, or order", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/project/mixed-search.md": "# Mixed Search\n\nРусский search material.\n",
+      "wiki/pages/project/cyrillic-only.md": "# Cyrillic Only\n\nРусский material.\n",
+      "wiki/pages/project/latin-only.md": "# Latin Only\n\nSearch material.\n",
+    });
+
+    for (const query of ["русский search", "РУССКИЙ, SEARCH!!!", "search русский"]) {
+      const response = executeKnowledgeSearch(
+        { query },
+        { agentWorkspaceRoot: workspace },
+      );
+
+      assertSearchOk(response);
+      assert.deepEqual(
+        response.results.map((result) => result.path),
+        ["wiki/pages/project/mixed-search.md"],
+        query,
+      );
+    }
+  });
+
   it("searches legacy default and diary scopes", () => {
     const workspace = createWorkspace({
       "MEMORY.md": "# Memory\n\n- [Shipping](memory/auto/shipping.md)\n",
