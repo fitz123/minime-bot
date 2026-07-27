@@ -300,7 +300,7 @@ class BoundedStreamCapture {
 }
 
 /**
- * Ordinary Pi 0.80.6 session contract used here (package source citations):
+ * Ordinary Pi 0.82.1 session contract used here (package source citations):
  *
  * - `dist/cli/args.js:parseArgs` supports `--session-dir`, `--session-id`, and
  *   `--session`; no `--no-session` is used.
@@ -2033,7 +2033,7 @@ export class OpsWorkerPiAttemptRunner {
   }
 
   private newSessionId(taskId: string): string {
-    // Pi 0.80.6 forwards its session id through Codex request headers whose
+    // Pi 0.82.1 forwards its session id through Codex request headers whose
     // effective prompt-cache key is limited to 64 characters by the provider.
     const taskDigest = createHash("sha256").update(taskId).digest("hex").slice(0, 16);
     const prefix = `ops-${taskDigest}-`;

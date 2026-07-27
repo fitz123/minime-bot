@@ -27,21 +27,34 @@ interface ContextOptions {
   provider?: string;
   model?: string;
   oauth?: boolean;
+  providerAuthToken?: string;
   resolvedToken?: string;
-  storedToken?: string;
   accountId?: string;
   authOk?: boolean;
+  providerAuthOk?: boolean;
+}
+
+function codexOAuthToken(accountId: string, marker = "refreshed"): string {
+  return [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+      marker,
+    })).toString("base64url"),
+    Buffer.from(`signature-${marker}`).toString("base64url"),
+  ].join(".");
 }
 
 function makeContext(options: ContextOptions = {}): {
   context: CodexWebSearchExecutionContext;
-  calls: { isUsingOAuth: number; getAuth: number; getStored: number };
+  calls: { isUsingOAuth: number; getProviderAuth: number; getRequestAuth: number };
 } {
   const provider = options.provider ?? CODEX_WEB_SEARCH_PROVIDER;
   const model = options.model ?? "gpt-active-codex";
-  const resolvedToken = options.resolvedToken ?? "oauth-access-token";
-  const storedToken = options.storedToken ?? resolvedToken;
-  const calls = { isUsingOAuth: 0, getAuth: 0, getStored: 0 };
+  const providerAuthToken = options.providerAuthToken
+    ?? codexOAuthToken(options.accountId ?? "account-fixture");
+  const resolvedToken = options.resolvedToken ?? providerAuthToken;
+  const calls = { isUsingOAuth: 0, getProviderAuth: 0, getRequestAuth: 0 };
   return {
     calls,
     context: {
@@ -51,20 +64,15 @@ function makeContext(options: ContextOptions = {}): {
           calls.isUsingOAuth += 1;
           return options.oauth ?? true;
         },
+        getProviderAuth: async () => {
+          calls.getProviderAuth += 1;
+          if (options.providerAuthOk === false) return undefined;
+          return { auth: { apiKey: providerAuthToken }, source: "OAuth" };
+        },
         getApiKeyAndHeaders: async () => {
-          calls.getAuth += 1;
+          calls.getRequestAuth += 1;
           if (options.authOk === false) return { ok: false as const, error: "private auth error" };
           return { ok: true as const, apiKey: resolvedToken };
-        },
-        authStorage: {
-          get: () => {
-            calls.getStored += 1;
-            return {
-              type: "oauth",
-              access: storedToken,
-              accountId: options.accountId ?? "account-fixture",
-            };
-          },
         },
       },
     },
@@ -159,24 +167,31 @@ function sseResponse(body: string, chunks?: number[]): Response {
 }
 
 describe("Codex web search auth and request", () => {
-  it("resolves the active model's refreshed OAuth token and stored account id", async () => {
+  it("resolves the active model's refreshed OAuth token and locally validated account id", async () => {
     const { context, calls } = makeContext({ model: "gpt-current", accountId: "account-current" });
     const auth = await resolveCodexWebSearchOAuth(context);
     assert.deepEqual(auth, {
-      token: "oauth-access-token",
+      token: codexOAuthToken("account-current"),
       accountId: "account-current",
       provider: CODEX_WEB_SEARCH_PROVIDER,
       model: "gpt-current",
     });
-    assert.deepEqual(calls, { isUsingOAuth: 1, getAuth: 1, getStored: 1 });
+    assert.deepEqual(calls, { isUsingOAuth: 1, getProviderAuth: 1, getRequestAuth: 1 });
   });
 
-  it("rejects non-Codex, non-OAuth, unresolved, and API-key override auth", async () => {
+  it("rejects non-Codex, non-OAuth, unresolved, stale, API-key, and malformed auth", async () => {
+    const refreshed = codexOAuthToken("account-current", "refreshed");
     for (const options of [
       { provider: "openai" },
       { oauth: false },
+      { providerAuthOk: false },
       { authOk: false },
-      { storedToken: "stored-oauth", resolvedToken: "runtime-api-key" },
+      {
+        providerAuthToken: refreshed,
+        resolvedToken: codexOAuthToken("account-current", "stale"),
+      },
+      { providerAuthToken: refreshed, resolvedToken: "runtime-api-key" },
+      { providerAuthToken: "malformed-token", resolvedToken: "malformed-token" },
       { accountId: "" },
     ]) {
       const { context } = makeContext(options);
@@ -284,7 +299,7 @@ describe("Codex web search auth and request", () => {
       assert.equal(calls.length, 1);
       assert.equal(calls[0].url, CODEX_WEB_SEARCH_ENDPOINT);
       const headers = calls[0].init?.headers as Record<string, string>;
-      assert.equal(headers.Authorization, "Bearer oauth-access-token");
+      assert.equal(headers.Authorization, `Bearer ${codexOAuthToken("account-fixture")}`);
       assert.doesNotMatch(JSON.stringify(calls[0]), /forbidden-environment-key|api\.openai\.com/);
       assert.equal((JSON.parse(String(calls[0].init?.body)) as { model: string }).model, "gpt-live-model");
     } finally {
@@ -660,23 +675,29 @@ describe("Codex web search cleanup and bounded failures", () => {
   });
 
   it("bounds OAuth resolution before fetch and honors parent cancellation", async () => {
-    for (const mode of ["timeout", "parent"] as const) {
-      const { context } = makeContext();
-      context.modelRegistry.getApiKeyAndHeaders = async () => new Promise(() => {});
-      const parent = new AbortController();
-      let fetchCalls = 0;
-      const pending = executeCodexWebSearch({ query: "safe query" }, {
-        context,
-        requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
-        fetchImpl: (async () => {
-          fetchCalls += 1;
-          throw new Error("must not fetch");
-        }) as typeof fetch,
-      }, parent.signal);
-      if (mode === "parent") setImmediate(() => parent.abort(new Error("cancelled by caller")));
-      const result = await pending;
-      assert.equal(result.failure?.classification, mode === "timeout" ? "timeout" : "transport");
-      assert.equal(fetchCalls, 0);
+    for (const resolver of ["provider", "request"] as const) {
+      for (const mode of ["timeout", "parent"] as const) {
+        const { context } = makeContext();
+        if (resolver === "provider") {
+          context.modelRegistry.getProviderAuth = async () => new Promise(() => {});
+        } else {
+          context.modelRegistry.getApiKeyAndHeaders = async () => new Promise(() => {});
+        }
+        const parent = new AbortController();
+        let fetchCalls = 0;
+        const pending = executeCodexWebSearch({ query: "safe query" }, {
+          context,
+          requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
+          fetchImpl: (async () => {
+            fetchCalls += 1;
+            throw new Error("must not fetch");
+          }) as typeof fetch,
+        }, parent.signal);
+        if (mode === "parent") setImmediate(() => parent.abort(new Error("cancelled by caller")));
+        const result = await pending;
+        assert.equal(result.failure?.classification, mode === "timeout" ? "timeout" : "transport");
+        assert.equal(fetchCalls, 0);
+      }
     }
   });
 
@@ -736,7 +757,7 @@ describe("Codex web search cleanup and bounded failures", () => {
       });
       assert.equal(result.ok, false);
       assert.match(result.text, /blocked/);
-      assert.equal(calls.getAuth, 0);
+      assert.equal(calls.getRequestAuth, 0);
       assert.equal(fetchCalls, 0);
     }
     for (const query of allowed) assert.equal(validateCodexWebSearchQuery(query), undefined, query.slice(0, 80));
@@ -752,7 +773,7 @@ describe("Codex web search cleanup and bounded failures", () => {
         }) as typeof fetch,
       });
       assert.equal(result.failure?.classification, "schema");
-      assert.equal(calls.getAuth, 0);
+      assert.equal(calls.getRequestAuth, 0);
       assert.equal(fetchCalls, 0);
     }
   });

@@ -98,10 +98,10 @@ interface ActiveModel {
   api?: string;
 }
 
-interface StoredCredential {
-  type?: unknown;
-  access?: unknown;
-  accountId?: unknown;
+interface ProviderAuthResult {
+  auth: {
+    apiKey?: string;
+  };
 }
 
 export interface CodexWebSearchExecutionContext {
@@ -112,9 +112,7 @@ export interface CodexWebSearchExecutionContext {
       | { ok: true; apiKey?: string; headers?: Record<string, string> }
       | { ok: false; error: string }
     >;
-    authStorage: {
-      get(provider: string): StoredCredential | undefined;
-    };
+    getProviderAuth(provider: string): Promise<ProviderAuthResult | undefined>;
   };
 }
 
@@ -163,6 +161,7 @@ const LOCAL_PATH_PATTERN =
 const REPO_FILE_PATH_PATTERN =
   /(?:^|[\s"'`=:(])(?:\.claude\/|bot\/|memory\/|\.ssh\/|(?:config\.local\.yaml|\.env|id_rsa)\b|[A-Za-z0-9_-]+\/[A-Za-z0-9._/-]+\.(?:env|json|key|md|pem|ts|tsx|yaml|yml)\b)/;
 const HIGH_ENTROPY_TOKEN_PATTERN = /[A-Za-z0-9_+/=-]{32,}/g;
+const OPENAI_CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
@@ -244,7 +243,36 @@ function classifiedFailure(
   return emptyResult(failureText(failure), failure);
 }
 
-/** Resolve only the active model's refreshed, stored OAuth credential. */
+async function awaitWithAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  if (signal.aborted) throw signal.reason ?? new Error("Codex OAuth resolution aborted");
+  let abort: (() => void) | undefined;
+  return Promise.race([
+    pending,
+    new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason ?? new Error("Codex OAuth resolution aborted"));
+      signal.addEventListener("abort", abort, { once: true });
+    }),
+  ]).finally(() => {
+    if (abort) signal.removeEventListener("abort", abort);
+  });
+}
+
+function extractCodexAccountId(token: string): string | undefined {
+  const parts = token.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload = asRecord(JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")));
+    const auth = asRecord(payload?.[OPENAI_CODEX_AUTH_CLAIM]);
+    return typeof auth?.chatgpt_account_id === "string" && auth.chatgpt_account_id.trim()
+      ? auth.chatgpt_account_id.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve only the active model's refreshed OAuth credential through Pi's supported extension APIs. */
 export async function resolveCodexWebSearchOAuth(
   context: CodexWebSearchExecutionContext,
   signal?: AbortSignal,
@@ -254,37 +282,26 @@ export async function resolveCodexWebSearchOAuth(
     return undefined;
   }
 
-  if (signal?.aborted) throw signal.reason ?? new Error("Codex OAuth resolution aborted");
-  const authPromise = context.modelRegistry.getApiKeyAndHeaders(model);
-  let abortAuth: (() => void) | undefined;
-  const auth = signal
-    ? await Promise.race([
-      authPromise,
-      new Promise<never>((_resolve, reject) => {
-        abortAuth = () => reject(signal.reason ?? new Error("Codex OAuth resolution aborted"));
-        signal.addEventListener("abort", abortAuth, { once: true });
-      }),
-    ]).finally(() => {
-      if (abortAuth) signal.removeEventListener("abort", abortAuth);
-    })
-    : await authPromise;
-  if (!auth.ok || !auth.apiKey) return undefined;
+  const providerAuth = await awaitWithAbort(
+    context.modelRegistry.getProviderAuth(CODEX_WEB_SEARCH_PROVIDER),
+    signal,
+  );
+  const refreshedToken = providerAuth?.auth.apiKey;
+  if (!refreshedToken) return undefined;
 
-  const stored = context.modelRegistry.authStorage.get(CODEX_WEB_SEARCH_PROVIDER);
-  if (
-    stored?.type !== "oauth" ||
-    typeof stored.access !== "string" ||
-    stored.access !== auth.apiKey ||
-    typeof stored.accountId !== "string" ||
-    stored.accountId.length === 0
-  ) {
-    // Reject runtime API-key overrides and stale/non-OAuth credential shapes.
-    return undefined;
-  }
+  const requestAuth = await awaitWithAbort(context.modelRegistry.getApiKeyAndHeaders(model), signal);
+  if (!requestAuth.ok || requestAuth.apiKey !== refreshedToken) return undefined;
+
+  // Pi's OAuth resolver refreshes the token before returning it. Comparing the
+  // provider and model request views rejects stale/API-key overrides, while
+  // decoding the same JWT locally validates the account identity without
+  // reaching into credential storage or exposing either value.
+  const accountId = extractCodexAccountId(refreshedToken);
+  if (!accountId) return undefined;
 
   return {
-    token: stored.access,
-    accountId: stored.accountId,
+    token: refreshedToken,
+    accountId,
     provider: model.provider,
     model: model.id,
   };

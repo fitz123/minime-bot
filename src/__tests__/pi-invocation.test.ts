@@ -41,8 +41,8 @@ describe("package-owned Pi invocation", () => {
     assert.equal(invocation.command, "/usr/local/bin/node");
     assert.deepEqual(invocation.args, [RPC_ENTRY, "--model", "gpt-5.5"]);
     assert.deepEqual(invocation.diagnostic, {
-      expectedVersion: "0.80.6",
-      detectedVersion: "0.80.6",
+      expectedVersion: "0.82.1",
+      detectedVersion: "0.82.1",
       entrypointKind: "rpc",
       versionMismatch: false,
     });
@@ -87,13 +87,13 @@ describe("package-owned Pi invocation", () => {
     }));
     const diagnostic = formatPiRuntimeDiagnostic(invocation.diagnostic);
 
-    assert.match(diagnostic, /expectedVersion=0\.80\.6/);
+    assert.match(diagnostic, /expectedVersion=0\.82\.1/);
     assert.match(diagnostic, /entrypointKind=cli/);
     assert.match(diagnostic, /versionMismatch=true/);
     assert.doesNotMatch(diagnostic, /\/opt\//);
   });
 
-  it("keeps all four direct Pi dependencies exact and aligned with the lockfile", () => {
+  it("keeps every direct and nested Pi resolution coherent at the exact approved version", () => {
     const packageJson = JSON.parse(readFileSync(resolve(TEST_ROOT, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
     };
@@ -112,9 +112,20 @@ describe("package-owned Pi invocation", () => {
       assert.equal(packageLock.packages[""].dependencies?.[name], EXPECTED_PI_PACKAGE_VERSION);
       assert.equal(packageLock.packages[`node_modules/${name}`].version, EXPECTED_PI_PACKAGE_VERSION);
     }
+
+    const piResolutions = Object.entries(packageLock.packages)
+      .filter(([path]) => /(?:^|\/)node_modules\/@earendil-works\/pi-(?:agent-core|ai|coding-agent|tui)$/.test(path));
+    assert.ok(piResolutions.length >= names.length);
+    for (const [path, manifest] of piResolutions) {
+      assert.equal(manifest.version, EXPECTED_PI_PACKAGE_VERSION, path);
+      const installed = JSON.parse(
+        readFileSync(resolve(TEST_ROOT, path, "package.json"), "utf8"),
+      ) as { version?: string };
+      assert.equal(installed.version, EXPECTED_PI_PACKAGE_VERSION, path);
+    }
   });
 
-  it("keeps grammY exact at 1.44.0 without changing the auto-retry contract", () => {
+  it("keeps grammY/types exact and the Pi-relevant patched transitive resolutions installed", () => {
     const packageJson = JSON.parse(readFileSync(resolve(TEST_ROOT, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
     };
@@ -124,12 +135,31 @@ describe("package-owned Pi invocation", () => {
     const installedGrammy = JSON.parse(
       readFileSync(resolve(TEST_ROOT, "node_modules", "grammy", "package.json"), "utf8"),
     ) as { version?: string };
+    const installedGrammyTypes = JSON.parse(
+      readFileSync(resolve(TEST_ROOT, "node_modules", "@grammyjs", "types", "package.json"), "utf8"),
+    ) as { version?: string };
 
-    assert.equal(packageJson.dependencies.grammy, "1.44.0");
-    assert.equal(packageLock.packages[""].dependencies?.grammy, "1.44.0");
-    assert.equal(packageLock.packages["node_modules/grammy"].version, "1.44.0");
-    assert.equal(installedGrammy.version, "1.44.0");
+    assert.equal(packageJson.dependencies.grammy, "1.45.1");
+    assert.equal(packageLock.packages[""].dependencies?.grammy, "1.45.1");
+    assert.equal(packageLock.packages["node_modules/grammy"].version, "1.45.1");
+    assert.equal(packageLock.packages["node_modules/grammy"].dependencies?.["@grammyjs/types"], "4.0.0");
+    assert.equal(packageLock.packages["node_modules/@grammyjs/types"].version, "4.0.0");
+    assert.equal(installedGrammy.version, "1.45.1");
+    assert.equal(installedGrammyTypes.version, "4.0.0");
     assert.equal(packageJson.dependencies["@grammyjs/auto-retry"], "^2.0.2");
     assert.equal(packageLock.packages[""].dependencies?.["@grammyjs/auto-retry"], "^2.0.2");
+    assert.equal(
+      packageLock.packages[
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
+      ].version,
+      "5.0.7",
+    );
+    assert.equal(
+      packageLock.packages[
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/protobufjs"
+      ].version,
+      "7.6.5",
+    );
+    assert.equal(packageLock.packages["node_modules/protobufjs"].version, "7.6.5");
   });
 });

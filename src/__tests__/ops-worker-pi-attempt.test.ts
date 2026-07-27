@@ -472,7 +472,7 @@ async function waitFor(
 }
 
 describe("ops worker Pi standard-session attempts", () => {
-  it("traces the pinned Pi 0.80.6 create/resume and corrupt-session contract", () => {
+  it("traces the pinned Pi 0.82.1 create/resume and corrupt-session contract", () => {
     const rpcEntry = fileURLToPath(
       import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
     );
@@ -495,7 +495,7 @@ describe("ops worker Pi standard-session attempts", () => {
       "utf8",
     );
 
-    assert.equal(manifest.version, "0.80.6");
+    assert.equal(manifest.version, "0.82.1");
     assert.match(mainSource, /if \(parsed\.sessionId\)/);
     assert.match(mainSource, /SessionManager\.create\(cwd, sessionDir/);
     assert.match(mainSource, /if \(parsed\.session\)/);
@@ -505,7 +505,7 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(sessionSource, /Session file is not a valid pi session/);
     assert.match(
       codexTransportSource,
-      /prompt_cache_key: clampOpenAIPromptCacheKey\(options\?\.sessionId\)/,
+      /const codexSessionId = clampOpenAIPromptCacheKey\(cacheSessionId\)/,
     );
     assert.match(
       codexTransportSource,

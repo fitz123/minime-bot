@@ -97,7 +97,7 @@ minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/t
 ```
 
 Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
-the package-owned Pi 0.80.6 entrypoints and execute them with Node. They never
+the package-owned Pi 0.82.1 entrypoints and execute them with Node. They never
 fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
@@ -234,7 +234,7 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path. Pi 0.80.6 does not bind
+handle cancellation or provide a noninteractive path. Pi 0.82.1 does not bind
 its RPC input reader until startup handlers complete, so a blocking dialog from
 `session_start` instead fails session creation promptly and the child is reaped.
 
