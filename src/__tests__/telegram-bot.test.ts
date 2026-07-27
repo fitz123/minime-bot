@@ -6,6 +6,8 @@ import client from "prom-client";
 import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
+import { cleanupSessionMediaDir } from "../media-store.js";
+import { existsSync } from "node:fs";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -1376,13 +1378,18 @@ describe("command handler wiring", () => {
     mockSM: SessionManager,
     apiCalls: Array<{ method: string; payload: any }> = [],
     opts?: Parameters<typeof createTelegramBot>[2],
+    apiResult?: (method: string, payload: any) => unknown,
+    factory: typeof createTelegramBot = createTelegramBot,
   ) {
-    const result = createTelegramBot(handlerConfig, mockSM, opts);
+    const result = factory(handlerConfig, mockSM, opts);
     const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
       apiCalls.push({ method, payload });
-      return { ok: true, result: true } as any;
+      return {
+        ok: true,
+        result: apiResult?.(String(method), payload) ?? true,
+      } as any;
     });
     // Provide bot info so handleUpdate works without calling getMe
     bot.botInfo = {
@@ -1401,6 +1408,93 @@ describe("command handler wiring", () => {
       allows_users_to_create_topics: false,
     };
     return result;
+  }
+
+  function createSteeringSessionManager() {
+    const sent: string[] = [];
+    const steerCalls: Array<{
+      chatId: string;
+      agentId: string;
+      text: string;
+      resolve: (acknowledged: boolean) => void;
+    }> = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => {
+      releaseInitial = resolve;
+    });
+
+    const manager = createMockSessionManager() as unknown as SessionManager & {
+      sent: string[];
+      steerCalls: typeof steerCalls;
+      releaseInitial: () => void;
+    };
+    manager.sent = sent;
+    manager.steerCalls = steerCalls;
+    manager.releaseInitial = releaseInitial;
+    manager.sendSessionMessage = (_chatId: string, _agentId: string, text: string) => {
+      const callIndex = sent.length;
+      sent.push(text);
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: `session-${callIndex}` } as const;
+        if (callIndex === 0) await initialBlocked;
+        yield { type: "result", result: "", session_id: `session-${callIndex}` } as const;
+      })();
+    };
+    manager.steerSessionMessage = (chatId: string, agentId: string, text: string) =>
+      new Promise<boolean>((resolve) => {
+        steerCalls.push({ chatId, agentId, text, resolve });
+      });
+    return manager;
+  }
+
+  function makeTextUpdate(
+    text: string,
+    updateId: number,
+    extra: Record<string, unknown> = {},
+  ) {
+    return {
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        from: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        chat: { id: testChatId, type: "private" as const, first_name: "Test" },
+        date: 36_000,
+        text,
+        ...extra,
+      },
+    };
+  }
+
+  function makeMediaUpdate(
+    media: Record<string, unknown>,
+    updateId: number,
+  ) {
+    return {
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        from: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        chat: { id: testChatId, type: "private" as const, first_name: "Test" },
+        date: 36_000,
+        ...media,
+      },
+    };
+  }
+
+  async function flushAsyncWork(): Promise<void> {
+    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await Promise.resolve();
   }
 
   it("retains grammY's normal API timeout for potentially large media uploads", () => {
@@ -1508,6 +1602,308 @@ describe("command handler wiring", () => {
     });
     assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 1);
     messageQueue.clear(String(testChatId));
+  });
+
+  it("uses acknowledged steering for active-turn text and preserves exact Telegram context", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const manager = createSteeringSessionManager();
+    const { bot, messageQueue } = initBot(manager);
+    const key = String(testChatId);
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 10));
+    t.mock.timers.tick(2_999);
+    await flushAsyncWork();
+    assert.deepStrictEqual(manager.sent, [], "Telegram keeps the existing 3-second debounce");
+
+    t.mock.timers.tick(1);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      manager.sent,
+      ["[From: Test (@tester) | 10:00]\ninitial request"],
+    );
+    assert.strictEqual(messageQueue.isBusy(key), true);
+
+    await bot.handleUpdate(makeTextUpdate("apply this correction", 11, {
+      reply_to_message: {
+        message_id: 7,
+        from: { id: 7, is_bot: false, first_name: "Reviewer", username: "reviewer" },
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        date: 35_000,
+        text: "the earlier request",
+      },
+      forward_origin: {
+        type: "hidden_user",
+        sender_user_name: "Forward Source",
+        date: 35_500,
+      },
+    }) as never);
+
+    assert.deepStrictEqual(manager.steerCalls.map(({ chatId, agentId, text }) => ({
+      chatId,
+      agentId,
+      text,
+    })), [{
+      chatId: key,
+      agentId: "main",
+      text:
+        "[From: Test (@tester) | 10:00]\n" +
+        "[Reply to Reviewer (@reviewer)]\n" +
+        "> the earlier request\n" +
+        "[Forwarded from Forward Source]\n" +
+        "apply this correction",
+    }]);
+
+    manager.steerCalls[0].resolve(true);
+    await flushAsyncWork();
+    assert.strictEqual(messageQueue.getCollectCount(key), 0);
+
+    manager.releaseInitial();
+    await flushAsyncWork();
+    assert.strictEqual(messageQueue.isBusy(key), false);
+    assert.strictEqual(manager.sent.length, 1, "acknowledged text is not sent again as fallback");
+
+    await bot.handleUpdate(makeTextUpdate("after settlement", 12));
+    assert.strictEqual(manager.steerCalls.length, 1, "idle input does not use steering");
+    assert.strictEqual(messageQueue.getPendingCount(key), 1);
+
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(manager.sent, [
+      "[From: Test (@tester) | 10:00]\ninitial request",
+      "[From: Test (@tester) | 10:00]\nafter settlement",
+    ]);
+    messageQueue.clearAll();
+  });
+
+  for (const testCase of [
+    {
+      name: "photo acknowledgement",
+      media: {
+        photo: [{
+          file_id: "photo-file",
+          file_unique_id: "photo-unique",
+          width: 10,
+          height: 10,
+        }],
+        caption: "photo correction",
+      },
+      action: "acknowledge",
+      expectedText: "photo correction",
+    },
+    {
+      name: "document fallback",
+      media: {
+        document: {
+          file_id: "document-file",
+          file_unique_id: "document-unique",
+          file_name: "notes.txt",
+          mime_type: "text/plain",
+          file_size: 4,
+        },
+        caption: "document correction",
+      },
+      action: "fallback",
+      expectedText: "[Document: notes.txt | Type: text/plain | Size: 4 B]",
+    },
+    {
+      name: "other-media /clean race",
+      media: {
+        video: {
+          file_id: "video-file",
+          file_unique_id: "video-unique",
+          file_name: "clip.mp4",
+          mime_type: "video/mp4",
+          file_size: 4,
+          width: 10,
+          height: 10,
+          duration: 1,
+        },
+        caption: "video correction",
+      },
+      action: "clean",
+      expectedText: "[Video: clip.mp4 | Type: video/mp4 | Size: 4 B]",
+    },
+    {
+      name: "other-media /reconnect race",
+      media: {
+        sticker: {
+          file_id: "sticker-file",
+          file_unique_id: "sticker-unique",
+          width: 10,
+          height: 10,
+          is_animated: false,
+          is_video: false,
+          type: "regular",
+        },
+      },
+      action: "reconnect",
+      expectedText: "[Sticker]",
+    },
+  ] as const) {
+    it(`preserves media ownership for ${testCase.name}`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+      t.mock.method(
+        globalThis,
+        "fetch",
+        async () => new Response(new Uint8Array([1, 2, 3, 4])),
+      );
+      const manager = createSteeringSessionManager();
+      const { bot, messageQueue } = initBot(
+        manager,
+        [],
+        undefined,
+        (method, payload) => method === "getFile"
+          ? { file_id: payload.file_id, file_path: `files/${payload.file_id}` }
+          : true,
+      );
+      const key = String(testChatId);
+
+      await bot.handleUpdate(makeTextUpdate("initial request", 20));
+      t.mock.timers.tick(3_000);
+      await flushAsyncWork();
+      assert.strictEqual(messageQueue.isBusy(key), true);
+
+      await bot.handleUpdate(makeMediaUpdate(testCase.media, 21) as never);
+      await flushAsyncWork();
+      assert.strictEqual(manager.steerCalls.length, 1);
+      assert.match(manager.steerCalls[0].text, new RegExp(testCase.expectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      const mediaPath = manager.steerCalls[0].text.trimEnd().split("\n").at(-1);
+      assert.ok(mediaPath);
+      assert.strictEqual(existsSync(mediaPath), true, "download remains while acknowledgement is pending");
+
+      if (testCase.action === "acknowledge") {
+        manager.steerCalls[0].resolve(true);
+        await flushAsyncWork();
+        assert.strictEqual(messageQueue.getCollectCount(key), 0);
+        messageQueue.clear(key);
+        assert.strictEqual(existsSync(mediaPath), true, "acknowledged media belongs to the session");
+      } else if (testCase.action === "fallback") {
+        manager.steerCalls[0].resolve(false);
+        manager.releaseInitial();
+        await flushAsyncWork();
+        assert.strictEqual(manager.sent.length, 2);
+        assert.strictEqual(manager.sent[1], manager.steerCalls[0].text);
+        assert.strictEqual(existsSync(mediaPath), true, "fallback delivery transfers media to the session");
+      } else {
+        await bot.handleUpdate(makeCommandUpdate(testCase.action, 22));
+        assert.strictEqual(existsSync(mediaPath), false, `/${testCase.action} reclaims bot-owned media`);
+        manager.steerCalls[0].resolve(true);
+        await flushAsyncWork();
+        assert.strictEqual(existsSync(mediaPath), false, "late acknowledgement cannot restore dropped media");
+        assert.strictEqual(manager.sent.length, 1);
+      }
+
+      manager.releaseInitial();
+      await flushAsyncWork();
+      messageQueue.clearAll();
+      cleanupSessionMediaDir(key);
+    });
+  }
+
+  it("routes voice transcripts through acknowledgement and ordered fallback", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    t.mock.method(
+      globalThis,
+      "fetch",
+      async () => new Response(new Uint8Array([1, 2, 3, 4])),
+    );
+    const voicePaths: string[] = [];
+    const actualVoice = await import("../voice.js");
+    t.mock.module("../voice.js", {
+      namedExports: {
+        ...actualVoice,
+        transcribeAudio: async (path: string) => {
+          voicePaths.push(path);
+          return `voice correction ${voicePaths.length}`;
+        },
+      },
+    });
+    const mockedTelegramModulePath = "../telegram-bot.js?voice-steering";
+    const { createTelegramBot: createVoiceTelegramBot } = await import(
+      mockedTelegramModulePath
+    ) as { createTelegramBot: typeof createTelegramBot };
+
+    const manager = createSteeringSessionManager();
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      undefined,
+      (method, payload) => method === "getFile"
+        ? { file_id: payload.file_id, file_path: `files/${payload.file_id}` }
+        : true,
+      createVoiceTelegramBot,
+    );
+    const key = String(testChatId);
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 40));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+
+    await bot.handleUpdate(makeMediaUpdate({
+      voice: { file_id: "voice-file-1", file_unique_id: "voice-unique-1", duration: 1 },
+    }, 41) as never);
+    assert.deepStrictEqual(manager.steerCalls.map(({ text }) => text), [
+      "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 1",
+    ]);
+    assert.strictEqual(existsSync(voicePaths[0]), false, "transcription temp file is reclaimed");
+    manager.steerCalls[0].resolve(true);
+    await flushAsyncWork();
+
+    await bot.handleUpdate(makeMediaUpdate({
+      voice: { file_id: "voice-file-2", file_unique_id: "voice-unique-2", duration: 1 },
+    }, 42) as never);
+    assert.strictEqual(
+      manager.steerCalls[1].text,
+      "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 2",
+    );
+    assert.strictEqual(existsSync(voicePaths[1]), false, "fallback also reclaims the voice temp file");
+    manager.steerCalls[1].resolve(false);
+    manager.releaseInitial();
+    await flushAsyncWork();
+
+    assert.deepStrictEqual(manager.sent, [
+      "[From: Test (@tester) | 10:00]\ninitial request",
+      "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 2",
+    ]);
+    messageQueue.clearAll();
+  });
+
+  it("routes reactions through the same acknowledged active-turn path", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const manager = createSteeringSessionManager();
+    const { bot, messageQueue } = initBot(manager);
+    const key = String(testChatId);
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 30));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+
+    await bot.handleUpdate({
+      update_id: 31,
+      message_reaction: {
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        message_id: 30,
+        date: 36_001,
+        user: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "👍" }],
+      },
+    } as never);
+
+    assert.deepStrictEqual(manager.steerCalls.map(({ text }) => text), [
+      "[From: Test (@tester) | 10:00]\n" +
+      "[Reaction: 👍 on message by @tester: \"initial request\"]",
+    ]);
+    manager.steerCalls[0].resolve(true);
+    manager.releaseInitial();
+    await flushAsyncWork();
+    assert.strictEqual(manager.sent.length, 1);
+    messageQueue.clearAll();
   });
 
   it("drops idle echo context without enqueueing or opening a session", () => {

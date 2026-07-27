@@ -82,11 +82,11 @@ Ralphex marks each item immediately after implementation and validation. A faile
 ### Task 3: Wire acknowledged steering for every ordinary Telegram input
 **Goal:** Connect MessageQueue's acknowledged-steer hook to SessionManager for normal Telegram text and media-bearing inputs while leaving passive and non-Telegram behavior unchanged.
 **Serves:** The operator requires the UX for ordinary Telegram text, voice, photo, document, other media, reply/forward/source-prefixed inputs, and reactions to improve without changing Discord, passive echo/shutdown steering, drafts, idle debounce, or Pi steering mode.
-- [ ] Add Telegram integration tests proving ordinary active-turn inputs use the acknowledged path, inactive/post-settlement inputs retain fallback, and text/reply/forward/source-prefix content is preserved exactly.
-- [ ] Add media-handler regressions for voice/photo/document/other media ownership on acknowledgement and fallback, including `/clean` and `/reconnect` while acknowledgement is pending.
-- [ ] Wire `createTelegramBot` to pass only the new acknowledged SessionManager callback into `MessageQueue`; retain `makeSteerFn` for passive echo and retain graceful-shutdown best-effort steering.
-- [ ] Verify Discord construction/call sites and Telegram idle 3-second debounce, draft relay, queue-cap notice, outbox behavior, and reaction routing remain unchanged.
-- [ ] Run Telegram, MessageQueue, session-manager, stream-relay, and telegram-adapter focused suites; they must pass before Task 4.
+- [x] Add Telegram integration tests proving ordinary active-turn inputs use the acknowledged path, inactive/post-settlement inputs retain fallback, and text/reply/forward/source-prefix content is preserved exactly.
+- [x] Add media-handler regressions for voice/photo/document/other media ownership on acknowledgement and fallback, including `/clean` and `/reconnect` while acknowledgement is pending.
+- [x] Wire `createTelegramBot` to pass only the new acknowledged SessionManager callback into `MessageQueue`; retain `makeSteerFn` for passive echo and retain graceful-shutdown best-effort steering.
+- [x] Verify Discord construction/call sites and Telegram idle 3-second debounce, draft relay, queue-cap notice, outbox behavior, and reaction routing remain unchanged.
+- [x] Run Telegram, MessageQueue, session-manager, stream-relay, and telegram-adapter focused suites; they must pass before Task 4.
 
 ### Task 4: Document semantics and run the complete regression contract
 **Goal:** Publish the exact steering/fallback contract and prove the minimum implementation satisfies the whole repository contract without public-data leakage.

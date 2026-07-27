@@ -698,8 +698,7 @@ export const AUTO_RETRY_OPTIONS = {
 
 /**
  * Build the Pi steer decision for passive echo context. Normal user messages
- * stay on MessageQueue's collect-buffer path because Pi steer responses do not
- * provide a usable delivery acknowledgement.
+ * use MessageQueue's separately acknowledged steering path.
  */
 export function makeSteerFn(
   sessionManager: Pick<SessionManager, "getActive">,
@@ -793,6 +792,10 @@ export function createTelegramBot(
     async (chatId, agentId, text, platform, onAgentOwnership) => {
       const stream = sessionManager.sendSessionMessage(chatId, agentId, text);
       await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
+    },
+    {
+      acknowledgedSteerFn: (chatId, agentId, text) =>
+        sessionManager.steerSessionMessage(chatId, agentId, text),
     },
   );
 
