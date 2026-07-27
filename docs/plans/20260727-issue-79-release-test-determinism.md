@@ -42,12 +42,12 @@ git diff --stat main...HEAD
 ### Task 1: Add one bounded package-test supervisor and wire the release gate
 **Serves:** Operator outcome that every later release validation must terminate or fail within a deterministic bound, clean up subprocess/resources, and emit actionable diagnostics without changing production behavior.
 
-- [ ] Reproduce the current gap with a synthetic test fixture that leaves a descendant/resource alive, proving the existing direct Node test invocation can outlive completed or stalled test work.
-- [ ] Add one dependency-free, test-only Node supervisor under `scripts/` that runs the existing Node test command in an owned process group, applies a configurable bounded deadline with a conservative production default, reports the command/stage/elapsed time and child-process evidence on timeout, and performs bounded `SIGTERM` then `SIGKILL` cleanup of the owned group on success, failure, and timeout paths.
-- [ ] Add a Node per-test timeout suitable for the existing explicit 120–180 second package tests; do not use force-exit to turn leaked handles into success.
-- [ ] Wire `npm test` through the supervisor without changing the selected tests, serial concurrency, media-test environment, or existing Node flags; add an explicit CI job timeout as an outer non-success safety bound.
-- [ ] Add focused regression tests that use short injected deadlines to prove timeout diagnostics, nonzero exit, descendant termination, ordinary exit-code propagation, and no leftover fixture process after each case.
-- [ ] Run the focused regression three times, the full suite twice, build, package dry-run, contract check, CLI/workspace validation, `git diff --check`, and compare the final Ralphex diffstat with `main...HEAD`.
+- [x] Reproduce the current gap with a synthetic test fixture that leaves a descendant/resource alive, proving the existing direct Node test invocation can outlive completed or stalled test work.
+- [x] Add one dependency-free, test-only Node supervisor under `scripts/` that runs the existing Node test command in an owned process group, applies a configurable bounded deadline with a conservative production default, reports the command/stage/elapsed time and child-process evidence on timeout, and performs bounded `SIGTERM` then `SIGKILL` cleanup of the owned group on success, failure, and timeout paths.
+- [x] Add a Node per-test timeout suitable for the existing explicit 120–180 second package tests; do not use force-exit to turn leaked handles into success.
+- [x] Wire `npm test` through the supervisor without changing the selected tests, serial concurrency, media-test environment, or existing Node flags; add an explicit CI job timeout as an outer non-success safety bound.
+- [x] Add focused regression tests that use short injected deadlines to prove timeout diagnostics, nonzero exit, descendant termination, ordinary exit-code propagation, and no leftover fixture process after each case.
+- [x] Run the focused regression three times, the full suite twice, build, package dry-run, contract check, CLI/workspace validation, `git diff --check`, and compare the final Ralphex diffstat with `main...HEAD`.
 
 ## Post-Completion
 
