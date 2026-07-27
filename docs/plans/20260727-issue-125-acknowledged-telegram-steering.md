@@ -9,7 +9,7 @@ Give ordinary Telegram inputs received during an active Pi turn the earliest rea
 - Canonical task: `fitz123/minime-bot#125`, including the 2026-07-27 operator corrections and full-cycle authorization.
 - Baseline: `main` commit `3ae49e957e7f4bfa824522a0e8b0e12e01ce23e9`, minime-bot 2026.7.36, Pi 0.82.1, grammY 1.45.1.
 - `src/pi-rpc-protocol.ts` has the one stdout reader. Pi 0.82.1's native steer handler unconditionally queues while idle, so exact command correlation alone is not atomic with the child lifecycle.
-- The package-owned acknowledged-steer extension gates and enqueues within Pi's event loop, then emits a matching success/failure notification record to that existing reader through Pi's supported extension UI API.
+- The package-owned acknowledged-steer extension gates and enqueues within Pi's event loop, then emits distinct matching enqueue, consumption, or rejection notification records to that existing reader through Pi's supported extension UI API.
 - `src/session-manager.ts` owns the active read stream through `agent_settled`, including retry, compaction, and queued continuation. Child exit/activity timeout and settlement are existing resolution boundaries.
 - `src/message-queue.ts` currently stores mid-turn text and cleanup callbacks in parallel arrays, then drains them only after the active send settles.
 - `src/telegram-bot.ts` sends ordinary Telegram inputs through `MessageQueue`; passive echo and shutdown steering are separate best-effort paths.
@@ -76,7 +76,7 @@ Ralphex marks each item immediately after implementation and validation. A faile
 - [x] Add deterministic MessageQueue tests for acknowledged head transfer, rejection/unacknowledged fallback, several corrections under one-at-a-time semantics, partial failures, around-settlement races, cap overflow, clear/replacement while acknowledgement is pending, and late callback no-ops.
 - [x] Add cleanup/media tests proving acknowledged entries run delivery cleanup once and transfer drop-cleanup ownership, while fallback/rejection/clear paths retain existing cleanup guarantees with no double execution.
 - [x] Replace only the collect parallel arrays with structured entries carrying stable object identity and cleanup ownership; keep pending idle-debounce storage and public cap unchanged.
-- [x] Add a serial head-of-line acknowledged-steer attempt for the current busy generation; on matching success remove exactly that entry and try the next, while the first failure/settlement preserves the remaining ordered fallback without retries or timeouts.
+- [x] Add serial head-of-line acknowledged-steer submission for the current busy generation; matching enqueue acceptance opens the next submission, matching consumption removes exactly that entry, and the first failure/settlement preserves the remaining ordered fallback without retries or timeouts.
 - [x] Run the MessageQueue focused suite; it must pass before Task 3.
 
 ### Task 3: Wire acknowledged steering for every ordinary Telegram input
@@ -106,16 +106,18 @@ Ralphex marks each item immediately after implementation and validation. A faile
 - Corrective cut review passed the full contract plus `git diff --check`; dependency manifests, Discord sources, and stream-relay remain unchanged, generated output remains untracked, and status contains only task-owned source, tests, build wiring, and documentation. No generic broker, independent acknowledgement timeout/retry, test weakening, private data, or unrelated abstraction was added.
 - Corrective files add `extensions/pi/acknowledged-steer.ts`, `src/pi-extensions/acknowledged-steer.ts`, its focused test, build/package/spawn wiring and assertions, session/protocol tests, the complete Telegram media matrix, queue simplification, and README/Pi-extension/plan documentation.
 - Residual boundary: the queue remains process-memory scoped and native steering cannot interrupt the current tool-call batch. PR/CI, release, deploy/restart, installed-artifact smoke, tail audit, and issue closure remain with the parent as planned.
-- Plan progress: Tasks 1–4 are complete. This independent Ralphex review found and fixed confirmed issues, so another external review iteration is required before `REVIEW_DONE`.
+- Subsequent critical/major review passes fixed buffered-success handling at child exit/teardown, kept the lifecycle gate available through retry/compaction/continuation work, and separated serial enqueue acceptance from ownership-transferring consumption so Pi's configured steering mode remains authoritative.
+- Latest review validation passed the focused extension/protocol/SessionManager/MessageQueue contract (270/270), the full suite (2,344/2,344 across 322 suites), lint/typecheck, and `git diff --check`.
+- Plan progress: Tasks 1–4 are complete. This review iteration found and fixed confirmed issues, so another external review iteration is required before `REVIEW_DONE`.
 
 ## Technical Details
 
-- The package-owned Pi extension opens steering on `agent_start`, closes it on `agent_end`/`agent_settled`, and synchronously enqueues through Pi's extension binding only while the child is still active. This closes both prompt-preflight and settlement races left by Pi 0.82.1's unconditional native steer RPC.
-- The extension emits a gate result through an `extension_ui_request` fire-and-forget notification whose message contains the exact prefixed, base64url-encoded result envelope. The parent normalizes it to `type=minime_acknowledged_steer_result`; ownership evidence additionally requires the exact pending `id` and `success=true`.
+- The package-owned Pi extension opens steering on `agent_start`, keeps it open across low-level `agent_end` retry/compaction/continuation windows, closes it on `agent_settled`, and synchronously enqueues through Pi's extension binding only while `ctx.isIdle()` is false. This closes both prompt-preflight and settlement races left by Pi 0.82.1's unconditional native steer RPC.
+- The extension emits correlated `enqueued`, `consumed`, or `rejected` results through `extension_ui_request` fire-and-forget notifications whose messages contain the exact prefixed, base64url-encoded result envelope. Enqueue acceptance advances serial submission so Pi's configured steering mode remains authoritative; ownership evidence additionally requires the exact pending `id` and `status=consumed`.
 - Direct process/stdout access is deliberately absent so the wrapper remains compatible with primary-resource parity attestation. The existing stdout reader observes the notification before normal nonterminal parsing. Unmatched, malformed, duplicate, and late results cannot resolve another entry or terminate the prompt stream.
 - A pending steer belongs to one `ActiveSession`; teardown and replacement resolve it as fallback. `agent_settled`/EOF/child exit resolve still-pending requests before MessageQueue begins its existing collect drain.
-- MessageQueue attempts at most one head entry at a time. It does not acknowledge later entries past an unresolved/failed earlier entry, preserving arrival order even when responses are asynchronous.
-- Successful acknowledgement runs normal consumed-message cleanup once because Pi/session now owns referenced media. Every non-success retains the entry for existing follow-up delivery; explicit clear/drop behavior remains recoverable and once-only.
+- MessageQueue has at most one enqueue submission awaiting acceptance at a time. Accepted entries remain bot-owned pending consumption while the queue serially offers later entries in arrival order; a rejection blocks entries behind it.
+- Matching consumption runs normal consumed-message cleanup once because Pi/session now owns referenced media. Every unresolved or rejected entry remains available for existing follow-up delivery; explicit clear/drop behavior remains recoverable and once-only.
 - No wall-clock acknowledgement timer is introduced. The existing response activity timeout may terminate a dead child, after which SessionManager resolves fallback.
 
 ## Post-Completion

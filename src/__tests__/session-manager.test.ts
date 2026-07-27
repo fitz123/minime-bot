@@ -14,7 +14,10 @@ import {
 } from "../session-manager.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
 import { PI_EXTENSIONS_DISABLED_ENV } from "../pi-rpc-protocol.js";
-import { buildPiAcknowledgedSteerResultNotice } from "../pi-extensions/acknowledged-steer.js";
+import {
+  buildPiAcknowledgedSteerResultNotice,
+  type PiAcknowledgedSteerResultStatus,
+} from "../pi-extensions/acknowledged-steer.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
 import PQueue from "p-queue";
 
@@ -107,13 +110,19 @@ function piAgentEnd(result: string, sessionId = "pi-session"): string {
   ].join("\n") + "\n";
 }
 
-function piAcknowledgedSteerResult(id: unknown, success: boolean): string {
+function piAcknowledgedSteerResult(
+  id: unknown,
+  result: boolean | PiAcknowledgedSteerResultStatus,
+): string {
+  const status = typeof result === "boolean"
+    ? result ? "consumed" : "rejected"
+    : result;
   return `${JSON.stringify({
     type: "extension_ui_request",
     id: "notice-fixture",
     method: "notify",
     notifyType: "info",
-    message: buildPiAcknowledgedSteerResultNotice(String(id), success),
+    message: buildPiAcknowledgedSteerResultNotice(String(id), status),
   })}\n`;
 }
 
@@ -790,9 +799,35 @@ describe("SessionManager acknowledged steer", () => {
     const turn = await beginSteeringTurn(manager, "steer-match");
     await waitForSteeringCommand(fixture, "prompt");
 
-    const first = manager.steerSessionMessage("steer-match", "main", "first correction");
+    let firstEnqueueCount = 0;
+    let secondEnqueueCount = 0;
+    let resolveFirstEnqueued!: () => void;
+    let resolveSecondEnqueued!: () => void;
+    const firstEnqueued = new Promise<void>((resolveEnqueued) => {
+      resolveFirstEnqueued = resolveEnqueued;
+    });
+    const secondEnqueued = new Promise<void>((resolveEnqueued) => {
+      resolveSecondEnqueued = resolveEnqueued;
+    });
+    const first = manager.steerSessionMessage(
+      "steer-match",
+      "main",
+      "first correction",
+      () => {
+        firstEnqueueCount++;
+        resolveFirstEnqueued();
+      },
+    );
     const firstCommand = await waitForAcknowledgedSteerCommand(fixture, 1);
-    const second = manager.steerSessionMessage("steer-match", "main", "second correction");
+    const second = manager.steerSessionMessage(
+      "steer-match",
+      "main",
+      "second correction",
+      () => {
+        secondEnqueueCount++;
+        resolveSecondEnqueued();
+      },
+    );
     const secondCommand = await waitForAcknowledgedSteerCommand(fixture, 2);
     assert.strictEqual(typeof firstCommand.id, "string");
     assert.strictEqual(typeof secondCommand.id, "string");
@@ -804,29 +839,47 @@ describe("SessionManager acknowledged steer", () => {
     assert.ok(secondResolver);
     let firstResolutionCount = 0;
     let secondResolutionCount = 0;
-    fixture.session.pendingSteers.set(firstId, (acknowledged) => {
-      firstResolutionCount++;
-      firstResolver(acknowledged);
+    fixture.session.pendingSteers.set(firstId, {
+      ...firstResolver,
+      resolve: (acknowledged) => {
+        firstResolutionCount++;
+        firstResolver.resolve(acknowledged);
+      },
     });
-    fixture.session.pendingSteers.set(secondId, (acknowledged) => {
-      secondResolutionCount++;
-      secondResolver(acknowledged);
+    fixture.session.pendingSteers.set(secondId, {
+      ...secondResolver,
+      resolve: (acknowledged) => {
+        secondResolutionCount++;
+        secondResolver.resolve(acknowledged);
+      },
     });
     let firstResolved = false;
+    let secondResolved = false;
     void first.then(() => { firstResolved = true; });
+    void second.then(() => { secondResolved = true; });
 
-    fixture.stdout.push(piAcknowledgedSteerResult(secondId, true));
-    fixture.stdout.push(piAcknowledgedSteerResult("unrelated-steer", true));
+    fixture.stdout.push(piAcknowledgedSteerResult(secondId, "enqueued"));
+    fixture.stdout.push(piAcknowledgedSteerResult("unrelated-steer", "enqueued"));
+    await secondEnqueued;
+    assert.strictEqual(secondResolved, false, "enqueue acceptance cannot transfer ownership");
+    fixture.stdout.push(piAcknowledgedSteerResult(secondId, "enqueued"));
+    await Promise.resolve();
+    assert.strictEqual(secondEnqueueCount, 1, "duplicate enqueue results are ignored");
 
+    fixture.stdout.push(piAcknowledgedSteerResult(secondId, "consumed"));
     assert.strictEqual(await second, true);
     await Promise.resolve();
     assert.strictEqual(firstResolved, false, "an unrelated acknowledgement cannot resolve the first steer");
 
-    fixture.stdout.push(piAcknowledgedSteerResult(firstId, true));
+    fixture.stdout.push(piAcknowledgedSteerResult(firstId, "enqueued"));
+    await firstEnqueued;
+    assert.strictEqual(firstResolved, false, "the first steer remains bot-owned until consumption");
+    fixture.stdout.push(piAcknowledgedSteerResult(firstId, "consumed"));
     assert.strictEqual(await first, true);
+    assert.strictEqual(firstEnqueueCount, 1);
 
-    fixture.stdout.push(piAcknowledgedSteerResult(firstId, true));
-    fixture.stdout.push(piAcknowledgedSteerResult(secondId, false));
+    fixture.stdout.push(piAcknowledgedSteerResult(firstId, "consumed"));
+    fixture.stdout.push(piAcknowledgedSteerResult(secondId, "rejected"));
     fixture.stdout.push(piAgentEnd("done", fixture.session.sessionId));
     await turn.done;
     assert.strictEqual(firstResolutionCount, 1);

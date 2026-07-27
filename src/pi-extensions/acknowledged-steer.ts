@@ -9,9 +9,14 @@ export interface PiAcknowledgedSteerEnvelope {
   text: string;
 }
 
+export type PiAcknowledgedSteerResultStatus =
+  | "enqueued"
+  | "consumed"
+  | "rejected";
+
 export interface PiAcknowledgedSteerResultEnvelope {
   id: string;
-  success: boolean;
+  status: PiAcknowledgedSteerResultStatus;
 }
 
 export function buildPiAcknowledgedSteerInvocation(id: string, text: string): string {
@@ -41,9 +46,9 @@ export function parsePiAcknowledgedSteerEnvelope(
 
 export function buildPiAcknowledgedSteerResultNotice(
   id: string,
-  success: boolean,
+  status: PiAcknowledgedSteerResultStatus,
 ): string {
-  const encoded = Buffer.from(JSON.stringify({ id, success }), "utf8").toString(
+  const encoded = Buffer.from(JSON.stringify({ id, status }), "utf8").toString(
     "base64url",
   );
   return `${PI_ACKNOWLEDGED_STEER_RESULT_PREFIX}${encoded}`;
@@ -63,11 +68,15 @@ export function parsePiAcknowledgedSteerResultNotice(
     if (
       typeof parsed.id !== "string" ||
       parsed.id.length === 0 ||
-      typeof parsed.success !== "boolean"
+      (
+        parsed.status !== "enqueued" &&
+        parsed.status !== "consumed" &&
+        parsed.status !== "rejected"
+      )
     ) {
       return null;
     }
-    return { id: parsed.id, success: parsed.success };
+    return { id: parsed.id, status: parsed.status };
   } catch {
     return null;
   }

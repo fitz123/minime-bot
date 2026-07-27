@@ -891,7 +891,7 @@ export interface PiRpcEvent {
 export interface PiAcknowledgedSteerResult extends PiRpcEvent {
   type: typeof PI_ACKNOWLEDGED_STEER_RESULT_EVENT;
   id: string;
-  success: boolean;
+  status: "enqueued" | "consumed" | "rejected";
 }
 
 function asPiAcknowledgedSteerResult(

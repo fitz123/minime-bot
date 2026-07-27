@@ -148,7 +148,13 @@ export interface ActiveSession {
   /** Per-session outbox directory for file delivery. */
   outboxPath: string;
   /** Correlated steer requests still owned by the bot pending Pi response. */
-  pendingSteers: Map<string, (acknowledged: boolean) => void>;
+  pendingSteers: Map<string, PendingSteer>;
+}
+
+export interface PendingSteer {
+  resolve: (acknowledged: boolean) => void;
+  onEnqueued?: () => void;
+  enqueued: boolean;
 }
 
 export interface SessionHealth {
@@ -994,10 +1000,16 @@ export class SessionManager {
   /**
    * Attempt first-party Pi steering for an active turn. The returned promise is
    * true only after the existing stdout reader observes the exact correlated
-   * acceptance event from the child lifecycle gate. Every other resolution
-   * preserves bot ownership.
+   * consumption event from the child lifecycle gate. `onEnqueued` observes the
+   * earlier atomic enqueue acceptance without transferring bot ownership.
+   * Every other terminal resolution preserves bot ownership.
    */
-  steerSessionMessage(chatId: string, agentId: string, text: string): Promise<boolean> {
+  steerSessionMessage(
+    chatId: string,
+    agentId: string,
+    text: string,
+    onEnqueued?: () => void,
+  ): Promise<boolean> {
     const session = this.active.get(chatId);
     if (
       !session ||
@@ -1014,7 +1026,11 @@ export class SessionManager {
 
     const id = `minime-steer-${randomUUID()}`;
     return new Promise<boolean>((resolveSteer) => {
-      session.pendingSteers.set(id, resolveSteer);
+      session.pendingSteers.set(id, {
+        resolve: resolveSteer,
+        onEnqueued,
+        enqueued: false,
+      });
       try {
         sendPiAcknowledgedSteer(session.child, text, id, (error) => {
           log.warn(
@@ -1037,7 +1053,18 @@ export class SessionManager {
     session: ActiveSession,
     result: PiAcknowledgedSteerResult,
   ): void {
-    this.settlePendingSteer(session, result.id, result.success);
+    if (result.status === "enqueued") {
+      const pending = session.pendingSteers.get(result.id);
+      if (!pending || pending.enqueued) return;
+      pending.enqueued = true;
+      try {
+        pending.onEnqueued?.();
+      } catch {
+        log.warn("session-manager", "Pi steer enqueue callback failed");
+      }
+      return;
+    }
+    this.settlePendingSteer(session, result.id, result.status === "consumed");
   }
 
   private settlePendingSteer(
@@ -1045,10 +1072,10 @@ export class SessionManager {
     id: string,
     acknowledged: boolean,
   ): void {
-    const resolveSteer = session.pendingSteers.get(id);
-    if (!resolveSteer) return;
+    const pending = session.pendingSteers.get(id);
+    if (!pending) return;
     session.pendingSteers.delete(id);
-    resolveSteer(acknowledged);
+    pending.resolve(acknowledged);
   }
 
   private settlePendingSteers(session: ActiveSession): void {

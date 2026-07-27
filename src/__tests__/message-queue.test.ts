@@ -90,14 +90,26 @@ function createManualAcknowledgedSteer() {
     chatId: string;
     agentId: string;
     text: string;
+    accept: () => void;
     resolve: (acknowledged: boolean) => void;
   }> = [];
 
   return {
     calls,
-    steerFn(chatId: string, agentId: string, text: string): Promise<boolean> {
+    steerFn(
+      chatId: string,
+      agentId: string,
+      text: string,
+      onEnqueued?: () => void,
+    ): Promise<boolean> {
       return new Promise<boolean>((resolve) => {
-        calls.push({ chatId, agentId, text, resolve });
+        calls.push({
+          chatId,
+          agentId,
+          text,
+          accept: () => onEnqueued?.(),
+          resolve,
+        });
       });
     },
   };
@@ -334,16 +346,23 @@ describe("MessageQueue acknowledged mid-turn steering", () => {
     );
     assert.strictEqual(queue.getCollectCount("chat1"), 2);
 
-    steer.calls[0].resolve(true);
+    steer.calls[0].accept();
     await flushMicrotasks();
-    assert.deepStrictEqual(cleanups, [1, 0], "acknowledgement consumes only its entry");
-    assert.deepStrictEqual(dropCleanups, [0, 0], "Pi owns acknowledged persistent media");
-    assert.strictEqual(queue.getCollectCount("chat1"), 1);
+    assert.deepStrictEqual(cleanups, [0, 0], "enqueue acceptance does not transfer ownership");
+    assert.deepStrictEqual(dropCleanups, [0, 0]);
+    assert.strictEqual(queue.getCollectCount("chat1"), 2);
     assert.deepStrictEqual(
       steer.calls.map(({ text }) => text),
       ["first correction", "second correction"],
-      "the next attempt starts only after the head succeeds",
+      "enqueue acceptance opens the next serial submission before consumption",
     );
+
+    steer.calls[1].accept();
+    steer.calls[0].resolve(true);
+    await flushMicrotasks();
+    assert.deepStrictEqual(cleanups, [1, 0], "consumption transfers only the exact entry");
+    assert.deepStrictEqual(dropCleanups, [0, 0], "Pi owns consumed persistent media");
+    assert.strictEqual(queue.getCollectCount("chat1"), 1);
 
     steer.calls[1].resolve(true);
     await flushMicrotasks();
@@ -392,9 +411,11 @@ describe("MessageQueue acknowledged mid-turn steering", () => {
         () => { cleanups[index]++; }, () => { dropCleanups[index]++; });
     }
 
-    steer.calls[0].resolve(true);
+    steer.calls[0].accept();
     await flushMicrotasks();
     steer.calls[1].resolve(false);
+    await flushMicrotasks();
+    steer.calls[0].resolve(true);
     await flushMicrotasks();
 
     assert.deepStrictEqual(
@@ -450,6 +471,8 @@ describe("MessageQueue acknowledged mid-turn steering", () => {
     queue.enqueue("chat1", "main", "settlement fallback", platform,
       () => { cleanup++; }, () => { dropCleanup++; });
     assert.strictEqual(steer.calls.length, 1);
+    steer.calls[0].accept();
+    await flushMicrotasks();
 
     releaseInitial();
     await flushMicrotasks();

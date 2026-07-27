@@ -29,11 +29,16 @@ export type ProcessFn = (
   onAgentOwnership: () => void,
 ) => Promise<void>;
 
-/** Attempt native steering and resolve true only after correlated acceptance. */
+/**
+ * Attempt native steering and resolve true only after correlated consumption.
+ * `onEnqueued` fires after atomic child-side enqueue acceptance so the queue can
+ * offer the next entry without transferring ownership early.
+ */
 export type AcknowledgedSteerFn = (
   chatId: string,
   agentId: string,
   text: string,
+  onEnqueued?: () => void,
 ) => Promise<boolean>;
 
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
@@ -64,8 +69,10 @@ interface ChatQueueState {
 
   /** Whether a message is currently being processed */
   busy: boolean;
-  /** Exact head entry currently waiting for correlated acceptance. */
-  steerInFlight: CollectEntry | null;
+  /** Exact entry currently waiting for correlated enqueue acceptance. */
+  steerSubmitting: CollectEntry | null;
+  /** Entries submitted to Pi whose consumption result is still pending. */
+  steerPending: Set<CollectEntry>;
   /** Stop attempting later entries after the first failure in this busy turn. */
   steerBlocked: boolean;
 
@@ -139,7 +146,8 @@ export class MessageQueue {
         debounceTimer: null,
         collectEntries: [],
         busy: false,
-        steerInFlight: null,
+        steerSubmitting: null,
+        steerPending: new Set(),
         steerBlocked: false,
         latestPlatform: null,
         agentId,
@@ -360,12 +368,14 @@ export class MessageQueue {
 
   private beginBusyGeneration(state: ChatQueueState): void {
     state.busy = true;
-    state.steerInFlight = null;
+    state.steerSubmitting = null;
+    state.steerPending.clear();
     state.steerBlocked = false;
   }
 
   private settleBusyGeneration(state: ChatQueueState): void {
-    state.steerInFlight = null;
+    state.steerSubmitting = null;
+    state.steerPending.clear();
     state.steerBlocked = true;
   }
 
@@ -375,19 +385,27 @@ export class MessageQueue {
       this.queues.get(chatId) !== state ||
       !state.busy ||
       state.steerBlocked ||
-      state.steerInFlight
+      state.steerSubmitting
     ) {
       return;
     }
 
-    const entry = state.collectEntries[0];
+    const entry = state.collectEntries.find(
+      (candidate) => !state.steerPending.has(candidate),
+    );
     if (!entry) return;
 
-    state.steerInFlight = entry;
+    state.steerSubmitting = entry;
+    state.steerPending.add(entry);
 
     let acknowledgement: Promise<boolean>;
     try {
-      acknowledgement = this.acknowledgedSteerFn(chatId, state.agentId, entry.text);
+      acknowledgement = this.acknowledgedSteerFn(
+        chatId,
+        state.agentId,
+        entry.text,
+        () => this.finishSteerEnqueue(chatId, state, entry),
+      );
     } catch {
       this.finishAcknowledgedSteer(chatId, state, entry, false);
       return;
@@ -403,6 +421,26 @@ export class MessageQueue {
     );
   }
 
+  private finishSteerEnqueue(
+    chatId: string,
+    state: ChatQueueState,
+    entry: CollectEntry,
+  ): void {
+    if (
+      this.queues.get(chatId) !== state ||
+      !state.busy ||
+      state.steerBlocked ||
+      state.steerSubmitting !== entry ||
+      !state.steerPending.has(entry) ||
+      !state.collectEntries.includes(entry)
+    ) {
+      return;
+    }
+
+    state.steerSubmitting = null;
+    this.attemptAcknowledgedSteer(chatId, state);
+  }
+
   private finishAcknowledgedSteer(
     chatId: string,
     state: ChatQueueState,
@@ -412,19 +450,23 @@ export class MessageQueue {
     if (
       this.queues.get(chatId) !== state ||
       !state.busy ||
-      state.steerInFlight !== entry ||
-      state.collectEntries[0] !== entry
+      !state.steerPending.has(entry)
     ) {
       return;
     }
 
-    state.steerInFlight = null;
+    state.steerPending.delete(entry);
+    if (state.steerSubmitting === entry) {
+      state.steerSubmitting = null;
+    }
     if (!acknowledged) {
       state.steerBlocked = true;
       return;
     }
 
-    state.collectEntries.shift();
+    const entryIndex = state.collectEntries.indexOf(entry);
+    if (entryIndex === -1) return;
+    state.collectEntries.splice(entryIndex, 1);
     this.runCleanups([entry.cleanup]);
     this.attemptAcknowledgedSteer(chatId, state);
   }
@@ -494,6 +536,9 @@ export class MessageQueue {
   }
 
   private dropCollectEntries(state: ChatQueueState): void {
+    state.steerSubmitting = null;
+    state.steerPending.clear();
+    state.steerBlocked = true;
     const entries = state.collectEntries.splice(0);
     for (const entry of entries) {
       this.runCleanups([entry.cleanup, entry.dropCleanup]);

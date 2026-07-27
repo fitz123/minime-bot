@@ -94,7 +94,7 @@ describe("acknowledged-steer Pi extension", () => {
     assert.strictEqual(parsePiAcknowledgedSteerEnvelope("not-base64-json"), null);
   });
 
-  it("atomically accepts only between agent_start and agent_end", async () => {
+  it("atomically accepts from agent_start through post-run continuation work", async () => {
     const wrapper = await loadWrapper();
     const harness = createHarness();
     wrapper(harness.pi);
@@ -127,15 +127,40 @@ describe("acknowledged-steer Pi extension", () => {
     });
 
     harness.emit("agent_end");
+    await harness.commandHandler(
+      commandArgs("post-run", "apply during retry or compaction"),
+      harness.context,
+    );
+    assert.strictEqual(
+      harness.sent.length,
+      2,
+      "agent_end is followed by retry, compaction, or queued continuation work",
+    );
+    harness.emit("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
+        content: "apply during retry or compaction",
+        display: false,
+        details: { requestId: "post-run" },
+        timestamp: 2,
+      },
+    });
+
+    harness.emit("agent_settled");
     await harness.commandHandler(commandArgs("after", "too late"), harness.context);
-    assert.strictEqual(harness.sent.length, 1);
+    assert.strictEqual(harness.sent.length, 2);
 
     assert.deepStrictEqual(
       harness.notices.map((notice) => parsePiAcknowledgedSteerResultNotice(notice)),
       [
-        { id: "before", success: false },
-        { id: "accepted", success: true },
-        { id: "after", success: false },
+        { id: "before", status: "rejected" },
+        { id: "accepted", status: "enqueued" },
+        { id: "accepted", status: "consumed" },
+        { id: "post-run", status: "enqueued" },
+        { id: "post-run", status: "consumed" },
+        { id: "after", status: "rejected" },
       ],
     );
   });
@@ -158,7 +183,7 @@ describe("acknowledged-steer Pi extension", () => {
     assert.strictEqual(harness.sent.length, 0);
     assert.deepStrictEqual(parsePiAcknowledgedSteerResultNotice(harness.notices[0]), {
       id: "idle-race",
-      success: false,
+      status: "rejected",
     });
   });
 });

@@ -794,8 +794,8 @@ export function createTelegramBot(
       await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
     },
     {
-      acknowledgedSteerFn: (chatId, agentId, text) =>
-        sessionManager.steerSessionMessage(chatId, agentId, text),
+      acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
+        sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued),
     },
   );
 

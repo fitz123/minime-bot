@@ -2469,7 +2469,7 @@ describe("readPiStream", () => {
         id: "notice-1",
         method: "notify",
         notifyType: "info",
-        message: buildPiAcknowledgedSteerResultNotice("steer-later", true),
+        message: buildPiAcknowledgedSteerResultNotice("steer-later", "consumed"),
       }),
       JSON.stringify({
         type: "response",
@@ -2482,14 +2482,14 @@ describe("readPiStream", () => {
         id: "notice-2",
         method: "notify",
         notifyType: "info",
-        message: buildPiAcknowledgedSteerResultNotice("steer-earlier", false),
+        message: buildPiAcknowledgedSteerResultNotice("steer-earlier", "rejected"),
       }),
       JSON.stringify({
         type: "extension_ui_request",
         id: "notice-3",
         method: "notify",
         notifyType: "warning",
-        message: buildPiAcknowledgedSteerResultNotice("wrong-notify-type", true),
+        message: buildPiAcknowledgedSteerResultNotice("wrong-notify-type", "enqueued"),
       }),
       JSON.stringify({
         type: "extension_ui_request",
@@ -2506,22 +2506,22 @@ describe("readPiStream", () => {
     ]);
     const observed: Array<{
       id: string;
-      success: boolean;
+      status: "enqueued" | "consumed" | "rejected";
     }> = [];
     const lines: StreamLine[] = [];
 
     for await (const line of readPiStream(child, undefined, undefined, (response) => {
       observed.push({
         id: response.id,
-        success: response.success,
+        status: response.status,
       });
     })) {
       lines.push(line);
     }
 
     assert.deepStrictEqual(observed, [
-      { id: "steer-later", success: true },
-      { id: "steer-earlier", success: false },
+      { id: "steer-later", status: "consumed" },
+      { id: "steer-earlier", status: "rejected" },
     ]);
     assert.deepStrictEqual(lines.map((line) => line.type), ["result"]);
     assert.strictEqual((lines[0] as { result: string }).result, "turn result");

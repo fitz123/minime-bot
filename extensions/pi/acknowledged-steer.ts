@@ -7,14 +7,15 @@ import {
   PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
   buildPiAcknowledgedSteerResultNotice,
   parsePiAcknowledgedSteerEnvelope,
+  type PiAcknowledgedSteerResultStatus,
 } from "../../src/pi-extensions/acknowledged-steer.js";
 
 function emitResult(
   ctx: ExtensionContext,
   id: string,
-  success: boolean,
+  status: PiAcknowledgedSteerResultStatus,
 ): void {
-  ctx.ui.notify(buildPiAcknowledgedSteerResultNotice(id, success), "info");
+  ctx.ui.notify(buildPiAcknowledgedSteerResultNotice(id, status), "info");
 }
 
 export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
@@ -22,9 +23,6 @@ export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_start", () => {
     steeringOpen = true;
-  });
-  pi.on("agent_end", () => {
-    steeringOpen = false;
   });
   pi.on("agent_settled", () => {
     steeringOpen = false;
@@ -41,7 +39,7 @@ export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
       message.details as { requestId?: unknown } | undefined
     )?.requestId;
     if (typeof requestId === "string" && requestId.length > 0) {
-      emitResult(ctx, requestId, true);
+      emitResult(ctx, requestId, "consumed");
     }
   });
 
@@ -52,7 +50,7 @@ export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
       if (!envelope) return;
 
       if (!steeringOpen || ctx.isIdle()) {
-        emitResult(ctx, envelope.id, false);
+        emitResult(ctx, envelope.id, "rejected");
         return;
       }
 
@@ -69,6 +67,7 @@ export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
         },
         { deliverAs: "steer" },
       );
+      emitResult(ctx, envelope.id, "enqueued");
     },
   });
 }
