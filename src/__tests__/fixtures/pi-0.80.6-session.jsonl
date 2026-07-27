@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"pi-0806-legacy-session","timestamp":"2026-07-01T08:00:00.000Z","cwd":"/tmp"}
+{"type":"model_change","id":"legacy-model","parentId":null,"timestamp":"2026-07-01T08:00:01.000Z","provider":"openai-codex","modelId":"gpt-5.5"}
+{"type":"thinking_level_change","id":"legacy-thinking","parentId":"legacy-model","timestamp":"2026-07-01T08:00:02.000Z","thinkingLevel":"high"}
+{"type":"message","id":"legacy-user","parentId":"legacy-thinking","timestamp":"2026-07-01T08:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"Legacy 0.80.6 user history marker."}],"timestamp":1782892803000}}
+{"type":"message","id":"legacy-assistant","parentId":"legacy-user","timestamp":"2026-07-01T08:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Legacy 0.80.6 assistant history marker."}],"api":"openai-codex-responses","provider":"openai-codex","model":"gpt-5.5","usage":{"input":12,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":19,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1782892804000}}
+{"type":"session_info","id":"legacy-name","parentId":"legacy-assistant","timestamp":"2026-07-01T08:00:05.000Z","name":"Pi 0.80.6 compatibility fixture"}

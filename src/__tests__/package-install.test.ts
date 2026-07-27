@@ -620,7 +620,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workspace = process.env.FIXTURE_WORKSPACE;
 const sourceBotRoot = process.env.SOURCE_BOT_ROOT;
@@ -641,6 +641,40 @@ const expectedBundledAgentFiles = ${JSON.stringify(EXPECTED_BUNDLED_AGENT_FILES)
 const expectedBundledPromptFiles = ${JSON.stringify(EXPECTED_BUNDLED_PROMPT_FILES)};
 const retiredGuardWrapperPattern = new RegExp(["guardian", "protect", "files"].join("-"));
 const retiredRecoveryArtifacts = ${JSON.stringify(RETIRED_RECOVERY_INSTALLED_PATHS)};
+
+const installedRpcEntry = fileURLToPath(
+  import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
+);
+const installedPiRoot = join(
+  projectDir,
+  "node_modules",
+  "@earendil-works",
+  "pi-coding-agent",
+);
+const installedPiManifest = JSON.parse(
+  readFileSync(join(installedPiRoot, "package.json"), "utf8"),
+);
+const { resolvePackageOwnedPiInvocation } = await importPackageFile("dist/pi-runtime.js");
+const installedRpcInvocation = resolvePackageOwnedPiInvocation("rpc", ["--offline"]);
+const installedCliInvocation = resolvePackageOwnedPiInvocation("cli", ["--offline"]);
+
+assert.equal(installedPiManifest.version, "0.82.1");
+assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "rpc-entry.js"));
+assert.deepEqual(installedRpcInvocation.args, [installedRpcEntry, "--offline"]);
+assert.deepEqual(
+  installedCliInvocation.args,
+  [join(installedPiRoot, installedPiManifest.bin.pi), "--offline"],
+);
+assert.equal(installedRpcInvocation.diagnostic.versionMismatch, false);
+assert.equal(installedCliInvocation.diagnostic.versionMismatch, false);
+
+const { OPENAI_CODEX_MODELS } = await import(
+  "@earendil-works/pi-ai/providers/openai-codex.models"
+);
+for (const id of ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+  assert.equal(OPENAI_CODEX_MODELS[id].contextWindow, 272000, id);
+  assert.equal(OPENAI_CODEX_MODELS[id].maxTokens, 128000, id);
+}
 
 function extensionPathsFromArgs(args) {
   const paths = [];

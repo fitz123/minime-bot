@@ -494,6 +494,10 @@ describe("ops worker Pi standard-session attempts", () => {
       join(dirname(piAiEntry), "api", "openai-codex-responses.js"),
       "utf8",
     );
+    const promptCacheSource = readFileSync(
+      join(dirname(piAiEntry), "api", "openai-prompt-cache.js"),
+      "utf8",
+    );
 
     assert.equal(manifest.version, "0.82.1");
     assert.match(mainSource, /if \(parsed\.sessionId\)/);
@@ -509,7 +513,25 @@ describe("ops worker Pi standard-session attempts", () => {
     );
     assert.match(
       codexTransportSource,
+      /buildRequestBody\(model, context, options, codexSessionId, grammarToolInputProperties\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /buildSSEHeaders\(model\.headers, options\?\.headers, accountId, apiKey, codexSessionId\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /const websocketRequestId = codexSessionId \|\| uuidv7\(\)/,
+    );
+    assert.match(
+      codexTransportSource,
       /headers\.set\("session-id", sessionId\)/,
+    );
+    assert.match(promptCacheSource, /OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64/);
+    assert.match(promptCacheSource, /const chars = Array\.from\(key\)/);
+    assert.match(
+      promptCacheSource,
+      /chars\.slice\(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH\)\.join\(""\)/,
     );
   });
 
