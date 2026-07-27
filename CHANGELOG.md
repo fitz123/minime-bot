@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 2026.7.36
+
+- Keep Telegram DM drafts alive through long tool gaps, hold leading
+  `NO_REPLY` sentinels, preserve a typing fallback, order ordinary draft
+  settlement before final delivery, and keep long draft tails valid and
+  current without weakening bounded scheduler or final-message guarantees
+  (#149).
+
 ## 2026.7.35
 
 - Upgrade the package-owned Pi runtime to 0.82.1 and grammY to 1.45.1 while
