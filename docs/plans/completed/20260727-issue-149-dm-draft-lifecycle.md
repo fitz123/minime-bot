@@ -54,10 +54,10 @@ git diff --check
 ### Task 2: Document and validate the complete release candidate
 **Goal:** Lock the user-visible contract and prove no regression outside DM cosmetic streaming.
 **Serves:** The requirement to fix only confirmed draft lifecycle gaps on the Pi 0.82.1 / grammY 1.45.1 baseline and complete the authorized full release cycle safely.
-- [ ] Update current README documentation to state the sub-30-second keepalive, always-active configured typing fallback, leading-sentinel hold, bounded natural finalization ordering, useful tail snapshots, and unchanged authoritative final delivery; keep Bot API 10.2 empty-text/rich features explicitly unadopted.
-- [ ] Run clean install if dependency state changed, the full 2,299-test-or-later suite, lint/typecheck, build, package dry-run, schema contract, CLI help, minimal-workspace validation, and whitespace checks. Verify no test/runtime subprocess survives.
-- [ ] Inspect `git diff main...HEAD` for exact issue scope, PII/secrets, accidental generated files, metric-label drift, package/version movement, private paths, and unrelated Telegram behavior.
-- [ ] Move this plan to `docs/plans/completed/` only after both tasks and all gates pass; leave PR, CalVer release, private deployment/restart, installed-artifact smoke, issue closure, Knowledge/milestone persistence, and queue completion to the parent supervisor.
+- [x] Update current README documentation to state the sub-30-second keepalive, always-active configured typing fallback, leading-sentinel hold, bounded natural finalization ordering, useful tail snapshots, and unchanged authoritative final delivery; keep Bot API 10.2 empty-text/rich features explicitly unadopted.
+- [x] Run clean install if dependency state changed, the full 2,299-test-or-later suite, lint/typecheck, build, package dry-run, schema contract, CLI help, minimal-workspace validation, and whitespace checks. Verify no test/runtime subprocess survives.
+- [x] Inspect `git diff main...HEAD` for exact issue scope, PII/secrets, accidental generated files, metric-label drift, package/version movement, private paths, and unrelated Telegram behavior.
+- [x] Move this plan to `docs/plans/completed/` only after both tasks and all gates pass; leave PR, CalVer release, private deployment/restart, installed-artifact smoke, issue closure, Knowledge/milestone persistence, and queue completion to the parent supervisor.
 
 ## Success criteria
 
