@@ -9,6 +9,10 @@ const TELEGRAM_MAX_MSG_LENGTH = 4096;
 const TELEGRAM_TYPING_INTERVAL_MS = 5000;
 const MAX_DRAFT_RETRY_AFTER_MS = 60_000;
 
+function shouldFallbackToPlainText(err: unknown): boolean {
+  return err instanceof Error && /can't parse entities|message is too long/.test(err.message);
+}
+
 /** Convert Telegram's structured 429 response into bounded scheduler feedback. */
 function draftFailureResult(err: unknown): DraftSendResult {
   if (typeof err !== "object" || err === null) return { status: "failed" };
@@ -64,7 +68,7 @@ export function createTelegramAdapter(
         return String(sent.message_id);
       } catch (err) {
         // Only fall back to plain text for HTML parse errors; re-throw everything else
-        if (err instanceof Error && /can't parse entities|message is too long/.test(err.message)) {
+        if (shouldFallbackToPlainText(err)) {
           const sent = await ctx.reply(text, { ...threadOpts });
           if (chatId != null && threadId != null) setThread(chatId, sent.message_id, threadId);
           if (chatId != null) recordMessage(chatId, sent.message_id, `@${_botUsername}`, text, "out");
@@ -84,6 +88,16 @@ export function createTelegramAdapter(
         }, signal as Parameters<typeof ctx.api.sendMessageDraft>[4]);
         return { status: "sent" };
       } catch (err) {
+        if (shouldFallbackToPlainText(err)) {
+          try {
+            await ctx.api.sendMessageDraft(chatId, draftId, text, {
+              ...threadOpts,
+            }, signal as Parameters<typeof ctx.api.sendMessageDraft>[4]);
+            return { status: "sent" };
+          } catch (fallbackErr) {
+            return draftFailureResult(fallbackErr);
+          }
+        }
         return draftFailureResult(err);
       }
     },
