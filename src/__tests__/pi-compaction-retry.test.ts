@@ -1,14 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { generateSummary } from "@earendil-works/pi-agent-core";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { generateSummary } from "@earendil-works/pi-coding-agent";
 import type {
   AssistantMessage,
   Model,
-  Models,
   RetryCallbacks,
   RetryPolicy,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const TEST_MODEL: Model<"openai-responses"> = {
   id: "summary-test-model",
@@ -62,7 +63,7 @@ function assistantMessage(
 }
 
 interface SummaryHarness {
-  models: Models;
+  streamFn: StreamFn;
   calls: () => number;
   options: SimpleStreamOptions[];
 }
@@ -72,18 +73,23 @@ function summaryHarness(
 ): SummaryHarness {
   let calls = 0;
   const options: SimpleStreamOptions[] = [];
-  const models = {
-    async completeSimple(
-      _model: Model<"openai-responses">,
-      _context: unknown,
-      requestOptions: SimpleStreamOptions = {},
-    ): Promise<AssistantMessage> {
-      calls += 1;
-      options.push(requestOptions);
-      return produce(calls);
-    },
-  } as unknown as Models;
-  return { models, calls: () => calls, options };
+  const streamFn: StreamFn = async (
+    _model,
+    _context,
+    requestOptions: SimpleStreamOptions = {},
+  ) => {
+    calls += 1;
+    options.push(requestOptions);
+    const message = await produce(calls);
+    const stream = createAssistantMessageEventStream();
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      stream.push({ type: "error", reason: message.stopReason, error: message });
+    } else {
+      stream.push({ type: "done", reason: message.stopReason, message });
+    }
+    return stream;
+  };
+  return { streamFn, calls: () => calls, options };
 }
 
 function retryPolicy(maxRetries: number, baseDelayMs = 1): RetryPolicy {
@@ -91,19 +97,22 @@ function retryPolicy(maxRetries: number, baseDelayMs = 1): RetryPolicy {
 }
 
 async function runSummary(
-  models: Models,
+  streamFn: StreamFn,
   retry: RetryPolicy,
   callbacks: RetryCallbacks,
   signal?: AbortSignal,
 ) {
   return generateSummary(
     [{ role: "user", content: "Summarize this deterministic fixture.", timestamp: 1 }],
-    models,
     TEST_MODEL,
     1_000,
+    undefined,
+    undefined,
     signal,
     undefined,
     undefined,
+    undefined,
+    streamFn,
     undefined,
     retry,
     callbacks,
@@ -120,7 +129,7 @@ describe("Pi 0.82.1 compaction summarization retry", () => {
     let attemptStarts = 0;
     const finished: Array<[boolean, number, string | undefined]> = [];
 
-    const result = await runSummary(harness.models, retryPolicy(1), {
+    const result = await runSummary(harness.streamFn, retryPolicy(1), {
       onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
         scheduled.push([attempt, maxAttempts, delayMs, errorMessage]);
       },
@@ -132,9 +141,7 @@ describe("Pi 0.82.1 compaction summarization retry", () => {
       },
     });
 
-    assert.strictEqual(result.ok, true);
-    if (!result.ok) return;
-    assert.strictEqual(result.value, "single recovered summary");
+    assert.strictEqual(result, "single recovered summary");
     assert.strictEqual(harness.calls(), 2);
     assert.deepStrictEqual(scheduled, [
       [1, 1, 1, "WebSocket error: connection closed"],
@@ -157,22 +164,21 @@ describe("Pi 0.82.1 compaction summarization retry", () => {
     let attemptStarts = 0;
     const finished: Array<[boolean, number, string | undefined]> = [];
 
-    const result = await runSummary(harness.models, retryPolicy(2), {
-      onRetryScheduled: (attempt) => {
-        scheduled.push(attempt);
-      },
-      onRetryAttemptStart: () => {
-        attemptStarts += 1;
-      },
-      onRetryFinished: (success, attempt, finalError) => {
-        finished.push([success, attempt, finalError]);
-      },
-    });
+    await assert.rejects(
+      runSummary(harness.streamFn, retryPolicy(2), {
+        onRetryScheduled: (attempt) => {
+          scheduled.push(attempt);
+        },
+        onRetryAttemptStart: () => {
+          attemptStarts += 1;
+        },
+        onRetryFinished: (success, attempt, finalError) => {
+          finished.push([success, attempt, finalError]);
+        },
+      }),
+      /Summarization failed: WebSocket error: connection closed/,
+    );
 
-    assert.strictEqual(result.ok, false);
-    if (result.ok) return;
-    assert.strictEqual(result.error.code, "summarization_failed");
-    assert.match(result.error.message, /WebSocket error: connection closed/);
     assert.strictEqual(harness.calls(), 3, "one initial call plus two bounded retries");
     assert.deepStrictEqual(scheduled, [1, 2]);
     assert.strictEqual(attemptStarts, 2);
@@ -186,36 +192,38 @@ describe("Pi 0.82.1 compaction summarization retry", () => {
       assistantMessage("error", "", "insufficient_quota: billing limit reached"));
     let callbackCount = 0;
 
-    const result = await runSummary(harness.models, retryPolicy(3), {
-      onRetryScheduled: () => {
-        callbackCount += 1;
-      },
-      onRetryAttemptStart: () => {
-        callbackCount += 1;
-      },
-      onRetryFinished: () => {
-        callbackCount += 1;
-      },
-    });
+    await assert.rejects(
+      runSummary(harness.streamFn, retryPolicy(3), {
+        onRetryScheduled: () => {
+          callbackCount += 1;
+        },
+        onRetryAttemptStart: () => {
+          callbackCount += 1;
+        },
+        onRetryFinished: () => {
+          callbackCount += 1;
+        },
+      }),
+      /Summarization failed: insufficient_quota: billing limit reached/,
+    );
 
-    assert.strictEqual(result.ok, false);
-    if (result.ok) return;
-    assert.strictEqual(result.error.code, "summarization_failed");
-    assert.match(result.error.message, /insufficient_quota/);
     assert.strictEqual(harness.calls(), 1);
     assert.strictEqual(callbackCount, 0, "no retry lifecycle starts for terminal quota errors");
   });
 
-  it("aborts during retry backoff without starting another call", async () => {
+  it("aborts while retry backoff is pending without starting another call", { timeout: 1_000 }, async () => {
     const controller = new AbortController();
     const harness = summaryHarness(() =>
       assistantMessage("error", "", "WebSocket error: connection closed"));
     let attemptStarts = 0;
+    let abortImmediate: NodeJS.Immediate | undefined;
     const finished: Array<[boolean, number, string | undefined]> = [];
 
-    const result = await runSummary(harness.models, retryPolicy(3, 50), {
+    const result = await runSummary(harness.streamFn, retryPolicy(3, 5_000), {
       onRetryScheduled: () => {
-        controller.abort();
+        // setImmediate runs only after retryAssistantCall has returned from this
+        // callback and installed the backoff sleep's abort listener.
+        abortImmediate = setImmediate(() => controller.abort());
       },
       onRetryAttemptStart: () => {
         attemptStarts += 1;
@@ -225,10 +233,9 @@ describe("Pi 0.82.1 compaction summarization retry", () => {
       },
     }, controller.signal);
 
-    assert.strictEqual(result.ok, false);
-    if (result.ok) return;
-    assert.strictEqual(result.error.code, "aborted");
-    assert.match(result.error.message, /Summarization aborted/);
+    if (abortImmediate) clearImmediate(abortImmediate);
+    assert.strictEqual(controller.signal.aborted, true);
+    assert.strictEqual(result, "");
     assert.strictEqual(harness.calls(), 1);
     assert.strictEqual(attemptStarts, 0);
     assert.deepStrictEqual(finished, [

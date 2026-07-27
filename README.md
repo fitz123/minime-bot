@@ -570,6 +570,14 @@ git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|conf
 npm run check:schema-guard-contract
 ```
 
+For a focused test run, pass one or more test paths after `--`, for example:
+
+```bash
+npm run test:file -- src/__tests__/pi-compaction-retry.test.ts
+```
+
+`test:file` forwards those paths to Node's test runner and uses the same
+per-test timeout and process-group watchdog as `npm test`.
 `npm test` gives each Node test 240 seconds and bounds the complete suite at
 30 minutes; CI adds a 35-minute outer job limit. On a suite timeout, the
 watchdog reports the stage, command, elapsed time, and live process-group
