@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 2026.7.37
+
+- Deliver ordinary Telegram corrections at Pi's native active-turn steering
+  boundary through a correlated child-lifecycle gate, while retaining ordered
+  fallback and media ownership on rejection, settlement, write failure, or
+  child exit without changing idle debounce, passive steering, or Discord
+  behavior (#125).
+
 ## 2026.7.36
 
 - Keep Telegram DM drafts alive through long tool gaps, hold leading
