@@ -97,10 +97,25 @@ minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/t
 ```
 
 Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
-the package-owned Pi 0.80.6 entrypoints and execute them with Node. They never
+the package-owned Pi 0.82.1 entrypoints and execute them with Node. They never
 fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
+
+The runtime dependency contract pins all four package-owned Pi packages to
+0.82.1 and grammY to 1.45.1 (`@grammyjs/types` 4.0.0). Pi owns the bounded
+summarization retry, including transient WebSocket recovery; Minime treats its
+retry records as stream activity and does not add a second compaction retry.
+`agent_settled` remains the accepted-turn terminal boundary. A reasoning-only
+`stopReason=length` settlement without text remains an error distinct from that
+recovery and is not classified as fixed.
+
+Pi's OpenAI catalog reports a 272K (272,000-token) context window for the
+supported GPT-5.6 models. Earlier compaction at that boundary is expected and
+Minime does not override the model metadata. The grammY upgrade preserves the
+existing polling, authoritative final delivery, cosmetic draft fallback,
+topics, media/upload, retry/connectivity, and cancellation contracts; it does
+not opt into new Bot API product features.
 
 The sampler uses the same packaged Pi CLI by default; override it explicitly
 with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
@@ -234,7 +249,7 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path. Pi 0.80.6 does not bind
+handle cancellation or provide a noninteractive path. Pi 0.82.1 does not bind
 its RPC input reader until startup handlers complete, so a blocking dialog from
 `session_start` instead fails session creation promptly and the child is reaped.
 
@@ -555,6 +570,14 @@ git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|conf
 npm run check:schema-guard-contract
 ```
 
+For a focused test run, pass one or more test paths after `--`, for example:
+
+```bash
+npm run test:file -- src/__tests__/pi-compaction-retry.test.ts
+```
+
+`test:file` forwards those paths to Node's test runner and uses the same
+per-test timeout and process-group watchdog as `npm test`.
 `npm test` gives each Node test 240 seconds and bounds the complete suite at
 30 minutes; CI adds a 35-minute outer job limit. On a suite timeout, the
 watchdog reports the stage, command, elapsed time, and live process-group

@@ -2005,6 +2005,84 @@ describe("parsePiEvent", () => {
     assert.strictEqual((settled as { result: string }).result, "recovered");
   });
 
+  it("keeps every summarization retry shape nonterminal without disturbing overflow state", () => {
+    const state: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "context_length_exceeded: input exceeds the context window",
+          content: [],
+        }],
+      }, state),
+      null,
+    );
+
+    for (const retryEvent of [
+      {
+        type: "summarization_retry_scheduled",
+        attempt: 1,
+        maxAttempts: 2,
+        delayMs: 1,
+        errorMessage: "WebSocket error",
+      },
+      {
+        type: "summarization_retry_attempt_start",
+        source: "compaction",
+        reason: "overflow",
+      },
+      { type: "summarization_retry_attempt_start", source: "branchSummary" },
+      { type: "summarization_retry_finished" },
+    ]) {
+      assert.strictEqual(parsePiEvent(retryEvent, state), null);
+    }
+
+    const reset = parsePiEvent({ type: "compaction_start", reason: "overflow" }, state);
+    assert.ok(reset);
+    assert.strictEqual((reset as { action?: unknown }).action, "reset_response_text");
+    assert.strictEqual(
+      parsePiEvent({ type: "compaction_end", reason: "overflow", willRetry: true }, state),
+      null,
+    );
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "recovered once" }] }],
+      }, state),
+      null,
+    );
+
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual((settled as { result: string }).result, "recovered once");
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
+  });
+
+  it("keeps reasoning-only stopReason=length as a distinct terminal error", () => {
+    const state: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }, state),
+      null,
+    );
+
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    assert.match(
+      (settled as { result: string }).result,
+      /without a usable agent_end outcome/,
+    );
+  });
+
   it("defers final errors until settlement and preserves the original overflow cause", () => {
     const state: PiRpcParseState = {};
     const overflowMessage = "context_length_exceeded: original request too large";
@@ -2643,6 +2721,73 @@ describe("readPiStream", () => {
         (line) => line.type === "assistant" && (line as { action?: unknown }).action === "reset_response_text",
       ).length,
       1,
+    );
+  });
+
+  it("treats summarization retries as watchdog activity and settles exactly once", async () => {
+    const records = [
+      {
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "context_length_exceeded: input exceeds the context window",
+          content: [{ type: "text", text: "stale partial" }],
+        }],
+      },
+      {
+        type: "summarization_retry_scheduled",
+        attempt: 1,
+        maxAttempts: 2,
+        delayMs: 1,
+        errorMessage: "WebSocket error",
+      },
+      {
+        type: "summarization_retry_attempt_start",
+        source: "compaction",
+        reason: "overflow",
+      },
+      { type: "summarization_retry_finished" },
+      {
+        type: "summarization_retry_attempt_start",
+        source: "branchSummary",
+      },
+      { type: "compaction_start", reason: "overflow" },
+      { type: "compaction_end", reason: "overflow", willRetry: true },
+      {
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "text", text: "post-compaction result" }],
+        }],
+      },
+      { type: "agent_settled" },
+    ];
+    const child = childWithStdout(records.map((record) => JSON.stringify(record)));
+    let activityCount = 0;
+    const lines: StreamLine[] = [];
+
+    for await (const line of readPiStream(child, () => {
+      activityCount += 1;
+    })) {
+      lines.push(line);
+    }
+
+    assert.strictEqual(activityCount, records.length);
+    assert.strictEqual(
+      lines.filter(
+        (line) =>
+          line.type === "assistant" &&
+          (line as { action?: unknown }).action === "reset_response_text",
+      ).length,
+      1,
+      "retry events preserve the single overflow reset",
+    );
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "post-compaction result",
     );
   });
 

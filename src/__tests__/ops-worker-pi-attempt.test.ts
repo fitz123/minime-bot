@@ -472,7 +472,7 @@ async function waitFor(
 }
 
 describe("ops worker Pi standard-session attempts", () => {
-  it("traces the pinned Pi 0.80.6 create/resume and corrupt-session contract", () => {
+  it("traces the pinned Pi 0.82.1 create/resume and corrupt-session contract", () => {
     const rpcEntry = fileURLToPath(
       import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
     );
@@ -494,8 +494,12 @@ describe("ops worker Pi standard-session attempts", () => {
       join(dirname(piAiEntry), "api", "openai-codex-responses.js"),
       "utf8",
     );
+    const promptCacheSource = readFileSync(
+      join(dirname(piAiEntry), "api", "openai-prompt-cache.js"),
+      "utf8",
+    );
 
-    assert.equal(manifest.version, "0.80.6");
+    assert.equal(manifest.version, "0.82.1");
     assert.match(mainSource, /if \(parsed\.sessionId\)/);
     assert.match(mainSource, /SessionManager\.create\(cwd, sessionDir/);
     assert.match(mainSource, /if \(parsed\.session\)/);
@@ -505,11 +509,29 @@ describe("ops worker Pi standard-session attempts", () => {
     assert.match(sessionSource, /Session file is not a valid pi session/);
     assert.match(
       codexTransportSource,
-      /prompt_cache_key: clampOpenAIPromptCacheKey\(options\?\.sessionId\)/,
+      /const codexSessionId = clampOpenAIPromptCacheKey\(cacheSessionId\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /buildRequestBody\(model, context, options, codexSessionId, grammarToolInputProperties\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /buildSSEHeaders\(model\.headers, options\?\.headers, accountId, apiKey, codexSessionId\)/,
+    );
+    assert.match(
+      codexTransportSource,
+      /const websocketRequestId = codexSessionId \|\| uuidv7\(\)/,
     );
     assert.match(
       codexTransportSource,
       /headers\.set\("session-id", sessionId\)/,
+    );
+    assert.match(promptCacheSource, /OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64/);
+    assert.match(promptCacheSource, /const chars = Array\.from\(key\)/);
+    assert.match(
+      promptCacheSource,
+      /chars\.slice\(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH\)\.join\(""\)/,
     );
   });
 

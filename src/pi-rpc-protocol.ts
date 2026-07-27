@@ -1102,6 +1102,9 @@ function markCompletedRunReset(
  *   terminal `ResultMessage` for the accepted prompt.
  * - `compaction_start` / `compaction_end` → ignored unless a prior overflow
  *   `agent_end` is pending; a failed compaction end is retained until settlement.
+ * - `summarization_retry_scheduled` / `summarization_retry_attempt_start` /
+ *   `summarization_retry_finished` → nonterminal lifecycle activity. The stream
+ *   reader refreshes its watchdog before these records are intentionally filtered.
  * - `turn_end` → `null`. It is a per-turn boundary that fires once PER turn, so a
  *   multi-turn (tool-using) response emits several `turn_end`s before `agent_end`.
  *   Neither boundary settles the accepted prompt.
@@ -1274,13 +1277,20 @@ export function parsePiEvent(
       }
       return null;
 
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
+      // Pi owns the summarization retry lifecycle. These records keep the
+      // accepted prompt alive and must not settle it or disturb overflow state.
+      return null;
+
     case "response": {
       // Command responses are side-channel replies, NOT prompt-turn stream
       // content. The terminal event of an accepted prompt is `agent_settled`.
       // A `response` shares the same stdout the active turn
       // is reading, so it must be correlated by `command` before being treated
       // as terminal:
-      //  - a failed `prompt` response is terminal because Pi 0.80.6 emits it
+      //  - a failed `prompt` response is terminal because Pi 0.82.1 emits it
       //    only when preflight rejects before acceptance; no agent lifecycle
       //    records will follow for that prompt.
       //  - EXCEPT Pi's "already processing" concurrency rejection (a second,
@@ -1315,7 +1325,7 @@ export function parsePiEvent(
             return null;
           }
           const promptErrorMessage = nonEmptyText(rawEvent.error) ?? "Pi RPC command failed";
-          // In Pi 0.80.6 a failed prompt response is emitted only when preflight
+          // In Pi 0.82.1 a failed prompt response is emitted only when preflight
           // rejected before acceptance, so it is terminal without agent_settled.
           return emitPiRpcResult(
             buildPiRpcErrorResult(promptErrorMessage, rawEvent.sessionId),
@@ -1468,7 +1478,7 @@ function parsePiJsonlRecord(record: string): PiRpcEvent | null {
 /**
  * Route an extension UI JSONL record through the shared cancellation writer.
  * Startup capture uses the result to fail promptly on blocking dialogs: Pi
- * 0.80.6 does not attach its RPC stdin reader until session_start handlers have
+ * Pi 0.82.1 does not attach its RPC stdin reader until session_start handlers have
  * completed, so a handler awaiting a dialog cannot consume its cancellation.
  */
 export function handlePiExtensionUiRecord(
@@ -1522,7 +1532,7 @@ interface PiPromptCompletionProbeResult {
 }
 
 /**
- * Pi 0.80.6 accepts extension commands and `input` handlers that finish without
+ * Pi 0.82.1 accepts extension commands and `input` handlers that finish without
  * starting an agent run. Those paths emit a successful prompt response but no
  * agent lifecycle events. Probe the correlated session state after acceptance:
  * an active/queued model turn remains authoritative through agent_settled,

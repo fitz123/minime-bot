@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
-export const EXPECTED_PI_PACKAGE_VERSION = "0.80.6";
+export const EXPECTED_PI_PACKAGE_VERSION = "0.82.1";
 const PI_RPC_ENTRY_SPECIFIER = `${PI_CODING_AGENT_PACKAGE}/rpc-entry`;
 
 export type PiEntrypointKind = "rpc" | "cli";

@@ -329,7 +329,7 @@ export class SessionManager {
       for await (const [chunk] of on(stdout, "data", { signal: controller.signal, close: ["close"] })) {
         for (const record of splitter.push(chunk as Buffer)) {
           // This routes extension UI records before parsing get_state. A
-          // blocking startup request throws because Pi 0.80.6 cannot consume
+          // blocking startup request throws because Pi 0.82.1 cannot consume
           // its correlated cancellation until session_start has completed.
           const id = parsePiStartupRecord(child, record);
           if (id) return id;

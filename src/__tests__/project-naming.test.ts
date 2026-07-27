@@ -13,11 +13,16 @@ function readPackageFile(relativePath: string): string {
   return readFileSync(resolve(packageRoot, relativePath), "utf-8");
 }
 
+function normalizeDoc(content: string): string {
+  return content.replace(/\s+/g, " ");
+}
+
 describe("project naming", () => {
   const readme = readPackageFile("README.md");
   const changelog = readPackageFile("CHANGELOG.md");
   const agentsDoc = readPackageFile("AGENTS.md");
   const launchdOperations = readPackageFile("docs/launchd-operations.md");
+  const monitoringDoc = readPackageFile("docs/monitoring.md");
   const packageJson = JSON.parse(readPackageFile("package.json")) as {
     name: string;
     description: string;
@@ -132,6 +137,39 @@ describe("project naming", () => {
       "npm run workspace:validate -- --workspace test-fixtures/minimal-workspace",
     ]) {
       assert.ok(readme.includes(command), `README.md should include ${command}`);
+    }
+  });
+
+  it("README and monitoring docs preserve the Pi and grammY upgrade contract", () => {
+    const normalizedReadme = normalizeDoc(readme);
+    for (const expected of [
+      "all four package-owned Pi packages to 0.82.1",
+      "grammY to 1.45.1",
+      "@grammyjs/types` 4.0.0",
+      "Pi owns the bounded summarization retry",
+      "does not add a second compaction retry",
+      "`agent_settled` remains the accepted-turn terminal boundary",
+      "272K (272,000-token) context window",
+      "does not override the model metadata",
+      "does not opt into new Bot API product features",
+    ]) {
+      assert.ok(normalizedReadme.includes(expected), `README.md should document ${expected}`);
+    }
+
+    const normalizedMonitoringDoc = normalizeDoc(monitoringDoc);
+    for (const expected of [
+      "Pi runtime to 0.82.1",
+      "grammY to 1.45.1",
+      "Pi owns bounded summarization retries",
+      "`summarization_retry_scheduled`",
+      "`summarization_retry_attempt_start`",
+      "`summarization_retry_finished`",
+      "272K (272,000-token) context window",
+      "does not add a Minime-owned compaction retry",
+      "reasoning-only `stopReason=length` case as fixed",
+      "change production monitoring, deployment, restart, or rollback configuration",
+    ]) {
+      assert.ok(normalizedMonitoringDoc.includes(expected), `docs/monitoring.md should document ${expected}`);
     }
   });
 

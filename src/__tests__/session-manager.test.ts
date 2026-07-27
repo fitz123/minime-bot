@@ -2205,7 +2205,9 @@ describe("SessionManager Pi dispatch", () => {
     const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
     const { child, stdout, stdinWrites } = makeCapturingChild();
     injectSession(manager, "pi-activity", "pi", child);
-    manager.getActive("pi-activity")!.idleTimeoutMs = 10_000_000;
+    // Keep the unrelated session-idle timer beyond the cumulative fake time
+    // needed to prove each 30-minute response-watchdog refresh independently.
+    manager.getActive("pi-activity")!.idleTimeoutMs = 100_000_000;
 
     const response = manager.sendSessionMessage("pi-activity", "pi", "keep working");
     const resultPromise = response.next();
@@ -2223,11 +2225,32 @@ describe("SessionManager Pi dispatch", () => {
       t.mock.timers.tick(2);
       assert.strictEqual(child.killed, false, "filtered agent_end refreshes the watchdog");
 
-      t.mock.timers.tick(1_799_997);
-      stdout.push(JSON.stringify({ type: "compaction_start", reason: "threshold" }) + "\n");
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(2);
-      assert.strictEqual(child.killed, false, "filtered compaction activity refreshes the watchdog");
+      for (const [record, label] of [
+        [{
+          type: "summarization_retry_scheduled",
+          attempt: 1,
+          maxAttempts: 2,
+          delayMs: 1,
+          errorMessage: "WebSocket error",
+        }, "scheduled summarization retry"],
+        [{
+          type: "summarization_retry_attempt_start",
+          source: "compaction",
+          reason: "threshold",
+        }, "compaction retry attempt"],
+        [{
+          type: "summarization_retry_attempt_start",
+          source: "branchSummary",
+        }, "branch-summary retry attempt"],
+        [{ type: "summarization_retry_finished" }, "finished summarization retry"],
+        [{ type: "compaction_start", reason: "threshold" }, "compaction"],
+      ] as const) {
+        t.mock.timers.tick(1_799_997);
+        stdout.push(JSON.stringify(record) + "\n");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        t.mock.timers.tick(2);
+        assert.strictEqual(child.killed, false, `filtered ${label} activity refreshes the watchdog`);
+      }
 
       stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
       const result = await resultPromise;

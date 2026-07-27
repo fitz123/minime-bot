@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { createRequire } from "node:module";
 import {
   chmodSync,
   existsSync,
@@ -339,6 +340,62 @@ describe("package artifact install", () => {
       assert.equal(install.status, 0, install.stderr || install.stdout);
 
       const installedPackage = join(projectDir, "node_modules", "minime-bot");
+      for (const packageName of [
+        "@earendil-works/pi-agent-core",
+        "@earendil-works/pi-ai",
+        "@earendil-works/pi-coding-agent",
+        "@earendil-works/pi-tui",
+      ]) {
+        const manifest = JSON.parse(
+          readFileSync(join(projectDir, "node_modules", ...packageName.split("/"), "package.json"), "utf8"),
+        ) as { version?: string };
+        assert.equal(manifest.version, "0.82.1", packageName);
+      }
+      const codingAgentRoot = join(
+        projectDir,
+        "node_modules",
+        "@earendil-works",
+        "pi-coding-agent",
+      );
+      const codingAgentRequire = createRequire(join(codingAgentRoot, "package.json"));
+      for (const packageName of [
+        "@earendil-works/pi-agent-core",
+        "@earendil-works/pi-ai",
+        "@earendil-works/pi-tui",
+      ]) {
+        const nestedManifestPath = join(codingAgentRoot, "node_modules", ...packageName.split("/"), "package.json");
+        const resolvedManifestPath = existsSync(nestedManifestPath)
+          ? nestedManifestPath
+          : join(projectDir, "node_modules", ...packageName.split("/"), "package.json");
+        const nestedManifest = JSON.parse(
+          readFileSync(resolvedManifestPath, "utf8"),
+        ) as { version?: string };
+        assert.equal(nestedManifest.version, "0.82.1", `Pi nested ${packageName}`);
+      }
+      assert.equal(
+        (JSON.parse(readFileSync(codingAgentRequire.resolve("brace-expansion/package.json"), "utf8")) as {
+          version?: string;
+        }).version,
+        "5.0.7",
+      );
+      assert.equal(
+        (JSON.parse(readFileSync(codingAgentRequire.resolve("protobufjs/package.json"), "utf8")) as {
+          version?: string;
+        }).version,
+        "7.6.5",
+      );
+      assert.equal(
+        (JSON.parse(readFileSync(join(projectDir, "node_modules", "grammy", "package.json"), "utf8")) as {
+          version?: string;
+        }).version,
+        "1.45.1",
+      );
+      assert.equal(
+        (JSON.parse(
+          readFileSync(join(projectDir, "node_modules", "@grammyjs", "types", "package.json"), "utf8"),
+        ) as { version?: string }).version,
+        "4.0.0",
+      );
       for (const helper of [
         "monitoring_native.py",
         "alertmanager_webhook.py",
@@ -563,7 +620,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workspace = process.env.FIXTURE_WORKSPACE;
 const sourceBotRoot = process.env.SOURCE_BOT_ROOT;
@@ -585,6 +642,40 @@ const expectedBundledPromptFiles = ${JSON.stringify(EXPECTED_BUNDLED_PROMPT_FILE
 const retiredGuardWrapperPattern = new RegExp(["guardian", "protect", "files"].join("-"));
 const retiredRecoveryArtifacts = ${JSON.stringify(RETIRED_RECOVERY_INSTALLED_PATHS)};
 
+const installedRpcEntry = fileURLToPath(
+  import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
+);
+const installedPiRoot = join(
+  projectDir,
+  "node_modules",
+  "@earendil-works",
+  "pi-coding-agent",
+);
+const installedPiManifest = JSON.parse(
+  readFileSync(join(installedPiRoot, "package.json"), "utf8"),
+);
+const { resolvePackageOwnedPiInvocation } = await importPackageFile("dist/pi-runtime.js");
+const installedRpcInvocation = resolvePackageOwnedPiInvocation("rpc", ["--offline"]);
+const installedCliInvocation = resolvePackageOwnedPiInvocation("cli", ["--offline"]);
+
+assert.equal(installedPiManifest.version, "0.82.1");
+assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "rpc-entry.js"));
+assert.deepEqual(installedRpcInvocation.args, [installedRpcEntry, "--offline"]);
+assert.deepEqual(
+  installedCliInvocation.args,
+  [join(installedPiRoot, installedPiManifest.bin.pi), "--offline"],
+);
+assert.equal(installedRpcInvocation.diagnostic.versionMismatch, false);
+assert.equal(installedCliInvocation.diagnostic.versionMismatch, false);
+
+const { OPENAI_CODEX_MODELS } = await import(
+  "@earendil-works/pi-ai/providers/openai-codex.models"
+);
+for (const id of ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+  assert.equal(OPENAI_CODEX_MODELS[id].contextWindow, 272000, id);
+  assert.equal(OPENAI_CODEX_MODELS[id].maxTokens, 128000, id);
+}
+
 function extensionPathsFromArgs(args) {
   const paths = [];
   for (let idx = 0; idx < args.length; idx += 2) {
@@ -605,6 +696,28 @@ function assertCanonicalWebWrapper(label, paths) {
 
 function assertNoGuardContract(label, args) {
   assert.doesNotMatch(JSON.stringify(args), retiredGuardWrapperPattern, label);
+}
+
+function installedCodexToken(accountId, marker) {
+  return [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+      marker,
+    })).toString("base64url"),
+    Buffer.from("signature-" + marker).toString("base64url"),
+  ].join(".");
+}
+
+function installedCodexContext(providerToken, requestToken = providerToken) {
+  return {
+    model: { provider: "openai-codex", id: "gpt-installed", api: "openai-codex-responses" },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => ({ auth: { apiKey: providerToken }, source: "OAuth" }),
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: requestToken }),
+    },
+  };
 }
 
 function extensionPathsFromSpawnArgs(args) {
@@ -1059,20 +1172,8 @@ try {
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");
   assert.ok(searchTool, "web_search should be registered");
-  const codexContext = {
-    model: { provider: "openai-codex", id: "gpt-installed", api: "openai-codex-responses" },
-    modelRegistry: {
-      isUsingOAuth: () => true,
-      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "installed-oauth-token" }),
-      authStorage: {
-        get: () => ({
-          type: "oauth",
-          access: "installed-oauth-token",
-          accountId: "installed-account-id",
-        }),
-      },
-    },
-  };
+  const installedOAuthToken = installedCodexToken("installed-account-id", "refreshed");
+  const codexContext = installedCodexContext(installedOAuthToken);
   const oldOpenAiApiKey = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = "must-not-be-used";
   const searchResult = await searchTool.execute(
@@ -1095,7 +1196,7 @@ try {
   assert.equal(fetchCalls.length, 1);
   assert.equal(fetchCalls[0].url, "https://chatgpt.com/backend-api/codex/responses");
   assert.equal(fetchCalls[0].init.method, "POST");
-  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer installed-oauth-token");
+  assert.equal(fetchCalls[0].init.headers.Authorization, "Bearer " + installedOAuthToken);
   assert.equal(fetchCalls[0].init.headers["ChatGPT-Account-Id"], "installed-account-id");
   const searchBody = JSON.parse(fetchCalls[0].init.body);
   assert.equal(searchBody.model, "gpt-installed");
@@ -1105,6 +1206,39 @@ try {
     search_context_size: "medium",
   }]);
   assert.equal(JSON.stringify(fetchCalls[0]).includes("must-not-be-used"), false);
+
+  const staleOAuthToken = installedCodexToken("installed-account-id", "stale");
+  const rejectedAuthCases = [
+    {
+      label: "stale OAuth",
+      context: installedCodexContext(installedOAuthToken, staleOAuthToken),
+      secret: staleOAuthToken,
+    },
+    {
+      label: "API-key override",
+      context: installedCodexContext(installedOAuthToken, "installed-private-api-key"),
+      secret: "installed-private-api-key",
+    },
+    {
+      label: "malformed OAuth",
+      context: installedCodexContext("malformed-installed-token"),
+      secret: "malformed-installed-token",
+    },
+  ];
+  for (const rejected of rejectedAuthCases) {
+    const beforeFetches = fetchCalls.length;
+    const rejectedResult = await searchTool.execute(
+      "rejected-" + rejected.label,
+      { query: "installed wrapper" },
+      undefined,
+      undefined,
+      rejected.context,
+    );
+    assert.equal(rejectedResult.details.ok, false, rejected.label);
+    assert.equal(rejectedResult.details.failure.classification, "auth", rejected.label);
+    assert.equal(fetchCalls.length, beforeFetches, rejected.label);
+    assert.equal(JSON.stringify(rejectedResult).includes(rejected.secret), false, rejected.label);
+  }
 
 } finally {
   globalThis.fetch = oldFetch;
