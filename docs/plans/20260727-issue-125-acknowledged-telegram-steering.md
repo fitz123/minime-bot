@@ -73,11 +73,11 @@ Ralphex marks each item immediately after implementation and validation. A faile
 ### Task 2: Transfer structured MessageQueue entries serially and exactly once
 **Goal:** Keep each mid-turn input as one structured bot-owned entry, attempt steering in arrival order, and transfer only the matching acknowledged head entry while preserving one ordered fallback for everything else.
 **Serves:** The operator requires no known loss/duplication, arrival order, existing total cap/saturation behavior, and exact cleanup/media ownership across acknowledgement, fallback, `/clean`, and `/reconnect` races.
-- [ ] Add deterministic MessageQueue tests for acknowledged head transfer, rejection/unacknowledged fallback, several corrections under one-at-a-time semantics, partial failures, around-settlement races, cap overflow, clear/replacement while acknowledgement is pending, and late callback no-ops.
-- [ ] Add cleanup/media tests proving acknowledged entries run delivery cleanup once and transfer drop-cleanup ownership, while fallback/rejection/clear paths retain existing cleanup guarantees with no double execution.
-- [ ] Replace only the collect parallel arrays with structured entries carrying stable entry identity/state and cleanup ownership; keep pending idle-debounce storage and public cap unchanged.
-- [ ] Add a serial head-of-line acknowledged-steer attempt for the current busy generation; on matching success remove exactly that entry and try the next, while the first failure/settlement preserves the remaining ordered fallback without retries or timeouts.
-- [ ] Run the MessageQueue focused suite; it must pass before Task 3.
+- [x] Add deterministic MessageQueue tests for acknowledged head transfer, rejection/unacknowledged fallback, several corrections under one-at-a-time semantics, partial failures, around-settlement races, cap overflow, clear/replacement while acknowledgement is pending, and late callback no-ops.
+- [x] Add cleanup/media tests proving acknowledged entries run delivery cleanup once and transfer drop-cleanup ownership, while fallback/rejection/clear paths retain existing cleanup guarantees with no double execution.
+- [x] Replace only the collect parallel arrays with structured entries carrying stable entry identity/state and cleanup ownership; keep pending idle-debounce storage and public cap unchanged.
+- [x] Add a serial head-of-line acknowledged-steer attempt for the current busy generation; on matching success remove exactly that entry and try the next, while the first failure/settlement preserves the remaining ordered fallback without retries or timeouts.
+- [x] Run the MessageQueue focused suite; it must pass before Task 3.
 
 ### Task 3: Wire acknowledged steering for every ordinary Telegram input
 **Goal:** Connect MessageQueue's acknowledged-steer hook to SessionManager for normal Telegram text and media-bearing inputs while leaving passive and non-Telegram behavior unchanged.

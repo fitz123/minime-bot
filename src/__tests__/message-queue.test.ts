@@ -85,6 +85,24 @@ async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 6; i++) await Promise.resolve();
 }
 
+function createManualAcknowledgedSteer() {
+  const calls: Array<{
+    chatId: string;
+    agentId: string;
+    text: string;
+    resolve: (acknowledged: boolean) => void;
+  }> = [];
+
+  return {
+    calls,
+    steerFn(chatId: string, agentId: string, text: string): Promise<boolean> {
+      return new Promise<boolean>((resolve) => {
+        calls.push({ chatId, agentId, text, resolve });
+      });
+    },
+  };
+}
+
 // -------------------------------------------------------------------
 // buildCollectPrompt
 // -------------------------------------------------------------------
@@ -268,6 +286,276 @@ describe("MessageQueue mid-turn collect", () => {
     assert.strictEqual(mock.calls[1].text, "followup");
 
     queue.clearAll();
+  });
+});
+
+// -------------------------------------------------------------------
+// MessageQueue — acknowledged mid-turn steering
+// -------------------------------------------------------------------
+
+describe("MessageQueue acknowledged mid-turn steering", () => {
+  it("transfers acknowledged entries serially in arrival order with exactly-once cleanup", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const steer = createManualAcknowledgedSteer();
+    const processCalls: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      processCalls.push(text);
+      onAgentOwnership();
+      if (processCalls.length === 1) await initialBlocked;
+    };
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 10,
+      acknowledgedSteerFn: steer.steerFn,
+    });
+    const platform = mockPlatform(undefined, false);
+    const cleanups = [0, 0];
+    const dropCleanups = [0, 0];
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    queue.enqueue("chat1", "main", "first correction", platform,
+      () => { cleanups[0]++; }, () => { dropCleanups[0]++; });
+    queue.enqueue("chat1", "main", "second correction", platform,
+      () => { cleanups[1]++; }, () => { dropCleanups[1]++; });
+
+    assert.deepStrictEqual(
+      steer.calls.map(({ text }) => text),
+      ["first correction"],
+      "only the head entry is attempted while its acknowledgement is pending",
+    );
+    assert.strictEqual(queue.getCollectCount("chat1"), 2);
+
+    steer.calls[0].resolve(true);
+    await flushMicrotasks();
+    assert.deepStrictEqual(cleanups, [1, 0], "acknowledgement consumes only its entry");
+    assert.deepStrictEqual(dropCleanups, [0, 0], "Pi owns acknowledged persistent media");
+    assert.strictEqual(queue.getCollectCount("chat1"), 1);
+    assert.deepStrictEqual(
+      steer.calls.map(({ text }) => text),
+      ["first correction", "second correction"],
+      "the next attempt starts only after the head succeeds",
+    );
+
+    steer.calls[1].resolve(true);
+    await flushMicrotasks();
+    assert.deepStrictEqual(cleanups, [1, 1]);
+    assert.deepStrictEqual(dropCleanups, [0, 0]);
+    assert.strictEqual(queue.getCollectCount("chat1"), 0);
+
+    releaseInitial();
+    await flushMicrotasks();
+    assert.deepStrictEqual(processCalls, ["initial"], "acknowledged entries are not duplicated as followups");
+    queue.clearAll();
+    assert.deepStrictEqual(cleanups, [1, 1], "later clear cannot repeat acknowledged cleanup");
+    assert.deepStrictEqual(dropCleanups, [0, 0]);
+  });
+
+  it("stops after a partial failure and preserves the remaining ordered fallback", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const steer = createManualAcknowledgedSteer();
+    const processCalls: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      processCalls.push(text);
+      onAgentOwnership();
+      if (processCalls.length === 1) await initialBlocked;
+    };
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 10,
+      acknowledgedSteerFn: steer.steerFn,
+    });
+    const platform = mockPlatform(undefined, false);
+    const cleanups = [0, 0, 0];
+    const dropCleanups = [0, 0, 0];
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    for (const [index, text] of ["accepted", "fallback one", "fallback two"].entries()) {
+      queue.enqueue("chat1", "main", text, platform,
+        () => { cleanups[index]++; }, () => { dropCleanups[index]++; });
+    }
+
+    steer.calls[0].resolve(true);
+    await flushMicrotasks();
+    steer.calls[1].resolve(false);
+    await flushMicrotasks();
+
+    assert.deepStrictEqual(
+      steer.calls.map(({ text }) => text),
+      ["accepted", "fallback one"],
+      "a rejected head prevents later steering attempts in this busy turn",
+    );
+    assert.deepStrictEqual(cleanups, [1, 0, 0]);
+    assert.deepStrictEqual(dropCleanups, [0, 0, 0]);
+    assert.strictEqual(queue.getCollectCount("chat1"), 2);
+
+    releaseInitial();
+    await flushMicrotasks();
+    assert.strictEqual(processCalls.length, 2);
+    assert.strictEqual(
+      processCalls[1],
+      buildCollectPrompt(["fallback one", "fallback two"]),
+      "unacknowledged entries retain one ordered followup",
+    );
+    assert.deepStrictEqual(cleanups, [1, 1, 1]);
+    assert.deepStrictEqual(dropCleanups, [0, 0, 0], "fallback ownership transfers through processFn");
+    assert.strictEqual(queue.getCollectCount("chat1"), 0);
+  });
+
+  it("keeps settlement fallback when an acknowledgement callback arrives late", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const steer = createManualAcknowledgedSteer();
+    const processCalls: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      processCalls.push(text);
+      onAgentOwnership();
+      if (processCalls.length === 1) await initialBlocked;
+    };
+    let cleanup = 0;
+    let dropCleanup = 0;
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 10,
+      acknowledgedSteerFn: steer.steerFn,
+    });
+    const platform = mockPlatform(undefined, false);
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    queue.enqueue("chat1", "main", "settlement fallback", platform,
+      () => { cleanup++; }, () => { dropCleanup++; });
+    assert.strictEqual(steer.calls.length, 1);
+
+    releaseInitial();
+    await flushMicrotasks();
+    assert.deepStrictEqual(processCalls, ["initial", "settlement fallback"]);
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 0);
+
+    steer.calls[0].resolve(true);
+    await flushMicrotasks();
+    assert.deepStrictEqual(processCalls, ["initial", "settlement fallback"]);
+    assert.strictEqual(cleanup, 1, "late success cannot consume the fallback twice");
+    assert.strictEqual(dropCleanup, 0);
+  });
+
+  it("keeps the total collect cap while one head acknowledgement is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const steer = createManualAcknowledgedSteer();
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      _text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      onAgentOwnership();
+      await initialBlocked;
+    };
+    const notices: string[] = [];
+    let rejectedCleanup = 0;
+    let rejectedDropCleanup = 0;
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 10,
+      queueCap: 2,
+      acknowledgedSteerFn: steer.steerFn,
+    });
+    const platform = mockPlatform((message) => { notices.push(message); }, false);
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    queue.enqueue("chat1", "main", "head", platform);
+    queue.enqueue("chat1", "main", "tail", platform);
+    queue.enqueue("chat1", "main", "overflow", platform,
+      () => { rejectedCleanup++; }, () => { rejectedDropCleanup++; });
+    await flushMicrotasks();
+
+    assert.strictEqual(queue.getCollectCount("chat1"), 2);
+    assert.strictEqual(steer.calls.length, 1);
+    assert.deepStrictEqual(notices, [QUEUE_REJECTION_MESSAGE]);
+    assert.strictEqual(rejectedCleanup, 1);
+    assert.strictEqual(rejectedDropCleanup, 1);
+
+    queue.clear("chat1");
+    releaseInitial();
+    await flushMicrotasks();
+  });
+
+  it("clears a pending attempt once and ignores its callback after chat replacement", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const steer = createManualAcknowledgedSteer();
+    const processCalls: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const processFn = async (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      _platform: PlatformContext,
+      onAgentOwnership: () => void,
+    ) => {
+      processCalls.push(text);
+      onAgentOwnership();
+      if (processCalls.length === 1) await initialBlocked;
+    };
+    let cleanup = 0;
+    let dropCleanup = 0;
+    const queue = new MessageQueue(processFn, {
+      debounceMs: 10,
+      acknowledgedSteerFn: steer.steerFn,
+    });
+    const platform = mockPlatform(undefined, false);
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    queue.enqueue("chat1", "main", "old correction", platform,
+      () => { cleanup++; }, () => { dropCleanup++; });
+    assert.strictEqual(steer.calls.length, 1);
+
+    queue.clear("chat1");
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 1);
+    queue.enqueue("chat1", "main", "replacement message", platform);
+
+    steer.calls[0].resolve(true);
+    await flushMicrotasks();
+    assert.strictEqual(queue.getPendingCount("chat1"), 1);
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 1, "late acknowledgement cannot touch replacement state");
+
+    releaseInitial();
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.deepStrictEqual(processCalls, ["initial", "replacement message"]);
   });
 });
 
