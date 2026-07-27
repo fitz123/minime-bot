@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.34
+
+- Preserve Unicode letters and numbers in Knowledge search tokens so Cyrillic
+  queries retain punctuation-insensitive, case-folded, order-independent
+  all-token matching at existing corpus-scale latency (#127).
+
 ## 2026.7.33
 
 - Bound the package test suite and every Node test, emit actionable timeout
