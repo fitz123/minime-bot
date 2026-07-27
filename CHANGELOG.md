@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 2026.7.35
+
+- Upgrade the package-owned Pi runtime to 0.82.1 and grammY to 1.45.1 while
+  preserving package-owned RPC, session, extension, Telegram, recovery, and
+  rollback contracts (#126).
+- Use Pi's supported OAuth APIs for Codex web search with abort-safe credential
+  resolution, and accept upstream bounded compaction-summary retries as
+  nonterminal exactly-once lifecycle activity (#98, #126).
+
 ## 2026.7.34
 
 - Preserve Unicode letters and numbers in Knowledge search tokens so Cyrillic
