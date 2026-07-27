@@ -117,6 +117,25 @@ existing polling, authoritative final delivery, cosmetic draft fallback,
 topics, media/upload, retry/connectivity, and cancellation contracts; it does
 not opt into new Bot API product features.
 
+In Telegram DMs, streaming text uses one stable nonzero draft ID and refreshes
+the latest visible snapshot every 25 seconds during quiet tool gaps, before
+Telegram's 30-second draft expiry. Unchanged ordinary deltas are deduplicated,
+while the configured periodic typing indicator remains active for the whole
+turn as a fallback when drafts fail or are rate-limited. Draft publication is
+held while trimmed output could still be the leading `NO_REPLY` sentinel;
+disambiguated text such as `NO_REPLY_EXTRA` streams normally, and completed
+leading or trailing sentinel responses remain suppressed.
+
+Long draft snapshots retain the current response tail, stay within Telegram's
+message bound, and do not split UTF-16 surrogate pairs. HTML entity or length
+rejections use the same narrow bounded plain-text fallback as final messages.
+At settlement, future cosmetic draft work stops and the one in-flight draft is
+allowed up to three seconds to finish naturally before a hung request is
+aborted. The authoritative final `sendMessage` still runs exactly once after
+that bounded wait. Groups and other non-DM delivery are unchanged, and this
+contract does not adopt Bot API 10.2 empty-text “Thinking…” drafts or rich
+message drafts.
+
 The sampler uses the same packaged Pi CLI by default; override it explicitly
 with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
 isolated sampler project settings, and `--dry-run` prints the resolved command

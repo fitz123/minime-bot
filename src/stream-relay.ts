@@ -148,6 +148,8 @@ export async function sendOutboxFiles(outboxPath: string, platform: PlatformCont
 
 /** Telegram drafts share the per-chat send budget; keep starts at least 1s apart. */
 export const DRAFT_MIN_INTERVAL_MS = 1000;
+/** Refresh visible drafts before Telegram's 30-second expiry. */
+export const DRAFT_REFRESH_INTERVAL_MS = 25_000;
 const MAX_DRAFT_PAUSE_MS = 60_000;
 
 /** Max time (ms) to wait for in-flight drafts before final delivery. */
@@ -159,10 +161,14 @@ export const DRAFT_SETTLE_TIMEOUT_MS = 3000;
  */
 class DraftScheduler {
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlight: Promise<void> | null = null;
   private pendingText: string | null = null;
+  private latestText: string | null = null;
+  private visibleText: string | null = null;
   private lastStartedAt: number | null = null;
   private pauseUntil = 0;
+  private nextRefreshAt = 0;
   private cancelled = false;
   private unsupported = false;
   private inFlightController: AbortController | null = null;
@@ -170,34 +176,48 @@ class DraftScheduler {
   constructor(
     private readonly platform: PlatformContext,
     private readonly draftId: number,
-    private readonly onFirstVisibleDraft: () => void,
   ) {}
 
   enqueue(text: string): void {
     if (this.cancelled || this.unsupported || !text) return;
+    if (text === this.latestText) return;
+    this.latestText = text;
     if (this.pendingText !== null) recordDraftSchedulerEvent("coalesced");
     this.pendingText = text;
     if (this.inFlight === null) this.startOrSchedule();
   }
 
-  clearPending(): void {
+  reset(): void {
+    this.latestText = null;
+    this.visibleText = null;
+    this.nextRefreshAt = 0;
+    this.clearScheduled();
+  }
+
+  private clearScheduled(): void {
     this.pendingText = null;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.refreshTimer !== null) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
   }
 
   cancel(): void {
     this.cancelled = true;
-    this.clearPending();
+    this.clearScheduled();
     this.inFlightController?.abort();
   }
 
   async closeAndWait(): Promise<void> {
-    this.cancel();
+    this.cancelled = true;
+    this.clearScheduled();
     const active = this.inFlight;
     if (active === null) return;
+    const controller = this.inFlightController;
 
     await new Promise<void>((resolve) => {
       let done = false;
@@ -207,7 +227,10 @@ class DraftScheduler {
         clearTimeout(timeout);
         resolve();
       };
-      const timeout = setTimeout(finish, DRAFT_SETTLE_TIMEOUT_MS);
+      const timeout = setTimeout(() => {
+        controller?.abort();
+        finish();
+      }, DRAFT_SETTLE_TIMEOUT_MS);
       void active.then(finish, finish);
     });
   }
@@ -232,34 +255,43 @@ class DraftScheduler {
 
     const text = this.pendingText;
     this.pendingText = null;
+    if (this.refreshTimer !== null) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
     this.lastStartedAt = now;
     const controller = new AbortController();
     this.inFlightController = controller;
     this.inFlight = Promise.resolve()
       .then(() => this.platform.sendDraft(this.draftId, text, controller.signal))
-      .then((result) => this.handleResult(result))
-      .catch(() => this.handleResult({ status: "failed" }))
+      .then((result) => this.handleResult(result, text))
+      .catch(() => this.handleResult({ status: "failed" }, text))
       .finally(() => {
         if (this.inFlightController === controller) this.inFlightController = null;
         this.inFlight = null;
-        if (!this.cancelled) this.startOrSchedule();
+        if (!this.cancelled) {
+          this.startOrSchedule();
+          this.scheduleRefresh();
+        }
       });
   }
 
-  private handleResult(result: DraftSendResult): void {
+  private handleResult(result: DraftSendResult, text: string): void {
     switch (result.status) {
       case "sent":
-        if (!this.cancelled) this.onFirstVisibleDraft();
+        this.visibleText = text;
+        this.nextRefreshAt = Date.now() + DRAFT_REFRESH_INTERVAL_MS;
         break;
       case "unsupported":
         this.unsupported = true;
-        this.clearPending();
+        this.clearScheduled();
         break;
       case "rate_limited":
         this.pauseUntil = Math.max(
           this.pauseUntil,
           Date.now() + Math.min(MAX_DRAFT_PAUSE_MS, Math.max(0, result.retryAfterMs)),
         );
+        this.nextRefreshAt = Math.max(this.nextRefreshAt, this.pauseUntil);
         recordDraftSchedulerEvent("rate_limited");
         break;
       case "failed":
@@ -267,6 +299,66 @@ class DraftScheduler {
         break;
     }
   }
+
+  private scheduleRefresh(): void {
+    if (
+      this.cancelled ||
+      this.unsupported ||
+      this.visibleText === null ||
+      this.latestText === null ||
+      this.inFlight !== null ||
+      this.pendingText !== null ||
+      this.refreshTimer !== null
+    ) {
+      return;
+    }
+
+    const delay = Math.max(0, this.nextRefreshAt - Date.now());
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      if (
+        this.cancelled ||
+        this.unsupported ||
+        this.visibleText === null ||
+        this.latestText === null ||
+        this.pendingText !== null
+      ) {
+        return;
+      }
+      this.nextRefreshAt = Date.now() + DRAFT_REFRESH_INTERVAL_MS;
+      this.pendingText = this.visibleText;
+      if (this.inFlight === null) this.startOrSchedule();
+    }, delay);
+  }
+}
+
+function shouldHoldDraft(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length === 0 ||
+    "NO_REPLY".startsWith(trimmed) ||
+    /^NO_REPLY\b/.test(trimmed);
+}
+
+function boundedDraftSnapshot(text: string, maxLength: number): string | null {
+  const collapsed = collapseNewlines(text);
+  if (!collapsed.trim() || maxLength <= 0) return null;
+  if (collapsed.length <= maxLength) return collapsed;
+
+  const marker = maxLength > 3 ? "..." : "";
+  const tailLength = maxLength - marker.length;
+  let start = collapsed.length - tailLength;
+  const firstCodeUnit = collapsed.charCodeAt(start);
+  if (
+    firstCodeUnit >= 0xDC00 &&
+    firstCodeUnit <= 0xDFFF &&
+    start > 0
+  ) {
+    const previousCodeUnit = collapsed.charCodeAt(start - 1);
+    if (previousCodeUnit >= 0xD800 && previousCodeUnit <= 0xDBFF) start++;
+  }
+
+  const snapshot = marker + collapsed.slice(start);
+  return snapshot || ".".slice(0, maxLength);
 }
 
 /**
@@ -299,7 +391,7 @@ export async function relayStream(
       typingTimer = null;
     }
   };
-  const draftScheduler = new DraftScheduler(platform, draftId, stopPeriodicTyping);
+  const draftScheduler = new DraftScheduler(platform, draftId);
 
   // Take over pre-stream typing if active (clean handoff from message queue)
   if (platform.preStreamTypingTimer) {
@@ -319,12 +411,9 @@ export async function relayStream(
 
   /** Queue the latest display snapshot; stale pending snapshots are replaced. */
   const scheduleDraft = () => {
-    if (!accumulated) return;
-    const collapsed = collapseNewlines(accumulated);
-    const displayText = collapsed.length > platform.maxMessageLength
-      ? collapsed.slice(0, platform.maxMessageLength - 3) + "..."
-      : collapsed;
-    draftScheduler.enqueue(displayText);
+    if (!accumulated || shouldHoldDraft(accumulated)) return;
+    const displayText = boundedDraftSnapshot(accumulated, platform.maxMessageLength);
+    if (displayText !== null) draftScheduler.enqueue(displayText);
   };
 
   try {
@@ -344,7 +433,7 @@ export async function relayStream(
         accumulated = "";
         resultText = null;
         sawNonTextBlock = false;
-        draftScheduler.clearPending();
+        draftScheduler.reset();
         continue;
       }
       // Detect non-text content blocks (tool_use, etc.) so we can insert a
@@ -398,8 +487,8 @@ export async function relayStream(
       accumulated = resultText;
     }
 
-    // Discard pending cosmetic work and wait only a bounded time for the sole
-    // in-flight request, so final delivery remains authoritative and prompt.
+    // Stop future cosmetic work and let the sole in-flight request settle
+    // naturally before final delivery. Abort only at the bounded timeout.
     await draftScheduler.closeAndWait();
 
     // NO_REPLY: agent explicitly signals "no response needed" — suppress delivery.
