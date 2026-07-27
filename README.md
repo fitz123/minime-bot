@@ -366,6 +366,24 @@ receives a coalesced resend-later notice, at most once per chat every 30 seconds
 `bot_message_queue_rejection_notices_total` records `sent`, `failed`, and
 `rate_limited` notice outcomes without identifying the chat.
 
+Ordinary Telegram inputs received during an active Pi turn remain bot-owned
+queue entries until Pi accepts the exact correlated `steer` request. The queue
+offers entries serially in arrival order. Only the matching successful response
+transfers that entry to Pi and removes it from fallback collection; rejection,
+write or child failure, session replacement, or turn settlement before
+acknowledgement leaves it for the existing ordered follow-up drain. This keeps
+the process-lifetime no-known-loss/no-duplicate boundary without an independent
+acknowledgement timeout or retry loop. Acknowledged media keeps session-lifetime
+file ownership, while fallback and dropped entries retain their existing
+cleanup behavior.
+
+Native Pi steering takes effect after the current complete tool-call batch and
+before the next model call; it does not interrupt a running tool or its sibling
+calls. Pi's configured steering mode remains authoritative. Telegram's idle
+3-second debounce, queue cap and saturation policy, draft/final delivery, and
+outbox behavior are unchanged. Passive echo and shutdown steering remain
+best-effort, and Discord message-queue behavior is unchanged.
+
 Media downloads retry transient network or stream failures and HTTP 408, 429,
 and 5xx responses up to three attempts, honoring a bounded `Retry-After` value.
 `bot_media_download_retries_total` records bounded `recovered` and `exhausted`

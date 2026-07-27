@@ -91,11 +91,21 @@ Ralphex marks each item immediately after implementation and validation. A faile
 ### Task 4: Document semantics and run the complete regression contract
 **Goal:** Publish the exact steering/fallback contract and prove the minimum implementation satisfies the whole repository contract without public-data leakage.
 **Serves:** The operator authorized a full release only if the earliest-boundary semantics, no-loss/no-duplicate reliability boundary, preserved behaviors, and explicit non-goals are demonstrably met.
-- [ ] Update README message-queue/runtime documentation: correlated acceptance, serial bot-to-Pi ownership transfer, settlement fallback, native tool-batch boundary, Pi steering-mode authority, and unchanged Discord/idle behavior.
-- [ ] Run every focused regression from Tasks 1–3 and inspect the changed behavior against all ten required regression cases in issue #125.
-- [ ] Run the full test suite, lint/typecheck, build, package dry-run, retired schema-guard contract check, minimal-workspace validation, and built CLI help.
-- [ ] Review `main...HEAD` as a cut pass for unnecessary abstractions, timeout/retry machinery, unrelated changes, test weakening, private data, generated output, and dependency drift; run `git diff --check` and verify repository status is task-owned/clean.
-- [ ] Record final changed files, commands/results, residual risks, plan progress, and Ralphex review outcome for parent lifecycle follow-through.
+- [x] Update README message-queue/runtime documentation: correlated acceptance, serial bot-to-Pi ownership transfer, settlement fallback, native tool-batch boundary, Pi steering-mode authority, and unchanged Discord/idle behavior.
+- [x] Run every focused regression from Tasks 1–3 and inspect the changed behavior against all ten required regression cases in issue #125.
+- [x] Run the full test suite, lint/typecheck, build, package dry-run, retired schema-guard contract check, minimal-workspace validation, and built CLI help.
+- [x] Review `main...HEAD` as a cut pass for unnecessary abstractions, timeout/retry machinery, unrelated changes, test weakening, private data, generated output, and dependency drift; run `git diff --check` and verify repository status is task-owned/clean.
+- [x] Record final changed files, commands/results, residual risks, plan progress, and Ralphex review outcome for parent lifecycle follow-through.
+
+## Task 4 Validation Record
+
+- Focused suites passed: Pi RPC 144/144, SessionManager 77/77, MessageQueue 43/43, Telegram 265/265, and stream-relay/Telegram adapter 135/135.
+- Issue #125 regression cases 1–10 passed by source/test trace: acknowledged no-duplicate transfer; explicit rejection with nonterminal stream and one fallback; before/after-settlement races; serial corrections; cap/notice behavior; child-exit/write-failure fallback; pending `/clean` and `/reconnect`; photo/document ownership; unrelated/out-of-order response isolation; and unchanged passive echo/shutdown steering.
+- Full contract passed: `npm test` (2334/2334), `npm run lint`, `npm run build`, `npm pack --dry-run` (267 intended files), `npm run check:schema-guard-contract`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `node dist/cli.js --help`. The workspace fixture remained valid with its expected missing-context/knowledge/rules warnings.
+- Cut review passed: `git diff --check` and the added-line private-data scan were clean; dependency manifests, Discord sources, and stream-relay stayed unchanged; generated output remained untracked; and pre-commit status contained only Task 4 documentation. No generic broker, independent acknowledgement timeout/retry, test weakening, private data, or unrelated abstraction was found. The task commit is followed by a clean-status check.
+- Final branch files: `README.md`, this plan, `src/pi-rpc-protocol.ts`, `src/session-manager.ts`, `src/message-queue.ts`, `src/telegram-bot.ts`, and focused tests in `src/__tests__/pi-rpc-protocol.test.ts`, `src/__tests__/session-manager.test.ts`, `src/__tests__/session-manager-pi-spawn.test.ts`, `src/__tests__/message-queue.test.ts`, and `src/__tests__/telegram-bot.test.ts`.
+- Residual boundary: the queue remains process-memory scoped and native steering cannot interrupt the current tool-call batch. PR/CI, release, deploy/restart, installed-artifact smoke, tail audit, and issue closure remain with the parent as planned.
+- Plan progress: Tasks 1–4 are complete. Ralphex executor cut-review outcome: pass, with no corrective code change required during Task 4.
 
 ## Technical Details
 
