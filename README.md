@@ -102,6 +102,21 @@ fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
 
+The runtime dependency contract pins all four package-owned Pi packages to
+0.82.1 and grammY to 1.45.1 (`@grammyjs/types` 4.0.0). Pi owns the bounded
+summarization retry, including transient WebSocket recovery; Minime treats its
+retry records as stream activity and does not add a second compaction retry.
+`agent_settled` remains the accepted-turn terminal boundary. A reasoning-only
+`stopReason=length` settlement without text remains an error distinct from that
+recovery and is not classified as fixed.
+
+Pi's OpenAI catalog reports a 272K (272,000-token) context window for the
+supported GPT-5.6 models. Earlier compaction at that boundary is expected and
+Minime does not override the model metadata. The grammY upgrade preserves the
+existing polling, authoritative final delivery, cosmetic draft fallback,
+topics, media/upload, retry/connectivity, and cancellation contracts; it does
+not opt into new Bot API product features.
+
 The sampler uses the same packaged Pi CLI by default; override it explicitly
 with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
 isolated sampler project settings, and `--dry-run` prints the resolved command

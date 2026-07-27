@@ -14,6 +14,23 @@ Copy them outside the package and replace every placeholder. Keep the package
 checkout, installed package, control workspace, and runtime state in distinct
 locations.
 
+## Runtime compatibility boundary
+
+The current package pins its package-owned Pi runtime to 0.82.1 and grammY to
+1.45.1. Pi owns bounded summarization retries. Its
+`summarization_retry_scheduled`, `summarization_retry_attempt_start`, and
+`summarization_retry_finished` records are continued stream activity, not a
+terminal result or a reason for host monitoring to restart the bot;
+`agent_settled` remains the accepted-turn terminal boundary.
+
+The upstream OpenAI GPT-5.6 model metadata reports a 272K (272,000-token)
+context window, so earlier compaction is expected and is not a degraded-runtime
+signal by itself. grammY polling, delivery, draft, topic, media/upload,
+retry/connectivity, and cancellation metrics retain their existing meaning.
+This upgrade does not add a Minime-owned compaction retry, classify the
+reasoning-only `stopReason=length` case as fixed, adopt new Bot API features, or
+change production monitoring, deployment, restart, or rollback configuration.
+
 ## Codex subscription quota and web search
 
 `web_search` uses Pi's existing `openai-codex` subscription OAuth and active
