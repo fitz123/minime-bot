@@ -6,7 +6,12 @@ import { Readable, Writable, PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
 import type { BotConfig, StreamLine } from "../types.js";
-import { waitForSpawn, outboxDir, type ActiveSession } from "../session-manager.js";
+import {
+  waitForSpawn,
+  outboxDir,
+  type ActiveSession,
+  type SessionManager,
+} from "../session-manager.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
 import PQueue from "p-queue";
@@ -98,6 +103,101 @@ function piAgentEnd(result: string, sessionId = "pi-session"): string {
     }),
     JSON.stringify({ type: "agent_settled" }),
   ].join("\n") + "\n";
+}
+
+interface SteeringFixture {
+  child: ChildProcess;
+  stdout: Readable;
+  session: ActiveSession;
+  writes: Array<Record<string, unknown>>;
+}
+
+function createSteeringFixture(
+  manager: SessionManager,
+  chatId: string,
+  options?: { failSteerWrite?: boolean },
+): SteeringFixture {
+  const child = new EventEmitter() as unknown as ChildProcess;
+  const stdout = new Readable({ read() {} });
+  const stderr = new Readable({ read() {} });
+  const writes: Array<Record<string, unknown>> = [];
+  const stdin = new Writable({
+    write(chunk, _enc, callback) {
+      const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
+      writes.push(command);
+      if (options?.failSteerWrite && command.type === "steer") {
+        callback(new Error("steer write failed"));
+        return;
+      }
+      callback();
+    },
+  });
+  stdin.on("error", () => {});
+  Object.assign(child, {
+    stdout,
+    stderr,
+    stdin,
+    pid: 91234,
+    exitCode: null,
+    signalCode: null,
+    killed: false,
+    kill(signal?: string) {
+      if ((child as unknown as { exitCode: number | null }).exitCode !== null) return true;
+      (child as unknown as { killed: boolean }).killed = true;
+      process.nextTick(() => {
+        if (!stdout.destroyed) stdout.push(null);
+        (child as unknown as { exitCode: number | null }).exitCode =
+          signal === "SIGKILL" ? 137 : 0;
+        child.emit("exit", signal === "SIGKILL" ? 137 : 0, signal ?? "SIGTERM");
+      });
+      return true;
+    },
+  });
+
+  const session: ActiveSession = {
+    child,
+    sessionId: `${chatId}-session`,
+    agentId: "main",
+    provider: "pi",
+    model: "openai-codex/gpt-5.5",
+    queue: new PQueue({ concurrency: 1 }),
+    idleTimer: null,
+    idleTimeoutMs: 60_000,
+    lastActivity: Date.now(),
+    processingStartedAt: null,
+    lastSuccessAt: null,
+    restartCount: 0,
+    outboxPath: `${TEST_DIR}/${chatId}-outbox`,
+    pendingSteers: new Map(),
+  };
+  (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, session);
+  return { child, stdout, session, writes };
+}
+
+async function waitForSteeringCommand(
+  fixture: SteeringFixture,
+  type: "prompt" | "steer",
+  count = 1,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const matches = fixture.writes.filter((command) => command.type === type);
+    if (matches.length >= count) return matches[count - 1];
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2));
+  }
+  throw new Error(`Timed out waiting for Pi ${type} command #${count}`);
+}
+
+async function beginSteeringTurn(
+  manager: SessionManager,
+  chatId: string,
+): Promise<{ lines: StreamLine[]; done: Promise<void> }> {
+  const lines: StreamLine[] = [];
+  const done = (async () => {
+    for await (const line of manager.sendSessionMessage(chatId, "main", "initial prompt")) {
+      lines.push(line);
+    }
+  })();
+  return { lines, done };
 }
 
 let mockChildFactory: () => ChildProcess;
@@ -343,6 +443,7 @@ describe("SessionManager", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath,
+      pendingSteers: new Map(),
     };
 
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set("chat-race", fakeSession);
@@ -422,6 +523,7 @@ describe("SessionManager", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath,
+      pendingSteers: new Map(),
     };
 
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
@@ -630,6 +732,270 @@ describe("ActiveSession shape", () => {
     const mod = await import("../session-manager.js");
     assert.ok(mod.SessionManager);
     // ActiveSession is exported as interface, verified by TypeScript compilation
+  });
+});
+
+describe("SessionManager acknowledged steer", () => {
+  beforeEach(() => {
+    cleanup();
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("resolves only the exact matching steer response, including out-of-order responses", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-match");
+    const turn = await beginSteeringTurn(manager, "steer-match");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const first = manager.steerSessionMessage("steer-match", "main", "first correction");
+    const firstCommand = await waitForSteeringCommand(fixture, "steer", 1);
+    const second = manager.steerSessionMessage("steer-match", "main", "second correction");
+    const secondCommand = await waitForSteeringCommand(fixture, "steer", 2);
+    assert.strictEqual(typeof firstCommand.id, "string");
+    assert.strictEqual(typeof secondCommand.id, "string");
+    const firstId = firstCommand.id as string;
+    const secondId = secondCommand.id as string;
+    const firstResolver = fixture.session.pendingSteers.get(firstId);
+    const secondResolver = fixture.session.pendingSteers.get(secondId);
+    assert.ok(firstResolver);
+    assert.ok(secondResolver);
+    let firstResolutionCount = 0;
+    let secondResolutionCount = 0;
+    fixture.session.pendingSteers.set(firstId, (acknowledged) => {
+      firstResolutionCount++;
+      firstResolver(acknowledged);
+    });
+    fixture.session.pendingSteers.set(secondId, (acknowledged) => {
+      secondResolutionCount++;
+      secondResolver(acknowledged);
+    });
+    let firstResolved = false;
+    void first.then(() => { firstResolved = true; });
+
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: secondId,
+      success: true,
+    })}\n`);
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: "unrelated-steer",
+      success: true,
+    })}\n`);
+
+    assert.strictEqual(await second, true);
+    await Promise.resolve();
+    assert.strictEqual(firstResolved, false, "an unrelated acknowledgement cannot resolve the first steer");
+
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: firstId,
+      success: true,
+    })}\n`);
+    assert.strictEqual(await first, true);
+
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: firstId,
+      success: true,
+    })}\n`);
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: secondId,
+      success: false,
+    })}\n`);
+    fixture.stdout.push(piAgentEnd("done", fixture.session.sessionId));
+    await turn.done;
+    assert.strictEqual(firstResolutionCount, 1);
+    assert.strictEqual(secondResolutionCount, 1);
+    assert.deepStrictEqual(
+      turn.lines.filter((line) => line.type === "result").map((line) => (line as { result: string }).result),
+      ["done"],
+    );
+    assert.strictEqual(fixture.session.pendingSteers.size, 0);
+    await manager.closeAll();
+  });
+
+  it("resolves an explicit steer rejection as fallback without ending the turn", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-reject");
+    const turn = await beginSteeringTurn(manager, "steer-reject");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const acknowledgement = manager.steerSessionMessage("steer-reject", "main", "correction");
+    const command = await waitForSteeringCommand(fixture, "steer");
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: command.id,
+      success: false,
+      error: "no active turn",
+    })}\n`);
+
+    assert.strictEqual(await acknowledgement, false);
+    fixture.stdout.push(piAgentEnd("still completed", fixture.session.sessionId));
+    await turn.done;
+    assert.strictEqual(
+      (turn.lines.find((line) => line.type === "result") as { result: string }).result,
+      "still completed",
+    );
+    await manager.closeAll();
+  });
+
+  it("resolves stdin write failure as fallback", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-write-failure", {
+      failSteerWrite: true,
+    });
+    const turn = await beginSteeringTurn(manager, "steer-write-failure");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    assert.strictEqual(
+      await manager.steerSessionMessage("steer-write-failure", "main", "correction"),
+      false,
+    );
+    assert.strictEqual(fixture.session.pendingSteers.size, 0);
+
+    fixture.stdout.push(piAgentEnd("done", fixture.session.sessionId));
+    await turn.done;
+    await manager.closeAll();
+  });
+
+  it("rejects inactive, wrong-agent, dead-child, and unknown sessions without writing", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-inactive");
+
+    assert.strictEqual(
+      await manager.steerSessionMessage("steer-inactive", "main", "inactive"),
+      false,
+    );
+    fixture.session.processingStartedAt = Date.now();
+    assert.strictEqual(
+      await manager.steerSessionMessage("steer-inactive", "agent-b", "wrong agent"),
+      false,
+    );
+    (fixture.child as unknown as { exitCode: number | null }).exitCode = 1;
+    assert.strictEqual(
+      await manager.steerSessionMessage("steer-inactive", "main", "dead child"),
+      false,
+    );
+    assert.strictEqual(
+      await manager.steerSessionMessage("missing-chat", "main", "missing"),
+      false,
+    );
+    assert.deepStrictEqual(fixture.writes, []);
+  });
+
+  it("resolves a pending steer on child exit", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-child-exit");
+    (manager as unknown as {
+      setupCrashRecovery(chatId: string, child: ChildProcess): void;
+    }).setupCrashRecovery("steer-child-exit", fixture.child);
+    const turn = await beginSteeringTurn(manager, "steer-child-exit");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const acknowledgement = manager.steerSessionMessage(
+      "steer-child-exit",
+      "main",
+      "correction",
+    );
+    await waitForSteeringCommand(fixture, "steer");
+    fixture.stdout.push(null);
+    (fixture.child as unknown as { exitCode: number | null }).exitCode = 1;
+    fixture.child.emit("exit", 1, null);
+
+    assert.strictEqual(await acknowledgement, false);
+    await turn.done;
+    assert.strictEqual(manager.getActive("steer-child-exit"), undefined);
+  });
+
+  it("settles pending steer fallback before turn completion and ignores a late acknowledgement", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-settlement");
+    const firstTurn = await beginSteeringTurn(manager, "steer-settlement");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const staleAcknowledgement = manager.steerSessionMessage(
+      "steer-settlement",
+      "main",
+      "stale correction",
+    );
+    const staleCommand = await waitForSteeringCommand(fixture, "steer");
+    fixture.stdout.push(piAgentEnd("first done", fixture.session.sessionId));
+
+    assert.strictEqual(await staleAcknowledgement, false);
+    await firstTurn.done;
+
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: staleCommand.id,
+      success: true,
+    })}\n`);
+    const secondTurn = await beginSteeringTurn(manager, "steer-settlement");
+    await waitForSteeringCommand(fixture, "prompt", 2);
+    const currentAcknowledgement = manager.steerSessionMessage(
+      "steer-settlement",
+      "main",
+      "current correction",
+    );
+    const currentCommand = await waitForSteeringCommand(fixture, "steer", 2);
+    let currentResolved = false;
+    void currentAcknowledgement.then(() => { currentResolved = true; });
+    await Promise.resolve();
+    assert.strictEqual(currentResolved, false, "a late response cannot acknowledge a new steer");
+
+    fixture.stdout.push(`${JSON.stringify({
+      type: "response",
+      command: "steer",
+      id: currentCommand.id,
+      success: true,
+    })}\n`);
+    assert.strictEqual(await currentAcknowledgement, true);
+    fixture.stdout.push(piAgentEnd("second done", fixture.session.sessionId));
+    await secondTurn.done;
+    await manager.closeAll();
+  });
+
+  it("settles pending steer fallback during teardown before a replacement session is installed", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const oldFixture = createSteeringFixture(manager, "steer-replacement");
+    const turn = await beginSteeringTurn(manager, "steer-replacement");
+    await waitForSteeringCommand(oldFixture, "prompt");
+    const acknowledgement = manager.steerSessionMessage(
+      "steer-replacement",
+      "main",
+      "old correction",
+    );
+    await waitForSteeringCommand(oldFixture, "steer");
+
+    const close = manager.closeSession("steer-replacement");
+    assert.strictEqual(await acknowledgement, false);
+    await close;
+    await turn.done;
+    assert.strictEqual(oldFixture.session.pendingSteers.size, 0);
+
+    const replacement = createSteeringFixture(manager, "steer-replacement");
+    assert.notStrictEqual(replacement.session, oldFixture.session);
+    assert.strictEqual(replacement.session.pendingSteers.size, 0);
+    await manager.closeAll();
   });
 });
 
@@ -1825,6 +2191,7 @@ describe("SessionManager gracefulShutdown", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: `${TEST_DIR}/outbox-${chatId}`,
+      pendingSteers: new Map(),
     });
 
     return { queue, child, stdinWrites };
@@ -2027,6 +2394,7 @@ describe("SessionManager Pi dispatch", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: `${TEST_DIR}/outbox-${chatId}`,
+      pendingSteers: new Map(),
     };
     (manager as unknown as Record<string, Map<string, ActiveSession>>).active.set(chatId, session);
   }

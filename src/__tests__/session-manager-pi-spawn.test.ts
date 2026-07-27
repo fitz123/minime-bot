@@ -1505,6 +1505,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: oldOutbox,
+      pendingSteers: new Map(),
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
     sessionsActive.inc();
@@ -1590,6 +1591,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
       lastSuccessAt: null,
       restartCount: 0,
       outboxPath: oldOutbox,
+      pendingSteers: new Map(),
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(chatId, fakeSession);
     const before = await activeGauge();

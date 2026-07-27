@@ -1669,6 +1669,15 @@ describe("Pi RPC prompt and steer commands", () => {
     });
   });
 
+  it("attaches an optional correlation id to steer commands", () => {
+    assert.deepStrictEqual(buildPiSteerCommand("focus", "steer-17"), {
+      type: "steer",
+      message: "focus",
+      id: "steer-17",
+    });
+    assert.ok(!("id" in buildPiSteerCommand("focus")));
+  });
+
   it("attaches streamingBehavior to a prompt command only when requested (Defect B)", () => {
     // followUp variant: the queue-driven send path delivers every Pi prompt with
     // followUp so a desynced bare prompt can never collide with a live turn.
@@ -1823,6 +1832,25 @@ describe("Pi RPC prompt and steer commands", () => {
     assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
       type: "steer",
       message: "focus",
+    });
+  });
+
+  it("writes an explicitly correlated steer command to stdin", () => {
+    const chunks: Buffer[] = [];
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    const child = createMockChild({ stdin });
+
+    sendPiSteer(child, "focus now", "steer-18");
+
+    assert.deepStrictEqual(JSON.parse(Buffer.concat(chunks).toString().trim()), {
+      type: "steer",
+      message: "focus now",
+      id: "steer-18",
     });
   });
 
@@ -2403,6 +2431,60 @@ describe("readPiStream", () => {
     );
     assert.strictEqual(extractPiTextDelta(lines[1]), "hi");
     assert.strictEqual((lines[2] as { result: string }).result, "ok");
+  });
+
+  it("observes valid command responses in arrival order without making steer responses terminal", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "response",
+        command: "steer",
+        id: "steer-later",
+        success: true,
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "set_model",
+        id: "unrelated-command",
+        success: true,
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "steer",
+        id: "steer-earlier",
+        success: false,
+        error: "steering rejected",
+      }),
+      JSON.stringify({ type: "response", command: "steer", success: true }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "turn result" }] }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+    const observed: Array<{
+      command: string;
+      id: string;
+      success: boolean;
+    }> = [];
+    const lines: StreamLine[] = [];
+
+    for await (const line of readPiStream(child, undefined, undefined, (response) => {
+      observed.push({
+        command: response.command,
+        id: response.id,
+        success: response.success,
+      });
+    })) {
+      lines.push(line);
+    }
+
+    assert.deepStrictEqual(observed, [
+      { command: "steer", id: "steer-later", success: true },
+      { command: "set_model", id: "unrelated-command", success: true },
+      { command: "steer", id: "steer-earlier", success: false },
+    ]);
+    assert.deepStrictEqual(lines.map((line) => line.type), ["result"]);
+    assert.strictEqual((lines[0] as { result: string }).result, "turn result");
   });
 
   for (const handledBy of ["extension command", "input handler"]) {

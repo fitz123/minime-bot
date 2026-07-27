@@ -64,11 +64,11 @@ Ralphex marks each item immediately after implementation and validation. A faile
 ### Task 1: Correlate acknowledged steer responses in the existing Pi stream owner
 **Goal:** Add a minimum session-level acknowledged-steer primitive whose exact response is observed by the existing single stdout reader and whose failure/settlement paths resolve without terminating the active turn.
 **Serves:** The operator requires bot ownership to remain until matching Pi steer success, and requires rejection, write failure, child exit, inactive session, or settlement without that acknowledgement to preserve fallback.
-- [ ] Add focused protocol tests for optional steer request IDs, matching and unrelated/out-of-order response observation, and successful/failed steer responses remaining nonterminal to the prompt result.
-- [ ] Extend `src/pi-rpc-protocol.ts` only enough for callers to send an explicitly correlated steer and for `readPiStream` to expose valid command-response records to its owner without adding another reader or translating side responses into `ResultMessage`.
-- [ ] Add session-manager tests for matching success, explicit rejection, stdin/write failure, inactive/wrong session, child exit, turn settlement before acknowledgement, late acknowledgement, and teardown/session replacement; every pending promise resolves exactly once with no independent timeout.
-- [ ] Implement the per-`ActiveSession` pending-steer correlation map and acknowledged-steer API in `src/session-manager.ts`; settle unresolved entries as fallback at the existing turn/child/teardown boundaries and preserve passive shutdown steering.
-- [ ] Run the protocol and session-manager focused suites; they must pass before Task 2.
+- [x] Add focused protocol tests for optional steer request IDs, matching and unrelated/out-of-order response observation, and successful/failed steer responses remaining nonterminal to the prompt result.
+- [x] Extend `src/pi-rpc-protocol.ts` only enough for callers to send an explicitly correlated steer and for `readPiStream` to expose valid command-response records to its owner without adding another reader or translating side responses into `ResultMessage`.
+- [x] Add session-manager tests for matching success, explicit rejection, stdin/write failure, inactive/wrong session, child exit, turn settlement before acknowledgement, late acknowledgement, and teardown/session replacement; every pending promise resolves exactly once with no independent timeout.
+- [x] Implement the per-`ActiveSession` pending-steer correlation map and acknowledged-steer API in `src/session-manager.ts`; settle unresolved entries as fallback at the existing turn/child/teardown boundaries and preserve passive shutdown steering.
+- [x] Run the protocol and session-manager focused suites; they must pass before Task 2.
 
 ### Task 2: Transfer structured MessageQueue entries serially and exactly once
 **Goal:** Keep each mid-turn input as one structured bot-owned entry, attempt steering in arrival order, and transfer only the matching acknowledged head entry while preserving one ordered fallback for everything else.

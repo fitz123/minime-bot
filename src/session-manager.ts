@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiCommandResponse, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -147,6 +147,8 @@ export interface ActiveSession {
   restartCount: number;
   /** Per-session outbox directory for file delivery. */
   outboxPath: string;
+  /** Correlated steer requests still owned by the bot pending Pi response. */
+  pendingSteers: Map<string, (acknowledged: boolean) => void>;
 }
 
 export interface SessionHealth {
@@ -599,6 +601,7 @@ export class SessionManager {
       if (!hasExited(existing.child)) {
         existing.child.kill("SIGKILL");
       }
+      this.settlePendingSteers(existing);
       this.active.delete(chatId);
       sessionsActive.dec();
     }
@@ -801,6 +804,7 @@ export class SessionManager {
       lastSuccessAt: null,
       restartCount,
       outboxPath,
+      pendingSteers: new Map(),
     };
 
     this.active.set(chatId, session);
@@ -919,8 +923,19 @@ export class SessionManager {
         // histogram. processingStartedAt is reset to null after the loop, so
         // capture it now while it is still set.
         const turnStartedAt = session.processingStartedAt ?? Date.now();
-        const stream = readPiStream(session.child, resetActivityTimer, promptId);
+        const stream = readPiStream(
+          session.child,
+          resetActivityTimer,
+          promptId,
+          (response) => this.observeCommandResponse(session, response),
+        );
         for await (const line of stream) {
+          if (line.type === "result") {
+            // `agent_settled` is an existing ownership boundary. Any steer that
+            // was not acknowledged before this result remains bot-owned and
+            // must be eligible for the normal follow-up path.
+            this.settlePendingSteers(session);
+          }
           push(line);
           // Pi auto-retry telemetry: increment once per retry on auto_retry_start
           // (auto_retry_end signals recovery — counting it too would double-count).
@@ -948,6 +963,7 @@ export class SessionManager {
         clearActivityTimers();
         session.processingStartedAt = null;
         if (!gotResult) {
+          this.settlePendingSteers(session);
           finish(new Error("Pi stream ended without an agent_settled result"));
           return;
         }
@@ -955,6 +971,7 @@ export class SessionManager {
       } catch (err) {
         clearActivityTimers();
         session.processingStartedAt = null;
+        this.settlePendingSteers(session);
         finish(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -972,6 +989,72 @@ export class SessionManager {
     } finally {
       // Ensure queue bookkeeping completes even if consumer stops early
       await taskPromise;
+    }
+  }
+
+  /**
+   * Attempt native Pi steering for an active turn. The returned promise is true
+   * only after the existing stdout reader observes the exact correlated
+   * `steer` success response. Every other resolution preserves bot ownership.
+   */
+  steerSessionMessage(chatId: string, agentId: string, text: string): Promise<boolean> {
+    const session = this.active.get(chatId);
+    if (
+      !session ||
+      session.agentId !== agentId ||
+      session.processingStartedAt === null ||
+      hasExited(session.child) ||
+      session.child.killed ||
+      !session.child.stdout ||
+      session.child.stdout.destroyed
+    ) {
+      return Promise.resolve(false);
+    }
+
+    const id = `minime-steer-${randomUUID()}`;
+    return new Promise<boolean>((resolveSteer) => {
+      session.pendingSteers.set(id, resolveSteer);
+      try {
+        sendPiSteer(session.child, text, id, (error) => {
+          log.warn(
+            "session-manager",
+            `Pi steer write failed for chat ${chatId}: ${error.message}`,
+          );
+          this.settlePendingSteer(session, id, false);
+        });
+      } catch (err) {
+        log.warn(
+          "session-manager",
+          `Pi steer write failed for chat ${chatId}: ${(err as Error).message}`,
+        );
+        this.settlePendingSteer(session, id, false);
+      }
+    });
+  }
+
+  private observeCommandResponse(
+    session: ActiveSession,
+    response: PiCommandResponse,
+  ): void {
+    if (response.command !== "steer") return;
+    this.settlePendingSteer(session, response.id, response.success === true);
+  }
+
+  private settlePendingSteer(
+    session: ActiveSession,
+    id: string,
+    acknowledged: boolean,
+  ): void {
+    const resolveSteer = session.pendingSteers.get(id);
+    if (!resolveSteer) return;
+    session.pendingSteers.delete(id);
+    resolveSteer(acknowledged);
+  }
+
+  private settlePendingSteers(session: ActiveSession): void {
+    if (!session.pendingSteers) return;
+    for (const id of [...session.pendingSteers.keys()]) {
+      this.settlePendingSteer(session, id, false);
     }
   }
 
@@ -1036,6 +1119,8 @@ export class SessionManager {
     if (persist) {
       this.store.setSession(chatId, this.toSessionState(chatId, session));
     }
+
+    this.settlePendingSteers(session);
 
     // Remove from active map first to prevent re-entry
     this.active.delete(chatId);
@@ -1241,6 +1326,7 @@ export class SessionManager {
       }
 
       // Remove from active map (not from store — session can be resumed)
+      this.settlePendingSteers(session);
       this.active.delete(chatId);
       sessionsActive.dec();
 

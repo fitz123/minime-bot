@@ -398,6 +398,8 @@ export interface PiPromptCommand {
 export interface PiSteerCommand {
   type: "steer";
   message: string;
+  /** Optional id used by owners that need Pi's exact steer acknowledgement. */
+  id?: string;
 }
 
 /**
@@ -723,8 +725,8 @@ export function buildPiPromptCommand(
   return command;
 }
 
-export function buildPiSteerCommand(text: string): PiSteerCommand {
-  return { type: "steer", message: text };
+export function buildPiSteerCommand(text: string, id?: string): PiSteerCommand {
+  return id ? { type: "steer", message: text, id } : { type: "steer", message: text };
 }
 
 export function buildGetStateCommand(id?: string): PiGetStateCommand {
@@ -780,8 +782,13 @@ export function sendPiPrompt(
   return id;
 }
 
-export function sendPiSteer(child: ChildProcess, text: string): void {
-  writePiCommand(child, buildPiSteerCommand(text));
+export function sendPiSteer(
+  child: ChildProcess,
+  text: string,
+  id?: string,
+  onWriteError?: (error: Error) => void,
+): void {
+  writePiCommand(child, buildPiSteerCommand(text, id), onWriteError);
 }
 
 /**
@@ -795,11 +802,22 @@ export function sendPiGetState(child: ChildProcess, id?: string): void {
 
 let piPromptCommandSequence = 0;
 
-function writePiCommand(child: ChildProcess, command: PiRpcCommand): void {
+function writePiCommand(
+  child: ChildProcess,
+  command: PiRpcCommand,
+  onWriteError?: (error: Error) => void,
+): void {
   if (!child.stdin || child.stdin.destroyed || child.exitCode !== null || child.killed) {
     throw new Error("Pi RPC child process is not available");
   }
-  child.stdin.write(`${JSON.stringify(command)}\n`);
+  const frame = `${JSON.stringify(command)}\n`;
+  if (onWriteError) {
+    child.stdin.write(frame, (error) => {
+      if (error) onWriteError(error);
+    });
+    return;
+  }
+  child.stdin.write(frame);
 }
 
 /**
@@ -840,6 +858,26 @@ export interface PiRpcEvent {
   toolName?: string;
   tool?: { name?: string; [key: string]: unknown };
   [key: string]: unknown;
+}
+
+/** A structurally valid correlated RPC command response observed on stdout. */
+export interface PiCommandResponse extends PiRpcEvent {
+  type: "response";
+  id: string;
+  command: string;
+  success: boolean;
+}
+
+function asPiCommandResponse(event: PiRpcEvent): PiCommandResponse | null {
+  if (
+    event.type !== "response" ||
+    !isNonEmptyString(event.id) ||
+    !isNonEmptyString(event.command) ||
+    typeof event.success !== "boolean"
+  ) {
+    return null;
+  }
+  return event as PiCommandResponse;
 }
 
 /**
@@ -1510,12 +1548,17 @@ function handlePiStreamRecord(
   record: string,
   state: PiRpcParseState,
   onActivity?: () => void,
+  onCommandResponse?: (response: PiCommandResponse) => void,
 ): StreamLine | null {
   const event = parsePiJsonlRecord(record);
   if (!event) {
     return null;
   }
   onActivity?.();
+  const commandResponse = asPiCommandResponse(event);
+  if (commandResponse) {
+    onCommandResponse?.(commandResponse);
+  }
   if (handlePiExtensionUiRequest(child, event) !== "not_ui") {
     return null;
   }
@@ -1596,11 +1639,14 @@ function handlePiPromptCompletionProbe(
  * including lifecycle and UI records that do not become user-facing lines, so
  * callers can maintain an accurate inactivity watchdog. Malformed JSON records
  * and untranslatable events are skipped (never throw mid-stream).
+ * `onCommandResponse` observes structurally valid correlated command responses
+ * before normal nonterminal translation; it does not add another stdout reader.
  */
 export async function* readPiStream(
   child: ChildProcess,
   onActivity?: () => void,
   expectedPromptId?: string,
+  onCommandResponse?: (response: PiCommandResponse) => void,
 ): AsyncGenerator<StreamLine> {
   const stdout = child.stdout;
   if (!stdout) {
@@ -1614,7 +1660,13 @@ export async function* readPiStream(
     let chunk: Buffer | string | null;
     while ((chunk = stdout.read()) !== null) {
       for (const record of splitter.push(chunk)) {
-        const line = handlePiStreamRecord(child, record, parseState, onActivity);
+        const line = handlePiStreamRecord(
+          child,
+          record,
+          parseState,
+          onActivity,
+          onCommandResponse,
+        );
         if (line) {
           yield line;
           if (line.type === "result") {
@@ -1631,7 +1683,13 @@ export async function* readPiStream(
   }
 
   for (const record of splitter.end()) {
-    const line = handlePiStreamRecord(child, record, parseState, onActivity);
+    const line = handlePiStreamRecord(
+      child,
+      record,
+      parseState,
+      onActivity,
+      onCommandResponse,
+    );
     if (line) {
       yield line;
       if (line.type === "result") {
