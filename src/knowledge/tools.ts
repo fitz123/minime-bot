@@ -456,7 +456,7 @@ function normalizeSearchText(text: string): string {
     .toLowerCase()
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
 }
@@ -566,6 +566,10 @@ function searchEntry(entry: CorpusEntry, query: PreparedQuery): KnowledgeSearchR
   }
 
   const document = parseMarkdownDocument(markdown, entry.relPath, entry.sourceKind);
+  const normalizedDocument = normalizeSearchText(document.searchableText);
+  if (query.tokens.some((token) => !normalizedDocument.includes(token))) {
+    return undefined;
+  }
   const best = bestLineForDocument(document, query);
   if (!best) {
     return undefined;
