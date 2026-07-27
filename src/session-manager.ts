@@ -1358,8 +1358,9 @@ export class SessionManager {
       this.active.delete(chatId);
       sessionsActive.dec();
 
-      // Clean up media directory — files are scoped to this session's lifetime
-      try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
+      // Reclaim session-owned media, but preserve bot-owned in-flight files for
+      // the ordered fallback that runs after pending steer settlement.
+      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
 
       if (code !== 0 && signal !== "SIGTERM" && signal !== "SIGKILL") {
         sessionCrashes.inc({ agent_id: session.agentId });

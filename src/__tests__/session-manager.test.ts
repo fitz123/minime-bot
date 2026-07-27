@@ -5,13 +5,20 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable, PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
-import type { BotConfig, StreamLine } from "../types.js";
+import type { BotConfig, PlatformContext, StreamLine } from "../types.js";
 import {
   waitForSpawn,
   outboxDir,
   type ActiveSession,
   type SessionManager,
 } from "../session-manager.js";
+import { MessageQueue } from "../message-queue.js";
+import {
+  allocateMediaPath,
+  cleanupSessionMediaDir,
+  discardMediaPath,
+  releaseMediaPath,
+} from "../media-store.js";
 import { piRetryTotal, piTurnDuration } from "../metrics.js";
 import { PI_EXTENSIONS_DISABLED_ENV } from "../pi-rpc-protocol.js";
 import {
@@ -1005,6 +1012,94 @@ describe("SessionManager acknowledged steer", () => {
     assert.strictEqual(await acknowledgement, false);
     await turn.done;
     assert.strictEqual(manager.getActive("steer-child-exit"), undefined);
+  });
+
+  it("preserves pending media through child-exit fallback", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const chatId = "steer-media-child-exit";
+    const fixture = createSteeringFixture(manager, chatId);
+    (manager as unknown as {
+      setupCrashRecovery(chatId: string, child: ChildProcess): void;
+    }).setupCrashRecovery(chatId, fixture.child);
+    const turn = await beginSteeringTurn(manager, chatId);
+    await waitForSteeringCommand(fixture, "prompt");
+
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolveInitial) => {
+      releaseInitial = resolveInitial;
+    });
+    const processCalls: string[] = [];
+    const platform: PlatformContext = {
+      maxMessageLength: 4096,
+      typingIntervalMs: 4000,
+      typingIndicator: false,
+      async sendMessage() { return "1"; },
+      async deleteMessage() {},
+      async sendDraft() { return { status: "unsupported" } as const; },
+      async sendTyping() {},
+      async sendFile() {},
+      async replyError() {},
+    };
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, text, _platform, onAgentOwnership) => {
+        processCalls.push(text);
+        onAgentOwnership();
+        if (processCalls.length === 1) await initialBlocked;
+      },
+      {
+        debounceMs: 1,
+        acknowledgedSteerFn: (steerChatId, agentId, text, onEnqueued) =>
+          manager.steerSessionMessage(steerChatId, agentId, text, onEnqueued),
+      },
+    );
+    const mediaPath = allocateMediaPath(chatId, "pending", ".jpg");
+    writeFileSync(mediaPath, "pending media");
+    const mediaMessage = `media correction\n${mediaPath}`;
+
+    try {
+      queue.enqueue(chatId, "main", "initial queue turn", platform);
+      for (let attempt = 0; attempt < 100 && !queue.isBusy(chatId); attempt++) {
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2));
+      }
+      assert.strictEqual(queue.isBusy(chatId), true);
+
+      queue.enqueue(
+        chatId,
+        "main",
+        mediaMessage,
+        platform,
+        () => { releaseMediaPath(mediaPath); },
+        () => { discardMediaPath(mediaPath); },
+      );
+      await waitForAcknowledgedSteerCommand(fixture);
+
+      fixture.stdout.push(null);
+      (fixture.child as unknown as { exitCode: number | null }).exitCode = 1;
+      fixture.child.emit("exit", 1, null);
+      await turn.done;
+
+      assert.strictEqual(
+        existsSync(mediaPath),
+        true,
+        "child exit must preserve bot-owned media for fallback",
+      );
+
+      releaseInitial();
+      for (let attempt = 0; attempt < 100 && processCalls.length < 2; attempt++) {
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2));
+      }
+      assert.deepStrictEqual(processCalls, ["initial queue turn", mediaMessage]);
+      assert.strictEqual(
+        existsSync(mediaPath),
+        true,
+        "fallback delivery transfers the media to the replacement session",
+      );
+    } finally {
+      releaseInitial();
+      queue.clearAll();
+      cleanupSessionMediaDir(chatId);
+    }
   });
 
   it("honors an acknowledgement buffered before child exit", async () => {
