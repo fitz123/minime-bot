@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, type PiCommandResponse, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -927,7 +927,7 @@ export class SessionManager {
           session.child,
           resetActivityTimer,
           promptId,
-          (response) => this.observeCommandResponse(session, response),
+          (result) => this.observeAcknowledgedSteerResult(session, result),
         );
         for await (const line of stream) {
           if (line.type === "result") {
@@ -993,9 +993,10 @@ export class SessionManager {
   }
 
   /**
-   * Attempt native Pi steering for an active turn. The returned promise is true
-   * only after the existing stdout reader observes the exact correlated
-   * `steer` success response. Every other resolution preserves bot ownership.
+   * Attempt first-party Pi steering for an active turn. The returned promise is
+   * true only after the existing stdout reader observes the exact correlated
+   * acceptance event from the child lifecycle gate. Every other resolution
+   * preserves bot ownership.
    */
   steerSessionMessage(chatId: string, agentId: string, text: string): Promise<boolean> {
     const session = this.active.get(chatId);
@@ -1003,6 +1004,7 @@ export class SessionManager {
       !session ||
       session.agentId !== agentId ||
       session.processingStartedAt === null ||
+      process.env[PI_EXTENSIONS_DISABLED_ENV] === "1" ||
       hasExited(session.child) ||
       session.child.killed ||
       !session.child.stdout ||
@@ -1015,7 +1017,7 @@ export class SessionManager {
     return new Promise<boolean>((resolveSteer) => {
       session.pendingSteers.set(id, resolveSteer);
       try {
-        sendPiSteer(session.child, text, id, (error) => {
+        sendPiAcknowledgedSteer(session.child, text, id, (error) => {
           log.warn(
             "session-manager",
             `Pi steer write failed for chat ${chatId}: ${error.message}`,
@@ -1032,12 +1034,11 @@ export class SessionManager {
     });
   }
 
-  private observeCommandResponse(
+  private observeAcknowledgedSteerResult(
     session: ActiveSession,
-    response: PiCommandResponse,
+    result: PiAcknowledgedSteerResult,
   ): void {
-    if (response.command !== "steer") return;
-    this.settlePendingSteer(session, response.id, response.success === true);
+    this.settlePendingSteer(session, result.id, result.success);
   }
 
   private settlePendingSteer(

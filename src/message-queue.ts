@@ -39,14 +39,10 @@ export type AcknowledgedSteerFn = (
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
 export type CleanupFn = () => void;
 
-type CollectEntryState = "queued" | "steering" | "fallback" | "transferred" | "dropped";
-
 interface CollectEntry {
-  id: number;
   text: string;
   cleanup?: CleanupFn;
   dropCleanup?: CleanupFn;
-  state: CollectEntryState;
 }
 
 interface ChatQueueState {
@@ -68,10 +64,8 @@ interface ChatQueueState {
 
   /** Whether a message is currently being processed */
   busy: boolean;
-  /** Monotonic token invalidating steer callbacks after the current turn settles. */
-  busyGeneration: number;
   /** Exact head entry currently waiting for correlated acceptance. */
-  steerInFlight: { generation: number; entryId: number } | null;
+  steerInFlight: CollectEntry | null;
   /** Stop attempting later entries after the first failure in this busy turn. */
   steerBlocked: boolean;
 
@@ -120,7 +114,6 @@ export class MessageQueue {
   private queueCap: number;
   private processFn: ProcessFn;
   private acknowledgedSteerFn?: AcknowledgedSteerFn;
-  private nextCollectEntryId = 1;
 
   constructor(
     processFn: ProcessFn,
@@ -146,7 +139,6 @@ export class MessageQueue {
         debounceTimer: null,
         collectEntries: [],
         busy: false,
-        busyGeneration: 0,
         steerInFlight: null,
         steerBlocked: false,
         latestPlatform: null,
@@ -192,11 +184,9 @@ export class MessageQueue {
     if (state.busy) {
       if (state.collectEntries.length < this.queueCap) {
         state.collectEntries.push({
-          id: this.nextCollectEntryId++,
           text,
           cleanup,
           dropCleanup,
-          state: "queued",
         });
 
         log.debug(
@@ -312,7 +302,6 @@ export class MessageQueue {
     // Loop to drain messages that arrive during processing (avoids recursion)
     while (state.collectEntries.length > 0) {
       const entries = state.collectEntries.splice(0);
-      for (const entry of entries) entry.state = "fallback";
       const collected = entries.map(({ text }) => text);
       const cleanups = entries.map(({ cleanup }) => cleanup);
       // Hold drop cleanups locally for exactly this batch. If processFn
@@ -371,18 +360,11 @@ export class MessageQueue {
 
   private beginBusyGeneration(state: ChatQueueState): void {
     state.busy = true;
-    state.busyGeneration++;
     state.steerInFlight = null;
     state.steerBlocked = false;
   }
 
   private settleBusyGeneration(state: ChatQueueState): void {
-    const inFlight = state.steerInFlight;
-    if (inFlight) {
-      const entry = state.collectEntries.find(({ id }) => id === inFlight.entryId);
-      if (entry?.state === "steering") entry.state = "queued";
-    }
-    state.busyGeneration++;
     state.steerInFlight = null;
     state.steerBlocked = true;
   }
@@ -399,26 +381,24 @@ export class MessageQueue {
     }
 
     const entry = state.collectEntries[0];
-    if (!entry || entry.state !== "queued") return;
+    if (!entry) return;
 
-    const generation = state.busyGeneration;
-    entry.state = "steering";
-    state.steerInFlight = { generation, entryId: entry.id };
+    state.steerInFlight = entry;
 
     let acknowledgement: Promise<boolean>;
     try {
       acknowledgement = this.acknowledgedSteerFn(chatId, state.agentId, entry.text);
     } catch {
-      this.finishAcknowledgedSteer(chatId, state, generation, entry.id, false);
+      this.finishAcknowledgedSteer(chatId, state, entry, false);
       return;
     }
 
     void acknowledgement.then(
       (acknowledged) => {
-        this.finishAcknowledgedSteer(chatId, state, generation, entry.id, acknowledged);
+        this.finishAcknowledgedSteer(chatId, state, entry, acknowledged);
       },
       () => {
-        this.finishAcknowledgedSteer(chatId, state, generation, entry.id, false);
+        this.finishAcknowledgedSteer(chatId, state, entry, false);
       },
     );
   }
@@ -426,34 +406,26 @@ export class MessageQueue {
   private finishAcknowledgedSteer(
     chatId: string,
     state: ChatQueueState,
-    generation: number,
-    entryId: number,
+    entry: CollectEntry,
     acknowledged: boolean,
   ): void {
     if (
       this.queues.get(chatId) !== state ||
       !state.busy ||
-      state.busyGeneration !== generation ||
-      state.steerInFlight?.generation !== generation ||
-      state.steerInFlight.entryId !== entryId
+      state.steerInFlight !== entry ||
+      state.collectEntries[0] !== entry
     ) {
       return;
     }
 
-    const entry = state.collectEntries[0];
-    if (!entry || entry.id !== entryId || entry.state !== "steering") return;
-
     state.steerInFlight = null;
     if (!acknowledged) {
-      entry.state = "queued";
       state.steerBlocked = true;
       return;
     }
 
     state.collectEntries.shift();
-    entry.state = "transferred";
     this.runCleanups([entry.cleanup]);
-    entry.dropCleanup = undefined;
     this.attemptAcknowledgedSteer(chatId, state);
   }
 
@@ -524,7 +496,6 @@ export class MessageQueue {
   private dropCollectEntries(state: ChatQueueState): void {
     const entries = state.collectEntries.splice(0);
     for (const entry of entries) {
-      entry.state = "dropped";
       this.runCleanups([entry.cleanup, entry.dropCleanup]);
     }
   }

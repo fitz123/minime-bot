@@ -81,6 +81,8 @@ mock.module("../pi-rpc-protocol.js", {
     },
     sendPiPrompt() {},
     sendPiSteer() {},
+    sendPiAcknowledgedSteer() {},
+    PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     async *readPiStream() {},
     normalizePiModel,
     NewlineOnlyJsonlSplitter,

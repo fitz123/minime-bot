@@ -224,11 +224,13 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/subagent-args.js",
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
+    "dist/pi-extensions/acknowledged-steer.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/ops-worker-parity-attestation.js",
     "dist/ops-worker/parity.js",
     "dist/extensions/pi/codex-usage.js",
+    "dist/extensions/pi/acknowledged-steer.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/ops-worker-parity-attestation.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -765,7 +767,14 @@ const parentExtensionArgs = piRpc.resolvePiExtensionArgs({ env: {} });
 const extensionPaths = extensionPathsFromArgs(parentExtensionArgs);
 assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
-  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+  [
+    "acknowledged-steer.js",
+    "codex-transport-overflow.js",
+    "web-tools.js",
+    "knowledge-tools.js",
+    "subagent/index.js",
+    "ask-agent/index.js",
+  ],
 );
 assertCanonicalWebWrapper("interactive parent", extensionPaths);
 assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);

@@ -378,6 +378,8 @@ mock.module("../pi-rpc-protocol.js", {
     },
     sendPiPrompt() {},
     sendPiSteer() {},
+    sendPiAcknowledgedSteer() {},
+    PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     normalizePiModel,
     async *readPiStream(): AsyncGenerator<StreamLine> {
       // Message-path reader (unused by the spawn-path capture, which now reads

@@ -1691,6 +1691,35 @@ describe("command handler wiring", () => {
       expectedText: "photo correction",
     },
     {
+      name: "photo fallback",
+      media: {
+        photo: [{
+          file_id: "photo-fallback-file",
+          file_unique_id: "photo-fallback-unique",
+          width: 10,
+          height: 10,
+        }],
+        caption: "photo fallback correction",
+      },
+      action: "fallback",
+      expectedText: "photo fallback correction",
+    },
+    {
+      name: "document acknowledgement",
+      media: {
+        document: {
+          file_id: "document-ack-file",
+          file_unique_id: "document-ack-unique",
+          file_name: "accepted.txt",
+          mime_type: "text/plain",
+          file_size: 4,
+        },
+        caption: "document accepted correction",
+      },
+      action: "acknowledge",
+      expectedText: "[Document: accepted.txt | Type: text/plain | Size: 4 B]",
+    },
+    {
       name: "document fallback",
       media: {
         document: {
@@ -1704,6 +1733,40 @@ describe("command handler wiring", () => {
       },
       action: "fallback",
       expectedText: "[Document: notes.txt | Type: text/plain | Size: 4 B]",
+    },
+    {
+      name: "other-media acknowledgement",
+      media: {
+        video: {
+          file_id: "video-ack-file",
+          file_unique_id: "video-ack-unique",
+          file_name: "accepted.mp4",
+          mime_type: "video/mp4",
+          file_size: 4,
+          width: 10,
+          height: 10,
+          duration: 1,
+        },
+        caption: "video accepted correction",
+      },
+      action: "acknowledge",
+      expectedText: "[Video: accepted.mp4 | Type: video/mp4 | Size: 4 B]",
+    },
+    {
+      name: "other-media fallback",
+      media: {
+        sticker: {
+          file_id: "sticker-fallback-file",
+          file_unique_id: "sticker-fallback-unique",
+          width: 10,
+          height: 10,
+          is_animated: false,
+          is_video: false,
+          type: "regular",
+        },
+      },
+      action: "fallback",
+      expectedText: "[Sticker]",
     },
     {
       name: "other-media /clean race",

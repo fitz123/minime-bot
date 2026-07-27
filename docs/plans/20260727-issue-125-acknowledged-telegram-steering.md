@@ -2,14 +2,14 @@
 
 ## Goal
 
-Give ordinary Telegram inputs received during an active Pi turn the earliest real native Pi steering semantics—after the current complete tool-call batch and before the next model call—without known message loss or duplication. Bot ownership transfers only after the exact correlated Pi `steer` success response; every unresolved or failed attempt remains eligible for the existing follow-up path exactly once.
+Give ordinary Telegram inputs received during an active Pi turn the earliest real native Pi steering semantics—after the current complete tool-call batch and before the next model call—without known message loss or duplication. Bot ownership transfers only after the exact correlated child-lifecycle gate accepts and Pi begins consuming the correction; every unresolved or failed attempt remains eligible for the existing follow-up path exactly once.
 
 ## Context
 
 - Canonical task: `fitz123/minime-bot#125`, including the 2026-07-27 operator corrections and full-cycle authorization.
 - Baseline: `main` commit `3ae49e957e7f4bfa824522a0e8b0e12e01ce23e9`, minime-bot 2026.7.36, Pi 0.82.1, grammY 1.45.1.
-- `src/pi-rpc-protocol.ts` has the one stdout reader. It writes uncorrelated steer commands and deliberately keeps side-command responses nonterminal.
-- Pi 0.82.1 RPC accepts optional command IDs; its steer handler awaits `session.steer(...)` and then emits a matching success/failure response.
+- `src/pi-rpc-protocol.ts` has the one stdout reader. Pi 0.82.1's native steer handler unconditionally queues while idle, so exact command correlation alone is not atomic with the child lifecycle.
+- The package-owned acknowledged-steer extension gates and enqueues within Pi's event loop, then emits a matching success/failure notification record to that existing reader through Pi's supported extension UI API.
 - `src/session-manager.ts` owns the active read stream through `agent_settled`, including retry, compaction, and queued continuation. Child exit/activity timeout and settlement are existing resolution boundaries.
 - `src/message-queue.ts` currently stores mid-turn text and cleanup callbacks in parallel arrays, then drains them only after the active send settles.
 - `src/telegram-bot.ts` sends ordinary Telegram inputs through `MessageQueue`; passive echo and shutdown steering are separate best-effort paths.
@@ -18,7 +18,7 @@ Give ordinary Telegram inputs received during an active Pi turn the earliest rea
 
 - **Testing approach:** invariant-first tests before or with each behavior change.
 - Keep one logical Ralphex run in this repository/branch/plan lineage with Codex xhigh. Launch with `-b main`; invocation attempt 1 is capped at one task cycle for the mandatory trajectory check.
-- Keep the implementation narrow: one correlated acknowledgement hook in the existing stdout owner, one session-owned pending-steer map, and structured collect entries with serial head-of-line steering.
+- Keep the implementation narrow: one first-party child-lifecycle gate observed by the existing stdout owner, one session-owned pending-steer map, and structured collect entries with serial head-of-line steering.
 - Complete and validate each task before moving to the next. The parent does not edit this active plan after launch.
 
 ## Testing Strategy
@@ -63,9 +63,9 @@ Ralphex marks each item immediately after implementation and validation. A faile
 
 ### Task 1: Correlate acknowledged steer responses in the existing Pi stream owner
 **Goal:** Add a minimum session-level acknowledged-steer primitive whose exact response is observed by the existing single stdout reader and whose failure/settlement paths resolve without terminating the active turn.
-**Serves:** The operator requires bot ownership to remain until matching Pi steer success, and requires rejection, write failure, child exit, inactive session, or settlement without that acknowledgement to preserve fallback.
-- [x] Add focused protocol tests for optional steer request IDs, matching and unrelated/out-of-order response observation, and successful/failed steer responses remaining nonterminal to the prompt result.
-- [x] Extend `src/pi-rpc-protocol.ts` only enough for callers to send an explicitly correlated steer and for `readPiStream` to expose valid command-response records to its owner without adding another reader or translating side responses into `ResultMessage`.
+**Serves:** The operator requires bot ownership to remain until matching Pi acceptance, and requires rejection, write failure, child exit, inactive session, or settlement without that acknowledgement to preserve fallback.
+- [x] Add focused protocol and extension tests for exact request IDs, child lifecycle acceptance/rejection, matching and unrelated/out-of-order result observation, and results remaining nonterminal to the prompt result.
+- [x] Extend the first-party Pi wrapper set and `src/pi-rpc-protocol.ts` only enough to gate/enqueue a correlated correction atomically and expose its bounded result to the existing reader without adding another reader or translating it into `ResultMessage`.
 - [x] Add session-manager tests for matching success, explicit rejection, stdin/write failure, inactive/wrong session, child exit, turn settlement before acknowledgement, late acknowledgement, and teardown/session replacement; every pending promise resolves exactly once with no independent timeout.
 - [x] Implement the per-`ActiveSession` pending-steer correlation map and acknowledged-steer API in `src/session-manager.ts`; settle unresolved entries as fallback at the existing turn/child/teardown boundaries and preserve passive shutdown steering.
 - [x] Run the protocol and session-manager focused suites; they must pass before Task 2.
@@ -75,7 +75,7 @@ Ralphex marks each item immediately after implementation and validation. A faile
 **Serves:** The operator requires no known loss/duplication, arrival order, existing total cap/saturation behavior, and exact cleanup/media ownership across acknowledgement, fallback, `/clean`, and `/reconnect` races.
 - [x] Add deterministic MessageQueue tests for acknowledged head transfer, rejection/unacknowledged fallback, several corrections under one-at-a-time semantics, partial failures, around-settlement races, cap overflow, clear/replacement while acknowledgement is pending, and late callback no-ops.
 - [x] Add cleanup/media tests proving acknowledged entries run delivery cleanup once and transfer drop-cleanup ownership, while fallback/rejection/clear paths retain existing cleanup guarantees with no double execution.
-- [x] Replace only the collect parallel arrays with structured entries carrying stable entry identity/state and cleanup ownership; keep pending idle-debounce storage and public cap unchanged.
+- [x] Replace only the collect parallel arrays with structured entries carrying stable object identity and cleanup ownership; keep pending idle-debounce storage and public cap unchanged.
 - [x] Add a serial head-of-line acknowledged-steer attempt for the current busy generation; on matching success remove exactly that entry and try the next, while the first failure/settlement preserves the remaining ordered fallback without retries or timeouts.
 - [x] Run the MessageQueue focused suite; it must pass before Task 3.
 
@@ -99,21 +99,23 @@ Ralphex marks each item immediately after implementation and validation. A faile
 
 ## Task 4 Validation Record
 
-- Focused suites passed: Pi RPC 144/144, SessionManager 77/77, MessageQueue 43/43, Telegram 265/265, and stream-relay/Telegram adapter 135/135.
+- Focused suites passed after review corrections: acknowledged-steer 3/3, Pi RPC 144/144, SessionManager 78/78, MessageQueue 43/43, Telegram 269/269, and stream-relay/Telegram adapter 135/135. The parity/resource/worker-CLI-inclusive run passed 194/194, and package install/workspace spawn passed 3/3.
 - Issue #125 regression cases 1–10 passed by source/test trace: acknowledged no-duplicate transfer; explicit rejection with nonterminal stream and one fallback; before/after-settlement races; serial corrections; cap/notice behavior; child-exit/write-failure fallback; pending `/clean` and `/reconnect`; photo/document ownership; unrelated/out-of-order response isolation; and unchanged passive echo/shutdown steering.
-- Full contract passed: `npm test` (2334/2334), `npm run lint`, `npm run build`, `npm pack --dry-run` (267 intended files), `npm run check:schema-guard-contract`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `node dist/cli.js --help`. The workspace fixture remained valid with its expected missing-context/knowledge/rules warnings.
-- Cut review passed: `git diff --check` and the added-line private-data scan were clean; dependency manifests, Discord sources, and stream-relay stayed unchanged; generated output remained untracked; and pre-commit status contained only Task 4 documentation. No generic broker, independent acknowledgement timeout/retry, test weakening, private data, or unrelated abstraction was found. The task commit is followed by a clean-status check.
-- Final branch files: `README.md`, this plan, `src/pi-rpc-protocol.ts`, `src/session-manager.ts`, `src/message-queue.ts`, `src/telegram-bot.ts`, and focused tests in `src/__tests__/pi-rpc-protocol.test.ts`, `src/__tests__/session-manager.test.ts`, `src/__tests__/session-manager-pi-spawn.test.ts`, `src/__tests__/message-queue.test.ts`, and `src/__tests__/telegram-bot.test.ts`.
+- Full contract passed after review corrections: `npm test` (2342/2342 across 322 suites), `npm run lint`, `npm run build`, `npm pack --dry-run` (271 intended files), `npm run check:schema-guard-contract`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`, and `node dist/cli.js --help`. The workspace fixture remained valid with its expected missing-context/knowledge/rules warnings.
+- Independent six-agent review confirmed Pi 0.82.1 preflight/settlement races in the original native-steer correlation, incomplete Telegram media/docs coverage, and avoidable queue state bookkeeping. Corrections add the atomic first-party lifecycle gate, complete the ordinary media matrix and public semantics, simplify queue identity tracking, and retain the fixture-required defensive pending-map guard.
+- Corrective cut review passed the full contract plus `git diff --check`; dependency manifests, Discord sources, and stream-relay remain unchanged, generated output remains untracked, and status contains only task-owned source, tests, build wiring, and documentation. No generic broker, independent acknowledgement timeout/retry, test weakening, private data, or unrelated abstraction was added.
+- Corrective files add `extensions/pi/acknowledged-steer.ts`, `src/pi-extensions/acknowledged-steer.ts`, its focused test, build/package/spawn wiring and assertions, session/protocol tests, the complete Telegram media matrix, queue simplification, and README/Pi-extension/plan documentation.
 - Residual boundary: the queue remains process-memory scoped and native steering cannot interrupt the current tool-call batch. PR/CI, release, deploy/restart, installed-artifact smoke, tail audit, and issue closure remain with the parent as planned.
-- Plan progress: Tasks 1–4 are complete. Ralphex executor cut-review outcome: pass, with no corrective code change required during Task 4.
+- Plan progress: Tasks 1–4 are complete. This independent Ralphex review found and fixed confirmed issues, so another external review iteration is required before `REVIEW_DONE`.
 
 ## Technical Details
 
-- A correlated steer response is ownership evidence only when `type=response`, `command=steer`, `id` matches the exact pending request, and `success=true`.
-- The existing stdout reader observes command responses before normal nonterminal parsing. Unmatched, duplicate, late, and non-steer responses cannot resolve another entry or terminate the prompt stream.
+- The package-owned Pi extension opens steering on `agent_start`, closes it on `agent_end`/`agent_settled`, and synchronously enqueues through Pi's extension binding only while the child is still active. This closes both prompt-preflight and settlement races left by Pi 0.82.1's unconditional native steer RPC.
+- The extension emits a gate result through an `extension_ui_request` fire-and-forget notification whose message contains the exact prefixed, base64url-encoded result envelope. The parent normalizes it to `type=minime_acknowledged_steer_result`; ownership evidence additionally requires the exact pending `id` and `success=true`.
+- Direct process/stdout access is deliberately absent so the wrapper remains compatible with primary-resource parity attestation. The existing stdout reader observes the notification before normal nonterminal parsing. Unmatched, malformed, duplicate, and late results cannot resolve another entry or terminate the prompt stream.
 - A pending steer belongs to one `ActiveSession`; teardown and replacement resolve it as fallback. `agent_settled`/EOF/child exit resolve still-pending requests before MessageQueue begins its existing collect drain.
 - MessageQueue attempts at most one head entry at a time. It does not acknowledge later entries past an unresolved/failed earlier entry, preserving arrival order even when responses are asynchronous.
-- Successful acknowledgement runs normal consumed-message cleanup once and discards drop cleanup because Pi/session now owns referenced media. Every non-success retains the entry for existing follow-up delivery; clear/drop behavior remains recoverable and once-only.
+- Successful acknowledgement runs normal consumed-message cleanup once because Pi/session now owns referenced media. Every non-success retains the entry for existing follow-up delivery; explicit clear/drop behavior remains recoverable and once-only.
 - No wall-clock acknowledgement timer is introduced. The existing response activity timeout may terminate a dead child, after which SessionManager resolves fallback.
 
 ## Post-Completion

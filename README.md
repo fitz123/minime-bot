@@ -367,15 +367,24 @@ receives a coalesced resend-later notice, at most once per chat every 30 seconds
 `rate_limited` notice outcomes without identifying the chat.
 
 Ordinary Telegram inputs received during an active Pi turn remain bot-owned
-queue entries until Pi accepts the exact correlated `steer` request. The queue
-offers entries serially in arrival order. Only the matching successful response
-transfers that entry to Pi and removes it from fallback collection; rejection,
-write or child failure, session replacement, or turn settlement before
-acknowledgement leaves it for the existing ordered follow-up drain. This keeps
-the process-lifetime no-known-loss/no-duplicate boundary without an independent
-acknowledgement timeout or retry loop. Acknowledged media keeps session-lifetime
-file ownership, while fallback and dropped entries retain their existing
-cleanup behavior.
+queue entries until a first-party Pi lifecycle gate atomically accepts and
+enqueues the exact correlated correction. The queue offers entries serially in
+arrival order. Only the matching successful gate result transfers that entry to
+Pi and removes it from fallback collection; rejection, write or child failure,
+or turn settlement before acknowledgement leaves it for the existing ordered
+follow-up drain. This keeps the process-lifetime no-known-loss/no-duplicate
+boundary without an independent acknowledgement timeout or retry loop. When
+first-party Pi extensions are deliberately disabled, the queue uses fallback
+instead of attempting acknowledged steering. Acknowledged media keeps
+session-lifetime file ownership, while fallback and dropped entries retain
+their existing cleanup behavior.
+
+The acknowledged path applies to text (including source, reply, and forward
+framing), voice transcripts, photos, documents, supported media, and reaction
+context. Both `/reconnect` and `/clean` explicitly clear pending and mid-turn
+queue entries, including an acknowledgement currently in flight, and late
+results cannot restore those dropped entries. `/reconnect` preserves stored
+conversation state; `/clean` deletes it.
 
 Native Pi steering takes effect after the current complete tool-call batch and
 before the next model call; it does not interrupt a running tool or its sibling

@@ -4,6 +4,8 @@ Pure, testable helpers for Pi extension wrappers.
 
 Most helpers here back the live Pi extensions:
 
+- `acknowledged-steer` for an atomic active-lifecycle gate around Telegram
+  steering ownership transfer.
 - `web-tools` for subscription-backed Codex `web_search`.
 - `knowledge-tools` for `knowledge_search`, `knowledge_get`, `knowledge_update`,
   and scoped protection for managed Knowledge v2 wiki files.
@@ -26,9 +28,10 @@ See
 
 `PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
 first-party wrappers and any configured `piExtraExtensions`. That deliberately
-removes the Knowledge tools and also removes the scoped managed-wiki protection;
-use it only as an operator bypass when a Pi session must start without package
-extensions.
+disables acknowledged steering (Telegram falls back to its ordered follow-up
+path), removes the Knowledge tools, and removes the scoped managed-wiki
+protection; use it only as an operator bypass when a Pi session must start
+without package extensions.
 
 ## Codex web search
 
