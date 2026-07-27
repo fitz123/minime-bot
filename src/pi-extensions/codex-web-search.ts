@@ -243,19 +243,19 @@ function classifiedFailure(
   return emptyResult(failureText(failure), failure);
 }
 
-async function awaitWithAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return pending;
+async function awaitWithAbort<T>(createPending: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return createPending();
   if (signal.aborted) throw signal.reason ?? new Error("Codex OAuth resolution aborted");
   let abort: (() => void) | undefined;
-  return Promise.race([
-    pending,
-    new Promise<never>((_resolve, reject) => {
-      abort = () => reject(signal.reason ?? new Error("Codex OAuth resolution aborted"));
-      signal.addEventListener("abort", abort, { once: true });
-    }),
-  ]).finally(() => {
-    if (abort) signal.removeEventListener("abort", abort);
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason ?? new Error("Codex OAuth resolution aborted"));
+    signal.addEventListener("abort", abort, { once: true });
   });
+  try {
+    return await Promise.race([createPending(), aborted]);
+  } finally {
+    if (abort) signal.removeEventListener("abort", abort);
+  }
 }
 
 function extractCodexAccountId(token: string): string | undefined {
@@ -283,13 +283,16 @@ export async function resolveCodexWebSearchOAuth(
   }
 
   const providerAuth = await awaitWithAbort(
-    context.modelRegistry.getProviderAuth(CODEX_WEB_SEARCH_PROVIDER),
+    () => context.modelRegistry.getProviderAuth(CODEX_WEB_SEARCH_PROVIDER),
     signal,
   );
   const refreshedToken = providerAuth?.auth.apiKey;
   if (!refreshedToken) return undefined;
 
-  const requestAuth = await awaitWithAbort(context.modelRegistry.getApiKeyAndHeaders(model), signal);
+  const requestAuth = await awaitWithAbort(
+    () => context.modelRegistry.getApiKeyAndHeaders(model),
+    signal,
+  );
   if (!requestAuth.ok || requestAuth.apiKey !== refreshedToken) return undefined;
 
   // Pi's OAuth resolver refreshes the token before returning it. Comparing the

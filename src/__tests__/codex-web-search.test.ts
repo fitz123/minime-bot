@@ -199,6 +199,23 @@ describe("Codex web search auth and request", () => {
     }
   });
 
+  it("does not start OAuth resolution after cancellation", async () => {
+    const { context, calls } = makeContext();
+    context.modelRegistry.getProviderAuth = async () => {
+      calls.getProviderAuth += 1;
+      throw new Error("orphaned provider auth rejection");
+    };
+    const controller = new AbortController();
+    const reason = new Error("request cancelled");
+    controller.abort(reason);
+
+    await assert.rejects(
+      resolveCodexWebSearchOAuth(context, controller.signal),
+      (error: unknown) => error === reason,
+    );
+    assert.deepEqual(calls, { isUsingOAuth: 1, getProviderAuth: 0, getRequestAuth: 0 });
+  });
+
   it("builds one fixed subscription request with the compatible controls", () => {
     const request = buildCodexWebSearchRequest({
       token: "oauth-fixture",
