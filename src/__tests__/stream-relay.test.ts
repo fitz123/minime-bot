@@ -560,14 +560,23 @@ describe("relayStream bounded draft scheduler", () => {
     assert.strictEqual(calls[1].draftId, calls[0].draftId);
     assert.strictEqual(calls[1].text, "working");
 
-    t.mock.timers.tick(5_001);
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS - 1);
     await flushMicrotasks();
-    assert.strictEqual(calls.length, 2, "a >30-second gap does not cause extra churn");
+    assert.strictEqual(calls.length, 2);
+    t.mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.deepStrictEqual(
+      calls.map(({ at }) => at),
+      [1_000, 1_000 + DRAFT_REFRESH_INTERVAL_MS, 1_000 + 2 * DRAFT_REFRESH_INTERVAL_MS],
+      "keepalives continue for the full no-delta gap",
+    );
+    assert.strictEqual(calls[2].draftId, calls[0].draftId);
+    assert.strictEqual(calls[2].text, "working");
     finish.resolve();
     await relay;
     t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
     await flushMicrotasks();
-    assert.strictEqual(calls.length, 2, "relay settlement cancels future refreshes");
+    assert.strictEqual(calls.length, 3, "relay settlement cancels future refreshes");
   });
 
   it("refreshes only the latest snapshot and dedupes unchanged ordinary snapshots", async (t) => {
@@ -611,6 +620,86 @@ describe("relayStream bounded draft scheduler", () => {
       calls,
       ["first\n\n", "first\n\nlatest", "first\n\nlatest"],
       "the intentional refresh uses only the newest snapshot",
+    );
+    finish.resolve();
+    await relay;
+  });
+
+  it("keeps refreshing the last visible snapshot when a newer update fails", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+
+    for (const outcome of ["failed", "rate_limited"] as const) {
+      const { platform } = mockPlatform({ typingIndicator: false });
+      const calls: Array<{ text: string; at: number }> = [];
+      platform.sendDraft = async (_draftId, text) => {
+        calls.push({ text, at: Date.now() });
+        if (calls.length !== 2) return { status: "sent" };
+        return outcome === "failed"
+          ? { status: "failed" }
+          : { status: "rate_limited", retryAfterMs: 3_000 };
+      };
+      const update = deferred<void>();
+      const finish = deferred<void>();
+      async function* stream(): AsyncGenerator<StreamLine> {
+        yield { type: "stream_event", event: { delta: { type: "text_delta", text: "visible" } } } as StreamEvent;
+        await update.promise;
+        yield { type: "stream_event", event: { delta: { type: "text_delta", text: " newer" } } } as StreamEvent;
+        await finish.promise;
+        yield { type: "result", result: "visible newer", session_id: "test" } as ResultMessage;
+      }
+
+      const relay = relayStream(stream(), platform);
+      await flushMicrotasks();
+      t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS - 1_000);
+      update.resolve();
+      await flushMicrotasks();
+      assert.deepStrictEqual(calls.map(({ text }) => text), ["visible", "visible newer"]);
+
+      const expectedDelay = outcome === "failed" ? 1_000 : 3_000;
+      t.mock.timers.tick(expectedDelay - 1);
+      await flushMicrotasks();
+      assert.strictEqual(calls.length, 2);
+      t.mock.timers.tick(1);
+      await flushMicrotasks();
+      assert.deepStrictEqual(
+        calls.map(({ text }) => text),
+        ["visible", "visible newer", "visible"],
+        `${outcome} update must not replace the confirmed visible refresh source`,
+      );
+
+      finish.resolve();
+      await relay;
+    }
+  });
+
+  it("contains a failed refresh until the next keepalive interval", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { platform } = mockPlatform({ typingIndicator: false });
+    const calls: number[] = [];
+    platform.sendDraft = async () => {
+      calls.push(Date.now());
+      return { status: calls.length === 2 ? "failed" : "sent" };
+    };
+    const finish = deferred<void>();
+    async function* stream(): AsyncGenerator<StreamLine> {
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "visible" } } } as StreamEvent;
+      await finish.promise;
+      yield { type: "result", result: "visible", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(stream(), platform);
+    await flushMicrotasks();
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, [1_000, 1_000 + DRAFT_REFRESH_INTERVAL_MS]);
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS - 1);
+    await flushMicrotasks();
+    assert.strictEqual(calls.length, 2, "a failed refresh does not create a retry loop");
+    t.mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.deepStrictEqual(
+      calls,
+      [1_000, 1_000 + DRAFT_REFRESH_INTERVAL_MS, 1_000 + 2 * DRAFT_REFRESH_INTERVAL_MS],
     );
     finish.resolve();
     await relay;
@@ -875,10 +964,14 @@ describe("relayStream bounded draft scheduler", () => {
     assert.deepStrictEqual(sends, [{ text: " \n\n " }]);
   });
 
-  it("preserves periodic typing when drafts are unsupported", async (t) => {
+  it("stops refreshes and preserves periodic typing when drafts become unsupported", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const { platform, typings } = mockPlatform({ typingIntervalMs: 100 });
-    platform.sendDraft = async () => ({ status: "unsupported" });
+    let draftCalls = 0;
+    platform.sendDraft = async () => {
+      draftCalls++;
+      return { status: draftCalls === 1 ? "sent" : "unsupported" };
+    };
     const finish = deferred<void>();
     async function* stream(): AsyncGenerator<StreamLine> {
       yield { type: "stream_event", event: { delta: { type: "text_delta", text: "discord" } } } as StreamEvent;
@@ -893,6 +986,10 @@ describe("relayStream bounded draft scheduler", () => {
     assert.strictEqual(typings.length, 4, "initial typing plus three periodic actions remain");
     t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
     await flushMicrotasks();
+    assert.strictEqual(draftCalls, 2);
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
+    await flushMicrotasks();
+    assert.strictEqual(draftCalls, 2, "unsupported refreshes permanently stop cosmetic draft work");
     finish.resolve();
     await relay;
   });
@@ -1333,12 +1430,13 @@ describe("relayStream NO_REPLY with drafts", () => {
   });
 
   it("suppresses delivery for NO_REPLY with surrounding whitespace", async () => {
-    const { platform, sends } = mockPlatform();
+    const { platform, sends, drafts } = mockPlatform();
     const stream = fakeStream(["  NO_REPLY  "]);
 
     await relayStream(stream, platform);
 
     assert.strictEqual(sends.length, 0, "Should not send messages for whitespace-padded NO_REPLY");
+    assert.deepStrictEqual(drafts, [], "Whitespace-padded leading sentinels must never become visible drafts");
   });
 
   it("does not call deleteMessage for NO_REPLY — drafts auto-disappear", async () => {

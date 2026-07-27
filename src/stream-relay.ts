@@ -165,10 +165,10 @@ class DraftScheduler {
   private inFlight: Promise<void> | null = null;
   private pendingText: string | null = null;
   private latestText: string | null = null;
+  private visibleText: string | null = null;
   private lastStartedAt: number | null = null;
   private pauseUntil = 0;
   private nextRefreshAt = 0;
-  private hasVisibleDraft = false;
   private cancelled = false;
   private unsupported = false;
   private inFlightController: AbortController | null = null;
@@ -189,7 +189,7 @@ class DraftScheduler {
 
   reset(): void {
     this.latestText = null;
-    this.hasVisibleDraft = false;
+    this.visibleText = null;
     this.nextRefreshAt = 0;
     this.clearScheduled();
   }
@@ -264,8 +264,8 @@ class DraftScheduler {
     this.inFlightController = controller;
     this.inFlight = Promise.resolve()
       .then(() => this.platform.sendDraft(this.draftId, text, controller.signal))
-      .then((result) => this.handleResult(result))
-      .catch(() => this.handleResult({ status: "failed" }))
+      .then((result) => this.handleResult(result, text))
+      .catch(() => this.handleResult({ status: "failed" }, text))
       .finally(() => {
         if (this.inFlightController === controller) this.inFlightController = null;
         this.inFlight = null;
@@ -276,10 +276,10 @@ class DraftScheduler {
       });
   }
 
-  private handleResult(result: DraftSendResult): void {
+  private handleResult(result: DraftSendResult, text: string): void {
     switch (result.status) {
       case "sent":
-        this.hasVisibleDraft = true;
+        this.visibleText = text;
         this.nextRefreshAt = Date.now() + DRAFT_REFRESH_INTERVAL_MS;
         break;
       case "unsupported":
@@ -291,14 +291,10 @@ class DraftScheduler {
           this.pauseUntil,
           Date.now() + Math.min(MAX_DRAFT_PAUSE_MS, Math.max(0, result.retryAfterMs)),
         );
-        this.nextRefreshAt = Math.max(
-          this.pauseUntil,
-          Date.now() + DRAFT_REFRESH_INTERVAL_MS,
-        );
+        this.nextRefreshAt = Math.max(this.nextRefreshAt, this.pauseUntil);
         recordDraftSchedulerEvent("rate_limited");
         break;
       case "failed":
-        this.nextRefreshAt = Date.now() + DRAFT_REFRESH_INTERVAL_MS;
         recordDraftSchedulerEvent("failed");
         break;
     }
@@ -308,7 +304,7 @@ class DraftScheduler {
     if (
       this.cancelled ||
       this.unsupported ||
-      !this.hasVisibleDraft ||
+      this.visibleText === null ||
       this.latestText === null ||
       this.inFlight !== null ||
       this.pendingText !== null ||
@@ -323,12 +319,14 @@ class DraftScheduler {
       if (
         this.cancelled ||
         this.unsupported ||
+        this.visibleText === null ||
         this.latestText === null ||
         this.pendingText !== null
       ) {
         return;
       }
-      this.pendingText = this.latestText;
+      this.nextRefreshAt = Date.now() + DRAFT_REFRESH_INTERVAL_MS;
+      this.pendingText = this.visibleText;
       if (this.inFlight === null) this.startOrSchedule();
     }, delay);
   }

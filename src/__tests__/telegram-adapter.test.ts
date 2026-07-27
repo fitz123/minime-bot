@@ -201,6 +201,20 @@ describe("createTelegramAdapter", () => {
       assert.strictEqual(calls, 2);
     });
 
+    it("contains an ordinary failure from the plain-text fallback", async () => {
+      const ctx = mockContext();
+      let calls = 0;
+      ctx.api.sendMessageDraft = async () => {
+        calls++;
+        if (calls === 1) throw new Error("Bad Request: can't parse entities");
+        throw new Error("network failure");
+      };
+      const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
+
+      assert.deepStrictEqual(await adapter.sendDraft(42, "**bold**"), { status: "failed" });
+      assert.strictEqual(calls, 2);
+    });
+
     it("is a no-op for group bindings", async () => {
       const ctx = mockContext();
       const draftCalls: unknown[] = [];
