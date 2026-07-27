@@ -4,16 +4,24 @@ import { spawn, spawnSync } from "node:child_process";
 
 const DEFAULT_SUITE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_TERMINATION_GRACE_MS = 2_000;
+const MAX_TIMER_MS = 2_147_483_647;
 const TIMEOUT_EXIT_CODE = 124;
 const POLL_INTERVAL_MS = 25;
 
-function readPositiveInteger(name, fallback) {
+function readPositiveTimer(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
-  if (!/^[1-9]\d*$/.test(raw)) {
-    throw new Error(`${name} must be a positive integer, received ${JSON.stringify(raw)}`);
+  const value = Number(raw);
+  if (
+    !/^[1-9]\d*$/.test(raw)
+    || !Number.isSafeInteger(value)
+    || value > MAX_TIMER_MS
+  ) {
+    throw new Error(
+      `${name} must be an integer from 1 to ${MAX_TIMER_MS}, received ${JSON.stringify(raw)}`,
+    );
   }
-  return Number(raw);
+  return value;
 }
 
 function quoteArgument(argument) {
@@ -68,8 +76,10 @@ async function terminateProcessGroup(processGroupId, graceMs) {
 
   if (await waitForGroupExit(processGroupId, Date.now() + graceMs)) return;
 
-  signalGroup(processGroupId, "SIGKILL");
-  await waitForGroupExit(processGroupId, Date.now() + graceMs);
+  if (!signalGroup(processGroupId, "SIGKILL")) return;
+  if (!await waitForGroupExit(processGroupId, Date.now() + graceMs)) {
+    throw new Error(`process group survived SIGKILL for ${graceMs}ms`);
+  }
 }
 
 function childProcessEvidence(processGroupId) {
@@ -109,11 +119,11 @@ async function run() {
     return 2;
   }
 
-  const suiteTimeoutMs = readPositiveInteger(
+  const suiteTimeoutMs = readPositiveTimer(
     "MINIME_TEST_SUITE_TIMEOUT_MS",
     DEFAULT_SUITE_TIMEOUT_MS,
   );
-  const terminationGraceMs = readPositiveInteger(
+  const terminationGraceMs = readPositiveTimer(
     "MINIME_TEST_TERMINATION_GRACE_MS",
     DEFAULT_TERMINATION_GRACE_MS,
   );

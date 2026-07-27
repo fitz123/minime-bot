@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const mode = process.argv[2] ?? process.env.MINIME_WATCHDOG_FIXTURE_MODE;
 
@@ -14,7 +15,7 @@ if (mode === "descendant") {
 
   const descendant = spawn(
     process.execPath,
-    [new URL(import.meta.url).pathname, "descendant"],
+    [fileURLToPath(import.meta.url), "descendant"],
     { stdio: "ignore" },
   );
   descendant.unref();

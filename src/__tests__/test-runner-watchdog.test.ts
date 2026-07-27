@@ -113,7 +113,52 @@ function runSupervisor(
   });
 }
 
+function waitForExit(
+  child: ReturnType<typeof spawn>,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("exit", (code, signal) => resolveExit({ code, signal }));
+  });
+}
+
 describe("test-runner watchdog", () => {
+  it("rejects timeout values outside Node's supported timer range", () => {
+    const markerPath = join(tmpdir(), "unused-watchdog-marker");
+    const invalidValues = ["0", "-1", "invalid", "2147483648", "9".repeat(400)];
+
+    for (const variable of [
+      "MINIME_TEST_SUITE_TIMEOUT_MS",
+      "MINIME_TEST_TERMINATION_GRACE_MS",
+    ] as const) {
+      for (const value of invalidValues) {
+        const result = runSupervisor(["--version"], markerPath, {
+          [variable]: value,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 2, `${variable}=${value}\n${result.stderr}`);
+        assert.match(
+          result.stderr,
+          new RegExp(`${variable} must be an integer from 1 to 2147483647`),
+        );
+      }
+    }
+  });
+
+  it("accepts the maximum supported timer value", () => {
+    const result = runSupervisor(
+      ["--version"],
+      join(tmpdir(), "unused-watchdog-marker"),
+      {
+        MINIME_TEST_SUITE_TIMEOUT_MS: "2147483647",
+        MINIME_TEST_TERMINATION_GRACE_MS: "2147483647",
+      },
+    );
+
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+  });
+
   it("reproduces the direct runner gap with completed test work and live resources", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-watchdog-direct-"));
     const markerPath = join(directory, "processes.json");
@@ -179,12 +224,68 @@ describe("test-runner watchdog", () => {
     assert.match(diagnostics, /timeout in stage: synthetic stalled tests/);
     assert.match(diagnostics, /command: .*--test.*test-runner-watchdog-fixture\.mjs/);
     assert.match(diagnostics, /elapsed: \d+ms \(deadline: 750ms\)/);
-    assert.match(diagnostics, /child-process evidence for process group \d+:/);
-    assert.match(diagnostics, /test-runner-watchdog-fixture\.mjs/);
+    const evidenceMatch = diagnostics.match(
+      /child-process evidence for process group \d+:\n([\s\S]*)$/,
+    );
+    assert.ok(evidenceMatch, "timeout diagnostics should include a process-evidence section");
+    assert.match(evidenceMatch[1], /PID\s+PPID\s+PGID STAT\s+ELAPSED COMMAND/);
+    assert.match(
+      evidenceMatch[1],
+      /test-runner-watchdog-fixture\.mjs descendant/,
+    );
 
     const processes = readFixtureProcesses(markerPath);
     await assertProcessesGone(processes);
   });
+
+  for (const [signal, expectedExitCode] of [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ] as const) {
+    it(`cleans its process group when it receives ${signal}`, async (t) => {
+      const directory = mkdtempSync(join(tmpdir(), "minime-watchdog-signal-"));
+      const markerPath = join(directory, "processes.json");
+      let output = "";
+      const watchdog = spawn(
+        process.execPath,
+        [supervisorPath, "--", "--test", fixturePath],
+        {
+          cwd: packageRoot,
+          env: fixtureEnvironment(markerPath, {
+            MINIME_WATCHDOG_FIXTURE_MODE: "stall",
+            MINIME_TEST_SUITE_TIMEOUT_MS: "10000",
+            MINIME_TEST_TERMINATION_GRACE_MS: "150",
+          }),
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      watchdog.stdout.on("data", (chunk) => { output += chunk.toString(); });
+      watchdog.stderr.on("data", (chunk) => { output += chunk.toString(); });
+
+      t.after(() => {
+        if (
+          watchdog.pid !== undefined
+          && watchdog.exitCode === null
+          && watchdog.signalCode === null
+        ) {
+          killProcess(watchdog.pid);
+        }
+        cleanupFixture(markerPath);
+        rmSync(directory, { recursive: true, force: true });
+      });
+
+      await waitFor(() => existsSync(markerPath), "fixture process marker");
+      const watchdogExit = waitForExit(watchdog);
+      assert.equal(watchdog.kill(signal), true);
+
+      const result = await watchdogExit;
+      assert.equal(result.signal, null, output);
+      assert.equal(result.code, expectedExitCode, output);
+
+      const processes = readFixtureProcesses(markerPath);
+      await assertProcessesGone(processes);
+    });
+  }
 
   it("propagates an ordinary exit code and cleans its descendant", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-watchdog-failure-"));

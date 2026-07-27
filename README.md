@@ -555,4 +555,12 @@ git ls-files | grep -E "^(node_modules/|dist/|\.tmp/|\.claude/|config\.yaml|conf
 npm run check:schema-guard-contract
 ```
 
+`npm test` gives each Node test 240 seconds and bounds the complete suite at
+30 minutes; CI adds a 35-minute outer job limit. On a suite timeout, the
+watchdog reports the stage, command, elapsed time, and live process-group
+evidence, exits with status 124, and cleans the group with bounded `SIGTERM`
+then `SIGKILL`. For focused runs, set `MINIME_TEST_SUITE_TIMEOUT_MS` or
+`MINIME_TEST_TERMINATION_GRACE_MS` to a positive millisecond value no greater
+than 2,147,483,647, and use `MINIME_TEST_STAGE` to label diagnostics.
+
 Changes should land through pull requests. Do not push directly to `main`.
