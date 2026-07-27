@@ -954,6 +954,34 @@ describe("SessionManager acknowledged steer", () => {
     assert.strictEqual(manager.getActive("steer-child-exit"), undefined);
   });
 
+  it("honors an acknowledgement buffered before child exit", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-buffered-exit");
+    (manager as unknown as {
+      setupCrashRecovery(chatId: string, child: ChildProcess): void;
+    }).setupCrashRecovery("steer-buffered-exit", fixture.child);
+    const turn = await beginSteeringTurn(manager, "steer-buffered-exit");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const acknowledgement = manager.steerSessionMessage(
+      "steer-buffered-exit",
+      "main",
+      "correction",
+    );
+    const command = await waitForAcknowledgedSteerCommand(fixture);
+
+    fixture.stdout.push(piAcknowledgedSteerResult(command.id, true));
+    (fixture.child as unknown as { exitCode: number | null }).exitCode = 1;
+    fixture.child.emit("exit", 1, null);
+    fixture.stdout.push(null);
+
+    assert.strictEqual(await acknowledgement, true);
+    await turn.done;
+    assert.strictEqual(fixture.session.pendingSteers.size, 0);
+    assert.strictEqual(manager.getActive("steer-buffered-exit"), undefined);
+  });
+
   it("settles pending steer fallback before turn completion and ignores a late acknowledgement", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
@@ -1016,6 +1044,30 @@ describe("SessionManager acknowledged steer", () => {
     assert.notStrictEqual(replacement.session, oldFixture.session);
     assert.strictEqual(replacement.session.pendingSteers.size, 0);
     await manager.closeAll();
+  });
+
+  it("honors an acknowledgement buffered before session teardown", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const fixture = createSteeringFixture(manager, "steer-buffered-teardown");
+    const turn = await beginSteeringTurn(manager, "steer-buffered-teardown");
+    await waitForSteeringCommand(fixture, "prompt");
+
+    const acknowledgement = manager.steerSessionMessage(
+      "steer-buffered-teardown",
+      "main",
+      "correction",
+    );
+    const command = await waitForAcknowledgedSteerCommand(fixture);
+
+    fixture.stdout.push(piAcknowledgedSteerResult(command.id, true));
+    const close = manager.closeSession("steer-buffered-teardown");
+
+    assert.strictEqual(await acknowledgement, true);
+    await close;
+    await turn.done;
+    assert.strictEqual(fixture.session.pendingSteers.size, 0);
+    assert.strictEqual(manager.getActive("steer-buffered-teardown"), undefined);
   });
 });
 

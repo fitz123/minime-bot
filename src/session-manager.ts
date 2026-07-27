@@ -601,7 +601,6 @@ export class SessionManager {
       if (!hasExited(existing.child)) {
         existing.child.kill("SIGKILL");
       }
-      this.settlePendingSteers(existing);
       this.active.delete(chatId);
       sessionsActive.dec();
     }
@@ -1121,9 +1120,9 @@ export class SessionManager {
       this.store.setSession(chatId, this.toSessionState(chatId, session));
     }
 
-    this.settlePendingSteers(session);
-
-    // Remove from active map first to prevent re-entry
+    // Remove from active first to reject new steering attempts. The current
+    // stdout reader still owns existing correlations and must drain any success
+    // record buffered before termination; its result/EOF path settles the rest.
     this.active.delete(chatId);
     sessionsActive.dec();
 
@@ -1326,8 +1325,9 @@ export class SessionManager {
         clearTimeout(session.idleTimer);
       }
 
-      // Remove from active map (not from store — session can be resumed)
-      this.settlePendingSteers(session);
+      // Remove from active (not from store — session can be resumed) so no new
+      // steering starts. The current stdout reader must first drain any success
+      // record buffered before this exit event, then settle unresolved entries.
       this.active.delete(chatId);
       sessionsActive.dec();
 
