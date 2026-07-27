@@ -30,6 +30,7 @@ describe("GitHub workflows", () => {
       "branches: [main]",
       "actions/setup-node@v4",
       'node-version: "22.19.0"',
+      "timeout-minutes: 35",
       "npm ci",
       "npm test",
       "npm run build",
