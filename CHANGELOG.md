@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.7.38
+
+- Continue a reasoning-only `stopReason=length` turn after successful Pi 0.82.1
+  threshold compaction, while preserving queued steering, truthful terminal
+  diagnostics, exactly-once final delivery, and session history without
+  persisted continuation control (#64).
+
 ## 2026.7.37
 
 - Deliver ordinary Telegram corrections at Pi's native active-turn steering
