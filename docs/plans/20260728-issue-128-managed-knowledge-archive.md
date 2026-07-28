@@ -46,9 +46,9 @@ npm pack --dry-run
 
 **Serves:** Reversible preservation, active-index/default-search removal, complete update/archive logging, and the existing ADR-077/081 managed consistency boundary.
 
-- [ ] Split write-payload validation from operation dispatch in `src/knowledge/update.ts`; add archive/restore path-only normalization, original-to-archive mapping, strict active/archive collision checks, regular-file/symlink/containment checks, and operation-specific success/failure responses without weakening create/update/upsert validation.
-- [ ] Extend the locked transaction/rollback and invariant checks for exact-byte moves plus index/log updates: archive requires zero active target links and a byte-identical archive; restore requires one active target link, no archive source, and byte-identical restored content; every index link must exactly match the complete active page set.
-- [ ] Log modifying create/update/upsert/archive/restore actions only after successful commit, refresh search after verification, and add focused filesystem tests for byte-identical round trip, default-search disappearance/reappearance, action logs, path/collision/symlink/lock rejection, injected move/write/refresh failure rollback, no dangling links, and unchanged legacy write behavior.
+- [x] Split write-payload validation from operation dispatch in `src/knowledge/update.ts`; add archive/restore path-only normalization, original-to-archive mapping, strict active/archive collision checks, regular-file/symlink/containment checks, and operation-specific success/failure responses without weakening create/update/upsert validation.
+- [x] Extend the locked transaction/rollback and invariant checks for exact-byte moves plus index/log updates: archive requires zero active target links and a byte-identical archive; restore requires one active target link, no archive source, and byte-identical restored content; every index link must exactly match the complete active page set.
+- [x] Log modifying create/update/upsert/archive/restore actions only after successful commit, refresh search after verification, and add focused filesystem tests for byte-identical round trip, default-search disappearance/reappearance, action logs, path/collision/symlink/lock rejection, injected move/write/refresh failure rollback, no dangling links, and unchanged legacy write behavior.
 
 ### Task 2: Add the fixed high/low maintenance engine and CLI
 

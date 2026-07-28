@@ -179,7 +179,7 @@ describe("knowledge_update", () => {
     assert.equal(search.results[0].path, "wiki/pages/project/runtime/runtime-notes.md");
   });
 
-  it("updates existing page content without appending a structural log entry", () => {
+  it("updates existing page content and appends an update action log", () => {
     const workspace = createV2Workspace({
       "wiki/log.md": "- 2026-06-07T12:00:00.000Z create wiki/pages/project/runtime/runtime-notes.md\n",
       "wiki/pages/project/runtime/runtime-notes.md": [
@@ -204,17 +204,330 @@ describe("knowledge_update", () => {
         frontmatter: pageFrontmatter("Runtime Notes"),
         body: "# Runtime Notes\n\nUpdated adapter notes.\n",
       },
-      { agentWorkspaceRoot: workspace },
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => new Date("2026-06-08T12:00:00.000Z"),
+      },
     );
 
     assertUpdateOk(response);
     assert.equal(response.action, "updated");
-    assert.equal(response.logPath, undefined);
+    assert.equal(response.logPath, "wiki/log.md");
     assert.match(readFileSync(join(workspace, "wiki/pages/project/runtime/runtime-notes.md"), "utf8"), /Updated adapter notes/);
     assert.equal(
       readFileSync(join(workspace, "wiki/log.md"), "utf8"),
-      "- 2026-06-07T12:00:00.000Z create wiki/pages/project/runtime/runtime-notes.md\n",
+      "- 2026-06-07T12:00:00.000Z create wiki/pages/project/runtime/runtime-notes.md\n" +
+        "- 2026-06-08T12:00:00.000Z update wiki/pages/project/runtime/runtime-notes.md\n",
     );
+  });
+
+  it("archives and restores a page byte-for-byte while updating index, search, and action logs", () => {
+    const relPath = "wiki/pages/project/history/issue-128-2026-05-01.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const originalBytes = Buffer.from(
+      [
+        "---",
+        "name: Archived Record",
+        "description: Completed dated record",
+        "type: project",
+        "---",
+        "",
+        "# Archived Record",
+        "",
+        "BYTE_PRESERVATION_SEARCH_TOKEN",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const workspace = createV2Workspace({
+      "wiki/pages/project/current.md": [
+        "---",
+        "name: Current",
+        "description: Current record",
+        "type: project",
+        "---",
+        "",
+        "# Current",
+        "",
+      ].join("\n"),
+    });
+    const activePath = join(workspace, ...relPath.split("/"));
+    mkdirSync(dirname(activePath), { recursive: true });
+    writeFileSync(activePath, originalBytes);
+
+    const beforeSearch = executeKnowledgeSearch(
+      { query: "BYTE_PRESERVATION_SEARCH_TOKEN" },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(beforeSearch.ok, true, JSON.stringify(beforeSearch));
+    assert.equal(beforeSearch.results[0]?.path, relPath);
+
+    const archived = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => new Date("2026-06-09T12:00:00.000Z"),
+      },
+    );
+    assertUpdateOk(archived);
+    assert.equal(archived.operation, "archive");
+    assert.equal(archived.action, "archived");
+    if (archived.operation !== "archive") {
+      assert.fail("expected archive response");
+    }
+    assert.equal(archived.archivePath, archiveRelPath);
+    assert.equal(existsSync(activePath), false);
+    assert.deepEqual(readFileSync(join(workspace, ...archiveRelPath.split("/"))), originalBytes);
+
+    const archivedIndex = readFileSync(join(workspace, "wiki/index.md"), "utf8");
+    assert.doesNotMatch(archivedIndex, /issue-128-2026-05-01/);
+    assert.match(archivedIndex, /\[Current\]\(pages\/project\/current\.md\)/);
+    for (const match of archivedIndex.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)) {
+      assert.equal(existsSync(join(workspace, "wiki", ...match[1].split("/"))), true);
+    }
+    const archivedSearch = executeKnowledgeSearch(
+      { query: "BYTE_PRESERVATION_SEARCH_TOKEN" },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(archivedSearch.ok, true, JSON.stringify(archivedSearch));
+    assert.deepEqual(archivedSearch.results, []);
+
+    const restored = executeKnowledgeUpdate(
+      { operation: "restore", path: relPath },
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => new Date("2026-06-10T12:00:00.000Z"),
+      },
+    );
+    assertUpdateOk(restored);
+    assert.equal(restored.operation, "restore");
+    assert.equal(restored.action, "restored");
+    assert.equal(existsSync(join(workspace, ...archiveRelPath.split("/"))), false);
+    assert.deepEqual(readFileSync(activePath), originalBytes);
+    assert.match(readFileSync(join(workspace, "wiki/index.md"), "utf8"), /issue-128-2026-05-01\.md/);
+
+    const restoredSearch = executeKnowledgeSearch(
+      { query: "BYTE_PRESERVATION_SEARCH_TOKEN" },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(restoredSearch.ok, true, JSON.stringify(restoredSearch));
+    assert.equal(restoredSearch.results[0]?.path, relPath);
+    assert.equal(
+      readFileSync(join(workspace, "wiki/log.md"), "utf8"),
+      `- 2026-06-09T12:00:00.000Z archive ${relPath} -> ${archiveRelPath}\n` +
+        `- 2026-06-10T12:00:00.000Z restore ${relPath} <- ${archiveRelPath}\n`,
+    );
+  });
+
+  it("logs upserts as create or update according to the resulting action", () => {
+    const workspace = createV2Workspace();
+    const args = {
+      op: "upsert",
+      type: "project",
+      slug: "upserted",
+      frontmatter: pageFrontmatter("Upserted"),
+      body: "# Upserted\n\nFirst body.\n",
+    };
+    const created = executeKnowledgeUpdate(args, {
+      agentWorkspaceRoot: workspace,
+      now: () => new Date("2026-06-11T12:00:00.000Z"),
+    });
+    assertUpdateOk(created);
+    assert.equal(created.action, "created");
+
+    const updated = executeKnowledgeUpdate(
+      { ...args, body: "# Upserted\n\nSecond body.\n" },
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => new Date("2026-06-12T12:00:00.000Z"),
+      },
+    );
+    assertUpdateOk(updated);
+    assert.equal(updated.action, "updated");
+    assert.equal(
+      readFileSync(join(workspace, "wiki/log.md"), "utf8"),
+      "- 2026-06-11T12:00:00.000Z create wiki/pages/project/upserted.md\n" +
+        "- 2026-06-12T12:00:00.000Z update wiki/pages/project/upserted.md\n",
+    );
+  });
+
+  it("rejects non-path archive payloads, unmanaged paths, collisions, symlinks, and locks", () => {
+    const relPath = "wiki/pages/project/archive-me.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const page = [
+      "---",
+      "name: Archive Me",
+      "description: Archive collision fixture",
+      "type: project",
+      "---",
+      "",
+      "# Archive Me",
+      "",
+    ].join("\n");
+    const workspace = createV2Workspace({ [relPath]: page });
+
+    const unexpectedPayload = executeKnowledgeUpdate(
+      { op: "archive", path: relPath, type: "project" },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(unexpectedPayload.ok, false);
+    assert.equal(unexpectedPayload.reason, "unexpected-move-payload");
+
+    const unmanaged = executeKnowledgeUpdate(
+      { op: "archive", path: "artifacts/archive-me.md" },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(unmanaged.ok, false);
+    assert.equal(unmanaged.reason, "path-not-managed-page");
+
+    writeFiles(workspace, { [archiveRelPath]: page });
+    const duplicate = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(duplicate.ok, false);
+    assert.equal(duplicate.reason, "active-archive-collision");
+    rmSync(join(workspace, "artifacts"), { recursive: true, force: true });
+
+    const lockPath = join(workspace, ".tmp", "knowledge-update.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 1, acquiredAt: "2026-06-13T12:00:00.000Z" })}\n`,
+      "utf8",
+    );
+    const locked = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => new Date("2026-06-13T12:00:01.000Z"),
+        staleLockMs: 60_000,
+      },
+    );
+    assert.equal(locked.ok, false);
+    assert.equal(locked.status, "locked");
+    rmSync(lockPath, { force: true });
+
+    const outside = createWorkspace();
+    mkdirSync(join(workspace, "artifacts"), { recursive: true });
+    symlinkSync(outside, join(workspace, "artifacts", "knowledge-archive"), "dir");
+    const symlinked = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: workspace },
+    );
+    assert.equal(symlinked.ok, false);
+    assert.equal(symlinked.reason, "symlink-escape");
+    assert.equal(existsSync(join(outside, ...relPath.split("/"))), false);
+    assert.equal(readFileSync(join(workspace, ...relPath.split("/")), "utf8"), page);
+  });
+
+  it("rejects occupied one-sided archive and restore destinations without overwriting", () => {
+    const relPath = "wiki/pages/project/collision.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const page = [
+      "---",
+      "name: Collision",
+      "description: Collision fixture",
+      "type: project",
+      "---",
+      "",
+      "# Collision",
+      "",
+    ].join("\n");
+    const archivedOnly = createV2Workspace({ [archiveRelPath]: page });
+    const archiveAgain = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: archivedOnly },
+    );
+    assert.equal(archiveAgain.ok, false);
+    assert.equal(archiveAgain.reason, "archive-destination-exists");
+    assert.equal(readFileSync(join(archivedOnly, ...archiveRelPath.split("/")), "utf8"), page);
+
+    const activeOnly = createV2Workspace({ [relPath]: page });
+    const restoreOverActive = executeKnowledgeUpdate(
+      { op: "restore", path: relPath },
+      { agentWorkspaceRoot: activeOnly },
+    );
+    assert.equal(restoreOverActive.ok, false);
+    assert.equal(restoreOverActive.reason, "active-destination-exists");
+    assert.equal(readFileSync(join(activeOnly, ...relPath.split("/")), "utf8"), page);
+  });
+
+  it("rolls an archive back when its move, transaction write, or search refresh fails", () => {
+    const relPath = "wiki/pages/project/rollback-archive.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const page = [
+      "---",
+      "name: Rollback Archive",
+      "description: Rollback fixture",
+      "type: project",
+      "---",
+      "",
+      "# Rollback Archive",
+      "",
+      "ROLLBACK_ARCHIVE_TOKEN",
+      "",
+    ].join("\n");
+
+    for (const failureKind of ["move", "write", "refresh"] as const) {
+      const originalIndex = "# Knowledge Index\n";
+      const originalLog = "- prior entry\n";
+      const workspace = createV2Workspace({
+        [relPath]: page,
+        "wiki/index.md": originalIndex,
+        "wiki/log.md": originalLog,
+      });
+      const activePath = join(workspace, ...relPath.split("/"));
+      const archivePath = join(workspace, ...archiveRelPath.split("/"));
+      const fs =
+        failureKind === "move"
+          ? {
+              renameSync(from: Parameters<typeof renameSync>[0], to: Parameters<typeof renameSync>[1]) {
+                if (from === activePath && to === archivePath) {
+                  renameSync(from, to);
+                  throw new Error("forced move failure");
+                }
+                return renameSync(from, to);
+              },
+            }
+          : failureKind === "write"
+            ? {
+                writeFileSync(path: Parameters<typeof writeFileSync>[0], ...args: unknown[]) {
+                  if (typeof path === "string" && path.includes(".index.md.") && path.endsWith(".tmp")) {
+                    throw new Error("forced transaction write failure");
+                  }
+                  return (writeFileSync as (...values: unknown[]) => void)(path, ...args);
+                },
+              }
+            : undefined;
+
+      const response = executeKnowledgeUpdate(
+        { op: "archive", path: relPath },
+        {
+          agentWorkspaceRoot: workspace,
+          ...(fs ? { fs } : {}),
+          ...(failureKind === "refresh"
+            ? {
+                refreshSearchBackend() {
+                  throw new Error("forced search refresh failure");
+                },
+              }
+            : {}),
+        },
+      );
+      assert.equal(response.ok, false, failureKind);
+      assert.equal(existsSync(activePath), true, failureKind);
+      assert.equal(existsSync(archivePath), false, failureKind);
+      assert.equal(readFileSync(activePath, "utf8"), page, failureKind);
+      assert.equal(readFileSync(join(workspace, "wiki/index.md"), "utf8"), originalIndex, failureKind);
+      assert.equal(readFileSync(join(workspace, "wiki/log.md"), "utf8"), originalLog, failureKind);
+      const search = executeKnowledgeSearch(
+        { query: "ROLLBACK_ARCHIVE_TOKEN" },
+        { agentWorkspaceRoot: workspace },
+      );
+      assert.equal(search.ok, true, JSON.stringify(search));
+      assert.equal(search.results[0]?.path, relPath, failureKind);
+    }
   });
 
   it("rejects create for an existing page without changing page, index, or log", () => {

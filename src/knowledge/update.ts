@@ -23,8 +23,10 @@ import {
 } from "./layout.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
-export type KnowledgeUpdateOperation = "create" | "update" | "upsert";
-export type KnowledgeUpdateAction = "created" | "updated";
+export type KnowledgeWriteOperation = "create" | "update" | "upsert";
+export type KnowledgeMoveOperation = "archive" | "restore";
+export type KnowledgeUpdateOperation = KnowledgeWriteOperation | KnowledgeMoveOperation;
+export type KnowledgeUpdateAction = "created" | "updated" | "archived" | "restored";
 
 export interface KnowledgeUpdateArgs {
   op?: unknown;
@@ -55,17 +57,30 @@ export interface KnowledgeUpdateDeps {
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
 }
 
-export interface KnowledgeUpdateSuccess {
+interface KnowledgeUpdateSuccessBase {
   ok: true;
   layoutKind: "v2";
   operation: KnowledgeUpdateOperation;
   action: KnowledgeUpdateAction;
   path: string;
   indexPath: "wiki/index.md";
-  logPath?: "wiki/log.md";
+  logPath: "wiki/log.md";
   lockPath: ".tmp/knowledge-update.lock";
+}
+
+export interface KnowledgeWriteSuccess extends KnowledgeUpdateSuccessBase {
+  operation: KnowledgeWriteOperation;
+  action: "created" | "updated";
   frontmatter: KnowledgePageFrontmatter;
 }
+
+export interface KnowledgeMoveSuccess extends KnowledgeUpdateSuccessBase {
+  operation: KnowledgeMoveOperation;
+  action: "archived" | "restored";
+  archivePath: string;
+}
+
+export type KnowledgeUpdateSuccess = KnowledgeWriteSuccess | KnowledgeMoveSuccess;
 
 export interface KnowledgeUpdateFailure {
   ok: false;
@@ -188,10 +203,14 @@ function isKnowledgeFailure(value: ResolvedKnowledgeLayout | KnowledgeUpdateFail
 
 function normalizeOperation(raw: unknown): KnowledgeUpdateOperation | undefined {
   const op = typeof raw === "string" ? raw.toLowerCase() : "";
-  if (op === "create" || op === "update" || op === "upsert") {
+  if (op === "create" || op === "update" || op === "upsert" || op === "archive" || op === "restore") {
     return op;
   }
   return undefined;
+}
+
+function isWriteOperation(operation: KnowledgeUpdateOperation): operation is KnowledgeWriteOperation {
+  return operation === "create" || operation === "update" || operation === "upsert";
 }
 
 function normalizeType(raw: unknown): KnowledgePageType | undefined {
@@ -357,6 +376,96 @@ function resolveTargetRelPath(args: KnowledgeUpdateArgs, type: KnowledgePageType
   return `wiki/pages/${type}/${slug}`;
 }
 
+interface NormalizedWriteRequest {
+  operation: KnowledgeWriteOperation;
+  type: KnowledgePageType;
+  relPath: string;
+  frontmatter: KnowledgePageFrontmatter;
+  body: string;
+}
+
+interface NormalizedMoveRequest {
+  operation: KnowledgeMoveOperation;
+  type: KnowledgePageType;
+  relPath: string;
+  archiveRelPath: string;
+}
+
+type NormalizedKnowledgeUpdateRequest = NormalizedWriteRequest | NormalizedMoveRequest;
+
+function normalizeManagedPagePath(raw: unknown): { relPath: string; type: KnowledgePageType } | KnowledgeUpdateFailure {
+  const relPath = normalizePagePath(raw);
+  if (typeof relPath !== "string") {
+    return relPath;
+  }
+  const type = pageTypeForRelPath(relPath);
+  if (!type || !relPath.startsWith(`wiki/pages/${type}/`) || relPath.split("/").length < 4) {
+    return failure(
+      "rejected",
+      "path-not-managed-page",
+      "Archive and restore require an original path under wiki/pages/<type>/**/*.md.",
+    );
+  }
+  return { relPath, type };
+}
+
+function normalizeKnowledgeUpdateRequest(
+  args: KnowledgeUpdateArgs,
+): NormalizedKnowledgeUpdateRequest | KnowledgeUpdateFailure {
+  const operation = normalizeOperation(args.op ?? args.operation);
+  if (!operation) {
+    return failure(
+      "rejected",
+      "invalid-operation",
+      "knowledge_update op must be create, update, upsert, archive, or restore.",
+    );
+  }
+
+  if (!isWriteOperation(operation)) {
+    const allowedFields = new Set(["op", "operation", "path"]);
+    const unexpectedField = Object.keys(args).find((field) => !allowedFields.has(field));
+    if (unexpectedField) {
+      return failure(
+        "rejected",
+        "unexpected-move-payload",
+        `knowledge_update ${operation} accepts only the original managed page path; ${unexpectedField} is not allowed.`,
+      );
+    }
+    const managedPath = normalizeManagedPagePath(args.path);
+    if (isUpdateFailure(managedPath)) {
+      return managedPath;
+    }
+    return {
+      operation,
+      type: managedPath.type,
+      relPath: managedPath.relPath,
+      archiveRelPath: `artifacts/knowledge-archive/${managedPath.relPath}`,
+    };
+  }
+
+  const type = normalizeType(args.type);
+  if (!type) {
+    return failure(
+      "rejected",
+      "invalid-type",
+      "knowledge_update type must be user, project, feedback, or reference.",
+    );
+  }
+  const frontmatter = validateKnowledgePageFrontmatter(args.frontmatter, type);
+  if (isUpdateFailure(frontmatter)) {
+    return frontmatter;
+  }
+  const body = markdownBody(args.body);
+  if (typeof body !== "string") {
+    return body;
+  }
+  const relPath = resolveTargetRelPath(args, type);
+  if (typeof relPath !== "string") {
+    return relPath;
+  }
+  return { operation, type, relPath, frontmatter, body };
+}
+
 function toWorkspaceRel(root: string, absPath: string): string {
   return relative(root, absPath).split(sep).join("/");
 }
@@ -447,6 +556,52 @@ function assertTargetPath(
   return absPath;
 }
 
+function assertArchivePath(
+  layout: ResolvedKnowledgeV2Layout,
+  archiveRelPath: string,
+  fs: KnowledgeUpdateFs,
+): string | KnowledgeUpdateFailure {
+  const archiveRoot = normalize(resolve(layout.paths.artifactsDir, "knowledge-archive"));
+  const absPath = normalize(resolve(layout.agentWorkspaceRoot, ...archiveRelPath.split("/")));
+  if (!isInsidePath(archiveRoot, absPath)) {
+    return failure(
+      "rejected",
+      "archive-path-escape",
+      "knowledge_update archive path must stay inside artifacts/knowledge-archive.",
+    );
+  }
+  const symlinkProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, absPath, fs);
+  if (symlinkProblem) {
+    return symlinkProblem;
+  }
+  return absPath;
+}
+
+function assertRegularFile(
+  path: string,
+  fs: KnowledgeUpdateFs,
+  missingReason: string,
+  missingMessage: string,
+  invalidMessage: string,
+): KnowledgeUpdateFailure | undefined {
+  let stat: ReturnType<KnowledgeUpdateFs["lstatSync"]>;
+  try {
+    stat = fs.lstatSync(path);
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") {
+      return failure("rejected", missingReason, missingMessage);
+    }
+    return failure("rejected", "path-unreadable", "knowledge_update could not inspect the managed page path.");
+  }
+  if (stat.isSymbolicLink()) {
+    return failure("rejected", "symlink-escape", "knowledge_update refuses symlinked active or archived pages.");
+  }
+  if (!stat.isFile()) {
+    return failure("rejected", "target-not-file", invalidMessage);
+  }
+  return undefined;
+}
+
 function splitMarkdownLines(markdown: string): string[] {
   const normalized = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (normalized.length === 0) {
@@ -516,8 +671,11 @@ function walkPageFiles(
   let dirents;
   try {
     dirents = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return undefined;
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") {
+      return undefined;
+    }
+    return failure("rejected", "path-unreadable", "knowledge_update could not enumerate active Knowledge pages.");
   }
 
   for (const dirent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -642,18 +800,20 @@ function extractMarkdownLinks(markdown: string): string[] {
 
 function verifyIndexInvariants(
   layout: ResolvedKnowledgeV2Layout,
-  updatedRelPath: string,
+  targetRelPath: string,
+  expectedTargetCount: 0 | 1,
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   const index = fs.readFileSync(layout.paths.indexPath, "utf8");
-  const expectedLink = relative(dirname(layout.paths.indexPath), resolve(layout.agentWorkspaceRoot, ...updatedRelPath.split("/")))
+  const targetLink = relative(dirname(layout.paths.indexPath), resolve(layout.agentWorkspaceRoot, ...targetRelPath.split("/")))
     .split(sep)
     .join("/");
-  let updatedCount = 0;
+  const actualLinks = extractMarkdownLinks(index);
+  let targetCount = 0;
 
-  for (const link of extractMarkdownLinks(index)) {
-    if (link === expectedLink) {
-      updatedCount += 1;
+  for (const link of actualLinks) {
+    if (link === targetLink) {
+      targetCount += 1;
     }
     if (isAbsolute(link) || link.includes("\\") || link.includes("#")) {
       return failure("error", "index-link-invalid", `Knowledge index link is not a plain relative Markdown link: ${link}.`);
@@ -668,13 +828,29 @@ function verifyIndexInvariants(
     }
   }
 
-  if (updatedCount !== 1) {
-    return failure("error", "updated-page-index-count", "Updated page must appear exactly once in wiki/index.md.");
+  if (targetCount !== expectedTargetCount) {
+    return failure(
+      "error",
+      "target-page-index-count",
+      `Managed target must appear ${expectedTargetCount === 1 ? "exactly once" : "zero times"} in wiki/index.md.`,
+    );
   }
 
   const pages = collectPages(layout, fs);
   if (isUpdateFailure(pages)) {
     return pages;
+  }
+  const expectedLinks = pages.map((page) => page.linkPath).sort((a, b) => a.localeCompare(b));
+  const sortedActualLinks = [...actualLinks].sort((a, b) => a.localeCompare(b));
+  if (
+    expectedLinks.length !== sortedActualLinks.length ||
+    expectedLinks.some((link, index) => link !== sortedActualLinks[index])
+  ) {
+    return failure(
+      "error",
+      "index-page-set-mismatch",
+      "wiki/index.md links must exactly match the complete active Knowledge page set.",
+    );
   }
   return undefined;
 }
@@ -847,7 +1023,10 @@ function atomicWriteFiles(writes: AtomicWrite[], fs: KnowledgeUpdateFs): AtomicW
   }
 }
 
-function actionForOperation(operation: KnowledgeUpdateOperation, existed: boolean): KnowledgeUpdateAction | KnowledgeUpdateFailure {
+function actionForOperation(
+  operation: KnowledgeWriteOperation,
+  existed: boolean,
+): "created" | "updated" | KnowledgeUpdateFailure {
   if (operation === "create") {
     return existed
       ? failure("rejected", "page-exists", "knowledge_update create refused to overwrite an existing page.")
@@ -861,16 +1040,308 @@ function actionForOperation(operation: KnowledgeUpdateOperation, existed: boolea
   return existed ? "updated" : "created";
 }
 
-function appendStructuralLog(existingLog: string, action: KnowledgeUpdateAction, relPath: string, now: Date): string {
-  if (action !== "created") {
-    return existingLog;
-  }
+function appendStructuralLog(
+  existingLog: string,
+  action: KnowledgeUpdateAction,
+  relPath: string,
+  archiveRelPath: string | undefined,
+  now: Date,
+): string {
+  const verb: Record<KnowledgeUpdateAction, string> = {
+    created: "create",
+    updated: "update",
+    archived: "archive",
+    restored: "restore",
+  };
+  const archiveLocation =
+    archiveRelPath === undefined ? "" : action === "restored" ? ` <- ${archiveRelPath}` : ` -> ${archiveRelPath}`;
   const base = existingLog.endsWith("\n") || existingLog.length === 0 ? existingLog : `${existingLog}\n`;
-  return `${base}- ${now.toISOString()} create ${relPath}\n`;
+  return `${base}- ${now.toISOString()} ${verb[action]} ${relPath}${archiveLocation}\n`;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function readFileBytes(path: string, fs: KnowledgeUpdateFs): Buffer {
+  const content = fs.readFileSync(path) as Buffer | string;
+  return typeof content === "string" ? Buffer.from(content) : Buffer.from(content);
+}
+
+function rollbackMove(sourcePath: string, destinationPath: string, fs: KnowledgeUpdateFs): void {
+  try {
+    if (!fs.existsSync(sourcePath) && fs.existsSync(destinationPath)) {
+      fs.renameSync(destinationPath, sourcePath);
+    }
+  } catch {
+    // Preserve the original failure; transaction rollback is best effort.
+  }
+}
+
+function verifyMovedBytes(
+  sourcePath: string,
+  destinationPath: string,
+  expectedBytes: Buffer,
+  fs: KnowledgeUpdateFs,
+): KnowledgeUpdateFailure | undefined {
+  if (fs.existsSync(sourcePath)) {
+    return failure("error", "move-source-present", "Managed move left the source page in place.");
+  }
+  if (!fs.existsSync(destinationPath)) {
+    return failure("error", "move-destination-missing", "Managed move did not create its destination page.");
+  }
+  let stat: ReturnType<KnowledgeUpdateFs["lstatSync"]>;
+  try {
+    stat = fs.lstatSync(destinationPath);
+  } catch {
+    return failure("error", "move-destination-unreadable", "Managed move destination could not be inspected.");
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    return failure("error", "move-destination-invalid", "Managed move destination must be a regular file.");
+  }
+  if (!readFileBytes(destinationPath, fs).equals(expectedBytes)) {
+    return failure("error", "move-byte-mismatch", "Managed move destination bytes differ from the source bytes.");
+  }
+  return undefined;
+}
+
+function validateIndexAndLogPaths(
+  layout: ResolvedKnowledgeV2Layout,
+  fs: KnowledgeUpdateFs,
+): KnowledgeUpdateFailure | undefined {
+  return (
+    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs) ??
+    assertRegularFileIfExists(
+      layout.paths.indexPath,
+      fs,
+      "knowledge_update index path must be a regular Markdown file.",
+    ) ??
+    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
+    assertRegularFileIfExists(layout.paths.logPath, fs, "knowledge_update log path must be a regular Markdown file.")
+  );
+}
+
+function executeWriteRequest(
+  request: NormalizedWriteRequest,
+  layout: ResolvedKnowledgeV2Layout,
+  fs: KnowledgeUpdateFs,
+  deps: KnowledgeUpdateDeps,
+  lockRelPath: ".tmp/knowledge-update.lock",
+): KnowledgeWriteSuccess | KnowledgeUpdateFailure {
+  const absPath = assertTargetPath(layout, request.relPath, request.type, fs);
+  if (typeof absPath !== "string") {
+    return absPath;
+  }
+
+  const existed = fs.existsSync(absPath);
+  const action = actionForOperation(request.operation, existed);
+  if (typeof action !== "string") {
+    return action;
+  }
+  if (existed) {
+    const fileProblem = assertRegularFile(
+      absPath,
+      fs,
+      "page-missing",
+      "knowledge_update update requires an existing page.",
+      "knowledge_update target must be a regular Markdown file.",
+    );
+    if (fileProblem) {
+      return fileProblem;
+    }
+  }
+
+  const beforePages = collectPages(layout, fs);
+  if (isUpdateFailure(beforePages)) {
+    return beforePages;
+  }
+  const pageForIndex: ParsedPage = {
+    absPath,
+    relPath: request.relPath,
+    linkPath: relative(dirname(layout.paths.indexPath), absPath).split(sep).join("/"),
+    frontmatter: request.frontmatter,
+  };
+  const pagesByPath = new Map(beforePages.map((page) => [page.relPath, page]));
+  pagesByPath.set(request.relPath, pageForIndex);
+  const nextPages = [...pagesByPath.values()].sort((a, b) => a.relPath.localeCompare(b.relPath));
+  const pathProblem = validateIndexAndLogPaths(layout, fs);
+  if (pathProblem) {
+    return pathProblem;
+  }
+
+  const existingLog = fs.existsSync(layout.paths.logPath) ? fs.readFileSync(layout.paths.logPath, "utf8") : "";
+  const logContent = appendStructuralLog(
+    existingLog,
+    action,
+    request.relPath,
+    undefined,
+    deps.now?.() ?? new Date(),
+  );
+  const plans = atomicWriteFiles(
+    [
+      { path: absPath, content: formatKnowledgePage(request.frontmatter, request.body) },
+      { path: layout.paths.indexPath, content: generateKnowledgeIndex(nextPages) },
+      { path: layout.paths.logPath, content: logContent },
+    ],
+    fs,
+  );
+  try {
+    const invariantProblem = verifyIndexInvariants(layout, request.relPath, 1, fs);
+    if (invariantProblem) {
+      rollbackCommittedWrites(plans, fs);
+      return invariantProblem;
+    }
+    deps.refreshSearchBackend?.(layout);
+  } catch (error) {
+    rollbackCommittedWrites(plans, fs);
+    return failure(
+      "error",
+      "knowledge-update-verify-failed",
+      `knowledge_update verification failed: ${errorMessage(error)}`,
+    );
+  }
+
+  return {
+    ok: true,
+    layoutKind: "v2",
+    operation: request.operation,
+    action,
+    path: request.relPath,
+    indexPath: "wiki/index.md",
+    logPath: "wiki/log.md",
+    lockPath: lockRelPath,
+    frontmatter: request.frontmatter,
+  };
+}
+
+function executeMoveRequest(
+  request: NormalizedMoveRequest,
+  layout: ResolvedKnowledgeV2Layout,
+  fs: KnowledgeUpdateFs,
+  deps: KnowledgeUpdateDeps,
+  lockRelPath: ".tmp/knowledge-update.lock",
+): KnowledgeMoveSuccess | KnowledgeUpdateFailure {
+  const activePath = assertTargetPath(layout, request.relPath, request.type, fs);
+  if (typeof activePath !== "string") {
+    return activePath;
+  }
+  const archivePath = assertArchivePath(layout, request.archiveRelPath, fs);
+  if (typeof archivePath !== "string") {
+    return archivePath;
+  }
+
+  const activeExists = fs.existsSync(activePath);
+  const archiveExists = fs.existsSync(archivePath);
+  if (activeExists && archiveExists) {
+    return failure(
+      "rejected",
+      "active-archive-collision",
+      "Both active and archived copies exist; knowledge_update refuses to choose or overwrite either copy.",
+    );
+  }
+
+  const sourcePath = request.operation === "archive" ? activePath : archivePath;
+  const destinationPath = request.operation === "archive" ? archivePath : activePath;
+  if (fs.existsSync(destinationPath)) {
+    return failure(
+      "rejected",
+      request.operation === "archive" ? "archive-destination-exists" : "active-destination-exists",
+      `knowledge_update ${request.operation} refuses to overwrite an occupied destination.`,
+    );
+  }
+  const sourceProblem =
+    request.operation === "archive"
+      ? assertRegularFile(
+          sourcePath,
+          fs,
+          "page-missing",
+          "knowledge_update archive requires an existing active page.",
+          "knowledge_update archive source must be a regular Markdown file.",
+        )
+      : assertRegularFile(
+          sourcePath,
+          fs,
+          "archive-missing",
+          "knowledge_update restore requires an existing archived page.",
+          "knowledge_update restore source must be a regular Markdown file.",
+        );
+  if (sourceProblem) {
+    return sourceProblem;
+  }
+
+  const beforePages = collectPages(layout, fs);
+  if (isUpdateFailure(beforePages)) {
+    return beforePages;
+  }
+  const pathProblem = validateIndexAndLogPaths(layout, fs);
+  if (pathProblem) {
+    return pathProblem;
+  }
+  const expectedBytes = readFileBytes(sourcePath, fs);
+  const existingLog = fs.existsSync(layout.paths.logPath) ? fs.readFileSync(layout.paths.logPath, "utf8") : "";
+  const action = request.operation === "archive" ? "archived" : "restored";
+
+  fs.mkdirSync(dirname(destinationPath), { recursive: true });
+  const createdDestinationProblem =
+    request.operation === "archive"
+      ? assertArchivePath(layout, request.archiveRelPath, fs)
+      : assertTargetPath(layout, request.relPath, request.type, fs);
+  if (typeof createdDestinationProblem !== "string") {
+    return createdDestinationProblem;
+  }
+
+  let plans: AtomicWritePlan[] = [];
+  try {
+    fs.renameSync(sourcePath, destinationPath);
+    const nextPages = collectPages(layout, fs);
+    if (isUpdateFailure(nextPages)) {
+      rollbackMove(sourcePath, destinationPath, fs);
+      return nextPages;
+    }
+    const logContent = appendStructuralLog(
+      existingLog,
+      action,
+      request.relPath,
+      request.archiveRelPath,
+      deps.now?.() ?? new Date(),
+    );
+    plans = atomicWriteFiles(
+      [
+        { path: layout.paths.indexPath, content: generateKnowledgeIndex(nextPages) },
+        { path: layout.paths.logPath, content: logContent },
+      ],
+      fs,
+    );
+    const invariantProblem =
+      verifyMovedBytes(sourcePath, destinationPath, expectedBytes, fs) ??
+      verifyIndexInvariants(layout, request.relPath, request.operation === "archive" ? 0 : 1, fs);
+    if (invariantProblem) {
+      rollbackCommittedWrites(plans, fs);
+      rollbackMove(sourcePath, destinationPath, fs);
+      return invariantProblem;
+    }
+    deps.refreshSearchBackend?.(layout);
+  } catch (error) {
+    rollbackCommittedWrites(plans, fs);
+    rollbackMove(sourcePath, destinationPath, fs);
+    return failure(
+      "error",
+      "knowledge-update-verify-failed",
+      `knowledge_update verification failed: ${errorMessage(error)}`,
+    );
+  }
+
+  return {
+    ok: true,
+    layoutKind: "v2",
+    operation: request.operation,
+    action,
+    path: request.relPath,
+    archivePath: request.archiveRelPath,
+    indexPath: "wiki/index.md",
+    logPath: "wiki/log.md",
+    lockPath: lockRelPath,
+  };
 }
 
 export function executeKnowledgeUpdate(args: KnowledgeUpdateArgs = {}, deps: KnowledgeUpdateDeps = {}): KnowledgeUpdateResponse {
@@ -878,24 +1349,9 @@ export function executeKnowledgeUpdate(args: KnowledgeUpdateArgs = {}, deps: Kno
   let lock: LockHandle | undefined;
 
   try {
-    const operation = normalizeOperation(args.op ?? args.operation);
-    if (!operation) {
-      return failure("rejected", "invalid-operation", "knowledge_update op must be create, update, or upsert.");
-    }
-
-    const type = normalizeType(args.type);
-    if (!type) {
-      return failure("rejected", "invalid-type", "knowledge_update type must be user, project, feedback, or reference.");
-    }
-
-    const frontmatter = validateKnowledgePageFrontmatter(args.frontmatter, type);
-    if (isUpdateFailure(frontmatter)) {
-      return frontmatter;
-    }
-
-    const body = markdownBody(args.body);
-    if (typeof body !== "string") {
-      return body;
+    const request = normalizeKnowledgeUpdateRequest(args);
+    if (isUpdateFailure(request)) {
+      return request;
     }
 
     const layout = resolveLayoutForDeps(deps);
@@ -916,91 +1372,9 @@ export function executeKnowledgeUpdate(args: KnowledgeUpdateArgs = {}, deps: Kno
       return acquiredLock;
     }
     lock = acquiredLock;
-    const lockRelPath = lock.relPath;
-
-    const relPath = resolveTargetRelPath(args, type);
-    if (typeof relPath !== "string") {
-      return relPath;
-    }
-    const absPath = assertTargetPath(layout, relPath, type, fs);
-    if (typeof absPath !== "string") {
-      return absPath;
-    }
-
-    const existed = fs.existsSync(absPath);
-    const action = actionForOperation(operation, existed);
-    if (typeof action !== "string") {
-      return action;
-    }
-
-    if (existed) {
-      const stat = fs.lstatSync(absPath);
-      if (!stat.isFile()) {
-        return failure("rejected", "target-not-file", "knowledge_update target must be a regular Markdown file.");
-      }
-    }
-
-    const pageContent = formatKnowledgePage(frontmatter, body);
-    const beforePages = collectPages(layout, fs);
-    if (isUpdateFailure(beforePages)) {
-      return beforePages;
-    }
-
-    const pageForIndex: ParsedPage = {
-      absPath,
-      relPath,
-      linkPath: relative(dirname(layout.paths.indexPath), absPath).split(sep).join("/"),
-      frontmatter,
-    };
-    const pagesByPath = new Map(beforePages.map((page) => [page.relPath, page]));
-    pagesByPath.set(relPath, pageForIndex);
-    const nextPages = [...pagesByPath.values()].sort((a, b) => a.relPath.localeCompare(b.relPath));
-    const indexContent = generateKnowledgeIndex(nextPages);
-    const indexSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs);
-    if (indexSafetyProblem) {
-      return indexSafetyProblem;
-    }
-    const logSafetyProblem =
-      assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
-      assertRegularFileIfExists(layout.paths.logPath, fs, "knowledge_update log path must be a regular Markdown file.");
-    if (logSafetyProblem) {
-      return logSafetyProblem;
-    }
-    const existingLog = fs.existsSync(layout.paths.logPath) ? fs.readFileSync(layout.paths.logPath, "utf8") : "";
-    const now = deps.now?.() ?? new Date();
-    const logContent = appendStructuralLog(existingLog, action, relPath, now);
-    const writes: AtomicWrite[] = [
-      { path: absPath, content: pageContent },
-      { path: layout.paths.indexPath, content: indexContent },
-    ];
-    if (logContent !== existingLog) {
-      writes.push({ path: layout.paths.logPath, content: logContent });
-    }
-
-    const plans = atomicWriteFiles(writes, fs);
-    try {
-      const invariantProblem = verifyIndexInvariants(layout, relPath, fs);
-      if (invariantProblem) {
-        rollbackCommittedWrites(plans, fs);
-        return invariantProblem;
-      }
-      deps.refreshSearchBackend?.(layout);
-    } catch (error) {
-      rollbackCommittedWrites(plans, fs);
-      return failure("error", "knowledge-update-verify-failed", `knowledge_update verification failed: ${errorMessage(error)}`);
-    }
-
-    return {
-      ok: true,
-      layoutKind: "v2",
-      operation,
-      action,
-      path: relPath,
-      indexPath: "wiki/index.md",
-      ...(logContent !== existingLog ? { logPath: "wiki/log.md" as const } : {}),
-      lockPath: lockRelPath,
-      frontmatter,
-    };
+    return "body" in request
+      ? executeWriteRequest(request, layout, fs, deps, lock.relPath)
+      : executeMoveRequest(request, layout, fs, deps, lock.relPath);
   } catch (error) {
     return failure("error", "knowledge-update-failed", `knowledge_update failed: ${errorMessage(error)}`);
   } finally {
