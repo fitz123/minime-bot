@@ -39,11 +39,11 @@ git diff --check
 ### Task 1: Queue one hidden continuation only after successful threshold compaction
 **Goal:** Add the minimum first-party Pi extension state machine for the exact reasoning-only length lifecycle.
 **Serves:** The approved outcome that successful automatic compaction resumes the original turn without manual Continue UX or synthetic user-message leakage.
-- [ ] Add a small shared helper/contract that recognizes only a final assistant `stopReason="length"` with no non-whitespace visible text.
-- [ ] Add a parent interactive Pi wrapper that arms on that exact `agent_end`, consumes the arm only at a successful threshold `session_compact`, and queues one `display:false` custom follow-up so Pi 0.82.1 continues from compacted state.
-- [ ] Make duplicate/nonmatching events, overflow retry compaction, failed/aborted compaction, and settlement clear or ignore the arm without queuing extra work.
-- [ ] Add focused wrapper/helper tests proving one custom follow-up, no user-role message, no visible control text, no duplicate continuation, and no continuation when compaction did not succeed.
-- [ ] Run the new focused extension tests before Task 2.
+- [x] Add a small shared helper/contract that recognizes only a final assistant `stopReason="length"` with no non-whitespace visible text.
+- [x] Add a parent interactive Pi wrapper that arms on that exact `agent_end`, consumes the arm only at a successful threshold `session_compact`, and queues one `display:false` custom follow-up so Pi 0.82.1 continues from compacted state.
+- [x] Make duplicate/nonmatching events, overflow retry compaction, failed/aborted compaction, and settlement clear or ignore the arm without queuing extra work.
+- [x] Add focused wrapper/helper tests proving one custom follow-up, no user-role message, no visible control text, no duplicate continuation, and no continuation when compaction did not succeed.
+- [x] Run the new focused extension tests before Task 2.
 
 ### Task 2: Package the continuation wrapper only for primary interactive sessions
 **Goal:** Ship the new wrapper through the existing source and built-artifact contract without expanding other Pi execution surfaces.
