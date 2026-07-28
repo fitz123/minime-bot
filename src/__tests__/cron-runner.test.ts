@@ -1883,6 +1883,27 @@ bindings: []
         entry.message === "FAIL: invalid cron configuration"));
     });
 
+    it("logs configuration failure before terminal metric publication failure", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const recordMetric = deps.writeCronHealthMetric;
+      deps.loadCronTask = () => {
+        throw new Error("invalid cron configuration");
+      };
+      deps.writeCronHealthMetric = (cronName, exitCode, outcome) => {
+        recordMetric(cronName, exitCode, outcome);
+        throw new Error("metric persistence unavailable");
+      };
+
+      await assert.rejects(() => main(deps), /metric persistence unavailable/);
+
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "FAIL: invalid cron configuration"));
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
     it("propagates terminal metric publication failure after delivery", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
@@ -2173,6 +2194,31 @@ bindings: []
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
       assert.deepStrictEqual(calls.deliveries, []);
+    });
+
+    it("logs execution diagnostics before terminal metric publication failure", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const recordMetric = deps.writeCronHealthMetric;
+      deps.runPi = () => {
+        throw Object.assign(new Error("runner exploded"), {
+          diagnostics: "stderr: local diagnostic",
+        });
+      };
+      deps.writeCronHealthMetric = (cronName, exitCode, outcome) => {
+        recordMetric(cronName, exitCode, outcome);
+        throw new Error("metric persistence unavailable");
+      };
+
+      await assert.rejects(() => main(deps), /metric persistence unavailable/);
+
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `FAIL: Cron task "${cron.name}" failed: runner exploded`));
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "FAIL diagnostics: stderr: local diagnostic"));
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
     it("records one failure without direct delivery when LLM workspace resolution fails", async () => {
@@ -2758,6 +2804,36 @@ bindings: []
         {
           cronName: cron.name,
           targetChatId: 111111111,
+          errorMsg: "delivery transport failed",
+          adminChatId: 999999999,
+        },
+      ]);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("preserves queued output and admin fallback before metric publication failure", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const recordMetric = deps.writeCronHealthMetric;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("delivery transport failed");
+      };
+      deps.writeCronHealthMetric = (cronName, exitCode, outcome) => {
+        recordMetric(cronName, exitCode, outcome);
+        throw new Error("metric persistence unavailable");
+      };
+
+      await assert.rejects(() => main(deps), /metric persistence unavailable/);
+
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.strictEqual(state.pending, calls.outboxWrites[0]);
+      assert.deepStrictEqual(calls.deliveryFailures, [
+        {
+          cronName: cron.name,
+          targetChatId: cron.deliveryChatId,
           errorMsg: "delivery transport failed",
           adminChatId: 999999999,
         },

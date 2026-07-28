@@ -1292,8 +1292,11 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   try {
     cron = deps.loadCronTask(taskName, undefined, defaults);
   } catch (err) {
-    finalizeInvocation(taskName, "failure");
-    deps.log(taskName, `FAIL: ${(err as Error).message}`);
+    try {
+      deps.log(taskName, `FAIL: ${(err as Error).message}`);
+    } finally {
+      finalizeInvocation(taskName, "failure");
+    }
     deps.exit(1);
   }
 
@@ -1471,11 +1474,17 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   } catch (err) {
     const error = errorFromUnknown(err);
     const errMsg = `Cron task "${taskName}" failed: ${error.message}`;
-    finalizeInvocation(taskName, "failure");
-    deps.log(taskName, `FAIL: ${errMsg}`);
     const diagnostics = cronErrorDiagnostics(err);
-    if (diagnostics) {
-      deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
+    try {
+      try {
+        deps.log(taskName, `FAIL: ${errMsg}`);
+      } finally {
+        if (diagnostics) {
+          deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
+        }
+      }
+    } finally {
+      finalizeInvocation(taskName, "failure");
     }
     deps.exit(1);
   }
@@ -1503,11 +1512,17 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   try {
     await deliverWithRetry(cron.deliveryChatId, output, cron.deliveryThreadId);
   } catch (err) {
-    finalizeInvocation(taskName, "failure");
-    if (isQueueableDeliveryFailure(err)) {
-      queueOutputIfEmpty(output, cron.deliveryChatId, cron.deliveryThreadId);
+    try {
+      try {
+        if (isQueueableDeliveryFailure(err)) {
+          queueOutputIfEmpty(output, cron.deliveryChatId, cron.deliveryThreadId);
+        }
+      } finally {
+        deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
+      }
+    } finally {
+      finalizeInvocation(taskName, "failure");
     }
-    deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
     deps.exit(1);
   }
 
