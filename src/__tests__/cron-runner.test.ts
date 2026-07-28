@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   buildDeliverArgs,
   buildPiCronAgentConfig,
+  classifyLlmCronTerminalResult,
   classifyPiResult,
   CRON_DELIVERY_RETRY_DELAYS_MS,
   CRON_OUTBOX_EXPIRY_MS,
@@ -18,13 +19,19 @@ import {
   loadCronTask,
   loadDefaultDelivery,
   main,
+  MINIME_CRON_UNRESOLVED_MARKER,
   resolveCronAgentData,
   resolveCronEngine,
   runOneShot,
   runScript,
   writeCronHealthMetric,
 } from "../cron-runner.js";
-import type { CronAgentData, CronRunnerMainDeps, DeliveryDefaults } from "../cron-runner.js";
+import type {
+  CronAgentData,
+  CronRunnerMainDeps,
+  CronTerminalOutcome,
+  DeliveryDefaults,
+} from "../cron-runner.js";
 import {
   clearCronOutboxRecord,
   readCronOutboxRecord,
@@ -950,6 +957,44 @@ describe("cron-runner", () => {
     });
   });
 
+  describe("LLM cron terminal classification", () => {
+    it("strips one exact final unresolved marker and classifies failure", () => {
+      assert.deepStrictEqual(
+        classifyLlmCronTerminalResult(
+          `Finding remains unresolved.\n\n${MINIME_CRON_UNRESOLVED_MARKER}\n`,
+        ),
+        {
+          output: "Finding remains unresolved.",
+          outcome: "failure",
+        },
+      );
+    });
+
+    it("accepts a marker-only unresolved result without creating deliverable output", () => {
+      assert.deepStrictEqual(
+        classifyLlmCronTerminalResult(MINIME_CRON_UNRESOLVED_MARKER),
+        { output: "", outcome: "failure" },
+      );
+    });
+
+    it("leaves embedded, quoted, non-final, and repeated marker-like prose unchanged", () => {
+      const cases = [
+        `The token ${MINIME_CRON_UNRESOLVED_MARKER} is documented here.`,
+        `> ${MINIME_CRON_UNRESOLVED_MARKER}`,
+        `\`${MINIME_CRON_UNRESOLVED_MARKER}\``,
+        `${MINIME_CRON_UNRESOLVED_MARKER}\nThis is the final line.`,
+        `${MINIME_CRON_UNRESOLVED_MARKER}\n${MINIME_CRON_UNRESOLVED_MARKER}`,
+      ];
+
+      for (const output of cases) {
+        assert.deepStrictEqual(
+          classifyLlmCronTerminalResult(output),
+          { output, outcome: "success" },
+        );
+      }
+    });
+  });
+
   describe("cron agent data resolution", () => {
     const CONFIG_DIR = join(TEST_DIR, "cron-agent-config");
     const CONFIG_FILE = join(CONFIG_DIR, "config.yaml");
@@ -1242,10 +1287,10 @@ bindings: []
       rmSync(METRIC_DIR, { recursive: true, force: true });
     });
 
-    it("writes success timestamp and exit code to stable hashed textfiles", () => {
+    it("writes all terminal series to stable hashed textfiles without temporary residue", () => {
       const before = Math.floor(Date.now() / 1000);
 
-      writeCronHealthMetric("Daily Pi / Main!", 0, true);
+      writeCronHealthMetric("Daily Pi / Main!", 0, "success");
 
       const files = readdirSync(METRIC_DIR).filter((name) => name.endsWith(".prom")).sort();
       assert.strictEqual(files.length, 2);
@@ -1261,30 +1306,86 @@ bindings: []
       const timestamp = Number(timestampMatch[1]);
       assert.ok(timestamp >= before && timestamp <= after, `timestamp ${timestamp} outside test window`);
       assert.match(content, /minime_cron_last_exit_code\{cron="Daily Pi \/ Main!"\} 0/);
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="Daily Pi \/ Main!",outcome="success"\} 1/,
+      );
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="Daily Pi \/ Main!",outcome="failure"\} 0/,
+      );
+      assert.match(
+        content,
+        /minime_cron_last_run_timestamp_seconds\{cron="Daily Pi \/ Main!"\} \d+/,
+      );
+      assert.doesNotMatch(content, /\{[^}]*?(?:error|run_id|destination|chat_id)=/);
       assert.deepStrictEqual(
         readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
         [],
       );
     });
 
-    it("preserves the previous success timestamp when writing a failure exit code", () => {
-      writeCronHealthMetric("failing-cron", 0, true);
+    it("preserves the success timestamp and monotonically restores both counters from disk", () => {
+      writeCronHealthMetric("failing-cron", 0, "success");
       const successFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".success.prom"));
       assert.ok(successFile);
       const successContent = readFileSync(join(METRIC_DIR, successFile), "utf8");
 
-      writeCronHealthMetric("failing-cron", 2, false);
+      writeCronHealthMetric("failing-cron", 2, "failure");
 
       assert.strictEqual(readFileSync(join(METRIC_DIR, successFile), "utf8"), successContent);
       const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
       assert.ok(exitFile);
       const exitContent = readFileSync(join(METRIC_DIR, exitFile), "utf8");
       assert.match(exitContent, /minime_cron_last_exit_code\{cron="failing-cron"\} 2/);
+      assert.match(
+        exitContent,
+        /minime_cron_runs_total\{cron="failing-cron",outcome="success"\} 1/,
+      );
+      assert.match(
+        exitContent,
+        /minime_cron_runs_total\{cron="failing-cron",outcome="failure"\} 1/,
+      );
+
+      writeCronHealthMetric("failing-cron", 0, "success");
+      const repairedContent = readFileSync(join(METRIC_DIR, exitFile), "utf8");
+      assert.match(
+        repairedContent,
+        /minime_cron_runs_total\{cron="failing-cron",outcome="success"\} 2/,
+      );
+      assert.match(
+        repairedContent,
+        /minime_cron_runs_total\{cron="failing-cron",outcome="failure"\} 1/,
+      );
+      assert.match(repairedContent, /minime_cron_last_exit_code\{cron="failing-cron"\} 0/);
+    });
+
+    it("starts a valid counter epoch when prior state is missing or corrupt", () => {
+      writeCronHealthMetric("counter-reset", 1, "failure");
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      const exitPath = join(METRIC_DIR, exitFile);
+      assert.match(
+        readFileSync(exitPath, "utf8"),
+        /minime_cron_runs_total\{cron="counter-reset",outcome="failure"\} 1/,
+      );
+
+      writeFileSync(exitPath, "not prometheus state\n", "utf8");
+      writeCronHealthMetric("counter-reset", 0, "success");
+      const resetContent = readFileSync(exitPath, "utf8");
+      assert.match(
+        resetContent,
+        /minime_cron_runs_total\{cron="counter-reset",outcome="success"\} 1/,
+      );
+      assert.match(
+        resetContent,
+        /minime_cron_runs_total\{cron="counter-reset",outcome="failure"\} 0/,
+      );
     });
 
     it("keeps distinct files and labels for cron names that sanitize to the same stem", () => {
-      writeCronHealthMetric("a/b", 0, false);
-      writeCronHealthMetric("a_b", 1, false);
+      writeCronHealthMetric("a/b", 0, "failure");
+      writeCronHealthMetric("a_b", 1, "failure");
 
       const files = readdirSync(METRIC_DIR).filter((name) => name.endsWith(".exit.prom")).sort();
       assert.strictEqual(files.length, 2);
@@ -1295,13 +1396,18 @@ bindings: []
     });
 
     it("escapes quotes, backslashes, newlines, and carriage returns in Prometheus labels", () => {
-      writeCronHealthMetric('quoted"slash\\newline\ncarriage\rname', 7, false);
+      writeCronHealthMetric('quoted"slash\\newline\ncarriage\rname', 7, "failure");
 
       const file = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
       assert.ok(file);
-      assert.strictEqual(
-        readFileSync(join(METRIC_DIR, file), "utf8"),
-        'minime_cron_last_exit_code{cron="quoted\\"slash\\\\newline\\ncarriage\\rname"} 7\n',
+      const content = readFileSync(join(METRIC_DIR, file), "utf8");
+      assert.match(
+        content,
+        /^minime_cron_last_exit_code\{cron="quoted\\"slash\\\\newline\\ncarriage\\rname"\} 7$/m,
+      );
+      assert.match(
+        content,
+        /^minime_cron_runs_total\{cron="quoted\\"slash\\\\newline\\ncarriage\\rname",outcome="failure"\} 1$/m,
       );
     });
 
@@ -1318,7 +1424,7 @@ bindings: []
           return true;
         }) as typeof process.stderr.write;
 
-        assert.doesNotThrow(() => writeCronHealthMetric("blocked metric", 1, false));
+        assert.doesNotThrow(() => writeCronHealthMetric("blocked metric", 1, "failure"));
       } finally {
         process.stderr.write = oldWrite;
       }
@@ -1495,8 +1601,12 @@ bindings: []
         ) => {
           calls.deliveryFailures.push({ cronName, targetChatId, errorMsg, adminChatId });
         },
-        writeCronHealthMetric: (cronName: string, exitCode: number, success: boolean) => {
-          calls.metrics.push({ cronName, exitCode, success });
+        writeCronHealthMetric: (
+          cronName: string,
+          exitCode: number,
+          outcome: CronTerminalOutcome,
+        ) => {
+          calls.metrics.push({ cronName, exitCode, success: outcome === "success" });
         },
       };
 
@@ -1525,6 +1635,23 @@ bindings: []
         { cronName: "unknown", exitCode: 1, success: false },
       ]);
       assert.deepStrictEqual(calls.cronLoads, []);
+    });
+
+    it("records one failure when cron configuration cannot be loaded", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.loadCronTask = () => {
+        throw new Error("invalid cron configuration");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "FAIL: invalid cron configuration"));
     });
 
     it("keeps script crons on the script path and delivers their output", async () => {
@@ -1558,7 +1685,7 @@ bindings: []
       assert.ok(calls.logs.some((entry) => entry.message === "DONE"));
     });
 
-    it("logs and sends diagnostics from failing script crons", async () => {
+    it("logs bounded diagnostics without direct delivery from failing script crons", async () => {
       const cron = makeMainCron({
         type: "script",
         prompt: undefined,
@@ -1572,12 +1699,8 @@ bindings: []
 
       assert.deepStrictEqual(calls.workspaces, []);
       assert.deepStrictEqual(calls.oneShots, []);
-      assert.strictEqual(calls.deliveries.length, 1);
-      assert.strictEqual(calls.deliveries[0].chatId, 111111111);
-      assert.strictEqual(calls.deliveries[0].threadId, 42);
-      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
-      assert.match(calls.deliveries[0].message, /Script cron exited with code 7/);
-      assert.match(calls.deliveries[0].message, /Diagnostics: stderr: script-stderr; stdout: script-stdout; status: 7/);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
       assert.ok(calls.logs.some((entry) => entry.message === "FAIL diagnostics: stderr: script-stderr; stdout: script-stdout; status: 7"));
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
@@ -1615,7 +1738,7 @@ bindings: []
       assert.ok(calls.logs.some((entry) => entry.message === "Pi returned 10 chars"));
     });
 
-    it("sends cron FAIL notifications when the old Pi kill-switch is set", async () => {
+    it("records a failure without direct delivery when the old Pi kill-switch is set", async () => {
       const oldCronPiDisabled = process.env.CRON_PI_DISABLED;
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
@@ -1632,9 +1755,10 @@ bindings: []
       }
 
       assert.deepStrictEqual(calls.oneShots, []);
-      assert.strictEqual(calls.deliveries.length, 1);
-      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
-      assert.match(calls.deliveries[0].message, /CRON_PI_DISABLED=1 is no longer supported/);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message.includes("CRON_PI_DISABLED=1 is no longer supported")));
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
@@ -1680,29 +1804,89 @@ bindings: []
       assert.ok(calls.logs.some((entry) => entry.message === "DONE"));
     });
 
-    it("does not apply NO_REPLY suppression to script output", async () => {
+    it("delivers a stripped unresolved LLM report once, records failure, and exits non-zero", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runPi = () =>
+        `Actionable report for the operator.\n\n${MINIME_CRON_UNRESOLVED_MARKER}`;
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.deliveries, [
+        {
+          chatId: cron.deliveryChatId,
+          message: "Actionable report for the operator.",
+          threadId: cron.deliveryThreadId,
+        },
+      ]);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.doesNotMatch(calls.deliveries[0].message, /MINIME_CRON_UNRESOLVED/);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("records marker-only unresolved output as failure without delivery", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runPi = () => MINIME_CRON_UNRESOLVED_MARKER;
+
+      await assertMainExits(deps, 1);
+
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("queues only the stripped unresolved report when output delivery is unavailable", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      deps.runPi = () => `Unresolved report.\n${MINIME_CRON_UNRESOLVED_MARKER}`;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("delivery unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.strictEqual(calls.outboxWrites[0].kind, "output");
+      assert.strictEqual(calls.outboxWrites[0].payload, "Unresolved report.");
+      assert.strictEqual(state.pending, calls.outboxWrites[0]);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("does not apply LLM terminal markers or NO_REPLY suppression to script output", async () => {
       const cron = makeMainCron({
         type: "script",
         prompt: undefined,
-        command: "echo NO_REPLY",
+        command: "echo marker",
       });
       const { calls, deps } = makeMainHarness(cron);
       deps.runScript = (scriptCron: CronJob) => {
         calls.scripts.push(scriptCron.name);
-        return "NO_REPLY";
+        return `NO_REPLY\n${MINIME_CRON_UNRESOLVED_MARKER}`;
       };
 
       await main(deps);
 
       assert.deepStrictEqual(calls.deliveries, [
-        { chatId: 111111111, message: "NO_REPLY", threadId: 42 },
+        {
+          chatId: 111111111,
+          message: `NO_REPLY\n${MINIME_CRON_UNRESOLVED_MARKER}`,
+          threadId: 42,
+        },
       ]);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 
-    it("sends cron FAIL notifications and exits when execution fails", async () => {
+    it("records one failure without direct delivery or outbox creation when execution fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
       deps.runPi = () => {
@@ -1711,20 +1895,16 @@ bindings: []
 
       await assertMainExits(deps, 1);
 
-      assert.strictEqual(calls.deliveries.length, 1);
-      assert.strictEqual(calls.deliveries[0].chatId, 111111111);
-      assert.strictEqual(calls.deliveries[0].threadId, 42);
-      assert.strictEqual(
-        calls.deliveries[0].message,
-        '⚠️ Cron FAIL: main-behavior-task\nCron task "main-behavior-task" failed: runner exploded',
-      );
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.sleeps, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
       assert.deepStrictEqual(calls.deliveryFailures, []);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
     });
 
-    it("sends cron FAIL notifications and exits when LLM workspace resolution fails", async () => {
+    it("records one failure without direct delivery when LLM workspace resolution fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
       deps.resolveCronAgentData = () => {
@@ -1737,234 +1917,34 @@ bindings: []
       await assertMainExits(deps, 1);
 
       assert.deepStrictEqual(calls.oneShots, []);
-      assert.strictEqual(calls.deliveries.length, 1);
-      assert.strictEqual(calls.deliveries[0].chatId, 111111111);
-      assert.match(calls.deliveries[0].message, /Cron FAIL: main-behavior-task/);
-      assert.match(calls.deliveries[0].message, /Agent "missing" not found/);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.ok(calls.logs.some((entry) => entry.message.includes('Agent "missing" not found')));
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
     });
 
-    it("includes redacted subprocess diagnostics in cron FAIL notifications", async () => {
+    it("keeps bounded execution diagnostics local without emitting a generic failure", async () => {
       const cron = makeMainCron({ engine: "pi" });
       const { calls, deps } = makeMainHarness(cron);
       deps.runPi = () => {
         throw Object.assign(new Error("Pi cron produced stderr without stdout"), {
-          diagnostics: "stderr: fetch failed with Bearer secret-token-should-stay-in-local-log",
+          diagnostics: "stderr: local diagnostic",
         });
       };
 
       await assertMainExits(deps, 1);
 
-      assert.strictEqual(calls.deliveries.length, 1);
-      assert.match(calls.deliveries[0].message, /Pi cron produced stderr without stdout/);
-      assert.match(calls.deliveries[0].message, /Diagnostics: stderr: fetch failed with Bearer \[redacted\]/);
-      assert.doesNotMatch(calls.deliveries[0].message, /secret-token/);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
       assert.ok(
-        calls.logs.some((entry) => entry.message.includes("secret-token-should-stay-in-local-log")),
+        calls.logs.some((entry) => entry.message === "FAIL diagnostics: stderr: local diagnostic"),
         "expected local diagnostics log",
       );
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
-    });
-
-    it("redacts and caps cron FAIL notification diagnostics", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const longDiagnostics = [
-        "stderr:",
-        "API_KEY=secret-api-key",
-        "PRIVATE_KEY=secret-private-key",
-        "AWS_ACCESS_KEY_ID=secret-access-key-id",
-        "key=secret-generic-key",
-        "password: secret-password",
-        "url=https://user:pass@example.com/path",
-        "mirror=https://ghp_secretsecretsecretsecret@example.org/repo.git",
-        "session_id=secret-session",
-        `public_detail=${"x".repeat(500)}`,
-      ].join(" ");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics: longDiagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      const diagnosticsLine = calls.deliveries[0].message
-        .split("\n")
-        .find((line) => line.startsWith("Diagnostics: "));
-      assert.ok(diagnosticsLine, "expected diagnostics line");
-      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
-      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
-      assert.doesNotMatch(
-        calls.deliveries[0].message,
-        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|user:pass|ghp_secret/,
-      );
-      assert.match(calls.deliveries[0].message, /API_KEY=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /password: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.com\/path/);
-      assert.match(calls.deliveries[0].message, /https:\/\/\[redacted\]@example\.org\/repo\.git/);
-      assert.match(calls.deliveries[0].message, /session_id=\[redacted\]/);
-      assert.ok(
-        calls.logs.some((entry) => entry.message.includes("secret-api-key")),
-        "expected local diagnostics log to remain unchanged",
-      );
-    });
-
-    it("redacts full credential headers in cron FAIL notification diagnostics", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const diagnostics = [
-        "Authorization: ApiKey authorization-secret",
-        "Cookie: sid=secret-cookie; refresh=secret-refresh",
-        "Set-Cookie: session=secret-set-cookie; Path=/; HttpOnly",
-        "Session: id=secret-session; refresh=secret-session-refresh",
-        "PRIVATE_KEY=secret-private-key",
-        "AWS_ACCESS_KEY_ID=secret-access-key-id",
-        "key=secret-generic-key",
-        "monkey=visible-monkey-value",
-      ].join("\n");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      assert.doesNotMatch(
-        calls.deliveries[0].message,
-        /authorization-secret|secret-cookie|secret-refresh|secret-set-cookie|secret-session|secret-session-refresh|secret-private-key|secret-access-key-id|secret-generic-key/,
-      );
-      assert.match(calls.deliveries[0].message, /Authorization: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /Cookie: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /Set-Cookie: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /Session: \[redacted\]/);
-      assert.match(calls.deliveries[0].message, /PRIVATE_KEY=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /AWS_ACCESS_KEY_ID=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /key=\[redacted\]/);
-      assert.match(calls.deliveries[0].message, /monkey=visible-monkey-value/);
-    });
-
-    it("redacts URL query credentials and API key headers in cron FAIL notification diagnostics", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const diagnostics = [
-        "stderr: POST https://example.com/hook?token=query-token-secret&ok=visible&api_key=query-api-secret",
-        "mirror=https://example.org/path?access_token=query-access-secret;password=query-password-secret#frag",
-        '-H "X-API-Key: header-secret"',
-        "Api-Key: alternate-header-secret",
-        "public_detail=visible",
-      ].join("\n");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      const message = calls.deliveries[0].message;
-      assert.doesNotMatch(
-        message,
-        /query-token-secret|query-api-secret|query-access-secret|query-password-secret|header-secret|alternate-header-secret/,
-      );
-      assert.match(message, /token=\[redacted\]/);
-      assert.match(message, /api_key=\[redacted\]/);
-      assert.match(message, /access_token=\[redacted\]/);
-      assert.match(message, /password=\[redacted\]/);
-      assert.match(message, /ok=visible/);
-      assert.match(message, /X-API-Key: \[redacted\]/);
-      assert.match(message, /Api-Key: \[redacted\]/);
-      assert.match(message, /public_detail=visible/);
-    });
-
-    it("redacts JSON credential fields and private key blocks in cron FAIL notification diagnostics", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const diagnostics = [
-        'stderr: {"access_token":"json-token-secret","api_key":"json-api-key-secret","password":"json password secret"}',
-        "API Key: correct horse battery staple",
-        "-----BEGIN OPENSSH PRIVATE KEY-----",
-        "private-key-material",
-        "-----END OPENSSH PRIVATE KEY-----",
-        "public_detail=visible",
-      ].join("\n");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      const message = calls.deliveries[0].message;
-      assert.doesNotMatch(
-        message,
-        /json-token-secret|json-api-key-secret|json password secret|correct horse|battery staple|private-key-material|BEGIN OPENSSH PRIVATE KEY/,
-      );
-      assert.match(message, /"access_token":"\[redacted\]"/);
-      assert.match(message, /"api_key":"\[redacted\]"/);
-      assert.match(message, /"password":"\[redacted\]"/);
-      assert.match(message, /API Key: \[redacted\]/);
-      assert.match(message, /\[redacted private key\]/);
-      assert.match(message, /public_detail=visible/);
-    });
-
-    it("redacts delimiter-prefixed credential assignments and space-containing passwords", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const diagnostics = [
-        "stderr: Error:OPENAI_API_KEY=colon-secret status=403",
-        "stderr: warning;SESSION_TOKEN=semicolon-secret next=ok",
-        "stderr: password: correct horse battery staple status=401",
-        "public_detail=visible",
-      ].join("\n");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      const message = calls.deliveries[0].message;
-      assert.doesNotMatch(message, /colon-secret|semicolon-secret|correct horse|battery staple|status=\[redacted\]/);
-      assert.match(message, /Error:OPENAI_API_KEY=\[redacted\] status=403/);
-      assert.match(message, /warning;SESSION_TOKEN=\[redacted\] next=ok/);
-      assert.match(message, /password: \[redacted\] status=401/);
-      assert.match(message, /public_detail=visible/);
-    });
-
-    it("redacts space-delimited credential diagnostics without swallowing status fields", async () => {
-      const cron = makeMainCron({ engine: "pi" });
-      const { calls, deps } = makeMainHarness(cron);
-      const diagnostics = [
-        "stderr: --token cli-token-secret status=403",
-        "stderr: --password cli-password-secret next=ok",
-        "stderr: token bare-token-secret status=401",
-        "stderr: token expired status=402",
-      ].join("\n");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics,
-        });
-      };
-
-      await assertMainExits(deps, 1);
-
-      const message = calls.deliveries[0].message;
-      assert.doesNotMatch(message, /cli-token-secret|cli-password-secret|bare-token-secret|status=\[redacted\]/);
-      assert.match(message, /--token \[redacted\] status=403/);
-      assert.match(message, /--password \[redacted\] next=ok/);
-      assert.match(message, /token \[redacted\] status=401/);
-      assert.match(message, /token \[redacted\] status=402/);
     });
 
     it("queues failed output after bounded retries and redelivers it before the next generation", async () => {
@@ -2046,7 +2026,7 @@ bindings: []
       }
     });
 
-    it("queues a generation-failure notice after its delivery retries fail", async () => {
+    it("does not attempt delivery or create a failure-notice outbox record on generation failure", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       deps.runPi = () => {
@@ -2059,18 +2039,13 @@ bindings: []
 
       await assertMainExits(deps, 1);
 
-      assert.deepStrictEqual(calls.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
-      assert.strictEqual(calls.outboxWrites.length, 1);
-      const queued = calls.outboxWrites[0];
-      assert.strictEqual(queued.kind, "failure-notice");
-      assert.strictEqual(queued.chatId, cron.deliveryChatId);
-      assert.strictEqual(queued.threadId, cron.deliveryThreadId);
-      assert.strictEqual(queued.attempts, 0);
-      assert.match(queued.payload, /^⚠️ Cron FAIL: main-behavior-task/);
-      assert.match(queued.payload, /generation failed/);
-      assert.strictEqual(state.pending, queued);
-      assert.ok(calls.logs.some((entry) =>
-        entry.message === `OUTBOX QUEUED runId=${queued.runId} kind=failure-notice`));
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.sleeps, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
     it("stops retrying after an in-process delivery retry succeeds", async () => {
@@ -2117,13 +2092,13 @@ bindings: []
       assert.doesNotMatch(calls.logs.map((entry) => entry.message).join("\n"), /OUTBOX QUEUED/);
     });
 
-    it("clears an attempts-exhausted pending record, notifies admin, and continues", async () => {
+    it("clears an attempts-exhausted pending record, notifies admin, and finalizes failure", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
       state.pending = pending;
 
-      await main(deps);
+      await assertMainExits(deps, 1);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2133,10 +2108,13 @@ bindings: []
       );
       assert.strictEqual(calls.deliveries[0].chatId, 999999999);
       assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
-    it("clears an expired pending record, notifies admin, and continues", async () => {
+    it("clears an expired pending record, notifies admin, and finalizes failure", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron, {
@@ -2145,7 +2123,7 @@ bindings: []
       });
       state.pending = pending;
 
-      await main(deps);
+      await assertMainExits(deps, 1);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2153,26 +2131,30 @@ bindings: []
         entry.message === `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=4`));
       assert.strictEqual(calls.deliveries[0].chatId, 999999999);
       assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
-    it("clears corrupt pending state with terminal evidence and continues", async () => {
+    it("clears corrupt pending state with terminal evidence and finalizes failure", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       state.pending = "corrupt";
 
-      await main(deps);
+      await assertMainExits(deps, 1);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
       assert.ok(calls.logs.some((entry) => entry.message === "OUTBOX TERMINAL corrupt"));
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
-      assert.deepStrictEqual(calls.deliveries, [
-        { chatId: 111111111, message: "llm output", threadId: 42 },
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
       ]);
     });
 
-    it("clears a deterministically undeliverable pending record, notifies admin, and continues", async () => {
+    it("clears a deterministically undeliverable pending record, notifies admin, and finalizes failure", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron);
@@ -2187,7 +2169,7 @@ bindings: []
         }
       };
 
-      await main(deps);
+      await assertMainExits(deps, 1);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2196,10 +2178,12 @@ bindings: []
       assert.deepStrictEqual(calls.deliveries.map((call) => call.chatId), [
         cron.deliveryChatId,
         999999999,
-        cron.deliveryChatId,
       ]);
       assert.match(calls.deliveries[1].message, /Cron outbox deterministic/);
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
     });
 
     it("defers a queueable pending failure before generation and persists the next attempt", async () => {
@@ -2373,84 +2357,6 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
       ]);
-    });
-
-    it("uses the admin fallback when cron FAIL notification delivery fails", async () => {
-      const cron = makeMainCron();
-      const { calls, deps } = makeMainHarness(cron);
-      deps.runPi = () => {
-        throw new Error("runner exploded");
-      };
-      deps.deliver = (chatId: number, message: string, threadId?: number) => {
-        calls.deliveries.push({ chatId, message, threadId });
-        throw new Error("bot blocked");
-      };
-
-      await assertMainExits(deps, 1);
-
-      assert.strictEqual(calls.deliveryFailures.length, 1);
-      assert.deepStrictEqual(calls.deliveryFailures[0], {
-        cronName: cron.name,
-        targetChatId: 111111111,
-        errorMsg: 'Cron task "main-behavior-task" failed: runner exploded\n(notification delivery failed: bot blocked)',
-        adminChatId: 999999999,
-      });
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
-      ]);
-    });
-
-    it("includes diagnostics context in the admin fallback when cron FAIL notification delivery fails", async () => {
-      const cron = makeMainCron();
-      const { calls, deps } = makeMainHarness(cron);
-      const longDiagnostics = [
-        "stderr:",
-        "API_KEY=secret-api-key",
-        "PRIVATE_KEY=secret-private-key",
-        "AWS_ACCESS_KEY_ID=secret-access-key-id",
-        "key=secret-generic-key",
-        "password: secret-password",
-        "url=https://user:pass@example.com/path",
-        "session_id=secret-session",
-        "callback=https://example.com/hook?token=secret-query-token&safe=1",
-        `public_detail=${"x".repeat(500)}`,
-      ].join(" ");
-      deps.runPi = () => {
-        throw Object.assign(new Error("Pi cron exited with code 1"), {
-          diagnostics: longDiagnostics,
-        });
-      };
-      deps.deliver = (chatId: number, message: string, threadId?: number) => {
-        calls.deliveries.push({ chatId, message, threadId });
-        throw new Error("bot blocked");
-      };
-
-      await assertMainExits(deps, 1);
-
-      assert.strictEqual(calls.deliveryFailures.length, 1);
-      const failure = calls.deliveryFailures[0];
-      assert.strictEqual(failure.cronName, cron.name);
-      assert.strictEqual(failure.targetChatId, 111111111);
-      assert.strictEqual(failure.adminChatId, 999999999);
-      assert.match(failure.errorMsg, /^Cron task "main-behavior-task" failed: Pi cron exited with code 1\nDiagnostics: /);
-      assert.match(failure.errorMsg, /\n\(notification delivery failed: bot blocked\)$/);
-      const diagnosticsLine = failure.errorMsg.split("\n").find((line) => line.startsWith("Diagnostics: "));
-      assert.ok(diagnosticsLine, "expected diagnostics line");
-      assert.ok(diagnosticsLine.length <= "Diagnostics: ".length + 300);
-      assert.match(diagnosticsLine, /\.\.\. \[truncated\]$/);
-      assert.doesNotMatch(
-        failure.errorMsg,
-        /secret-api-key|secret-private-key|secret-access-key-id|secret-generic-key|secret-password|secret-session|secret-query-token|user:pass/,
-      );
-      assert.match(failure.errorMsg, /API_KEY=\[redacted\]/);
-      assert.match(failure.errorMsg, /PRIVATE_KEY=\[redacted\]/);
-      assert.match(failure.errorMsg, /AWS_ACCESS_KEY_ID=\[redacted\]/);
-      assert.match(failure.errorMsg, /key=\[redacted\]/);
-      assert.match(failure.errorMsg, /password: \[redacted\]/);
-      assert.match(failure.errorMsg, /https:\/\/\[redacted\]@example\.com\/path/);
-      assert.match(failure.errorMsg, /session_id=\[redacted\]/);
-      assert.match(failure.errorMsg, /token=\[redacted\]/);
-      assert.match(failure.errorMsg, /safe=1/);
     });
 
     it("uses the admin fallback and exits when final output delivery fails", async () => {

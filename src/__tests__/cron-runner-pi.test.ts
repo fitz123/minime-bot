@@ -129,7 +129,15 @@ function flagValues(args: string[], flag: string): string[] {
 }
 
 function assertCronSystemInstruction(value: string): void {
-  assert.match(value, /^Today is \d{4}-\d{2}-\d{2}\. Respond concisely\.$/);
+  assert.match(value, /^Today is \d{4}-\d{2}-\d{2}\. Respond concisely\./);
+  assert.match(
+    value,
+    /add \[\[MINIME_CRON_UNRESOLVED_V1\]\] as its exact standalone final non-empty line/,
+  );
+  assert.strictEqual(
+    value.match(/\[\[MINIME_CRON_UNRESOLVED_V1\]\]/g)?.length,
+    1,
+  );
 }
 
 describe("cron-runner runPi", () => {
