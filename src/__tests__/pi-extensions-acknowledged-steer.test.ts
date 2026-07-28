@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import {
   PI_ACKNOWLEDGED_STEER_COMMAND,
   PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
+  PI_ACKNOWLEDGED_STEER_RESULT_EVENT,
   buildPiAcknowledgedSteerInvocation,
   parsePiAcknowledgedSteerEnvelope,
   parsePiAcknowledgedSteerResultNotice,
@@ -30,6 +31,7 @@ function createHarness() {
     options: Record<string, unknown> | undefined;
   }> = [];
   const notices: string[] = [];
+  const busEvents: Array<{ channel: string; data: unknown }> = [];
   let commandName = "";
   let commandHandler: CommandHandler | undefined;
   const context = {
@@ -44,6 +46,11 @@ function createHarness() {
   const pi = {
     on(event: string, handler: EventHandler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    events: {
+      emit(channel: string, data: unknown) {
+        busEvents.push({ channel, data });
+      },
     },
     registerCommand(name: string, options: { handler: CommandHandler }) {
       commandName = name;
@@ -61,6 +68,7 @@ function createHarness() {
     pi,
     sent,
     notices,
+    busEvents,
     context,
     get commandName() {
       return commandName;
@@ -161,6 +169,17 @@ describe("acknowledged-steer Pi extension", () => {
         { id: "post-run", status: "enqueued" },
         { id: "post-run", status: "consumed" },
         { id: "after", status: "rejected" },
+      ],
+    );
+    assert.deepStrictEqual(
+      harness.busEvents,
+      [
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "before", status: "rejected" } },
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "accepted", status: "enqueued" } },
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "accepted", status: "consumed" } },
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "post-run", status: "enqueued" } },
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "post-run", status: "consumed" } },
+        { channel: PI_ACKNOWLEDGED_STEER_RESULT_EVENT, data: { id: "after", status: "rejected" } },
       ],
     );
   });

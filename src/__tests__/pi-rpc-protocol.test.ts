@@ -2232,6 +2232,44 @@ describe("parsePiEvent", () => {
     assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
   });
 
+  it("lets continuation errors replace the retained length outcome", () => {
+    for (const errorMessage of [
+      "continuation failed after compaction",
+      "context_length_exceeded: continued request still exceeds the context window",
+    ]) {
+      const state: PiRpcParseState = {};
+      assert.strictEqual(
+        parsePiEvent({
+          type: "agent_end",
+          messages: [{
+            role: "assistant",
+            stopReason: "length",
+            content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+          }],
+        }, state),
+        null,
+      );
+      assert.strictEqual(parsePiEvent({ type: "agent_start" }, state), null);
+      assert.strictEqual(
+        parsePiEvent({
+          type: "agent_end",
+          messages: [{
+            role: "assistant",
+            stopReason: "error",
+            errorMessage,
+            content: [],
+          }],
+        }, state),
+        null,
+      );
+
+      const settled = parsePiEvent({ type: "agent_settled" }, state);
+      assert.ok(settled);
+      assert.strictEqual((settled as { result: string }).result, errorMessage);
+      assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    }
+  });
+
   it("defers final errors until settlement and preserves the original overflow cause", () => {
     const state: PiRpcParseState = {};
     const overflowMessage = "context_length_exceeded: original request too large";
@@ -3080,7 +3118,7 @@ describe("readPiStream", () => {
     assert.ok(lines.indexOf(resets[0]) < lines.findIndex((line) => extractPiTextDelta(line) === "continued final"));
   });
 
-  it("continues a reasoning-only length run after threshold compaction and emits one final answer", async () => {
+  it("parses a continued reasoning-only length lifecycle into one final answer", async () => {
     const child = childWithStdout([
       JSON.stringify({ type: "agent_start" }),
       JSON.stringify({
@@ -3178,6 +3216,35 @@ describe("readPiStream", () => {
     );
     assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
+  });
+
+  it("returns the specific length error when stdout ends before settlement", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.strictEqual(
+      (lines[0] as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual(
+      (lines[0] as { session_id: string }).session_id,
+      "length-session",
+    );
+    assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
   });
 
   it("emits a protocol error when settlement has no usable agent_end outcome", async () => {

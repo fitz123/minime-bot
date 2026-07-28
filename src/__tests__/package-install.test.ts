@@ -851,10 +851,21 @@ compactionContinuation.default({
   sendUserMessage(message) {
     compactionUserMessages.push(message);
   },
+  events: {
+    emit() {},
+    on() {
+      return () => {};
+    },
+  },
 });
+const compactionContext = {
+  hasPendingMessages() {
+    return false;
+  },
+};
 const emitCompactionEvent = (event, payload = {}) => {
   for (const handler of compactionHandlers.get(event) ?? []) {
-    handler({ type: event, ...payload });
+    handler({ type: event, ...payload }, compactionContext);
   }
 };
 emitCompactionEvent("agent_end", {

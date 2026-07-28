@@ -2,18 +2,35 @@ import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  PI_ACKNOWLEDGED_STEER_COMMAND,
+  PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
+  buildPiAcknowledgedSteerInvocation,
+} from "../pi-extensions/acknowledged-steer.js";
 import {
   PI_COMPACTION_CONTINUATION_CONTENT,
   PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
   isReasoningOnlyLengthAgentEnd,
 } from "../pi-extensions/compaction-continuation.js";
 
-type EventHandler = (event: Record<string, unknown>) => void;
+type EventHandler = (
+  event: Record<string, unknown>,
+  ctx: ExtensionCommandContext,
+) => void;
+type CommandHandler = (
+  args: string,
+  ctx: ExtensionCommandContext,
+) => Promise<void>;
 
-async function loadWrapper(): Promise<(pi: ExtensionAPI) => void> {
+async function loadWrapper(
+  name = "compaction-continuation",
+): Promise<(pi: ExtensionAPI) => void> {
   const wrapperUrl = pathToFileURL(
-    resolve("extensions/pi/compaction-continuation.ts"),
+    resolve(`extensions/pi/${name}.ts`),
   );
   wrapperUrl.searchParams.set("test", `${Date.now()}-${Math.random()}`);
   return (await import(wrapperUrl.href)).default as (pi: ExtensionAPI) => void;
@@ -21,15 +38,46 @@ async function loadWrapper(): Promise<(pi: ExtensionAPI) => void> {
 
 function createHarness() {
   const handlers = new Map<string, EventHandler[]>();
+  const busHandlers = new Map<string, Array<(data: unknown) => void>>();
+  const commands = new Map<string, CommandHandler>();
   const sent: Array<{
     message: Record<string, unknown>;
     options: Record<string, unknown> | undefined;
   }> = [];
   const userMessages: unknown[] = [];
+  let hasPendingMessages = false;
+  const context = {
+    hasPendingMessages: () => hasPendingMessages,
+    isIdle: () => false,
+    ui: {
+      notify() {},
+    },
+  } as unknown as ExtensionCommandContext;
 
   const pi = {
     on(event: string, handler: EventHandler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    events: {
+      emit(channel: string, data: unknown) {
+        for (const handler of busHandlers.get(channel) ?? []) {
+          handler(data);
+        }
+      },
+      on(channel: string, handler: (data: unknown) => void) {
+        busHandlers.set(channel, [...(busHandlers.get(channel) ?? []), handler]);
+        return () => {
+          busHandlers.set(
+            channel,
+            (busHandlers.get(channel) ?? []).filter(
+              (candidate) => candidate !== handler,
+            ),
+          );
+        };
+      },
+    },
+    registerCommand(name: string, options: { handler: CommandHandler }) {
+      commands.set(name, options.handler);
     },
     sendMessage(
       message: Record<string, unknown>,
@@ -46,9 +94,18 @@ function createHarness() {
     pi,
     sent,
     userMessages,
+    context,
+    setHasPendingMessages(value: boolean) {
+      hasPendingMessages = value;
+    },
+    async runCommand(name: string, args: string) {
+      const handler = commands.get(name);
+      assert.ok(handler, `missing command handler for ${name}`);
+      await handler(args, context);
+    },
     emit(event: string, payload: Record<string, unknown> = {}) {
       for (const handler of handlers.get(event) ?? []) {
-        handler({ type: event, ...payload });
+        handler({ type: event, ...payload }, context);
       }
     },
   };
@@ -221,5 +278,88 @@ describe("compaction continuation Pi extension", () => {
 
     assert.deepEqual(harness.sent, []);
     assert.deepEqual(harness.userMessages, []);
+  });
+
+  it("clears the arm when another run starts or the session shuts down", async () => {
+    const wrapper = await loadWrapper();
+
+    for (const resetEvent of ["agent_start", "session_shutdown"]) {
+      const harness = createHarness();
+      wrapper(harness.pi);
+      harness.emit("agent_end", {
+        messages: [
+          assistant("length", [{ type: "thinking", thinking: "unfinished" }]),
+        ],
+      });
+      harness.emit(resetEvent);
+      harness.emit("session_compact", {
+        reason: "threshold",
+        willRetry: false,
+      });
+      assert.deepEqual(harness.sent, [], resetEvent);
+    }
+  });
+
+  it("uses already queued user work instead of appending an internal continuation", async () => {
+    const wrapper = await loadWrapper();
+    const harness = createHarness();
+    wrapper(harness.pi);
+
+    harness.emit("agent_end", {
+      messages: [
+        assistant("length", [{ type: "thinking", thinking: "unfinished" }]),
+      ],
+    });
+    harness.setHasPendingMessages(true);
+    harness.emit("session_compact", {
+      reason: "threshold",
+      willRetry: false,
+    });
+
+    assert.deepEqual(harness.sent, []);
+  });
+
+  it("does not append an internal continuation behind acknowledged steering", async () => {
+    const acknowledgedSteer = await loadWrapper("acknowledged-steer");
+    const continuation = await loadWrapper();
+    const harness = createHarness();
+    acknowledgedSteer(harness.pi);
+    continuation(harness.pi);
+
+    harness.emit("agent_start");
+    harness.emit("agent_end", {
+      messages: [
+        assistant("length", [{ type: "thinking", thinking: "unfinished" }]),
+      ],
+    });
+    const command = buildPiAcknowledgedSteerInvocation(
+      "during-compaction",
+      "apply the user's newer direction",
+    );
+    await harness.runCommand(
+      PI_ACKNOWLEDGED_STEER_COMMAND,
+      command.slice(command.indexOf(" ") + 1),
+    );
+    harness.emit("session_compact", {
+      reason: "threshold",
+      willRetry: false,
+    });
+
+    assert.deepEqual(harness.sent, [{
+      message: {
+        customType: PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
+        content: "apply the user's newer direction",
+        display: false,
+        details: { requestId: "during-compaction" },
+      },
+      options: { deliverAs: "steer" },
+    }]);
+    assert.equal(
+      harness.sent.some(
+        ({ message }) =>
+          message.customType === PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+      ),
+      false,
+    );
   });
 });

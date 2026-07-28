@@ -106,9 +106,12 @@ The runtime dependency contract pins all four package-owned Pi packages to
 0.82.1 and grammY to 1.45.1 (`@grammyjs/types` 4.0.0). Pi owns the bounded
 summarization retry, including transient WebSocket recovery; Minime treats its
 retry records as stream activity and does not add a second compaction retry.
-`agent_settled` remains the accepted-turn terminal boundary. A reasoning-only
-`stopReason=length` settlement without text remains an error distinct from that
-recovery and is not classified as fixed.
+`agent_settled` remains the accepted-turn terminal boundary. In primary
+interactive sessions, a reasoning-only `stopReason=length` outcome without
+visible text continues automatically after successful threshold compaction
+through a hidden follow-up. If compaction produces no meaningful continuation
+outcome, Minime returns a specific length-limit error. Cron, subagent-child, and
+ask-agent-child sessions do not load this continuation wrapper.
 
 Pi's OpenAI catalog reports a 272K (272,000-token) context window for the
 supported GPT-5.6 models. Earlier compaction at that boundary is expected and
