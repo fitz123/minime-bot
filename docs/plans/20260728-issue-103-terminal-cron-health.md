@@ -66,9 +66,9 @@ Run the checked-in Prometheus rule fixture with `promtool test rules` when `prom
 
 **Serves:** Full package confidence, public safety, installability, and a decision-complete handoff to monitored rollout.
 
-- [ ] Extend package-install/artifact assertions so the monitoring rule-test fixture and updated examples are shipped and runnable, with no import-time process, network, or filesystem side effects.
-- [ ] Run all focused cron/monitoring tests and inspect terminal branch coverage for a single metric-finalization call. Confirm no test or implementation adds execution retries, idempotency fields, per-cron policies, direct generic `Cron FAIL`, or changes outside runner/metrics/examples/docs/package tests.
-- [ ] Run `npm test`, `npm run lint`, `npm run build`, and `npm pack --dry-run`; run `git diff --check`, public tracked-file/identity/secrets checks, and verify the worktree is clean after commits.
+- [x] Extend package-install/artifact assertions so the monitoring rule-test fixture and updated examples are shipped and runnable, with no import-time process, network, or filesystem side effects.
+- [x] Run all focused cron/monitoring tests and inspect terminal branch coverage for a single metric-finalization call. Confirm no test or implementation adds execution retries, idempotency fields, per-cron policies, direct generic `Cron FAIL`, or changes outside runner/metrics/examples/docs/package tests.
+- [x] Run `npm test`, `npm run lint`, `npm run build`, and `npm pack --dry-run`; run `git diff --check`, public tracked-file/identity/secrets checks, and verify the worktree is clean after commits.
 
 ## Post-Completion
 
