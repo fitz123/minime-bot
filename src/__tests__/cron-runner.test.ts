@@ -2092,13 +2092,13 @@ bindings: []
       assert.doesNotMatch(calls.logs.map((entry) => entry.message).join("\n"), /OUTBOX QUEUED/);
     });
 
-    it("clears an attempts-exhausted pending record, notifies admin, and finalizes failure", async () => {
+    it("clears an attempts-exhausted pending record, notifies admin, and counts only the new logical run", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
       state.pending = pending;
 
-      await assertMainExits(deps, 1);
+      await main(deps);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2108,13 +2108,13 @@ bindings: []
       );
       assert.strictEqual(calls.deliveries[0].chatId, 999999999);
       assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
       assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
+        { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 
-    it("clears an expired pending record, notifies admin, and finalizes failure", async () => {
+    it("clears an expired pending record, notifies admin, and counts only the new logical run", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron, {
@@ -2123,7 +2123,7 @@ bindings: []
       });
       state.pending = pending;
 
-      await assertMainExits(deps, 1);
+      await main(deps);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2131,30 +2131,32 @@ bindings: []
         entry.message === `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=4`));
       assert.strictEqual(calls.deliveries[0].chatId, 999999999);
       assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
       assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
+        { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 
-    it("clears corrupt pending state with terminal evidence and finalizes failure", async () => {
+    it("clears corrupt pending state and counts only the new logical run", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       state.pending = "corrupt";
 
-      await assertMainExits(deps, 1);
+      await main(deps);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
       assert.ok(calls.logs.some((entry) => entry.message === "OUTBOX TERMINAL corrupt"));
-      assert.deepStrictEqual(calls.oneShots, []);
-      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: 111111111, message: "llm output", threadId: 42 },
+      ]);
       assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
+        { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 
-    it("clears a deterministically undeliverable pending record, notifies admin, and finalizes failure", async () => {
+    it("clears a deterministically undeliverable pending record, notifies admin, and counts only the new logical run", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const pending = makePendingRecord(cron);
@@ -2169,7 +2171,7 @@ bindings: []
         }
       };
 
-      await assertMainExits(deps, 1);
+      await main(deps);
 
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxClears, [cron.name]);
@@ -2178,11 +2180,12 @@ bindings: []
       assert.deepStrictEqual(calls.deliveries.map((call) => call.chatId), [
         cron.deliveryChatId,
         999999999,
+        cron.deliveryChatId,
       ]);
       assert.match(calls.deliveries[1].message, /Cron outbox deterministic/);
-      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
       assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
+        { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 
@@ -2203,9 +2206,7 @@ bindings: []
       assert.strictEqual(state.pending, calls.outboxWrites[0]);
       assert.ok(calls.logs.some((entry) =>
         entry.message === `OUTBOX RETRY-DEFERRED runId=${pending.runId} attempts=3`));
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
-      ]);
+      assert.deepStrictEqual(calls.metrics, []);
       assert.deepStrictEqual(calls.scripts, []);
       assert.deepStrictEqual(calls.oneShots, []);
       assert.deepStrictEqual(calls.sleeps, []);
@@ -2248,9 +2249,7 @@ bindings: []
       assert.strictEqual(state.pending, pending);
       assert.deepStrictEqual(calls.outboxWrites, []);
       assert.deepStrictEqual(calls.oneShots, []);
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
-      ]);
+      assert.deepStrictEqual(calls.metrics, []);
       assert.ok(calls.logs.some((entry) =>
         entry.message === `OUTBOX CLEAR-FAILED runId=${pending.runId}: clear unavailable`));
     });
@@ -2266,9 +2265,7 @@ bindings: []
 
       assert.ok(calls.logs.some((entry) =>
         entry.message === "OUTBOX STATE-READ-FAILED: disk unavailable"));
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 1, success: false },
-      ]);
+      assert.deepStrictEqual(calls.metrics, []);
       assert.deepStrictEqual(calls.scripts, []);
       assert.deepStrictEqual(calls.oneShots, []);
       assert.deepStrictEqual(calls.deliveries, []);

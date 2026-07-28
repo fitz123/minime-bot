@@ -1064,7 +1064,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     pendingRecord = deps.readCronOutboxRecord(taskName);
   } catch (err) {
     deps.log(taskName, `OUTBOX STATE-READ-FAILED: ${errorFromUnknown(err).message}`);
-    finalizeInvocation(taskName, 1, "failure");
+    // No logical cron execution started, so this outbox preflight failure must
+    // not increment terminal logical-run counters.
     deps.exit(1);
   }
 
@@ -1074,9 +1075,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       deps.log(taskName, "OUTBOX TERMINAL corrupt");
     } catch (err) {
       deps.log(taskName, `OUTBOX CLEAR-FAILED corrupt: ${errorFromUnknown(err).message}`);
+      deps.exit(1);
     }
-    finalizeInvocation(taskName, 1, "failure");
-    deps.exit(1);
   } else if (pendingRecord !== undefined) {
     const expired = Date.now() - Date.parse(pendingRecord.createdAt) > CRON_OUTBOX_EXPIRY_MS;
     if (expired || pendingRecord.attempts >= CRON_OUTBOX_MAX_ATTEMPTS) {
@@ -1087,7 +1087,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           taskName,
           `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
         );
-        finalizeInvocation(taskName, 1, "failure");
         deps.exit(1);
       }
       deps.log(
@@ -1095,8 +1094,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         `OUTBOX TERMINAL gave-up runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
       notifyAdminOfTerminalOutbox(pendingRecord, "gave-up");
-      finalizeInvocation(taskName, 1, "failure");
-      deps.exit(1);
     } else {
       const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = (() => {
         try {
@@ -1121,14 +1118,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
               taskName,
               `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
             );
-            finalizeInvocation(taskName, 1, "failure");
             deps.exit(1);
           }
           deps.log(
             taskName,
             `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
           );
-          finalizeInvocation(taskName, 1, "failure");
+          // This invocation only retried delivery owed by an earlier logical
+          // run. It exits without generating or counting a new logical run.
           deps.exit(1);
         }
         try {
@@ -1138,7 +1135,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             taskName,
             `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
           );
-          finalizeInvocation(taskName, 1, "failure");
           deps.exit(1);
         }
         deps.log(
@@ -1146,8 +1142,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
         );
         notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
-        finalizeInvocation(taskName, 1, "failure");
-        deps.exit(1);
       } else {
         try {
           deps.clearCronOutboxRecord(taskName);
@@ -1156,7 +1150,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             taskName,
             `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
           );
-          finalizeInvocation(taskName, 1, "failure");
           deps.exit(1);
         }
         deps.log(
