@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.7.39
+
+- Expose one bounded terminal outcome per logical cron run through monotonic
+  success/failure counters, latest-run timestamps, and stable Prometheus alerts;
+  support stripped agent-declared unresolved failures while moving generic
+  failure grouping, repeats, and recovery to Alertmanager (#103).
+
 ## 2026.7.38
 
 - Continue a reasoning-only `stopReason=length` turn after successful Pi 0.82.1
