@@ -454,12 +454,12 @@ describe("package artifact install", () => {
       const installedRuleFixture = parseYaml(
         readFileSync(installedRuleFixturePath, "utf8"),
       ) as { rule_files?: string[]; tests?: unknown[] };
-      assert.deepEqual(installedRuleFixture.rule_files, ["examples/monitoring/minime.rules.yml"]);
+      assert.deepEqual(installedRuleFixture.rule_files, ["minime.rules.yml"]);
       assert.ok((installedRuleFixture.tests?.length ?? 0) > 0);
       for (const ruleFile of installedRuleFixture.rule_files ?? []) {
         assert.ok(
-          existsSync(join(installedPackage, ruleFile)),
-          `installed rule fixture must resolve ${ruleFile} from the package root`,
+          existsSync(join(installedMonitoringDir, ruleFile)),
+          `installed rule fixture must resolve ${ruleFile} relative to the fixture`,
         );
       }
 

@@ -142,7 +142,7 @@ describe("cron terminal monitoring contract", () => {
 
   it("checks every terminal-state edge case while keeping counter values out of alert identity", () => {
     const fixture = readYaml<RuleTestFixture>(fixturePath);
-    assert.deepEqual(fixture.rule_files, ["examples/monitoring/minime.rules.yml"]);
+    assert.deepEqual(fixture.rule_files, ["minime.rules.yml"]);
     assert.equal(fixture.evaluation_interval, "1m");
 
     const cases = new Map(fixture.tests.map((testCase) => [testCase.name, testCase]));

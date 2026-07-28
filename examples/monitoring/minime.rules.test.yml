@@ -1,5 +1,5 @@
 rule_files:
-  - examples/monitoring/minime.rules.yml
+  - minime.rules.yml
 
 evaluation_interval: 1m
 
