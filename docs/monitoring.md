@@ -59,8 +59,10 @@ errors remain logged, and shutdown cancels any pending address retry.
 
 ## Terminal cron health contract
 
-Each completed cron invocation publishes one restart-safe terminal
-classification through the node-exporter textfile collector. The public
+Each completed new logical cron run publishes one restart-safe terminal
+classification through the node-exporter textfile collector. Exit state, both
+counters, and the last-run timestamp share one atomic terminal snapshot; the
+separate success timestamp snapshot changes only after success. The public
 contract has four metric families:
 
 - `minime_cron_last_exit_code{cron}` is zero for the latest success and
@@ -101,7 +103,13 @@ Execution failures do not send a second generic `Cron FAIL` notification.
 Prometheus owns terminal evaluation, while Alertmanager owns incident
 grouping, deduplication, repeats, and recovery delivery. Generated-output
 retry/outbox behavior and the admin fallback for delivery-path failures remain
-separate and unchanged.
+separate and unchanged. An old queued `failure-notice` record encountered
+after upgrade is discarded without delivery.
+
+Pickup-only outbox preflight failures and deferred redelivery attempts happen
+before a new logical cron run begins. They exit non-zero without changing
+last-exit, last-run, last-success, or counter series; use their bounded
+`OUTBOX` cron-log evidence and process status for diagnosis.
 
 Run the deterministic rule fixture from the package root:
 

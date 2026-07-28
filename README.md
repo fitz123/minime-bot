@@ -556,8 +556,10 @@ Dry-run may perform that read-only parser comparison, with desired content sent
 on standard input, but creates no temporary files or directories and performs
 no writes, plist lint, launchctl calls, or other state mutation.
 
-Each completed cron invocation updates one atomic node-exporter textfile
-snapshot with a bounded `cron` label:
+Each completed new logical cron run updates atomic node-exporter textfile
+snapshots with a bounded `cron` label. The terminal snapshot contains exit
+state, both counters, and the last-run timestamp; the separate success
+timestamp snapshot changes only after success:
 
 - `minime_cron_last_exit_code{cron}` is the latest terminal exit state;
 - `minime_cron_last_success_timestamp{cron}` changes only after success;
@@ -577,7 +579,8 @@ Execution failures no longer send a direct generic `Cron FAIL` message or
 create a failure-notice outbox entry. Prometheus and Alertmanager own terminal
 incident grouping, repeats, and recovery. Bounded diagnostics remain in the
 local cron log, while the existing admin fallback for a delivery-path failure
-is unchanged.
+is unchanged. On upgrade, an old queued `failure-notice` record is discarded
+without delivery.
 
 Cron delivery is pickup-first. At the start of each scheduled invocation, the
 runner tries to deliver any result owed by that cron before generating new
@@ -587,6 +590,11 @@ pickup failure stops the invocation before generation, so a newer result
 cannot overwrite the pending one. Redelivery is limited to 10 later attempts
 and a 48-hour lifetime. Queue, redelivery, deferral, and terminal decisions are
 recorded as `OUTBOX` lines in `cron-<name>.log`.
+
+Pickup-only outbox preflight failures and deferred redelivery attempts do not
+start a new logical cron run, so they do not change terminal metrics or
+counters. Their non-zero process exit and `OUTBOX` log lines remain the
+diagnostic evidence.
 
 Delivery has at-least-once, not exactly-once, semantics: a process crash after
 the chat accepts a message but before the outbox record is cleared can produce

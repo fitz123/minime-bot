@@ -1,6 +1,14 @@
 import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+  readFileSync,
+  readdirSync,
+  utimesSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   buildDeliverArgs,
@@ -35,6 +43,7 @@ import type {
 import {
   clearCronOutboxRecord,
   readCronOutboxRecord,
+  sanitizeCronMetricStem,
   writeCronOutboxRecord,
   type CronOutboxRecord,
 } from "../cron-outbox.js";
@@ -46,6 +55,43 @@ import { installCronTestEnv } from "./cron-test-env.js";
 installCronTestEnv();
 
 const TEST_DIR = join("/tmp", "cron-runner-test-" + Date.now());
+const CRON_RUNNER_SOURCE_URL = new URL("../cron-runner.ts", import.meta.url).href;
+
+function runMetricWriterChild(
+  metricDir: string,
+  cronName: string,
+  outcome: CronTerminalOutcome,
+  iterations: number,
+): Promise<void> {
+  const script = [
+    `import { writeCronHealthMetric } from ${JSON.stringify(CRON_RUNNER_SOURCE_URL)};`,
+    `for (let index = 0; index < ${iterations}; index += 1) {`,
+    `  writeCronHealthMetric(${JSON.stringify(cronName)}, ${outcome === "success" ? 0 : 1}, ${JSON.stringify(outcome)});`,
+    "}",
+  ].join("\n");
+
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "--eval", script],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, CRON_HEALTH_TEXTFILE_DIR: metricDir },
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        resolvePromise();
+        return;
+      }
+      reject(new Error(`metric writer child failed: code=${code} signal=${signal}\n${stderr}`));
+    });
+  });
+}
 
 function makeLlmCron(engine?: CronJob["engine"]): CronJob {
   const cron: CronJob = {
@@ -968,6 +1014,15 @@ describe("cron-runner", () => {
           outcome: "failure",
         },
       );
+      assert.deepStrictEqual(
+        classifyLlmCronTerminalResult(
+          `Finding remains unresolved.\r\n\r\n${MINIME_CRON_UNRESOLVED_MARKER}\r\n`,
+        ),
+        {
+          output: "Finding remains unresolved.",
+          outcome: "failure",
+        },
+      );
     });
 
     it("accepts a marker-only unresolved result without creating deliverable output", () => {
@@ -984,6 +1039,9 @@ describe("cron-runner", () => {
         `\`${MINIME_CRON_UNRESOLVED_MARKER}\``,
         `${MINIME_CRON_UNRESOLVED_MARKER}\nThis is the final line.`,
         `${MINIME_CRON_UNRESOLVED_MARKER}\n${MINIME_CRON_UNRESOLVED_MARKER}`,
+        ` ${MINIME_CRON_UNRESOLVED_MARKER}`,
+        `${MINIME_CRON_UNRESOLVED_MARKER} `,
+        `\t${MINIME_CRON_UNRESOLVED_MARKER}\t`,
       ];
 
       for (const output of cases) {
@@ -1287,6 +1345,21 @@ bindings: []
       rmSync(METRIC_DIR, { recursive: true, force: true });
     });
 
+    function captureStderr(run: () => void): string {
+      const oldWrite = process.stderr.write;
+      const stderrWrites: string[] = [];
+      try {
+        process.stderr.write = ((chunk: string | Uint8Array) => {
+          stderrWrites.push(String(chunk));
+          return true;
+        }) as typeof process.stderr.write;
+        run();
+      } finally {
+        process.stderr.write = oldWrite;
+      }
+      return stderrWrites.join("");
+    }
+
     it("writes all terminal series to stable hashed textfiles without temporary residue", () => {
       const before = Math.floor(Date.now() / 1000);
 
@@ -1360,6 +1433,93 @@ bindings: []
       assert.match(repairedContent, /minime_cron_last_exit_code\{cron="failing-cron"\} 0/);
     });
 
+    it("advances the exact terminal timestamp on every outcome and success time only on success", (t) => {
+      let now = 1_900_000_000_000;
+      t.mock.method(Date, "now", () => now);
+
+      writeCronHealthMetric("timestamp-contract", 0, "success");
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      const successFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".success.prom"));
+      assert.ok(exitFile);
+      assert.ok(successFile);
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_last_run_timestamp_seconds\{cron="timestamp-contract"\} 1900000000/,
+      );
+      assert.match(
+        readFileSync(join(METRIC_DIR, successFile), "utf8"),
+        /minime_cron_last_success_timestamp\{cron="timestamp-contract"\} 1900000000/,
+      );
+
+      now += 60_000;
+      writeCronHealthMetric("timestamp-contract", 1, "failure");
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_last_run_timestamp_seconds\{cron="timestamp-contract"\} 1900000060/,
+      );
+      assert.match(
+        readFileSync(join(METRIC_DIR, successFile), "utf8"),
+        /minime_cron_last_success_timestamp\{cron="timestamp-contract"\} 1900000000/,
+      );
+
+      now += 60_000;
+      writeCronHealthMetric("timestamp-contract", 0, "success");
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_last_run_timestamp_seconds\{cron="timestamp-contract"\} 1900000120/,
+      );
+      assert.match(
+        readFileSync(join(METRIC_DIR, successFile), "utf8"),
+        /minime_cron_last_success_timestamp\{cron="timestamp-contract"\} 1900000120/,
+      );
+    });
+
+    it("serializes concurrent process writers without losing terminal counts", async () => {
+      const cronName = "concurrent-metric";
+      await Promise.all([
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 8),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 8),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 8),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 8),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 8),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 8),
+      ]);
+
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      const content = readFileSync(join(METRIC_DIR, exitFile), "utf8");
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-metric",outcome="success"\} 24/,
+      );
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-metric",outcome="failure"\} 24/,
+      );
+      assert.deepStrictEqual(
+        readdirSync(METRIC_DIR).filter((name) => name.endsWith(".lock")),
+        [],
+      );
+    });
+
+    it("recovers a stale writer lock left by a terminated process", () => {
+      const cronName = "stale-lock";
+      const stem = sanitizeCronMetricStem(cronName);
+      const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
+      writeFileSync(lockPath, "stale\n");
+      utimesSync(lockPath, new Date(0), new Date(0));
+
+      writeCronHealthMetric(cronName, 0, "success");
+
+      assert.ok(!readdirSync(METRIC_DIR).includes(`.minime_cron_${stem}.lock`));
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_runs_total\{cron="stale-lock",outcome="success"\} 1/,
+      );
+    });
+
     it("starts a valid counter epoch when prior state is missing or corrupt", () => {
       writeCronHealthMetric("counter-reset", 1, "failure");
       const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
@@ -1384,15 +1544,37 @@ bindings: []
     });
 
     it("keeps distinct files and labels for cron names that sanitize to the same stem", () => {
-      writeCronHealthMetric("a/b", 0, "failure");
+      writeCronHealthMetric("a/b", 1, "failure");
       writeCronHealthMetric("a_b", 1, "failure");
 
       const files = readdirSync(METRIC_DIR).filter((name) => name.endsWith(".exit.prom")).sort();
       assert.strictEqual(files.length, 2);
       assert.notStrictEqual(files[0], files[1]);
       const content = files.map((name) => readFileSync(join(METRIC_DIR, name), "utf8")).join("\n");
-      assert.match(content, /minime_cron_last_exit_code\{cron="a\/b"\} 0/);
+      assert.match(content, /minime_cron_last_exit_code\{cron="a\/b"\} 1/);
       assert.match(content, /minime_cron_last_exit_code\{cron="a_b"\} 1/);
+    });
+
+    it("normalizes contradictory exit values to the closed terminal outcome", () => {
+      writeCronHealthMetric("normalized-outcome", 0, "failure");
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_last_exit_code\{cron="normalized-outcome"\} 1/,
+      );
+
+      writeCronHealthMetric("normalized-outcome", 9, "success");
+      const content = readFileSync(join(METRIC_DIR, exitFile), "utf8");
+      assert.match(content, /minime_cron_last_exit_code\{cron="normalized-outcome"\} 0/);
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="normalized-outcome",outcome="success"\} 1/,
+      );
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="normalized-outcome",outcome="failure"\} 1/,
+      );
     });
 
     it("escapes quotes, backslashes, newlines, and carriage returns in Prometheus labels", () => {
@@ -1411,24 +1593,55 @@ bindings: []
       );
     });
 
+    it("does not reset or overwrite counters after an unexpected prior-state read error", () => {
+      const cronName = "unreadable-prior-state";
+      const stem = sanitizeCronMetricStem(cronName);
+      const exitPath = join(METRIC_DIR, `minime_cron_${stem}.exit.prom`);
+      mkdirSync(exitPath);
+
+      const stderr = captureStderr(() => {
+        assert.doesNotThrow(() => writeCronHealthMetric(cronName, 1, "failure"));
+      });
+
+      assert.match(stderr, /failed to read prior cron health metric/);
+      assert.deepStrictEqual(readdirSync(exitPath), []);
+      assert.deepStrictEqual(
+        readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
+        [],
+      );
+    });
+
+    it("cleans a temporary file when the success snapshot rename fails", () => {
+      const cronName = "rename-cleanup";
+      const stem = sanitizeCronMetricStem(cronName);
+      const successPath = join(METRIC_DIR, `minime_cron_${stem}.success.prom`);
+      mkdirSync(successPath);
+
+      const stderr = captureStderr(() => {
+        assert.doesNotThrow(() => writeCronHealthMetric(cronName, 0, "success"));
+      });
+
+      assert.match(stderr, /failed to write cron health success metric/);
+      assert.deepStrictEqual(readdirSync(successPath), []);
+      assert.deepStrictEqual(
+        readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
+        [],
+      );
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      assert.match(
+        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
+        /minime_cron_runs_total\{cron="rename-cleanup",outcome="success"\} 1/,
+      );
+    });
+
     it("warns but does not throw when the textfile path cannot be written", () => {
       const blocker = join(METRIC_DIR, "not-a-directory");
       writeFileSync(blocker, "blocking file", "utf8");
       process.env.CRON_HEALTH_TEXTFILE_DIR = join(blocker, "child");
-      const oldWrite = process.stderr.write;
-      const stderrWrites: string[] = [];
-
-      try {
-        process.stderr.write = ((chunk: string | Uint8Array) => {
-          stderrWrites.push(String(chunk));
-          return true;
-        }) as typeof process.stderr.write;
-
+      const stderr = captureStderr(() => {
         assert.doesNotThrow(() => writeCronHealthMetric("blocked metric", 1, "failure"));
-      } finally {
-        process.stderr.write = oldWrite;
-      }
-      const stderr = stderrWrites.join("");
+      });
       assert.match(stderr, /blocked metric/);
       assert.match(stderr, /failed to prepare cron health metric dir/);
     });
@@ -1904,6 +2117,28 @@ bindings: []
       ]);
     });
 
+    it("records execution failure even when failure logging throws", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const captureLog = deps.log;
+      deps.runPi = () => {
+        throw new Error("runner exploded");
+      };
+      deps.log = (taskName: string, message: string) => {
+        captureLog(taskName, message);
+        if (message.startsWith("FAIL:")) {
+          throw new Error("log unavailable");
+        }
+      };
+
+      await assert.rejects(() => main(deps), /log unavailable/);
+
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.deepStrictEqual(calls.deliveries, []);
+    });
+
     it("records one failure without direct delivery when LLM workspace resolution fails", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
@@ -2156,6 +2391,30 @@ bindings: []
       ]);
     });
 
+    it("drops a legacy failure-notice outbox record without delivering it", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, {
+        kind: "failure-notice",
+        payload: "⚠️ Cron FAIL: legacy failure",
+      });
+      state.pending = pending;
+
+      await main(deps);
+
+      assert.strictEqual(state.pending, undefined);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX DROPPED legacy-failure-notice runId=${pending.runId}`));
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: cron.deliveryChatId, message: "llm output", threadId: cron.deliveryThreadId },
+      ]);
+      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
+      ]);
+    });
+
     it("clears a deterministically undeliverable pending record, notifies admin, and counts only the new logical run", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
@@ -2210,6 +2469,94 @@ bindings: []
       assert.deepStrictEqual(calls.scripts, []);
       assert.deepStrictEqual(calls.oneShots, []);
       assert.deepStrictEqual(calls.sleeps, []);
+    });
+
+    it("fails closed when corrupt pending state cannot be cleared", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      state.pending = "corrupt";
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        throw new Error("clear unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, "corrupt");
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === "OUTBOX CLEAR-FAILED corrupt: clear unavailable"));
+    });
+
+    it("fails closed when an attempts-exhausted record cannot be cleared", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
+      state.pending = pending;
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        throw new Error("clear unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, pending);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX CLEAR-FAILED runId=${pending.runId}: clear unavailable`));
+    });
+
+    it("fails closed when a deterministic pickup failure cannot be cleared", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron);
+      state.pending = pending;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new DeliveryError("invalid destination", {
+          status: 1,
+          stderrExcerpt: "[deliver] Error: invalid chat_id",
+        });
+      };
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        throw new Error("clear unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, pending);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX CLEAR-FAILED runId=${pending.runId}: clear unavailable`));
+    });
+
+    it("fails closed when a queueable pickup retry cannot be persisted", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, { attempts: 2 });
+      state.pending = pending;
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("network unavailable");
+      };
+      deps.writeCronOutboxRecord = (record: CronOutboxRecord) => {
+        calls.outboxWrites.push(record);
+        throw new Error("write unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, pending);
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.strictEqual(calls.outboxWrites[0].attempts, 3);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.metrics, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message === `OUTBOX RETRY-WRITE-FAILED runId=${pending.runId}: write unavailable`));
     });
 
     it("does not resurrect a delivered record when success logging fails", async () => {
@@ -2384,7 +2731,29 @@ bindings: []
       ]);
     });
 
-    it("does not queue delivered output when success logging fails", async () => {
+    it("records delivery failure before a fallback handler throws", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.deliver = (chatId: number, message: string, threadId?: number) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new DeliveryError("invalid destination", {
+          status: 1,
+          stderrExcerpt: "[deliver] Error: invalid chat_id",
+        });
+      };
+      deps.handleDeliveryFailure = () => {
+        throw new Error("fallback unavailable");
+      };
+
+      await assert.rejects(() => main(deps), /fallback unavailable/);
+
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("records delivered output before success logging fails", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
       const captureLog = deps.log;
@@ -2403,7 +2772,9 @@ bindings: []
       assert.strictEqual(state.pending, undefined);
       assert.deepStrictEqual(calls.outboxWrites, []);
       assert.deepStrictEqual(calls.deliveryFailures, []);
-      assert.deepStrictEqual(calls.metrics, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
+      ]);
     });
   });
 
