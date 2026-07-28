@@ -99,8 +99,8 @@ describe("cron terminal monitoring contract", () => {
     });
     assert.equal(
       normalizePromql(terminal.expr),
-      "(minime_cron_last_exit_code != 0) and on (cron) "
-        + "(minime_cron_last_run_timestamp_seconds <= time() + 300)",
+      "max by (cron) ( (minime_cron_last_exit_code != 0) and on (cron) "
+        + "(minime_cron_last_run_timestamp_seconds <= time() + 300) )",
     );
 
     const incomplete = rules[1];
@@ -112,9 +112,9 @@ describe("cron terminal monitoring contract", () => {
     });
     assert.equal(
       normalizePromql(incomplete.expr),
-      "( minime_cron_last_exit_code unless on (cron) minime_cron_last_run_timestamp_seconds ) "
-        + "or ( minime_cron_last_exit_code and on (cron) "
-        + "(minime_cron_last_run_timestamp_seconds > time() + 300) )",
+      "max by (cron) ( ( minime_cron_last_exit_code unless on (cron) "
+        + "minime_cron_last_run_timestamp_seconds ) or ( minime_cron_last_exit_code "
+        + "and on (cron) (minime_cron_last_run_timestamp_seconds > time() + 300) ) )",
     );
 
     for (const rule of rules) {
@@ -165,6 +165,15 @@ describe("cron terminal monitoring contract", () => {
       series.series.includes('outcome="failure"')
     );
     assert.equal(failureCounter?.values, "7 8 9 0 1 2 3 4 5 6 7");
+    const terminalSeries = stableIdentity.input_series?.filter((series) =>
+      series.series.startsWith("minime_cron_last_")
+    ) ?? [];
+    assert.ok(terminalSeries.length > 0);
+    for (const series of terminalSeries) {
+      assert.match(series.series, /job="node-exporter"/);
+      assert.match(series.series, /instance="127\.0\.0\.1:9100"/);
+      assert.match(series.series, /scrape_scope="fixture"/);
+    }
 
     const expectedAlerts = stableIdentity.alert_rule_test.flatMap((evaluation) => evaluation.exp_alerts);
     assert.equal(expectedAlerts.length, 2);
@@ -175,6 +184,21 @@ describe("cron terminal monitoring contract", () => {
       "failure_class",
       "severity",
     ]);
+
+    const missingTimestamp = cases.get("missing terminal timestamp reports incomplete telemetry");
+    assert.ok(missingTimestamp);
+    assert.match(missingTimestamp.input_series?.[0]?.series ?? "", /job="node-exporter"/);
+    assert.match(missingTimestamp.input_series?.[0]?.series ?? "", /instance="127\.0\.0\.1:9100"/);
+    assert.match(missingTimestamp.input_series?.[0]?.series ?? "", /scrape_scope="fixture"/);
+    const incompleteLabels = missingTimestamp.alert_rule_test
+      .flatMap((evaluation) => evaluation.exp_alerts)
+      .map((alert) => Object.keys(alert.exp_labels).sort());
+    assert.deepEqual(incompleteLabels, [[
+      "component",
+      "cron",
+      "failure_class",
+      "severity",
+    ]]);
 
     const missingAll = cases.get("missing all terminal series stays unobservable");
     assert.ok(missingAll);

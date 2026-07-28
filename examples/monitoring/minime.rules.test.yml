@@ -46,9 +46,9 @@ tests:
 
   - name: repeated failures and a counter reset retain one alert identity
     input_series:
-      - series: 'minime_cron_last_exit_code{cron="stable-identity"}'
+      - series: 'minime_cron_last_exit_code{cron="stable-identity",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
         values: "1x11"
-      - series: 'minime_cron_last_run_timestamp_seconds{cron="stable-identity"}'
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="stable-identity",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
         values: "0+60x10"
       - series: 'minime_cron_runs_total{cron="stable-identity",outcome="success"}'
         values: "3x11"
@@ -121,7 +121,7 @@ tests:
 
   - name: missing terminal timestamp reports incomplete telemetry
     input_series:
-      - series: 'minime_cron_last_exit_code{cron="missing-timestamp"}'
+      - series: 'minime_cron_last_exit_code{cron="missing-timestamp",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
         values: "0x11"
     alert_rule_test:
       - eval_time: 5m
