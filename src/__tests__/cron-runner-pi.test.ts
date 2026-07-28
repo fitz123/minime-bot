@@ -150,7 +150,7 @@ describe("cron-runner runPi", () => {
 
     const output = runPi(makeCron({ timeout: 1234 }), ws, deps);
 
-    assert.strictEqual(output, "pi output");
+    assert.strictEqual(output, " pi output\n");
     assert.strictEqual(captures.length, 1);
     const capture = captures[0];
     assert.strictEqual(capture.command, process.execPath);
@@ -190,6 +190,17 @@ describe("cron-runner runPi", () => {
     ]) {
       assert.ok(!capture.args.includes(forbidden), `forbidden Pi cron flag present: ${forbidden}`);
     }
+  });
+
+  it("preserves successful stdout whitespace for exact terminal marker classification", () => {
+    const ws = makeWorkspace();
+    const captures: SpawnCapture[] = [];
+    const output = "report\n[[MINIME_CRON_UNRESOLVED_V1]] \t\n";
+    const deps = makeDeps(captures, {
+      spawnSync: capturingSpawn(captures, spawnResult({ stdout: output })),
+    });
+
+    assert.strictEqual(runPi(makeCron(), ws, deps), output);
   });
 
   it("keeps configured extra extensions out of Pi cron spawns", () => {

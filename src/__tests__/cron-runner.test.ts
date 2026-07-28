@@ -966,9 +966,9 @@ describe("cron-runner", () => {
   describe("Pi result classification", () => {
     const cases = [
       {
-        name: "returns trimmed stdout for a zero exit with output",
+        name: "preserves stdout for a zero exit with output",
         args: [0, null, "  hello from pi\n", ""] as const,
-        expected: { status: "ok" as const, output: "hello from pi" },
+        expected: { status: "ok" as const, output: "  hello from pi\n" },
       },
       {
         name: "treats a zero exit with empty stdout and empty stderr as intentional empty success",
@@ -978,7 +978,7 @@ describe("cron-runner", () => {
       {
         name: "preserves NO_REPLY output for the existing post-run suppression logic",
         args: [0, null, "\nNO_REPLY\n", "diagnostic warning"] as const,
-        expected: { status: "ok" as const, output: "NO_REPLY" },
+        expected: { status: "ok" as const, output: "\nNO_REPLY\n" },
       },
       {
         name: "treats a zero exit with empty stdout and non-empty stderr as an error",
@@ -1037,6 +1037,17 @@ describe("cron-runner", () => {
       assert.match(result.diagnostics ?? "", /truncated \d+ chars/);
       assert.doesNotMatch(result.diagnostics ?? "", /-tail/);
       assert.ok((result.diagnostics ?? "").length < 2400, `diagnostics were not bounded: ${result.diagnostics?.length}`);
+    });
+
+    it("preserves successful Pi stdout until exact LLM marker classification", () => {
+      const output = `Finding remains unresolved.\n${MINIME_CRON_UNRESOLVED_MARKER} \n`;
+      const result = classifyPiResult(0, null, output, "");
+
+      assert.deepStrictEqual(result, { status: "ok", output });
+      assert.deepStrictEqual(
+        classifyLlmCronTerminalResult(result.status === "ok" ? result.output : ""),
+        { output, outcome: "success" },
+      );
     });
   });
 
@@ -2186,6 +2197,26 @@ bindings: []
       assert.doesNotMatch(calls.deliveries[0].message, /MINIME_CRON_UNRESOLVED/);
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+    });
+
+    it("keeps a whitespace-padded final marker as ordinary successful output", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runPi = () =>
+        `Actionable report for the operator.\n${MINIME_CRON_UNRESOLVED_MARKER} \n`;
+
+      await main(deps);
+
+      assert.deepStrictEqual(calls.deliveries, [
+        {
+          chatId: cron.deliveryChatId,
+          message: `Actionable report for the operator.\n${MINIME_CRON_UNRESOLVED_MARKER}`,
+          threadId: cron.deliveryThreadId,
+        },
+      ]);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
       ]);
     });
 

@@ -185,6 +185,15 @@ describe("cron terminal monitoring contract", () => {
       "severity",
     ]);
 
+    const recovery = cases.get("successful terminal state resolves a firing failure");
+    assert.ok(recovery);
+    assert.deepEqual(
+      recovery.input_series?.map((series) => series.values),
+      ["1x6 0x4", "0x6 420x4"],
+    );
+    assert.equal(recovery.alert_rule_test.at(-1)?.eval_time, "7m");
+    assert.deepEqual(recovery.alert_rule_test.at(-1)?.exp_alerts, []);
+
     const missingTimestamp = cases.get("missing terminal timestamp reports incomplete telemetry");
     assert.ok(missingTimestamp);
     assert.match(missingTimestamp.input_series?.[0]?.series ?? "", /job="node-exporter"/);

@@ -1011,7 +1011,7 @@ function classifyPiResult(
     return piErrorResult(summary, stdout, stderr);
   }
   if (trimmedStdout) {
-    return { status: "ok", output: trimmedStdout };
+    return { status: "ok", output: stdout };
   }
   if (trimmedStderr) {
     return piErrorResult("Pi cron produced stderr without stdout", stdout, stderr);
@@ -1481,7 +1481,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       );
       deps.log(taskName, `Pi returned ${output.length} chars`);
       const classified = classifyLlmCronTerminalResult(output);
-      output = classified.output;
+      output = classified.output.trim();
       terminalOutcome = classified.outcome;
     }
   } catch (err) {
