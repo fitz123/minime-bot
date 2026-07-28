@@ -568,6 +568,10 @@ timestamp snapshot changes only after success:
 - `minime_cron_last_run_timestamp_seconds{cron}` records the latest terminal
   classification time.
 
+Terminal metric persistence is fail-closed: a directory, lock, state-read, or
+snapshot-write failure is reported on standard error and leaves the runner
+non-zero instead of silently completing against an older snapshot.
+
 LLM crons receive a package-owned instruction allowing the exact standalone
 final non-empty line `[[MINIME_CRON_UNRESOLVED_V1]]`. The runner strips that
 line from delivery, delivers any clean report through the ordinary

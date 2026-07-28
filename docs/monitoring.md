@@ -73,6 +73,11 @@ contract has four metric families:
 - `minime_cron_last_run_timestamp_seconds{cron}` is the timestamp of the latest
   terminal classification.
 
+Terminal metric persistence is fail-closed. A directory, lock, prior-state
+read, or snapshot-write failure is emitted on standard error and makes the
+runner non-zero rather than allowing a successful process status against an
+older terminal snapshot.
+
 Only the bounded configured cron name and the closed `success` or `failure`
 outcome are labels. Exit values, timestamps, diagnostics, run IDs,
 destinations, and identities are not labels. Counter resets do not change an

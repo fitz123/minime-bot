@@ -4,15 +4,16 @@
 
 import {
   appendFileSync,
-  closeSync,
   mkdirSync,
-  openSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import {
   loadRawMergedConfig,
   loadTelegramToken,
@@ -68,8 +69,8 @@ const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
 const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
 const CRON_HEALTH_LOCK_RETRY_MS = 10;
-const CRON_HEALTH_LOCK_TIMEOUT_MS = 5_000;
 const CRON_HEALTH_STALE_LOCK_MS = 30_000;
+const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
@@ -155,6 +156,167 @@ function writeAtomicTextFile(dir: string, fileName: string, content: string): vo
   }
 }
 
+function inspectProcessStartToken(pid: number): string | undefined {
+  let identity: string | undefined;
+  if (process.platform === "linux") {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = raw.lastIndexOf(")");
+      const fields = raw.slice(closingParen + 2).trim().split(/\s+/);
+      if (closingParen >= 0 && fields[19]) {
+        identity = `linux:${fields[19]}`;
+      }
+    } catch {
+      // The liveness probe below remains the fail-closed fallback.
+    }
+  } else {
+    const inspected = spawnSync(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf8", timeout: 1_000, maxBuffer: 64 * 1024 },
+    );
+    if (!inspected.error && inspected.status === 0 && inspected.stdout.trim()) {
+      identity = `${process.platform}:${inspected.stdout.trim()}`;
+    }
+  }
+
+  return identity === undefined
+    ? undefined
+    : createHash("sha256").update(identity).digest("hex").slice(0, 16);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function removeEmptyCronHealthLockDirectory(lockPath: string): boolean {
+  try {
+    rmdirSync(lockPath);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST") {
+      return code === "ENOENT";
+    }
+    throw err;
+  }
+}
+
+function removeCronHealthLockEntry(entryPath: string): boolean {
+  try {
+    unlinkSync(entryPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+function recoverCronHealthLock(lockPath: string): boolean {
+  let lockStat: ReturnType<typeof statSync>;
+  try {
+    lockStat = statSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return true;
+    }
+    throw err;
+  }
+
+  if (!lockStat.isDirectory()) {
+    if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
+      return false;
+    }
+    try {
+      unlinkSync(lockPath);
+      return true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "EISDIR" || code === "EPERM") {
+        return true;
+      }
+      throw err;
+    }
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return true;
+    }
+    throw err;
+  }
+
+  if (entries.length === 0) {
+    if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
+      return false;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  const ownerEntries = entries.filter((entry) =>
+    /^owner-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/.test(entry)
+  );
+  const ownerEntry = ownerEntries.length === 1 ? ownerEntries[0] : undefined;
+  const ownerMatch = ownerEntry?.match(
+    /^owner-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/,
+  );
+  if (
+    entries.length === 2
+    && entries.includes("claim")
+    && ownerEntry !== undefined
+    && ownerMatch
+  ) {
+    const ownerPid = Number(ownerMatch[1]);
+    const recordedStartToken = ownerMatch[2];
+    if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
+      const currentStartToken = inspectProcessStartToken(ownerPid);
+      if (
+        currentStartToken !== undefined
+        && recordedStartToken !== "unknown"
+        && currentStartToken === recordedStartToken
+      ) {
+        return false;
+      }
+      if (
+        (currentStartToken === undefined || recordedStartToken === "unknown")
+        && isProcessAlive(ownerPid)
+      ) {
+        return false;
+      }
+    }
+    if (!removeCronHealthLockEntry(join(lockPath, ownerEntry))) {
+      return true;
+    }
+    if (!removeCronHealthLockEntry(join(lockPath, "claim"))) {
+      return true;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
+    return false;
+  }
+
+  if (entries.length === 1 && entries[0] === "claim") {
+    if (!removeCronHealthLockEntry(join(lockPath, "claim"))) {
+      return true;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  throw new Error(`cron health lock "${lockPath}" has invalid ownership state`);
+}
+
 function acquireCronHealthLock(dir: string, fileStem: string): () => void {
   const lockPath = join(dir, `.minime_cron_${fileStem}.lock`);
   const deadline = Date.now() + CRON_HEALTH_LOCK_TIMEOUT_MS;
@@ -162,20 +324,42 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
 
   while (true) {
     try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      closeSync(fd);
+      mkdirSync(lockPath, { mode: 0o700 });
+      const ownerToken = [
+        process.pid,
+        inspectProcessStartToken(process.pid) ?? "unknown",
+        randomUUID(),
+      ].join("-");
+      const claimPath = join(lockPath, "claim");
+      writeFileSync(claimPath, `${ownerToken}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      const ownerEntry = `owner-${ownerToken}`;
+      const ownerPath = join(lockPath, ownerEntry);
+      try {
+        writeFileSync(ownerPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      } catch (err) {
+        removeCronHealthLockEntry(claimPath);
+        removeEmptyCronHealthLockDirectory(lockPath);
+        throw err;
+      }
+
       let released = false;
       return () => {
         if (released) {
           return;
         }
         released = true;
-        try {
-          unlinkSync(lockPath);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw err;
-          }
+        if (!removeCronHealthLockEntry(ownerPath)) {
+          throw new Error(`cron health lock owner "${ownerPath}" is missing`);
+        }
+        if (!removeCronHealthLockEntry(claimPath)) {
+          throw new Error(`cron health lock claim "${claimPath}" is missing`);
+        }
+        if (!removeEmptyCronHealthLockDirectory(lockPath)) {
+          throw new Error(`cron health lock directory "${lockPath}" is not empty`);
         }
       };
     } catch (err) {
@@ -184,16 +368,8 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
       }
     }
 
-    try {
-      if (Date.now() - statSync(lockPath).mtimeMs > CRON_HEALTH_STALE_LOCK_MS) {
-        unlinkSync(lockPath);
-        continue;
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        continue;
-      }
-      throw err;
+    if (recoverCronHealthLock(lockPath)) {
+      continue;
     }
 
     if (Date.now() >= deadline) {
@@ -267,20 +443,18 @@ function writeCronHealthMetric(
   try {
     mkdirSync(dir, { recursive: true });
   } catch (err) {
-    process.stderr.write(
-      `[cron-runner] WARN: failed to prepare cron health metric dir for "${cronName}": ${(err as Error).message}\n`,
+    throw new Error(
+      `failed to prepare cron health metric dir for "${cronName}": ${errorFromUnknown(err).message}`,
     );
-    return;
   }
 
-  let releaseLock: (() => void) | undefined;
+  let releaseLock: () => void;
   try {
     releaseLock = acquireCronHealthLock(dir, fileStem);
   } catch (err) {
-    process.stderr.write(
-      `[cron-runner] WARN: failed to lock cron health metric for "${cronName}": ${(err as Error).message}\n`,
+    throw new Error(
+      `failed to lock cron health metric for "${cronName}": ${errorFromUnknown(err).message}`,
     );
-    return;
   }
 
   try {
@@ -288,10 +462,9 @@ function writeCronHealthMetric(
     try {
       previousCounts = readCronRunCounts(exitFilePath, label);
     } catch (err) {
-      process.stderr.write(
-        `[cron-runner] WARN: failed to read prior cron health metric for "${cronName}": ${(err as Error).message}\n`,
+      throw new Error(
+        `failed to read prior cron health metric for "${cronName}": ${errorFromUnknown(err).message}`,
       );
-      return;
     }
 
     const counts: CronRunCounts = {
@@ -307,15 +480,6 @@ function writeCronHealthMetric(
       "",
     ].join("\n");
 
-    try {
-      writeAtomicTextFile(dir, exitFileName, terminalSnapshot);
-    } catch (err) {
-      process.stderr.write(
-        `[cron-runner] WARN: failed to write cron health terminal metric for "${cronName}": ${(err as Error).message}\n`,
-      );
-      return;
-    }
-
     if (outcome === "success") {
       try {
         writeAtomicTextFile(
@@ -324,17 +488,25 @@ function writeCronHealthMetric(
           `minime_cron_last_success_timestamp{cron="${label}"} ${timestamp}\n`,
         );
       } catch (err) {
-        process.stderr.write(
-          `[cron-runner] WARN: failed to write cron health success metric for "${cronName}": ${(err as Error).message}\n`,
+        throw new Error(
+          `failed to write cron health success metric for "${cronName}": ${errorFromUnknown(err).message}`,
         );
       }
+    }
+
+    try {
+      writeAtomicTextFile(dir, exitFileName, terminalSnapshot);
+    } catch (err) {
+      throw new Error(
+        `failed to write cron health terminal metric for "${cronName}": ${errorFromUnknown(err).message}`,
+      );
     }
   } finally {
     try {
       releaseLock();
     } catch (err) {
-      process.stderr.write(
-        `[cron-runner] WARN: failed to release cron health metric lock for "${cronName}": ${(err as Error).message}\n`,
+      throw new Error(
+        `failed to release cron health metric lock for "${cronName}": ${errorFromUnknown(err).message}`,
       );
     }
   }
@@ -1034,8 +1206,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     if (terminalFinalized) {
       throw new Error(`Cron invocation "${cronName}" was finalized more than once`);
     }
-    terminalFinalized = true;
     deps.writeCronHealthMetric(cronName, outcome === "success" ? 0 : 1, outcome);
+    terminalFinalized = true;
   };
 
   const taskIdx = deps.argv.indexOf("--task");

@@ -1345,21 +1345,6 @@ bindings: []
       rmSync(METRIC_DIR, { recursive: true, force: true });
     });
 
-    function captureStderr(run: () => void): string {
-      const oldWrite = process.stderr.write;
-      const stderrWrites: string[] = [];
-      try {
-        process.stderr.write = ((chunk: string | Uint8Array) => {
-          stderrWrites.push(String(chunk));
-          return true;
-        }) as typeof process.stderr.write;
-        run();
-      } finally {
-        process.stderr.write = oldWrite;
-      }
-      return stderrWrites.join("");
-    }
-
     it("writes all terminal series to stable hashed textfiles without temporary residue", () => {
       const before = Math.floor(Date.now() / 1000);
 
@@ -1520,6 +1505,42 @@ bindings: []
       );
     });
 
+    it("serializes simultaneous recovery of one abandoned owner lock", async () => {
+      const cronName = "concurrent-stale-lock";
+      const stem = sanitizeCronMetricStem(cronName);
+      const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
+      mkdirSync(lockPath);
+      const staleOwner = `${process.pid}-0000000000000000-deadbeef`;
+      writeFileSync(join(lockPath, "claim"), `${staleOwner}\n`, "utf8");
+      writeFileSync(
+        join(lockPath, `owner-${staleOwner}`),
+        `${process.pid}\n`,
+        "utf8",
+      );
+
+      await Promise.all([
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+      ]);
+
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      const content = readFileSync(join(METRIC_DIR, exitFile), "utf8");
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-stale-lock",outcome="success"\} 3/,
+      );
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-stale-lock",outcome="failure"\} 3/,
+      );
+      assert.ok(!readdirSync(METRIC_DIR).includes(`.minime_cron_${stem}.lock`));
+    });
+
     it("starts a valid counter epoch when prior state is missing or corrupt", () => {
       writeCronHealthMetric("counter-reset", 1, "failure");
       const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
@@ -1599,11 +1620,11 @@ bindings: []
       const exitPath = join(METRIC_DIR, `minime_cron_${stem}.exit.prom`);
       mkdirSync(exitPath);
 
-      const stderr = captureStderr(() => {
-        assert.doesNotThrow(() => writeCronHealthMetric(cronName, 1, "failure"));
-      });
+      assert.throws(
+        () => writeCronHealthMetric(cronName, 1, "failure"),
+        /failed to read prior cron health metric/,
+      );
 
-      assert.match(stderr, /failed to read prior cron health metric/);
       assert.deepStrictEqual(readdirSync(exitPath), []);
       assert.deepStrictEqual(
         readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
@@ -1617,33 +1638,28 @@ bindings: []
       const successPath = join(METRIC_DIR, `minime_cron_${stem}.success.prom`);
       mkdirSync(successPath);
 
-      const stderr = captureStderr(() => {
-        assert.doesNotThrow(() => writeCronHealthMetric(cronName, 0, "success"));
-      });
+      assert.throws(
+        () => writeCronHealthMetric(cronName, 0, "success"),
+        /failed to write cron health success metric/,
+      );
 
-      assert.match(stderr, /failed to write cron health success metric/);
       assert.deepStrictEqual(readdirSync(successPath), []);
       assert.deepStrictEqual(
         readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
         [],
       );
       const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
-      assert.ok(exitFile);
-      assert.match(
-        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
-        /minime_cron_runs_total\{cron="rename-cleanup",outcome="success"\} 1/,
-      );
+      assert.strictEqual(exitFile, undefined);
     });
 
-    it("warns but does not throw when the textfile path cannot be written", () => {
+    it("throws when the textfile path cannot be written", () => {
       const blocker = join(METRIC_DIR, "not-a-directory");
       writeFileSync(blocker, "blocking file", "utf8");
       process.env.CRON_HEALTH_TEXTFILE_DIR = join(blocker, "child");
-      const stderr = captureStderr(() => {
-        assert.doesNotThrow(() => writeCronHealthMetric("blocked metric", 1, "failure"));
-      });
-      assert.match(stderr, /blocked metric/);
-      assert.match(stderr, /failed to prepare cron health metric dir/);
+      assert.throws(
+        () => writeCronHealthMetric("blocked metric", 1, "failure"),
+        /failed to prepare cron health metric dir for "blocked metric"/,
+      );
     });
   });
 
@@ -1865,6 +1881,26 @@ bindings: []
       ]);
       assert.ok(calls.logs.some((entry) =>
         entry.message === "FAIL: invalid cron configuration"));
+    });
+
+    it("propagates terminal metric publication failure after delivery", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const recordMetric = deps.writeCronHealthMetric;
+      deps.writeCronHealthMetric = (cronName, exitCode, outcome) => {
+        recordMetric(cronName, exitCode, outcome);
+        throw new Error("metric persistence unavailable");
+      };
+
+      await assert.rejects(() => main(deps), /metric persistence unavailable/);
+
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: cron.deliveryChatId, message: "llm output", threadId: cron.deliveryThreadId },
+      ]);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
+      ]);
+      assert.ok(!calls.logs.some((entry) => entry.message === "DONE"));
     });
 
     it("keeps script crons on the script path and delivers their output", async () => {
