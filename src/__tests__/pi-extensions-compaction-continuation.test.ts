@@ -1,11 +1,25 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxThinking,
+  type Context,
+} from "@earendil-works/pi-ai";
 import {
   PI_ACKNOWLEDGED_STEER_COMMAND,
   PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
@@ -20,7 +34,7 @@ import {
 type EventHandler = (
   event: Record<string, unknown>,
   ctx: ExtensionCommandContext,
-) => void;
+) => unknown;
 type CommandHandler = (
   args: string,
   ctx: ExtensionCommandContext,
@@ -104,9 +118,9 @@ function createHarness() {
       await handler(args, context);
     },
     emit(event: string, payload: Record<string, unknown> = {}) {
-      for (const handler of handlers.get(event) ?? []) {
-        handler({ type: event, ...payload }, context);
-      }
+      return (handlers.get(event) ?? []).map((handler) =>
+        handler({ type: event, ...payload }, context)
+      );
     },
   };
 }
@@ -187,7 +201,7 @@ describe("compaction continuation Pi extension", () => {
       {
         message: {
           customType: PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
-          content: PI_COMPACTION_CONTINUATION_CONTENT,
+          content: [],
           display: false,
         },
         options: { deliverAs: "followUp" },
@@ -199,12 +213,161 @@ describe("compaction continuation Pi extension", () => {
       "the continuation must remain a custom message, not a synthetic user message",
     );
 
+    const marker = {
+      role: "custom",
+      customType: PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+      content: [],
+      display: false,
+      timestamp: Date.now(),
+    };
+    harness.emit("message_end", { message: marker });
+    assert.equal(marker.role, "bashExecution");
+    assert.equal(
+      (marker as Record<string, unknown>).excludeFromContext,
+      true,
+    );
+
+    const userMessage = {
+      role: "user",
+      content: "question",
+      timestamp: Date.now(),
+    };
+    const contextResults = harness.emit("context", {
+      messages: [userMessage, marker],
+    });
+    assert.equal(contextResults.length, 1);
+    const contextMessages = (
+      contextResults[0] as { messages: Array<Record<string, unknown>> }
+    ).messages;
+    assert.deepEqual(contextMessages[0], userMessage);
+    assert.deepEqual(
+      {
+        ...contextMessages[1],
+        timestamp: 0,
+      },
+      {
+        role: "custom",
+        customType: PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+        content: PI_COMPACTION_CONTINUATION_CONTENT,
+        display: false,
+        timestamp: 0,
+      },
+    );
+    assert.deepEqual(
+      harness.emit("context", { messages: [marker] }),
+      [{ messages: [] }],
+      "the transient instruction must be injected only once",
+    );
+
     harness.emit("agent_settled");
     harness.emit("session_compact", {
       reason: "threshold",
       willRetry: false,
     });
     assert.equal(harness.sent.length, 1);
+  });
+
+  it("keeps the continuation control out of real Pi session persistence", async (t) => {
+    const testRoot = await mkdtemp(
+      join(tmpdir(), "minime-continuation-session-"),
+    );
+    t.after(async () => {
+      await rm(testRoot, { recursive: true, force: true });
+    });
+    const sessionDir = join(testRoot, "sessions");
+    const sessionManager = SessionManager.create(testRoot, sessionDir);
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+    const faux = fauxProvider({
+      provider: "compaction-continuation-test",
+      api: "compaction-continuation-test",
+      models: [{
+        id: "continuation-model",
+        reasoning: true,
+        contextWindow: 200_000,
+        maxTokens: 128,
+      }],
+    });
+    modelRuntime.registerNativeProvider(faux.provider);
+
+    let continuationRequest: Context | undefined;
+    faux.setResponses([
+      fauxAssistantMessage(fauxThinking("unfinished reasoning"), {
+        stopReason: "length",
+      }),
+      fauxAssistantMessage("compacted turn prefix"),
+      (context) => {
+        continuationRequest = context;
+        return fauxAssistantMessage("continued final answer");
+      },
+    ]);
+
+    const settingsManager = SettingsManager.inMemory({
+      extensions: [resolve("extensions/pi/compaction-continuation.ts")],
+      compaction: {
+        enabled: true,
+        reserveTokens: 199_000,
+        keepRecentTokens: 1,
+      },
+      retry: { enabled: false },
+    });
+    const { session, extensionsResult } = await createAgentSession({
+      cwd: testRoot,
+      agentDir: join(testRoot, "agent"),
+      modelRuntime,
+      model: faux.getModel(),
+      thinkingLevel: "off",
+      settingsManager,
+      sessionManager,
+      noTools: "all",
+    });
+
+    try {
+      assert.deepEqual(extensionsResult.errors, []);
+      await session.prompt("long accepted turn ".repeat(300));
+    } finally {
+      session.dispose();
+    }
+
+    assert.equal(faux.state.callCount, 3);
+    assert.ok(continuationRequest);
+    const requestText = JSON.stringify(continuationRequest.messages);
+    assert.equal(
+      requestText.split(PI_COMPACTION_CONTINUATION_CONTENT).length - 1,
+      1,
+      "the continuation request must receive one transient instruction",
+    );
+
+    const sessionFile = sessionManager.getSessionFile();
+    assert.ok(sessionFile);
+    const persistedText = await readFile(sessionFile, "utf8");
+    const persistedEntries = persistedText
+      .trim()
+      .split("\n")
+      .slice(1)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(
+      persistedEntries.some(
+        (entry) =>
+          entry.type === "custom_message" &&
+          entry.customType === PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+      ),
+      false,
+    );
+    assert.equal(
+      persistedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
+      false,
+    );
+
+    const resumed = SessionManager.open(sessionFile, sessionDir, testRoot);
+    const resumedText = JSON.stringify(resumed.buildSessionContext().messages);
+    assert.equal(
+      resumedText.includes(PI_COMPACTION_CONTINUATION_CUSTOM_TYPE),
+      false,
+    );
+    assert.equal(
+      resumedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
+      false,
+    );
   });
 
   it("clears the arm when a later agent outcome does not match", async () => {

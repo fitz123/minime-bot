@@ -864,9 +864,9 @@ const compactionContext = {
   },
 };
 const emitCompactionEvent = (event, payload = {}) => {
-  for (const handler of compactionHandlers.get(event) ?? []) {
-    handler({ type: event, ...payload }, compactionContext);
-  }
+  return (compactionHandlers.get(event) ?? []).map((handler) =>
+    handler({ type: event, ...payload }, compactionContext)
+  );
 };
 emitCompactionEvent("agent_end", {
   messages: [{
@@ -890,12 +890,38 @@ emitCompactionEvent("session_compact", {
 assert.deepEqual(compactionSentMessages, [{
   message: {
     customType: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
-    content: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CONTENT,
+    content: [],
     display: false,
   },
   options: { deliverAs: "followUp" },
 }]);
 assert.deepEqual(compactionUserMessages, []);
+const installedMarker = {
+  role: "custom",
+  ...compactionSentMessages[0].message,
+  timestamp: Date.now(),
+};
+emitCompactionEvent("message_end", { message: installedMarker });
+assert.equal(installedMarker.role, "bashExecution");
+assert.equal(installedMarker.excludeFromContext, true);
+const installedContextMessages = emitCompactionEvent(
+  "context",
+  { messages: [installedMarker] },
+)[0].messages;
+assert.equal(installedContextMessages.length, 1);
+assert.deepEqual(
+  {
+    ...installedContextMessages[0],
+    timestamp: 0,
+  },
+  {
+    role: "custom",
+    customType: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+    content: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CONTENT,
+    display: false,
+    timestamp: 0,
+  },
+);
 
 const configMod = await importPackageFile("dist/config.js");
 const loadedConfig = configMod.loadConfig(join(workspace, "config.yaml"), {
