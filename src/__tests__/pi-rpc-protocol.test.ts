@@ -62,6 +62,10 @@ import {
   buildPiAcknowledgedSteerResultNotice,
   parsePiAcknowledgedSteerEnvelope,
 } from "../pi-extensions/acknowledged-steer.js";
+import {
+  PI_COMPACTION_CONTINUATION_CONTENT,
+  PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+} from "../pi-extensions/compaction-continuation.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
@@ -2183,14 +2187,49 @@ describe("parsePiEvent", () => {
       }, state),
       null,
     );
+    assert.strictEqual(state.agentEndObserved, true);
 
     const settled = parsePiEvent({ type: "agent_settled" }, state);
     assert.ok(settled);
     assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    assert.match(
+    assert.strictEqual(
       (settled as { result: string }).result,
-      /without a usable agent_end outcome/,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
     );
+  });
+
+  it("keeps the length outcome until a meaningful continuation outcome replaces it", () => {
+    const state: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }, state),
+      null,
+    );
+    assert.strictEqual(parsePiEvent({ type: "agent_start" }, state), null);
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "no terminal answer" }],
+        }],
+      }, state),
+      null,
+    );
+
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual(
+      (settled as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
   });
 
   it("defers final errors until settlement and preserves the original overflow cause", () => {
@@ -2226,19 +2265,43 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("uses a non-empty error for final agent failure and settlement without an outcome", () => {
-    for (const messages of [
-      [{ role: "assistant", stopReason: "error", errorMessage: "   ", content: [] }],
-      [{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" }] }],
-    ]) {
-      const state: PiRpcParseState = {};
-      assert.strictEqual(parsePiEvent({ type: "agent_end", messages }, state), null);
-      const settled = parsePiEvent({ type: "agent_settled" }, state);
-      assert.ok(settled);
-      assert.strictEqual(settled.type, "result");
-      assert.ok((settled as { result: string }).result.trim().length > 0);
-      assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    }
+  it("distinguishes an observed empty agent_end from a genuinely missing agent_end", () => {
+    const failedState: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "   ",
+          content: [],
+        }],
+      }, failedState),
+      null,
+    );
+    const failed = parsePiEvent({ type: "agent_settled" }, failedState);
+    assert.ok(failed);
+    assert.strictEqual((failed as { result: string }).result, "Pi RPC agent failed");
+    assert.strictEqual((failed as { is_error?: boolean }).is_error, true);
+
+    const emptyState: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "toolCall", id: "c1", name: "bash" }],
+        }],
+      }, emptyState),
+      null,
+    );
+    const empty = parsePiEvent({ type: "agent_settled" }, emptyState);
+    assert.ok(empty);
+    assert.strictEqual(
+      (empty as { result: string }).result,
+      "Pi agent_end arrived without a usable terminal outcome",
+    );
+    assert.strictEqual((empty as { is_error?: boolean }).is_error, true);
 
     const noRunState: PiRpcParseState = {};
     const noRun = parsePiEvent({ type: "agent_settled" }, noRunState);
@@ -2977,7 +3040,16 @@ describe("readPiStream", () => {
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "first run" }] }],
       }),
-      JSON.stringify({ type: "queue_update", followUp: ["continue"] }),
+      JSON.stringify({
+        type: "queue_update",
+        steering: ["redirect"],
+        followUp: ["continue"],
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "steer",
+        success: true,
+      }),
       JSON.stringify({ type: "agent_start" }),
       JSON.stringify({
         type: "message_update",
@@ -3006,6 +3078,106 @@ describe("readPiStream", () => {
     assert.strictEqual((resets[0] as { reason?: unknown }).reason, "pi_queued_continuation");
     assert.ok(lines.indexOf(resets[0]) > 0);
     assert.ok(lines.indexOf(resets[0]) < lines.findIndex((line) => extractPiTextDelta(line) === "continued final"));
+  });
+
+  it("continues a reasoning-only length run after threshold compaction and emits one final answer", async () => {
+    const child = childWithStdout([
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "threshold" }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "threshold",
+        willRetry: false,
+        success: true,
+      }),
+      JSON.stringify({
+        type: "queue_update",
+        followUp: [{
+          customType: PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+          content: PI_COMPACTION_CONTINUATION_CONTENT,
+          display: false,
+        }],
+      }),
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_delta",
+          delta: "continued final answer",
+        },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "text", text: "continued final answer" }],
+        }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.deepStrictEqual(
+      lines.map(extractPiTextDelta).filter((text): text is string => text !== null),
+      ["continued final answer"],
+    );
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "continued final answer");
+    assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
+    assert.ok(
+      !JSON.stringify(lines).includes(PI_COMPACTION_CONTINUATION_CONTENT),
+      "hidden continuation control text must not become user-facing output",
+    );
+  });
+
+  it("returns the specific length error when threshold compaction cannot continue", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "threshold" }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "threshold",
+        willRetry: false,
+        success: false,
+        errorMessage: "Unable to compact the conversation",
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
   });
 
   it("emits a protocol error when settlement has no usable agent_end outcome", async () => {

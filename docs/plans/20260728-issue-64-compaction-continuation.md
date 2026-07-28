@@ -57,11 +57,11 @@ git diff --check
 ### Task 3: Distinguish observed length outcomes and lock the end-to-end lifecycle regression
 **Goal:** Make terminal parsing truthful and prove length → compaction → automatic continuation → one final answer.
 **Serves:** The approved outcome that an observed reasoning-only length `agent_end` is neither success nor the false missing-`agent_end` diagnostic, while genuine missing-`agent_end` behavior remains distinct.
-- [ ] Track observation of the completed run's `agent_end` separately from retained visible answer text and keep a specific unrecoverable length outcome until a real continuation outcome replaces it.
-- [ ] Update settlement/reset handling so a final answer after continuation wins exactly once, while a settled length path that could not continue returns one specific error and a true settlement with no `agent_end` retains the existing missing-outcome diagnostic.
-- [ ] Add deterministic parser/stream tests for reasoning-only length, successful threshold compaction and hidden continuation, final visible answer exactly once, compaction failure/no continuation, genuine missing `agent_end`, queued steering/follow-up, and overflow recovery.
-- [ ] Run focused lifecycle tests, then the full package test suite, lint, build, package dry-run, and whitespace validation.
-- [ ] Review `git diff main...HEAD` as a scope/privacy cut pass and confirm no unrelated lifecycle framework or dependency change entered the branch.
+- [x] Track observation of the completed run's `agent_end` separately from retained visible answer text and keep a specific unrecoverable length outcome until a real continuation outcome replaces it.
+- [x] Update settlement/reset handling so a final answer after continuation wins exactly once, while a settled length path that could not continue returns one specific error and a true settlement with no `agent_end` retains the existing missing-outcome diagnostic.
+- [x] Add deterministic parser/stream tests for reasoning-only length, successful threshold compaction and hidden continuation, final visible answer exactly once, compaction failure/no continuation, genuine missing `agent_end`, queued steering/follow-up, and overflow recovery.
+- [x] Run focused lifecycle tests, then the full package test suite, lint, build, package dry-run, and whitespace validation.
+- [x] Review `git diff main...HEAD` as a scope/privacy cut pass and confirm no unrelated lifecycle framework or dependency change entered the branch.
 
 ## Post-Completion
 
