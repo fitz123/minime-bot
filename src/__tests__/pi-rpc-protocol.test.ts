@@ -62,6 +62,10 @@ import {
   buildPiAcknowledgedSteerResultNotice,
   parsePiAcknowledgedSteerEnvelope,
 } from "../pi-extensions/acknowledged-steer.js";
+import {
+  PI_COMPACTION_CONTINUATION_CONTENT,
+  PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+} from "../pi-extensions/compaction-continuation.js";
 import type { AgentConfig, StreamLine } from "../types.js";
 import {
   MINIME_AGENT_WORKSPACE_ROOT_ENV,
@@ -381,7 +385,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -444,6 +448,7 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -455,11 +460,11 @@ describe("Pi extension loading (--extension)", () => {
   it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["acknowledged-steer.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["acknowledged-steer.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -476,6 +481,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(parentArgs, [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -512,11 +518,56 @@ describe("Pi extension loading (--extension)", () => {
     const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
     const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
     assert.ok(!sourceRelpaths.includes("acknowledged-steer.ts"));
+    assert.ok(!sourceRelpaths.includes("compaction-continuation.ts"));
     assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
     assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
     assert.ok(!artifactRelpaths.includes("acknowledged-steer.js"));
+    assert.ok(!artifactRelpaths.includes("compaction-continuation.js"));
     assert.ok(!artifactRelpaths.includes("subagent/index.js"));
     assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
+  });
+
+  it("loads compaction continuation only in the primary interactive inventory", () => {
+    const sourceInventories: Record<string, readonly string[]> = {
+      interactive: PI_EXTENSION_WRAPPER_RELPATHS,
+      subagent: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
+      askAgent: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
+      cron: PI_CRON_WRAPPER_RELPATHS,
+    };
+    const artifactInventories: Record<string, readonly string[]> = {
+      interactive: PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
+      subagent: PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+      askAgent: PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+    };
+
+    assert.equal(
+      sourceInventories.interactive.filter(
+        (relpath) => relpath === "compaction-continuation.ts",
+      ).length,
+      1,
+    );
+    for (const runtime of ["subagent", "askAgent", "cron"]) {
+      assert.equal(
+        sourceInventories[runtime].includes("compaction-continuation.ts"),
+        false,
+        `${runtime} must not load interactive turn continuation`,
+      );
+    }
+    assert.equal(
+      artifactInventories.interactive.filter(
+        (relpath) => relpath === "compaction-continuation.js",
+      ).length,
+      1,
+    );
+    for (const runtime of ["subagent", "askAgent"]) {
+      assert.equal(
+        artifactInventories[runtime].includes(
+          "compaction-continuation.js",
+        ),
+        false,
+        `${runtime} artifact must not load interactive turn continuation`,
+      );
+    }
   });
 
   it("loads the canonical web-tools wrapper exactly once on every package-managed runtime inventory", () => {
@@ -697,6 +748,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -715,6 +767,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -737,6 +790,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -774,8 +828,9 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
     assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
+    assert.ok(args.includes(wrapperAbs("compaction-continuation.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
@@ -791,6 +846,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -807,7 +863,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -826,6 +882,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -955,10 +1012,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 6, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 7, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 6);
+    assert.strictEqual(paths.length, 7);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -2130,14 +2187,87 @@ describe("parsePiEvent", () => {
       }, state),
       null,
     );
+    assert.strictEqual(state.agentEndObserved, true);
 
     const settled = parsePiEvent({ type: "agent_settled" }, state);
     assert.ok(settled);
     assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    assert.match(
+    assert.strictEqual(
       (settled as { result: string }).result,
-      /without a usable agent_end outcome/,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
     );
+  });
+
+  it("keeps the length outcome until a meaningful continuation outcome replaces it", () => {
+    const state: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }, state),
+      null,
+    );
+    assert.strictEqual(parsePiEvent({ type: "agent_start" }, state), null);
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "no terminal answer" }],
+        }],
+      }, state),
+      null,
+    );
+
+    const settled = parsePiEvent({ type: "agent_settled" }, state);
+    assert.ok(settled);
+    assert.strictEqual(
+      (settled as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+  });
+
+  it("lets continuation errors replace the retained length outcome", () => {
+    for (const errorMessage of [
+      "continuation failed after compaction",
+      "context_length_exceeded: continued request still exceeds the context window",
+    ]) {
+      const state: PiRpcParseState = {};
+      assert.strictEqual(
+        parsePiEvent({
+          type: "agent_end",
+          messages: [{
+            role: "assistant",
+            stopReason: "length",
+            content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+          }],
+        }, state),
+        null,
+      );
+      assert.strictEqual(parsePiEvent({ type: "agent_start" }, state), null);
+      assert.strictEqual(
+        parsePiEvent({
+          type: "agent_end",
+          messages: [{
+            role: "assistant",
+            stopReason: "error",
+            errorMessage,
+            content: [],
+          }],
+        }, state),
+        null,
+      );
+
+      const settled = parsePiEvent({ type: "agent_settled" }, state);
+      assert.ok(settled);
+      assert.strictEqual((settled as { result: string }).result, errorMessage);
+      assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    }
   });
 
   it("defers final errors until settlement and preserves the original overflow cause", () => {
@@ -2173,19 +2303,43 @@ describe("parsePiEvent", () => {
     assert.strictEqual(result.is_error, true);
   });
 
-  it("uses a non-empty error for final agent failure and settlement without an outcome", () => {
-    for (const messages of [
-      [{ role: "assistant", stopReason: "error", errorMessage: "   ", content: [] }],
-      [{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" }] }],
-    ]) {
-      const state: PiRpcParseState = {};
-      assert.strictEqual(parsePiEvent({ type: "agent_end", messages }, state), null);
-      const settled = parsePiEvent({ type: "agent_settled" }, state);
-      assert.ok(settled);
-      assert.strictEqual(settled.type, "result");
-      assert.ok((settled as { result: string }).result.trim().length > 0);
-      assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    }
+  it("distinguishes an observed empty agent_end from a genuinely missing agent_end", () => {
+    const failedState: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "   ",
+          content: [],
+        }],
+      }, failedState),
+      null,
+    );
+    const failed = parsePiEvent({ type: "agent_settled" }, failedState);
+    assert.ok(failed);
+    assert.strictEqual((failed as { result: string }).result, "Pi RPC agent failed");
+    assert.strictEqual((failed as { is_error?: boolean }).is_error, true);
+
+    const emptyState: PiRpcParseState = {};
+    assert.strictEqual(
+      parsePiEvent({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "toolCall", id: "c1", name: "bash" }],
+        }],
+      }, emptyState),
+      null,
+    );
+    const empty = parsePiEvent({ type: "agent_settled" }, emptyState);
+    assert.ok(empty);
+    assert.strictEqual(
+      (empty as { result: string }).result,
+      "Pi agent_end arrived without a usable terminal outcome",
+    );
+    assert.strictEqual((empty as { is_error?: boolean }).is_error, true);
 
     const noRunState: PiRpcParseState = {};
     const noRun = parsePiEvent({ type: "agent_settled" }, noRunState);
@@ -2924,7 +3078,16 @@ describe("readPiStream", () => {
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "first run" }] }],
       }),
-      JSON.stringify({ type: "queue_update", followUp: ["continue"] }),
+      JSON.stringify({
+        type: "queue_update",
+        steering: ["redirect"],
+        followUp: ["continue"],
+      }),
+      JSON.stringify({
+        type: "response",
+        command: "steer",
+        success: true,
+      }),
       JSON.stringify({ type: "agent_start" }),
       JSON.stringify({
         type: "message_update",
@@ -2953,6 +3116,135 @@ describe("readPiStream", () => {
     assert.strictEqual((resets[0] as { reason?: unknown }).reason, "pi_queued_continuation");
     assert.ok(lines.indexOf(resets[0]) > 0);
     assert.ok(lines.indexOf(resets[0]) < lines.findIndex((line) => extractPiTextDelta(line) === "continued final"));
+  });
+
+  it("parses a continued reasoning-only length lifecycle into one final answer", async () => {
+    const child = childWithStdout([
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "threshold" }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "threshold",
+        willRetry: false,
+        success: true,
+      }),
+      JSON.stringify({
+        type: "queue_update",
+        followUp: [{
+          customType: PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+          content: PI_COMPACTION_CONTINUATION_CONTENT,
+          display: false,
+        }],
+      }),
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_delta",
+          delta: "continued final answer",
+        },
+      }),
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "text", text: "continued final answer" }],
+        }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.deepStrictEqual(
+      lines.map(extractPiTextDelta).filter((text): text is string => text !== null),
+      ["continued final answer"],
+    );
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual((results[0] as { result: string }).result, "continued final answer");
+    assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, undefined);
+    assert.ok(
+      !JSON.stringify(lines).includes(PI_COMPACTION_CONTINUATION_CONTENT),
+      "hidden continuation control text must not become user-facing output",
+    );
+  });
+
+  it("returns the specific length error when threshold compaction cannot continue", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+      JSON.stringify({ type: "compaction_start", reason: "threshold" }),
+      JSON.stringify({
+        type: "compaction_end",
+        reason: "threshold",
+        willRetry: false,
+        success: false,
+        errorMessage: "Unable to compact the conversation",
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    const results = lines.filter((line) => line.type === "result");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(
+      (results[0] as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
+    assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
+  });
+
+  it("returns the specific length error when stdout ends before settlement", async () => {
+    const child = childWithStdout([
+      JSON.stringify({
+        type: "agent_end",
+        sessionId: "length-session",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      }),
+    ]);
+
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child)) lines.push(line);
+
+    assert.strictEqual(lines.length, 1);
+    assert.strictEqual(lines[0].type, "result");
+    assert.strictEqual(
+      (lines[0] as { result: string }).result,
+      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+    );
+    assert.strictEqual(
+      (lines[0] as { session_id: string }).session_id,
+      "length-session",
+    );
+    assert.strictEqual((lines[0] as { is_error?: boolean }).is_error, true);
   });
 
   it("emits a protocol error when settlement has no usable agent_end outcome", async () => {

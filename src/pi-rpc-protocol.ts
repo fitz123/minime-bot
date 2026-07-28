@@ -32,6 +32,7 @@ import {
   buildPiAcknowledgedSteerInvocation,
   parsePiAcknowledgedSteerResultNotice,
 } from "./pi-extensions/acknowledged-steer.js";
+import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
 
 export const PI_PROVIDER = "openai-codex";
 export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
@@ -40,6 +41,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * Wrapper entrypoints loaded into every primary interactive Pi spawn, in load
  * order:
  *   acknowledged-steer (atomic active-lifecycle steering gate),
+ *   compaction-continuation (hidden continuation after a reasoning-only length stop),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
@@ -50,6 +52,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "acknowledged-steer.ts",
+  "compaction-continuation.ts",
   "codex-transport-overflow.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
@@ -59,6 +62,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "acknowledged-steer.js",
+  "compaction-continuation.js",
   "codex-transport-overflow.js",
   "web-tools.js",
   "knowledge-tools.js",
@@ -86,6 +90,7 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
  */
 const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.ts",
+  "compaction-continuation.ts",
   "subagent/index.ts",
   "ask-agent/index.ts",
 ]);
@@ -106,6 +111,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
 ] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.js",
+  "compaction-continuation.js",
   "subagent/index.js",
   "ask-agent/index.js",
 ]);
@@ -946,6 +952,10 @@ interface FinalAssistantInfo {
 export interface PiRpcParseState {
   /** Latest usable run or terminal failure outcome waiting for `agent_settled`. */
   pendingOutcome?: ResultMessage;
+  /** Specific fallback retained until a meaningful continuation run replaces it. */
+  pendingReasoningOnlyLengthOutcome?: ResultMessage;
+  /** Distinguishes an observed low-level outcome from a missing `agent_end`. */
+  agentEndObserved?: boolean;
   /** Session metadata observed on this stream, used when events omit it. */
   observedSessionId?: string;
   /** Guards prompt rejection, settlement, and EOF fallbacks from duplicating results. */
@@ -970,6 +980,10 @@ const PI_RPC_AGENT_FAILURE_MESSAGE = "Pi RPC agent failed";
 const PI_RPC_OVERFLOW_FAILURE_MESSAGE = "Pi RPC context overflow recovery failed";
 const PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE =
   "Pi agent_settled arrived without a usable agent_end outcome";
+const PI_RPC_AGENT_END_WITHOUT_OUTCOME_MESSAGE =
+  "Pi agent_end arrived without a usable terminal outcome";
+const PI_RPC_REASONING_ONLY_LENGTH_MESSAGE =
+  "Pi response hit the length limit before producing visible text and could not continue after compaction";
 const PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE = "Pi subprocess exited before agent_settled";
 
 /**
@@ -1074,6 +1088,7 @@ function emitPiRpcResult(
   }
   state.terminalResultEmitted = true;
   state.pendingOutcome = undefined;
+  state.pendingReasoningOnlyLengthOutcome = undefined;
   state.currentRunHasStreamOutput = undefined;
   state.completedRunHasStreamOutput = undefined;
   state.completedRunResetEmitted = undefined;
@@ -1107,7 +1122,11 @@ function rememberPendingOverflow(
 function retainAgentEndOutcome(
   state: PiRpcParseState,
   outcome: ResultMessage | undefined,
+  replacesReasoningOnlyLengthOutcome = false,
 ): void {
+  if (replacesReasoningOnlyLengthOutcome) {
+    state.pendingReasoningOnlyLengthOutcome = undefined;
+  }
   state.pendingOutcome = outcome;
   state.completedRunHasStreamOutput = state.currentRunHasStreamOutput;
   state.currentRunHasStreamOutput = undefined;
@@ -1118,18 +1137,25 @@ function consumeSettledOutcome(state?: PiRpcParseState): ResultMessage | null {
   if (!state) {
     return buildPiRpcErrorResult(PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE, undefined);
   }
-  const outcome = state.pendingOutcome;
+  const outcome =
+    state.pendingReasoningOnlyLengthOutcome ?? state.pendingOutcome;
   if (outcome && nonEmptyText(outcome.result)) {
     return emitPiRpcResult(outcome, state);
   }
   return emitPiRpcResult(
-    buildPiRpcErrorResult(PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE, state.observedSessionId),
+    buildPiRpcErrorResult(
+      state.agentEndObserved
+        ? PI_RPC_AGENT_END_WITHOUT_OUTCOME_MESSAGE
+        : PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE,
+      state.observedSessionId,
+    ),
     state,
   );
 }
 
 function consumeEofOutcome(state: PiRpcParseState): ResultMessage | null {
-  const outcome = state.pendingOutcome;
+  const outcome =
+    state.pendingReasoningOnlyLengthOutcome ?? state.pendingOutcome;
   if (outcome?.is_error === true && nonEmptyText(outcome.result)) {
     return emitPiRpcResult(outcome, state);
   }
@@ -1164,7 +1190,9 @@ function markCompletedRunReset(
  * - `tool_execution_start` → synthetic `StreamEvent` shaped as a
  *   `content_block_start` tool_use block so stream-relay flips `sawNonTextBlock`.
  * - `agent_end` → retains the latest low-level run outcome without yielding a
- *   terminal result. Pi may still retry, compact, or drain queued continuations.
+ *   terminal result. A reasoning-only length outcome remains distinct from a
+ *   missing `agent_end` and is replaced only by a meaningful continuation
+ *   outcome. Pi may still retry, compact, or drain queued continuations.
  * - a later `agent_start` → resets response text left by the completed run before
  *   a queued continuation begins, unless retry/compaction already reset it.
  * - `agent_settled` → consumes the latest retained outcome and yields the one
@@ -1269,6 +1297,7 @@ export function parsePiEvent(
         return null;
       }
       state.agentLifecycleObserved = true;
+      state.agentEndObserved = true;
       const sessionId = rawEvent.sessionId ?? state.observedSessionId;
       if (isFinalAssistantError && isContextOverflowError(finalAssistant.errorMessage)) {
         const overflowMessage =
@@ -1277,6 +1306,7 @@ export function parsePiEvent(
         retainAgentEndOutcome(
           state,
           buildOverflowAwareErrorResult(state, { ...rawEvent, errorMessage: overflowMessage }),
+          true,
         );
         if (rawEvent.willRetry === true) {
           return markCompletedRunReset(state);
@@ -1294,22 +1324,36 @@ export function parsePiEvent(
               sessionId,
             );
         clearPendingOverflow(state);
-        retainAgentEndOutcome(state, outcome);
+        retainAgentEndOutcome(state, outcome, true);
         if (rawEvent.willRetry === true) {
           return markCompletedRunReset(state, "pi_agent_retry");
         }
         return null;
       }
       clearPendingOverflow(state);
-      retainAgentEndOutcome(
-        state,
+      if (
+        Array.isArray(rawEvent.messages) &&
+        isReasoningOnlyLengthAgentEnd(rawEvent.messages)
+      ) {
+        state.pendingReasoningOnlyLengthOutcome = buildPiRpcErrorResult(
+          PI_RPC_REASONING_ONLY_LENGTH_MESSAGE,
+          sessionId,
+        );
+        retainAgentEndOutcome(state, undefined);
+        return null;
+      }
+      const visibleOutcome =
         finalAssistant.text.trim().length > 0
           ? {
-              type: "result",
+              type: "result" as const,
               result: finalAssistant.text,
               session_id: sessionId ?? "",
             }
-          : undefined,
+          : undefined;
+      retainAgentEndOutcome(
+        state,
+        visibleOutcome,
+        Boolean(visibleOutcome),
       );
       return null;
     }
