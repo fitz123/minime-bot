@@ -568,6 +568,11 @@ timestamp snapshot changes only after success:
 - `minime_cron_last_run_timestamp_seconds{cron}` records the latest terminal
   classification time.
 
+The runner writes these snapshots to
+`/opt/homebrew/var/node_exporter/textfile` by default.
+`CRON_HEALTH_TEXTFILE_DIR` overrides that location; it must be writable by the
+runner and match the directory collected by node-exporter.
+
 Terminal metric persistence is fail-closed: a directory, lock, state-read, or
 snapshot-write failure is reported on standard error and leaves the runner
 non-zero instead of silently completing against an older snapshot.

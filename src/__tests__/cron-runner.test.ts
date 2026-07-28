@@ -1535,45 +1535,22 @@ bindings: []
       );
     });
 
-    it("recovers a stale writer lock left by a terminated process", () => {
-      const cronName = "stale-lock";
+    it("fails closed when the writer lock path is not a directory", () => {
+      const cronName = "invalid-lock";
       const stem = sanitizeCronMetricStem(cronName);
       const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
-      writeFileSync(lockPath, "stale\n");
-      utimesSync(lockPath, new Date(0), new Date(0));
+      writeFileSync(lockPath, "invalid\n");
 
-      writeCronHealthMetric(cronName, 0, "success");
-
-      assert.ok(!readdirSync(METRIC_DIR).includes(`.minime_cron_${stem}.lock`));
-      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
-      assert.ok(exitFile);
-      assert.match(
-        readFileSync(join(METRIC_DIR, exitFile), "utf8"),
-        /minime_cron_runs_total\{cron="stale-lock",outcome="success"\} 1/,
+      assert.throws(
+        () => writeCronHealthMetric(cronName, 0, "success"),
+        /failed to lock cron health metric.*invalid ownership state/s,
       );
-    });
 
-    it("fails closed when an undeletable stale writer lock remains in place", async (t) => {
-      if (process.platform !== "darwin") {
-        t.skip("immutable file flags are exercised on the supported launchd platform");
-        return;
-      }
-
-      const cronName = "undeletable-stale-lock";
-      const stem = sanitizeCronMetricStem(cronName);
-      const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
-      writeFileSync(lockPath, "stale\n");
-      utimesSync(lockPath, new Date(0), new Date(0));
-      execFileSync("chflags", ["uchg", lockPath]);
-
-      try {
-        await assert.rejects(
-          runMetricWriterChild(METRIC_DIR, cronName, "failure", 1, 5_000),
-          /failed to lock cron health metric.*(?:EPERM|Operation not permitted)/s,
-        );
-      } finally {
-        execFileSync("chflags", ["nouchg", lockPath]);
-      }
+      assert.strictEqual(readFileSync(lockPath, "utf8"), "invalid\n");
+      assert.strictEqual(
+        readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom")),
+        undefined,
+      );
     });
 
     it("serializes simultaneous recovery of one abandoned owner lock", async () => {
@@ -1582,7 +1559,7 @@ bindings: []
       const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
       mkdirSync(lockPath);
       const staleOwner = `${process.pid}-0000000000000000-deadbeef`;
-      writeFileSync(join(lockPath, "claim"), `${staleOwner}\n`, "utf8");
+      writeFileSync(join(lockPath, `claim-${staleOwner}`), `${staleOwner}\n`, "utf8");
       writeFileSync(
         join(lockPath, `owner-${staleOwner}`),
         `${process.pid}\n`,
@@ -1608,6 +1585,38 @@ bindings: []
       assert.match(
         content,
         /minime_cron_runs_total\{cron="concurrent-stale-lock",outcome="failure"\} 3/,
+      );
+      assert.ok(!readdirSync(METRIC_DIR).includes(`.minime_cron_${stem}.lock`));
+    });
+
+    it("serializes simultaneous recovery of one abandoned claim-only lock", async () => {
+      const cronName = "concurrent-stale-claim";
+      const stem = sanitizeCronMetricStem(cronName);
+      const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
+      const staleOwner = `${process.pid}-0000000000000000-deadbeef`;
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, `claim-${staleOwner}`), `${staleOwner}\n`, "utf8");
+      utimesSync(lockPath, new Date(0), new Date(0));
+
+      await Promise.all([
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "success", 1),
+        runMetricWriterChild(METRIC_DIR, cronName, "failure", 1),
+      ]);
+
+      const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
+      assert.ok(exitFile);
+      const content = readFileSync(join(METRIC_DIR, exitFile), "utf8");
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-stale-claim",outcome="success"\} 3/,
+      );
+      assert.match(
+        content,
+        /minime_cron_runs_total\{cron="concurrent-stale-claim",outcome="failure"\} 3/,
       );
       assert.ok(!readdirSync(METRIC_DIR).includes(`.minime_cron_${stem}.lock`));
     });
@@ -1721,6 +1730,37 @@ bindings: []
       );
       const exitFile = readdirSync(METRIC_DIR).find((name) => name.endsWith(".exit.prom"));
       assert.strictEqual(exitFile, undefined);
+    });
+
+    it("preserves the prior terminal snapshot when its atomic rename fails", (t) => {
+      if (process.platform !== "darwin") {
+        t.skip("immutable file flags are exercised on the supported launchd platform");
+        return;
+      }
+
+      const cronName = "terminal-rename-cleanup";
+      const stem = sanitizeCronMetricStem(cronName);
+      const exitPath = join(METRIC_DIR, `minime_cron_${stem}.exit.prom`);
+      const lockName = `.minime_cron_${stem}.lock`;
+      writeCronHealthMetric(cronName, 0, "success");
+      const previousSnapshot = readFileSync(exitPath, "utf8");
+      execFileSync("chflags", ["uchg", exitPath]);
+
+      try {
+        assert.throws(
+          () => writeCronHealthMetric(cronName, 1, "failure"),
+          /failed to write cron health terminal metric.*(?:EPERM|Operation not permitted)/s,
+        );
+      } finally {
+        execFileSync("chflags", ["nouchg", exitPath]);
+      }
+
+      assert.strictEqual(readFileSync(exitPath, "utf8"), previousSnapshot);
+      assert.deepStrictEqual(
+        readdirSync(METRIC_DIR).filter((name) => name.endsWith(".tmp")),
+        [],
+      );
+      assert.ok(!readdirSync(METRIC_DIR).includes(lockName));
     });
 
     it("throws when the textfile path cannot be written", () => {
@@ -2619,6 +2659,31 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 0, success: true },
       ]);
+    });
+
+    it("fails closed when a legacy failure-notice outbox record cannot be cleared", async () => {
+      const cron = makeMainCron();
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, {
+        kind: "failure-notice",
+        payload: "⚠️ Cron FAIL: legacy failure",
+      });
+      state.pending = pending;
+      deps.clearCronOutboxRecord = (cronName: string) => {
+        calls.outboxClears.push(cronName);
+        throw new Error("clear unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.strictEqual(state.pending, pending);
+      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
+      assert.deepStrictEqual(calls.oneShots, []);
+      assert.deepStrictEqual(calls.deliveries, []);
+      assert.deepStrictEqual(calls.metrics, []);
+      assert.ok(calls.logs.some((entry) =>
+        entry.message
+        === `OUTBOX CLEAR-FAILED legacy-failure-notice runId=${pending.runId}: clear unavailable`));
     });
 
     it("clears a deterministically undeliverable pending record, notifies admin, and counts only the new logical run", async () => {

@@ -73,6 +73,13 @@ contract has four metric families:
 - `minime_cron_last_run_timestamp_seconds{cron}` is the timestamp of the latest
   terminal classification.
 
+The runner writes these snapshots to
+`/opt/homebrew/var/node_exporter/textfile` by default.
+`CRON_HEALTH_TEXTFILE_DIR` selects a different directory. The selected
+directory must be writable by the runner and must be the same host directory
+that node-exporter's textfile collector scans, or be mapped to it by the active
+container bind mount.
+
 Terminal metric persistence is fail-closed. A directory, lock, prior-state
 read, or snapshot-write failure is emitted on standard error and makes the
 runner non-zero rather than allowing a successful process status against an
@@ -128,10 +135,11 @@ Run the pinned production `promtool`, validate the active Alertmanager and
 Compose configuration and current bind mounts, then reload or recreate only
 the required monitoring services. Verify targets, loaded rules, routing, and
 native monitoring health before deploying the package that removes direct
-generic failure delivery. Finally, run controlled installed-artifact success,
-failure, and recovery cases and confirm the stable alert group, resolved
-transition, four-hour repeat contract, bounded metrics, and absence of a
-duplicate direct failure message.
+generic failure delivery. Confirm that a controlled run exposes all four cron
+metric families through Prometheus from the selected textfile directory.
+Finally, run controlled installed-artifact success, failure, and recovery cases
+and confirm the stable alert group, resolved transition, four-hour repeat
+contract, bounded metrics, and absence of a duplicate direct failure message.
 
 ## Prerequisites
 
@@ -290,6 +298,13 @@ Deduplication is process-local, retains at most 1,024 successful batch digests
 for one hour, and resets when the webhook restarts. It suppresses immediate
 retries; it is not durable exactly-once delivery. Large batches are summarized
 within Telegram's message limit.
+
+Native-only and bridge-fallback Telegram lines append
+`cron=<sanitized-name>` when the alert has a `cron` label, for both firing and
+resolved transitions. For a native-only alert without a supplied fingerprint,
+that sanitized cron value also participates in the fallback identity. Alerts
+without a `cron` label retain the previous message and fallback-identity
+format.
 
 ## Runtime doctor installation
 

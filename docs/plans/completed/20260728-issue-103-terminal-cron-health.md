@@ -2,14 +2,14 @@
 
 ## Goal
 
-Classify each completed cron invocation exactly once as a bounded terminal success or failure, expose that state through restart-safe node-exporter textfile metrics, and provide a stable Prometheus/Alertmanager rule contract so monitoring—not per-invocation `Cron FAIL` delivery—owns incident grouping, repeats, and recovery. Let an LLM cron deliberately mark an unresolved finding as logical failure while delivering only its clean report.
+Classify each completed new logical cron run exactly once as a bounded terminal success or failure, expose that state through restart-safe node-exporter textfile metrics, and provide a stable Prometheus/Alertmanager rule contract so monitoring—not per-invocation `Cron FAIL` delivery—owns incident grouping, repeats, and recovery. Let an LLM cron deliberately mark an unresolved finding as logical failure while delivering only its clean report.
 
 ## Non-goals
 
 - No execution retry/backoff, idempotency declaration, logical-run deduplication, side-effect reconciliation, or retry policy framework.
 - No Apple Health incident repair, issue #65 reopening, dashboard/Grafana, workflow database, or per-cron alert profile/threshold framework.
 - No change to generated-output delivery retry/outbox reliability, ordinary successful delivery, cron schedules/prompts, runtime selection, or interactive/child-agent behavior.
-- No promise of exactly-once Telegram notification. The guarantee is one terminal metric classification per invocation; Alertmanager owns incident-state delivery semantics.
+- No promise of exactly-once Telegram notification. The guarantee is one terminal metric classification per completed new logical run; pickup-only preflight and redelivery exits do not start one. Alertmanager owns incident-state delivery semantics.
 - No production/private monitoring configuration in this public branch. Package examples and deterministic fixtures are the deployable contract; rollout is parent-owned.
 
 ## Context
@@ -26,7 +26,7 @@ Classify each completed cron invocation exactly once as a bounded terminal succe
 ```sh
 npm ci
 node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/cron-runner.test.ts src/__tests__/cron-runner-pi.test.ts src/__tests__/cron-runner-isolation.test.ts
-node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/monitoring-rules.test.ts src/__tests__/package-install.test.ts
+node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/monitoring-rules.test.ts src/__tests__/monitoring-native.test.ts src/__tests__/package-install.test.ts
 npm test
 npm run lint
 npm run build
@@ -39,12 +39,12 @@ Run the checked-in Prometheus rule fixture with `promtool test rules` when `prom
 
 ### Task 1: Add one terminal classification and metric update contract
 
-**Goal:** Make every terminal cron path produce one bounded terminal metric snapshot, and make an intentional unresolved LLM result become one stripped report plus non-zero logical failure without duplicate generic failure delivery.
+**Goal:** Make every terminal path of a completed new logical cron run produce one bounded terminal metric snapshot, and make an intentional unresolved LLM result become one stripped report plus non-zero logical failure without duplicate generic failure delivery.
 
 **Serves:** Exact terminal outcome/timestamp metrics; clean `NO_REPLY` and repaired success; agent-declared unresolved failure; bounded labels; removal of direct per-invocation `Cron FAIL`; no execution retry/idempotency.
 
 - [x] Introduce a small exported terminal-result classifier for LLM output. Put the exact marker `[[MINIME_CRON_UNRESOLVED_V1]]` in the package-owned cron system instruction; accept only one exact standalone final non-empty line for LLM crons, remove it from delivered output, and leave embedded/quoted marker-like prose and all script output unchanged.
-- [x] Route clean empty/`NO_REPLY`, visible successful/repaired output, agent-declared unresolved output, execution failure, delivery-terminal failure, config failure, and outbox-terminal paths through one explicit outcome-finalization boundary per invocation. An unresolved report is delivered through the existing retry/outbox path, then records failure and exits non-zero; it never triggers an additional generic failure message.
+- [x] Route clean empty/`NO_REPLY`, visible successful/repaired output, agent-declared unresolved output, execution failure, delivery-terminal failure, and config failure through one explicit outcome-finalization boundary per completed new logical run. Pickup-only outbox state/read/write/cleanup failures and deferred redelivery exits happen before a new logical run and do not finalize one. An unresolved report is delivered through the existing retry/outbox path, then records failure and exits non-zero; it never triggers an additional generic failure message.
 - [x] Remove direct generic execution-failure delivery and failure-notice outbox creation from the execution-error branch while preserving bounded local diagnostics, generated-output delivery retry/outbox semantics, admin notification for delivery-path failure, and successful user-facing output behavior.
 - [x] Extend the atomic per-cron textfile contract with both `minime_cron_runs_total{cron,outcome="success|failure"}` series and `minime_cron_last_run_timestamp_seconds{cron}`. Preserve existing last-exit and last-success series, stable collision-safe filenames, label escaping, prior counts across process restarts, and valid whole-file snapshots without temporary-file residue.
 - [x] Add focused tests proving exactly one metric update per terminal path, monotonic success/failure counts across writes and module/process-like restarts, counter-reset/corrupt-or-missing prior-state behavior, atomic files, bounded labels, clean `NO_REPLY`, repaired visible success, unresolved stripped report/non-zero exit, no generic duplicate, marker-like prose safety, script exclusion, execution failure without direct delivery, and unchanged output/outbox delivery behavior.
@@ -57,7 +57,7 @@ Run the checked-in Prometheus rule fixture with `promtool test rules` when `prom
 
 - [x] Add `MinimeCronTerminalFailure` to `examples/monitoring/minime.rules.yml`: fire on non-zero `minime_cron_last_exit_code` joined by `cron` to an existing `minime_cron_last_run_timestamp_seconds` that is not materially future-dated. Add `MinimeCronTelemetryIncomplete` for an exit series with no terminal timestamp or a materially future-dated timestamp. A stale old timestamp plus non-zero exit must remain firing until success; missing both series stays unobservable. Keep output labels closed and stable (`alertname`, bounded inherited `cron`, fixed severity/component/failure class); do not put values, diagnostics, destinations, run IDs, or timestamps into labels and do not invent schedule-age/per-cron policy.
 - [x] Add a checked-in `promtool` rule-test fixture covering success/no alert, terminal failure after the configured `for`, repeated failed samples as one stable alert identity, success recovery, counter reset without alert-identity change, stale failure remaining firing, missing timestamp producing telemetry-incomplete, future timestamp producing telemetry-incomplete, and missing all series producing no invented alert.
-- [x] Add repository tests that parse the example rule, Alertmanager template, and rule-test fixture and assert the bounded label/grouping contract, four-hour Alertmanager repeat, resolved delivery, and absence of per-cron/unbounded selectors. When a compatible local `promtool` is available, execute the fixture; keep the fixture independently runnable in parent rollout.
+- [x] Add repository tests that parse the example rule, Alertmanager template, and rule-test fixture and assert the bounded label/grouping contract, four-hour Alertmanager repeat, resolved delivery, and absence of per-cron/unbounded selectors. Preserve the bounded `cron` identity in native-only and bridge-fallback webhook rendering, including native fallback identity when Alertmanager supplies no fingerprint. When a compatible local `promtool` is available, execute the fixture; keep the fixture independently runnable in parent rollout.
 - [x] Update `README.md` and `docs/monitoring.md` with the four-series terminal contract, logical-failure marker semantics, direct-generic-notification removal, Alertmanager ownership boundaries, `promtool` command, and safe rollout order. Do not document private destinations or active host paths.
 
 ### Task 3: Close package regressions and release readiness
@@ -67,7 +67,7 @@ Run the checked-in Prometheus rule fixture with `promtool test rules` when `prom
 **Serves:** Full package confidence, public safety, installability, and a decision-complete handoff to monitored rollout.
 
 - [x] Extend package-install/artifact assertions so the monitoring rule-test fixture and updated examples are shipped and runnable, with no import-time process, network, or filesystem side effects.
-- [x] Run all focused cron/monitoring tests and inspect terminal branch coverage for a single metric-finalization call. Confirm no test or implementation adds execution retries, idempotency fields, per-cron policies, direct generic `Cron FAIL`, or changes outside runner/metrics/examples/docs/package tests.
+- [x] Run all focused cron/monitoring tests, including the native webhook integration, and inspect terminal branch coverage for a single metric-finalization call. Confirm no test or implementation adds execution retries, idempotency fields, per-cron policies, direct generic `Cron FAIL`, or changes outside runner/metrics/examples/docs/package tests.
 - [x] Run `npm test`, `npm run lint`, `npm run build`, and `npm pack --dry-run`; run `git diff --check`, public tracked-file/identity/secrets checks, and verify the worktree is clean after commits.
 
 ## Post-Completion

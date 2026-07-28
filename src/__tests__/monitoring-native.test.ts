@@ -566,6 +566,40 @@ describe("Alertmanager webhook", () => {
     }
   });
 
+  it("includes cron in fingerprintless native fallback identity", async () => {
+    const payloads = ["daily-alpha", "daily-beta"].map((cron) => {
+      const payload = alertmanagerPayload({
+        alertname: "MinimeCronTerminalFailure",
+        cron,
+        status: "firing",
+      });
+      const [alert] = payload.alerts as Array<Record<string, unknown>>;
+      delete alert.fingerprint;
+      return payload;
+    });
+    const result = await runPython([
+      "-c",
+      [
+        "import json,sys",
+        "sys.path.insert(0, 'scripts')",
+        "import alertmanager_webhook as webhook",
+        "first=webhook.parse_alertmanager_payload(sys.argv[1].encode('utf-8'))",
+        "second=webhook.parse_alertmanager_payload(sys.argv[2].encode('utf-8'))",
+        "print(json.dumps([first, second]))",
+      ].join(";"),
+      JSON.stringify(payloads[0]),
+      JSON.stringify(payloads[1]),
+    ], {});
+
+    assert.equal(result.status, 0, result.stderr);
+    const [[firstKey, firstMessage], [secondKey, secondMessage]] = JSON.parse(
+      result.stdout,
+    ) as [[string, string], [string, string]];
+    assert.notEqual(firstKey, secondKey);
+    assert.match(firstMessage, /cron=daily-alpha/);
+    assert.match(secondMessage, /cron=daily-beta/);
+  });
+
   it("delivers firing and resolved batches, suppresses duplicates, and uses no Node subprocess", async () => {
     const messages: string[] = [];
     const dir = tempDir();

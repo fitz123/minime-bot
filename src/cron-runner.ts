@@ -231,31 +231,7 @@ function recoverCronHealthLock(lockPath: string): boolean {
   }
 
   if (!lockStat.isDirectory()) {
-    if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
-      return false;
-    }
-    try {
-      unlinkSync(lockPath);
-      return true;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") {
-        return true;
-      }
-      if (code === "EISDIR" || code === "EPERM") {
-        try {
-          if (statSync(lockPath).isDirectory()) {
-            return true;
-          }
-        } catch (inspectErr) {
-          if ((inspectErr as NodeJS.ErrnoException).code === "ENOENT") {
-            return true;
-          }
-          throw inspectErr;
-        }
-      }
-      throw err;
-    }
+    throw new Error(`cron health lock "${lockPath}" has invalid ownership state`);
   }
 
   let entries: string[];
@@ -282,9 +258,13 @@ function recoverCronHealthLock(lockPath: string): boolean {
   const ownerMatch = ownerEntry?.match(
     /^owner-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/,
   );
+  const claimEntry = ownerEntry === undefined
+    ? undefined
+    : `claim-${ownerEntry.slice("owner-".length)}`;
   if (
     entries.length === 2
-    && entries.includes("claim")
+    && claimEntry !== undefined
+    && entries.includes(claimEntry)
     && ownerEntry !== undefined
     && ownerMatch
   ) {
@@ -309,7 +289,7 @@ function recoverCronHealthLock(lockPath: string): boolean {
     if (!removeCronHealthLockEntry(join(lockPath, ownerEntry))) {
       return true;
     }
-    if (!removeCronHealthLockEntry(join(lockPath, "claim"))) {
+    if (!removeCronHealthLockEntry(join(lockPath, claimEntry))) {
       return true;
     }
     return removeEmptyCronHealthLockDirectory(lockPath);
@@ -319,8 +299,11 @@ function recoverCronHealthLock(lockPath: string): boolean {
     return false;
   }
 
-  if (entries.length === 1 && entries[0] === "claim") {
-    if (!removeCronHealthLockEntry(join(lockPath, "claim"))) {
+  if (
+    entries.length === 1
+    && /^claim-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/.test(entries[0])
+  ) {
+    if (!removeCronHealthLockEntry(join(lockPath, entries[0]))) {
       return true;
     }
     return removeEmptyCronHealthLockDirectory(lockPath);
@@ -346,12 +329,18 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
         inspectProcessStartToken(process.pid) ?? "unknown",
         randomUUID(),
       ].join("-");
-      const claimPath = join(lockPath, "claim");
-      writeFileSync(claimPath, `${ownerToken}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
+      const claimPath = join(lockPath, `claim-${ownerToken}`);
+      try {
+        writeFileSync(claimPath, `${ownerToken}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+      } catch (err) {
+        removeCronHealthLockEntry(claimPath);
+        removeEmptyCronHealthLockDirectory(lockPath);
+        throw err;
+      }
       const ownerEntry = `owner-${ownerToken}`;
       const ownerPath = join(lockPath, ownerEntry);
       try {
