@@ -161,12 +161,20 @@ def _native_payload_fields(payload: dict[str, Any]) -> tuple[str, str]:
         name = safe_field(labels.get("alertname"))
         severity = safe_field(labels.get("severity"))
         instance = safe_field(labels.get("instance"))
-        lines.append(f"{status.upper()} alert={name} severity={severity} instance={instance}")
+        cron = safe_field(labels.get("cron")) if "cron" in labels else None
+        cron_field = f" cron={cron}" if cron is not None else ""
+        lines.append(
+            f"{status.upper()} alert={name} severity={severity} "
+            f"instance={instance}{cron_field}"
+        )
         fingerprint = item.get("fingerprint")
         if isinstance(fingerprint, str) and fingerprint:
             identity = fingerprint
         else:
-            identity = json.dumps([status, name, severity, instance], separators=(",", ":"))
+            identity_fields = [status, name, severity, instance]
+            if cron is not None:
+                identity_fields.append(cron)
+            identity = json.dumps(identity_fields, separators=(",", ":"))
         identities.append(f"{status}:{identity}")
 
     try:
@@ -235,10 +243,15 @@ def _bridge_native_message(
     lines: list[str] = []
     for status, member in members:
         labels = dict(member.labels)
+        cron = (
+            f" cron={safe_field(labels.get('cron'))}"
+            if "cron" in labels
+            else ""
+        )
         lines.append(
             f"{status.upper()} alert={safe_field(labels.get('alertname'))} "
             f"severity={safe_field(labels.get('severity'))} "
-            f"instance={safe_field(labels.get('instance'))}"
+            f"instance={safe_field(labels.get('instance'))}{cron}"
         )
     return _bounded_alert_message(lines)
 

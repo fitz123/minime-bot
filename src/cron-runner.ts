@@ -2,7 +2,19 @@
 // Usage: npx tsx src/cron-runner.ts --task <name>
 // Loads cron definition from crons.yaml, runs a Pi print-mode one-shot, delivers output to Telegram
 
-import { appendFileSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import {
   loadRawMergedConfig,
   loadTelegramToken,
@@ -57,28 +69,16 @@ const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
 const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
+const CRON_HEALTH_LOCK_RETRY_MS = 10;
+const CRON_HEALTH_STALE_LOCK_MS = 30_000;
+const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
 const PI_ERROR_EXCERPT_CHARS = 1000;
-const FAILURE_NOTIFICATION_ERROR_CHARS = 500;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
-const FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS = 300;
 export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
 export const CRON_OUTBOX_MAX_ATTEMPTS = 10;
 export const CRON_OUTBOX_EXPIRY_MS = 48 * 60 * 60 * 1000;
-const NOTIFICATION_PRIVATE_KEY_PATTERN =
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi;
-const NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN = String.raw`[A-Za-z0-9_.-]*(?:(?:api|access|private)[_.-]*key|authorization|cookie|credentials?|token|password|passwd|pwd|secret|session)[A-Za-z0-9_.-]*`;
-const NOTIFICATION_SECRET_LABEL_FIELD_PATTERN = String.raw`(?:(?:x-)?api[ -]*key|access[ -]*token|private[ -]*key|session[ -]*(?:id|token|key)|authorization|cookie|credentials?|token|password|passwd|pwd|secret)`;
-const NOTIFICATION_SECRET_FIELD_NAME_PATTERN = String.raw`(?:${NOTIFICATION_SECRET_IDENTIFIER_FIELD_PATTERN}|key|[A-Za-z0-9_.-]*(?:[_.-]key|key[_.-])[A-Za-z0-9_.-]*|${NOTIFICATION_SECRET_LABEL_FIELD_PATTERN})`;
-const NOTIFICATION_SECRET_ASSIGNMENT_PATTERN = new RegExp(
-  String.raw`(^|[\s{[,:;])(["']?)(${NOTIFICATION_SECRET_FIELD_NAME_PATTERN})\2(\s*[:=]\s*)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\r\n,;&}\]]*?))(?=$|[\r\n,;&}\]]|\s+[A-Za-z0-9_.-]+\s*[:=])`,
-  "gim",
-);
-const NOTIFICATION_SECRET_SPACE_VALUE_PATTERN = new RegExp(
-  String.raw`(^|[\s{[,:;])((?:-{1,2})?(?:api[-_]?key|access[-_]?token|private[-_]?key|session[-_]?(?:id|token|key)|auth(?:orization)?|credentials?|token|password|passwd|pwd|secret)|-{1,2}key)(\s+)((?:"[^"\r\n]*"|'[^'\r\n]*'|\[redacted\]|[^\s\r\n,;&}\]]+))`,
-  "gim",
-);
-const NOTIFICATION_SECRET_QUERY_PARAM_PATTERN =
-  /([?&;])([^=\s&#;]*(?:(?:api|access|private)[_.-]*key|authorization|credentials?|token|password|passwd|pwd|secret|session)[^=\s&#;]*|key)(=)[^&#\s;]*/gi;
+export const MINIME_CRON_UNRESOLVED_MARKER = "[[MINIME_CRON_UNRESOLVED_V1]]";
+export type CronTerminalOutcome = "success" | "failure";
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
@@ -116,46 +116,6 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
 }
 
-function formatNotificationDiagnostics(diagnostics: string | undefined): string | undefined {
-  if (!diagnostics) {
-    return undefined;
-  }
-  const sanitized = sanitizeCapturedOutput(diagnostics);
-  if (!sanitized) {
-    return undefined;
-  }
-
-  const redacted = sanitized
-    .replace(NOTIFICATION_PRIVATE_KEY_PATTERN, "[redacted private key]")
-    .replace(/\b(Authorization\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/\b((?:Cookie|Set-Cookie|Session)\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
-    .replace(NOTIFICATION_SECRET_QUERY_PARAM_PATTERN, "$1$2$3[redacted]")
-    .replace(/\b((?:X-)?API[- ]?Key\s*[:=]\s*)[^\r\n]*/gi, "$1[redacted]")
-    .replace(
-      NOTIFICATION_SECRET_SPACE_VALUE_PATTERN,
-      (_match, prefix: string, fieldName: string, separator: string, value: string) => {
-        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
-        return `${prefix}${fieldName}${separator}${valueQuote}[redacted]${valueQuote}`;
-      },
-    )
-    .replace(
-      NOTIFICATION_SECRET_ASSIGNMENT_PATTERN,
-      (_match, prefix: string, fieldQuote: string, fieldName: string, separator: string, value: string) => {
-        const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : "";
-        return `${prefix}${fieldQuote}${fieldName}${fieldQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
-      },
-    )
-    .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b/gi, "[redacted]");
-  if (redacted.length <= FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS) {
-    return redacted;
-  }
-
-  const suffix = "... [truncated]";
-  return `${redacted.slice(0, FAILURE_NOTIFICATION_DIAGNOSTICS_CHARS - suffix.length)}${suffix}`;
-}
-
 export function resolveCronLogDir(): string {
   const configuredDir = process.env.LOG_DIR;
   return configuredDir?.trim() ? configuredDir : join(homedir(), ".minime", "logs");
@@ -184,49 +144,429 @@ function writeAtomicTextFile(dir: string, fileName: string, content: string): vo
     dir,
     `.${fileName}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
   );
-  writeFileSync(tmpPath, content, "utf8");
-  renameSync(tmpPath, filePath);
+  try {
+    writeFileSync(tmpPath, content, "utf8");
+    renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // The temporary file may not exist or may already have been renamed.
+    }
+    throw err;
+  }
 }
 
-function writeCronHealthMetric(cronName: string, exitCode: number, success: boolean): void {
+function inspectProcessStartToken(pid: number): string | undefined {
+  let identity: string | undefined;
+  if (process.platform === "linux") {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = raw.lastIndexOf(")");
+      const fields = raw.slice(closingParen + 2).trim().split(/\s+/);
+      if (closingParen >= 0 && fields[19]) {
+        identity = `linux:${fields[19]}`;
+      }
+    } catch {
+      // The liveness probe below remains the fail-closed fallback.
+    }
+  } else {
+    const inspected = spawnSync(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf8", timeout: 1_000, maxBuffer: 64 * 1024 },
+    );
+    if (!inspected.error && inspected.status === 0 && inspected.stdout.trim()) {
+      identity = `${process.platform}:${inspected.stdout.trim()}`;
+    }
+  }
+
+  return identity === undefined
+    ? undefined
+    : createHash("sha256").update(identity).digest("hex").slice(0, 16);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function removeEmptyCronHealthLockDirectory(lockPath: string): boolean {
+  try {
+    rmdirSync(lockPath);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST") {
+      return code === "ENOENT";
+    }
+    throw err;
+  }
+}
+
+function removeCronHealthLockEntry(entryPath: string): boolean {
+  try {
+    unlinkSync(entryPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+function cleanupCronHealthLockAcquisition(
+  lockPath: string,
+  claimPath: string,
+  ownerPath?: string,
+): void {
+  if (ownerPath !== undefined) {
+    removeCronHealthLockEntry(ownerPath);
+  }
+  removeCronHealthLockEntry(claimPath);
+  removeEmptyCronHealthLockDirectory(lockPath);
+}
+
+function hasCronHealthLockOwnership(
+  lockPath: string,
+  createdLockStat: Stats,
+  claimEntry: string,
+  ownerEntry: string,
+): boolean {
+  let currentLockStat: Stats;
+  let entries: string[];
+  try {
+    currentLockStat = statSync(lockPath);
+    entries = readdirSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
+
+  return currentLockStat.isDirectory()
+    && currentLockStat.dev === createdLockStat.dev
+    && currentLockStat.ino === createdLockStat.ino
+    && entries.length === 2
+    && entries.includes(claimEntry)
+    && entries.includes(ownerEntry);
+}
+
+function recoverCronHealthLock(lockPath: string): boolean {
+  let lockStat: Stats;
+  try {
+    lockStat = statSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return true;
+    }
+    throw err;
+  }
+
+  if (!lockStat.isDirectory()) {
+    throw new Error(`cron health lock "${lockPath}" has invalid ownership state`);
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return true;
+    }
+    throw err;
+  }
+
+  if (entries.length === 0) {
+    if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
+      return false;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  const ownerEntries = entries.filter((entry) =>
+    /^owner-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/.test(entry)
+  );
+  const ownerEntry = ownerEntries.length === 1 ? ownerEntries[0] : undefined;
+  const ownerMatch = ownerEntry?.match(
+    /^owner-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/,
+  );
+  const claimEntry = ownerEntry === undefined
+    ? undefined
+    : `claim-${ownerEntry.slice("owner-".length)}`;
+  if (
+    entries.length === 2
+    && claimEntry !== undefined
+    && entries.includes(claimEntry)
+    && ownerEntry !== undefined
+    && ownerMatch
+  ) {
+    const ownerPid = Number(ownerMatch[1]);
+    const recordedStartToken = ownerMatch[2];
+    if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
+      const currentStartToken = inspectProcessStartToken(ownerPid);
+      if (
+        currentStartToken !== undefined
+        && recordedStartToken !== "unknown"
+        && currentStartToken === recordedStartToken
+      ) {
+        return false;
+      }
+      if (
+        (currentStartToken === undefined || recordedStartToken === "unknown")
+        && isProcessAlive(ownerPid)
+      ) {
+        return false;
+      }
+    }
+    if (!removeCronHealthLockEntry(join(lockPath, ownerEntry))) {
+      return true;
+    }
+    if (!removeCronHealthLockEntry(join(lockPath, claimEntry))) {
+      return true;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  if (Date.now() - lockStat.mtimeMs <= CRON_HEALTH_STALE_LOCK_MS) {
+    return false;
+  }
+
+  if (
+    entries.length === 1
+    && /^claim-(\d+)-(unknown|[0-9a-f]{16})-[0-9a-f-]+$/.test(entries[0])
+  ) {
+    if (!removeCronHealthLockEntry(join(lockPath, entries[0]))) {
+      return true;
+    }
+    return removeEmptyCronHealthLockDirectory(lockPath);
+  }
+
+  throw new Error(`cron health lock "${lockPath}" has invalid ownership state`);
+}
+
+function acquireCronHealthLock(dir: string, fileStem: string): () => void {
+  const lockPath = join(dir, `.minime_cron_${fileStem}.lock`);
+  const deadline = Date.now() + CRON_HEALTH_LOCK_TIMEOUT_MS;
+  const waitState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+  while (true) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for cron health lock "${lockPath}"`);
+    }
+
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      let createdLockStat: Stats;
+      try {
+        createdLockStat = statSync(lockPath);
+      } catch (err) {
+        removeEmptyCronHealthLockDirectory(lockPath);
+        throw err;
+      }
+      const ownerToken = [
+        process.pid,
+        inspectProcessStartToken(process.pid) ?? "unknown",
+        randomUUID(),
+      ].join("-");
+      const claimEntry = `claim-${ownerToken}`;
+      const claimPath = join(lockPath, claimEntry);
+      try {
+        writeFileSync(claimPath, `${ownerToken}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+      } catch (err) {
+        cleanupCronHealthLockAcquisition(lockPath, claimPath);
+        throw err;
+      }
+      const ownerEntry = `owner-${ownerToken}`;
+      const ownerPath = join(lockPath, ownerEntry);
+      try {
+        writeFileSync(ownerPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      } catch (err) {
+        cleanupCronHealthLockAcquisition(lockPath, claimPath, ownerPath);
+        throw err;
+      }
+      if (
+        !hasCronHealthLockOwnership(
+          lockPath,
+          createdLockStat,
+          claimEntry,
+          ownerEntry,
+        )
+      ) {
+        cleanupCronHealthLockAcquisition(lockPath, claimPath, ownerPath);
+        throw new Error(`cron health lock "${lockPath}" ownership changed during acquisition`);
+      }
+
+      let released = false;
+      return () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        if (!removeCronHealthLockEntry(ownerPath)) {
+          throw new Error(`cron health lock owner "${ownerPath}" is missing`);
+        }
+        if (!removeCronHealthLockEntry(claimPath)) {
+          throw new Error(`cron health lock claim "${claimPath}" is missing`);
+        }
+        if (!removeEmptyCronHealthLockDirectory(lockPath)) {
+          throw new Error(`cron health lock directory "${lockPath}" is not empty`);
+        }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err;
+      }
+    }
+
+    if (recoverCronHealthLock(lockPath)) {
+      continue;
+    }
+
+    Atomics.wait(waitState, 0, 0, CRON_HEALTH_LOCK_RETRY_MS);
+  }
+}
+
+interface CronRunCounts {
+  success: number;
+  failure: number;
+}
+
+function parseCronRunCounts(contents: string, label: string): CronRunCounts {
+  const values = new Map<string, number>();
+  for (const line of contents.split(/\r?\n/)) {
+    for (const outcome of ["success", "failure"] as const) {
+      const prefix = `minime_cron_runs_total{cron="${label}",outcome="${outcome}"} `;
+      if (!line.startsWith(prefix)) {
+        continue;
+      }
+      const rawValue = line.slice(prefix.length);
+      if (!/^\d+$/.test(rawValue)) {
+        return { success: 0, failure: 0 };
+      }
+      const value = Number(rawValue);
+      if (!Number.isSafeInteger(value) || value < 0) {
+        return { success: 0, failure: 0 };
+      }
+      values.set(outcome, value);
+    }
+  }
+  if (!values.has("success") || !values.has("failure")) {
+    return { success: 0, failure: 0 };
+  }
+  return {
+    success: values.get("success") ?? 0,
+    failure: values.get("failure") ?? 0,
+  };
+}
+
+function readCronRunCounts(filePath: string, label: string): CronRunCounts {
+  try {
+    return parseCronRunCounts(readFileSync(filePath, "utf8"), label);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { success: 0, failure: 0 };
+    }
+    throw err;
+  }
+}
+
+function writeCronHealthMetric(
+  cronName: string,
+  exitCode: number,
+  outcome: CronTerminalOutcome,
+): void {
   const fileStem = sanitizeCronMetricStem(cronName);
   const label = escapePrometheusLabelValue(cronName);
   const dir = process.env.CRON_HEALTH_TEXTFILE_DIR ?? DEFAULT_CRON_HEALTH_TEXTFILE_DIR;
-  const normalizedExitCode = Number.isFinite(exitCode) ? Math.trunc(exitCode) : 1;
+  const suppliedExitCode = Number.isFinite(exitCode) ? Math.trunc(exitCode) : 1;
+  const normalizedExitCode = outcome === "success"
+    ? 0
+    : suppliedExitCode === 0
+      ? 1
+      : suppliedExitCode;
+  const exitFileName = `minime_cron_${fileStem}.exit.prom`;
+  const exitFilePath = join(dir, exitFileName);
 
   try {
     mkdirSync(dir, { recursive: true });
   } catch (err) {
-    process.stderr.write(
-      `[cron-runner] WARN: failed to prepare cron health metric dir for "${cronName}": ${(err as Error).message}\n`,
+    throw new Error(
+      `failed to prepare cron health metric dir for "${cronName}": ${errorFromUnknown(err).message}`,
     );
-    return;
   }
 
-  if (success) {
-    try {
-      writeAtomicTextFile(
-        dir,
-        `minime_cron_${fileStem}.success.prom`,
-        `minime_cron_last_success_timestamp{cron="${label}"} ${Math.floor(Date.now() / 1000)}\n`,
-      );
-    } catch (err) {
-      process.stderr.write(
-        `[cron-runner] WARN: failed to write cron health success metric for "${cronName}": ${(err as Error).message}\n`,
-      );
-    }
+  let releaseLock: () => void;
+  try {
+    releaseLock = acquireCronHealthLock(dir, fileStem);
+  } catch (err) {
+    throw new Error(
+      `failed to lock cron health metric for "${cronName}": ${errorFromUnknown(err).message}`,
+    );
   }
 
   try {
-    writeAtomicTextFile(
-      dir,
-      `minime_cron_${fileStem}.exit.prom`,
-      `minime_cron_last_exit_code{cron="${label}"} ${normalizedExitCode}\n`,
-    );
-  } catch (err) {
-    process.stderr.write(
-      `[cron-runner] WARN: failed to write cron health exit metric for "${cronName}": ${(err as Error).message}\n`,
-    );
+    let previousCounts: CronRunCounts;
+    try {
+      previousCounts = readCronRunCounts(exitFilePath, label);
+    } catch (err) {
+      throw new Error(
+        `failed to read prior cron health metric for "${cronName}": ${errorFromUnknown(err).message}`,
+      );
+    }
+
+    const counts: CronRunCounts = {
+      success: previousCounts.success + (outcome === "success" ? 1 : 0),
+      failure: previousCounts.failure + (outcome === "failure" ? 1 : 0),
+    };
+    const timestamp = Math.floor(Date.now() / 1000);
+    const terminalSnapshot = [
+      `minime_cron_last_exit_code{cron="${label}"} ${normalizedExitCode}`,
+      `minime_cron_runs_total{cron="${label}",outcome="success"} ${counts.success}`,
+      `minime_cron_runs_total{cron="${label}",outcome="failure"} ${counts.failure}`,
+      `minime_cron_last_run_timestamp_seconds{cron="${label}"} ${timestamp}`,
+      "",
+    ].join("\n");
+
+    if (outcome === "success") {
+      try {
+        writeAtomicTextFile(
+          dir,
+          `minime_cron_${fileStem}.success.prom`,
+          `minime_cron_last_success_timestamp{cron="${label}"} ${timestamp}\n`,
+        );
+      } catch (err) {
+        throw new Error(
+          `failed to write cron health success metric for "${cronName}": ${errorFromUnknown(err).message}`,
+        );
+      }
+    }
+
+    try {
+      writeAtomicTextFile(dir, exitFileName, terminalSnapshot);
+    } catch (err) {
+      throw new Error(
+        `failed to write cron health terminal metric for "${cronName}": ${errorFromUnknown(err).message}`,
+      );
+    }
+  } finally {
+    try {
+      releaseLock();
+    } catch (err) {
+      throw new Error(
+        `failed to release cron health metric lock for "${cronName}": ${errorFromUnknown(err).message}`,
+      );
+    }
   }
 }
 
@@ -636,7 +976,38 @@ function scrubLegacyRuntimeEnv(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 function buildCronSystemInstruction(): string {
   const today = new Date().toISOString().split("T")[0];
-  return `Today is ${today}. Respond concisely.`;
+  return [
+    `Today is ${today}. Respond concisely.`,
+    `If your final report has an unresolved finding, add ${MINIME_CRON_UNRESOLVED_MARKER} as its exact standalone final non-empty line. Do not use this marker otherwise.`,
+  ].join(" ");
+}
+
+export interface LlmCronTerminalResult {
+  output: string;
+  outcome: CronTerminalOutcome;
+}
+
+export function classifyLlmCronTerminalResult(output: string): LlmCronTerminalResult {
+  const lines = output.replace(/\r\n/g, "\n").split("\n");
+  let finalNonEmptyLine = lines.length - 1;
+  while (finalNonEmptyLine >= 0 && lines[finalNonEmptyLine].trim() === "") {
+    finalNonEmptyLine -= 1;
+  }
+  const exactMarkerCount = lines.filter(
+    (line) => line === MINIME_CRON_UNRESOLVED_MARKER,
+  ).length;
+
+  if (
+    exactMarkerCount === 1
+    && finalNonEmptyLine >= 0
+    && lines[finalNonEmptyLine] === MINIME_CRON_UNRESOLVED_MARKER
+  ) {
+    return {
+      output: lines.slice(0, finalNonEmptyLine).join("\n").trim(),
+      outcome: "failure",
+    };
+  }
+  return { output, outcome: "success" };
 }
 
 function formatCapturedOutputExcerpt(label: "stdout" | "stderr", value: string): string | undefined {
@@ -685,7 +1056,7 @@ function classifyPiResult(
     return piErrorResult(summary, stdout, stderr);
   }
   if (trimmedStdout) {
-    return { status: "ok", output: trimmedStdout };
+    return { status: "ok", output: stdout };
   }
   if (trimmedStderr) {
     return piErrorResult("Pi cron produced stderr without stdout", stdout, stderr);
@@ -853,7 +1224,11 @@ export interface CronRunnerMainDeps {
     errorMsg: string,
     adminChatId: number | undefined,
   ) => void;
-  writeCronHealthMetric: (cronName: string, exitCode: number, success: boolean) => void;
+  writeCronHealthMetric: (
+    cronName: string,
+    exitCode: number,
+    outcome: CronTerminalOutcome,
+  ) => void;
 }
 
 const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
@@ -881,11 +1256,26 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     argv: process.argv,
     ...overrides,
   };
+  let terminalFinalized = false;
+  const finalizeInvocation = (
+    cronName: string,
+    outcome: CronTerminalOutcome,
+  ): void => {
+    if (terminalFinalized) {
+      throw new Error(`Cron invocation "${cronName}" was finalized more than once`);
+    }
+    deps.writeCronHealthMetric(cronName, outcome === "success" ? 0 : 1, outcome);
+    terminalFinalized = true;
+  };
 
   const taskIdx = deps.argv.indexOf("--task");
   if (taskIdx === -1 || !deps.argv[taskIdx + 1]) {
-    deps.consoleError("Usage: cron-runner.ts --task <name>");
-    deps.writeCronHealthMetric("unknown", 1, false);
+    try {
+      deps.consoleError("Usage: cron-runner.ts --task <name>");
+    } catch {
+      // Usage reporting is best-effort; the terminal failure still must publish.
+    }
+    finalizeInvocation("unknown", "failure");
     deps.exit(1);
   }
   const taskName = deps.argv[taskIdx + 1];
@@ -914,8 +1304,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     }
   };
 
-  const queueDeliveryIfEmpty = (
-    kind: CronOutboxRecord["kind"],
+  const queueOutputIfEmpty = (
     payload: string,
     chatId: number,
     threadId?: number,
@@ -935,14 +1324,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         version: 1,
         cron: taskName,
         runId,
-        kind,
+        kind: "output",
         payload,
         chatId,
         ...(threadId === undefined ? {} : { threadId }),
         createdAt: new Date().toISOString(),
         attempts: 0,
       });
-      deps.log(taskName, `OUTBOX QUEUED runId=${runId} kind=${kind}`);
+      deps.log(taskName, `OUTBOX QUEUED runId=${runId} kind=output`);
     } catch (err) {
       deps.log(taskName, `OUTBOX QUEUE-WRITE-FAILED: ${errorFromUnknown(err).message}`);
     }
@@ -961,8 +1350,11 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   try {
     cron = deps.loadCronTask(taskName, undefined, defaults);
   } catch (err) {
-    deps.log(taskName, `FAIL: ${(err as Error).message}`);
-    deps.writeCronHealthMetric(taskName, 1, false);
+    try {
+      deps.log(taskName, `FAIL: ${(err as Error).message}`);
+    } finally {
+      finalizeInvocation(taskName, "failure");
+    }
     deps.exit(1);
   }
 
@@ -1000,17 +1392,52 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     pendingRecord = deps.readCronOutboxRecord(taskName);
   } catch (err) {
     deps.log(taskName, `OUTBOX STATE-READ-FAILED: ${errorFromUnknown(err).message}`);
-    deps.writeCronHealthMetric(taskName, 1, false);
+    // No logical cron execution started, so this outbox preflight failure must
+    // not increment terminal logical-run counters.
     deps.exit(1);
   }
 
+  if (
+    pendingRecord !== undefined
+    && pendingRecord !== "corrupt"
+    && pendingRecord.kind === "failure-notice"
+  ) {
+    try {
+      deps.clearCronOutboxRecord(taskName);
+    } catch (err) {
+      deps.log(
+        taskName,
+        `OUTBOX CLEAR-FAILED legacy-failure-notice runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
+      );
+      deps.exit(1);
+    }
+    deps.log(
+      taskName,
+      `OUTBOX DROPPED legacy-failure-notice runId=${pendingRecord.runId}`,
+    );
+    pendingRecord = undefined;
+  }
+
   if (pendingRecord === "corrupt") {
-    deps.clearCronOutboxRecord(taskName);
-    deps.log(taskName, "OUTBOX TERMINAL corrupt");
+    try {
+      deps.clearCronOutboxRecord(taskName);
+      deps.log(taskName, "OUTBOX TERMINAL corrupt");
+    } catch (err) {
+      deps.log(taskName, `OUTBOX CLEAR-FAILED corrupt: ${errorFromUnknown(err).message}`);
+      deps.exit(1);
+    }
   } else if (pendingRecord !== undefined) {
     const expired = Date.now() - Date.parse(pendingRecord.createdAt) > CRON_OUTBOX_EXPIRY_MS;
     if (expired || pendingRecord.attempts >= CRON_OUTBOX_MAX_ATTEMPTS) {
-      deps.clearCronOutboxRecord(taskName);
+      try {
+        deps.clearCronOutboxRecord(taskName);
+      } catch (err) {
+        deps.log(
+          taskName,
+          `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
+        );
+        deps.exit(1);
+      }
       deps.log(
         taskName,
         `OUTBOX TERMINAL gave-up runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
@@ -1033,15 +1460,32 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             ...pendingRecord,
             attempts: pendingRecord.attempts + 1,
           };
-          deps.writeCronOutboxRecord(updatedRecord);
+          try {
+            deps.writeCronOutboxRecord(updatedRecord);
+          } catch (writeError) {
+            deps.log(
+              taskName,
+              `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
+            );
+            deps.exit(1);
+          }
           deps.log(
             taskName,
             `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
           );
-          deps.writeCronHealthMetric(taskName, 1, false);
+          // This invocation only retried delivery owed by an earlier logical
+          // run. It exits without generating or counting a new logical run.
           deps.exit(1);
         }
-        deps.clearCronOutboxRecord(taskName);
+        try {
+          deps.clearCronOutboxRecord(taskName);
+        } catch (clearError) {
+          deps.log(
+            taskName,
+            `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
+          );
+          deps.exit(1);
+        }
         deps.log(
           taskName,
           `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
@@ -1055,7 +1499,6 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             taskName,
             `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
           );
-          deps.writeCronHealthMetric(taskName, 1, false);
           deps.exit(1);
         }
         deps.log(
@@ -1067,6 +1510,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   }
 
   let output: string;
+  let terminalOutcome: CronTerminalOutcome = "success";
   try {
     if (cron.type === "script") {
       output = deps.runScript(cron);
@@ -1081,58 +1525,43 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         cronAgentData,
       );
       deps.log(taskName, `Pi returned ${output.length} chars`);
+      const classified = classifyLlmCronTerminalResult(output);
+      output = classified.output.trim();
+      terminalOutcome = classified.outcome;
     }
   } catch (err) {
     const error = errorFromUnknown(err);
     const errMsg = `Cron task "${taskName}" failed: ${error.message}`;
-    deps.log(taskName, `FAIL: ${errMsg}`);
     const diagnostics = cronErrorDiagnostics(err);
-    if (diagnostics) {
-      deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
-    }
-    const notificationDiagnostics = formatNotificationDiagnostics(diagnostics);
-    const failureNotificationLines = [`⚠️ Cron FAIL: ${taskName}`, errMsg.slice(0, FAILURE_NOTIFICATION_ERROR_CHARS)];
-    const failureFallbackLines = [errMsg.slice(0, FAILURE_FALLBACK_ERROR_CHARS)];
-    if (notificationDiagnostics) {
-      const diagnosticsLine = `Diagnostics: ${notificationDiagnostics}`;
-      failureNotificationLines.push(diagnosticsLine);
-      failureFallbackLines.push(diagnosticsLine);
-    }
-    const failureNotification = failureNotificationLines.join("\n");
-    const failureFallbackContext = failureFallbackLines.join("\n");
-
-    // Send failure notification to delivery chat; use admin fallback if delivery fails
     try {
-      await deliverWithRetry(cron.deliveryChatId, failureNotification, cron.deliveryThreadId);
-    } catch (deliveryErr) {
-      if (isQueueableDeliveryFailure(deliveryErr)) {
-        queueDeliveryIfEmpty(
-          "failure-notice",
-          failureNotification,
-          cron.deliveryChatId,
-          cron.deliveryThreadId,
-        );
+      try {
+        deps.log(taskName, `FAIL: ${errMsg}`);
+      } finally {
+        if (diagnostics) {
+          deps.log(taskName, `FAIL diagnostics: ${diagnostics}`);
+        }
       }
-      deps.handleDeliveryFailure(
-        taskName,
-        cron.deliveryChatId,
-        `${failureFallbackContext}\n(notification delivery failed: ${(deliveryErr as Error).message})`,
-        adminChatId,
-      );
+    } finally {
+      finalizeInvocation(taskName, "failure");
     }
-    deps.writeCronHealthMetric(taskName, 1, false);
     deps.exit(1);
   }
 
   if (!output) {
+    finalizeInvocation(taskName, terminalOutcome);
     deps.log(taskName, "WARN: empty output — skipping delivery");
-    deps.writeCronHealthMetric(taskName, 0, true);
+    if (terminalOutcome === "failure") {
+      deps.exit(1);
+    }
     deps.log(taskName, "DONE");
     return;
   }
   if (cron.type === "llm" && shouldSuppressNoReply(output)) {
+    finalizeInvocation(taskName, terminalOutcome);
     deps.log(taskName, "NO_REPLY — skipping delivery");
-    deps.writeCronHealthMetric(taskName, 0, true);
+    if (terminalOutcome === "failure") {
+      deps.exit(1);
+    }
     deps.log(taskName, "DONE");
     return;
   }
@@ -1141,16 +1570,25 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   try {
     await deliverWithRetry(cron.deliveryChatId, output, cron.deliveryThreadId);
   } catch (err) {
-    if (isQueueableDeliveryFailure(err)) {
-      queueDeliveryIfEmpty("output", output, cron.deliveryChatId, cron.deliveryThreadId);
+    try {
+      try {
+        if (isQueueableDeliveryFailure(err)) {
+          queueOutputIfEmpty(output, cron.deliveryChatId, cron.deliveryThreadId);
+        }
+      } finally {
+        deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
+      }
+    } finally {
+      finalizeInvocation(taskName, "failure");
     }
-    deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
-    deps.writeCronHealthMetric(taskName, 1, false);
     deps.exit(1);
   }
-  deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
 
-  deps.writeCronHealthMetric(taskName, 0, true);
+  finalizeInvocation(taskName, terminalOutcome);
+  deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
+  if (terminalOutcome === "failure") {
+    deps.exit(1);
+  }
   deps.log(taskName, "DONE");
 }
 
@@ -1159,7 +1597,10 @@ const isMain =
   process.argv[1]?.endsWith("cron-runner.ts") ||
   process.argv[1]?.endsWith("cron-runner.js");
 if (isMain) {
-  main();
+  void main().catch((err) => {
+    process.stderr.write(`Cron runner failed: ${errorFromUnknown(err).message}\n`);
+    process.exitCode = 1;
+  });
 }
 
 export { loadCronTask, resolveCronAgentData, buildPiCronAgentConfig, getAgentWorkspace, deliver, buildDeliverArgs, runPi, runOneShot, resolveCronEngine, classifyPiResult, writeCronHealthMetric, runScript, main };

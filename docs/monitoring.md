@@ -57,6 +57,90 @@ retries an occupied configured host/port every second until the old listener
 releases it. Scrapes can briefly continue reaching the old process. Other listen
 errors remain logged, and shutdown cancels any pending address retry.
 
+## Terminal cron health contract
+
+Each completed new logical cron run publishes one restart-safe terminal
+classification through the node-exporter textfile collector. Exit state, both
+counters, and the last-run timestamp share one atomic terminal snapshot; the
+separate success timestamp snapshot changes only after success. The public
+contract has four metric families:
+
+- `minime_cron_last_exit_code{cron}` is zero for the latest success and
+  non-zero for the latest failure;
+- `minime_cron_last_success_timestamp{cron}` is updated only by success;
+- `minime_cron_runs_total{cron,outcome="success|failure"}` increments exactly
+  one closed outcome for each logical invocation;
+- `minime_cron_last_run_timestamp_seconds{cron}` is the timestamp of the latest
+  terminal classification.
+
+The runner writes these snapshots to
+`/opt/homebrew/var/node_exporter/textfile` by default.
+`CRON_HEALTH_TEXTFILE_DIR` selects a different directory. The selected
+directory must be writable by the runner and must be the same host directory
+that node-exporter's textfile collector scans, or be mapped to it by the active
+container bind mount.
+
+Terminal metric persistence is fail-closed. A directory, lock, prior-state
+read, or snapshot-write failure is emitted on standard error and makes the
+runner non-zero rather than allowing a successful process status against an
+older terminal snapshot.
+
+Only the bounded configured cron name and the closed `success` or `failure`
+outcome are labels. Exit values, timestamps, diagnostics, run IDs,
+destinations, and identities are not labels. Counter resets do not change an
+alert identity.
+
+For an LLM cron, the exact standalone final non-empty line
+`[[MINIME_CRON_UNRESOLVED_V1]]` declares that the clean report still contains
+an unresolved finding. The runner removes that line before normal
+retry/outbox delivery, then records a logical failure and exits non-zero. A
+marker embedded in prose, quoted, repeated, or followed by another non-empty
+line is delivered unchanged. Script cron output is never marker-classified.
+
+The example `MinimeCronTerminalFailure` rule joins non-zero exit state to an
+existing terminal timestamp by `cron`. Its five-minute `for` period suppresses
+brief evaluation churn, and its five-minute future tolerance rejects
+materially future-dated timestamps. The rule intentionally has no schedule-age
+threshold: an old non-zero terminal result remains firing until a successful
+run replaces it.
+
+`MinimeCronTelemetryIncomplete` reports an exit series whose terminal
+timestamp is missing or materially future-dated. Missing both series remains
+unobservable, so the rule does not invent a cron or an incident. Both alerts
+inherit only `cron` and add fixed `severity`, `component`, and `failure_class`
+labels. The Alertmanager example groups by `alertname` and `cron`, repeats a
+continuing incident every four hours, and sends resolved transitions.
+
+Execution failures do not send a second generic `Cron FAIL` notification.
+Prometheus owns terminal evaluation, while Alertmanager owns incident
+grouping, deduplication, repeats, and recovery delivery. Generated-output
+retry/outbox behavior and the admin fallback for delivery-path failures remain
+separate and unchanged. An old queued `failure-notice` record encountered
+after upgrade is discarded without delivery.
+
+Pickup-only outbox preflight failures and deferred redelivery attempts happen
+before a new logical cron run begins. They exit non-zero without changing
+last-exit, last-run, last-success, or counter series; use their bounded
+`OUTBOX` cron-log evidence and process status for diagnosis.
+
+Run the deterministic rule fixture from the package root:
+
+```sh
+promtool test rules examples/monitoring/minime.rules.test.yml
+```
+
+For rollout, first merge the example rules and Alertmanager route into the
+external active configuration without replacing unrelated rules or routes.
+Run the pinned production `promtool`, validate the active Alertmanager and
+Compose configuration and current bind mounts, then reload or recreate only
+the required monitoring services. Verify targets, loaded rules, routing, and
+native monitoring health before deploying the package that removes direct
+generic failure delivery. Confirm that a controlled run exposes all four cron
+metric families through Prometheus from the selected textfile directory.
+Finally, run controlled installed-artifact success, failure, and recovery cases
+and confirm the stable alert group, resolved transition, four-hour repeat
+contract, bounded metrics, and absence of a duplicate direct failure message.
+
 ## Prerequisites
 
 The native helpers require Python 3.9 or newer. The encrypted-secret path also
@@ -214,6 +298,13 @@ Deduplication is process-local, retains at most 1,024 successful batch digests
 for one hour, and resets when the webhook restarts. It suppresses immediate
 retries; it is not durable exactly-once delivery. Large batches are summarized
 within Telegram's message limit.
+
+Native-only and bridge-fallback Telegram lines append
+`cron=<sanitized-name>` when the alert has a `cron` label, for both firing and
+resolved transitions. For a native-only alert without a supplied fingerprint,
+that sanitized cron value also participates in the fallback identity. Alerts
+without a `cron` label retain the previous message and fallback-identity
+format.
 
 ## Runtime doctor installation
 

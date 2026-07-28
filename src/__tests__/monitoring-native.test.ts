@@ -121,6 +121,7 @@ function bridgeEnv(base: string): NodeJS.ProcessEnv {
 
 function alertmanagerPayload(options: {
   alertname: string;
+  cron?: string;
   severity?: "warning" | "critical";
   status?: "firing" | "resolved";
   fingerprint?: string;
@@ -131,6 +132,7 @@ function alertmanagerPayload(options: {
     alertname: options.alertname,
     severity: options.severity ?? "warning",
     instance: "local",
+    ...(options.cron === undefined ? {} : { cron: options.cron }),
   };
   return {
     receiver: "minime-native-webhook",
@@ -144,7 +146,10 @@ function alertmanagerPayload(options: {
       generatorURL: "http://127.0.0.1/prometheus/graph",
       fingerprint: options.fingerprint ?? options.alertname,
     }],
-    groupLabels: { alertname: options.alertname },
+    groupLabels: {
+      alertname: options.alertname,
+      ...(options.cron === undefined ? {} : { cron: options.cron }),
+    },
     commonLabels: labels,
     commonAnnotations: {},
     externalURL: "http://127.0.0.1/alertmanager",
@@ -523,6 +528,78 @@ describe("host-native secret and Telegram delivery", () => {
 });
 
 describe("Alertmanager webhook", () => {
+  it("renders cron identity for distinct firing and resolved groups in both native paths", async () => {
+    const cases = [
+      { cron: "daily-alpha", status: "firing" as const, other: "daily-beta" },
+      { cron: "daily-beta", status: "resolved" as const, other: "daily-alpha" },
+    ];
+
+    for (const testCase of cases) {
+      const payload = alertmanagerPayload({
+        alertname: "MinimeCronTerminalFailure",
+        cron: testCase.cron,
+        status: testCase.status,
+        fingerprint: `${testCase.status}-${testCase.cron}`,
+      });
+      const result = await runPython([
+        "-c",
+        [
+          "import json,sys",
+          "sys.path.insert(0, 'scripts')",
+          "import alertmanager_webhook as webhook",
+          "body=sys.argv[1].encode('utf-8')",
+          "native=webhook.parse_alertmanager_payload(body)[1]",
+          "bridge=webhook.parse_bridge_alertmanager_payload(body).message",
+          "print(json.dumps([native, bridge]))",
+        ].join(";"),
+        JSON.stringify(payload),
+      ], {});
+
+      assert.equal(result.status, 0, result.stderr);
+      const messages = JSON.parse(result.stdout) as string[];
+      assert.equal(messages.length, 2);
+      for (const message of messages) {
+        assert.match(message, new RegExp(`${testCase.status.toUpperCase()} alert=MinimeCronTerminalFailure`));
+        assert.match(message, new RegExp(`cron=${testCase.cron}`));
+        assert.doesNotMatch(message, new RegExp(`cron=${testCase.other}`));
+      }
+    }
+  });
+
+  it("includes cron in fingerprintless native fallback identity", async () => {
+    const payloads = ["daily-alpha", "daily-beta"].map((cron) => {
+      const payload = alertmanagerPayload({
+        alertname: "MinimeCronTerminalFailure",
+        cron,
+        status: "firing",
+      });
+      const [alert] = payload.alerts as Array<Record<string, unknown>>;
+      delete alert.fingerprint;
+      return payload;
+    });
+    const result = await runPython([
+      "-c",
+      [
+        "import json,sys",
+        "sys.path.insert(0, 'scripts')",
+        "import alertmanager_webhook as webhook",
+        "first=webhook.parse_alertmanager_payload(sys.argv[1].encode('utf-8'))",
+        "second=webhook.parse_alertmanager_payload(sys.argv[2].encode('utf-8'))",
+        "print(json.dumps([first, second]))",
+      ].join(";"),
+      JSON.stringify(payloads[0]),
+      JSON.stringify(payloads[1]),
+    ], {});
+
+    assert.equal(result.status, 0, result.stderr);
+    const [[firstKey, firstMessage], [secondKey, secondMessage]] = JSON.parse(
+      result.stdout,
+    ) as [[string, string], [string, string]];
+    assert.notEqual(firstKey, secondKey);
+    assert.match(firstMessage, /cron=daily-alpha/);
+    assert.match(secondMessage, /cron=daily-beta/);
+  });
+
   it("delivers firing and resolved batches, suppresses duplicates, and uses no Node subprocess", async () => {
     const messages: string[] = [];
     const dir = tempDir();

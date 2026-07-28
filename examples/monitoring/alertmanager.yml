@@ -1,6 +1,6 @@
 route:
   receiver: minime-native-webhook
-  group_by: [alertname]
+  group_by: [alertname, cron]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h

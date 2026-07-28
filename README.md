@@ -556,22 +556,54 @@ Dry-run may perform that read-only parser comparison, with desired content sent
 on standard input, but creates no temporary files or directories and performs
 no writes, plist lint, launchctl calls, or other state mutation.
 
-Cron execution failures send `Cron FAIL: <task>` plus the error line to the
-delivery chat. When Pi diagnostics are available, the notification appends a
-`Diagnostics:` excerpt capped at 300 characters after sanitization and
-best-effort redaction of common credential shapes. Full diagnostics remain in
-the local `FAIL diagnostics: ...` cron log, and admin delivery-failure fallback
-uses the same concise failure context.
+Each completed new logical cron run updates atomic node-exporter textfile
+snapshots with a bounded `cron` label. The terminal snapshot contains exit
+state, both counters, and the last-run timestamp; the separate success
+timestamp snapshot changes only after success:
+
+- `minime_cron_last_exit_code{cron}` is the latest terminal exit state;
+- `minime_cron_last_success_timestamp{cron}` changes only after success;
+- `minime_cron_runs_total{cron,outcome="success|failure"}` counts exactly one
+  closed outcome per logical invocation and survives normal runner restarts;
+- `minime_cron_last_run_timestamp_seconds{cron}` records the latest terminal
+  classification time.
+
+The runner writes these snapshots to
+`/opt/homebrew/var/node_exporter/textfile` by default.
+`CRON_HEALTH_TEXTFILE_DIR` overrides that location; it must be writable by the
+runner and match the directory collected by node-exporter.
+
+Terminal metric persistence is fail-closed: a directory, lock, state-read, or
+snapshot-write failure is reported on standard error and leaves the runner
+non-zero instead of silently completing against an older snapshot.
+
+LLM crons receive a package-owned instruction allowing the exact standalone
+final non-empty line `[[MINIME_CRON_UNRESOLVED_V1]]`. The runner strips that
+line from delivery, delivers any clean report through the ordinary
+retry/outbox path, and then records a non-zero logical failure. Embedded,
+quoted, repeated, or non-final marker-like text is ordinary output, and script
+cron output is never interpreted as this marker.
+
+Execution failures no longer send a direct generic `Cron FAIL` message or
+create a failure-notice outbox entry. Prometheus and Alertmanager own terminal
+incident grouping, repeats, and recovery. Bounded diagnostics remain in the
+local cron log, while the existing admin fallback for a delivery-path failure
+is unchanged. On upgrade, an old queued `failure-notice` record is discarded
+without delivery.
 
 Cron delivery is pickup-first. At the start of each scheduled invocation, the
 runner tries to deliver any result owed by that cron before generating new
 output. After bounded in-process delivery retries fail, it stores the exact
-generated output (or generation-failure notice) in one atomic, durable outbox
-slot per cron. A queueable pickup failure stops the invocation before
-generation, so a newer result cannot overwrite the pending one. Redelivery is
-limited to 10 later attempts and a 48-hour lifetime. Queue, redelivery,
-deferral, and terminal decisions are recorded as `OUTBOX` lines in
-`cron-<name>.log`.
+generated output in one atomic, durable outbox slot per cron. A queueable
+pickup failure stops the invocation before generation, so a newer result
+cannot overwrite the pending one. Redelivery is limited to 10 later attempts
+and a 48-hour lifetime. Queue, redelivery, deferral, and terminal decisions are
+recorded as `OUTBOX` lines in `cron-<name>.log`.
+
+Pickup-only outbox preflight failures and deferred redelivery attempts do not
+start a new logical cron run, so they do not change terminal metrics or
+counters. Their non-zero process exit and `OUTBOX` log lines remain the
+diagnostic evidence.
 
 Delivery has at-least-once, not exactly-once, semantics: a process crash after
 the chat accepts a message but before the outbox record is cleared can produce

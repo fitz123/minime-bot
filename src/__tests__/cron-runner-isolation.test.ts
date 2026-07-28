@@ -42,11 +42,11 @@ describe("cron-runner path isolation", () => {
     assert.match(readFileSync(join(logDirB, "cron-isolation.log"), "utf8"), /second failure/);
 
     process.env.CRON_HEALTH_TEXTFILE_DIR = metricsDirA;
-    writeCronHealthMetric("isolation", 0, true);
+    writeCronHealthMetric("isolation", 0, "success");
     const metricSnapshotA = snapshotDir(metricsDirA);
 
     process.env.CRON_HEALTH_TEXTFILE_DIR = metricsDirB;
-    writeCronHealthMetric("isolation", 1, false);
+    writeCronHealthMetric("isolation", 1, "failure");
 
     assert.deepStrictEqual(snapshotDir(metricsDirA), metricSnapshotA);
     assert.ok(

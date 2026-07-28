@@ -8,3 +8,41 @@ groups:
           severity: critical
         annotations:
           summary: Minime bot metrics target is unavailable
+      - alert: MinimeCronTerminalFailure
+        expr: |
+          max by (cron) (
+            (minime_cron_last_exit_code != 0)
+              and on (cron)
+            (minime_cron_last_run_timestamp_seconds <= time() + 300)
+          )
+        for: 5m
+        labels:
+          severity: warning
+          component: cron
+          failure_class: terminal
+        annotations:
+          summary: Minime cron invocation ended in failure
+          description: 'Cron "{{ $labels.cron }}" remains in its latest terminal failure state.'
+      - alert: MinimeCronTelemetryIncomplete
+        expr: |
+          max by (cron) (
+            (
+              minime_cron_last_exit_code
+                unless on (cron)
+              minime_cron_last_run_timestamp_seconds
+            )
+            or
+            (
+              minime_cron_last_exit_code
+                and on (cron)
+              (minime_cron_last_run_timestamp_seconds > time() + 300)
+            )
+          )
+        for: 5m
+        labels:
+          severity: warning
+          component: cron
+          failure_class: telemetry_incomplete
+        annotations:
+          summary: Minime cron terminal telemetry is incomplete
+          description: 'Cron "{{ $labels.cron }}" has a missing or materially future-dated terminal timestamp.'

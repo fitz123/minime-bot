@@ -1,0 +1,168 @@
+rule_files:
+  - minime.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: terminal success stays healthy
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="healthy"}'
+        values: "0x11"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="healthy"}'
+        values: "0x11"
+      - series: 'minime_cron_runs_total{cron="healthy",outcome="success"}'
+        values: "1+1x10"
+      - series: 'minime_cron_runs_total{cron="healthy",outcome="failure"}'
+        values: "0x11"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: MinimeCronTelemetryIncomplete
+        exp_alerts: []
+
+  - name: terminal failure waits for the configured pending period
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="pending-then-firing"}'
+        values: "0 1x10"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="pending-then-firing"}'
+        values: "0 60x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts:
+          - exp_labels:
+              cron: pending-then-firing
+              severity: warning
+              component: cron
+              failure_class: terminal
+            exp_annotations:
+              summary: Minime cron invocation ended in failure
+              description: 'Cron "pending-then-firing" remains in its latest terminal failure state.'
+
+  - name: repeated failures and a counter reset retain one alert identity
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="stable-identity",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
+        values: "1x11"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="stable-identity",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
+        values: "0+60x10"
+      - series: 'minime_cron_runs_total{cron="stable-identity",outcome="success"}'
+        values: "3x11"
+      - series: 'minime_cron_runs_total{cron="stable-identity",outcome="failure"}'
+        values: "7 8 9 0 1 2 3 4 5 6 7"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts:
+          - exp_labels:
+              cron: stable-identity
+              severity: warning
+              component: cron
+              failure_class: terminal
+            exp_annotations:
+              summary: Minime cron invocation ended in failure
+              description: 'Cron "stable-identity" remains in its latest terminal failure state.'
+      - eval_time: 10m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts:
+          - exp_labels:
+              cron: stable-identity
+              severity: warning
+              component: cron
+              failure_class: terminal
+            exp_annotations:
+              summary: Minime cron invocation ended in failure
+              description: 'Cron "stable-identity" remains in its latest terminal failure state.'
+
+  - name: successful terminal state resolves a firing failure
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="recovered"}'
+        values: "1x6 0x4"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="recovered"}'
+        values: "0x6 420x4"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts:
+          - exp_labels:
+              cron: recovered
+              severity: warning
+              component: cron
+              failure_class: terminal
+            exp_annotations:
+              summary: Minime cron invocation ended in failure
+              description: 'Cron "recovered" remains in its latest terminal failure state.'
+      - eval_time: 7m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts: []
+
+  - name: stale terminal failure remains firing
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="stale-failure"}'
+        values: "2x11"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="stale-failure"}'
+        values: "0x11"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts:
+          - exp_labels:
+              cron: stale-failure
+              severity: warning
+              component: cron
+              failure_class: terminal
+            exp_annotations:
+              summary: Minime cron invocation ended in failure
+              description: 'Cron "stale-failure" remains in its latest terminal failure state.'
+
+  - name: missing terminal timestamp reports incomplete telemetry
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="missing-timestamp",job="node-exporter",instance="127.0.0.1:9100",scrape_scope="fixture"}'
+        values: "0x11"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MinimeCronTelemetryIncomplete
+        exp_alerts:
+          - exp_labels:
+              cron: missing-timestamp
+              severity: warning
+              component: cron
+              failure_class: telemetry_incomplete
+            exp_annotations:
+              summary: Minime cron terminal telemetry is incomplete
+              description: 'Cron "missing-timestamp" has a missing or materially future-dated terminal timestamp.'
+
+  - name: future terminal timestamp reports incomplete telemetry
+    input_series:
+      - series: 'minime_cron_last_exit_code{cron="future-timestamp"}'
+        values: "0x11"
+      - series: 'minime_cron_last_run_timestamp_seconds{cron="future-timestamp"}'
+        values: "3600x11"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MinimeCronTelemetryIncomplete
+        exp_alerts:
+          - exp_labels:
+              cron: future-timestamp
+              severity: warning
+              component: cron
+              failure_class: telemetry_incomplete
+            exp_annotations:
+              summary: Minime cron terminal telemetry is incomplete
+              description: 'Cron "future-timestamp" has a missing or materially future-dated terminal timestamp.'
+      - eval_time: 5m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts: []
+
+  - name: missing all terminal series stays unobservable
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeCronTerminalFailure
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: MinimeCronTelemetryIncomplete
+        exp_alerts: []

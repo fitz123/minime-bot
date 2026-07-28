@@ -16,12 +16,21 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
 const EXPECTED_BUNDLED_AGENT_FILES = ["planner.md", "reviewer.md", "scout.md", "worker.md"];
 const EXPECTED_BUNDLED_PROMPT_FILES = ["implement-and-review.md", "implement.md", "scout-and-plan.md"];
+const EXPECTED_MONITORING_EXAMPLE_FILES = [
+  "ai.minime.alertmanager-webhook.plist",
+  "ai.minime.runtime-doctor.plist",
+  "alertmanager.yml",
+  "minime.rules.test.yml",
+  "minime.rules.yml",
+  "prometheus.yml",
+];
 const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(RETIRED_GUARD_WRAPPER);
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
@@ -251,11 +260,7 @@ function assertPackFiles(files: readonly string[]): void {
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
     "docs/monitoring.md",
-    "examples/monitoring/ai.minime.alertmanager-webhook.plist",
-    "examples/monitoring/ai.minime.runtime-doctor.plist",
-    "examples/monitoring/alertmanager.yml",
-    "examples/monitoring/minime.rules.yml",
-    "examples/monitoring/prometheus.yml",
+    ...EXPECTED_MONITORING_EXAMPLE_FILES.map((file) => `examples/monitoring/${file}`),
     ...EXPECTED_BUNDLED_AGENT_FILES.map((file) => `dist/extensions/pi/subagent/agents/${file}`),
     ...EXPECTED_BUNDLED_PROMPT_FILES.map((file) => `dist/extensions/pi/subagent/prompts/${file}`),
   ]) {
@@ -431,6 +436,73 @@ describe("package artifact install", () => {
         );
         assert.equal(plistResult.status, 0, plistResult.stderr || String(plistResult.error));
       }
+
+      const installedMonitoringDir = join(installedPackage, "examples", "monitoring");
+      assert.deepEqual(
+        readdirSync(installedMonitoringDir).sort(),
+        EXPECTED_MONITORING_EXAMPLE_FILES,
+      );
+      for (const file of EXPECTED_MONITORING_EXAMPLE_FILES) {
+        assert.equal(
+          readFileSync(join(installedMonitoringDir, file), "utf8"),
+          readFileSync(join(BOT_ROOT, "examples", "monitoring", file), "utf8"),
+          `installed monitoring example must match the source artifact: ${file}`,
+        );
+      }
+
+      const installedRuleFixturePath = join(installedMonitoringDir, "minime.rules.test.yml");
+      const installedRuleFixture = parseYaml(
+        readFileSync(installedRuleFixturePath, "utf8"),
+      ) as { rule_files?: string[]; tests?: unknown[] };
+      assert.deepEqual(installedRuleFixture.rule_files, ["minime.rules.yml"]);
+      assert.ok((installedRuleFixture.tests?.length ?? 0) > 0);
+      for (const ruleFile of installedRuleFixture.rule_files ?? []) {
+        assert.ok(
+          existsSync(join(installedMonitoringDir, ruleFile)),
+          `installed rule fixture must resolve ${ruleFile} relative to the fixture`,
+        );
+      }
+
+      const promtoolVersion = spawnSync("promtool", ["--version"], {
+        cwd: installedPackage,
+        encoding: "utf8",
+        env: commandEnv(),
+      });
+      if (!promtoolVersion.error && promtoolVersion.status === 0) {
+        const promtoolResult = spawnSync(
+          "promtool",
+          ["test", "rules", "examples/monitoring/minime.rules.test.yml"],
+          {
+            cwd: installedPackage,
+            encoding: "utf8",
+            env: commandEnv(),
+          },
+        );
+        assert.equal(
+          promtoolResult.status,
+          0,
+          promtoolResult.stderr || promtoolResult.stdout || String(promtoolResult.error),
+        );
+      }
+
+      const cronImportCheck = spawnSync(
+        process.execPath,
+        ["--input-type=module", "-e", INSTALLED_CRON_IMPORT_CHECK],
+        {
+          cwd: projectDir,
+          encoding: "utf8",
+          env: commandEnv({
+            INSTALLED_CRON_RUNNER: join(installedPackage, "dist", "cron-runner.js"),
+          }),
+        },
+      );
+      assert.equal(
+        cronImportCheck.status,
+        0,
+        cronImportCheck.stderr || cronImportCheck.stdout || String(cronImportCheck.error),
+      );
+      assert.equal(cronImportCheck.stdout, "");
+      assert.equal(cronImportCheck.stderr, "");
 
       const help = runInstalledBin(projectDir, ["--help"], workspace);
       assert.equal(help.status, 0, help.stderr);
@@ -626,6 +698,83 @@ describe("package artifact install", () => {
     }
   });
 });
+
+const INSTALLED_CRON_IMPORT_CHECK = String.raw`
+import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import tls from "node:tls";
+import { syncBuiltinESMExports } from "node:module";
+import { pathToFileURL } from "node:url";
+
+const cronRunnerPath = process.env.INSTALLED_CRON_RUNNER;
+assert.ok(cronRunnerPath, "INSTALLED_CRON_RUNNER is required");
+
+const blockedCalls = [];
+function blockMethod(target, name, label) {
+  const original = target[name];
+  assert.equal(typeof original, "function", label + "." + name);
+  target[name] = (...args) => {
+    blockedCalls.push({ label, name, args: args.length });
+    throw new Error("blocked import-time side effect: " + label + "." + name);
+  };
+}
+
+for (const name of ["exec", "execFile", "execFileSync", "execSync", "fork", "spawn", "spawnSync"]) {
+  blockMethod(childProcess, name, "child_process");
+}
+for (const name of ["appendFileSync", "mkdirSync", "renameSync", "unlinkSync", "writeFileSync"]) {
+  blockMethod(fs, name, "fs");
+}
+for (const name of ["get", "request"]) {
+  blockMethod(http, name, "http");
+  blockMethod(https, name, "https");
+}
+for (const name of ["connect", "createConnection"]) {
+  blockMethod(net, name, "net");
+}
+blockMethod(tls, "connect", "tls");
+for (const name of ["chdir", "exit", "kill"]) {
+  blockMethod(process, name, "process");
+}
+syncBuiltinESMExports();
+
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (...args) => {
+  blockedCalls.push({ label: "global", name: "fetch", args: args.length });
+  throw new Error("blocked import-time side effect: global.fetch");
+};
+
+const processEvents = [
+  "beforeExit",
+  "exit",
+  "SIGINT",
+  "SIGTERM",
+  "uncaughtException",
+  "unhandledRejection",
+];
+const before = {
+  cwd: process.cwd(),
+  exitCode: process.exitCode,
+  listeners: Object.fromEntries(processEvents.map((event) => [event, process.listenerCount(event)])),
+};
+
+const cronRunner = await import(pathToFileURL(cronRunnerPath).href);
+
+assert.equal(typeof cronRunner.main, "function");
+assert.equal(typeof cronRunner.writeCronHealthMetric, "function");
+assert.equal(cronRunner.MINIME_CRON_UNRESOLVED_MARKER, "[[MINIME_CRON_UNRESOLVED_V1]]");
+assert.deepEqual(blockedCalls, []);
+assert.equal(process.cwd(), before.cwd);
+assert.equal(process.exitCode, before.exitCode);
+for (const event of processEvents) {
+  assert.equal(process.listenerCount(event), before.listeners[event], event);
+}
+globalThis.fetch = originalFetch;
+`;
 
 const INSTALLED_ARTIFACT_CHECK = String.raw`
 import assert from "node:assert/strict";
