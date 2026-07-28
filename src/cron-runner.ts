@@ -12,6 +12,7 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -219,8 +220,46 @@ function removeCronHealthLockEntry(entryPath: string): boolean {
   }
 }
 
+function cleanupCronHealthLockAcquisition(
+  lockPath: string,
+  claimPath: string,
+  ownerPath?: string,
+): void {
+  if (ownerPath !== undefined) {
+    removeCronHealthLockEntry(ownerPath);
+  }
+  removeCronHealthLockEntry(claimPath);
+  removeEmptyCronHealthLockDirectory(lockPath);
+}
+
+function hasCronHealthLockOwnership(
+  lockPath: string,
+  createdLockStat: Stats,
+  claimEntry: string,
+  ownerEntry: string,
+): boolean {
+  let currentLockStat: Stats;
+  let entries: string[];
+  try {
+    currentLockStat = statSync(lockPath);
+    entries = readdirSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
+
+  return currentLockStat.isDirectory()
+    && currentLockStat.dev === createdLockStat.dev
+    && currentLockStat.ino === createdLockStat.ino
+    && entries.length === 2
+    && entries.includes(claimEntry)
+    && entries.includes(ownerEntry);
+}
+
 function recoverCronHealthLock(lockPath: string): boolean {
-  let lockStat: ReturnType<typeof statSync>;
+  let lockStat: Stats;
   try {
     lockStat = statSync(lockPath);
   } catch (err) {
@@ -324,12 +363,20 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
 
     try {
       mkdirSync(lockPath, { mode: 0o700 });
+      let createdLockStat: Stats;
+      try {
+        createdLockStat = statSync(lockPath);
+      } catch (err) {
+        removeEmptyCronHealthLockDirectory(lockPath);
+        throw err;
+      }
       const ownerToken = [
         process.pid,
         inspectProcessStartToken(process.pid) ?? "unknown",
         randomUUID(),
       ].join("-");
-      const claimPath = join(lockPath, `claim-${ownerToken}`);
+      const claimEntry = `claim-${ownerToken}`;
+      const claimPath = join(lockPath, claimEntry);
       try {
         writeFileSync(claimPath, `${ownerToken}\n`, {
           encoding: "utf8",
@@ -337,8 +384,7 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
           mode: 0o600,
         });
       } catch (err) {
-        removeCronHealthLockEntry(claimPath);
-        removeEmptyCronHealthLockDirectory(lockPath);
+        cleanupCronHealthLockAcquisition(lockPath, claimPath);
         throw err;
       }
       const ownerEntry = `owner-${ownerToken}`;
@@ -346,9 +392,19 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
       try {
         writeFileSync(ownerPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
       } catch (err) {
-        removeCronHealthLockEntry(claimPath);
-        removeEmptyCronHealthLockDirectory(lockPath);
+        cleanupCronHealthLockAcquisition(lockPath, claimPath, ownerPath);
         throw err;
+      }
+      if (
+        !hasCronHealthLockOwnership(
+          lockPath,
+          createdLockStat,
+          claimEntry,
+          ownerEntry,
+        )
+      ) {
+        cleanupCronHealthLockAcquisition(lockPath, claimPath, ownerPath);
+        throw new Error(`cron health lock "${lockPath}" ownership changed during acquisition`);
       }
 
       let released = false;
