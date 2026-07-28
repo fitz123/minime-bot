@@ -239,8 +239,20 @@ function recoverCronHealthLock(lockPath: string): boolean {
       return true;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "EISDIR" || code === "EPERM") {
+      if (code === "ENOENT") {
         return true;
+      }
+      if (code === "EISDIR" || code === "EPERM") {
+        try {
+          if (statSync(lockPath).isDirectory()) {
+            return true;
+          }
+        } catch (inspectErr) {
+          if ((inspectErr as NodeJS.ErrnoException).code === "ENOENT") {
+            return true;
+          }
+          throw inspectErr;
+        }
       }
       throw err;
     }
@@ -323,6 +335,10 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
   const waitState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
   while (true) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for cron health lock "${lockPath}"`);
+    }
+
     try {
       mkdirSync(lockPath, { mode: 0o700 });
       const ownerToken = [
@@ -372,9 +388,6 @@ function acquireCronHealthLock(dir: string, fileStem: string): () => void {
       continue;
     }
 
-    if (Date.now() >= deadline) {
-      throw new Error(`timed out waiting for cron health lock "${lockPath}"`);
-    }
     Atomics.wait(waitState, 0, 0, CRON_HEALTH_LOCK_RETRY_MS);
   }
 }
@@ -1539,7 +1552,10 @@ const isMain =
   process.argv[1]?.endsWith("cron-runner.ts") ||
   process.argv[1]?.endsWith("cron-runner.js");
 if (isMain) {
-  main();
+  void main().catch((err) => {
+    process.stderr.write(`Cron runner failed: ${errorFromUnknown(err).message}\n`);
+    process.exitCode = 1;
+  });
 }
 
 export { loadCronTask, resolveCronAgentData, buildPiCronAgentConfig, getAgentWorkspace, deliver, buildDeliverArgs, runPi, runOneShot, resolveCronEngine, classifyPiResult, writeCronHealthMetric, runScript, main };

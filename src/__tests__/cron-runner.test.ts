@@ -1,6 +1,6 @@
 import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   writeFileSync,
   mkdirSync,
@@ -10,6 +10,7 @@ import {
   utimesSync,
 } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildDeliverArgs,
   buildPiCronAgentConfig,
@@ -55,13 +56,16 @@ import { installCronTestEnv } from "./cron-test-env.js";
 installCronTestEnv();
 
 const TEST_DIR = join("/tmp", "cron-runner-test-" + Date.now());
-const CRON_RUNNER_SOURCE_URL = new URL("../cron-runner.ts", import.meta.url).href;
+const CRON_RUNNER_SOURCE = new URL("../cron-runner.ts", import.meta.url);
+const CRON_RUNNER_SOURCE_URL = CRON_RUNNER_SOURCE.href;
+const CRON_RUNNER_SOURCE_PATH = fileURLToPath(CRON_RUNNER_SOURCE);
 
 function runMetricWriterChild(
   metricDir: string,
   cronName: string,
   outcome: CronTerminalOutcome,
   iterations: number,
+  timeoutMs?: number,
 ): Promise<void> {
   const script = [
     `import { writeCronHealthMetric } from ${JSON.stringify(CRON_RUNNER_SOURCE_URL)};`,
@@ -81,14 +85,47 @@ function runMetricWriterChild(
       },
     );
     let stderr = "";
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`metric writer child timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
     child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
     child.once("error", reject);
     child.once("close", (code, signal) => {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
       if (code === 0) {
         resolvePromise();
         return;
       }
       reject(new Error(`metric writer child failed: code=${code} signal=${signal}\n${stderr}`));
+    });
+  });
+}
+
+function runCronRunnerChild(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string }> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", CRON_RUNNER_SOURCE_PATH, ...args],
+      {
+        cwd: process.cwd(),
+        env,
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      resolvePromise({ code, signal, stderr });
     });
   });
 }
@@ -1505,6 +1542,29 @@ bindings: []
       );
     });
 
+    it("fails closed when an undeletable stale writer lock remains in place", async (t) => {
+      if (process.platform !== "darwin") {
+        t.skip("immutable file flags are exercised on the supported launchd platform");
+        return;
+      }
+
+      const cronName = "undeletable-stale-lock";
+      const stem = sanitizeCronMetricStem(cronName);
+      const lockPath = join(METRIC_DIR, `.minime_cron_${stem}.lock`);
+      writeFileSync(lockPath, "stale\n");
+      utimesSync(lockPath, new Date(0), new Date(0));
+      execFileSync("chflags", ["uchg", lockPath]);
+
+      try {
+        await assert.rejects(
+          runMetricWriterChild(METRIC_DIR, cronName, "failure", 1, 5_000),
+          /failed to lock cron health metric.*(?:EPERM|Operation not permitted)/s,
+        );
+      } finally {
+        execFileSync("chflags", ["nouchg", lockPath]);
+      }
+    });
+
     it("serializes simultaneous recovery of one abandoned owner lock", async () => {
       const cronName = "concurrent-stale-lock";
       const stem = sanitizeCronMetricStem(cronName);
@@ -1660,6 +1720,39 @@ bindings: []
         () => writeCronHealthMetric("blocked metric", 1, "failure"),
         /failed to prepare cron health metric dir for "blocked metric"/,
       );
+    });
+
+    it("exits non-zero on top-level metric failure under permissive rejection settings", async () => {
+      const childRoot = join(TEST_DIR, "top-level-metric-failure");
+      const logDir = join(childRoot, "logs");
+      const controlRoot = join(childRoot, "control");
+      const metricBlocker = join(childRoot, "metric-blocker");
+      mkdirSync(logDir, { recursive: true });
+      mkdirSync(controlRoot, { recursive: true });
+      writeFileSync(metricBlocker, "not a directory", "utf8");
+
+      try {
+        const result = await runCronRunnerChild(
+          ["--task", "missing-task"],
+          {
+            ...process.env,
+            NODE_OPTIONS: "--unhandled-rejections=warn",
+            LOG_DIR: logDir,
+            MINIME_CONTROL_WORKSPACE_ROOT: controlRoot,
+            CRON_HEALTH_TEXTFILE_DIR: join(metricBlocker, "child"),
+          },
+        );
+
+        assert.strictEqual(result.code, 1, result.stderr);
+        assert.strictEqual(result.signal, null, result.stderr);
+        assert.match(
+          result.stderr,
+          /Cron runner failed: failed to prepare cron health metric dir for "missing-task"/,
+        );
+        assert.doesNotMatch(result.stderr, /UnhandledPromiseRejectionWarning/);
+      } finally {
+        rmSync(childRoot, { recursive: true, force: true });
+      }
     });
   });
 
