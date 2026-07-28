@@ -40,6 +40,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * Wrapper entrypoints loaded into every primary interactive Pi spawn, in load
  * order:
  *   acknowledged-steer (atomic active-lifecycle steering gate),
+ *   compaction-continuation (hidden continuation after a reasoning-only length stop),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
@@ -50,6 +51,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "acknowledged-steer.ts",
+  "compaction-continuation.ts",
   "codex-transport-overflow.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
@@ -59,6 +61,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "acknowledged-steer.js",
+  "compaction-continuation.js",
   "codex-transport-overflow.js",
   "web-tools.js",
   "knowledge-tools.js",
@@ -86,6 +89,7 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
  */
 const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.ts",
+  "compaction-continuation.ts",
   "subagent/index.ts",
   "ask-agent/index.ts",
 ]);
@@ -106,6 +110,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
 ] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.js",
+  "compaction-continuation.js",
   "subagent/index.js",
   "ask-agent/index.js",
 ]);

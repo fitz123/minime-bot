@@ -225,12 +225,14 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/acknowledged-steer.js",
+    "dist/pi-extensions/compaction-continuation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/ops-worker-parity-attestation.js",
     "dist/ops-worker/parity.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/acknowledged-steer.js",
+    "dist/extensions/pi/compaction-continuation.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/ops-worker-parity-attestation.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -285,6 +287,14 @@ function assertPackFiles(files: readonly string[]): void {
     files.filter((file) => file === "dist/extensions/pi/web-tools.js").length,
     1,
     "canonical web-tools wrapper must be packaged exactly once",
+  );
+  assert.equal(
+    files.filter(
+      (file) =>
+        file === "dist/extensions/pi/compaction-continuation.js",
+    ).length,
+    1,
+    "interactive compaction continuation wrapper must be packaged exactly once",
   );
 }
 
@@ -769,6 +779,7 @@ assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   [
     "acknowledged-steer.js",
+    "compaction-continuation.js",
     "codex-transport-overflow.js",
     "web-tools.js",
     "knowledge-tools.js",
@@ -789,6 +800,12 @@ assert.deepEqual(
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("subagent child", extensionPathsFromArgs(subagentChildExtensionArgs));
+assert.equal(
+  extensionPathsFromArgs(subagentChildExtensionArgs).some(
+    (path) => path.endsWith("/compaction-continuation.js"),
+  ),
+  false,
+);
 assertNoGuardContract("subagent child extension args must not load the retired guard", subagentChildExtensionArgs);
 
 const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
@@ -800,6 +817,12 @@ assert.deepEqual(
   ["web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("cron", extensionPathsFromArgs(cronExtensionArgs));
+assert.equal(
+  extensionPathsFromArgs(cronExtensionArgs).some(
+    (path) => path.endsWith("/compaction-continuation.js"),
+  ),
+  false,
+);
 assertNoGuardContract("cron Pi extension args must not load the retired guard", cronExtensionArgs);
 
 for (const extensionPath of extensionPaths) {
@@ -808,6 +831,60 @@ for (const extensionPath of extensionPaths) {
   const mod = await importFile(extensionPath);
   assert.equal(typeof mod.default, "function", extensionPath);
 }
+
+const compactionContinuation = await importFile(
+  join(artifactDir, "compaction-continuation.js"),
+);
+const compactionContinuationContract = await importPackageFile(
+  "dist/pi-extensions/compaction-continuation.js",
+);
+const compactionHandlers = new Map();
+const compactionSentMessages = [];
+const compactionUserMessages = [];
+compactionContinuation.default({
+  on(event, handler) {
+    compactionHandlers.set(event, [...(compactionHandlers.get(event) ?? []), handler]);
+  },
+  sendMessage(message, options) {
+    compactionSentMessages.push({ message, options });
+  },
+  sendUserMessage(message) {
+    compactionUserMessages.push(message);
+  },
+});
+const emitCompactionEvent = (event, payload = {}) => {
+  for (const handler of compactionHandlers.get(event) ?? []) {
+    handler({ type: event, ...payload });
+  }
+};
+emitCompactionEvent("agent_end", {
+  messages: [{
+    role: "assistant",
+    stopReason: "length",
+    content: [{ type: "thinking", thinking: "unfinished installed reasoning" }],
+  }],
+});
+emitCompactionEvent("session_before_compact", {
+  reason: "threshold",
+  willRetry: false,
+});
+emitCompactionEvent("session_compact", {
+  reason: "threshold",
+  willRetry: false,
+});
+emitCompactionEvent("session_compact", {
+  reason: "threshold",
+  willRetry: false,
+});
+assert.deepEqual(compactionSentMessages, [{
+  message: {
+    customType: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+    content: compactionContinuationContract.PI_COMPACTION_CONTINUATION_CONTENT,
+    display: false,
+  },
+  options: { deliverAs: "followUp" },
+}]);
+assert.deepEqual(compactionUserMessages, []);
 
 const configMod = await importPackageFile("dist/config.js");
 const loadedConfig = configMod.loadConfig(join(workspace, "config.yaml"), {
@@ -1040,6 +1117,12 @@ assert.deepEqual(
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("ask-agent child", askAgentLoadedExtensions);
+assert.equal(
+  askAgentLoadedExtensions.some(
+    (path) => path.endsWith("/compaction-continuation.js"),
+  ),
+  false,
+);
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("subagent")));
 assert.ok(!askAgentLoadedExtensions.some((path) => path.includes("ask-agent")));
 askAgentSmokeChild.stdout.emitData(JSON.stringify({
@@ -1162,6 +1245,12 @@ try {
     ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
   );
   assertCanonicalWebWrapper("ask-agent wrapper child", askAgentWrapperExtensions);
+  assert.equal(
+    askAgentWrapperExtensions.some(
+      (path) => path.endsWith("/compaction-continuation.js"),
+    ),
+    false,
+  );
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
   assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);

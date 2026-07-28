@@ -48,11 +48,11 @@ git diff --check
 ### Task 2: Package the continuation wrapper only for primary interactive sessions
 **Goal:** Ship the new wrapper through the existing source and built-artifact contract without expanding other Pi execution surfaces.
 **Serves:** The approved constraint to preserve unrelated cron/subagent behavior and verify the released installed artifact rather than relying on source-only behavior.
-- [ ] Add the wrapper to primary interactive source/artifact inventories and the package artifact builder.
-- [ ] Explicitly keep the wrapper out of cron, subagent-child, and Ask Agent child inventories.
-- [ ] Update extension inventory and package-install assertions so both source and built package paths contain exactly the intended wrapper set.
-- [ ] Add/adjust installed-artifact tests proving the packaged wrapper can load and retains the hidden custom-message contract.
-- [ ] Run extension inventory, build, and package-install focused tests before Task 3.
+- [x] Add the wrapper to primary interactive source/artifact inventories and the package artifact builder.
+- [x] Explicitly keep the wrapper out of cron, subagent-child, and Ask Agent child inventories.
+- [x] Update extension inventory and package-install assertions so both source and built package paths contain exactly the intended wrapper set.
+- [x] Add/adjust installed-artifact tests proving the packaged wrapper can load and retains the hidden custom-message contract.
+- [x] Run extension inventory, build, and package-install focused tests before Task 3.
 
 ### Task 3: Distinguish observed length outcomes and lock the end-to-end lifecycle regression
 **Goal:** Make terminal parsing truthful and prove length → compaction → automatic continuation → one final answer.

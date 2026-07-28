@@ -381,7 +381,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], "pi-sess-resume");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
   it("degrades to no context args for an empty pi workspace", () => {
@@ -444,6 +444,7 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -455,11 +456,11 @@ describe("Pi extension loading (--extension)", () => {
   it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["acknowledged-steer.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["acknowledged-steer.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -476,6 +477,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(parentArgs, [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -512,11 +514,56 @@ describe("Pi extension loading (--extension)", () => {
     const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
     const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
     assert.ok(!sourceRelpaths.includes("acknowledged-steer.ts"));
+    assert.ok(!sourceRelpaths.includes("compaction-continuation.ts"));
     assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
     assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
     assert.ok(!artifactRelpaths.includes("acknowledged-steer.js"));
+    assert.ok(!artifactRelpaths.includes("compaction-continuation.js"));
     assert.ok(!artifactRelpaths.includes("subagent/index.js"));
     assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
+  });
+
+  it("loads compaction continuation only in the primary interactive inventory", () => {
+    const sourceInventories: Record<string, readonly string[]> = {
+      interactive: PI_EXTENSION_WRAPPER_RELPATHS,
+      subagent: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
+      askAgent: PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
+      cron: PI_CRON_WRAPPER_RELPATHS,
+    };
+    const artifactInventories: Record<string, readonly string[]> = {
+      interactive: PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS,
+      subagent: PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+      askAgent: PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
+    };
+
+    assert.equal(
+      sourceInventories.interactive.filter(
+        (relpath) => relpath === "compaction-continuation.ts",
+      ).length,
+      1,
+    );
+    for (const runtime of ["subagent", "askAgent", "cron"]) {
+      assert.equal(
+        sourceInventories[runtime].includes("compaction-continuation.ts"),
+        false,
+        `${runtime} must not load interactive turn continuation`,
+      );
+    }
+    assert.equal(
+      artifactInventories.interactive.filter(
+        (relpath) => relpath === "compaction-continuation.js",
+      ).length,
+      1,
+    );
+    for (const runtime of ["subagent", "askAgent"]) {
+      assert.equal(
+        artifactInventories[runtime].includes(
+          "compaction-continuation.js",
+        ),
+        false,
+        `${runtime} artifact must not load interactive turn continuation`,
+      );
+    }
   });
 
   it("loads the canonical web-tools wrapper exactly once on every package-managed runtime inventory", () => {
@@ -697,6 +744,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -715,6 +763,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -737,6 +786,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -774,8 +824,9 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 6);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
     assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
+    assert.ok(args.includes(wrapperAbs("compaction-continuation.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
     assert.ok(args.includes(wrapperAbs("web-tools.ts")));
     assert.ok(args.includes(wrapperAbs("knowledge-tools.ts")));
@@ -791,6 +842,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
@@ -807,7 +859,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -826,6 +878,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
@@ -955,10 +1008,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 6, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 7, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 6);
+    assert.strictEqual(paths.length, 7);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
