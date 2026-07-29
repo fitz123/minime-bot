@@ -182,6 +182,7 @@ interface ShellToken {
 interface UnwrappedCommand {
   command: string[];
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 const MANAGED_EXACT_RELPATHS = [
@@ -476,7 +477,11 @@ function extractBashDestructiveAncestorTargetsAtDepth(
   let currentCwd = cwd;
 
   for (const segment of splitShellSegments(tokens)) {
-    const { command: unwrapped, cwd: commandCwd } = unwrapCommandWithCwd(segment, currentCwd, env);
+    const {
+      command: unwrapped,
+      cwd: commandCwd,
+      env: commandEnv,
+    } = unwrapCommandWithCwd(segment, currentCwd, env);
     if (unwrapped.length > 0) {
       const name = basename(unwrapped[0]);
       const args = unwrapped.slice(1);
@@ -487,7 +492,7 @@ function extractBashDestructiveAncestorTargetsAtDepth(
             nestedCommand,
             depth + 1,
             commandCwd,
-            env,
+            commandEnv,
           )) {
             appendTarget(targets, target);
           }
@@ -496,16 +501,19 @@ function extractBashDestructiveAncestorTargetsAtDepth(
         name === "rm" &&
         args.some((arg) => arg === "--recursive" || /^-[^-]*[rR]/.test(arg))
       ) {
-        appendTargetCandidates(targets, commandOperands(args), commandCwd, env);
+        appendTargetCandidates(targets, commandOperands(args), commandCwd, commandEnv);
       } else if (name === "mv") {
         const operands = commandOperands(args);
         const targetDir = optionValue(args, "-t") ?? optionValue(args, "--target-directory");
         const sources = targetDir
           ? operands.filter((operand) => operand !== targetDir)
           : operands.slice(0, -1);
-        appendTargetCandidates(targets, sources, commandCwd, env);
-      } else if (name === "find" && args.includes("-delete")) {
-        appendTargetCandidates(targets, commandOperands(args).slice(0, 1), commandCwd, env);
+        appendTargetCandidates(targets, sources, commandCwd, commandEnv);
+      } else if (
+        name === "find" &&
+        args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir")
+      ) {
+        appendTargetCandidates(targets, commandOperands(args).slice(0, 1), commandCwd, commandEnv);
       } else if (
         name === "cp" &&
         args.some((arg) =>
@@ -513,25 +521,32 @@ function extractBashDestructiveAncestorTargetsAtDepth(
           arg === "--recursive" ||
           /^-[^-]*[aRr]/.test(arg))
       ) {
-        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, env);
-      } else if (name === "tar" && tarExtracts(args)) {
-        appendTargetCandidates(targets, tarExtractionTargets(args, commandCwd, env), commandCwd, env);
-      } else if (name === "git") {
-        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, env);
-        if (worktreeTarget) {
-          appendTargetCandidates(targets, [worktreeTarget], commandCwd, env);
-        }
-        if (!isReadOnlyGitCommand(args)) {
-          appendTargetCandidates(targets, commandPathArguments(args), commandCwd, env);
-        }
+        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, commandEnv);
       } else if (
-        name !== "mkdir" &&
-        name !== "touch" &&
-        name !== "truncate" &&
-        name !== "unlink" &&
-        !isReadOnlyShellCommand(name, args)
+        name === "rsync" &&
+        args.some((arg) => arg === "--delete" || arg.startsWith("--delete-"))
       ) {
-        appendTargetCandidates(targets, commandPathArguments(args), commandCwd, env);
+        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, commandEnv);
+      } else if (name === "tar" && tarExtracts(args)) {
+        appendTargetCandidates(
+          targets,
+          tarExtractionTargets(args, commandCwd, commandEnv),
+          commandCwd,
+          commandEnv,
+        );
+      } else if (isInterpreter(name)) {
+        appendTargetCandidates(
+          targets,
+          interpreterDestructiveAncestorTargets(args),
+          commandCwd,
+          commandEnv,
+        );
+      } else if (name === "git") {
+        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, commandEnv);
+        if (worktreeTarget) {
+          appendTargetCandidates(targets, gitWorktreePathArguments(args), commandCwd, commandEnv);
+          appendTargetCandidates(targets, [worktreeTarget], commandCwd, commandEnv);
+        }
       }
     }
     currentCwd = cwdAfterSegment(segment, currentCwd, env);
@@ -653,9 +668,24 @@ function tokenizeShell(command: string): ShellToken[] {
       quote = "\"";
       continue;
     }
+    if (
+      char === "\\" &&
+      (command[index + 1] === "\n" || command[index + 1] === "\r")
+    ) {
+      index += command[index + 1] === "\r" && command[index + 2] === "\n" ? 2 : 1;
+      continue;
+    }
     if (char === "\\" && index + 1 < command.length) {
       index += 1;
       value += command[index];
+      continue;
+    }
+    if (char === "\n" || char === "\r") {
+      push();
+      tokens.push({ value: ";" });
+      if (char === "\r" && command[index + 1] === "\n") {
+        index += 1;
+      }
       continue;
     }
     if (/\s/.test(char)) {
@@ -663,7 +693,14 @@ function tokenizeShell(command: string): ShellToken[] {
       continue;
     }
     if (char === "#" && value.length === 0) {
-      break;
+      while (
+        index + 1 < command.length &&
+        command[index + 1] !== "\n" &&
+        command[index + 1] !== "\r"
+      ) {
+        index += 1;
+      }
+      continue;
     }
     if (char === "&" && command[index + 1] === ">") {
       push();
@@ -770,9 +807,13 @@ function extractCommandWriteTargets(
   env?: NodeJS.ProcessEnv,
 ): string[] {
   const targets = redirectionTargets(segment);
-  const { command, cwd: commandCwd } = unwrapCommandWithCwd(segment, cwd, env);
+  const {
+    command,
+    cwd: commandCwd,
+    env: commandEnv,
+  } = unwrapCommandWithCwd(segment, cwd, env);
   if (command.length === 0) {
-    return targetCandidates(targets, commandCwd, env);
+    return targetCandidates(targets, commandCwd, commandEnv);
   }
 
   const name = basename(command[0]);
@@ -780,40 +821,44 @@ function extractCommandWriteTargets(
   if (NESTED_SHELL_COMMANDS.has(name)) {
     const nestedCommand = nestedShellCommand(args);
     const nestedTargets = nestedCommand
-      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, env)]
+      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv)]
       : targets;
-    return targetCandidates(nestedTargets, commandCwd, env);
+    return targetCandidates(nestedTargets, commandCwd, commandEnv);
   }
   if (name === "tee") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if (name === "dd") {
-    return targetCandidates([...targets, ...ddWriteTargets(args)], commandCwd, env);
+    return targetCandidates([...targets, ...ddWriteTargets(args)], commandCwd, commandEnv);
   }
   if (name === "cp" || name === "install") {
-    return targetCandidates([...targets, ...copyLikeTargets(args)], commandCwd, env);
+    return targetCandidates([...targets, ...copyLikeTargets(args)], commandCwd, commandEnv);
   }
   if (name === "mv") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if (name === "rm" || name === "unlink" || name === "touch" || name === "truncate" || name === "mkdir") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if ((name === "sed" || name === "perl") && hasInPlaceEditFlag(args)) {
     return targetCandidates(
       [...targets, ...commandOperands(args).slice(1), ...extractManagedKnowledgePathReferences(command.join(" "))],
       commandCwd,
-      env,
+      commandEnv,
     );
   }
   if (name === "find" && args.includes("-delete")) {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
 
   if (isReadOnlyShellCommand(name, args)) {
-    return targetCandidates(targets, commandCwd, env);
+    return targetCandidates(targets, commandCwd, commandEnv);
   }
-  return targetCandidates([...targets, ...extractManagedKnowledgePathReferences(command.join(" "))], commandCwd, env);
+  return targetCandidates(
+    [...targets, ...extractManagedKnowledgePathReferences(command.join(" "))],
+    commandCwd,
+    commandEnv,
+  );
 }
 
 function nestedShellCommand(args: string[]): string | undefined {
@@ -848,8 +893,8 @@ function nestedShellCommand(args: string[]): string | undefined {
 }
 
 function isReadOnlyShellCommand(name: string, args: string[]): boolean {
-  if (name === "find" && (args.includes("-delete") || args.includes("-exec") || args.includes("-execdir"))) {
-    return false;
+  if (name === "find") {
+    return !args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir");
   }
   if (name === "git") {
     return isReadOnlyGitCommand(args);
@@ -944,7 +989,18 @@ function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boole
     const action = args.find((arg) => !arg.startsWith("-"));
     return !action || !new Set(["clear", "create", "drop", "list", "show", "store"]).has(action);
   }
+  if (subcommand === "restore") {
+    return !args.includes("--staged") || args.includes("--worktree");
+  }
+  if (subcommand === "rm") {
+    return !args.includes("--cached");
+  }
   return WORKTREE_MUTATING_GIT_SUBCOMMANDS.has(subcommand);
+}
+
+function gitWorktreePathArguments(args: string[]): string[] {
+  const command = gitSubcommandPosition(args);
+  return command ? commandPathArguments(args.slice(command.index + 1)) : [];
 }
 
 function tarExtracts(args: string[]): boolean {
@@ -976,6 +1032,20 @@ function tarExtractionTargets(
       directory = arg.slice(2);
     } else if (arg.startsWith("--directory=")) {
       directory = arg.slice("--directory=".length);
+    } else {
+      const shortOptions = arg.startsWith("-")
+        ? arg.slice(1)
+        : index === 0 && !arg.startsWith("-")
+          ? arg
+          : undefined;
+      const directoryOptionIndex = shortOptions?.indexOf("C") ?? -1;
+      if (directoryOptionIndex >= 0) {
+        const attachedDirectory = shortOptions?.slice(directoryOptionIndex + 1);
+        directory = attachedDirectory || args[index + 1];
+        if (!attachedDirectory) {
+          index += 1;
+        }
+      }
     }
     if (!directory) {
       continue;
@@ -987,6 +1057,37 @@ function tarExtractionTargets(
 
   if (targets.length === 0) {
     appendTarget(targets, effectiveCwd ?? ".");
+  }
+  return targets;
+}
+
+function isInterpreter(name: string): boolean {
+  return (
+    /^python(?:\d+(?:\.\d+)*)?$/.test(name) ||
+    name === "ruby" ||
+    name === "node"
+  );
+}
+
+function interpreterDestructiveAncestorTargets(args: string[]): string[] {
+  const codeOptionIndex = args.findIndex(
+    (arg) => arg === "-c" || arg === "-e" || arg === "--eval",
+  );
+  if (codeOptionIndex < 0) {
+    return [];
+  }
+  const code = args[codeOptionIndex + 1];
+  if (!code) {
+    return [];
+  }
+
+  const targets: string[] = [];
+  const destructiveCall =
+    /(?:rmtree|rm_rf|rmSync|removeSync)\s*\(\s*(["'])([^"'\\]*(?:\\.[^"'\\]*)*)\1/g;
+  for (const match of code.matchAll(destructiveCall)) {
+    if (match[2]) {
+      appendTarget(targets, match[2].replace(/\\(["'\\])/g, "$1"));
+    }
   }
   return targets;
 }
@@ -1022,6 +1123,7 @@ function resolveCwdOption(value: string | undefined, cwd: string | undefined, en
 function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.ProcessEnv): UnwrappedCommand {
   let index = 0;
   let effectiveCwd = cwd;
+  let effectiveEnv = env;
   while (index < segment.length) {
     const name = basename(segment[index]);
     if (name === "sudo") {
@@ -1030,7 +1132,7 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
         const option = segment[index];
         const cwdOption = cwdOptionValue(option, segment, index);
         if (cwdOption.value !== undefined && (option === "-D" || option === "--chdir" || option.startsWith("--chdir="))) {
-          effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, env);
+          effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, effectiveEnv);
           index = cwdOption.nextIndex;
           continue;
         }
@@ -1045,14 +1147,27 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
       index += 1;
       while (index < segment.length) {
         const token = segment[index];
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+        const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(token);
+        if (assignment) {
+          const value = effectiveCwd
+            ? expandShellPathVariables(assignment[2], effectiveCwd, effectiveEnv) ?? assignment[2]
+            : assignment[2];
+          effectiveEnv = {
+            ...(effectiveEnv ?? {}),
+            [assignment[1]]: value,
+          };
+          index += 1;
+          continue;
+        }
+        if (token === "-" || token === "-i" || token === "--ignore-environment") {
+          effectiveEnv = {};
           index += 1;
           continue;
         }
         if (token.startsWith("-")) {
           const cwdOption = cwdOptionValue(token, segment, index);
           if (cwdOption.value !== undefined && (token === "-C" || token === "--chdir" || token.startsWith("--chdir="))) {
-            effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, env);
+            effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, effectiveEnv);
             index = cwdOption.nextIndex;
             continue;
           }
@@ -1075,14 +1190,18 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
     }
     break;
   }
-  return { command: segment.slice(index), cwd: effectiveCwd };
+  return { command: segment.slice(index), cwd: effectiveCwd, env: effectiveEnv };
 }
 
 function cwdAfterSegment(segment: string[], cwd: string | undefined, env: NodeJS.ProcessEnv | undefined): string | undefined {
   if (!cwd) {
     return cwd;
   }
-  const { command, cwd: commandCwd } = unwrapCommandWithCwd(segment, cwd, env);
+  const {
+    command,
+    cwd: commandCwd,
+    env: commandEnv,
+  } = unwrapCommandWithCwd(segment, cwd, env);
   if (command.length === 0) {
     return cwd;
   }
@@ -1090,8 +1209,8 @@ function cwdAfterSegment(segment: string[], cwd: string | undefined, env: NodeJS
   if (name !== "cd" && name !== "pushd") {
     return cwd;
   }
-  const target = cwdTargetOperand(command.slice(1)) ?? env?.HOME ?? homedir();
-  return resolveShellPath(target, commandCwd ?? cwd, env) ?? cwd;
+  const target = cwdTargetOperand(command.slice(1)) ?? commandEnv?.HOME ?? homedir();
+  return resolveShellPath(target, commandCwd ?? cwd, commandEnv) ?? cwd;
 }
 
 function cwdTargetOperand(args: string[]): string | undefined {
@@ -1213,6 +1332,13 @@ function expandShellPathVariables(rawPath: string, cwd: string, env: NodeJS.Proc
     );
     expanded = expanded.replace(workspacePattern, () => agentWorkspaceRoot);
   }
+  expanded = expanded.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])/g,
+    (reference, bracedName: string | undefined, bareName: string | undefined) => {
+      const value = env?.[bracedName ?? bareName ?? ""];
+      return typeof value === "string" ? value : reference;
+    },
+  );
   if (expanded.includes("$") || expanded.includes("`")) {
     return undefined;
   }

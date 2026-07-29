@@ -552,7 +552,7 @@ describe("knowledge_update", () => {
     ].join("\n");
 
     for (const operation of ["archive", "restore"] as const) {
-      for (const failureKind of ["move", "write", "refresh", "refresh-rollback"] as const) {
+      for (const failureKind of ["move", "byte-drift", "write", "refresh", "refresh-rollback"] as const) {
         const originalIndex = "# Knowledge Index\n";
         const originalLog = "- prior entry\n";
         const workspace = createV2Workspace({
@@ -577,7 +577,22 @@ describe("knowledge_update", () => {
                   return unlinkSync(path);
                 },
               }
-            : failureKind === "write"
+            : failureKind === "byte-drift"
+              ? {
+                  unlinkSync(path: Parameters<typeof unlinkSync>[0]) {
+                    const result = unlinkSync(path);
+                    if (!moveFailureInjected && path === sourcePath) {
+                      moveFailureInjected = true;
+                      writeFileSync(
+                        destinationPath,
+                        page.replace("# Rollback Move", "# Corrupted Move"),
+                        "utf8",
+                      );
+                    }
+                    return result;
+                  },
+                }
+              : failureKind === "write"
               ? {
                   writeFileSync(path: Parameters<typeof writeFileSync>[0], ...args: unknown[]) {
                     if (typeof path === "string" && path.includes(".index.md.") && path.endsWith(".tmp")) {
@@ -609,6 +624,9 @@ describe("knowledge_update", () => {
           },
         );
         assert.equal(response.ok, false, `${operation}:${failureKind}`);
+        if (failureKind === "byte-drift") {
+          assert.equal(response.reason, "move-byte-mismatch");
+        }
         if (failureKind === "refresh-rollback") {
           assert.equal(response.reason, "knowledge-update-search-rollback-failed");
         }

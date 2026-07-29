@@ -309,6 +309,8 @@ describe("Knowledge Pi extension helpers", () => {
         "python -c 'import shutil; shutil.rmtree(\"artifacts/knowledge-archive\")'",
         "artifacts/knowledge-archive",
       ],
+      ["python -c 'import shutil; shutil.rmtree(\"artifacts\")'", "artifacts"],
+      ["python -c 'import shutil; shutil.rmtree(\"wiki\")'", "wiki"],
       [
         "ruby -e 'File.write(\"artifacts/knowledge-archive/wiki/pages/project/runtime.md\", \"x\")'",
         "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
@@ -334,8 +336,12 @@ describe("Knowledge Pi extension helpers", () => {
       ["git restore artifacts", "artifacts"],
       ["tar -xf payload.tar", workspace],
       ["tar -xf payload.tar -Cartifacts", "artifacts"],
-      ["node delete-tree.js artifacts", "artifacts"],
-      ["node delete-tree.js --root=artifacts", "artifacts"],
+      ["tar -xC artifacts -f payload.tar", "artifacts"],
+      [
+        "cat /dev/null\nrm -rf artifacts/knowledge-archive",
+        "artifacts/knowledge-archive",
+      ],
+      ["true # an ordinary comment\nrm -rf wiki/pages", "wiki/pages"],
       [
         "printf x > $UNKNOWN/artifacts/knowledge-archive/wiki/pages/project/runtime.md",
         "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
@@ -367,6 +373,8 @@ describe("Knowledge Pi extension helpers", () => {
       "git stash --include-untracked",
       "git checkout-index -a -f",
       "git read-tree -u --reset HEAD^",
+      "git restore :/",
+      "git rm -r :/",
     ]) {
       assertBlocked(
         workspace,
@@ -381,6 +389,11 @@ describe("Knowledge Pi extension helpers", () => {
       [`rm -rf $${MINIME_AGENT_WORKSPACE_ROOT_ENV}/artifacts`, "artifacts"],
       [`git -C $${MINIME_AGENT_WORKSPACE_ROOT_ENV} clean -fdx`, workspace],
       [`git --work-tree=$${MINIME_AGENT_WORKSPACE_ROOT_ENV} reset --hard`, workspace],
+      [`tar -xC $${MINIME_AGENT_WORKSPACE_ROOT_ENV} -f payload.tar`, workspace],
+      [
+        `env P=$${MINIME_AGENT_WORKSPACE_ROOT_ENV}/artifacts/knowledge-archive sh -c 'rm -rf "$P"'`,
+        "artifacts/knowledge-archive",
+      ],
     ] as const) {
       const decision = classifyKnowledgeIntegrityToolCall(
         { toolName: "bash", input: { command } },
@@ -425,6 +438,12 @@ describe("Knowledge Pi extension helpers", () => {
       "git status -- wiki/pages/project/runtime.md",
       "git show HEAD:wiki/index.md",
       "git log -- wiki/index.md",
+      "find . -type f",
+      "node inspect.js .",
+      "npm test -- .",
+      "git add .",
+      "git restore --staged :/",
+      "git rm --cached -r :/",
     ]) {
       assert.equal(
         classifyKnowledgeIntegrityToolCall(

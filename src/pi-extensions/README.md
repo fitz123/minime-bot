@@ -8,7 +8,8 @@ Most helpers here back the live Pi extensions:
   steering ownership transfer.
 - `web-tools` for subscription-backed Codex `web_search`.
 - `knowledge-tools` for `knowledge_search`, `knowledge_get`, `knowledge_update`,
-  and scoped protection for managed Knowledge v2 wiki files.
+  and scoped protection for managed Knowledge v2 wiki and archive paths,
+  including destructive ancestor and worktree operations.
 - `subagent` for delegated child Pi runs.
 - `ask-agent` for configured full-agent inter-agent questions.
 - `codex-usage` for bounded Codex quota capture and persistence.
@@ -17,7 +18,7 @@ Most helpers here back the live Pi extensions:
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
-Knowledge v2 wiki files consistent with `knowledge_update`.
+Knowledge v2 wiki and archive paths consistent with `knowledge_update`.
 
 The standalone `extensions/pi/codex-usage.ts` wrapper is different: it is used
 only by the out-of-band Codex quota sampler and must not be added to the normal

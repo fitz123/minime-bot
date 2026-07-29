@@ -354,7 +354,10 @@ occupied or duplicate active/archive destinations instead of overwriting
 either copy. When first-party Pi extensions are enabled, their integrity guard
 also blocks direct write, edit, and mutating shell access to both
 `wiki/pages/**` and `artifacts/knowledge-archive/**`; use `knowledge update`
-for either side of the managed move.
+for either side of the managed move. Explicitly destructive recursive,
+archive-extraction, and worktree-mutating Git operations are also blocked when
+they target an ancestor containing either managed tree. Read-only commands and
+mutations confined to unrelated subdirectories remain available.
 
 Every committed modifying operation appends a structural entry to
 `wiki/log.md`: `create`, `update`, `archive`, or `restore`. An upsert records

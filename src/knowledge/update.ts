@@ -1070,11 +1070,30 @@ function readFileBytes(path: string, fs: KnowledgeUpdateFs): Buffer {
   return typeof content === "string" ? Buffer.from(content) : Buffer.from(content);
 }
 
-function rollbackMove(sourcePath: string, destinationPath: string, fs: KnowledgeUpdateFs): void {
+function rollbackMove(
+  sourcePath: string,
+  destinationPath: string,
+  expectedBytes: Buffer,
+  fs: KnowledgeUpdateFs,
+): void {
   try {
-    if (!fs.existsSync(sourcePath) && fs.existsSync(destinationPath)) {
-      fs.linkSync(destinationPath, sourcePath);
-      fs.unlinkSync(destinationPath);
+    let restoredSource = false;
+    if (!fs.existsSync(sourcePath)) {
+      if (fs.existsSync(destinationPath)) {
+        fs.linkSync(destinationPath, sourcePath);
+        fs.unlinkSync(destinationPath);
+      } else {
+        fs.mkdirSync(dirname(sourcePath), { recursive: true });
+        fs.writeFileSync(sourcePath, expectedBytes, { flag: "wx" });
+      }
+      restoredSource = true;
+    }
+    if (
+      restoredSource &&
+      fs.existsSync(sourcePath) &&
+      !readFileBytes(sourcePath, fs).equals(expectedBytes)
+    ) {
+      fs.writeFileSync(sourcePath, expectedBytes);
     }
   } catch {
     // Preserve the original failure; transaction rollback is best effort.
@@ -1086,6 +1105,7 @@ function moveFileNoClobber(
   destinationPath: string,
   destinationExistsReason: "archive-destination-exists" | "active-destination-exists",
   operation: KnowledgeMoveOperation,
+  expectedBytes: Buffer,
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   try {
@@ -1108,7 +1128,7 @@ function moveFileNoClobber(
       if (fs.existsSync(sourcePath)) {
         fs.unlinkSync(destinationPath);
       } else {
-        rollbackMove(sourcePath, destinationPath, fs);
+        rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
       }
     } catch {
       // Preserve the original failure; partial-move rollback is best effort.
@@ -1411,6 +1431,7 @@ function executeMoveRequest(
       destinationPath,
       request.operation === "archive" ? "archive-destination-exists" : "active-destination-exists",
       request.operation,
+      expectedBytes,
       fs,
     );
     if (moveProblem) {
@@ -1419,7 +1440,7 @@ function executeMoveRequest(
     moveCommitted = true;
     const nextPages = collectPages(layout, fs);
     if (isUpdateFailure(nextPages)) {
-      rollbackMove(sourcePath, destinationPath, fs);
+      rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
       return nextPages;
     }
     const logContent = appendStructuralLog(
@@ -1441,7 +1462,7 @@ function executeMoveRequest(
       verifyIndexInvariants(layout, request.relPath, request.operation === "archive" ? 0 : 1, fs);
     if (invariantProblem) {
       rollbackCommittedWrites(plans, fs);
-      rollbackMove(sourcePath, destinationPath, fs);
+      rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
       return invariantProblem;
     }
     if (deps.refreshSearchBackend) {
@@ -1451,7 +1472,7 @@ function executeMoveRequest(
   } catch (error) {
     rollbackCommittedWrites(plans, fs);
     if (moveCommitted) {
-      rollbackMove(sourcePath, destinationPath, fs);
+      rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
     }
     let rollbackRefreshError: unknown;
     if (refreshAttempted && deps.refreshSearchBackend) {
