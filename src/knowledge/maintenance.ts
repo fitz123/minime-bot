@@ -480,12 +480,14 @@ function collectMaintenanceCandidates(
       try {
         stat = lstatSync(absPath);
         if (!stat.isFile() || stat.isSymbolicLink()) {
+          complete = false;
           addError(state, relPath, "candidate-not-regular", "Maintenance candidates must be regular files.");
           continue;
         }
         pageBytes = Buffer.from(readFileSync(absPath));
         markdown = pageBytes.toString("utf8");
       } catch (error) {
+        complete = false;
         addError(
           state,
           relPath,
@@ -497,6 +499,7 @@ function collectMaintenanceCandidates(
 
       const frontmatter = parseFrontmatter(markdown);
       if (!frontmatter) {
+        complete = false;
         addError(state, relPath, "candidate-frontmatter-invalid", "Dated project record frontmatter is unreadable.");
         continue;
       }
@@ -506,6 +509,7 @@ function collectMaintenanceCandidates(
       }
       const validated = validateKnowledgePageFrontmatter(frontmatter, "project");
       if ("ok" in validated && validated.ok === false) {
+        complete = false;
         addError(state, relPath, validated.reason, validated.message);
         continue;
       }

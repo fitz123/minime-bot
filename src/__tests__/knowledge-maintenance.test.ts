@@ -676,6 +676,35 @@ describe("knowledge maintenance", () => {
     assert.equal(existsSync(lowPage.absPath), true);
   });
 
+  it("fails closed before mutation when a dated candidate cannot be validated", () => {
+    const workspace = createWorkspace();
+    const valid = addPage(
+      workspace,
+      "wiki/pages/project/history/release-2026-7-39.md",
+    );
+    writeWorkspaceFile(
+      workspace,
+      "wiki/pages/project/history/release-2026-6-0.md",
+      "# Missing required frontmatter\n",
+    );
+    writeExactIndexSize(
+      workspace,
+      KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+    );
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      { agentWorkspaceRoot: workspace, now: () => NOW },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.stopReason, "unsafe-failure");
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, false);
+    assert.equal(existsSync(valid.absPath), true);
+    assert.ok(response.errors.some((error) => error.reason === "candidate-frontmatter-invalid"));
+  });
+
   it("fails closed before mutation when the project scan root is symlinked or unreadable", () => {
     const symlinkWorkspace = createWorkspace();
     const outside = mkdtempSync(join(tmpdir(), "minime-knowledge-maintenance-outside-"));
