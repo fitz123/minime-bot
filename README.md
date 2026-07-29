@@ -697,8 +697,10 @@ for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
 
 The webhook can optionally verify current Alertmanager groups and forward them
-to the generic Ops incident intake while retaining native fallback and required
-critical dual delivery. Direct native Telegram delivery remains the default.
+to the generic Ops incident intake. Noncritical bridge failures stay quiet and
+retryable, relying on separately deduplicated Ops-health escalation instead of
+per-group native fallback; required critical dual delivery remains independent.
+Direct native Telegram delivery remains the default.
 
 ## Repository Boundaries
 

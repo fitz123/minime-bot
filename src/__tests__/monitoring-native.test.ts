@@ -957,24 +957,29 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("retries verification and rejected Ops delivery without repeating native fallback", async () => {
-    let alertmanagerQueries = 0;
-    let opsAttempts = 0;
+  it("keeps several noncritical groups quiet and retryable through source and Ops failures", async () => {
+    const alertmanagerQueries = new Map<string, number>();
+    const opsAttempts = new Map<string, number>();
     const telegramMessages: string[] = [];
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
-        alertmanagerQueries += 1;
-        if (alertmanagerQueries === 1) {
+        const filters = new URL(request.url, "http://127.0.0.1").searchParams.getAll("filter");
+        const alertnameFilter = filters.find((filter) => filter.startsWith("alertname="));
+        assert.ok(alertnameFilter);
+        const alertname = JSON.parse(alertnameFilter.slice("alertname=".length)) as string;
+        const attempt = (alertmanagerQueries.get(alertname) ?? 0) + 1;
+        alertmanagerQueries.set(alertname, attempt);
+        if (attempt === 1) {
           response.statusCode = 503;
           response.end("unavailable");
         } else {
           response.end(JSON.stringify([alertmanagerApiGroup(
-            { alertname: "RetryableWarning" },
+            { alertname },
             [{
-              labels: { alertname: "RetryableWarning", severity: "warning", instance: "local" },
+              labels: { alertname, severity: "warning", instance: "local" },
               status: { state: "suppressed" },
               startsAt: "2026-07-22T00:00:00Z",
-              fingerprint: "retry-warning",
+              fingerprint: alertname,
             }],
           )]));
         }
@@ -984,9 +989,14 @@ describe("Alertmanager webhook", () => {
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
         if (request.url === "/intake/alertmanager") {
-          opsAttempts += 1;
-          response.statusCode = opsAttempts === 1 ? 503 : 200;
-          response.end(JSON.stringify({ ok: opsAttempts > 1 }));
+          const payload = JSON.parse(body) as {
+            alerts: Array<{ labels: { alertname: string } }>;
+          };
+          const alertname = payload.alerts[0].labels.alertname;
+          const attempt = (opsAttempts.get(alertname) ?? 0) + 1;
+          opsAttempts.set(alertname, attempt);
+          response.statusCode = attempt === 1 ? 503 : 200;
+          response.end(JSON.stringify({ ok: attempt > 1 }));
         } else if (request.url?.includes("/sendMessage")) {
           telegramMessages.push(new URLSearchParams(body).get("text") ?? "");
           response.end(JSON.stringify({ ok: true }));
@@ -997,13 +1007,23 @@ describe("Alertmanager webhook", () => {
     const child = spawnWebhook(port, bridgeEnv(synthetic.base));
     try {
       await waitUntilReady(child);
-      const payload = alertmanagerPayload({ alertname: "RetryableWarning", fingerprint: "retry-warning" });
-      assert.equal((await postWebhook(port, payload)).status, 503, "query failure must remain retryable");
-      assert.equal((await postWebhook(port, payload)).status, 503, "Ops rejection must remain retryable");
-      assert.equal((await postWebhook(port, payload)).status, 200);
-      assert.equal(alertmanagerQueries, 3);
-      assert.equal(opsAttempts, 2);
-      assert.equal(telegramMessages.length, 1, "successful fallback must deduplicate across retries");
+      const alertnames = ["RetryableWarningA", "RetryableWarningB", "RetryableWarningC"];
+      for (const alertname of alertnames) {
+        const payload = alertmanagerPayload({ alertname });
+        assert.equal((await postWebhook(port, payload)).status, 503, "query failure must remain retryable");
+        assert.equal((await postWebhook(port, payload)).status, 503, "Ops rejection must remain retryable");
+        assert.equal((await postWebhook(port, payload)).status, 200, "Ops acceptance must converge");
+        assert.equal((await postWebhook(port, payload)).status, 200, "completed batches must deduplicate");
+      }
+      assert.deepEqual(
+        Object.fromEntries(alertmanagerQueries),
+        Object.fromEntries(alertnames.map((alertname) => [alertname, 3])),
+      );
+      assert.deepEqual(
+        Object.fromEntries(opsAttempts),
+        Object.fromEntries(alertnames.map((alertname) => [alertname, 2])),
+      );
+      assert.equal(telegramMessages.length, 0, "warning retries must not fan out natively");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -1011,7 +1031,7 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("returns 503 for an Ops timeout even after fallback and converges on retry", async () => {
+  it("returns 503 for an Ops timeout without native fallback and converges on retry", async () => {
     let opsAttempts = 0;
     let telegramAttempts = 0;
     const synthetic = await startServer((request, response) => {
@@ -1047,7 +1067,45 @@ describe("Alertmanager webhook", () => {
       assert.equal((await postWebhook(port, payload)).status, 503);
       assert.equal((await postWebhook(port, payload)).status, 200);
       assert.equal(opsAttempts, 2);
-      assert.equal(telegramAttempts, 1);
+      assert.equal(telegramAttempts, 0);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await closeServer(synthetic.server);
+    }
+  });
+
+  it("retains critical native delivery when source verification is unavailable", async () => {
+    let sourceQueries = 0;
+    let opsAttempts = 0;
+    let telegramAttempts = 0;
+    const synthetic = await startServer((request, response) => {
+      if (request.method === "GET") {
+        sourceQueries += 1;
+        response.statusCode = 503;
+        response.end("unavailable");
+        return;
+      }
+      request.resume();
+      request.on("end", () => {
+        if (request.url === "/intake/alertmanager") opsAttempts += 1;
+        if (request.url?.includes("/sendMessage")) telegramAttempts += 1;
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const port = await reservePort();
+    const child = spawnWebhook(port, bridgeEnv(synthetic.base));
+    try {
+      await waitUntilReady(child);
+      const critical = alertmanagerPayload({
+        alertname: "CriticalSourceUnavailable",
+        severity: "critical",
+      });
+      assert.equal((await postWebhook(port, critical)).status, 503);
+      assert.equal((await postWebhook(port, critical)).status, 503);
+      assert.equal(sourceQueries, 2);
+      assert.equal(opsAttempts, 0);
+      assert.equal(telegramAttempts, 1, "critical native delivery must remain independently deduplicated");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -1238,7 +1296,7 @@ describe("Alertmanager webhook", () => {
       );
       assert.equal(sourceQueries, 2);
       assert.equal(opsAttempts, 0);
-      assert.equal(telegramAttempts, 2, "each distinct failed source query uses native fallback");
+      assert.equal(telegramAttempts, 0, "noncritical source failures must stay quiet");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));

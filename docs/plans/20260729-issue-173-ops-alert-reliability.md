@@ -100,11 +100,11 @@ unrelated incident processing available.
 **Serves:** Operator input 2 — no native per-group warning fan-out when Ops
 forwarding is unavailable, while independent critical delivery remains intact.
 
-- [ ] Change bridge-mode delivery so noncritical source-query or Ops-forward failures return retryable failure without calling the native Telegram sink; leave successful noncritical forwarding quiet.
-- [ ] Preserve native-only compatibility, stale/forged acknowledgement behavior, and critical firing/resolved dual-delivery semantics, including failure when required critical native delivery fails.
-- [ ] Update monitoring integration tests for several distinct noncritical groups and repeated retries: zero per-group native messages, retryable HTTP outcomes until Ops accepts, and unchanged critical native delivery.
-- [ ] Update public monitoring documentation to state that routine noncritical bridge failures rely on the separately deduplicated Ops-health control-plane escalation rather than data-plane fallback.
-- [ ] Run the monitoring-native focused suite and keep it green before Task 3.
+- [x] Change bridge-mode delivery so noncritical source-query or Ops-forward failures return retryable failure without calling the native Telegram sink; leave successful noncritical forwarding quiet.
+- [x] Preserve native-only compatibility, stale/forged acknowledgement behavior, and critical firing/resolved dual-delivery semantics, including failure when required critical native delivery fails.
+- [x] Update monitoring integration tests for several distinct noncritical groups and repeated retries: zero per-group native messages, retryable HTTP outcomes until Ops accepts, and unchanged critical native delivery.
+- [x] Update public monitoring documentation to state that routine noncritical bridge failures rely on the separately deduplicated Ops-health control-plane escalation rather than data-plane fallback.
+- [x] Run the monitoring-native focused suite and keep it green before Task 3.
 
 ### Task 3: Retire terminal metrics with canonical cron removal
 

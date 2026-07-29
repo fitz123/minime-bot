@@ -244,20 +244,28 @@ exact, case-sensitive label `severity="critical"`. Firing batches consider only
 verified firing members; resolved-only batches consider their resolved members.
 All other values and casing are noncritical.
 A mismatch is treated as stale or forged input and is acknowledged without
-forwarding. A source-query failure uses native fallback and returns 503 so
-Alertmanager retries. Once the source is verified, required sinks are:
+forwarding. A source-query failure returns 503 so Alertmanager retries.
+Critical source-query failures still use the independent native path; routine
+noncritical failures stay quiet. Once the source is verified, required sinks
+are:
 
 - Noncritical: Ops acceptance is required. Success is quiet. Rejection,
-  timeout, or outage sends native fallback but still returns 503.
+  timeout, or outage stays quiet and returns 503.
 - Critical: both Ops acceptance and native Telegram delivery are required;
   failure of either returns 503.
 - Resolved-only: nothing is forwarded to Ops. Noncritical input is
   acknowledged quietly; critical input uses native Telegram and requires it to
   succeed.
 
-The webhook returns 2xx only after every required sink succeeds. Its separate
-process-local Ops and native deduplication state prevents a successful fallback
-or escalation from being repeated while Alertmanager retries an incomplete Ops
+Routine noncritical source-query and Ops-forward failures deliberately do not
+use a per-group data-plane native fallback. Alertmanager retains and retries
+those groups, while failure of the shared Ops path relies on the separately
+deduplicated Ops-health control-plane escalation. This prevents one shared Ops
+outage from producing a native Telegram message for every warning group.
+
+The webhook returns 2xx only after every required sink succeeds. Its
+process-local native deduplication state prevents a successful critical
+delivery from being repeated while Alertmanager retries an incomplete Ops
 delivery. Ops intake replay and coalescing provide durable task idempotency;
 native deduplication remains the bounded process-local contract described
 below. Setting none of the bridge variables preserves native-only delivery.
@@ -289,8 +297,10 @@ as stale unless its exact group is current. Check the complete delivery matrix:
   Telegram;
 - a critical firing reaches both Ops and Telegram;
 - a noncritical resolved-only delivery is quiet;
-- source-query or Ops failure sends one native fallback, returns 503, and does
-  not repeat the successful fallback while the same body retries.
+- noncritical source-query or Ops failure stays quiet and returns 503 until Ops
+  accepts;
+- critical source-query or required-sink failure retains independent native
+  delivery and returns 503 while required work remains incomplete.
 
 A required delivery failure returns a non-2xx response so Alertmanager can
 retry.
@@ -299,7 +309,7 @@ for one hour, and resets when the webhook restarts. It suppresses immediate
 retries; it is not durable exactly-once delivery. Large batches are summarized
 within Telegram's message limit.
 
-Native-only and bridge-fallback Telegram lines append
+Native-only and bridge-critical Telegram lines append
 `cron=<sanitized-name>` when the alert has a `cron` label, for both firing and
 resolved transitions. For a native-only alert without a supplied fingerprint,
 that sanitized cron value also participates in the fallback identity. Alerts

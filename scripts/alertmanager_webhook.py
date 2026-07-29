@@ -610,8 +610,9 @@ def _deliver_bridge_batch(
             batch.firing_members,
         )
     except Exception:
-        # Verification must be retried even when the independent fallback succeeds.
-        _deliver_native_once(app, batch.native_key, batch.message)
+        # Verification remains retryable; only critical delivery has an independent native sink.
+        if batch.critical:
+            _deliver_native_once(app, batch.native_key, batch.message)
         return False
     if not source_present:
         # Stale or forged local deliveries are acknowledged without granting Ops authority.
@@ -624,11 +625,7 @@ def _deliver_bridge_batch(
     if batch.critical:
         native_succeeded = _deliver_native_once(app, batch.native_key, batch.message)
         return ops_succeeded and native_succeeded
-    if ops_succeeded:
-        return True
-    # Native fallback prevents silence but does not hide the failed required Ops sink.
-    _deliver_native_once(app, batch.native_key, batch.message)
-    return False
+    return ops_succeeded
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
