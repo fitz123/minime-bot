@@ -21,6 +21,11 @@ import {
   type KnowledgeUpdateResponse,
 } from "./knowledge/update.js";
 import {
+  executeKnowledgeMaintenance,
+  formatKnowledgeMaintenanceResponse,
+  type KnowledgeMaintenanceResponse,
+} from "./knowledge/maintenance.js";
+import {
   validateWorkspaceContract,
   workspaceValidationErrors,
   workspaceValidationWarnings,
@@ -81,7 +86,9 @@ const HELP_TEXT = `Usage:
   minime-bot workspace validate --workspace <path>
   minime-bot knowledge search --workspace <agent-workspace> --query <q> [--scope auto|diary|all] [--json]
   minime-bot knowledge get --workspace <agent-workspace> --path <relpath> [--from N] [--lines N]
-  minime-bot knowledge update --workspace <agent-workspace> --op upsert --type project --slug <slug> --frontmatter <json> --body-file <file> [--json]
+  minime-bot knowledge update --workspace <agent-workspace> --op create|update|upsert --type <type> --slug <slug> --frontmatter <json> --body-file <file> [--json]
+  minime-bot knowledge update --workspace <agent-workspace> --op archive|restore --path <wiki/pages/type/page.md> [--json]
+  minime-bot knowledge maintain --workspace <agent-workspace> [--closed-issues <json-array>] [--json] [--report <workspace-json-path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>] [--run-cron-script <absolute-path>]
@@ -191,6 +198,7 @@ const KNOWLEDGE_VALUE_OPTIONS = new Set([
   "slug",
   "frontmatter",
   "body-file",
+  "closed-issues",
   "report",
 ]);
 
@@ -358,8 +366,31 @@ function parseFrontmatterJson(raw: string): unknown {
   return parsed;
 }
 
+function rejectUnexpectedKnowledgeOptions(
+  options: KnowledgeCommandOptions,
+  allowedValues: ReadonlySet<string>,
+  allowedFlags: ReadonlySet<string>,
+  command: string,
+): void {
+  for (const name of options.values.keys()) {
+    if (!allowedValues.has(name)) {
+      throw new CliUsageError(`knowledge ${command} does not accept --${name}`);
+    }
+  }
+  for (const name of options.flags) {
+    if (!allowedFlags.has(name)) {
+      throw new CliUsageError(`knowledge ${command} does not accept --${name}`);
+    }
+  }
+}
+
 function knowledgeFailureExitCode(
-  response: KnowledgeSearchResponse | KnowledgeGetResponse | KnowledgeUpdateResponse | KnowledgeMigrationResponse,
+  response:
+    | KnowledgeSearchResponse
+    | KnowledgeGetResponse
+    | KnowledgeUpdateResponse
+    | KnowledgeMigrationResponse
+    | KnowledgeMaintenanceResponse,
 ): number {
   if (response.ok) {
     return 0;
@@ -368,7 +399,12 @@ function knowledgeFailureExitCode(
 }
 
 function writeKnowledgeFailure(
-  response: KnowledgeSearchResponse | KnowledgeGetResponse | KnowledgeUpdateResponse | KnowledgeMigrationResponse,
+  response:
+    | KnowledgeSearchResponse
+    | KnowledgeGetResponse
+    | KnowledgeUpdateResponse
+    | KnowledgeMigrationResponse
+    | KnowledgeMaintenanceResponse,
   json: boolean,
   stdout: WriteFn,
   stderr: WriteFn,
@@ -463,17 +499,44 @@ function runKnowledgeUpdate(
   const commandOptions = parseKnowledgeCommandOptions(args);
   const json = commandOptions.flags.has("json");
   const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
-  const bodyFile = requiredKnowledgeValue(commandOptions, "body-file");
-  const bodyPath = resolveCliPath(bodyFile, cwdForCli(options));
-  const response = executeKnowledgeUpdate(
-    {
-      op: requiredKnowledgeValue(commandOptions, "op"),
+  const operation = requiredKnowledgeValue(commandOptions, "op").toLowerCase();
+  let updateArgs;
+  if (operation === "archive" || operation === "restore") {
+    rejectUnexpectedKnowledgeOptions(
+      commandOptions,
+      new Set(["op", "path"]),
+      new Set(["json"]),
+      "update --op archive|restore",
+    );
+    updateArgs = {
+      op: operation,
+      path: requiredKnowledgeValue(commandOptions, "path"),
+    };
+  } else {
+    if (operation !== "create" && operation !== "update" && operation !== "upsert") {
+      throw new CliUsageError(
+        "knowledge update --op must be create, update, upsert, archive, or restore",
+      );
+    }
+    rejectUnexpectedKnowledgeOptions(
+      commandOptions,
+      new Set(["op", "type", "slug", "path", "frontmatter", "body-file"]),
+      new Set(["json"]),
+      "update --op create|update|upsert",
+    );
+    const bodyFile = requiredKnowledgeValue(commandOptions, "body-file");
+    const bodyPath = resolveCliPath(bodyFile, cwdForCli(options));
+    updateArgs = {
+      op: operation,
       type: requiredKnowledgeValue(commandOptions, "type"),
       slug: commandOptions.values.get("slug"),
       path: commandOptions.values.get("path"),
       frontmatter: parseFrontmatterJson(requiredKnowledgeValue(commandOptions, "frontmatter")),
       body: readFileSync(bodyPath, "utf8"),
-    },
+    };
+  }
+  const response = executeKnowledgeUpdate(
+    updateArgs,
     { agentWorkspaceRoot, env: options.env ?? process.env },
   );
 
@@ -486,6 +549,62 @@ function runKnowledgeUpdate(
     writeLine(stdout, `${response.action} ${response.path}`);
   }
   return 0;
+}
+
+function runKnowledgeMaintain(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  rejectUnexpectedKnowledgeOptions(
+    commandOptions,
+    new Set(["closed-issues", "report"]),
+    new Set(["json"]),
+    "maintain",
+  );
+  const json = commandOptions.flags.has("json");
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const closedIssuesJson = commandOptions.values.get("closed-issues");
+  const response = executeKnowledgeMaintenance(
+    {
+      reportPath: commandOptions.values.get("report"),
+    },
+    {
+      agentWorkspaceRoot,
+      env: options.env ?? process.env,
+      loadClosedIssueNumbers: closedIssuesJson === undefined
+        ? undefined
+        : () => {
+            try {
+              return JSON.parse(closedIssuesJson);
+            } catch {
+              throw new Error("--closed-issues must be a valid JSON array");
+            }
+          },
+    },
+  );
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeMaintenanceResponse(response));
+  } else if (
+    response.stopReason !== "below-high-watermark" ||
+    response.reportPath
+  ) {
+    writeLine(
+      stdout,
+      `Knowledge maintenance: ${response.stopReason}; ${response.bytesBefore} -> ${response.bytesAfter} bytes; archived ${response.archivedCount}.`,
+    );
+    if (response.reportPath) {
+      writeLine(stdout, `Report: ${response.reportPath}`);
+    }
+  }
+  return response.stopReason === "unsafe-failure" ? 1 : 0;
 }
 
 function runKnowledgeMigrate(
@@ -544,6 +663,9 @@ function runKnowledgeCommand(
   }
   if (action === "update") {
     return runKnowledgeUpdate(parsed, args, options, stdout, stderr);
+  }
+  if (action === "maintain") {
+    return runKnowledgeMaintain(parsed, args, options, stdout, stderr);
   }
   if (action === "migrate") {
     return runKnowledgeMigrate(parsed, args, options, stdout, stderr);

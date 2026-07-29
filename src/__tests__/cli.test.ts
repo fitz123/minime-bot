@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   type LaunchdCommandRunner,
 } from "../launchd-cron-plists.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES } from "../knowledge/maintenance.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,10 +66,11 @@ crons:
   return workspace;
 }
 
-function writeWorkspaceFile(workspace: string, relPath: string, content: string): void {
+function writeWorkspaceFile(workspace: string, relPath: string, content: string): string {
   const path = join(workspace, ...relPath.split("/"));
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content);
+  return path;
 }
 
 function createKnowledgeWorkspace(): string {
@@ -102,6 +105,16 @@ function createKnowledgeWorkspace(): string {
     ].join("\n"),
   );
   return workspace;
+}
+
+function writeExactKnowledgeIndexSize(workspace: string, bytes: number): void {
+  const prefix = "# Knowledge Index\n";
+  writeWorkspaceFile(
+    workspace,
+    "wiki/index.md",
+    `${prefix}${" ".repeat(bytes - Buffer.byteLength(prefix))}`,
+  );
+  assert.equal(readFileSync(join(workspace, "wiki/index.md")).byteLength, bytes);
 }
 
 function runWithCapture(
@@ -168,6 +181,8 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+    assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
+    assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
     assert.match(result.stdout, /--run-cron-script <absolute-path>/);
     assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
@@ -635,6 +650,243 @@ describe("minime-bot CLI", () => {
       );
     } finally {
       rmSync(temp, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("archives and restores knowledge from the CLI without write payload flags", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    const relPath = "wiki/pages/project/runtime.md";
+    try {
+      const archived = runWithCapture(
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "archive",
+          "--path",
+          relPath,
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(archived.code, 0);
+      assert.equal(archived.stderr, "");
+      const archivedResponse = JSON.parse(archived.stdout) as {
+        ok: boolean;
+        operation: string;
+        action: string;
+        path: string;
+        archivePath: string;
+      };
+      assert.equal(archivedResponse.ok, true);
+      assert.equal(archivedResponse.operation, "archive");
+      assert.equal(archivedResponse.action, "archived");
+      assert.equal(archivedResponse.path, relPath);
+      assert.equal(
+        archivedResponse.archivePath,
+        `artifacts/knowledge-archive/${relPath}`,
+      );
+
+      const restored = runWithCapture(
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "restore",
+          "--path",
+          relPath,
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(restored.code, 0);
+      assert.equal(restored.stderr, "");
+      const restoredResponse = JSON.parse(restored.stdout) as {
+        ok: boolean;
+        operation: string;
+        action: string;
+      };
+      assert.equal(restoredResponse.ok, true);
+      assert.equal(restoredResponse.operation, "restore");
+      assert.equal(restoredResponse.action, "restored");
+      assert.equal(existsSync(join(agentWorkspace, ...relPath.split("/"))), true);
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects fabricated write payload flags for archive and restore", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    const temp = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-move-"));
+    const bodyFile = join(temp, "body.md");
+    writeFileSync(bodyFile, "# Fabricated\n", "utf8");
+    try {
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "archive",
+          "--path",
+          "wiki/pages/project/runtime.md",
+          "--body-file",
+          bodyFile,
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 2);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /does not accept --body-file/);
+      assert.equal(existsSync(join(agentWorkspace, "wiki/pages/project/runtime.md")), true);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps default no-pressure maintenance output empty and defers evidence parsing", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      writeExactKnowledgeIndexSize(
+        agentWorkspace,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES,
+      );
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--closed-issues",
+          "not-json",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "");
+      assert.equal(result.stderr, "");
+      assert.equal(existsSync(join(agentWorkspace, "wiki/pages/project/runtime.md")), true);
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("runs pressured maintenance with JSON and a bounded report", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-05-01.md";
+    const pagePath = writeWorkspaceFile(
+      agentWorkspace,
+      relPath,
+      [
+        "---",
+        "name: Completed Release",
+        "description: Old completed release",
+        "type: project",
+        "---",
+        "",
+        "# Completed Release",
+        "",
+      ].join("\n"),
+    );
+    const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1_000);
+    utimesSync(pagePath, old, old);
+    writeExactKnowledgeIndexSize(
+      agentWorkspace,
+      KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+    );
+    try {
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--json",
+          "--report",
+          "artifacts/maintenance/report.json",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      const response = JSON.parse(result.stdout) as {
+        ok: boolean;
+        stopReason: string;
+        archivedCount: number;
+        archivedPaths: string[];
+        reportPath: string;
+      };
+      assert.equal(response.ok, true);
+      assert.equal(response.stopReason, "low-watermark-reached");
+      assert.equal(response.archivedCount, 1);
+      assert.deepEqual(response.archivedPaths, [relPath]);
+      assert.equal(response.reportPath, "artifacts/maintenance/report.json");
+      assert.equal(
+        existsSync(join(agentWorkspace, "artifacts/maintenance/report.json")),
+        true,
+      );
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns usage exits for pressured invalid evidence and unsafe report paths", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      writeExactKnowledgeIndexSize(
+        agentWorkspace,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+      );
+      const invalidEvidence = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--closed-issues",
+          "not-json",
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+      assert.equal(invalidEvidence.code, 2);
+      assert.equal(invalidEvidence.stderr, "");
+      assert.equal(
+        (JSON.parse(invalidEvidence.stdout) as { reason: string }).reason,
+        "invalid-closed-issue-evidence",
+      );
+
+      const invalidReport = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--report",
+          "wiki/maintenance.json",
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+      assert.equal(invalidReport.code, 2);
+      assert.equal(invalidReport.stderr, "");
+      assert.equal(
+        (JSON.parse(invalidReport.stdout) as { reason: string }).reason,
+        "knowledge-maintenance-report-path-invalid",
+      );
+    } finally {
       rmSync(agentWorkspace, { recursive: true, force: true });
     }
   });

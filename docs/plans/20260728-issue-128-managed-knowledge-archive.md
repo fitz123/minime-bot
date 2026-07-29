@@ -56,9 +56,9 @@ npm pack --dry-run
 
 **Serves:** Exact 40 KiB → 30 KiB hysteresis, 30-day eligibility, fail-safe mixed/open handling, bounded manifests, and reusable parent-owned one-time/periodic rollout.
 
-- [ ] Add a package-owned maintenance module with fixed 40 KiB high, 30 KiB low, 30-day age, index-byte fast path, strict dated-record parsing, caller-supplied bounded closed-issue evidence, `revisit_if` mixed-page exclusion, conservative `mtime` age, stable oldest-first ordering, and reuse of `executeKnowledgeUpdate({op:"archive"})` rather than direct wiki mutation.
-- [ ] Add `minime-bot knowledge maintain` and operation-aware `knowledge update --op archive|restore --path ...` parsing/help/JSON/report behavior. Keep archive/restore free of fabricated body/frontmatter flags; keep default no-pressure maintenance output empty; validate report paths and bound all manifest arrays/errors.
-- [ ] Add exact-boundary tests for `40960` no-op versus `40961` activation, `30 days` eligible versus just younger, reduction to `<=30720`, eligible exhaustion above low, equal-age path tiebreaking, counter/size recalculation after every archive, recently updated/mixed/open/unproven/non-dated skips, per-page safe failure, bounded report, and CLI exit/output contracts.
+- [x] Add a package-owned maintenance module with fixed 40 KiB high, 30 KiB low, 30-day age, index-byte fast path, strict dated-record parsing, caller-supplied bounded closed-issue evidence, `revisit_if` mixed-page exclusion, conservative `mtime` age, stable oldest-first ordering, and reuse of `executeKnowledgeUpdate({op:"archive"})` rather than direct wiki mutation.
+- [x] Add `minime-bot knowledge maintain` and operation-aware `knowledge update --op archive|restore --path ...` parsing/help/JSON/report behavior. Keep archive/restore free of fabricated body/frontmatter flags; keep default no-pressure maintenance output empty; validate report paths and bound all manifest arrays/errors.
+- [x] Add exact-boundary tests for `40960` no-op versus `40961` activation, `30 days` eligible versus just younger, reduction to `<=30720`, eligible exhaustion above low, equal-age path tiebreaking, counter/size recalculation after every archive, recently updated/mixed/open/unproven/non-dated skips, per-page safe failure, bounded report, and CLI exit/output contracts.
 
 ### Task 3: Expose, document, and package the complete contract
 
