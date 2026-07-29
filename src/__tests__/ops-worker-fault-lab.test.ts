@@ -28,6 +28,7 @@ const EXPECTED_SCENARIOS = [
   "intake-duplicate-delivery-replay",
   "monitoring-silence-not-health",
   "report-crash-before-receipt-finish",
+  "complete-ops-alert-recovery-chain",
 ] as const;
 
 describe("ops-worker batched fake fault lab", () => {

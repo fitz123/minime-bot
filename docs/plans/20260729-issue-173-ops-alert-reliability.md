@@ -122,11 +122,11 @@ leave a terminal failure snapshot that can never self-clear.
 **Serves:** Operator input 4 — regression and end-to-end package proof for the
 exact incident chain, including one post-change result report.
 
-- [ ] Add one deterministic package integration/fault-lab scenario that seeds an ambiguous report receipt, proves health/status and intake stay available, accepts an unrelated warning, and leaves the ambiguous task/receipt truthful and recoverable.
-- [ ] Prove multiple noncritical groups during Ops unavailability remain retryable with no data-plane native messages, and prove a critical group still uses the independent native path.
-- [ ] Continue the fixture through Ops recovery: accept a warning incident, persist an actual bounded repair/change action, obtain fresh deterministic PASS, and send exactly one result report whose receipt is APPLIED and whose payload retains diagnosis, action, and health proof.
-- [ ] Exercise canonical cron removal against a failed terminal snapshot and prove the retired series source disappears without touching unrelated metrics or durable task artifacts.
-- [ ] Run all focused suites, full tests, lint, build, and package dry-run; inspect the final diff for scope, safety, and public-data hygiene.
+- [x] Add one deterministic package integration/fault-lab scenario that seeds an ambiguous report receipt, proves health/status and intake stay available, accepts an unrelated warning, and leaves the ambiguous task/receipt truthful and recoverable.
+- [x] Prove multiple noncritical groups during Ops unavailability remain retryable with no data-plane native messages, and prove a critical group still uses the independent native path.
+- [x] Continue the fixture through Ops recovery: accept a warning incident, persist an actual bounded repair/change action, obtain fresh deterministic PASS, and send exactly one result report whose receipt is APPLIED and whose payload retains diagnosis, action, and health proof.
+- [x] Exercise canonical cron removal against a failed terminal snapshot and prove the retired series source disappears without touching unrelated metrics or durable task artifacts.
+- [x] Run all focused suites, full tests, lint, build, and package dry-run; inspect the final diff for scope, safety, and public-data hygiene.
 
 ## Post-Completion
 
