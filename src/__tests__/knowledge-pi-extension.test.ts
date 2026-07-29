@@ -326,6 +326,9 @@ describe("Knowledge Pi extension helpers", () => {
         "rm artifacts/knowledge-archive/wiki/pages/project/*.md",
         "artifacts/knowledge-archive/wiki/pages/project/*.md",
       ],
+      ["rm -rf artifacts", "artifacts"],
+      ["mv artifacts /tmp/archive-backup", "artifacts"],
+      ["find artifacts -delete", "artifacts"],
       [
         "printf x > $UNKNOWN/artifacts/knowledge-archive/wiki/pages/project/runtime.md",
         "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
@@ -344,6 +347,25 @@ describe("Knowledge Pi extension helpers", () => {
       extractBashWriteTargets("cat <<EOF | tee -a wiki/issues.md && cp a.md wiki/pages/project/a.md"),
       ["wiki/issues.md", "wiki/pages/project/a.md"],
     );
+  });
+
+  it("allows unrelated writes beneath archive ancestors", () => {
+    const workspace = createV2Workspace();
+
+    for (const command of [
+      "mkdir -p artifacts/maintenance",
+      "touch artifacts/maintenance-report.json",
+      "mv source.md artifacts",
+    ]) {
+      assert.equal(
+        classifyKnowledgeIntegrityToolCall(
+          { toolName: "bash", input: { command } },
+          { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+        ),
+        undefined,
+        command,
+      );
+    }
   });
 
   it("allows bash read-only commands against managed knowledge paths", () => {

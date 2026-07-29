@@ -754,6 +754,28 @@ describe("knowledge_update", () => {
     assert.equal(existsSync(join(outside, "secret.md")), false);
   });
 
+  it("rejects managed paths that could corrupt index links or structural logs", () => {
+    const workspace = createV2Workspace();
+
+    for (const path of [
+      "wiki/pages/project/broken link.md",
+      "wiki/pages/project/fragment#target.md",
+      "wiki/pages/project/query?target.md",
+      "wiki/pages/project/close)paren.md",
+      "wiki/pages/project/forged\n- 2026-07-29T00:00:00.000Z archive fake.md",
+    ]) {
+      const response = executeKnowledgeUpdate(
+        { op: "archive", path },
+        { agentWorkspaceRoot: workspace },
+      );
+      assert.equal(response.ok, false, path);
+      assert.equal(response.status, "rejected", path);
+      assert.equal(response.reason, "invalid-path", path);
+    }
+
+    assert.equal(existsSync(join(workspace, "wiki/log.md")), false);
+  });
+
   it("rejects legacy and Karpathy-style non-v2 wiki layouts", () => {
     const legacy = createWorkspace({
       "MEMORY.md": "# Memory\n",
@@ -834,6 +856,46 @@ describe("knowledge_update", () => {
     assert.equal(existsSync(join(workspace, "wiki/pages/project/rollback.md")), false);
     assert.equal(readFileSync(join(workspace, "wiki/index.md"), "utf8"), "# Knowledge Index\n");
     assert.equal(readFileSync(join(workspace, "wiki/log.md"), "utf8"), "- prior entry\n");
+  });
+
+  it("refreshes restored search state after a write refresh fails", () => {
+    for (const rollbackRefreshFails of [false, true]) {
+      const workspace = createV2Workspace();
+      let refreshCalls = 0;
+      let indexed = readFileSync(join(workspace, "wiki/index.md"), "utf8");
+
+      const response = executeKnowledgeUpdate(
+        {
+          op: "create",
+          type: "project",
+          slug: "refresh-rollback",
+          frontmatter: pageFrontmatter("Refresh Rollback"),
+          body: "# Refresh Rollback\n",
+        },
+        {
+          agentWorkspaceRoot: workspace,
+          refreshSearchBackend(layout) {
+            refreshCalls += 1;
+            indexed = readFileSync(layout.paths.indexPath, "utf8");
+            if (refreshCalls === 1 || rollbackRefreshFails) {
+              throw new Error("forced search refresh failure");
+            }
+          },
+        },
+      );
+
+      assert.equal(response.ok, false);
+      assert.equal(
+        response.reason,
+        rollbackRefreshFails
+          ? "knowledge-update-search-rollback-failed"
+          : "knowledge-update-verify-failed",
+      );
+      assert.equal(refreshCalls, 2);
+      assert.equal(indexed, "# Knowledge Index\n");
+      assert.equal(existsSync(join(workspace, "wiki/pages/project/refresh-rollback.md")), false);
+      assert.equal(existsSync(join(workspace, "wiki/log.md")), false);
+    }
   });
 
   it("recovers stale locks and rejects fresh concurrent locks", () => {

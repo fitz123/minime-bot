@@ -202,7 +202,12 @@ describe("knowledge maintenance", () => {
     const pages: ParsedPage[] = [];
     const equalAge = new Date(OLD);
     for (let index = 0; index < 180; index += 1) {
-      const bucket = `bucket-${String(index).padStart(3, "0")}`;
+      const bucket =
+        index === 0
+          ? "Z-bucket"
+          : index === 1
+            ? "a-bucket"
+            : `bucket-${String(index).padStart(3, "0")}`;
       pages.push(addPage(
         workspace,
         `wiki/pages/project/${bucket}/release-2026-01-01.md`,
@@ -240,8 +245,8 @@ describe("knowledge maintenance", () => {
     assert.ok(response.bytesAfter <= KNOWLEDGE_MAINTENANCE_LOW_WATERMARK_BYTES);
     assert.ok(measuredSizes.every((size, index) => index === 0 || size < measuredSizes[index - 1]));
     assert.deepEqual(response.archivedPaths.slice(0, 2), [
-      "wiki/pages/project/bucket-000/release-2026-01-01.md",
-      "wiki/pages/project/bucket-001/release-2026-01-01.md",
+      "wiki/pages/project/Z-bucket/release-2026-01-01.md",
+      "wiki/pages/project/a-bucket/release-2026-01-01.md",
     ]);
   });
 
@@ -697,6 +702,7 @@ describe("knowledge maintenance", () => {
       "../outside.json",
       "wiki/report.json",
       "artifacts/knowledge-archive/report.json",
+      ".tmp/knowledge-update.lock/report.json",
       "reports/report.json",
       "report.txt",
     ]) {
@@ -708,5 +714,6 @@ describe("knowledge maintenance", () => {
       assert.equal(response.reason, "knowledge-maintenance-report-path-invalid");
     }
     assert.equal(existsSync(join(outside, "report.json")), false);
+    assert.equal(existsSync(join(workspace, ".tmp/knowledge-update.lock")), false);
   });
 });

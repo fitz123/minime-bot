@@ -379,6 +379,29 @@ export function classifyKnowledgeIntegrityToolCall(
       };
     }
   }
+  if (event.toolName === "bash") {
+    const destructiveAncestorTargets = extractBashDestructiveAncestorTargetsForCwd(
+      stringField(event.input, "command") ?? "",
+      cwd,
+      deps.env,
+    );
+    for (const rawTarget of destructiveAncestorTargets) {
+      const absTarget = resolveShellPath(rawTarget, cwd, deps.env);
+      if (!absTarget) {
+        continue;
+      }
+      const managedPath = managedKnowledgeAncestorRelPath(layout, absTarget);
+      if (managedPath) {
+        return {
+          block: true,
+          targetPath: managedPath,
+          reason:
+            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
+            `Blocked direct ${event.toolName} target: ${managedPath}.`,
+        };
+      }
+    }
+  }
 
   return undefined;
 }
@@ -416,6 +439,66 @@ export function extractBashWriteTargets(command: string): string[] {
 
 function extractBashWriteTargetsForCwd(command: string, cwd: string, env?: NodeJS.ProcessEnv): string[] {
   return extractBashWriteTargetsAtDepth(command, 0, cwd, env);
+}
+
+function extractBashDestructiveAncestorTargetsForCwd(
+  command: string,
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+): string[] {
+  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env);
+}
+
+function extractBashDestructiveAncestorTargetsAtDepth(
+  command: string,
+  depth: number,
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string[] {
+  if (depth > MAX_NESTED_SHELL_DEPTH) {
+    return [];
+  }
+  const tokens = expandAttachedRedirections(tokenizeShell(command).map((token) => token.value));
+  const targets: string[] = [];
+  let currentCwd = cwd;
+
+  for (const segment of splitShellSegments(tokens)) {
+    const { command: unwrapped, cwd: commandCwd } = unwrapCommandWithCwd(segment, currentCwd, env);
+    if (unwrapped.length > 0) {
+      const name = basename(unwrapped[0]);
+      const args = unwrapped.slice(1);
+      if (NESTED_SHELL_COMMANDS.has(name)) {
+        const nestedCommand = nestedShellCommand(args);
+        if (nestedCommand) {
+          for (const target of extractBashDestructiveAncestorTargetsAtDepth(
+            nestedCommand,
+            depth + 1,
+            commandCwd,
+            env,
+          )) {
+            appendTarget(targets, target);
+          }
+        }
+      } else if (
+        name === "rm" &&
+        args.some((arg) => arg === "--recursive" || /^-[^-]*[rR]/.test(arg))
+      ) {
+        appendTargetCandidates(targets, commandOperands(args), commandCwd, env);
+      } else if (name === "mv") {
+        const operands = commandOperands(args);
+        const targetDir = optionValue(args, "-t") ?? optionValue(args, "--target-directory");
+        const sources = targetDir
+          ? operands.filter((operand) => operand !== targetDir)
+          : operands.slice(0, -1);
+        appendTargetCandidates(targets, sources, commandCwd, env);
+      } else if (name === "find" && args.includes("-delete")) {
+        appendTargetCandidates(targets, commandOperands(args).slice(0, 1), commandCwd, env);
+      }
+    }
+    currentCwd = cwdAfterSegment(segment, currentCwd, env);
+  }
+
+  return targets;
 }
 
 function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: string, env?: NodeJS.ProcessEnv): string[] {
@@ -1139,6 +1222,25 @@ function managedKnowledgeRelPath(layout: Extract<ResolvedKnowledgeLayout, { kind
     }
   }
 
+  return undefined;
+}
+
+function managedKnowledgeAncestorRelPath(
+  layout: Extract<ResolvedKnowledgeLayout, { kind: "v2" }>,
+  absPath: string,
+): string | undefined {
+  const candidates = pathCandidates(absPath);
+  const managedPaths = [
+    ...MANAGED_EXACT_RELPATHS.map((relPath) => join(layout.agentWorkspaceRoot, ...relPath.split("/"))),
+    layout.paths.pagesDir,
+    layout.paths.knowledgeArchiveDir,
+  ].flatMap((managedPath) => [managedPath, realOrSelf(managedPath)]);
+
+  for (const candidate of candidates) {
+    if (managedPaths.some((managedPath) => insideOrSame(candidate, managedPath))) {
+      return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
+    }
+  }
   return undefined;
 }
 

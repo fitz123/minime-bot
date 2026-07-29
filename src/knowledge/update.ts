@@ -150,6 +150,7 @@ const KNOWN_PAGE_TYPES = new Set<string>(KNOWLEDGE_PAGE_TYPES);
 const REQUIRED_FRONTMATTER = ["name", "description", "type"] as const;
 const OPTIONAL_FRONTMATTER = ["confidence", "revisit_if", "originSessionId"] as const;
 const ALLOWED_FRONTMATTER = new Set<string>([...REQUIRED_FRONTMATTER, ...OPTIONAL_FRONTMATTER]);
+const SAFE_PATH_SEGMENT_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 const TYPE_LABELS: Record<KnowledgePageType, string> = {
   user: "User",
   project: "Project",
@@ -341,7 +342,7 @@ function normalizeSlug(raw: unknown): string | KnowledgeUpdateFailure {
   }
   const parts = slug.split("/");
   if (
-    parts.some((part) => !part || part === "." || part === ".." || !/^[a-z0-9][a-z0-9._-]*$/i.test(part))
+    parts.some((part) => !part || part === "." || part === ".." || !SAFE_PATH_SEGMENT_RE.test(part))
   ) {
     return failure(
       "rejected",
@@ -361,8 +362,12 @@ function normalizePagePath(raw: unknown): string | KnowledgeUpdateFailure {
     return failure("rejected", "invalid-path", "knowledge_update only accepts workspace-relative Markdown paths.");
   }
   const parts = relPath.split("/");
-  if (parts.some((part) => !part || part === "." || part === "..")) {
-    return failure("rejected", "invalid-path", "knowledge_update rejects empty, dot, and traversal path segments.");
+  if (parts.some((part) => !part || part === "." || part === ".." || !SAFE_PATH_SEGMENT_RE.test(part))) {
+    return failure(
+      "rejected",
+      "invalid-path",
+      "knowledge_update page paths require non-empty safe filename segments.",
+    );
   }
   if (extname(relPath).toLowerCase() !== ".md") {
     return failure("rejected", "non-markdown", "knowledge_update only writes Markdown pages.");
@@ -724,6 +729,14 @@ function parseExistingPage(
   relPath: string,
   fs: KnowledgeUpdateFs,
 ): ParsedPage | KnowledgeUpdateFailure {
+  const normalizedPath = normalizePagePath(relPath);
+  if (typeof normalizedPath !== "string" || normalizedPath !== relPath) {
+    return failure(
+      "rejected",
+      "invalid-page-path",
+      "Knowledge v2 page paths require safe filename segments.",
+    );
+  }
   const frontmatterResult = parseMarkdownFrontmatter(fs.readFileSync(absPath, "utf8"));
   if (isUpdateFailure(frontmatterResult)) {
     return frontmatterResult;
@@ -1238,15 +1251,34 @@ function executeWriteRequest(
     ],
     fs,
   );
+  let refreshAttempted = false;
   try {
     const invariantProblem = verifyIndexInvariants(layout, request.relPath, 1, fs);
     if (invariantProblem) {
       rollbackCommittedWrites(plans, fs);
       return invariantProblem;
     }
-    deps.refreshSearchBackend?.(layout);
+    if (deps.refreshSearchBackend) {
+      refreshAttempted = true;
+      deps.refreshSearchBackend(layout);
+    }
   } catch (error) {
     rollbackCommittedWrites(plans, fs);
+    let rollbackRefreshError: unknown;
+    if (refreshAttempted && deps.refreshSearchBackend) {
+      try {
+        deps.refreshSearchBackend(layout);
+      } catch (refreshError) {
+        rollbackRefreshError = refreshError;
+      }
+    }
+    if (rollbackRefreshError) {
+      return failure(
+        "error",
+        "knowledge-update-search-rollback-failed",
+        `knowledge_update rolled its files back after verification failed, but could not refresh restored search state: ${errorMessage(rollbackRefreshError)}`,
+      );
+    }
     return failure(
       "error",
       "knowledge-update-verify-failed",

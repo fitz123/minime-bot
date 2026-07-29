@@ -39,6 +39,7 @@ const MIN_AGE_MS = KNOWLEDGE_MAINTENANCE_MIN_AGE_DAYS * 24 * 60 * 60 * 1_000;
 const ISSUE_RECORD_RE = /^issue-([1-9][0-9]*)-(\d{4})-(\d{2})-(\d{2})\.md$/;
 const RELEASE_RECORD_RE = /^release-(\d{4})-(\d{2})-(\d{2})\.md$/;
 const MAX_ERROR_MESSAGE_LENGTH = 240;
+const KNOWLEDGE_UPDATE_LOCK_RELPATH = ".tmp/knowledge-update.lock";
 
 export interface KnowledgeMaintenanceArgs {
   closedIssueNumbers?: unknown;
@@ -192,6 +193,10 @@ function resolveAgentWorkspaceRoot(deps: KnowledgeMaintenanceDeps): string | und
 function isInsidePath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function comparePath(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function toWorkspaceRel(root: string, absPath: string): string {
@@ -442,7 +447,7 @@ function collectMaintenanceCandidates(
       return;
     }
 
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of entries.sort((a, b) => comparePath(a.name, b.name))) {
       const absPath = join(dir, entry.name);
       const relPath = toWorkspaceRel(layout.agentWorkspaceRoot, absPath);
       if (entry.isSymbolicLink()) {
@@ -522,7 +527,7 @@ function collectMaintenanceCandidates(
     candidates: candidates.sort(
       (left, right) =>
         left.mtimeMs - right.mtimeMs ||
-        left.relPath.localeCompare(right.relPath),
+        comparePath(left.relPath, right.relPath),
     ),
     complete,
   };
@@ -622,12 +627,14 @@ function reportTargetFor(
     );
   }
   const relPath = toWorkspaceRel(root, target);
+  const updateLockPath = resolve(root, KNOWLEDGE_UPDATE_LOCK_RELPATH);
   if (
     extname(target).toLowerCase() !== ".json" ||
     relPath === "wiki" ||
     relPath.startsWith("wiki/") ||
     relPath === "artifacts/knowledge-archive" ||
-    relPath.startsWith("artifacts/knowledge-archive/")
+    relPath.startsWith("artifacts/knowledge-archive/") ||
+    isInsidePath(updateLockPath, target)
   ) {
     return failure(
       "rejected",
