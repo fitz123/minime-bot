@@ -650,9 +650,10 @@ local task store.
 Ops intake does not replace the Node-independent native webhook. Optional
 forward-first bridge mode in `scripts/alertmanager_webhook.py` verifies the
 current exact routed group and receiver through Alertmanager's grouped API,
-then forwards the original bounded body to this route while retaining native
-fallback and critical escalation. With bridge configuration unset, the webhook
-and `scripts/monitoring_native.py` retain native-only behavior. See
+then forwards the original bounded body to this route. Noncritical source-query
+or Ops-intake failures stay quiet and retryable; critical groups retain
+independent native Telegram delivery. With bridge configuration unset, the
+webhook and `scripts/monitoring_native.py` retain native-only behavior. See
 `docs/monitoring.md` for the sink and rollback contract.
 
 The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a

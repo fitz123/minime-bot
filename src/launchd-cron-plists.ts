@@ -120,11 +120,9 @@ export interface LaunchdCronPlanItem {
   reason?: "active" | "disabled" | "stale";
   deferredReason?: "active" | "unknown";
   scheduleSummary?: string;
-  metricRetirement?: {
-    status: "planned" | "applied";
-    plannedArtifactCount: 2;
-    removedArtifactCount?: number;
-  };
+  metricRetirement?:
+    | { status: "planned" }
+    | { status: "applied"; removedArtifactCount: number };
 }
 
 export interface LaunchdCommandResult {
@@ -392,7 +390,6 @@ export function planLaunchdCronSync(
         reason: generated.disabledLabels.has(label) ? "disabled" : "stale",
         metricRetirement: {
           status: "planned",
-          plannedArtifactCount: 2,
         },
       });
     }
@@ -436,11 +433,11 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
       const removedArtifactCount = retireCronHealthMetricArtifacts(
         cronNameFromLaunchdLabel(item.label),
-        planned.context.cronHealthTextfileDir,
+        readPersistedCronHealthTextfileDir(item.plistPath)
+          ?? planned.context.cronHealthTextfileDir,
       );
       item.metricRetirement = {
         status: "applied",
-        plannedArtifactCount: 2,
         removedArtifactCount,
       };
       if (existsSync(item.plistPath)) {
@@ -506,7 +503,7 @@ export function formatLaunchdCronSyncResult(result: SyncLaunchdCronsResult): str
       lines.push(`${prefix}delete ${item.label} (${item.reason ?? "stale"})`);
       if (item.metricRetirement?.status === "applied") {
         lines.push(
-          `${prefix}retired terminal metrics ${item.label} (${item.metricRetirement.removedArtifactCount ?? 0} artifacts removed)`,
+          `${prefix}retired terminal metrics ${item.label} (${item.metricRetirement.removedArtifactCount} artifacts removed)`,
         );
       } else {
         lines.push(`${prefix}retire terminal metrics ${item.label} (planned)`);
@@ -1121,6 +1118,48 @@ function retireCronHealthMetricArtifacts(
     }
   }
   return removed;
+}
+
+function readPersistedCronHealthTextfileDir(
+  plistPath: string,
+): string | undefined {
+  let content: string;
+  try {
+    content = readFileSync(plistPath, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(
+      `failed to read persisted cron health metric directory${code ? `: ${code}` : ""}`,
+    );
+  }
+  const sections = [...content.matchAll(
+    /<key>\s*EnvironmentVariables\s*<\/key>\s*<dict>([\s\S]*?)<\/dict>/g,
+  )];
+  if (sections.length === 0) return undefined;
+  if (sections.length !== 1) {
+    throw new Error("persisted cron plist has ambiguous environment variables");
+  }
+  const values = [...sections[0][1].matchAll(
+    new RegExp(
+      `<key>\\s*${CRON_HEALTH_TEXTFILE_DIR_ENV}\\s*</key>\\s*<string>([^<]*)</string>`,
+      "g",
+    ),
+  )];
+  if (values.length === 0) return undefined;
+  if (values.length !== 1) {
+    throw new Error("persisted cron plist has ambiguous cron health metric directories");
+  }
+  const encoded = values[0][1];
+  const decoded = xmlUnescape(encoded);
+  if (
+    xmlEscape(decoded) !== encoded
+    || decoded.trim() !== decoded
+    || !isAbsolute(decoded)
+    || normalize(decoded) !== decoded
+  ) {
+    throw new Error("persisted cron health metric directory is unsafe");
+  }
+  return decoded;
 }
 
 function readLaunchdPlistLabel(plistPath: string): string {

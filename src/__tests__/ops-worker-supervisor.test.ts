@@ -635,6 +635,46 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-later");
   });
 
+  it("blocks a process-free reconciliation-marked task before scheduling it", async (t) => {
+    const harness = await makeHarness(t);
+    const fenced = makeTask("task-report-fence");
+    const legacyIntent = { legacyReportPayload: "incompatible" };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    fenced.state = "RESUMABLE";
+    fenced.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    fenced.report = {
+      state: "PENDING",
+      attempts: 0,
+      lastError: "Claimed report receipt requires external-outcome reconciliation",
+    };
+    fenced.mutationReceipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ state: "PENDING" }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    harness.store.create(fenced);
+    harness.store.create(makeTask("task-unrelated-after-fence"));
+
+    assert.equal(
+      harness.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-fence",
+    );
+    const isolated = harness.store.get(fenced.id);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.schedule.nextRunAt, null);
+    assert.equal(isolated?.schedule.nextCheckAt, null);
+  });
+
   it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => ({
@@ -1824,6 +1864,94 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.mutationReceipts.report?.operationId, receipts.report
       && (receipts.report as { operationId: string }).operationId);
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("recovers terminal report fences after fixed receipt outcomes", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-terminal-report-fence-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-first",
+    });
+    const operations = new Map<string, {
+      boundary: "report";
+      operationId: string;
+      intent: unknown;
+    }>();
+    for (const taskId of ["task-terminal-applied", "task-terminal-not-needed"]) {
+      first.store.create(makeTask(taskId));
+      await first.supervisor.requestDoneCheck(taskId);
+      await first.supervisor.runDoneCheck(taskId);
+      const intent = { legacyTerminalReport: taskId };
+      const intentHash = hashOpsWorkerCanonicalPayload(intent);
+      const operation = {
+        boundary: "report" as const,
+        operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+        intent,
+      };
+      operations.set(taskId, operation);
+      const snapshotPath = join(first.store.tasksDirectory, `${taskId}.json`);
+      const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask;
+      snapshot.mutationReceipts.report = {
+        boundary: "report",
+        operationId: operation.operationId,
+        intentHash,
+        queryObservedAt: NOW,
+        queryResultHash: hashOpsWorkerCanonicalPayload({ state: "PENDING" }),
+        mutationStartedAt: NOW,
+        outcome: null,
+        replayHistory: [],
+      };
+      writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+    }
+    first.close();
+
+    const isolated = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-isolated",
+    });
+    for (const taskId of operations.keys()) {
+      assert.equal(isolated.store.get(taskId)?.state, "DONE");
+      assert.match(
+        isolated.store.get(taskId)?.report.lastError ?? "",
+        /external-outcome reconciliation/,
+      );
+    }
+    const lifecycle = new OpsWorkerLifecycle(isolated.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.finishMutationReceipt("task-terminal-applied", {
+      ...operations.get("task-terminal-applied")!,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt("task-terminal-not-needed", {
+      ...operations.get("task-terminal-not-needed")!,
+      result: "NOT_NEEDED",
+      evidence: { delivered: false },
+    });
+    isolated.close();
+
+    const recovered = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-recovered",
+    });
+    const applied = recovered.store.get("task-terminal-applied");
+    assert.equal(applied?.report.state, "SENT");
+    assert.equal(applied?.report.lastError, null);
+    const pending = recovered.store.get("task-terminal-not-needed");
+    assert.equal(pending?.report.state, "PENDING");
+    assert.equal(pending?.report.lastError, null);
+    let attempts = 0;
+    const sent = await recovered.supervisor.recordReportAttempt(
+      "task-terminal-not-needed",
+      async () => {
+        attempts += 1;
+        return { sent: true };
+      },
+    );
+    assert.equal(attempts, 1);
+    assert.equal(sent.report.state, "SENT");
   });
 
   it("records a report receipt for a maximum-sized valid typed result", async (t) => {

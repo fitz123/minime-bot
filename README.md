@@ -609,11 +609,13 @@ loading or side effects.
 The sync command owns only the `ai.minime.cron.*` namespace. By default it
 creates or updates active cron plists, lint-checks changed plists, re-bootstraps
 changed active cron labels, and prunes stale or disabled owned cron plists by
-booting them out and deleting the plist without bootstrapping them again.
-`--no-prune` leaves stale owned cron plists in place for emergency/manual
-operation. `--launch-agents-dir` overrides the default
-`~/Library/LaunchAgents` target. Cron sync must not bootout, bootstrap, signal,
-or otherwise restart `ai.minime.telegram-bot`.
+booting them out, retiring that cron's exact terminal `.exit.prom` and
+`.success.prom` snapshots after proving it inactive, and deleting the plist
+without bootstrapping it again. Dry-run reports the planned retirement without
+deleting metrics. `--no-prune` leaves stale owned cron plists and terminal
+metrics in place for emergency/manual operation. `--launch-agents-dir`
+overrides the default `~/Library/LaunchAgents` target. Cron sync must not
+bootout, bootstrap, signal, or otherwise restart `ai.minime.telegram-bot`.
 
 Planning uses byte identity as a fast path. If an existing plist has different
 bytes, the configured `plutil` converts the existing file and desired in-memory
@@ -643,7 +645,9 @@ timestamp snapshot changes only after success:
 The runner writes these snapshots to
 `/opt/homebrew/var/node_exporter/textfile` by default.
 `CRON_HEALTH_TEXTFILE_DIR` overrides that location; it must be writable by the
-runner and match the directory collected by node-exporter.
+runner and match the directory collected by node-exporter. Canonical cron sync
+persists an explicit selection in generated plists and uses that persisted
+directory when retiring a stale or disabled cron's exact snapshots.
 
 Terminal metric persistence is fail-closed: a directory, lock, state-read, or
 snapshot-write failure is reported on standard error and leaves the runner

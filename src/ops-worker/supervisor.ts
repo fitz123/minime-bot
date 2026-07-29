@@ -1186,7 +1186,11 @@ export class OpsWorkerSupervisor {
     }
     const now = this.now().getTime();
     const candidateFor = (task: OpsWorkerTask): OpsWorkerScheduledTask[] => {
-      if (task.control.paused || task.control.interrupt !== null) return [];
+      if (
+        task.control.paused
+        || task.control.interrupt !== null
+        || isOpsWorkerReportReconciliationBlocked(task)
+      ) return [];
       if (task.state === "CHECKING") {
         if (
           task.schedule.nextCheckAt !== null
@@ -2809,6 +2813,7 @@ export class OpsWorkerSupervisor {
       throw new OpsWorkerSupervisorStateError("Report attempt requires a transport callback");
     }
     let task = this.requireTask(taskId);
+    task = this.reconcileResolvedReportReceiptFence(task) ?? task;
     if (task.report.state !== "PENDING") {
       throw new OpsWorkerSupervisorStateError(
         `Task ${taskId} has no pending report`,
@@ -3103,10 +3108,43 @@ export class OpsWorkerSupervisor {
 
   private isolateIncompatibleReportReceipts(): OpsWorkerTask[] {
     return this.store.list().flatMap((task) => {
-      if (!hasIncompatibleClaimedReportReceipt(task)) return [];
-      const isolated = this.isolateIncompatibleReportReceipt(task.id);
+      const reconciled = this.reconcileResolvedReportReceiptFence(task) ?? task;
+      if (!hasIncompatibleClaimedReportReceipt(reconciled)) return [];
+      const isolated = this.isolateIncompatibleReportReceipt(reconciled.id);
       return isolated === undefined ? [] : [isolated];
     });
+  }
+
+  private reconcileResolvedReportReceiptFence(
+    existing: Readonly<OpsWorkerTask>,
+  ): OpsWorkerTask | undefined {
+    if (!isOpsWorkerReportReconciliationBlocked(existing)) return undefined;
+    const outcome = existing.mutationReceipts.report?.outcome;
+    if (
+      outcome === null
+      || outcome === undefined
+      || (
+        existing.state === "BLOCKED"
+        && existing.activeRun === null
+        && existing.unverifiedRun === null
+      )
+    ) return undefined;
+    return this.store.mutate(
+      existing.id,
+      {
+        event: "RECONCILIATION",
+        summary: "Applied a fixed report receipt outcome to its reconciliation fence",
+      },
+      (task) => {
+        task.report.lastError = null;
+        if (
+          outcome.result === "APPLIED"
+          || outcome.result === "ALREADY_APPLIED"
+        ) {
+          task.report.state = "SENT";
+        }
+      },
+    ).task;
   }
 
   private isolateIncompatibleReportReceipt(
@@ -3114,7 +3152,15 @@ export class OpsWorkerSupervisor {
   ): OpsWorkerTask | undefined {
     const existing = this.requireTask(taskId);
     if (!hasIncompatibleClaimedReportReceipt(existing)) return undefined;
-    if (isOpsWorkerReportReconciliationBlocked(existing)) return existing;
+    if (
+      isOpsWorkerReportReconciliationBlocked(existing)
+      && (
+        existing.state === "BLOCKED"
+        || isOpsWorkerTerminalState(existing.state)
+        || existing.activeRun !== null
+        || existing.unverifiedRun !== null
+      )
+    ) return existing;
     const markReport = (task: OpsWorkerTask): void => {
       task.report.lastError = REPORT_RECONCILIATION_REQUIRED_ERROR;
     };

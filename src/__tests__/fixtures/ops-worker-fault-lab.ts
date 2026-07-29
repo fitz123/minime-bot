@@ -6,7 +6,6 @@ import {
 import {
   createServer as createHttpServer,
   type RequestListener,
-  type Server as HttpServer,
 } from "node:http";
 import type { CodexQuotaSnapshot } from "../../pi-extensions/codex-usage.js";
 import {
@@ -522,6 +521,7 @@ async function runAvailability(readings: AvailabilityReadings) {
 
 function availabilityContracts(
   clock: () => Date = () => new Date(NOW),
+  incidentServiceMode: () => "unavailable" | "healthy" = () => "healthy",
 ) {
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: {
@@ -543,7 +543,9 @@ function availabilityContracts(
         const observedAt = clock().toISOString();
         return {
           observedAt,
-          latestMatchingSampleAt: null,
+          latestMatchingSampleAt: incidentServiceMode() === "unavailable"
+            ? observedAt
+            : null,
           monitoringWindowStartedAt: new Date(
             Date.parse(observedAt) - 5 * 60 * 1_000,
           ).toISOString(),
@@ -553,7 +555,9 @@ function availabilityContracts(
     incidentAlertmanagerReader: {
       readExactGroupState: () => ({
         observedAt: clock().toISOString(),
-        status: "ABSENT",
+        status: incidentServiceMode() === "unavailable"
+          ? "PRESENT"
+          : "ABSENT",
       }),
     },
     monitoringFreshnessReader: {
@@ -615,12 +619,16 @@ function alertmanagerGroupWebhook(
 
 function createIntake(
   context: ScenarioContext,
+  incidentServiceMode?: () => "unavailable" | "healthy",
 ): {
   intake: OpsWorkerAlertmanagerIntake;
   store: OpsWorkerTaskStore;
   contracts: ReturnType<typeof availabilityContracts>;
 } {
-  const contracts = availabilityContracts(context.clock.now);
+  const contracts = availabilityContracts(
+    context.clock.now,
+    incidentServiceMode,
+  );
   const store = new OpsWorkerTaskStore(context.stateDirectory, {
     registry: contracts.taskRegistry,
     now: context.clock.now,
@@ -690,7 +698,7 @@ async function requestLoopback(options: {
 async function startLoopbackServer(
   context: ScenarioContext,
   handler: RequestListener,
-): Promise<{ server: HttpServer; base: string; port: number }> {
+): Promise<string> {
   const server = createHttpServer(handler);
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
@@ -705,11 +713,7 @@ async function startLoopbackServer(
   context.defer(() => new Promise<void>((resolveClose, rejectClose) => {
     server.close((error) => error ? rejectClose(error) : resolveClose());
   }));
-  return {
-    server,
-    base: `http://127.0.0.1:${address.port}`,
-    port: address.port,
-  };
+  return `http://127.0.0.1:${address.port}`;
 }
 
 async function reserveLoopbackPort(context: ScenarioContext): Promise<number> {
@@ -1429,7 +1433,23 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
     name: "complete-ops-alert-recovery-chain",
     summary: "The complete warning, Ops recovery, verified result, and cron-retirement chain stays truthful.",
     async run(context) {
-      const created = createIntake(context);
+      const repairStatePath = join(context.root, "bounded-repair-state.json");
+      writeFileSync(
+        repairStatePath,
+        `${JSON.stringify({ serviceMode: "unavailable" })}\n`,
+        { mode: 0o600 },
+      );
+      const readIncidentServiceMode = (): "unavailable" | "healthy" => {
+        const state = JSON.parse(readFileSync(repairStatePath, "utf8")) as {
+          serviceMode?: unknown;
+        };
+        assert.ok(
+          state.serviceMode === "unavailable"
+          || state.serviceMode === "healthy",
+        );
+        return state.serviceMode;
+      };
+      const created = createIntake(context, readIncidentServiceMode);
       const createIncidentStore = () => new OpsWorkerTaskStore(context.stateDirectory, {
         registry: created.contracts.taskRegistry,
         now: context.clock.now,
@@ -1587,7 +1607,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         taskId?: string;
         replayed?: boolean;
       } | undefined;
-      const synthetic = await startLoopbackServer(context, (request, response) => {
+      const syntheticBase = await startLoopbackServer(context, (request, response) => {
         if (
           request.method === "GET"
           && request.url?.startsWith("/api/v2/alerts/groups?")
@@ -1692,11 +1712,11 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
           env: {
             ...process.env,
             MINIME_TELEGRAM_BOT_TOKEN: BRIDGE_TELEGRAM_TOKEN,
-            MINIME_TELEGRAM_API_BASE: synthetic.base,
+            MINIME_TELEGRAM_API_BASE: syntheticBase,
             MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API: "1",
             MINIME_TELEGRAM_CHAT_ID: "10001",
-            MINIME_OPS_INTAKE_URL: `${synthetic.base}/intake/alertmanager`,
-            MINIME_ALERTMANAGER_URL: synthetic.base,
+            MINIME_OPS_INTAKE_URL: `${syntheticBase}/intake/alertmanager`,
+            MINIME_ALERTMANAGER_URL: syntheticBase,
             MINIME_OPS_INTAKE_SOPS_FILE: join(context.root, "ops.sops.yaml"),
             MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
             MINIME_SOPS_EXECUTABLE: sops,
@@ -1750,23 +1770,54 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         taskId: accepted.taskId,
         replayed: true,
       });
+      const quietRecoveryPayload = bridgePayloads.get("QuietRetryWarningA");
+      assert.ok(quietRecoveryPayload);
+      assert.equal((await postBridge(quietRecoveryPayload)).status, 200);
+      const bridgeAccepted = structuredClone(recoveredIntakeResult);
+      assert.equal(bridgeAccepted?.ok, true);
+      assert.equal(bridgeAccepted?.replayed, false);
+      assert.ok(bridgeAccepted?.taskId);
+      const bridgedTaskId = bridgeAccepted.taskId;
+      assert.notEqual(bridgedTaskId, accepted.taskId);
+      assert.notEqual(bridgedTaskId, ambiguousTaskId);
+      assert.equal((await postBridge(quietRecoveryPayload)).status, 200);
+      assert.deepEqual(recoveredIntakeResult, {
+        ok: true,
+        taskId: bridgedTaskId,
+        replayed: false,
+      });
+      assert.equal(opsAttempts.get("QuietRetryWarningA"), 3);
       assert.equal(nativeMessages.length, 1);
       assert.deepEqual(
         Object.fromEntries(sourceQueries),
         {
-          QuietRetryWarningA: 2,
+          QuietRetryWarningA: 3,
           QuietRetryWarningB: 2,
           IndependentCritical: 1,
           RecoveryActionWarning: 1,
         },
       );
 
-      const repairStatePath = join(context.root, "bounded-repair-state.json");
-      writeFileSync(
-        repairStatePath,
-        `${JSON.stringify({ serviceMode: "unavailable" })}\n`,
-        { mode: 0o600 },
+      assert.equal(readIncidentServiceMode(), "unavailable");
+      const diagnosticAttempt = activeRun(
+        recovered.supervisor,
+        "attempt-before-recovery-action",
       );
+      recovered.supervisor.markRunning(bridgedTaskId, diagnosticAttempt);
+      recovered.supervisor.recordPiAgentResult(bridgedTaskId, {
+        attemptId: diagnosticAttempt.attemptId,
+        kind: "remediation-complete",
+        summary: "Diagnosed the fixture service as unavailable before the bounded repair.",
+        actions: ["Confirmed the fixture remained unavailable before repair."],
+        requestedInput: null,
+        reason: null,
+      });
+      const stillUnavailable = await recovered.supervisor.runDoneCheck(
+        bridgedTaskId,
+      );
+      assert.equal(stillUnavailable.state, "RESUMABLE");
+      assert.equal(stillUnavailable.verification?.outcome, "PRODUCT_FAILURE");
+
       writeFileSync(
         repairStatePath,
         `${JSON.stringify({ serviceMode: "healthy" })}\n`,
@@ -1779,8 +1830,8 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         recovered.supervisor,
         "attempt-recovery-action",
       );
-      recovered.supervisor.markRunning(accepted.taskId, recoveryAttempt);
-      recovered.supervisor.recordPiAgentResult(accepted.taskId, {
+      recovered.supervisor.markRunning(bridgedTaskId, recoveryAttempt);
+      recovered.supervisor.recordPiAgentResult(bridgedTaskId, {
         attemptId: recoveryAttempt.attemptId,
         kind: "remediation-complete",
         summary: "Diagnosed the fixture service as unavailable before the bounded repair.",
@@ -1788,11 +1839,11 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         requestedInput: null,
         reason: null,
       });
-      const stabilizing = await recovered.supervisor.runDoneCheck(accepted.taskId);
+      const stabilizing = await recovered.supervisor.runDoneCheck(bridgedTaskId);
       assert.equal(stabilizing.state, "CHECKING");
       assert.equal(stabilizing.verification?.outcome, "NOT_READY");
       context.clock.advance(5 * 60 * 1_000 + 1);
-      const passed = await recovered.supervisor.runDoneCheck(accepted.taskId);
+      const passed = await recovered.supervisor.runDoneCheck(bridgedTaskId);
       assert.equal(
         passed.state,
         "DONE",
@@ -1812,7 +1863,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         recovered.supervisor,
         resultTransport,
       ).tick();
-      assert.equal(reportTick.reportTaskId, accepted.taskId);
+      assert.equal(reportTick.reportTaskId, bridgedTaskId);
       assert.equal(resultTransport.messages.length, 1);
       const resultReport = String(resultTransport.messages[0].text);
       assert.match(resultReport, /typedOutcome=remediation-complete/);
@@ -1826,7 +1877,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       ]) {
         assert.match(resultReport, new RegExp(component));
       }
-      const reported = recovered.store.get(accepted.taskId);
+      const reported = recovered.store.get(bridgedTaskId);
       assert.equal(reported?.report.state, "SENT");
       assert.equal(reported?.report.attempts, 1);
       assert.equal(
@@ -1873,7 +1924,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       );
       const reportedTaskArtifact = join(
         recovered.store.tasksDirectory,
-        `${accepted.taskId}.json`,
+        `${bridgedTaskId}.json`,
       );
       const taskArtifactsBefore = [
         readFileSync(ambiguousTaskArtifact, "utf8"),
@@ -1909,7 +1960,6 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         cronResult.items.find((item) => item.label === cronLabel)?.metricRetirement,
         {
           status: "applied",
-          plannedArtifactCount: 2,
           removedArtifactCount: 2,
         },
       );

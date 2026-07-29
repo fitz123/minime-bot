@@ -1132,6 +1132,109 @@ fi
     }
   });
 
+  it("retires stale metrics from the custom directory persisted in the prior plist", () => {
+    const fixture = createFixture();
+    const previousMetricDir = join(fixture.root, "previous-cron-metrics");
+    try {
+      writeCrons(fixture.workspace, cronYaml("stale", "0 8 * * *"));
+      const previous = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: {
+          ...metricEnv(fixture),
+          [CRON_HEALTH_TEXTFILE_DIR_ENV]: previousMetricDir,
+        },
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(previous.plists[0].plistPath, previous.plists[0].content, "utf8");
+      const previousArtifacts = resolveCronHealthMetricArtifacts(
+        "stale",
+        previousMetricDir,
+      );
+      const currentArtifacts = resolveCronHealthMetricArtifacts(
+        "stale",
+        fixture.metricDir,
+      );
+      mkdirSync(previousMetricDir, { recursive: true });
+      mkdirSync(fixture.metricDir, { recursive: true });
+      for (const path of [
+        previousArtifacts.exitFilePath,
+        previousArtifacts.successFilePath,
+      ]) {
+        writeFileSync(path, "previous metric\n", "utf8");
+      }
+      for (const path of [
+        currentArtifacts.exitFilePath,
+        currentArtifacts.successFilePath,
+      ]) {
+        writeFileSync(path, "current unrelated metric\n", "utf8");
+      }
+      writeCrons(fixture.workspace, cronYaml("active", "0 9 * * *"));
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner([]),
+      });
+
+      assert.equal(existsSync(previousArtifacts.exitFilePath), false);
+      assert.equal(existsSync(previousArtifacts.successFilePath), false);
+      assert.equal(
+        readFileSync(currentArtifacts.exitFilePath, "utf8"),
+        "current unrelated metric\n",
+      );
+      assert.equal(
+        readFileSync(currentArtifacts.successFilePath, "utf8"),
+        "current unrelated metric\n",
+      );
+      assert.deepEqual(
+        result.items.find((item) => item.label === "ai.minime.cron.stale")
+          ?.metricRetirement,
+        { status: "applied", removedArtifactCount: 2 },
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("fails closed on an unsafe persisted cron metric directory", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      writeFileSync(
+        stalePath,
+        `<plist><dict>
+<key>Label</key><string>ai.minime.cron.stale</string>
+<key>EnvironmentVariables</key><dict>
+<key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>../unsafe</string>
+</dict>
+</dict></plist>
+`,
+        "utf8",
+      );
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: metricEnv(fixture),
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner([]),
+        }),
+        /persisted cron health metric directory is unsafe/,
+      );
+      assert.equal(existsSync(stalePath), true);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("dry-run plans create and prune actions without writing files or running commands", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
@@ -1171,7 +1274,6 @@ fi
       ]);
       assert.deepEqual(result.items[1].metricRetirement, {
         status: "planned",
-        plannedArtifactCount: 2,
       });
       assert.equal(result.items.some((item) => item.label === "ai.minime.telegram-bot"), false);
       const output = formatLaunchdCronSyncResult(result);
@@ -1351,7 +1453,6 @@ fi
       const staleItem = result.items.find((item) => item.label === "ai.minime.cron.stale");
       assert.deepEqual(staleItem?.metricRetirement, {
         status: "applied",
-        plannedArtifactCount: 2,
         removedArtifactCount: 0,
       });
       assert.equal(result.items.some((item) => item.deferredReason !== undefined), false);
@@ -1398,7 +1499,6 @@ fi
         assert.equal(existsSync(stalePath), false);
         assert.deepEqual(staleItem?.metricRetirement, {
           status: "applied",
-          plannedArtifactCount: 2,
           removedArtifactCount: 0,
         });
       }
@@ -1550,7 +1650,6 @@ fi
       for (const item of result.items.filter((candidate) => candidate.action === "delete")) {
         assert.deepEqual(item.metricRetirement, {
           status: "applied",
-          plannedArtifactCount: 2,
           removedArtifactCount: 2,
         });
       }
