@@ -1,6 +1,14 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
@@ -10,6 +18,7 @@ import {
   KNOWLEDGE_UPDATE_TOOL,
   classifyKnowledgeIntegrityToolCall,
   executePiKnowledgeSearch,
+  executePiKnowledgeUpdate,
   extractBashWriteTargets,
 } from "../pi-extensions/knowledge-tools.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
@@ -71,8 +80,68 @@ describe("Knowledge Pi extension helpers", () => {
     assert.equal(KNOWLEDGE_GET_TOOL.name, "knowledge_get");
     assert.match(KNOWLEDGE_GET_TOOL.description, /exact Markdown line ranges/);
     assert.equal(KNOWLEDGE_UPDATE_TOOL.name, "knowledge_update");
-    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /not arbitrary file editing/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /archive, or restore/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /preserve page bytes/);
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /Direct manual writes/);
+    const [writeSchema, moveSchema] = KNOWLEDGE_UPDATE_TOOL.parameters.anyOf;
+    assert.deepEqual(writeSchema.required, ["op", "type", "frontmatter", "body"]);
+    assert.deepEqual(writeSchema.properties.op.enum, ["create", "update", "upsert"]);
+    assert.deepEqual(moveSchema.required, ["op", "path"]);
+    assert.deepEqual(moveSchema.properties.op.enum, ["archive", "restore"]);
+    assert.equal("body" in moveSchema.properties, false);
+    assert.equal(moveSchema.additionalProperties, false);
+  });
+
+  it("archives and restores through the Pi tool with path-only arguments while preserving managed-path protection", () => {
+    const relPath = "wiki/pages/project/history/issue-128-2026-05-01.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const page = [
+      "---",
+      "name: Completed Issue",
+      "description: Durable completed issue record",
+      "type: project",
+      "---",
+      "",
+      "# Completed Issue",
+      "",
+      "Exact archived bytes.",
+      "",
+    ].join("\n");
+    const workspace = createV2Workspace({
+      [relPath]: page,
+      "wiki/index.md": [
+        "# Knowledge Index",
+        "",
+        "## Project",
+        "",
+        "- [Completed Issue](pages/project/history/issue-128-2026-05-01.md) - Durable completed issue record",
+        "",
+      ].join("\n"),
+    });
+
+    const archived = executePiKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+    );
+    assert.equal(archived.ok, true, archived.text);
+    assert.match(archived.text, /"action": "archived"/);
+    assert.equal(existsSync(join(workspace, ...relPath.split("/"))), false);
+    assert.equal(readFileSync(join(workspace, ...archiveRelPath.split("/")), "utf8"), page);
+
+    const restored = executePiKnowledgeUpdate(
+      { op: "restore", path: relPath },
+      { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+    );
+    assert.equal(restored.ok, true, restored.text);
+    assert.match(restored.text, /"action": "restored"/);
+    assert.equal(readFileSync(join(workspace, ...relPath.split("/")), "utf8"), page);
+    assert.equal(existsSync(join(workspace, ...archiveRelPath.split("/"))), false);
+
+    assertBlocked(
+      workspace,
+      { toolName: "edit", input: { path: relPath, edits: [] } },
+      relPath,
+    );
   });
 
   it("lets Pi knowledge tool execution use the validated cwd with a warning when the agent workspace env is absent", () => {

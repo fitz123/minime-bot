@@ -690,6 +690,25 @@ describe("minime-bot CLI", () => {
         archivedResponse.archivePath,
         `artifacts/knowledge-archive/${relPath}`,
       );
+      const archivedSearch = runWithCapture(
+        [
+          "knowledge",
+          "search",
+          "--workspace",
+          agentWorkspace,
+          "--query",
+          "durable knowledge search",
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+      assert.equal(archivedSearch.code, 0);
+      assert.equal(archivedSearch.stderr, "");
+      assert.equal(
+        (JSON.parse(archivedSearch.stdout) as { results: Array<{ path: string }> }).results
+          .some((result) => result.path === relPath),
+        false,
+      );
 
       const restored = runWithCapture(
         [
@@ -717,6 +736,25 @@ describe("minime-bot CLI", () => {
       assert.equal(restoredResponse.operation, "restore");
       assert.equal(restoredResponse.action, "restored");
       assert.equal(existsSync(join(agentWorkspace, ...relPath.split("/"))), true);
+      const restoredSearch = runWithCapture(
+        [
+          "knowledge",
+          "search",
+          "--workspace",
+          agentWorkspace,
+          "--query",
+          "durable knowledge search",
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+      assert.equal(restoredSearch.code, 0);
+      assert.equal(restoredSearch.stderr, "");
+      assert.equal(
+        (JSON.parse(restoredSearch.stdout) as { results: Array<{ path: string }> }).results
+          .some((result) => result.path === relPath),
+        true,
+      );
     } finally {
       rmSync(agentWorkspace, { recursive: true, force: true });
     }

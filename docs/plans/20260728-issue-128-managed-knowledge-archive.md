@@ -66,9 +66,9 @@ npm pack --dry-run
 
 **Serves:** A deployable installed artifact, managed-only production cleanup, weekly private registration, and no regression to search/index/package behavior.
 
-- [ ] Update the first-party Pi knowledge tool schema/description/guidelines for operation-specific arguments and reversible archive/restore, preserving the narrow direct-write guard; add extension tests that exercise archive and restore without requiring write payload fields and prove direct managed wiki writes stay blocked.
-- [ ] Document archive destination/recovery, structural log semantics, fixed maintenance policy, conservative eligibility/mtime behavior, closed-issue evidence input, quiet no-op/report contracts, and parent-owned one-time cleanup without private examples. Extend package-install and CLI tests to execute installed archive → search miss → restore → search hit and an installed maintenance boundary fixture.
-- [ ] Run focused tests, the full suite, lint, build, schema/CLI validation, and package dry-run; inspect `git diff --stat main...HEAD`, package inventory, generated extension parity, and public text for scope/PII leakage before review.
+- [x] Update the first-party Pi knowledge tool schema/description/guidelines for operation-specific arguments and reversible archive/restore, preserving the narrow direct-write guard; add extension tests that exercise archive and restore without requiring write payload fields and prove direct managed wiki writes stay blocked.
+- [x] Document archive destination/recovery, structural log semantics, fixed maintenance policy, conservative eligibility/mtime behavior, closed-issue evidence input, quiet no-op/report contracts, and parent-owned one-time cleanup without private examples. Extend package-install and CLI tests to execute installed archive → search miss → restore → search hit and an installed maintenance boundary fixture.
+- [x] Run focused tests, the full suite, lint, build, schema/CLI validation, and package dry-run; inspect `git diff --stat main...HEAD`, package inventory, generated extension parity, and public text for scope/PII leakage before review.
 
 ## Post-Completion
 

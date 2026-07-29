@@ -58,29 +58,74 @@ export const KNOWLEDGE_UPDATE_TOOL = {
   name: "knowledge_update",
   label: "Knowledge Update",
   description:
-    "Create, update, or upsert durable Knowledge v2 Markdown pages through the package-owned write path. This is " +
-    "not arbitrary file editing: it validates flat frontmatter, writes under wiki/pages/<type> only, refreshes " +
-    "wiki/index.md mechanically, and records structural creates in wiki/log.md. Direct manual writes to managed " +
-    "wiki paths are blocked when first-party extensions are enabled.",
-  promptSnippet: "Write durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
+    "Create, update, upsert, archive, or restore durable Knowledge v2 Markdown pages through the package-owned " +
+    "managed path. Create/update/upsert require page type, flat frontmatter, and a Markdown body. Archive/restore " +
+    "require only the original wiki/pages/<type>/**/*.md path and preserve page bytes under " +
+    "artifacts/knowledge-archive. Successful operations refresh wiki/index.md and append a structural action to " +
+    "wiki/log.md. Direct manual writes to managed wiki paths are blocked when first-party extensions are enabled.",
+  promptSnippet:
+    "Write or reversibly archive durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
   promptGuidelines: [
-    "Use knowledge_update for durable Knowledge v2 writes; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, or wiki/pages/**.",
+    "Use knowledge_update for durable Knowledge v2 writes and reversible archive/restore; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, or wiki/pages/**.",
+    "For create, update, or upsert, provide type, a slug or managed page path, flat frontmatter, and a Markdown body without frontmatter.",
+    "For archive or restore, provide only op and the original managed wiki/pages/<type>/**/*.md path; never fabricate write payload fields.",
     "knowledge_update is for synthesized durable knowledge, not arbitrary file editing or active task state.",
   ] as string[],
   parameters: {
-    type: "object",
-    properties: {
-      op: { type: "string", enum: ["create", "update", "upsert"], description: "Write operation." },
-      type: { type: "string", enum: ["user", "project", "feedback", "reference"], description: "Knowledge page type." },
-      slug: { type: "string", description: "Safe relative slug under wiki/pages/<type>, without or with .md." },
-      path: { type: "string", description: "Alternative relative path under wiki/pages/<type>/**/*.md." },
-      frontmatter: {
+    anyOf: [
+      {
         type: "object",
-        description: "Flat frontmatter with required name, description, and type fields.",
+        title: "Create, update, or upsert a Knowledge page",
+        additionalProperties: false,
+        properties: {
+          op: {
+            type: "string",
+            enum: ["create", "update", "upsert"],
+            description: "Managed page write operation.",
+          },
+          type: {
+            type: "string",
+            enum: ["user", "project", "feedback", "reference"],
+            description: "Knowledge page type.",
+          },
+          slug: {
+            type: "string",
+            description: "Safe relative slug under wiki/pages/<type>, without or with .md.",
+          },
+          path: {
+            type: "string",
+            description: "Alternative original relative path under wiki/pages/<type>/**/*.md.",
+          },
+          frontmatter: {
+            type: "object",
+            description: "Flat frontmatter with required name, description, and type fields.",
+          },
+          body: { type: "string", description: "Markdown body without frontmatter." },
+        },
+        required: ["op", "type", "frontmatter", "body"],
+        anyOf: [
+          { required: ["slug"] },
+          { required: ["path"] },
+        ],
       },
-      body: { type: "string", description: "Markdown body without frontmatter." },
-    },
-    required: ["op", "type", "frontmatter", "body"],
+      {
+        type: "object",
+        title: "Archive or restore a Knowledge page",
+        additionalProperties: false,
+        properties: {
+          op: {
+            type: "string",
+            enum: ["archive", "restore"],
+            description: "Reversible managed page move.",
+          },
+          path: {
+            type: "string",
+            description: "Original relative path under wiki/pages/<type>/**/*.md.",
+          },
+        },
+        required: ["op", "path"],
+      },
+    ],
   },
 } as const;
 
