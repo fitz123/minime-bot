@@ -2,11 +2,13 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -457,6 +459,77 @@ describe("knowledge maintenance", () => {
     assert.equal(response.mutated, false);
     assert.equal(response.errors[0]?.reason, "archive-verification-failed");
     assert.equal(existsSync(join(workspace, ...relPath.split("/"))), true);
+  });
+
+  it("rejects a partial updater success that moves bytes without updating index and log", () => {
+    const workspace = createWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-01-01.md";
+    const activePath = addPage(workspace, relPath, frontmatter("Partial success")).absPath;
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const archivePath = join(workspace, ...archiveRelPath.split("/"));
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => NOW,
+        executeUpdate: () => {
+          mkdirSync(dirname(archivePath), { recursive: true });
+          linkSync(activePath, archivePath);
+          unlinkSync(activePath);
+          return {
+            ok: true,
+            layoutKind: "v2",
+            operation: "archive",
+            action: "archived",
+            path: relPath,
+            archivePath: archiveRelPath,
+            indexPath: "wiki/index.md",
+            logPath: "wiki/log.md",
+            lockPath: ".tmp/knowledge-update.lock",
+          };
+        },
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.stopReason, "unsafe-failure");
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, true);
+    assert.equal(response.errors[0]?.reason, "archive-verification-failed");
+    assert.equal(response.bytesAfter, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+    assert.equal(existsSync(join(workspace, "wiki/log.md")), false);
+  });
+
+  it("treats a log-only failed updater as unsafe state drift", () => {
+    const workspace = createWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-01-01.md";
+    addPage(workspace, relPath, frontmatter("Log drift"));
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => NOW,
+        executeUpdate: () => {
+          writeWorkspaceFile(workspace, "wiki/log.md", "- injected drift\n");
+          return {
+            ok: false,
+            status: "rejected",
+            reason: "injected-log-drift",
+            message: "Injected failure with log-only drift.",
+          };
+        },
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.stopReason, "unsafe-failure");
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, true);
+    assert.equal(response.errors[0]?.reason, "injected-log-drift");
   });
 
   it("stops after a failed archive when post-failure state no longer matches", () => {

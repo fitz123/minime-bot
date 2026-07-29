@@ -18,6 +18,7 @@ import {
 } from "./layout.js";
 import {
   executeKnowledgeUpdate,
+  knowledgeIndexMatchesActiveCorpus,
   KNOWLEDGE_ARCHIVE_PRECONDITION_CHANGED_REASON,
   KNOWLEDGE_ARCHIVE_PRECONDITION_LOW_WATERMARK_REASON,
   validateKnowledgePageFrontmatter,
@@ -152,6 +153,8 @@ interface FileSnapshot {
 
 interface CandidateSnapshot {
   indexBytes: Buffer;
+  indexCoherent: boolean;
+  log: FileSnapshot;
   active: FileSnapshot;
   archive: FileSnapshot;
 }
@@ -558,6 +561,8 @@ function snapshotCandidate(
 ): CandidateSnapshot {
   return {
     indexBytes: readIndexBytes(layout),
+    indexCoherent: knowledgeIndexMatchesActiveCorpus(layout),
+    log: snapshotFile(layout.paths.logPath),
     active: snapshotFile(resolve(layout.agentWorkspaceRoot, ...relPath.split("/"))),
     archive: snapshotFile(resolve(
       layout.paths.knowledgeArchiveDir,
@@ -582,6 +587,8 @@ function sameFileSnapshot(left: FileSnapshot, right: FileSnapshot): boolean {
 function sameCandidateSnapshot(left: CandidateSnapshot, right: CandidateSnapshot): boolean {
   return (
     left.indexBytes.equals(right.indexBytes) &&
+    left.indexCoherent === right.indexCoherent &&
+    sameFileSnapshot(left.log, right.log) &&
     sameFileSnapshot(left.active, right.active) &&
     sameFileSnapshot(left.archive, right.archive)
   );
@@ -590,14 +597,46 @@ function sameCandidateSnapshot(left: CandidateSnapshot, right: CandidateSnapshot
 function successfulArchiveMatches(
   before: CandidateSnapshot,
   after: CandidateSnapshot,
+  relPath: string,
+  archiveRelPath: string,
 ): boolean {
   return (
     before.active.kind === "file" &&
     before.archive.kind === "missing" &&
     after.active.kind === "missing" &&
     after.archive.kind === "file" &&
-    Boolean(before.active.bytes?.equals(after.archive.bytes as Buffer))
+    Boolean(before.active.bytes?.equals(after.archive.bytes as Buffer)) &&
+    after.indexCoherent &&
+    successfulArchiveLogMatches(before.log, after.log, relPath, archiveRelPath)
   );
+}
+
+function successfulArchiveLogMatches(
+  before: FileSnapshot,
+  after: FileSnapshot,
+  relPath: string,
+  archiveRelPath: string,
+): boolean {
+  if ((before.kind !== "missing" && before.kind !== "file") || after.kind !== "file") {
+    return false;
+  }
+  const existing = before.kind === "file" ? before.bytes?.toString("utf8") ?? "" : "";
+  const base = existing.endsWith("\n") || existing.length === 0 ? existing : `${existing}\n`;
+  const next = after.bytes?.toString("utf8") ?? "";
+  if (!next.startsWith(base)) {
+    return false;
+  }
+  const entry = next.slice(base.length);
+  const suffix = ` archive ${relPath} -> ${archiveRelPath}\n`;
+  if (!entry.startsWith("- ") || !entry.endsWith(suffix)) {
+    return false;
+  }
+  const timestamp = entry.slice(2, entry.length - suffix.length);
+  try {
+    return new Date(timestamp).toISOString() === timestamp;
+  } catch {
+    return false;
+  }
 }
 
 function reportTargetFor(
@@ -932,13 +971,20 @@ export function executeKnowledgeMaintenance(
     if (
       response.operation !== "archive" ||
       response.action !== "archived" ||
-      !successfulArchiveMatches(before, after)
+      response.path !== candidate.relPath ||
+      response.archivePath !== `artifacts/knowledge-archive/${candidate.relPath}` ||
+      !successfulArchiveMatches(
+        before,
+        after,
+        candidate.relPath,
+        `artifacts/knowledge-archive/${candidate.relPath}`,
+      )
     ) {
       addError(
         state,
         candidate.relPath,
         "archive-verification-failed",
-        "Managed archive returned success without the expected byte-identical active-to-archive move.",
+        "Managed archive returned success without a coherent byte-identical move, index, and structural log.",
       );
       if (!sameCandidateSnapshot(before, after)) {
         state.mutated = true;

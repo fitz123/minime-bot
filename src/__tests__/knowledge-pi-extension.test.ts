@@ -327,8 +327,13 @@ describe("Knowledge Pi extension helpers", () => {
         "artifacts/knowledge-archive/wiki/pages/project/*.md",
       ],
       ["rm -rf artifacts", "artifacts"],
+      ["rm -rf artifacts/*", "artifacts"],
       ["mv artifacts /tmp/archive-backup", "artifacts"],
       ["find artifacts -delete", "artifacts"],
+      ["rsync -a --delete /tmp/empty/ artifacts/", "artifacts"],
+      ["git restore artifacts", "artifacts"],
+      ["node delete-tree.js artifacts", "artifacts"],
+      ["node delete-tree.js --root=artifacts", "artifacts"],
       [
         "printf x > $UNKNOWN/artifacts/knowledge-archive/wiki/pages/project/runtime.md",
         "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
@@ -356,6 +361,7 @@ describe("Knowledge Pi extension helpers", () => {
       "mkdir -p artifacts/maintenance",
       "touch artifacts/maintenance-report.json",
       "mv source.md artifacts",
+      "node report.js artifacts/maintenance",
     ]) {
       assert.equal(
         classifyKnowledgeIntegrityToolCall(

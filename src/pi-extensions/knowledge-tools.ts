@@ -386,7 +386,7 @@ export function classifyKnowledgeIntegrityToolCall(
       deps.env,
     );
     for (const rawTarget of destructiveAncestorTargets) {
-      const absTarget = resolveShellPath(rawTarget, cwd, deps.env);
+      const absTarget = resolveShellPath(staticShellPathPrefix(rawTarget), cwd, deps.env);
       if (!absTarget) {
         continue;
       }
@@ -493,12 +493,41 @@ function extractBashDestructiveAncestorTargetsAtDepth(
         appendTargetCandidates(targets, sources, commandCwd, env);
       } else if (name === "find" && args.includes("-delete")) {
         appendTargetCandidates(targets, commandOperands(args).slice(0, 1), commandCwd, env);
+      } else if (
+        name === "cp" &&
+        args.some((arg) =>
+          arg === "--archive" ||
+          arg === "--recursive" ||
+          /^-[^-]*[aRr]/.test(arg))
+      ) {
+        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, env);
+      } else if (
+        name !== "mkdir" &&
+        name !== "touch" &&
+        name !== "truncate" &&
+        name !== "unlink" &&
+        !isReadOnlyShellCommand(name, args)
+      ) {
+        appendTargetCandidates(targets, commandPathArguments(args), commandCwd, env);
       }
     }
     currentCwd = cwdAfterSegment(segment, currentCwd, env);
   }
 
   return targets;
+}
+
+function staticShellPathPrefix(rawPath: string): string {
+  const expansionIndex = rawPath.search(/[$`*?\[\]{}]/);
+  if (expansionIndex < 0) {
+    return rawPath;
+  }
+  const literalPrefix = rawPath.slice(0, expansionIndex);
+  const separatorIndex = Math.max(literalPrefix.lastIndexOf("/"), literalPrefix.lastIndexOf("\\"));
+  if (separatorIndex < 0) {
+    return ".";
+  }
+  return literalPrefix.slice(0, separatorIndex) || "/";
 }
 
 function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: string, env?: NodeJS.ProcessEnv): string[] {
@@ -958,6 +987,24 @@ function commandOperands(args: string[]): string[] {
     }
   }
   return operands;
+}
+
+function commandPathArguments(args: string[]): string[] {
+  const targets = commandOperands(args);
+  for (const arg of args) {
+    if (!arg.startsWith("-")) {
+      continue;
+    }
+    const separatorIndex = arg.indexOf("=");
+    if (separatorIndex < 0) {
+      continue;
+    }
+    const value = arg.slice(separatorIndex + 1);
+    if (isPathLikeShellTarget(value)) {
+      appendTarget(targets, value);
+    }
+  }
+  return targets;
 }
 
 function copyLikeTargets(args: string[]): string[] {

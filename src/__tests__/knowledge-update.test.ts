@@ -19,6 +19,7 @@ import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { executeKnowledgeSearch } from "../knowledge/tools.js";
 import {
   executeKnowledgeUpdate,
+  formatKnowledgePage,
   formatKnowledgeUpdateResponse,
   type KnowledgeUpdateResponse,
 } from "../knowledge/update.js";
@@ -754,15 +755,13 @@ describe("knowledge_update", () => {
     assert.equal(existsSync(join(outside, "secret.md")), false);
   });
 
-  it("rejects managed paths that could corrupt index links or structural logs", () => {
+  it("rejects managed paths with control characters that could forge structural log entries", () => {
     const workspace = createV2Workspace();
 
     for (const path of [
-      "wiki/pages/project/broken link.md",
-      "wiki/pages/project/fragment#target.md",
-      "wiki/pages/project/query?target.md",
-      "wiki/pages/project/close)paren.md",
       "wiki/pages/project/forged\n- 2026-07-29T00:00:00.000Z archive fake.md",
+      "wiki/pages/project/forged\rentry.md",
+      "wiki/pages/project/forged\tentry.md",
     ]) {
       const response = executeKnowledgeUpdate(
         { op: "archive", path },
@@ -774,6 +773,53 @@ describe("knowledge_update", () => {
     }
 
     assert.equal(existsSync(join(workspace, "wiki/log.md")), false);
+  });
+
+  it("preserves existing managed filenames and safely serializes their index links", () => {
+    const relPath = "wiki/pages/project/Legacy Notes (β)+#?.md";
+    const workspace = createV2Workspace({
+      [relPath]: formatKnowledgePage(
+        {
+          name: "Legacy Notes",
+          description: "Legacy Notes description",
+          type: "project",
+        },
+        "# Legacy\n",
+      ),
+    });
+
+    const created = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "unrelated",
+        frontmatter: pageFrontmatter("Unrelated"),
+        body: "# Unrelated\n",
+      },
+      { agentWorkspaceRoot: workspace, now: () => new Date("2026-07-29T01:00:00.000Z") },
+    );
+    assertUpdateOk(created);
+    assert.match(
+      readFileSync(join(workspace, "wiki/index.md"), "utf8"),
+      /\(pages\/project\/Legacy%20Notes%20%28%CE%B2%29%2B%23%3F\.md\)/,
+    );
+
+    const archived = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: workspace, now: () => new Date("2026-07-29T02:00:00.000Z") },
+    );
+    assertUpdateOk(archived);
+    assert.match(
+      readFileSync(join(workspace, "wiki/log.md"), "utf8"),
+      / archive wiki\/pages\/project\/Legacy Notes \(β\)\+#\?\.md -> artifacts\/knowledge-archive\//,
+    );
+
+    const restored = executeKnowledgeUpdate(
+      { op: "restore", path: relPath },
+      { agentWorkspaceRoot: workspace, now: () => new Date("2026-07-29T03:00:00.000Z") },
+    );
+    assertUpdateOk(restored);
+    assert.equal(existsSync(join(workspace, ...relPath.split("/"))), true);
   });
 
   it("rejects legacy and Karpathy-style non-v2 wiki layouts", () => {

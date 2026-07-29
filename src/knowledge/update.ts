@@ -151,6 +151,7 @@ const REQUIRED_FRONTMATTER = ["name", "description", "type"] as const;
 const OPTIONAL_FRONTMATTER = ["confidence", "revisit_if", "originSessionId"] as const;
 const ALLOWED_FRONTMATTER = new Set<string>([...REQUIRED_FRONTMATTER, ...OPTIONAL_FRONTMATTER]);
 const SAFE_PATH_SEGMENT_RE = /^[a-z0-9][a-z0-9._-]*$/i;
+const UNSAFE_PATH_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const TYPE_LABELS: Record<KnowledgePageType, string> = {
   user: "User",
   project: "Project",
@@ -362,11 +363,11 @@ function normalizePagePath(raw: unknown): string | KnowledgeUpdateFailure {
     return failure("rejected", "invalid-path", "knowledge_update only accepts workspace-relative Markdown paths.");
   }
   const parts = relPath.split("/");
-  if (parts.some((part) => !part || part === "." || part === ".." || !SAFE_PATH_SEGMENT_RE.test(part))) {
+  if (parts.some((part) => !part || part === "." || part === ".." || UNSAFE_PATH_CONTROL_RE.test(part))) {
     return failure(
       "rejected",
       "invalid-path",
-      "knowledge_update page paths require non-empty safe filename segments.",
+      "knowledge_update rejects empty, dot, traversal, and control-character path segments.",
     );
   }
   if (extname(relPath).toLowerCase() !== ".md") {
@@ -729,14 +730,6 @@ function parseExistingPage(
   relPath: string,
   fs: KnowledgeUpdateFs,
 ): ParsedPage | KnowledgeUpdateFailure {
-  const normalizedPath = normalizePagePath(relPath);
-  if (typeof normalizedPath !== "string" || normalizedPath !== relPath) {
-    return failure(
-      "rejected",
-      "invalid-page-path",
-      "Knowledge v2 page paths require safe filename segments.",
-    );
-  }
   const frontmatterResult = parseMarkdownFrontmatter(fs.readFileSync(absPath, "utf8"));
   if (isUpdateFailure(frontmatterResult)) {
     return frontmatterResult;
@@ -786,6 +779,17 @@ function escapeIndexText(value: string): string {
   return value.replace(/\s+/g, " ").trim().replace(/\]/g, "\\]");
 }
 
+function encodeIndexLinkPath(value: string): string {
+  return value
+    .split("/")
+    .map((part) =>
+      encodeURIComponent(part).replace(
+        /[!'()*]/g,
+        (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+      ))
+    .join("/");
+}
+
 export function generateKnowledgeIndex(pages: readonly ParsedPage[]): string {
   const lines = [
     "# Knowledge Index",
@@ -803,13 +807,25 @@ export function generateKnowledgeIndex(pages: readonly ParsedPage[]): string {
     }
     for (const page of typePages) {
       lines.push(
-        `- [${escapeIndexText(page.frontmatter.name)}](${page.linkPath}) - ${escapeIndexText(page.frontmatter.description)}`,
+        `- [${escapeIndexText(page.frontmatter.name)}](${encodeIndexLinkPath(page.linkPath)}) - ${escapeIndexText(page.frontmatter.description)}`,
       );
     }
     lines.push("");
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function knowledgeIndexMatchesActiveCorpus(layout: ResolvedKnowledgeV2Layout): boolean {
+  try {
+    const pages = collectPages(layout, defaultFs);
+    return (
+      !isUpdateFailure(pages) &&
+      defaultFs.readFileSync(layout.paths.indexPath, "utf8") === generateKnowledgeIndex(pages)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function verifyIndexInvariants(
