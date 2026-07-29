@@ -31,6 +31,7 @@ const EXPECTED_MONITORING_EXAMPLE_FILES = [
   "minime.rules.yml",
   "prometheus.yml",
 ];
+const KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES = 40 * 1024;
 const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(RETIRED_GUARD_WRAPPER);
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
@@ -173,6 +174,16 @@ function createKnowledgeFixture(agentWorkspace: string): void {
       "",
     ].join("\n"),
   );
+}
+
+function writeExactKnowledgeIndexSize(agentWorkspace: string, bytes: number): void {
+  const prefix = "# Knowledge Index\n";
+  writeWorkspaceFile(
+    agentWorkspace,
+    "wiki/index.md",
+    `${prefix}${" ".repeat(bytes - Buffer.byteLength(prefix))}`,
+  );
+  assert.equal(readFileSync(join(agentWorkspace, "wiki", "index.md")).byteLength, bytes);
 }
 
 function collectSchemaFiles(root: string): string[] {
@@ -589,6 +600,126 @@ describe("package artifact install", () => {
       );
       assert.equal(knowledgeGet.status, 0, knowledgeGet.stderr || knowledgeGet.stdout);
       assert.equal(knowledgeGet.stdout, "# Runtime\n");
+
+      const runtimeRelPath = "wiki/pages/project/runtime.md";
+      const runtimeBytes = readFileSync(join(agentWorkspace, ...runtimeRelPath.split("/")));
+      const knowledgeArchive = runInstalledBin(
+        projectDir,
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "archive",
+          "--path",
+          runtimeRelPath,
+          "--json",
+        ],
+        workspace,
+      );
+      assert.equal(knowledgeArchive.status, 0, knowledgeArchive.stderr || knowledgeArchive.stdout);
+      const archiveJson = JSON.parse(knowledgeArchive.stdout) as {
+        ok: boolean;
+        action: string;
+        archivePath: string;
+      };
+      assert.equal(archiveJson.ok, true);
+      assert.equal(archiveJson.action, "archived");
+      assert.equal(archiveJson.archivePath, `artifacts/knowledge-archive/${runtimeRelPath}`);
+      assert.equal(existsSync(join(agentWorkspace, ...runtimeRelPath.split("/"))), false);
+
+      const archivedSearch = runInstalledBin(
+        projectDir,
+        ["knowledge", "search", "--workspace", agentWorkspace, "--query", "synthetic", "--json"],
+        workspace,
+      );
+      assert.equal(archivedSearch.status, 0, archivedSearch.stderr || archivedSearch.stdout);
+      assert.equal(
+        (JSON.parse(archivedSearch.stdout) as { results: Array<{ path: string }> }).results
+          .some((result) => result.path === runtimeRelPath),
+        false,
+      );
+
+      const knowledgeRestore = runInstalledBin(
+        projectDir,
+        [
+          "knowledge",
+          "update",
+          "--workspace",
+          agentWorkspace,
+          "--op",
+          "restore",
+          "--path",
+          runtimeRelPath,
+          "--json",
+        ],
+        workspace,
+      );
+      assert.equal(knowledgeRestore.status, 0, knowledgeRestore.stderr || knowledgeRestore.stdout);
+      assert.equal(
+        (JSON.parse(knowledgeRestore.stdout) as { ok: boolean; action: string }).action,
+        "restored",
+      );
+      assert.deepEqual(readFileSync(join(agentWorkspace, ...runtimeRelPath.split("/"))), runtimeBytes);
+
+      const restoredSearch = runInstalledBin(
+        projectDir,
+        ["knowledge", "search", "--workspace", agentWorkspace, "--query", "synthetic", "--json"],
+        workspace,
+      );
+      assert.equal(restoredSearch.status, 0, restoredSearch.stderr || restoredSearch.stdout);
+      assert.equal(
+        (JSON.parse(restoredSearch.stdout) as { results: Array<{ path: string }> }).results
+          .some((result) => result.path === runtimeRelPath),
+        true,
+      );
+
+      writeExactKnowledgeIndexSize(agentWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES);
+      const quietMaintenance = runInstalledBin(
+        projectDir,
+        ["knowledge", "maintain", "--workspace", agentWorkspace],
+        workspace,
+      );
+      assert.equal(quietMaintenance.status, 0, quietMaintenance.stderr || quietMaintenance.stdout);
+      assert.equal(quietMaintenance.stdout, "");
+      assert.equal(quietMaintenance.stderr, "");
+      assert.equal(
+        readFileSync(join(agentWorkspace, "wiki", "index.md")).byteLength,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES,
+      );
+
+      writeExactKnowledgeIndexSize(agentWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+      const pressuredMaintenance = runInstalledBin(
+        projectDir,
+        ["knowledge", "maintain", "--workspace", agentWorkspace, "--json"],
+        workspace,
+      );
+      assert.equal(
+        pressuredMaintenance.status,
+        0,
+        pressuredMaintenance.stderr || pressuredMaintenance.stdout,
+      );
+      const maintenanceJson = JSON.parse(pressuredMaintenance.stdout) as {
+        stopReason: string;
+        bytesBefore: number;
+        bytesAfter: number;
+        archivedCount: number;
+        mutated: boolean;
+        skipped: { nonDated: number };
+      };
+      assert.equal(maintenanceJson.stopReason, "eligible-exhausted");
+      assert.equal(
+        maintenanceJson.bytesBefore,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+      );
+      assert.equal(
+        maintenanceJson.bytesAfter,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+      );
+      assert.equal(maintenanceJson.archivedCount, 0);
+      assert.equal(maintenanceJson.mutated, false);
+      assert.equal(maintenanceJson.skipped.nonDated, 1);
 
       const knowledgeBodyFile = join(temp, "installed-knowledge-body.md");
       writeFileSync(knowledgeBodyFile, "# Installed Update\n\nInstalled package CLI update is searchable.\n", "utf8");
@@ -1546,6 +1677,20 @@ assert.match(knowledgeGetResult.content[0].text, /# Runtime/);
 
 const knowledgeUpdateTool = registeredToolDefs.find((tool) => tool.name === "knowledge_update");
 assert.ok(knowledgeUpdateTool, "knowledge_update should be registered");
+assert.equal(knowledgeUpdateTool.parameters.type, "object");
+assert.deepEqual(knowledgeUpdateTool.parameters.required, ["op"]);
+assert.deepEqual(knowledgeUpdateTool.parameters.properties.op.enum, [
+  "create",
+  "update",
+  "upsert",
+  "archive",
+  "restore",
+]);
+const [knowledgeWriteSchema, knowledgeMoveSchema] = knowledgeUpdateTool.parameters.anyOf;
+assert.deepEqual(knowledgeWriteSchema.required, ["op", "type", "frontmatter", "body"]);
+assert.deepEqual(knowledgeMoveSchema.required, ["op", "path"]);
+assert.deepEqual(knowledgeMoveSchema.properties.op.enum, ["archive", "restore"]);
+assert.equal("body" in knowledgeMoveSchema.properties, false);
 const knowledgeUpdateResult = await knowledgeUpdateTool.execute("knowledge-call-3", {
   op: "upsert",
   type: "project",
@@ -1559,6 +1704,24 @@ const knowledgeUpdateResult = await knowledgeUpdateTool.execute("knowledge-call-
 });
 assert.equal(knowledgeUpdateResult.details.ok, true);
 assert.match(knowledgeUpdateResult.content[0].text, /wiki\/pages\/project\/wrapper-update\.md/);
+const wrapperRelPath = "wiki/pages/project/wrapper-update.md";
+const wrapperArchivePath = "artifacts/knowledge-archive/" + wrapperRelPath;
+const wrapperArchiveResult = await knowledgeUpdateTool.execute("knowledge-call-4", {
+  op: "archive",
+  path: wrapperRelPath,
+});
+assert.equal(wrapperArchiveResult.details.ok, true);
+assert.match(wrapperArchiveResult.content[0].text, /"action": "archived"/);
+assert.equal(existsSync(join(agentWorkspace, wrapperRelPath)), false);
+assert.equal(existsSync(join(agentWorkspace, wrapperArchivePath)), true);
+const wrapperRestoreResult = await knowledgeUpdateTool.execute("knowledge-call-5", {
+  op: "restore",
+  path: wrapperRelPath,
+});
+assert.equal(wrapperRestoreResult.details.ok, true);
+assert.match(wrapperRestoreResult.content[0].text, /"action": "restored"/);
+assert.equal(existsSync(join(agentWorkspace, wrapperRelPath)), true);
+assert.equal(existsSync(join(agentWorkspace, wrapperArchivePath)), false);
 
 assert.equal(toolCallHandlers.length, 1);
 const blockDecision = await toolCallHandlers[0]({

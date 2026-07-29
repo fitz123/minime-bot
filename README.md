@@ -59,6 +59,9 @@ Knowledge commands operate on an agent workspace, not the control workspace:
 minime-bot knowledge search --workspace /path/to/agent-workspace --query "runtime notes" --scope default --max-results 10 --json
 minime-bot knowledge get --workspace /path/to/agent-workspace --path wiki/pages/project/runtime.md --from 1 --lines 20
 minime-bot knowledge update --workspace /path/to/agent-workspace --op upsert --type project --slug runtime --frontmatter '{"name":"Runtime","description":"Runtime notes","type":"project"}' --body-file /path/to/body.md --json
+minime-bot knowledge update --workspace /path/to/agent-workspace --op archive --path wiki/pages/project/history/issue-123-2026-05-01.md --json
+minime-bot knowledge update --workspace /path/to/agent-workspace --op restore --path wiki/pages/project/history/issue-123-2026-05-01.md --json
+minime-bot knowledge maintain --workspace /path/to/agent-workspace --closed-issues '[123,456]' --json --report artifacts/knowledge-maintenance/latest.json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --dry-run --report /path/to/report.json --json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --apply --allow-dirty --report /path/to/report.json --json
 ```
@@ -73,11 +76,15 @@ both select that curated corpus. Use `--scope diary` for narrative history and
 `MINIME_CONTROL_WORKSPACE_ROOT`.
 
 `update` is the durable Knowledge v2 write path; direct Pi writes to managed v2
-wiki paths are blocked when first-party Pi extensions are enabled. Migration is
-dry-run by default. `--apply` writes planned files only when the agent workspace
-has a clean git worktree and no blocking review items; `--allow-dirty` bypasses
-only the git cleanliness gate after operator review. Migration writes or copies
-files, does not delete legacy sources, and `--report` writes the JSON response.
+wiki paths are blocked when first-party Pi extensions are enabled. Its
+`create`, `update`, and `upsert` operations use the page write payload shown
+above. `archive` and `restore` instead accept only `--op` and the original
+managed `--path`; they do not accept type, slug, frontmatter, or body flags.
+Migration is dry-run by default. `--apply` writes planned files only when the
+agent workspace has a clean git worktree and no blocking review items;
+`--allow-dirty` bypasses only the git cleanliness gate after operator review.
+Migration writes or copies files, does not delete legacy sources, and
+`--report` writes the JSON response.
 Dry-runs skip catalog-only legacy memory indexes and report known active
 runtime docs or package/domain trees as nonblocking `out_of_scope` review items.
 Pre-v2 `wiki/schema.md`, `wiki/index.md`, `wiki/log.md`, and existing
@@ -336,6 +343,71 @@ flat YAML with required `name`, `description`, and `type`; optional fields are
 `knowledge update` must not include its own frontmatter. `--op create` refuses
 existing pages, `--op update` requires an existing page, and `--op upsert`
 creates or updates as needed while regenerating `wiki/index.md`.
+
+Archive and restore are reversible managed moves. Archiving
+`wiki/pages/<type>/<path>.md` preserves its serialized bytes at
+`artifacts/knowledge-archive/wiki/pages/<type>/<path>.md`, removes the active
+page from `wiki/index.md` and default search, and returns both paths. Restoring
+uses the same original `wiki/pages/**` path to move those bytes back into the
+active corpus. The helper rejects missing sources, symlinks, path escapes, and
+occupied or duplicate active/archive destinations instead of overwriting
+either copy. When first-party Pi extensions are enabled, their integrity guard
+also blocks direct write, edit, and mutating shell access to both
+`wiki/pages/**` and `artifacts/knowledge-archive/**`; use `knowledge update`
+for either side of the managed move. Explicitly destructive recursive,
+archive-extraction, and worktree-mutating Git operations are also blocked when
+they target an ancestor containing either managed tree. Read-only commands and
+mutations confined to unrelated subdirectories remain available.
+
+Every committed modifying operation appends a structural entry to
+`wiki/log.md`: `create`, `update`, `archive`, or `restore`. An upsert records
+the create/update action it actually performed. Entries retain the original
+page path; archive and restore entries also identify the mechanical archive
+path. Failed or rolled-back operations do not append log entries, and the log
+does not contain page bodies.
+
+`knowledge maintain` implements a fixed policy intended for a parent-owned
+weekly schedule:
+
+- It measures the raw `wiki/index.md` size first. At or below 40 KiB (40960
+  bytes), it does no candidate scan or mutation and emits no stdout by default.
+- Above 40 KiB, it considers only project pages named for completed process
+  records: `release-YYYY-M-PATCH.md` (the package CalVer page convention) or
+  `issue-N.md` / `issue-N-<safe-slug>.md`. Release records are treated as
+  completed; issue records require `N` in the caller-supplied positive-integer
+  JSON array passed with `--closed-issues`. The package does not fetch issue
+  state. Record age comes from `mtime`, not from interpreting a filename suffix
+  as a calendar completion date.
+- A candidate must have been unmodified for at least 30 days. Filesystem
+  `mtime` is the conservative age clock, so any recent edit restarts the wait.
+  A page containing the optional `revisit_if` frontmatter field is treated as
+  mixed/current and skipped.
+- Eligible pages are archived oldest first, with path as the deterministic
+  tie-breaker, until the regenerated index is at or below 30 KiB (30720 bytes)
+  or eligible pages are exhausted. The watermarks and age cannot be overridden.
+
+Use `--json` to print the bounded maintenance manifest. `--report` writes the
+same fixed-schema evidence to a contained workspace JSON path outside
+`wiki/**` and `artifacts/knowledge-archive/**`; requesting a report also makes
+an otherwise quiet run print its summary. The manifest reports before/after
+bytes, archived and skipped counts, bounded paths/errors, stop reason, and
+whether mutation occurred.
+
+Closed-issue evidence accepts at most 1,000 array entries. A manifest retains
+at most 100 archived paths and 20 errors (each error message is at most 240
+characters); `archivedPathsOmitted` and `errorsOmitted` report additional
+entries. `stopReason` is one of `below-high-watermark`,
+`low-watermark-reached`, `eligible-exhausted`, or `unsafe-failure`. An
+`unsafe-failure` manifest is still emitted or reported as requested, but the
+CLI exits with status 1 so scheduled callers can alert on incomplete scans or
+unverified state changes.
+
+A one-time cleanup is deliberately separate from periodic maintenance:
+operators review completed dated pages and invoke explicit installed
+`knowledge update --op archive` operations for the selected original paths.
+There is no force flag that weakens the fixed 40 KiB/30 KiB/30-day maintenance
+policy. Production selection, scheduling, and private cron configuration stay
+outside this public package.
 
 ## Running
 

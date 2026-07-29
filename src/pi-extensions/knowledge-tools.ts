@@ -58,29 +58,102 @@ export const KNOWLEDGE_UPDATE_TOOL = {
   name: "knowledge_update",
   label: "Knowledge Update",
   description:
-    "Create, update, or upsert durable Knowledge v2 Markdown pages through the package-owned write path. This is " +
-    "not arbitrary file editing: it validates flat frontmatter, writes under wiki/pages/<type> only, refreshes " +
-    "wiki/index.md mechanically, and records structural creates in wiki/log.md. Direct manual writes to managed " +
-    "wiki paths are blocked when first-party extensions are enabled.",
-  promptSnippet: "Write durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
+    "Create, update, upsert, archive, or restore durable Knowledge v2 Markdown pages through the package-owned " +
+    "managed path. Create/update/upsert require page type, flat frontmatter, and a Markdown body. Archive/restore " +
+    "require only the original wiki/pages/<type>/**/*.md path and preserve page bytes under " +
+    "artifacts/knowledge-archive. Successful operations refresh wiki/index.md and append a structural action to " +
+    "wiki/log.md. Direct manual writes to managed wiki paths are blocked when first-party extensions are enabled.",
+  promptSnippet:
+    "Write or reversibly archive durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
   promptGuidelines: [
-    "Use knowledge_update for durable Knowledge v2 writes; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, or wiki/pages/**.",
+    "Use knowledge_update for durable Knowledge v2 writes and reversible archive/restore; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, wiki/pages/**, or artifacts/knowledge-archive/**.",
+    "For create, update, or upsert, provide type, a slug or managed page path, flat frontmatter, and a Markdown body without frontmatter.",
+    "For archive or restore, provide only op and the original managed wiki/pages/<type>/**/*.md path; never fabricate write payload fields.",
     "knowledge_update is for synthesized durable knowledge, not arbitrary file editing or active task state.",
   ] as string[],
   parameters: {
     type: "object",
+    additionalProperties: false,
     properties: {
-      op: { type: "string", enum: ["create", "update", "upsert"], description: "Write operation." },
-      type: { type: "string", enum: ["user", "project", "feedback", "reference"], description: "Knowledge page type." },
-      slug: { type: "string", description: "Safe relative slug under wiki/pages/<type>, without or with .md." },
-      path: { type: "string", description: "Alternative relative path under wiki/pages/<type>/**/*.md." },
+      op: {
+        type: "string",
+        enum: ["create", "update", "upsert", "archive", "restore"],
+        description: "Managed Knowledge operation.",
+      },
+      type: {
+        type: "string",
+        enum: ["user", "project", "feedback", "reference"],
+        description: "Knowledge page type for write operations.",
+      },
+      slug: {
+        type: "string",
+        description: "Safe relative slug under wiki/pages/<type>, without or with .md.",
+      },
+      path: {
+        type: "string",
+        description: "Original relative path under wiki/pages/<type>/**/*.md.",
+      },
       frontmatter: {
         type: "object",
         description: "Flat frontmatter with required name, description, and type fields.",
       },
       body: { type: "string", description: "Markdown body without frontmatter." },
     },
-    required: ["op", "type", "frontmatter", "body"],
+    required: ["op"],
+    anyOf: [
+      {
+        type: "object",
+        title: "Create, update, or upsert a Knowledge page",
+        additionalProperties: false,
+        properties: {
+          op: {
+            type: "string",
+            enum: ["create", "update", "upsert"],
+            description: "Managed page write operation.",
+          },
+          type: {
+            type: "string",
+            enum: ["user", "project", "feedback", "reference"],
+            description: "Knowledge page type.",
+          },
+          slug: {
+            type: "string",
+            description: "Safe relative slug under wiki/pages/<type>, without or with .md.",
+          },
+          path: {
+            type: "string",
+            description: "Alternative original relative path under wiki/pages/<type>/**/*.md.",
+          },
+          frontmatter: {
+            type: "object",
+            description: "Flat frontmatter with required name, description, and type fields.",
+          },
+          body: { type: "string", description: "Markdown body without frontmatter." },
+        },
+        required: ["op", "type", "frontmatter", "body"],
+        anyOf: [
+          { required: ["slug"] },
+          { required: ["path"] },
+        ],
+      },
+      {
+        type: "object",
+        title: "Archive or restore a Knowledge page",
+        additionalProperties: false,
+        properties: {
+          op: {
+            type: "string",
+            enum: ["archive", "restore"],
+            description: "Reversible managed page move.",
+          },
+          path: {
+            type: "string",
+            description: "Original relative path under wiki/pages/<type>/**/*.md.",
+          },
+        },
+        required: ["op", "path"],
+      },
+    ],
   },
 } as const;
 
@@ -109,6 +182,7 @@ interface ShellToken {
 interface UnwrappedCommand {
   command: string[];
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 const MANAGED_EXACT_RELPATHS = [
@@ -117,6 +191,7 @@ const MANAGED_EXACT_RELPATHS = [
   "wiki/log.md",
   "wiki/issues.md",
 ] as const;
+const MANAGED_ARCHIVE_RELPATH = "artifacts/knowledge-archive";
 
 const AGENT_WORKSPACE_ENV_FALLBACK_WARNING =
   `${MINIME_AGENT_WORKSPACE_ROOT_ENV} was not provided; falling back to process cwd for this Pi knowledge call.`;
@@ -167,6 +242,18 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   "show-ref",
   "status",
 ]);
+const WORKTREE_MUTATING_GIT_SUBCOMMANDS = new Set([
+  "am",
+  "apply",
+  "checkout",
+  "checkout-index",
+  "cherry-pick",
+  "merge",
+  "pull",
+  "rebase",
+  "revert",
+  "switch",
+]);
 const SUDO_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-D",
@@ -186,7 +273,7 @@ const ENV_OPTIONS_WITH_VALUE = new Set(["-C", "-S", "-u", "--chdir", "--split-st
 const SHELL_OPTIONS_WITH_VALUE = new Set(["-o", "--init-file", "--rcfile"]);
 const MAX_NESTED_SHELL_DEPTH = 4;
 const MANAGED_KNOWLEDGE_PATH_REFERENCE =
-  /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
+  /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*|artifacts\/knowledge-archive(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
 
 function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
   const root = deps.agentWorkspaceRoot;
@@ -276,7 +363,7 @@ export function classifyKnowledgeIntegrityToolCall(
         block: true,
         targetPath: ambiguousManagedPath,
         reason:
-          `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
           `Blocked direct ${event.toolName} target: ${ambiguousManagedPath}.`,
       };
     }
@@ -288,7 +375,7 @@ export function classifyKnowledgeIntegrityToolCall(
           block: true,
           targetPath: managedRawPath,
           reason:
-            `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
             `Blocked direct ${event.toolName} target: ${managedRawPath}.`,
         };
       }
@@ -300,9 +387,33 @@ export function classifyKnowledgeIntegrityToolCall(
         block: true,
         targetPath: managedPath,
         reason:
-          `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
           `Blocked direct ${event.toolName} target: ${managedPath}.`,
       };
+    }
+  }
+  if (event.toolName === "bash") {
+    const destructiveAncestorTargets = extractBashDestructiveAncestorTargetsForCwd(
+      stringField(event.input, "command") ?? "",
+      cwd,
+      deps.env,
+    );
+    for (const rawTarget of destructiveAncestorTargets) {
+      const expandedTarget = expandShellPathVariables(rawTarget, cwd, deps.env) ?? rawTarget;
+      const absTarget = resolveShellPath(staticShellPathPrefix(expandedTarget), cwd, deps.env);
+      if (!absTarget) {
+        continue;
+      }
+      const managedPath = managedKnowledgeAncestorRelPath(layout, absTarget);
+      if (managedPath) {
+        return {
+          block: true,
+          targetPath: managedPath,
+          reason:
+            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
+            `Blocked direct ${event.toolName} target: ${managedPath}.`,
+        };
+      }
     }
   }
 
@@ -342,6 +453,119 @@ export function extractBashWriteTargets(command: string): string[] {
 
 function extractBashWriteTargetsForCwd(command: string, cwd: string, env?: NodeJS.ProcessEnv): string[] {
   return extractBashWriteTargetsAtDepth(command, 0, cwd, env);
+}
+
+function extractBashDestructiveAncestorTargetsForCwd(
+  command: string,
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+): string[] {
+  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env);
+}
+
+function extractBashDestructiveAncestorTargetsAtDepth(
+  command: string,
+  depth: number,
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string[] {
+  if (depth > MAX_NESTED_SHELL_DEPTH) {
+    return [];
+  }
+  const tokens = expandAttachedRedirections(tokenizeShell(command).map((token) => token.value));
+  const targets: string[] = [];
+  let currentCwd = cwd;
+
+  for (const segment of splitShellSegments(tokens)) {
+    const {
+      command: unwrapped,
+      cwd: commandCwd,
+      env: commandEnv,
+    } = unwrapCommandWithCwd(segment, currentCwd, env);
+    if (unwrapped.length > 0) {
+      const name = basename(unwrapped[0]);
+      const args = unwrapped.slice(1);
+      if (NESTED_SHELL_COMMANDS.has(name)) {
+        const nestedCommand = nestedShellCommand(args);
+        if (nestedCommand) {
+          for (const target of extractBashDestructiveAncestorTargetsAtDepth(
+            nestedCommand,
+            depth + 1,
+            commandCwd,
+            commandEnv,
+          )) {
+            appendTarget(targets, target);
+          }
+        }
+      } else if (
+        name === "rm" &&
+        args.some((arg) => arg === "--recursive" || /^-[^-]*[rR]/.test(arg))
+      ) {
+        appendTargetCandidates(targets, commandOperands(args), commandCwd, commandEnv);
+      } else if (name === "mv") {
+        const operands = commandOperands(args);
+        const targetDir = optionValue(args, "-t") ?? optionValue(args, "--target-directory");
+        const sources = targetDir
+          ? operands.filter((operand) => operand !== targetDir)
+          : operands.slice(0, -1);
+        appendTargetCandidates(targets, sources, commandCwd, commandEnv);
+      } else if (
+        name === "find" &&
+        args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir")
+      ) {
+        appendTargetCandidates(targets, commandOperands(args).slice(0, 1), commandCwd, commandEnv);
+      } else if (
+        name === "cp" &&
+        args.some((arg) =>
+          arg === "--archive" ||
+          arg === "--recursive" ||
+          /^-[^-]*[aRr]/.test(arg))
+      ) {
+        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, commandEnv);
+      } else if (
+        name === "rsync" &&
+        args.some((arg) => arg === "--delete" || arg.startsWith("--delete-"))
+      ) {
+        appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, commandEnv);
+      } else if (name === "tar" && tarExtracts(args)) {
+        appendTargetCandidates(
+          targets,
+          tarExtractionTargets(args, commandCwd, commandEnv),
+          commandCwd,
+          commandEnv,
+        );
+      } else if (isInterpreter(name)) {
+        appendTargetCandidates(
+          targets,
+          interpreterDestructiveAncestorTargets(args),
+          commandCwd,
+          commandEnv,
+        );
+      } else if (name === "git") {
+        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, commandEnv);
+        if (worktreeTarget) {
+          appendTargetCandidates(targets, gitWorktreePathArguments(args), commandCwd, commandEnv);
+          appendTargetCandidates(targets, [worktreeTarget], commandCwd, commandEnv);
+        }
+      }
+    }
+    currentCwd = cwdAfterSegment(segment, currentCwd, env);
+  }
+
+  return targets;
+}
+
+function staticShellPathPrefix(rawPath: string): string {
+  const expansionIndex = rawPath.search(/[$`*?\[\]{}]/);
+  if (expansionIndex < 0) {
+    return rawPath;
+  }
+  const literalPrefix = rawPath.slice(0, expansionIndex);
+  const separatorIndex = Math.max(literalPrefix.lastIndexOf("/"), literalPrefix.lastIndexOf("\\"));
+  if (separatorIndex < 0) {
+    return ".";
+  }
+  return literalPrefix.slice(0, separatorIndex) || "/";
 }
 
 function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: string, env?: NodeJS.ProcessEnv): string[] {
@@ -444,9 +668,24 @@ function tokenizeShell(command: string): ShellToken[] {
       quote = "\"";
       continue;
     }
+    if (
+      char === "\\" &&
+      (command[index + 1] === "\n" || command[index + 1] === "\r")
+    ) {
+      index += command[index + 1] === "\r" && command[index + 2] === "\n" ? 2 : 1;
+      continue;
+    }
     if (char === "\\" && index + 1 < command.length) {
       index += 1;
       value += command[index];
+      continue;
+    }
+    if (char === "\n" || char === "\r") {
+      push();
+      tokens.push({ value: ";" });
+      if (char === "\r" && command[index + 1] === "\n") {
+        index += 1;
+      }
       continue;
     }
     if (/\s/.test(char)) {
@@ -454,7 +693,14 @@ function tokenizeShell(command: string): ShellToken[] {
       continue;
     }
     if (char === "#" && value.length === 0) {
-      break;
+      while (
+        index + 1 < command.length &&
+        command[index + 1] !== "\n" &&
+        command[index + 1] !== "\r"
+      ) {
+        index += 1;
+      }
+      continue;
     }
     if (char === "&" && command[index + 1] === ">") {
       push();
@@ -561,9 +807,13 @@ function extractCommandWriteTargets(
   env?: NodeJS.ProcessEnv,
 ): string[] {
   const targets = redirectionTargets(segment);
-  const { command, cwd: commandCwd } = unwrapCommandWithCwd(segment, cwd, env);
+  const {
+    command,
+    cwd: commandCwd,
+    env: commandEnv,
+  } = unwrapCommandWithCwd(segment, cwd, env);
   if (command.length === 0) {
-    return targetCandidates(targets, commandCwd, env);
+    return targetCandidates(targets, commandCwd, commandEnv);
   }
 
   const name = basename(command[0]);
@@ -571,40 +821,44 @@ function extractCommandWriteTargets(
   if (NESTED_SHELL_COMMANDS.has(name)) {
     const nestedCommand = nestedShellCommand(args);
     const nestedTargets = nestedCommand
-      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, env)]
+      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv)]
       : targets;
-    return targetCandidates(nestedTargets, commandCwd, env);
+    return targetCandidates(nestedTargets, commandCwd, commandEnv);
   }
   if (name === "tee") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if (name === "dd") {
-    return targetCandidates([...targets, ...ddWriteTargets(args)], commandCwd, env);
+    return targetCandidates([...targets, ...ddWriteTargets(args)], commandCwd, commandEnv);
   }
   if (name === "cp" || name === "install") {
-    return targetCandidates([...targets, ...copyLikeTargets(args)], commandCwd, env);
+    return targetCandidates([...targets, ...copyLikeTargets(args)], commandCwd, commandEnv);
   }
   if (name === "mv") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if (name === "rm" || name === "unlink" || name === "touch" || name === "truncate" || name === "mkdir") {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
   if ((name === "sed" || name === "perl") && hasInPlaceEditFlag(args)) {
     return targetCandidates(
       [...targets, ...commandOperands(args).slice(1), ...extractManagedKnowledgePathReferences(command.join(" "))],
       commandCwd,
-      env,
+      commandEnv,
     );
   }
   if (name === "find" && args.includes("-delete")) {
-    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, env);
+    return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
 
   if (isReadOnlyShellCommand(name, args)) {
-    return targetCandidates(targets, commandCwd, env);
+    return targetCandidates(targets, commandCwd, commandEnv);
   }
-  return targetCandidates([...targets, ...extractManagedKnowledgePathReferences(command.join(" "))], commandCwd, env);
+  return targetCandidates(
+    [...targets, ...extractManagedKnowledgePathReferences(command.join(" "))],
+    commandCwd,
+    commandEnv,
+  );
 }
 
 function nestedShellCommand(args: string[]): string | undefined {
@@ -639,8 +893,8 @@ function nestedShellCommand(args: string[]): string | undefined {
 }
 
 function isReadOnlyShellCommand(name: string, args: string[]): boolean {
-  if (name === "find" && (args.includes("-delete") || args.includes("-exec") || args.includes("-execdir"))) {
-    return false;
+  if (name === "find") {
+    return !args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir");
   }
   if (name === "git") {
     return isReadOnlyGitCommand(args);
@@ -654,6 +908,10 @@ function isReadOnlyGitCommand(args: string[]): boolean {
 }
 
 function gitSubcommand(args: string[]): string | undefined {
+  return gitSubcommandPosition(args)?.name;
+}
+
+function gitSubcommandPosition(args: string[]): { name: string; index: number } | undefined {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--") {
@@ -673,9 +931,176 @@ function gitSubcommand(args: string[]): string | undefined {
     if (arg.startsWith("-")) {
       continue;
     }
-    return arg;
+    return { name: arg, index };
   }
   return undefined;
+}
+
+function gitWorktreeMutationTarget(
+  args: string[],
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+  const command = gitSubcommandPosition(args);
+  if (!command || !gitSubcommandMutatesWorktree(command.name, args.slice(command.index + 1))) {
+    return undefined;
+  }
+
+  let effectiveCwd = cwd;
+  let explicitWorktree: string | undefined;
+  for (let index = 0; index < command.index; index += 1) {
+    const arg = args[index];
+    if (arg === "-C") {
+      effectiveCwd = resolveCwdOption(args[index + 1], effectiveCwd, env);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-C") && arg.length > 2) {
+      effectiveCwd = resolveCwdOption(arg.slice(2), effectiveCwd, env);
+      continue;
+    }
+    if (arg === "--work-tree") {
+      explicitWorktree = resolveGitWorktreeOption(args[index + 1], effectiveCwd, env);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--work-tree=")) {
+      explicitWorktree = resolveGitWorktreeOption(
+        arg.slice("--work-tree=".length),
+        effectiveCwd,
+        env,
+      );
+    }
+  }
+  return explicitWorktree ?? effectiveCwd;
+}
+
+function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {
+  if (subcommand === "clean") {
+    return !args.some((arg) => arg === "--dry-run" || /^-[^-]*n/.test(arg));
+  }
+  if (subcommand === "read-tree") {
+    return args.some((arg) => /^-[^-]*u/.test(arg));
+  }
+  if (subcommand === "reset") {
+    return args.some((arg) => arg === "--hard" || arg === "--merge" || arg === "--keep");
+  }
+  if (subcommand === "stash") {
+    const action = args.find((arg) => !arg.startsWith("-"));
+    return !action || !new Set(["clear", "create", "drop", "list", "show", "store"]).has(action);
+  }
+  if (subcommand === "restore") {
+    return !args.includes("--staged") || args.includes("--worktree");
+  }
+  if (subcommand === "rm") {
+    return !args.includes("--cached");
+  }
+  return WORKTREE_MUTATING_GIT_SUBCOMMANDS.has(subcommand);
+}
+
+function gitWorktreePathArguments(args: string[]): string[] {
+  const command = gitSubcommandPosition(args);
+  return command ? commandPathArguments(args.slice(command.index + 1)) : [];
+}
+
+function tarExtracts(args: string[]): boolean {
+  return args.some((arg, index) =>
+    arg === "--extract" ||
+    arg === "--get" ||
+    (!arg.startsWith("--") && (
+      (arg.startsWith("-") && arg.slice(1).includes("x")) ||
+      (index === 0 && !arg.startsWith("-") && arg.includes("x"))
+    ))
+  );
+}
+
+function tarExtractionTargets(
+  args: string[],
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string[] {
+  const targets: string[] = [];
+  let effectiveCwd = cwd;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    let directory: string | undefined;
+    if (arg === "-C" || arg === "--directory") {
+      directory = args[index + 1];
+      index += 1;
+    } else if (arg.startsWith("-C") && arg.length > 2) {
+      directory = arg.slice(2);
+    } else if (arg.startsWith("--directory=")) {
+      directory = arg.slice("--directory=".length);
+    } else {
+      const shortOptions = arg.startsWith("-")
+        ? arg.slice(1)
+        : index === 0 && !arg.startsWith("-")
+          ? arg
+          : undefined;
+      const directoryOptionIndex = shortOptions?.indexOf("C") ?? -1;
+      if (directoryOptionIndex >= 0) {
+        const attachedDirectory = shortOptions?.slice(directoryOptionIndex + 1);
+        directory = attachedDirectory || args[index + 1];
+        if (!attachedDirectory) {
+          index += 1;
+        }
+      }
+    }
+    if (!directory) {
+      continue;
+    }
+
+    effectiveCwd = resolveCwdOption(directory, effectiveCwd, env);
+    appendTarget(targets, effectiveCwd ?? directory);
+  }
+
+  if (targets.length === 0) {
+    appendTarget(targets, effectiveCwd ?? ".");
+  }
+  return targets;
+}
+
+function isInterpreter(name: string): boolean {
+  return (
+    /^python(?:\d+(?:\.\d+)*)?$/.test(name) ||
+    name === "ruby" ||
+    name === "node"
+  );
+}
+
+function interpreterDestructiveAncestorTargets(args: string[]): string[] {
+  const codeOptionIndex = args.findIndex(
+    (arg) => arg === "-c" || arg === "-e" || arg === "--eval",
+  );
+  if (codeOptionIndex < 0) {
+    return [];
+  }
+  const code = args[codeOptionIndex + 1];
+  if (!code) {
+    return [];
+  }
+
+  const targets: string[] = [];
+  const destructiveCall =
+    /(?:rmtree|rm_rf|rmSync|removeSync)\s*\(\s*(["'])([^"'\\]*(?:\\.[^"'\\]*)*)\1/g;
+  for (const match of code.matchAll(destructiveCall)) {
+    if (match[2]) {
+      appendTarget(targets, match[2].replace(/\\(["'\\])/g, "$1"));
+    }
+  }
+  return targets;
+}
+
+function resolveGitWorktreeOption(
+  rawPath: string | undefined,
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+  if (!rawPath || !cwd) {
+    return rawPath;
+  }
+  return resolveShellPath(rawPath, cwd, env) ?? rawPath;
 }
 
 function cwdOptionValue(option: string, args: string[], index: number): { value?: string; nextIndex: number } {
@@ -698,6 +1123,7 @@ function resolveCwdOption(value: string | undefined, cwd: string | undefined, en
 function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.ProcessEnv): UnwrappedCommand {
   let index = 0;
   let effectiveCwd = cwd;
+  let effectiveEnv = env;
   while (index < segment.length) {
     const name = basename(segment[index]);
     if (name === "sudo") {
@@ -706,7 +1132,7 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
         const option = segment[index];
         const cwdOption = cwdOptionValue(option, segment, index);
         if (cwdOption.value !== undefined && (option === "-D" || option === "--chdir" || option.startsWith("--chdir="))) {
-          effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, env);
+          effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, effectiveEnv);
           index = cwdOption.nextIndex;
           continue;
         }
@@ -721,14 +1147,27 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
       index += 1;
       while (index < segment.length) {
         const token = segment[index];
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+        const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(token);
+        if (assignment) {
+          const value = effectiveCwd
+            ? expandShellPathVariables(assignment[2], effectiveCwd, effectiveEnv) ?? assignment[2]
+            : assignment[2];
+          effectiveEnv = {
+            ...(effectiveEnv ?? {}),
+            [assignment[1]]: value,
+          };
+          index += 1;
+          continue;
+        }
+        if (token === "-" || token === "-i" || token === "--ignore-environment") {
+          effectiveEnv = {};
           index += 1;
           continue;
         }
         if (token.startsWith("-")) {
           const cwdOption = cwdOptionValue(token, segment, index);
           if (cwdOption.value !== undefined && (token === "-C" || token === "--chdir" || token.startsWith("--chdir="))) {
-            effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, env);
+            effectiveCwd = resolveCwdOption(cwdOption.value, effectiveCwd, effectiveEnv);
             index = cwdOption.nextIndex;
             continue;
           }
@@ -751,14 +1190,18 @@ function unwrapCommandWithCwd(segment: string[], cwd?: string, env?: NodeJS.Proc
     }
     break;
   }
-  return { command: segment.slice(index), cwd: effectiveCwd };
+  return { command: segment.slice(index), cwd: effectiveCwd, env: effectiveEnv };
 }
 
 function cwdAfterSegment(segment: string[], cwd: string | undefined, env: NodeJS.ProcessEnv | undefined): string | undefined {
   if (!cwd) {
     return cwd;
   }
-  const { command, cwd: commandCwd } = unwrapCommandWithCwd(segment, cwd, env);
+  const {
+    command,
+    cwd: commandCwd,
+    env: commandEnv,
+  } = unwrapCommandWithCwd(segment, cwd, env);
   if (command.length === 0) {
     return cwd;
   }
@@ -766,8 +1209,8 @@ function cwdAfterSegment(segment: string[], cwd: string | undefined, env: NodeJS
   if (name !== "cd" && name !== "pushd") {
     return cwd;
   }
-  const target = cwdTargetOperand(command.slice(1)) ?? env?.HOME ?? homedir();
-  return resolveShellPath(target, commandCwd ?? cwd, env) ?? cwd;
+  const target = cwdTargetOperand(command.slice(1)) ?? commandEnv?.HOME ?? homedir();
+  return resolveShellPath(target, commandCwd ?? cwd, commandEnv) ?? cwd;
 }
 
 function cwdTargetOperand(args: string[]): string | undefined {
@@ -801,6 +1244,24 @@ function commandOperands(args: string[]): string[] {
     }
   }
   return operands;
+}
+
+function commandPathArguments(args: string[]): string[] {
+  const targets = commandOperands(args);
+  for (const arg of args) {
+    if (!arg.startsWith("-")) {
+      continue;
+    }
+    const separatorIndex = arg.indexOf("=");
+    if (separatorIndex < 0) {
+      continue;
+    }
+    const value = arg.slice(separatorIndex + 1);
+    if (isPathLikeShellTarget(value)) {
+      appendTarget(targets, value);
+    }
+  }
+  return targets;
 }
 
 function copyLikeTargets(args: string[]): string[] {
@@ -856,9 +1317,28 @@ function hasInPlaceEditFlag(args: string[]): boolean {
 function expandShellPathVariables(rawPath: string, cwd: string, env: NodeJS.ProcessEnv | undefined): string | undefined {
   const pwd = normalize(resolve(cwd));
   const envHome = typeof env?.HOME === "string" && env.HOME.trim() ? normalize(resolve(env.HOME)) : homedir();
-  const expanded = rawPath
+  const agentWorkspaceRoot =
+    typeof env?.[MINIME_AGENT_WORKSPACE_ROOT_ENV] === "string" &&
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV]?.trim()
+      ? normalize(resolve(env[MINIME_AGENT_WORKSPACE_ROOT_ENV] as string))
+      : undefined;
+  let expanded = rawPath
     .replace(/\$\{PWD\}|\$PWD(?=\/|$)/g, pwd)
     .replace(/\$\{HOME\}|\$HOME(?=\/|$)/g, envHome);
+  if (agentWorkspaceRoot) {
+    const workspacePattern = new RegExp(
+      `\\$\\{${MINIME_AGENT_WORKSPACE_ROOT_ENV}\\}|\\$${MINIME_AGENT_WORKSPACE_ROOT_ENV}(?=/|$)`,
+      "g",
+    );
+    expanded = expanded.replace(workspacePattern, () => agentWorkspaceRoot);
+  }
+  expanded = expanded.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])/g,
+    (reference, bracedName: string | undefined, bareName: string | undefined) => {
+      const value = env?.[bracedName ?? bareName ?? ""];
+      return typeof value === "string" ? value : reference;
+    },
+  );
   if (expanded.includes("$") || expanded.includes("`")) {
     return undefined;
   }
@@ -892,6 +1372,17 @@ function unresolvedManagedKnowledgeRelPath(rawPath: string): string | undefined 
       return relPath;
     }
   }
+  const archiveMarker = `/${MANAGED_ARCHIVE_RELPATH}/`;
+  const archiveMarkerIndex = normalized.indexOf(archiveMarker);
+  if (
+    normalized === MANAGED_ARCHIVE_RELPATH ||
+    normalized.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+  ) {
+    return normalized;
+  }
+  if (archiveMarkerIndex >= 0) {
+    return normalized.slice(archiveMarkerIndex + 1);
+  }
   const marker = "/wiki/pages/";
   const markerIndex = normalized.indexOf(marker);
   if (normalized === "wiki/pages" || normalized.startsWith("wiki/pages/")) {
@@ -922,6 +1413,12 @@ function ambiguousManagedKnowledgeRelPath(
   if (normalizedRawPath === "wiki" || normalizedRawPath.startsWith("wiki/")) {
     relCandidates.add(normalizedRawPath);
   }
+  if (
+    normalizedRawPath === MANAGED_ARCHIVE_RELPATH ||
+    normalizedRawPath.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+  ) {
+    relCandidates.add(normalizedRawPath);
+  }
 
   const absPath = resolveShellPath(rawPath, cwd, env);
   if (absPath) {
@@ -931,6 +1428,11 @@ function ambiguousManagedKnowledgeRelPath(
       }
     }
   } else {
+    const archiveMarker = `/${MANAGED_ARCHIVE_RELPATH}/`;
+    const archiveMarkerIndex = normalizedRawPath.indexOf(archiveMarker);
+    if (archiveMarkerIndex >= 0) {
+      relCandidates.add(normalizedRawPath.slice(archiveMarkerIndex + 1));
+    }
     const marker = "/wiki/";
     const markerIndex = normalizedRawPath.indexOf(marker);
     if (markerIndex >= 0) {
@@ -941,6 +1443,12 @@ function ambiguousManagedKnowledgeRelPath(
   for (const relCandidate of relCandidates) {
     const normalizedRel = relCandidate.replace(/\\/g, "/").replace(/^\.\//, "");
     if (normalizedRel === "wiki" || normalizedRel.startsWith("wiki/")) {
+      return normalizedRel;
+    }
+    if (
+      normalizedRel === MANAGED_ARCHIVE_RELPATH ||
+      normalizedRel.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+    ) {
       return normalizedRel;
     }
     const pagesMarker = "/wiki/pages/";
@@ -1021,17 +1529,41 @@ function managedKnowledgeRelPath(layout: Extract<ResolvedKnowledgeLayout, { kind
     const direct = join(layout.agentWorkspaceRoot, ...relPath.split("/"));
     return [direct, realOrSelf(direct)];
   });
-  const pageRoots = [layout.paths.pagesDir, realOrSelf(layout.paths.pagesDir)];
+  const managedRoots = [
+    layout.paths.pagesDir,
+    realOrSelf(layout.paths.pagesDir),
+    layout.paths.knowledgeArchiveDir,
+    realOrSelf(layout.paths.knowledgeArchiveDir),
+  ];
 
   for (const candidate of candidates) {
     if (exactPaths.some((managedPath) => samePath(candidate, managedPath))) {
       return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
     }
-    if (pageRoots.some((managedPath) => insideOrSame(managedPath, candidate))) {
+    if (managedRoots.some((managedPath) => insideOrSame(managedPath, candidate))) {
       return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
     }
   }
 
+  return undefined;
+}
+
+function managedKnowledgeAncestorRelPath(
+  layout: Extract<ResolvedKnowledgeLayout, { kind: "v2" }>,
+  absPath: string,
+): string | undefined {
+  const candidates = pathCandidates(absPath);
+  const managedPaths = [
+    ...MANAGED_EXACT_RELPATHS.map((relPath) => join(layout.agentWorkspaceRoot, ...relPath.split("/"))),
+    layout.paths.pagesDir,
+    layout.paths.knowledgeArchiveDir,
+  ].flatMap((managedPath) => [managedPath, realOrSelf(managedPath)]);
+
+  for (const candidate of candidates) {
+    if (managedPaths.some((managedPath) => insideOrSame(candidate, managedPath))) {
+      return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
+    }
+  }
   return undefined;
 }
 
