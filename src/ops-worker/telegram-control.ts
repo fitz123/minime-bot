@@ -115,6 +115,24 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return `${result}${TRUNCATION_MARKER}`;
 }
 
+function splitUtf8(value: string, maxBytes: number): string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+  let chunkBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (chunkBytes + characterBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = "";
+      chunkBytes = 0;
+    }
+    chunk += character;
+    chunkBytes += characterBytes;
+  }
+  chunks.push(chunk);
+  return chunks;
+}
+
 function safeError(error: unknown): string {
   if (error instanceof OpsWorkerTelegramTransportError) return error.message;
   return error instanceof Error ? error.name : "unknown transport error";
@@ -270,13 +288,53 @@ function taskSummary(task: OpsWorkerTask): string {
   ].join("\n");
 }
 
+function taskSummaryPage(
+  task: OpsWorkerTask,
+  page: number,
+  maxBytes: number,
+): string {
+  const summary = taskSummary(task);
+  if (Buffer.byteLength(summary, "utf8") <= maxBytes) {
+    return page === 1
+      ? summary
+      : `Task ${task.id} has 1 page; request /task ${task.id}.`;
+  }
+  let pageCount = 2;
+  let pages: string[];
+  while (true) {
+    const largestHeader = `Task ${task.id} page ${pageCount}/${pageCount}\n`;
+    const contentBytes = maxBytes - Buffer.byteLength(largestHeader, "utf8");
+    if (contentBytes < 4) {
+      throw new TypeError("Telegram reply limit cannot fit a task page header");
+    }
+    pages = splitUtf8(summary, contentBytes);
+    if (pages.length === pageCount) break;
+    pageCount = pages.length;
+  }
+  if (page > pages.length) {
+    return `Task ${task.id} has ${pages.length} pages; request /task ${task.id} <page>.`;
+  }
+  return `Task ${task.id} page ${page}/${pages.length}\n${pages[page - 1]}`;
+}
+
 function usage(): string {
-  return "Usage: /status | /tasks | /task <id> | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>";
+  return "Usage: /status | /tasks | /task <id> [page] | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>";
 }
 
 function taskArgument(value: string | undefined): string | null {
   const taskId = value?.trim();
   return isOpsWorkerTaskId(taskId) ? taskId : null;
+}
+
+function taskPageArgument(
+  value: string | undefined,
+): { taskId: string; page: number } | null {
+  const match = /^(\S+)(?:\s+([1-9]\d*))?$/.exec(value?.trim() ?? "");
+  const taskId = taskArgument(match?.[1]);
+  const page = match?.[2] === undefined ? 1 : Number(match[2]);
+  return taskId !== null && Number.isSafeInteger(page)
+    ? { taskId, page }
+    : null;
 }
 
 export class OpsWorkerTelegramControl {
@@ -482,10 +540,12 @@ export class OpsWorkerTelegramControl {
           `${task.id} ${task.state}${task.control.paused ? " paused" : ""}`).join("\n");
     }
     if (command === "task") {
-      const taskId = taskArgument(tail);
-      if (taskId === null) return usage();
-      const task = this.supervisor.getTask(taskId);
-      return task ? taskSummary(task) : `Unknown ops-worker task ${taskId}.`;
+      const argument = taskPageArgument(tail);
+      if (argument === null) return usage();
+      const task = this.supervisor.getTask(argument.taskId);
+      return task
+        ? taskSummaryPage(task, argument.page, this.config.reply.maxBytes)
+        : `Unknown ops-worker task ${argument.taskId}.`;
     }
     if (command === "answer" || command === "correct") {
       const steering = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");

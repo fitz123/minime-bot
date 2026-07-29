@@ -615,7 +615,9 @@ fixed receipt controls; current intents contain hashes, while a migrated
 schema-v5 intent may also contain the same bounded task state and outcome
 summary already present in that legacy snapshot. `worker inspect --json` and
 the dedicated `/task` control show that fixed-receipt input so recovery does not
-depend on pre-crash process memory.
+depend on pre-crash process memory. When the bounded task summary exceeds one
+Telegram reply, `/task <id> [page]` returns numbered pages without truncating
+the retained operation.
 
 A historical claimed receipt may already have become incompatible before a
 marker-capable package retained its intent. Its hash preimage cannot be

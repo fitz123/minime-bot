@@ -1146,6 +1146,103 @@ describe("ops worker dedicated Telegram control", () => {
     );
   });
 
+  it("paginates a maximum-size legacy v5 report reconciliation intent without truncation", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-max-v5-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Claimed report receipt requires external-outcome reconciliation",
+    };
+    const reconciliationIntent = {
+      reportIdentity: `sha256:${"a".repeat(64)}`,
+      taskState: "DONE",
+      lastOutcome: {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PASS",
+        summary: "\u0001".repeat(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 2)
+          + "x".repeat(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 2),
+      },
+    };
+    const reconciliationIntentHash =
+      hashOpsWorkerCanonicalPayload(reconciliationIntent);
+    const reconciliationOperation = {
+      boundary: "report",
+      operationId: "report:max-v5-reconciliation-fixture",
+      intent: reconciliationIntent,
+    };
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: reconciliationOperation.operationId,
+      intentHash: reconciliationIntentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    isolated.evidence.push({
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: reconciliationOperation.operationId,
+        intentHash: reconciliationIntentHash,
+        intent: reconciliationIntent,
+      }),
+      artifact: null,
+    });
+    fixture.store.create(isolated);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(54, `/task ${isolated.id}`),
+    ]);
+    const client = control(fixture, transport);
+
+    await client.tick();
+
+    const firstText = String(transport.messages[0]?.text);
+    const firstHeader = /^Task \S+ page 1\/(\d+)\n/.exec(firstText);
+    assert.ok(firstHeader);
+    const pageCount = Number(firstHeader[1]);
+    assert.ok(pageCount > 1);
+    assert.ok(pageCount <= 100);
+    transport.updates.push(Array.from(
+      { length: pageCount - 1 },
+      (_, index) =>
+        update(55 + index, `/task ${isolated.id} ${index + 2}`),
+    ));
+
+    await client.tick();
+
+    assert.equal(transport.messages.length, pageCount);
+    const reconstructed = transport.messages.map((message, index) => {
+      const text = String(message.text);
+      const header = `Task ${isolated.id} page ${index + 1}/${pageCount}\n`;
+      assert.equal(text.startsWith(header), true);
+      assert.ok(Buffer.byteLength(text, "utf8") <= config.reply.maxBytes);
+      assert.equal(text.includes("… [truncated]"), false);
+      return text.slice(header.length);
+    }).join("");
+    const operationLine = reconstructed.split("\n").find((line) =>
+      line.startsWith("reportReconciliationIntent="));
+    assert.ok(operationLine);
+    assert.deepEqual(
+      JSON.parse(operationLine.slice("reportReconciliationIntent=".length)),
+      reconciliationOperation,
+    );
+  });
+
   it("shows when a blocked report receipt has no retained package intent", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
