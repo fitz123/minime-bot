@@ -850,7 +850,7 @@ export function executeKnowledgeMaintenance(
         {
           agentWorkspaceRoot: workspaceRoot,
           env: deps.env ?? process.env,
-          now: () => now,
+          now: deps.now,
           archivePrecondition: {
             expectedSourceBytes: candidate.expectedBytes,
             expectedSourceMtimeMs: candidate.mtimeMs,

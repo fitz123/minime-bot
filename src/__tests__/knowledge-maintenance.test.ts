@@ -388,6 +388,39 @@ describe("knowledge maintenance", () => {
     assert.equal(existsSync(join(workspace, ...second.split("/"))), false);
   });
 
+  it("passes a live operation clock to archives instead of pinning the scan timestamp", () => {
+    const workspace = createWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-01-01.md";
+    addPage(workspace, relPath, frontmatter("Live archive clock"));
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+    let currentTime = NOW;
+    const clock = () => currentTime;
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: clock,
+        executeUpdate: (_args, deps) => {
+          currentTime = new Date(NOW.getTime() + 11 * 60 * 1_000);
+          assert.equal(deps?.now, clock);
+          assert.equal(deps.now?.(), currentTime);
+          return {
+            ok: false,
+            status: "rejected",
+            reason: "injected-safe-rejection",
+            message: "Clock contract verified without mutation.",
+          };
+        },
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, false);
+    assert.equal(response.errors[0]?.reason, "injected-safe-rejection");
+  });
+
   it("stops safely when an updater reports success without performing the archive", () => {
     const workspace = createWorkspace();
     const relPath = "wiki/pages/project/history/release-2026-01-01.md";

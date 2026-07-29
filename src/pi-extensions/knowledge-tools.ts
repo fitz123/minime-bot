@@ -260,7 +260,7 @@ const ENV_OPTIONS_WITH_VALUE = new Set(["-C", "-S", "-u", "--chdir", "--split-st
 const SHELL_OPTIONS_WITH_VALUE = new Set(["-o", "--init-file", "--rcfile"]);
 const MAX_NESTED_SHELL_DEPTH = 4;
 const MANAGED_KNOWLEDGE_PATH_REFERENCE =
-  /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
+  /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*|artifacts\/knowledge-archive(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
 
 function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
   const root = deps.agentWorkspaceRoot;

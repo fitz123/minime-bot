@@ -2,6 +2,7 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -437,7 +439,7 @@ describe("knowledge_update", () => {
       { op: "archive", path: relPath },
       {
         agentWorkspaceRoot: workspace,
-        now: () => new Date("2026-06-13T12:00:01.000Z"),
+        lockNow: () => new Date("2026-06-13T12:00:01.000Z"),
         staleLockMs: 60_000,
       },
     );
@@ -490,6 +492,48 @@ describe("knowledge_update", () => {
     assert.equal(readFileSync(join(activeOnly, ...relPath.split("/")), "utf8"), page);
   });
 
+  it("atomically rejects an archive destination created during the move", () => {
+    const relPath = "wiki/pages/project/destination-race.md";
+    const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
+    const page = [
+      "---",
+      "name: Destination Race",
+      "description: Destination no-clobber fixture",
+      "type: project",
+      "---",
+      "",
+      "# Destination Race",
+      "",
+    ].join("\n");
+    const independentDestination = "independently created archive destination\n";
+    const workspace = createV2Workspace({ [relPath]: page });
+    const sourcePath = join(workspace, ...relPath.split("/"));
+    const destinationPath = join(workspace, ...archiveRelPath.split("/"));
+    let injected = false;
+
+    const response = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      {
+        agentWorkspaceRoot: workspace,
+        fs: {
+          linkSync(from, to) {
+            if (!injected && from === sourcePath && to === destinationPath) {
+              injected = true;
+              writeFileSync(destinationPath, independentDestination, "utf8");
+            }
+            return linkSync(from, to);
+          },
+        },
+      },
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "rejected");
+    assert.equal(response.reason, "archive-destination-exists");
+    assert.equal(readFileSync(sourcePath, "utf8"), page);
+    assert.equal(readFileSync(destinationPath, "utf8"), independentDestination);
+  });
+
   it("rolls archive and restore back when their move, transaction write, or search refresh fails", () => {
     const relPath = "wiki/pages/project/rollback-move.md";
     const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
@@ -519,15 +563,17 @@ describe("knowledge_update", () => {
         const archivePath = join(workspace, ...archiveRelPath.split("/"));
         const sourcePath = operation === "archive" ? activePath : archivePath;
         const destinationPath = operation === "archive" ? archivePath : activePath;
+        let moveFailureInjected = false;
         const fs =
           failureKind === "move"
             ? {
-                renameSync(from: Parameters<typeof renameSync>[0], to: Parameters<typeof renameSync>[1]) {
-                  if (from === sourcePath && to === destinationPath) {
-                    renameSync(from, to);
+                unlinkSync(path: Parameters<typeof unlinkSync>[0]) {
+                  if (!moveFailureInjected && path === sourcePath) {
+                    moveFailureInjected = true;
+                    unlinkSync(path);
                     throw new Error("forced move failure");
                   }
-                  return renameSync(from, to);
+                  return unlinkSync(path);
                 },
               }
             : failureKind === "write"
@@ -810,7 +856,7 @@ describe("knowledge_update", () => {
       },
       {
         agentWorkspaceRoot: workspace,
-        now: () => new Date("2026-06-07T12:00:00.000Z"),
+        lockNow: () => new Date("2026-06-07T12:00:00.000Z"),
         staleLockMs: 1_000,
       },
     );
@@ -831,7 +877,7 @@ describe("knowledge_update", () => {
       },
       {
         agentWorkspaceRoot: workspace,
-        now: () => new Date("2026-06-07T12:00:01.000Z"),
+        lockNow: () => new Date("2026-06-07T12:00:01.000Z"),
         staleLockMs: 60_000,
       },
     );

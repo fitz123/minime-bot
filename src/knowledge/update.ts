@@ -1,6 +1,7 @@
 import {
   closeSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -62,6 +63,7 @@ export interface KnowledgeUpdateDeps {
   resolveLayout?: (agentWorkspaceRoot: string) => ResolvedKnowledgeLayout;
   fs?: Partial<KnowledgeUpdateFs>;
   now?: () => Date;
+  lockNow?: () => Date;
   staleLockMs?: number;
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
   archivePrecondition?: KnowledgeArchivePrecondition;
@@ -104,6 +106,7 @@ export type KnowledgeUpdateResponse = KnowledgeUpdateSuccess | KnowledgeUpdateFa
 
 export interface KnowledgeUpdateFs {
   existsSync: typeof existsSync;
+  linkSync: typeof linkSync;
   lstatSync: typeof lstatSync;
   mkdirSync: typeof mkdirSync;
   openSync: typeof openSync;
@@ -156,6 +159,7 @@ const TYPE_LABELS: Record<KnowledgePageType, string> = {
 
 const defaultFs: KnowledgeUpdateFs = {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -831,7 +835,7 @@ function acquireKnowledgeUpdateLock(
 ): LockHandle | KnowledgeUpdateFailure {
   const lockRelPath = ".tmp/knowledge-update.lock" as const;
   const lockPath = join(layout.agentWorkspaceRoot, ".tmp", "knowledge-update.lock");
-  const now = deps.now?.() ?? new Date();
+  const now = deps.lockNow?.() ?? new Date();
   const staleLockMs = deps.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
   const lockSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, lockPath, fs);
   if (lockSafetyProblem) {
@@ -1040,11 +1044,49 @@ function readFileBytes(path: string, fs: KnowledgeUpdateFs): Buffer {
 function rollbackMove(sourcePath: string, destinationPath: string, fs: KnowledgeUpdateFs): void {
   try {
     if (!fs.existsSync(sourcePath) && fs.existsSync(destinationPath)) {
-      fs.renameSync(destinationPath, sourcePath);
+      fs.linkSync(destinationPath, sourcePath);
+      fs.unlinkSync(destinationPath);
     }
   } catch {
     // Preserve the original failure; transaction rollback is best effort.
   }
+}
+
+function moveFileNoClobber(
+  sourcePath: string,
+  destinationPath: string,
+  destinationExistsReason: "archive-destination-exists" | "active-destination-exists",
+  operation: KnowledgeMoveOperation,
+  fs: KnowledgeUpdateFs,
+): KnowledgeUpdateFailure | undefined {
+  try {
+    fs.linkSync(sourcePath, destinationPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return failure(
+        "rejected",
+        destinationExistsReason,
+        `knowledge_update ${operation} refuses to overwrite an occupied destination.`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    fs.unlinkSync(sourcePath);
+  } catch (error) {
+    try {
+      if (fs.existsSync(sourcePath)) {
+        fs.unlinkSync(destinationPath);
+      } else {
+        rollbackMove(sourcePath, destinationPath, fs);
+      }
+    } catch {
+      // Preserve the original failure; partial-move rollback is best effort.
+    }
+    throw error;
+  }
+  return undefined;
 }
 
 function verifyMovedBytes(
@@ -1314,8 +1356,19 @@ function executeMoveRequest(
 
   let plans: AtomicWritePlan[] = [];
   let refreshAttempted = false;
+  let moveCommitted = false;
   try {
-    fs.renameSync(sourcePath, destinationPath);
+    const moveProblem = moveFileNoClobber(
+      sourcePath,
+      destinationPath,
+      request.operation === "archive" ? "archive-destination-exists" : "active-destination-exists",
+      request.operation,
+      fs,
+    );
+    if (moveProblem) {
+      return moveProblem;
+    }
+    moveCommitted = true;
     const nextPages = collectPages(layout, fs);
     if (isUpdateFailure(nextPages)) {
       rollbackMove(sourcePath, destinationPath, fs);
@@ -1349,7 +1402,9 @@ function executeMoveRequest(
     }
   } catch (error) {
     rollbackCommittedWrites(plans, fs);
-    rollbackMove(sourcePath, destinationPath, fs);
+    if (moveCommitted) {
+      rollbackMove(sourcePath, destinationPath, fs);
+    }
     let rollbackRefreshError: unknown;
     if (refreshAttempted && deps.refreshSearchBackend) {
       try {

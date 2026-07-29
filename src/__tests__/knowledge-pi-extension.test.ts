@@ -305,6 +305,14 @@ describe("Knowledge Pi extension helpers", () => {
       ["sh -c 'printf x > wiki/log.md'", "wiki/log.md"],
       ["env bash -c 'printf x > wiki/pages/project/runtime.md'", "wiki/pages/project/runtime.md"],
       ["python -c 'open(\"wiki/index.md\", \"w\").write(\"x\")'", "wiki/index.md"],
+      [
+        "python -c 'import shutil; shutil.rmtree(\"artifacts/knowledge-archive\")'",
+        "artifacts/knowledge-archive",
+      ],
+      [
+        "ruby -e 'File.write(\"artifacts/knowledge-archive/wiki/pages/project/runtime.md\", \"x\")'",
+        "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+      ],
       ["dd if=/dev/null of=wiki/index.md", "wiki/index.md"],
       ["f=index; printf x > wiki/$f.md", "wiki/$f.md"],
       ["rm wiki/i?dex.md", "wiki/i?dex.md"],
