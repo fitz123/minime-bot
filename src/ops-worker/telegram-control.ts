@@ -34,6 +34,7 @@ import {
   ingestLocalAudio,
   type LocalAudioIngestionOptions,
 } from "../voice.js";
+import { OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE } from "./conversation-runner.js";
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
@@ -51,7 +52,7 @@ export const OPS_WORKER_TELEGRAM_VOICE_LIMITS = Object.freeze({
 });
 
 export const OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE =
-  "Conversational Ops is unavailable. Use /status, /tasks, or /task <id>.";
+  OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE;
 
 export const OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK =
   "Could not transcribe the voice message locally. Send text, or use /status, /tasks, or /task <id>.";

@@ -62,11 +62,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 3: Add the tool-free bounded Ops conversation runner
 **Serves:** Ordinary Russian text must work naturally when provider/VPN is available, stay privacy-safe and bounded, and fail usefully when Pi/provider/quota/VPN is unavailable.
-- [ ] Add a package-owned Pi conversation runner with a fixed no-tools/no-ambient-context policy, prompt-through-stdin, current redacted snapshot, strict response envelope, and answers in the operator's language.
-- [ ] Enforce fixed input, context, output-token, output-byte, runtime, stall, and session/clarification bounds; own and reconcile any child process/session separately from remediation sessions.
-- [ ] Validate every model envelope fail-closed: read-only answers cannot mutate, alert text cannot become authority, and malformed/oversized/provider/quota/network/timeout output maps to one deterministic readable fallback with command guidance.
-- [ ] Add tests for Russian Q&A categories, bounded history, envelope validation, privacy, all failure classes, process/session cleanup, and zero task/custody/audit mutation for read-only turns.
-- [ ] Run the focused tests before Task 4.
+- [x] Add a package-owned Pi conversation runner with a fixed no-tools/no-ambient-context policy, prompt-through-stdin, current redacted snapshot, strict response envelope, and answers in the operator's language.
+- [x] Enforce fixed input, context, output-token, output-byte, runtime, stall, and session/clarification bounds; own and reconcile any child process/session separately from remediation sessions.
+- [x] Validate every model envelope fail-closed: read-only answers cannot mutate, alert text cannot become authority, and malformed/oversized/provider/quota/network/timeout output maps to one deterministic readable fallback with command guidance.
+- [x] Add tests for Russian Q&A categories, bounded history, envelope validation, privacy, all failure classes, process/session cleanup, and zero task/custody/audit mutation for read-only turns.
+- [x] Run the focused tests before Task 4.
 
 ### Task 4: Integrate incident-first admission and safe natural-language steering
 **Serves:** Conversation must not starve remediation or bypass lifecycle authorization, and unambiguous answer/retry/pause/resume/cancel intent must work without IDs while ambiguity performs no mutation.
