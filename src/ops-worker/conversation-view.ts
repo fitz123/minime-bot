@@ -31,6 +31,12 @@ export const OPS_WORKER_CONVERSATION_VIEW_LIMITS = Object.freeze({
   reportErrorBytes: 512,
 });
 
+/**
+ * Leaves room inside the runner's 128 KiB prompt ceiling for the maximum
+ * operator input, one clarification, and JSON framing.
+ */
+export const OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES = 80 * 1024;
+
 export interface OpsWorkerBoundedView<T> {
   total: number;
   omitted: number;
@@ -223,6 +229,9 @@ function reportReceiptView(task: Readonly<OpsWorkerTask>): {
 export function buildOpsWorkerTaskView(
   task: Readonly<OpsWorkerTask>,
   redact: OpsWorkerFieldRedactor,
+  options: {
+    includeReconciliationIntent?: boolean;
+  } = {},
 ): OpsWorkerTaskView {
   const receipt = reportReceiptView(task);
   const reconciliation = isOpsWorkerReportReconciliationBlocked(task);
@@ -335,8 +344,9 @@ export function buildOpsWorkerTaskView(
           ),
       ...receipt,
       reconciliation: reconciliation ? "REQUIRED" : "NONE",
-      reconciliationIntent: reconciliationOperation
-        ?? (reconciliation ? "UNAVAILABLE" : null),
+      reconciliationIntent: options.includeReconciliationIntent !== false
+        ? (reconciliationOperation ?? (reconciliation ? "UNAVAILABLE" : null))
+        : null,
     },
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -396,6 +406,73 @@ function blockerView(task: OpsWorkerTaskView): OpsWorkerBlockerView {
   };
 }
 
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function omitOldest<T>(view: OpsWorkerBoundedView<T>): boolean {
+  if (view.items.length === 0) return false;
+  view.items.pop();
+  view.omitted = view.total - view.items.length;
+  return true;
+}
+
+function fitConversationSnapshot(
+  snapshot: OpsWorkerConversationSnapshot,
+): OpsWorkerConversationSnapshot {
+  if (serializedBytes(snapshot) <= OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES) {
+    return snapshot;
+  }
+
+  const duplicatedAndHistorical = [
+    snapshot.recentReports,
+    snapshot.blockers,
+    snapshot.requestedInput,
+    snapshot.recentAlerts,
+    snapshot.recentHistory,
+  ] as OpsWorkerBoundedView<unknown>[];
+  const allViews = [
+    ...duplicatedAndHistorical,
+    snapshot.currentWork,
+  ] as OpsWorkerBoundedView<unknown>[];
+
+  let changed = true;
+  while (
+    serializedBytes(snapshot) > OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES
+    && changed
+  ) {
+    changed = false;
+    for (const view of allViews) {
+      if (view.items.length <= 1) continue;
+      changed = omitOldest(view) || changed;
+      if (
+        serializedBytes(snapshot)
+        <= OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES
+      ) return snapshot;
+    }
+  }
+
+  changed = true;
+  while (
+    serializedBytes(snapshot) > OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES
+    && changed
+  ) {
+    changed = false;
+    for (const view of allViews) {
+      changed = omitOldest(view) || changed;
+      if (
+        serializedBytes(snapshot)
+        <= OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES
+      ) return snapshot;
+    }
+  }
+
+  if (serializedBytes(snapshot) > OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES) {
+    throw new Error("Ops-worker conversation snapshot cannot fit its byte budget");
+  }
+  return snapshot;
+}
+
 export function buildOpsWorkerConversationSnapshot(
   tasks: readonly OpsWorkerTask[],
   policy: OpsWorkerPolicySnapshot,
@@ -405,7 +482,12 @@ export function buildOpsWorkerConversationSnapshot(
 ): OpsWorkerConversationSnapshot {
   const sorted = [...tasks].sort(compareTaskRecency);
   const taskViews = new Map(
-    sorted.map((task) => [task.id, buildOpsWorkerTaskView(task, options.redact)]),
+    sorted.map((task) => [
+      task.id,
+      buildOpsWorkerTaskView(task, options.redact, {
+        includeReconciliationIntent: false,
+      }),
+    ]),
   );
   const states = Object.fromEntries(
     OPS_WORKER_TASK_STATES.map((state) => [state, 0]),
@@ -455,7 +537,7 @@ export function buildOpsWorkerConversationSnapshot(
       updatedAt: task.updatedAt,
       requestedInput: task.agentResult?.requestedInput as string,
     }));
-  return {
+  return fitConversationSnapshot({
     counts: {
       totalTasks: sorted.length,
       states,
@@ -493,7 +575,7 @@ export function buildOpsWorkerConversationSnapshot(
       OPS_WORKER_CONVERSATION_VIEW_LIMITS.requestedInputs,
     ),
     policy: copyPolicy(policy),
-  };
+  });
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {

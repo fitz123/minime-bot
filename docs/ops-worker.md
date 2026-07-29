@@ -150,7 +150,8 @@ reply:
 `bearerTokenSopsKey`. Relative SOPS paths resolve from the control config's
 directory. The config itself must be a non-symlink regular file of at most 64
 KiB. The `poll` and `reply` sections are optional and use the defaults shown
-above when omitted. Secret values never belong in the YAML. Intake is
+above when omitted; `reply.maxBytes` accepts 1,024 through 4,096 bytes so every
+required report truth field can fit. Secret values never belong in the YAML. Intake is
 optional, but when present its host must be `127.0.0.1` or `::1` and its port
 is also the status server port.
 
@@ -160,6 +161,16 @@ same path after bounded local ffmpeg/whisper transcription and receives only a
 text reply. This behavior is enabled by the existing `--control-config`; it
 requires no additional private configuration and never routes through the
 primary bot.
+
+Voice requires local `ffmpeg` and `whisper-cli` binaries plus a Whisper model
+on the worker host. Their defaults are `/opt/homebrew/bin/ffmpeg`,
+`/opt/homebrew/bin/whisper-cli`, and
+`~/.minime/models/ggml-medium.bin`; override them with `FFMPEG_BIN`,
+`WHISPER_BIN`, and `WHISPER_MODEL`. `WHISPER_LANGUAGE` optionally replaces
+automatic language detection. Ops accepts only Telegram voice messages of at
+most 20 MiB and 10 minutes, and bounds each download attempt to 30 seconds.
+Missing local resources or transcription failure returns fixed text guidance;
+text and slash commands remain available.
 
 The conversation lane has one in-flight turn and no queue. Its update is
 acknowledged before local transcription or provider work begins, so polling,
@@ -175,12 +186,21 @@ The bounded command set is `/status`, `/tasks`, `/task <id>`, `/answer <id>
 admission and never depend on local transcription, Pi, the provider, or quota.
 Conversational Pi may return only a read-only answer, a clarification, or a
 proposed existing control intent. The host recomputes lifecycle eligibility
-and calls the same operation used by the corresponding slash command. It
-mutates only when exactly one task is eligible, or when the next reply selects
-one exact id from the single five-minute clarification slot; ambiguity and
-expiry perform no mutation. Telegram can steer only an existing task. It
-cannot create tasks or select configuration, commands, destinations, URLs,
-models, tools, templates, profiles, or verifier components.
+and never mutates from the model proposal alone. For exactly one eligible task,
+the host names the operation and task and requires a fixed exact confirmation
+token; for multiple eligible tasks, the next reply must be one exact task id
+from the single five-minute clarification slot. The confirmation/selection is
+resolved without Pi, then lifecycle eligibility is recomputed and the same
+operation used by the corresponding slash command is called. Ambiguity,
+provider failure, changed eligibility, and expiry perform no mutation.
+Telegram can steer only an existing task. It cannot create tasks or select
+configuration, commands, destinations, URLs, models, tools, templates,
+profiles, or verifier components.
+
+`/status`, `/tasks`, and `/task` render bounded, redacted human-readable
+narratives. These Telegram replies are operator views, not a stable
+machine-readable interface; use the CLI or loopback status JSON for structured
+state.
 
 Every update is fingerprinted in the versioned ledger at
 `<state-dir>/control/telegram.json`. An allowlisted slash command's task or
@@ -528,7 +548,9 @@ embeddings may add exact values through the programmatic-only
 CLI setting for additional values. Pattern redaction is defense in depth, not a
 substitute for keeping secrets out of alert payloads and agent-authored results.
 Per-field byte limits apply before the total reply limit. The existing durable
-report receipt and retry contract remains unchanged.
+report receipt and retry contract remains unchanged. Reports use readable
+labels such as `Result:`, `Diagnosis:`, `Actions:`, and `Verification:` and,
+like command replies, are not a stable machine-readable interface.
 
 ### Trusted embedding upgrade
 

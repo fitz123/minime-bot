@@ -76,10 +76,9 @@ export class OpsWorkerConversationLane {
 
   private async preemptActive(): Promise<void> {
     const active = this.active;
-    if (active === null) return;
-    active.controller.abort();
+    active?.controller.abort();
     const reaped = await this.abortConversation();
-    await active.done.catch(() => undefined);
+    await active?.done.catch(() => undefined);
     if (!reaped) throw new OpsWorkerConversationPreemptionError();
   }
 }

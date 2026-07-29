@@ -56,6 +56,7 @@ const TELEGRAM_FILE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const TELEGRAM_FILE_PATH_PATTERN = /^[A-Za-z0-9_./-]+$/;
 const CONVERSATION_CLARIFICATION_TTL_MS = 5 * 60 * 1_000;
 const MAX_CONVERSATION_CLARIFICATION_CANDIDATES = 16;
+const MAX_PENDING_REPLIES = MAX_UPDATES_PER_POLL + 1;
 
 export const OPS_WORKER_TELEGRAM_VOICE_LIMITS = Object.freeze({
   maxBytes: 20 * 1024 * 1024,
@@ -160,8 +161,15 @@ interface OpsWorkerClarificationSlot {
         intent: OpsWorkerConversationControlIntent;
         argument: string | null;
         candidateIds: readonly string[];
+        confirmationToken: string | null;
+        language: OpsWorkerConversationControlProposal["language"];
       }
     | null;
+}
+
+interface OpsWorkerPendingReply {
+  sequence: number;
+  text: string;
 }
 
 export class OpsWorkerTelegramTransportError extends Error {
@@ -481,8 +489,10 @@ export class OpsWorkerTelegramControl {
   private readonly conversationLane: OpsWorkerConversationLane;
   private readonly ingestVoice: OpsWorkerVoiceIngestor;
   private readonly redactAgentField: OpsWorkerFieldRedactor;
-  private pendingReply: string | undefined;
-  private conversationDelivery: Promise<void> | null = null;
+  private readonly pendingReplies: OpsWorkerPendingReply[] = [];
+  private replyDelivery: Promise<void> | null = null;
+  private nextReplySequence = 1;
+  private readonly conversationDeliveries = new Set<Promise<void>>();
   private clarification: OpsWorkerClarificationSlot | null = null;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
@@ -534,8 +544,8 @@ export class OpsWorkerTelegramControl {
   }
 
   async waitForConversation(): Promise<void> {
-    while (this.conversationDelivery !== null) {
-      await this.conversationDelivery;
+    while (this.conversationDeliveries.size > 0) {
+      await Promise.all([...this.conversationDeliveries]);
     }
   }
 
@@ -609,10 +619,38 @@ export class OpsWorkerTelegramControl {
     }, signal);
   }
 
+  private enqueueReply(text: string): void {
+    if (this.pendingReplies.length >= MAX_PENDING_REPLIES) {
+      throw new OpsWorkerTelegramTransportError(
+        "Telegram reply outbox reached its fixed bound",
+      );
+    }
+    this.pendingReplies.push({
+      sequence: this.nextReplySequence,
+      text,
+    });
+    this.nextReplySequence += 1;
+  }
+
   private async flushPendingReply(signal: AbortSignal): Promise<void> {
-    if (this.pendingReply === undefined) return;
-    await this.sendMessage(this.pendingReply, signal);
-    this.pendingReply = undefined;
+    while (this.pendingReplies.length > 0) {
+      const existing = this.replyDelivery;
+      if (existing !== null) {
+        await existing;
+        continue;
+      }
+      const pending = this.pendingReplies[0];
+      let delivery!: Promise<void>;
+      delivery = this.sendMessage(pending.text, signal).finally(() => {
+        if (this.replyDelivery === delivery) this.replyDelivery = null;
+      });
+      this.replyDelivery = delivery;
+      await delivery;
+      if (this.pendingReplies[0]?.sequence !== pending.sequence) {
+        throw new Error("Telegram reply outbox order changed during delivery");
+      }
+      this.pendingReplies.shift();
+    }
   }
 
   private async processUpdate(
@@ -665,7 +703,7 @@ export class OpsWorkerTelegramControl {
         ),
       );
       if (turn === null) {
-        this.pendingReply = OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+        this.enqueueReply(OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE);
         await this.flushPendingReply(signal);
         return;
       }
@@ -677,19 +715,12 @@ export class OpsWorkerTelegramControl {
         } catch {
           // The reply remains the deterministic provider-independent fallback.
         }
-        try {
-          await this.sendMessage(reply, signal);
-        } catch {
-          if (!signal.aborted && this.pendingReply === undefined) {
-            this.pendingReply = reply;
-          }
-        }
+        this.enqueueReply(reply);
+        await this.flushPendingReply(signal).catch(() => undefined);
       })().finally(() => {
-        if (this.conversationDelivery === delivery) {
-          this.conversationDelivery = null;
-        }
+        this.conversationDeliveries.delete(delivery);
       });
-      this.conversationDelivery = delivery;
+      this.conversationDeliveries.add(delivery);
       return;
     }
 
@@ -709,7 +740,7 @@ export class OpsWorkerTelegramControl {
       acknowledgedAt: this.now(),
     });
     this.faultInjector?.("after-ledger-before-reply", updateId);
-    this.pendingReply = reply;
+    this.enqueueReply(reply);
     await this.flushPendingReply(signal);
   }
 
@@ -753,6 +784,9 @@ export class OpsWorkerTelegramControl {
     signal: AbortSignal,
   ): Promise<string> {
     const clarification = this.takeClarification();
+    if (clarification !== null && clarification.control !== null) {
+      return this.resolveControlClarification(text, message, clarification);
+    }
     try {
       const reply = await this.handleConversation(text, {
         updateId: message.updateId,
@@ -779,8 +813,6 @@ export class OpsWorkerTelegramControl {
       return this.dispatchNaturalControl(
         reply.envelope,
         text,
-        message,
-        clarification,
       );
     } catch {
       return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
@@ -969,34 +1001,7 @@ export class OpsWorkerTelegramControl {
   private dispatchNaturalControl(
     proposal: OpsWorkerConversationControlProposal,
     operatorText: string,
-    message: ParsedTelegramMessageBase,
-    clarification: OpsWorkerClarificationSlot | null,
   ): string {
-    if (clarification !== null && clarification.control !== null) {
-      const selection = clarification.control;
-      const selectedId = proposal.taskReference;
-      if (
-        proposal.intent === selection.intent
-        && selectedId !== null
-        && selection.candidateIds.includes(selectedId)
-      ) {
-        const selected = this.supervisor.getTask(selectedId);
-        if (
-          selected !== undefined
-          && this.isNaturalControlCandidate(selected, selection.intent, selection.argument)
-        ) {
-          return this.dispatchControlOperation({
-            command: selection.intent,
-            taskId: selectedId,
-            argument: selection.argument,
-          }, message);
-        }
-      }
-      return proposal.language === "ru"
-        ? "Выбор задачи не подтверждён; изменений нет. Используйте /tasks и точную slash-команду."
-        : "Task selection was not confirmed; nothing changed. Use /tasks and an exact slash command.";
-    }
-
     const candidates = this.supervisor.listTasks()
       .filter((task) =>
         this.isNaturalControlCandidate(task, proposal.intent, proposal.argument))
@@ -1008,13 +1013,6 @@ export class OpsWorkerTelegramControl {
         ? "Нет задачи, для которой эта операция сейчас допустима; изменений нет."
         : "No task is currently eligible for that operation; nothing changed.";
     }
-    if (candidates.length === 1) {
-      return this.dispatchControlOperation({
-        command: proposal.intent,
-        taskId: candidates[0].id,
-        argument: proposal.argument,
-      }, message);
-    }
     if (candidates.length > MAX_CONVERSATION_CLARIFICATION_CANDIDATES) {
       return proposal.language === "ru"
         ? "Подходящих задач слишком много для безопасного уточнения; изменений нет. Используйте /tasks."
@@ -1022,15 +1020,64 @@ export class OpsWorkerTelegramControl {
     }
 
     const ids = candidates.map((task) => task.id);
-    const question = proposal.language === "ru"
-      ? `Уточните задачу: ${ids.join(", ")}. Ответьте точным идентификатором.`
-      : `Which task: ${ids.join(", ")}? Reply with the exact identifier.`;
+    const confirmationToken = candidates.length === 1
+      ? proposal.language === "ru" ? "ПОДТВЕРЖДАЮ" : "CONFIRM"
+      : null;
+    const operation = proposal.argument === null
+      ? proposal.intent
+      : `${proposal.intent} ${JSON.stringify(proposal.argument)}`;
+    const question = confirmationToken !== null
+      ? proposal.language === "ru"
+        ? `Подтвердите ${operation} для ${ids[0]}. Ответьте ровно: ${confirmationToken}`
+        : `Confirm ${operation} for ${ids[0]}. Reply exactly: ${confirmationToken}`
+      : proposal.language === "ru"
+        ? `Уточните задачу для ${operation}: ${ids.join(", ")}. Ответьте точным идентификатором.`
+        : `Which task for ${operation}: ${ids.join(", ")}? Reply with the exact identifier.`;
     this.storeClarification(operatorText, question, {
       intent: proposal.intent,
       argument: proposal.argument,
       candidateIds: ids,
+      confirmationToken,
+      language: proposal.language,
     });
     return question;
+  }
+
+  private resolveControlClarification(
+    operatorText: string,
+    message: ParsedTelegramMessageBase,
+    clarification: OpsWorkerClarificationSlot,
+  ): string {
+    const selection = clarification.control;
+    if (selection === null) {
+      return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+    }
+    const normalized = operatorText.trim();
+    const selectedId = selection.confirmationToken === null
+      ? selection.candidateIds.find((candidateId) => candidateId === normalized)
+      : normalized === selection.confirmationToken
+        ? selection.candidateIds[0]
+        : undefined;
+    if (selectedId !== undefined) {
+      const selected = this.supervisor.getTask(selectedId);
+      if (
+        selected !== undefined
+        && this.isNaturalControlCandidate(
+          selected,
+          selection.intent,
+          selection.argument,
+        )
+      ) {
+        return this.dispatchControlOperation({
+          command: selection.intent,
+          taskId: selectedId,
+          argument: selection.argument,
+        }, message);
+      }
+    }
+    return selection.language === "ru"
+      ? "Выбор или подтверждение не принято; изменений нет. Используйте /tasks и точную slash-команду."
+      : "Selection or confirmation was not accepted; nothing changed. Use /tasks and an exact slash command.";
   }
 
   private isNaturalControlCandidate(

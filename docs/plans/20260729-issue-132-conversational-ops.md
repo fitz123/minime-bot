@@ -1,5 +1,9 @@
 # Plan: Conversational dedicated Ops with local voice and readable reports
 
+Status: public-package implementation Tasks 1–4 and review fixes complete and
+validated on 2026-07-29. PR, release, deployment, and production drills remain
+pending under Post-completion.
+
 ## Goal
 Make the independently supervised dedicated Ops Telegram bot the normal conversational Ops interface. It must answer Russian text and locally transcribed voice questions from trusted bounded task/status/history context, while preserving deterministic slash commands as the provider-independent emergency path and routing any approved mutation through the existing lifecycle controls.
 
@@ -27,7 +31,7 @@ Preserve three layers in one dedicated Ops process:
 
 The conversational lane has one in-flight turn per configured operator/chat, no unbounded queue, fixed input/context/output-token/output-byte/media/time limits, and a bounded clarification slot. It neither claims task custody nor reserves the remediation Pi slot. The scheduler can preempt/abort a conversational turn, and conversation is admitted only when no incident action/process group/custody owner is runnable. Failure or preemption produces a concise deterministic fallback naming useful slash commands.
 
-Pi returns a strict bounded envelope: read-only answer, clarification, or a proposed existing control intent. The host computes lifecycle-eligible candidates. A mutation executes only when exactly one candidate is eligible (or one exact candidate was selected from the immediately preceding bounded clarification); otherwise it asks one clarification and records no task mutation. The final operation calls the same command/control function used by the slash command, preserving authorization, replay, audit, and safe-boundary checks.
+Pi returns a strict bounded envelope: read-only answer, clarification, or a proposed existing control intent. The host computes lifecycle-eligible candidates and never mutates from the proposal alone. With exactly one candidate it asks for a fixed exact confirmation token; with multiple candidates it requires one exact id from the immediately preceding bounded clarification. The host resolves that reply without Pi, recomputes eligibility, and calls the same command/control function used by the slash command, preserving authorization, replay, audit, and safe-boundary checks.
 
 ## Validation Commands
 
@@ -72,7 +76,7 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 **Serves:** Conversation must not starve remediation or bypass lifecycle authorization, and unambiguous answer/retry/pause/resume/cancel intent must work without IDs while ambiguity performs no mutation.
 - [x] Add one in-memory bounded conversation lane that acknowledges and continues polling independently, so long voice/provider work cannot delay later slash commands or report delivery.
 - [x] Make scheduler admission deterministically higher priority: reject conversation while incident work is active/runnable, and abort/reap an in-flight conversational child before an incident Pi launch can proceed.
-- [x] Centralize fixed command operations so slash and validated natural-language intents share exact task eligibility, replay IDs, authorization/lifecycle checks, audit writes, and replies; retain at most one expiring clarification with no mutation until exact selection.
+- [x] Centralize fixed command operations so slash and validated natural-language intents share exact task eligibility, replay IDs, authorization/lifecycle checks, audit writes, and replies; retain at most one expiring clarification with no mutation until deterministic confirmation or exact selection.
 - [x] Add race/fault tests for simultaneous Q&A and incident arrival, concurrency saturation, preemption, unambiguous steering audit, ambiguous clarification, duplicate Telegram delivery, command/provider independence, and unchanged custody ownership.
 - [x] Run the full validation command set and perform a final scope/public-data cut pass.
 

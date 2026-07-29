@@ -47,8 +47,12 @@ health/status. Its opt-in feature surface adds continuous authorization,
 primary context/capability attestation, quota-aware waits, typed availability
 verification, a generic all-group Alertmanager incident contract with schema-v6
 typed outcomes and redacted reports, a dedicated second-token Telegram control
-plane, authenticated loopback Alertmanager intake, and a deterministic fake
-fault lab. Nothing
+plane with bounded text and locally transcribed voice conversation,
+authenticated loopback Alertmanager intake, and a deterministic fake fault
+lab. Conversational control proposals require a deterministic operator
+confirmation and are revalidated through the same lifecycle path as slash
+commands; incident work preempts conversation, while slash commands remain
+provider-independent. Nothing
 starts automatically: control and intake exist only under an explicit
 `worker start --control-config` with trusted embedding dependencies. See
 [Ops-worker policy, control, intake, and fault lab](docs/ops-worker.md).

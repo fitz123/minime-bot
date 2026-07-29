@@ -3,11 +3,17 @@ import { describe, it } from "node:test";
 import {
   buildOpsWorkerConversationSnapshot,
   buildOpsWorkerTaskView,
+  OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES,
   OPS_WORKER_CONVERSATION_VIEW_LIMITS,
   renderOpsWorkerStatusNarrative,
   renderOpsWorkerTaskNarrative,
   renderOpsWorkerTasksNarrative,
 } from "../ops-worker/conversation-view.js";
+import { hashOpsWorkerCanonicalPayload } from "../ops-worker/lifecycle.js";
+import {
+  buildOpsWorkerConversationPrompt,
+  OPS_WORKER_CONVERSATION_RUNNER_LIMITS,
+} from "../ops-worker/conversation-runner.js";
 import { createOpsWorkerFieldRedactor } from "../ops-worker/reporting.js";
 import type { OpsWorkerPolicySnapshot } from "../ops-worker/status-server.js";
 import {
@@ -324,6 +330,63 @@ describe("ops worker bounded conversational views", () => {
     );
   });
 
+  it("withholds exact legacy reconciliation payloads from provider snapshots", () => {
+    const sensitive = "LEGACY_RECONCILIATION_SECRET_58";
+    const blocked = task("task-reconciliation");
+    blocked.state = "BLOCKED";
+    blocked.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Claimed report receipt requires external-outcome reconciliation",
+    };
+    const intent = {
+      reportIdentity: `sha256:${"e".repeat(64)}`,
+      taskState: "DONE",
+      lastOutcome: {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PASS",
+        summary: sensitive,
+      },
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(intent);
+    blocked.mutationReceipts.report = {
+      boundary: "report",
+      operationId: "report:legacy-view-fixture",
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    blocked.evidence.push({
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: blocked.mutationReceipts.report.operationId,
+        intentHash,
+        intent,
+      }),
+      artifact: null,
+    });
+
+    const redact = createOpsWorkerFieldRedactor();
+    const exact = buildOpsWorkerTaskView(blocked, redact);
+    const snapshot = buildOpsWorkerConversationSnapshot([blocked], policy, {
+      redact,
+    });
+
+    assert.match(JSON.stringify(exact.report.reconciliationIntent), new RegExp(sensitive));
+    assert.equal(
+      snapshot.currentWork.items[0].report.reconciliationIntent,
+      null,
+    );
+    assert.equal(JSON.stringify(snapshot).includes(sensitive), false);
+  });
+
   it("bounds task, action, verification, alert, and recency collections", () => {
     const tasks = Array.from({ length: 14 }, (_, index) => {
       const current = task(
@@ -378,15 +441,15 @@ describe("ops worker bounded conversational views", () => {
     });
 
     assert.equal(snapshot.currentWork.total, 14);
+    assert.ok(
+      snapshot.currentWork.items.length
+      <= OPS_WORKER_CONVERSATION_VIEW_LIMITS.currentTasks,
+    );
     assert.equal(
-      snapshot.currentWork.items.length,
-      OPS_WORKER_CONVERSATION_VIEW_LIMITS.currentTasks,
+      snapshot.currentWork.omitted,
+      snapshot.currentWork.total - snapshot.currentWork.items.length,
     );
-    assert.equal(snapshot.currentWork.omitted, 2);
-    assert.deepEqual(
-      snapshot.currentWork.items.slice(0, 2).map((entry) => entry.id),
-      ["task-bounded-13", "task-bounded-12"],
-    );
+    assert.equal(snapshot.currentWork.items[0].id, "task-bounded-13");
     assert.ok(
       Buffer.byteLength(snapshot.currentWork.items[0].objective, "utf8")
       <= OPS_WORKER_CONVERSATION_VIEW_LIMITS.objectiveBytes,
@@ -400,13 +463,39 @@ describe("ops worker bounded conversational views", () => {
       Buffer.byteLength(component.summary, "utf8")
       <= OPS_WORKER_CONVERSATION_VIEW_LIMITS.verificationSummaryBytes));
     assert.equal(snapshot.recentAlerts.total, 9);
-    assert.equal(snapshot.recentAlerts.items.length, 8);
-    assert.equal(snapshot.recentAlerts.omitted, 1);
+    assert.ok(
+      snapshot.recentAlerts.items.length
+      <= OPS_WORKER_CONVERSATION_VIEW_LIMITS.recentAlerts,
+    );
+    assert.equal(
+      snapshot.recentAlerts.omitted,
+      snapshot.recentAlerts.total - snapshot.recentAlerts.items.length,
+    );
     assert.equal(snapshot.recentAlerts.items[0].data.total, 6);
     assert.equal(snapshot.recentAlerts.items[0].data.items.length, 4);
     assert.equal(snapshot.recentAlerts.items[0].data.omitted, 2);
     assert.ok(snapshot.recentAlerts.items[0].data.items.every((entry) =>
       Buffer.byteLength(JSON.parse(entry.quotedData) as string, "utf8")
       <= OPS_WORKER_CONVERSATION_VIEW_LIMITS.alertDataBytes));
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(snapshot), "utf8")
+      <= OPS_WORKER_CONVERSATION_SNAPSHOT_MAX_BYTES,
+    );
+    const prompt = buildOpsWorkerConversationPrompt(
+      "\"".repeat(OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxInputBytes),
+      snapshot,
+      {
+        operatorText: "\"".repeat(
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        ),
+        question: "\"".repeat(
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        ),
+      },
+    );
+    assert.ok(
+      Buffer.byteLength(prompt, "utf8")
+      <= OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxContextBytes,
+    );
   });
 });

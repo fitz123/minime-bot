@@ -4,6 +4,7 @@ import { existsSync, statSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 let whisperStdout = "";
+let execFailure: "ffmpeg" | "whisper" | null = null;
 const execFileCalls: Array<{
   file: string;
   args: string[];
@@ -30,7 +31,11 @@ Object.defineProperty(execFileMock, promisify.custom, {
         ? { inputMode: statSync(args[1]).mode & 0o777 }
         : {}),
     });
-    if (args.includes("--no-timestamps")) {
+    const whisper = args.includes("--no-timestamps");
+    if (
+      execFailure === (whisper ? "whisper" : "ffmpeg")
+    ) throw new Error(`synthetic ${execFailure} failure`);
+    if (whisper) {
       return { stdout: whisperStdout, stderr: "" };
     }
 
@@ -56,6 +61,7 @@ const {
 
 afterEach(() => {
   whisperStdout = "";
+  execFailure = null;
   execFileCalls.length = 0;
   globalThis.fetch = originalFetch;
 });
@@ -118,5 +124,40 @@ describe("transcribeAudio ASR postprocessing", () => {
     assert.strictEqual(ffmpeg.inputMode, 0o600);
     assert.strictEqual(existsSync(sourcePath), false);
     assert.strictEqual(existsSync(wavPath), false);
+  });
+
+  it("reclaims private source and WAV files on conversion, transcription, and empty-result failures", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0x4f, 0x67, 0x67, 0x53]))) as typeof fetch;
+
+    for (const failure of ["ffmpeg", "whisper", "empty"] as const) {
+      execFileCalls.length = 0;
+      execFailure = failure === "empty" ? null : failure;
+      whisperStdout = "";
+
+      await assert.rejects(
+        ingestLocalAudio(
+          `https://api.telegram.org/file/botTEST_TOKEN/voice/${failure}.oga`,
+          { maxBytes: 4 },
+        ),
+        (error: unknown) =>
+          error instanceof MediaPipelineError
+          && error.stage === (
+            failure === "ffmpeg"
+              ? "conversion"
+              : failure === "whisper"
+                ? "transcription"
+                : "empty-transcript"
+          ),
+      );
+
+      const ffmpeg = execFileCalls[0];
+      assert.ok(ffmpeg);
+      const sourcePath = ffmpeg.args[1];
+      const wavPath = ffmpeg.args.at(-2);
+      assert.ok(wavPath);
+      assert.equal(existsSync(sourcePath), false);
+      assert.equal(existsSync(wavPath), false);
+    }
   });
 });

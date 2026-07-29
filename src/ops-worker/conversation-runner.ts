@@ -23,6 +23,10 @@ import {
 } from "../pi-extensions/ops-worker-conversation-bounds.js";
 import type { PiThinkingLevel } from "../types.js";
 import type { OpsWorkerConversationSnapshot } from "./conversation-view.js";
+import {
+  inspectOpsWorkerProcessGroup,
+  type OpsWorkerProcessGroupInspection,
+} from "./pi-attempt.js";
 
 export const OPS_WORKER_CONVERSATION_RUNNER_LIMITS = Object.freeze({
   maxInputBytes: 16 * 1024,
@@ -141,11 +145,6 @@ type SpawnProcess = (
   options: SpawnOptions,
 ) => ChildProcess;
 
-type ProcessGroupInspection =
-  | { status: "PRESENT" }
-  | { status: "GONE" }
-  | { status: "AMBIGUOUS" };
-
 export interface OpsWorkerConversationRunnerDependencies {
   spawnProcess?: SpawnProcess;
   resolveInvocation?: (args: readonly string[]) => PiInvocation;
@@ -154,7 +153,9 @@ export interface OpsWorkerConversationRunnerDependencies {
     runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
   ) => Record<string, string>;
   resolveBoundsExtensionPath?: () => string;
-  inspectProcessGroup?: (processGroupId: number) => ProcessGroupInspection;
+  inspectProcessGroup?: (
+    processGroupId: number,
+  ) => OpsWorkerProcessGroupInspection;
   signalProcessGroup?: (
     processGroupId: number,
     signal: NodeJS.Signals,
@@ -250,13 +251,14 @@ export class OpsWorkerConversationRunner {
   private readonly boundsExtensionPath: string;
   private readonly inspectProcessGroup: (
     processGroupId: number,
-  ) => ProcessGroupInspection;
+  ) => OpsWorkerProcessGroupInspection;
   private readonly signalProcessGroup: (
     processGroupId: number,
     signal: NodeJS.Signals,
   ) => void;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private running: RunningTurn | null = null;
+  private unreapedProcessGroupId: number | null = null;
 
   constructor(options: OpsWorkerConversationRunnerOptions) {
     this.workspaceCwd = validateWorkspace(options.workspaceCwd);
@@ -300,7 +302,7 @@ export class OpsWorkerConversationRunner {
       ?? resolveOpsWorkerConversationBoundsExtensionPath
     )();
     this.inspectProcessGroup = dependencies.inspectProcessGroup
-      ?? inspectProcessGroup;
+      ?? inspectOpsWorkerProcessGroup;
     this.signalProcessGroup = dependencies.signalProcessGroup
       ?? ((processGroupId, signal) => process.kill(-processGroupId, signal));
     this.sleep = dependencies.sleep
@@ -315,6 +317,7 @@ export class OpsWorkerConversationRunner {
     options: OpsWorkerConversationTurnOptions = {},
   ): Promise<OpsWorkerConversationTurnResult> {
     if (this.running !== null) return fallback("BUSY");
+    if (this.unreapedProcessGroupId !== null) return fallback("BUSY");
     if (this.abortSignal?.aborted || options.signal?.aborted) {
       return fallback("ABORTED");
     }
@@ -340,9 +343,17 @@ export class OpsWorkerConversationRunner {
 
   async abort(): Promise<boolean> {
     const running = this.running;
-    if (running === null) return true;
-    running.abort();
-    return running.done;
+    if (running !== null) {
+      running.abort();
+      return running.done;
+    }
+    const processGroupId = this.unreapedProcessGroupId;
+    if (processGroupId === null) return true;
+    const reaped = await this.stopProcessGroup(processGroupId);
+    if (reaped && this.unreapedProcessGroupId === processGroupId) {
+      this.unreapedProcessGroupId = null;
+    }
+    return reaped;
   }
 
   private async execute(
@@ -486,6 +497,9 @@ export class OpsWorkerConversationRunner {
       turnSignal?.removeEventListener("abort", abort);
       child.stdout?.off("data", onStdout);
       child.stderr?.off("data", onStderr);
+      if (!processReaped && child.pid !== undefined) {
+        this.unreapedProcessGroupId = child.pid;
+      }
       if (this.running?.done === done) this.running = null;
       resolveDone(processReaped);
     }
@@ -742,7 +756,10 @@ function validateOperatorText(value: unknown): string | null {
 }
 
 function boundedNonEmptyString(value: unknown, maximumBytes: number): string | null {
-  if (typeof value !== "string" || value.includes("\0")) return null;
+  if (
+    typeof value !== "string"
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)
+  ) return null;
   const trimmed = value.trim();
   return trimmed !== ""
     && Buffer.byteLength(trimmed, "utf8") <= maximumBytes
@@ -791,20 +808,6 @@ function hasExactKeys(
   const sortedExpected = [...expected].sort();
   return actual.length === sortedExpected.length
     && actual.every((key, index) => key === sortedExpected[index]);
-}
-
-function inspectProcessGroup(processGroupId: number): ProcessGroupInspection {
-  if (!Number.isSafeInteger(processGroupId) || processGroupId < 1) {
-    return { status: "AMBIGUOUS" };
-  }
-  try {
-    process.kill(-processGroupId, 0);
-    return { status: "PRESENT" };
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH"
-      ? { status: "GONE" }
-      : { status: "AMBIGUOUS" };
-  }
 }
 
 function classifyProcessFailure(

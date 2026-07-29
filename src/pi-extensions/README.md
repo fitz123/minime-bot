@@ -15,6 +15,8 @@ Most helpers here back the live Pi extensions:
 - `codex-usage` for bounded Codex quota capture and persistence.
 - `ops-worker-parity-attestation` for the ops-only, before-provider context and
   capability handshake.
+- `ops-worker-conversation-bounds` for the tool-free Ops conversation runner's
+  final provider-payload ceiling.
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
@@ -26,6 +28,12 @@ only by the out-of-band Codex quota sampler and must not be added to the normal
 ops-worker-only parity wrapper to persist attempt-scoped response telemetry.
 See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
+
+Conversational Ops disables normal extensions and loads only the
+`ops-worker-conversation-bounds` wrapper. Its `before_provider_request`
+handler clamps recognized request shapes to 768 output tokens. An unknown or
+invalid provider payload exits with the fixed fail-closed code instead of
+continuing with an unbounded request.
 
 `PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
 first-party wrappers and any configured `piExtraExtensions`. That deliberately

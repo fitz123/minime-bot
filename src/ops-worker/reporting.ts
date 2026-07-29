@@ -304,13 +304,10 @@ export function buildOpsWorkerTelegramReport(
       0,
       OPS_WORKER_REPORT_FIELD_LIMITS.verifierComponents,
     ).map((component) =>
-      `${component.identity}/${component.outcome}: ${truncateUtf8(
-          options.redact(
-            component.summary,
-            OPS_WORKER_REPORT_FIELD_LIMITS.verifierSummaryBytes,
-          ),
-          OPS_WORKER_REPORT_FIELD_LIMITS.verifierSummaryBytes,
-        )}`);
+      `${component.identity}/${component.outcome}: ${options.redact(
+        component.summary,
+        OPS_WORKER_REPORT_FIELD_LIMITS.verifierSummaryBytes,
+      )}`);
     lines.push({
       prefix: "Verification checks: ",
       value: components.length === 0 ? "none" : components.join(" | "),
