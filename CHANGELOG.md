@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.40
+
+- Add managed byte-preserving Knowledge archive/restore operations with complete
+  structural logging, active-index/search removal, and fixed weekly 40 KiB to
+  30 KiB maintenance for closed, old, non-mixed process records (#128).
+
 ## 2026.7.39
 
 - Expose one bounded terminal outcome per logical cron run through monotonic
