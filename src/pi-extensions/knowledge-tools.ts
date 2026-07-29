@@ -66,12 +66,40 @@ export const KNOWLEDGE_UPDATE_TOOL = {
   promptSnippet:
     "Write or reversibly archive durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
   promptGuidelines: [
-    "Use knowledge_update for durable Knowledge v2 writes and reversible archive/restore; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, or wiki/pages/**.",
+    "Use knowledge_update for durable Knowledge v2 writes and reversible archive/restore; do not directly write wiki/schema.md, wiki/index.md, wiki/log.md, wiki/issues.md, wiki/pages/**, or artifacts/knowledge-archive/**.",
     "For create, update, or upsert, provide type, a slug or managed page path, flat frontmatter, and a Markdown body without frontmatter.",
     "For archive or restore, provide only op and the original managed wiki/pages/<type>/**/*.md path; never fabricate write payload fields.",
     "knowledge_update is for synthesized durable knowledge, not arbitrary file editing or active task state.",
   ] as string[],
   parameters: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      op: {
+        type: "string",
+        enum: ["create", "update", "upsert", "archive", "restore"],
+        description: "Managed Knowledge operation.",
+      },
+      type: {
+        type: "string",
+        enum: ["user", "project", "feedback", "reference"],
+        description: "Knowledge page type for write operations.",
+      },
+      slug: {
+        type: "string",
+        description: "Safe relative slug under wiki/pages/<type>, without or with .md.",
+      },
+      path: {
+        type: "string",
+        description: "Original relative path under wiki/pages/<type>/**/*.md.",
+      },
+      frontmatter: {
+        type: "object",
+        description: "Flat frontmatter with required name, description, and type fields.",
+      },
+      body: { type: "string", description: "Markdown body without frontmatter." },
+    },
+    required: ["op"],
     anyOf: [
       {
         type: "object",
@@ -162,6 +190,7 @@ const MANAGED_EXACT_RELPATHS = [
   "wiki/log.md",
   "wiki/issues.md",
 ] as const;
+const MANAGED_ARCHIVE_RELPATH = "artifacts/knowledge-archive";
 
 const AGENT_WORKSPACE_ENV_FALLBACK_WARNING =
   `${MINIME_AGENT_WORKSPACE_ROOT_ENV} was not provided; falling back to process cwd for this Pi knowledge call.`;
@@ -321,7 +350,7 @@ export function classifyKnowledgeIntegrityToolCall(
         block: true,
         targetPath: ambiguousManagedPath,
         reason:
-          `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
           `Blocked direct ${event.toolName} target: ${ambiguousManagedPath}.`,
       };
     }
@@ -333,7 +362,7 @@ export function classifyKnowledgeIntegrityToolCall(
           block: true,
           targetPath: managedRawPath,
           reason:
-            `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
             `Blocked direct ${event.toolName} target: ${managedRawPath}.`,
         };
       }
@@ -345,7 +374,7 @@ export function classifyKnowledgeIntegrityToolCall(
         block: true,
         targetPath: managedPath,
         reason:
-          `Knowledge v2 managed wiki paths are writable only through knowledge_update. ` +
+          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
           `Blocked direct ${event.toolName} target: ${managedPath}.`,
       };
     }
@@ -937,6 +966,17 @@ function unresolvedManagedKnowledgeRelPath(rawPath: string): string | undefined 
       return relPath;
     }
   }
+  const archiveMarker = `/${MANAGED_ARCHIVE_RELPATH}/`;
+  const archiveMarkerIndex = normalized.indexOf(archiveMarker);
+  if (
+    normalized === MANAGED_ARCHIVE_RELPATH ||
+    normalized.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+  ) {
+    return normalized;
+  }
+  if (archiveMarkerIndex >= 0) {
+    return normalized.slice(archiveMarkerIndex + 1);
+  }
   const marker = "/wiki/pages/";
   const markerIndex = normalized.indexOf(marker);
   if (normalized === "wiki/pages" || normalized.startsWith("wiki/pages/")) {
@@ -967,6 +1007,12 @@ function ambiguousManagedKnowledgeRelPath(
   if (normalizedRawPath === "wiki" || normalizedRawPath.startsWith("wiki/")) {
     relCandidates.add(normalizedRawPath);
   }
+  if (
+    normalizedRawPath === MANAGED_ARCHIVE_RELPATH ||
+    normalizedRawPath.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+  ) {
+    relCandidates.add(normalizedRawPath);
+  }
 
   const absPath = resolveShellPath(rawPath, cwd, env);
   if (absPath) {
@@ -976,6 +1022,11 @@ function ambiguousManagedKnowledgeRelPath(
       }
     }
   } else {
+    const archiveMarker = `/${MANAGED_ARCHIVE_RELPATH}/`;
+    const archiveMarkerIndex = normalizedRawPath.indexOf(archiveMarker);
+    if (archiveMarkerIndex >= 0) {
+      relCandidates.add(normalizedRawPath.slice(archiveMarkerIndex + 1));
+    }
     const marker = "/wiki/";
     const markerIndex = normalizedRawPath.indexOf(marker);
     if (markerIndex >= 0) {
@@ -986,6 +1037,12 @@ function ambiguousManagedKnowledgeRelPath(
   for (const relCandidate of relCandidates) {
     const normalizedRel = relCandidate.replace(/\\/g, "/").replace(/^\.\//, "");
     if (normalizedRel === "wiki" || normalizedRel.startsWith("wiki/")) {
+      return normalizedRel;
+    }
+    if (
+      normalizedRel === MANAGED_ARCHIVE_RELPATH ||
+      normalizedRel.startsWith(`${MANAGED_ARCHIVE_RELPATH}/`)
+    ) {
       return normalizedRel;
     }
     const pagesMarker = "/wiki/pages/";
@@ -1066,13 +1123,18 @@ function managedKnowledgeRelPath(layout: Extract<ResolvedKnowledgeLayout, { kind
     const direct = join(layout.agentWorkspaceRoot, ...relPath.split("/"));
     return [direct, realOrSelf(direct)];
   });
-  const pageRoots = [layout.paths.pagesDir, realOrSelf(layout.paths.pagesDir)];
+  const managedRoots = [
+    layout.paths.pagesDir,
+    realOrSelf(layout.paths.pagesDir),
+    layout.paths.knowledgeArchiveDir,
+    realOrSelf(layout.paths.knowledgeArchiveDir),
+  ];
 
   for (const candidate of candidates) {
     if (exactPaths.some((managedPath) => samePath(candidate, managedPath))) {
       return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
     }
-    if (pageRoots.some((managedPath) => insideOrSame(managedPath, candidate))) {
+    if (managedRoots.some((managedPath) => insideOrSame(managedPath, candidate))) {
       return toWorkspaceRel(layout.agentWorkspaceRoot, candidate);
     }
   }

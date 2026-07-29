@@ -1677,6 +1677,15 @@ assert.match(knowledgeGetResult.content[0].text, /# Runtime/);
 
 const knowledgeUpdateTool = registeredToolDefs.find((tool) => tool.name === "knowledge_update");
 assert.ok(knowledgeUpdateTool, "knowledge_update should be registered");
+assert.equal(knowledgeUpdateTool.parameters.type, "object");
+assert.deepEqual(knowledgeUpdateTool.parameters.required, ["op"]);
+assert.deepEqual(knowledgeUpdateTool.parameters.properties.op.enum, [
+  "create",
+  "update",
+  "upsert",
+  "archive",
+  "restore",
+]);
 const [knowledgeWriteSchema, knowledgeMoveSchema] = knowledgeUpdateTool.parameters.anyOf;
 assert.deepEqual(knowledgeWriteSchema.required, ["op", "type", "frontmatter", "body"]);
 assert.deepEqual(knowledgeMoveSchema.required, ["op", "path"]);

@@ -57,6 +57,8 @@ describe("knowledge layout resolver", () => {
     assert.equal(layout.paths.rawGlob, join(workspace, "raw", "**"));
     assert.equal(layout.paths.artifactsDir, join(workspace, "artifacts"));
     assert.equal(layout.paths.artifactsGlob, join(workspace, "artifacts", "**"));
+    assert.equal(layout.paths.knowledgeArchiveDir, join(workspace, "artifacts", "knowledge-archive"));
+    assert.equal(layout.paths.knowledgeArchiveGlob, join(workspace, "artifacts", "knowledge-archive", "**"));
     assert.deepEqual(Object.keys(layout.paths.pageTypeDirs).sort(), [...KNOWLEDGE_PAGE_TYPES].sort());
     assert.deepEqual(Object.keys(layout.paths.pageTypeGlobs).sort(), [...KNOWLEDGE_PAGE_TYPES].sort());
     assert.equal(layout.paths.pageTypeGlobs.project, join(workspace, "wiki", "pages", "project", "**"));

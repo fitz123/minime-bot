@@ -30,6 +30,8 @@ export interface KnowledgeV2LayoutPaths {
   rawGlob: string;
   artifactsDir: string;
   artifactsGlob: string;
+  knowledgeArchiveDir: string;
+  knowledgeArchiveGlob: string;
 }
 
 export interface KnowledgeLegacyLayoutPaths {
@@ -119,6 +121,8 @@ function buildCandidatePaths(agentWorkspaceRoot: string): KnowledgeLayoutCandida
       rawGlob: workspacePath(agentWorkspaceRoot, "raw/**"),
       artifactsDir: workspacePath(agentWorkspaceRoot, "artifacts"),
       artifactsGlob: workspacePath(agentWorkspaceRoot, "artifacts/**"),
+      knowledgeArchiveDir: workspacePath(agentWorkspaceRoot, "artifacts/knowledge-archive"),
+      knowledgeArchiveGlob: workspacePath(agentWorkspaceRoot, "artifacts/knowledge-archive/**"),
     },
     legacy: {
       memoryPath: workspacePath(agentWorkspaceRoot, "MEMORY.md"),

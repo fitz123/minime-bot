@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -17,6 +18,8 @@ import {
 } from "./layout.js";
 import {
   executeKnowledgeUpdate,
+  KNOWLEDGE_ARCHIVE_PRECONDITION_CHANGED_REASON,
+  KNOWLEDGE_ARCHIVE_PRECONDITION_LOW_WATERMARK_REASON,
   validateKnowledgePageFrontmatter,
   type KnowledgeUpdateArgs,
   type KnowledgeUpdateDeps,
@@ -127,6 +130,12 @@ interface MutableManifestState {
   skipped: KnowledgeMaintenanceSkippedCounts;
   errors: KnowledgeMaintenanceError[];
   errorCount: number;
+  mutated: boolean;
+}
+
+interface MaintenanceCandidateCollection {
+  candidates: MaintenanceCandidate[];
+  complete: boolean;
 }
 
 interface ReportTarget {
@@ -205,6 +214,7 @@ function emptyState(): MutableManifestState {
     },
     errors: [],
     errorCount: 0,
+    mutated: false,
   };
 }
 
@@ -244,7 +254,7 @@ function buildManifest(
     errors: state.errors,
     errorsOmitted: Math.max(0, state.errorCount - state.errors.length),
     stopReason,
-    mutated: state.archivedCount > 0,
+    mutated: state.mutated,
   };
 }
 
@@ -337,16 +347,91 @@ function collectMaintenanceCandidates(
   closedIssueNumbers: ReadonlySet<number>,
   nowMs: number,
   state: MutableManifestState,
-): MaintenanceCandidate[] {
+): MaintenanceCandidateCollection {
   const candidates: MaintenanceCandidate[] = [];
   const projectRoot = layout.paths.pageTypeDirs.project;
+  let complete = true;
+  let realWorkspaceRoot: string;
+  try {
+    realWorkspaceRoot = realpathSync(layout.agentWorkspaceRoot);
+  } catch (error) {
+    addError(
+      state,
+      ".",
+      "scan-failed",
+      `Could not inspect the workspace root before scanning project records: ${errorMessage(error)}`,
+    );
+    return { candidates, complete: false };
+  }
+
+  const inspectDirectory = (dir: string): "directory" | "missing" | "unsafe" => {
+    if (!isInsidePath(layout.agentWorkspaceRoot, dir)) {
+      addError(state, toWorkspaceRel(layout.agentWorkspaceRoot, dir), "scan-escape", "Project scan path escaped the workspace.");
+      return "unsafe";
+    }
+    let current = layout.agentWorkspaceRoot;
+    for (const part of relative(layout.agentWorkspaceRoot, dir).split(sep).filter(Boolean)) {
+      current = join(current, part);
+      try {
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink()) {
+          addError(
+            state,
+            toWorkspaceRel(layout.agentWorkspaceRoot, current),
+            "symlink-rejected",
+            "Maintenance does not follow symlinked project paths.",
+          );
+          return "unsafe";
+        }
+        if (!stat.isDirectory()) {
+          addError(
+            state,
+            toWorkspaceRel(layout.agentWorkspaceRoot, current),
+            "scan-failed",
+            "Project scan path component is not a directory.",
+          );
+          return "unsafe";
+        }
+        if (!isInsidePath(realWorkspaceRoot, realpathSync(current))) {
+          addError(
+            state,
+            toWorkspaceRel(layout.agentWorkspaceRoot, current),
+            "scan-escape",
+            "Project scan path real location escaped the workspace.",
+          );
+          return "unsafe";
+        }
+      } catch (error) {
+        if ((error as { code?: string }).code === "ENOENT") {
+          return "missing";
+        }
+        addError(
+          state,
+          toWorkspaceRel(layout.agentWorkspaceRoot, current),
+          "scan-failed",
+          `Could not inspect the project scan path: ${errorMessage(error)}`,
+        );
+        return "unsafe";
+      }
+    }
+    return "directory";
+  };
 
   const walk = (dir: string): void => {
+    const directoryStatus = inspectDirectory(dir);
+    if (directoryStatus === "missing") {
+      return;
+    }
+    if (directoryStatus === "unsafe") {
+      complete = false;
+      return;
+    }
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch (error) {
       if ((error as { code?: string }).code !== "ENOENT") {
+        complete = false;
         addError(
           state,
           toWorkspaceRel(layout.agentWorkspaceRoot, dir),
@@ -433,11 +518,14 @@ function collectMaintenanceCandidates(
   };
 
   walk(projectRoot);
-  return candidates.sort(
-    (left, right) =>
-      left.mtimeMs - right.mtimeMs ||
-      left.relPath.localeCompare(right.relPath),
-  );
+  return {
+    candidates: candidates.sort(
+      (left, right) =>
+        left.mtimeMs - right.mtimeMs ||
+        left.relPath.localeCompare(right.relPath),
+    ),
+    complete,
+  };
 }
 
 function snapshotFile(path: string): FileSnapshot {
@@ -467,9 +555,7 @@ function snapshotCandidate(
     indexBytes: readIndexBytes(layout),
     active: snapshotFile(resolve(layout.agentWorkspaceRoot, ...relPath.split("/"))),
     archive: snapshotFile(resolve(
-      layout.agentWorkspaceRoot,
-      "artifacts",
-      "knowledge-archive",
+      layout.paths.knowledgeArchiveDir,
       ...relPath.split("/"),
     )),
   };
@@ -704,12 +790,20 @@ export function executeKnowledgeMaintenance(
   }
 
   const now = deps.now?.() ?? new Date();
-  const candidates = collectMaintenanceCandidates(
+  const candidateCollection = collectMaintenanceCandidates(
     layout,
     closedIssueNumbers,
     now.getTime(),
     state,
   );
+  if (!candidateCollection.complete) {
+    return finalizeSuccess(
+      layout,
+      buildManifest(state, bytesBefore, bytesBefore, "unsafe-failure"),
+      reportTarget,
+    );
+  }
+  const candidates = candidateCollection.candidates;
   const update = deps.executeUpdate ?? executeKnowledgeUpdate;
   let bytesAfter = bytesBefore;
   let stopReason: KnowledgeMaintenanceStopReason = "eligible-exhausted";
@@ -718,6 +812,7 @@ export function executeKnowledgeMaintenance(
     let before: CandidateSnapshot;
     try {
       before = snapshotCandidate(layout, candidate.relPath);
+      bytesAfter = before.indexBytes.byteLength;
     } catch (error) {
       addError(
         state,
@@ -726,6 +821,10 @@ export function executeKnowledgeMaintenance(
         `Could not capture pre-archive state: ${errorMessage(error)}`,
       );
       stopReason = "unsafe-failure";
+      break;
+    }
+    if (bytesAfter <= KNOWLEDGE_MAINTENANCE_LOW_WATERMARK_BYTES) {
+      stopReason = "low-watermark-reached";
       break;
     }
 
@@ -752,6 +851,11 @@ export function executeKnowledgeMaintenance(
           agentWorkspaceRoot: workspaceRoot,
           env: deps.env ?? process.env,
           now: () => now,
+          archivePrecondition: {
+            expectedSourceBytes: candidate.expectedBytes,
+            expectedSourceMtimeMs: candidate.mtimeMs,
+            indexMustExceedBytes: KNOWLEDGE_MAINTENANCE_LOW_WATERMARK_BYTES,
+          },
         },
       );
     } catch (error) {
@@ -769,6 +873,7 @@ export function executeKnowledgeMaintenance(
         "candidate-state-unreadable",
         `Could not verify post-archive state: ${errorMessage(error)}`,
       );
+      state.mutated = true;
       stopReason = "unsafe-failure";
       break;
     }
@@ -783,17 +888,35 @@ export function executeKnowledgeMaintenance(
       if (sameCandidateSnapshot(before, after)) {
         continue;
       }
+      state.mutated = true;
       stopReason = "unsafe-failure";
       break;
     }
 
     if (!response.ok) {
+      if (
+        response.status === "rejected" &&
+        response.reason === KNOWLEDGE_ARCHIVE_PRECONDITION_LOW_WATERMARK_REASON
+      ) {
+        stopReason = "low-watermark-reached";
+        break;
+      }
+      if (
+        response.status === "rejected" &&
+        response.reason === KNOWLEDGE_ARCHIVE_PRECONDITION_CHANGED_REASON
+      ) {
+        addError(state, candidate.relPath, response.reason, response.message);
+        continue;
+      }
       addError(state, candidate.relPath, response.reason, response.message);
       if (
         (response.status === "rejected" || response.status === "locked") &&
         sameCandidateSnapshot(before, after)
       ) {
         continue;
+      }
+      if (!sameCandidateSnapshot(before, after)) {
+        state.mutated = true;
       }
       stopReason = "unsafe-failure";
       break;
@@ -810,11 +933,15 @@ export function executeKnowledgeMaintenance(
         "archive-verification-failed",
         "Managed archive returned success without the expected byte-identical active-to-archive move.",
       );
+      if (!sameCandidateSnapshot(before, after)) {
+        state.mutated = true;
+      }
       stopReason = "unsafe-failure";
       break;
     }
 
     state.archivedCount += 1;
+    state.mutated = true;
     if (state.archivedPaths.length < KNOWLEDGE_MAINTENANCE_MAX_ARCHIVED_PATHS) {
       state.archivedPaths.push(candidate.relPath);
     }

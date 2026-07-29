@@ -28,6 +28,9 @@ export type KnowledgeMoveOperation = "archive" | "restore";
 export type KnowledgeUpdateOperation = KnowledgeWriteOperation | KnowledgeMoveOperation;
 export type KnowledgeUpdateAction = "created" | "updated" | "archived" | "restored";
 
+export const KNOWLEDGE_ARCHIVE_PRECONDITION_CHANGED_REASON = "archive-precondition-changed";
+export const KNOWLEDGE_ARCHIVE_PRECONDITION_LOW_WATERMARK_REASON = "archive-precondition-low-watermark";
+
 export interface KnowledgeUpdateArgs {
   op?: unknown;
   operation?: unknown;
@@ -47,6 +50,12 @@ export interface KnowledgePageFrontmatter {
   originSessionId?: string;
 }
 
+export interface KnowledgeArchivePrecondition {
+  expectedSourceBytes: Buffer;
+  expectedSourceMtimeMs: number;
+  indexMustExceedBytes: number;
+}
+
 export interface KnowledgeUpdateDeps {
   agentWorkspaceRoot?: string;
   env?: NodeJS.ProcessEnv;
@@ -55,6 +64,7 @@ export interface KnowledgeUpdateDeps {
   now?: () => Date;
   staleLockMs?: number;
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
+  archivePrecondition?: KnowledgeArchivePrecondition;
 }
 
 interface KnowledgeUpdateSuccessBase {
@@ -561,7 +571,7 @@ function assertArchivePath(
   archiveRelPath: string,
   fs: KnowledgeUpdateFs,
 ): string | KnowledgeUpdateFailure {
-  const archiveRoot = normalize(resolve(layout.paths.artifactsDir, "knowledge-archive"));
+  const archiveRoot = layout.paths.knowledgeArchiveDir;
   const absPath = normalize(resolve(layout.agentWorkspaceRoot, ...archiveRelPath.split("/")));
   if (!isInsidePath(archiveRoot, absPath)) {
     return failure(
@@ -785,19 +795,6 @@ export function generateKnowledgeIndex(pages: readonly ParsedPage[]): string {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function extractMarkdownLinks(markdown: string): string[] {
-  const links: string[] = [];
-  const pattern = /\[[^\]]+\]\(([^)]+)\)/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(markdown)) !== null) {
-    const target = match[1].trim();
-    if (target) {
-      links.push(target);
-    }
-  }
-  return links;
-}
-
 function verifyIndexInvariants(
   layout: ResolvedKnowledgeV2Layout,
   targetRelPath: string,
@@ -805,29 +802,11 @@ function verifyIndexInvariants(
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   const index = fs.readFileSync(layout.paths.indexPath, "utf8");
-  const targetLink = relative(dirname(layout.paths.indexPath), resolve(layout.agentWorkspaceRoot, ...targetRelPath.split("/")))
-    .split(sep)
-    .join("/");
-  const actualLinks = extractMarkdownLinks(index);
-  let targetCount = 0;
-
-  for (const link of actualLinks) {
-    if (link === targetLink) {
-      targetCount += 1;
-    }
-    if (isAbsolute(link) || link.includes("\\") || link.includes("#")) {
-      return failure("error", "index-link-invalid", `Knowledge index link is not a plain relative Markdown link: ${link}.`);
-    }
-    const parts = link.split("/");
-    if (parts.some((part) => !part || part === "." || part === "..")) {
-      return failure("error", "index-link-invalid", `Knowledge index link escapes the wiki directory: ${link}.`);
-    }
-    const target = normalize(resolve(dirname(layout.paths.indexPath), ...parts));
-    if (!isInsidePath(layout.paths.pagesDir, target) || extname(target).toLowerCase() !== ".md" || !fs.existsSync(target)) {
-      return failure("error", "index-link-missing", `Knowledge index link does not resolve to a page: ${link}.`);
-    }
+  const pages = collectPages(layout, fs);
+  if (isUpdateFailure(pages)) {
+    return pages;
   }
-
+  const targetCount = pages.filter((page) => page.relPath === targetRelPath).length;
   if (targetCount !== expectedTargetCount) {
     return failure(
       "error",
@@ -835,21 +814,11 @@ function verifyIndexInvariants(
       `Managed target must appear ${expectedTargetCount === 1 ? "exactly once" : "zero times"} in wiki/index.md.`,
     );
   }
-
-  const pages = collectPages(layout, fs);
-  if (isUpdateFailure(pages)) {
-    return pages;
-  }
-  const expectedLinks = pages.map((page) => page.linkPath).sort((a, b) => a.localeCompare(b));
-  const sortedActualLinks = [...actualLinks].sort((a, b) => a.localeCompare(b));
-  if (
-    expectedLinks.length !== sortedActualLinks.length ||
-    expectedLinks.some((link, index) => link !== sortedActualLinks[index])
-  ) {
+  if (index !== generateKnowledgeIndex(pages)) {
     return failure(
       "error",
       "index-page-set-mismatch",
-      "wiki/index.md links must exactly match the complete active Knowledge page set.",
+      "wiki/index.md must exactly match the generated complete active Knowledge page set.",
     );
   }
   return undefined;
@@ -1105,6 +1074,48 @@ function verifyMovedBytes(
   return undefined;
 }
 
+function verifyArchivePrecondition(
+  layout: ResolvedKnowledgeV2Layout,
+  sourcePath: string,
+  precondition: KnowledgeArchivePrecondition,
+  fs: KnowledgeUpdateFs,
+): KnowledgeUpdateFailure | undefined {
+  let indexBytes: Buffer;
+  let sourceStat: ReturnType<KnowledgeUpdateFs["lstatSync"]>;
+  let sourceBytes: Buffer;
+  try {
+    indexBytes = readFileBytes(layout.paths.indexPath, fs);
+    sourceStat = fs.lstatSync(sourcePath);
+    sourceBytes = readFileBytes(sourcePath, fs);
+  } catch {
+    return failure(
+      "error",
+      "archive-precondition-unreadable",
+      "knowledge_update could not revalidate the maintenance archive precondition.",
+    );
+  }
+  if (indexBytes.byteLength <= precondition.indexMustExceedBytes) {
+    return failure(
+      "rejected",
+      KNOWLEDGE_ARCHIVE_PRECONDITION_LOW_WATERMARK_REASON,
+      "knowledge_update skipped maintenance archive because the index already reached the low watermark.",
+    );
+  }
+  if (
+    !sourceStat.isFile() ||
+    sourceStat.isSymbolicLink() ||
+    sourceStat.mtimeMs !== precondition.expectedSourceMtimeMs ||
+    !sourceBytes.equals(precondition.expectedSourceBytes)
+  ) {
+    return failure(
+      "rejected",
+      KNOWLEDGE_ARCHIVE_PRECONDITION_CHANGED_REASON,
+      "knowledge_update skipped maintenance archive because the candidate changed after policy evaluation.",
+    );
+  }
+  return undefined;
+}
+
 function validateIndexAndLogPaths(
   layout: ResolvedKnowledgeV2Layout,
   fs: KnowledgeUpdateFs,
@@ -1268,6 +1279,17 @@ function executeMoveRequest(
   if (sourceProblem) {
     return sourceProblem;
   }
+  if (request.operation === "archive" && deps.archivePrecondition) {
+    const preconditionProblem = verifyArchivePrecondition(
+      layout,
+      sourcePath,
+      deps.archivePrecondition,
+      fs,
+    );
+    if (preconditionProblem) {
+      return preconditionProblem;
+    }
+  }
 
   const beforePages = collectPages(layout, fs);
   if (isUpdateFailure(beforePages)) {
@@ -1291,6 +1313,7 @@ function executeMoveRequest(
   }
 
   let plans: AtomicWritePlan[] = [];
+  let refreshAttempted = false;
   try {
     fs.renameSync(sourcePath, destinationPath);
     const nextPages = collectPages(layout, fs);
@@ -1320,10 +1343,28 @@ function executeMoveRequest(
       rollbackMove(sourcePath, destinationPath, fs);
       return invariantProblem;
     }
-    deps.refreshSearchBackend?.(layout);
+    if (deps.refreshSearchBackend) {
+      refreshAttempted = true;
+      deps.refreshSearchBackend(layout);
+    }
   } catch (error) {
     rollbackCommittedWrites(plans, fs);
     rollbackMove(sourcePath, destinationPath, fs);
+    let rollbackRefreshError: unknown;
+    if (refreshAttempted && deps.refreshSearchBackend) {
+      try {
+        deps.refreshSearchBackend(layout);
+      } catch (refreshError) {
+        rollbackRefreshError = refreshError;
+      }
+    }
+    if (rollbackRefreshError) {
+      return failure(
+        "error",
+        "knowledge-update-search-rollback-failed",
+        `knowledge_update rolled its files back after verification failed, but could not refresh restored search state: ${errorMessage(rollbackRefreshError)}`,
+      );
+    }
     return failure(
       "error",
       "knowledge-update-verify-failed",

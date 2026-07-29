@@ -83,6 +83,17 @@ describe("Knowledge Pi extension helpers", () => {
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /archive, or restore/);
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /preserve page bytes/);
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /Direct manual writes/);
+    assert.equal(KNOWLEDGE_UPDATE_TOOL.parameters.type, "object");
+    assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.required, ["op"]);
+    assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.properties.op.enum, [
+      "create",
+      "update",
+      "upsert",
+      "archive",
+      "restore",
+    ]);
+    assert.ok("path" in KNOWLEDGE_UPDATE_TOOL.parameters.properties);
+    assert.ok("body" in KNOWLEDGE_UPDATE_TOOL.parameters.properties);
     const [writeSchema, moveSchema] = KNOWLEDGE_UPDATE_TOOL.parameters.anyOf;
     assert.deepEqual(writeSchema.required, ["op", "type", "frontmatter", "body"]);
     assert.deepEqual(writeSchema.properties.op.enum, ["create", "update", "upsert"]);
@@ -127,6 +138,11 @@ describe("Knowledge Pi extension helpers", () => {
     assert.match(archived.text, /"action": "archived"/);
     assert.equal(existsSync(join(workspace, ...relPath.split("/"))), false);
     assert.equal(readFileSync(join(workspace, ...archiveRelPath.split("/")), "utf8"), page);
+    assertBlocked(
+      workspace,
+      { toolName: "edit", input: { path: archiveRelPath, edits: [] } },
+      archiveRelPath,
+    );
 
     const restored = executePiKnowledgeUpdate(
       { op: "restore", path: relPath },
@@ -206,7 +222,7 @@ describe("Knowledge Pi extension helpers", () => {
     assert.doesNotMatch(result.text, /falling back to process cwd/);
   });
 
-  it("blocks direct write and edit targets under managed v2 wiki paths", () => {
+  it("blocks direct write and edit targets under managed v2 wiki and archive paths", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n",
     });
@@ -220,6 +236,17 @@ describe("Knowledge Pi extension helpers", () => {
       workspace,
       { toolName: "edit", input: { path: "wiki/pages/project/runtime.md", edits: [] } },
       "wiki/pages/project/runtime.md",
+    );
+    assertBlocked(
+      workspace,
+      {
+        toolName: "write",
+        input: {
+          path: "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+          content: "bad",
+        },
+      },
+      "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
     );
   });
 
@@ -283,6 +310,18 @@ describe("Knowledge Pi extension helpers", () => {
       ["rm wiki/i?dex.md", "wiki/i?dex.md"],
       ["rm wiki/*.md", "wiki/*.md"],
       ["cd wiki && rm i?dex.md", "wiki/i?dex.md"],
+      [
+        "printf x > artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+        "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+      ],
+      [
+        "rm artifacts/knowledge-archive/wiki/pages/project/*.md",
+        "artifacts/knowledge-archive/wiki/pages/project/*.md",
+      ],
+      [
+        "printf x > $UNKNOWN/artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+        "artifacts/knowledge-archive/wiki/pages/project/runtime.md",
+      ],
     ];
 
     for (const [command, target] of cases) {

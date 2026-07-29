@@ -820,6 +820,43 @@ describe("minime-bot CLI", () => {
     }
   });
 
+  it("prints and writes requested maintenance evidence on the below-threshold fast path", () => {
+    const agentWorkspace = createKnowledgeWorkspace();
+    try {
+      writeExactKnowledgeIndexSize(
+        agentWorkspace,
+        KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES,
+      );
+      const result = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--report",
+          "artifacts/maintenance/below-threshold.json",
+        ],
+        BOT_ROOT,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, /Knowledge maintenance: below-high-watermark; 40960 -> 40960 bytes; archived 0\./);
+      assert.match(result.stdout, /Report: artifacts\/maintenance\/below-threshold\.json/);
+      const report = JSON.parse(
+        readFileSync(
+          join(agentWorkspace, "artifacts/maintenance/below-threshold.json"),
+          "utf8",
+        ),
+      ) as { stopReason: string; mutated: boolean; bytesBefore: number };
+      assert.equal(report.stopReason, "below-high-watermark");
+      assert.equal(report.mutated, false);
+      assert.equal(report.bytesBefore, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES);
+    } finally {
+      rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
   it("runs pressured maintenance with JSON and a bounded report", () => {
     const agentWorkspace = createKnowledgeWorkspace();
     const relPath = "wiki/pages/project/history/release-2026-05-01.md";
@@ -880,7 +917,7 @@ describe("minime-bot CLI", () => {
     }
   });
 
-  it("returns usage exits for pressured invalid evidence and unsafe report paths", () => {
+  it("returns nonzero exits for pressured invalid evidence, unsafe reports, and incomplete scans", () => {
     const agentWorkspace = createKnowledgeWorkspace();
     try {
       writeExactKnowledgeIndexSize(
@@ -924,6 +961,29 @@ describe("minime-bot CLI", () => {
         (JSON.parse(invalidReport.stdout) as { reason: string }).reason,
         "knowledge-maintenance-report-path-invalid",
       );
+
+      rmSync(join(agentWorkspace, "wiki/pages/project"), { recursive: true, force: true });
+      writeFileSync(join(agentWorkspace, "wiki/pages/project"), "not a directory", "utf8");
+      const incompleteScan = runWithCapture(
+        [
+          "knowledge",
+          "maintain",
+          "--workspace",
+          agentWorkspace,
+          "--json",
+        ],
+        BOT_ROOT,
+      );
+      assert.equal(incompleteScan.code, 1);
+      assert.equal(incompleteScan.stderr, "");
+      const incompleteManifest = JSON.parse(incompleteScan.stdout) as {
+        stopReason: string;
+        mutated: boolean;
+        errors: Array<{ reason: string }>;
+      };
+      assert.equal(incompleteManifest.stopReason, "unsafe-failure");
+      assert.equal(incompleteManifest.mutated, false);
+      assert.equal(incompleteManifest.errors[0]?.reason, "scan-failed");
     } finally {
       rmSync(agentWorkspace, { recursive: true, force: true });
     }

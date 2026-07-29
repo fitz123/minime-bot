@@ -319,6 +319,43 @@ describe("knowledge_update", () => {
     );
   });
 
+  it("verifies the generated index structurally when valid names and descriptions contain Markdown syntax", () => {
+    const workspace = createV2Workspace();
+    const relPath = "wiki/pages/project/markdown-label.md";
+    const frontmatter = {
+      name: "Status [old] notes",
+      description: "See [docs](https://example.invalid) for retained context",
+      type: "project",
+    };
+
+    const created = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "markdown-label",
+        frontmatter,
+        body: "# Status\n\nMARKDOWN_LABEL_TOKEN\n",
+      },
+      { agentWorkspaceRoot: workspace },
+    );
+    assertUpdateOk(created);
+    assert.match(
+      readFileSync(join(workspace, "wiki/index.md"), "utf8"),
+      /See \[docs\\\]\(https:\/\/example\.invalid\)/,
+    );
+
+    const archived = executeKnowledgeUpdate(
+      { op: "archive", path: relPath },
+      { agentWorkspaceRoot: workspace },
+    );
+    assertUpdateOk(archived);
+    const restored = executeKnowledgeUpdate(
+      { op: "restore", path: relPath },
+      { agentWorkspaceRoot: workspace },
+    );
+    assertUpdateOk(restored);
+  });
+
   it("logs upserts as create or update according to the resulting action", () => {
     const workspace = createV2Workspace();
     const args = {
@@ -453,80 +490,100 @@ describe("knowledge_update", () => {
     assert.equal(readFileSync(join(activeOnly, ...relPath.split("/")), "utf8"), page);
   });
 
-  it("rolls an archive back when its move, transaction write, or search refresh fails", () => {
-    const relPath = "wiki/pages/project/rollback-archive.md";
+  it("rolls archive and restore back when their move, transaction write, or search refresh fails", () => {
+    const relPath = "wiki/pages/project/rollback-move.md";
     const archiveRelPath = `artifacts/knowledge-archive/${relPath}`;
     const page = [
       "---",
-      "name: Rollback Archive",
+      "name: Rollback Move",
       "description: Rollback fixture",
       "type: project",
       "---",
       "",
-      "# Rollback Archive",
+      "# Rollback Move",
       "",
-      "ROLLBACK_ARCHIVE_TOKEN",
+      "ROLLBACK_MOVE_TOKEN",
       "",
     ].join("\n");
 
-    for (const failureKind of ["move", "write", "refresh"] as const) {
-      const originalIndex = "# Knowledge Index\n";
-      const originalLog = "- prior entry\n";
-      const workspace = createV2Workspace({
-        [relPath]: page,
-        "wiki/index.md": originalIndex,
-        "wiki/log.md": originalLog,
-      });
-      const activePath = join(workspace, ...relPath.split("/"));
-      const archivePath = join(workspace, ...archiveRelPath.split("/"));
-      const fs =
-        failureKind === "move"
-          ? {
-              renameSync(from: Parameters<typeof renameSync>[0], to: Parameters<typeof renameSync>[1]) {
-                if (from === activePath && to === archivePath) {
-                  renameSync(from, to);
-                  throw new Error("forced move failure");
-                }
-                return renameSync(from, to);
-              },
-            }
-          : failureKind === "write"
+    for (const operation of ["archive", "restore"] as const) {
+      for (const failureKind of ["move", "write", "refresh", "refresh-rollback"] as const) {
+        const originalIndex = "# Knowledge Index\n";
+        const originalLog = "- prior entry\n";
+        const workspace = createV2Workspace({
+          [operation === "archive" ? relPath : archiveRelPath]: page,
+          "wiki/index.md": originalIndex,
+          "wiki/log.md": originalLog,
+        });
+        const activePath = join(workspace, ...relPath.split("/"));
+        const archivePath = join(workspace, ...archiveRelPath.split("/"));
+        const sourcePath = operation === "archive" ? activePath : archivePath;
+        const destinationPath = operation === "archive" ? archivePath : activePath;
+        const fs =
+          failureKind === "move"
             ? {
-                writeFileSync(path: Parameters<typeof writeFileSync>[0], ...args: unknown[]) {
-                  if (typeof path === "string" && path.includes(".index.md.") && path.endsWith(".tmp")) {
-                    throw new Error("forced transaction write failure");
+                renameSync(from: Parameters<typeof renameSync>[0], to: Parameters<typeof renameSync>[1]) {
+                  if (from === sourcePath && to === destinationPath) {
+                    renameSync(from, to);
+                    throw new Error("forced move failure");
                   }
-                  return (writeFileSync as (...values: unknown[]) => void)(path, ...args);
+                  return renameSync(from, to);
                 },
               }
-            : undefined;
+            : failureKind === "write"
+              ? {
+                  writeFileSync(path: Parameters<typeof writeFileSync>[0], ...args: unknown[]) {
+                    if (typeof path === "string" && path.includes(".index.md.") && path.endsWith(".tmp")) {
+                      throw new Error("forced transaction write failure");
+                    }
+                    return (writeFileSync as (...values: unknown[]) => void)(path, ...args);
+                  },
+                }
+              : undefined;
+        let refreshCalls = 0;
 
-      const response = executeKnowledgeUpdate(
-        { op: "archive", path: relPath },
-        {
-          agentWorkspaceRoot: workspace,
-          ...(fs ? { fs } : {}),
-          ...(failureKind === "refresh"
-            ? {
-                refreshSearchBackend() {
-                  throw new Error("forced search refresh failure");
-                },
-              }
-            : {}),
-        },
-      );
-      assert.equal(response.ok, false, failureKind);
-      assert.equal(existsSync(activePath), true, failureKind);
-      assert.equal(existsSync(archivePath), false, failureKind);
-      assert.equal(readFileSync(activePath, "utf8"), page, failureKind);
-      assert.equal(readFileSync(join(workspace, "wiki/index.md"), "utf8"), originalIndex, failureKind);
-      assert.equal(readFileSync(join(workspace, "wiki/log.md"), "utf8"), originalLog, failureKind);
-      const search = executeKnowledgeSearch(
-        { query: "ROLLBACK_ARCHIVE_TOKEN" },
-        { agentWorkspaceRoot: workspace },
-      );
-      assert.equal(search.ok, true, JSON.stringify(search));
-      assert.equal(search.results[0]?.path, relPath, failureKind);
+        const response = executeKnowledgeUpdate(
+          { op: operation, path: relPath },
+          {
+            agentWorkspaceRoot: workspace,
+            ...(fs ? { fs } : {}),
+            ...(failureKind === "refresh" || failureKind === "refresh-rollback"
+              ? {
+                  refreshSearchBackend() {
+                    refreshCalls += 1;
+                    if (refreshCalls === 1 || failureKind === "refresh-rollback") {
+                      throw new Error("forced search refresh failure");
+                    }
+                    assert.equal(existsSync(sourcePath), true);
+                    assert.equal(existsSync(destinationPath), false);
+                  },
+                }
+              : {}),
+          },
+        );
+        assert.equal(response.ok, false, `${operation}:${failureKind}`);
+        if (failureKind === "refresh-rollback") {
+          assert.equal(response.reason, "knowledge-update-search-rollback-failed");
+        }
+        if (failureKind === "refresh") {
+          assert.equal(refreshCalls, 2);
+        }
+        assert.equal(existsSync(sourcePath), true, `${operation}:${failureKind}`);
+        assert.equal(existsSync(destinationPath), false, `${operation}:${failureKind}`);
+        assert.equal(readFileSync(sourcePath, "utf8"), page, `${operation}:${failureKind}`);
+        assert.equal(readFileSync(join(workspace, "wiki/index.md"), "utf8"), originalIndex, `${operation}:${failureKind}`);
+        assert.equal(readFileSync(join(workspace, "wiki/log.md"), "utf8"), originalLog, `${operation}:${failureKind}`);
+        const search = executeKnowledgeSearch(
+          { query: "ROLLBACK_MOVE_TOKEN" },
+          { agentWorkspaceRoot: workspace },
+        );
+        assert.equal(search.ok, true, JSON.stringify(search));
+        if (operation === "archive") {
+          assert.equal(search.results[0]?.path, relPath, failureKind);
+        } else {
+          assert.deepEqual(search.results, [], failureKind);
+        }
+      }
     }
   });
 

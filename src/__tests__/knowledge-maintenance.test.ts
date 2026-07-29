@@ -358,6 +358,69 @@ describe("knowledge maintenance", () => {
     assert.equal(existsSync(join(workspace, ...second.split("/"))), false);
   });
 
+  it("continues after a state-preserving archive throw and verifies the next candidate", () => {
+    const workspace = createWorkspace();
+    const first = "wiki/pages/project/a/release-2026-01-01.md";
+    const second = "wiki/pages/project/b/release-2026-01-01.md";
+    addPage(workspace, first, frontmatter("First"), new Date(OLD.getTime() - 1_000));
+    addPage(workspace, second, frontmatter("Second"), OLD);
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => NOW,
+        executeUpdate: (args, deps) => {
+          if (args.path === first) {
+            throw new Error("Injected state-preserving throw.");
+          }
+          return executeKnowledgeUpdate(args, deps);
+        },
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.archivedCount, 1);
+    assert.deepEqual(response.archivedPaths, [second]);
+    assert.equal(response.errors[0]?.reason, "archive-threw");
+    assert.equal(existsSync(join(workspace, ...first.split("/"))), true);
+    assert.equal(existsSync(join(workspace, ...second.split("/"))), false);
+  });
+
+  it("stops safely when an updater reports success without performing the archive", () => {
+    const workspace = createWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-01-01.md";
+    addPage(workspace, relPath, frontmatter("False success"));
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => NOW,
+        executeUpdate: () => ({
+          ok: true,
+          layoutKind: "v2",
+          operation: "archive",
+          action: "archived",
+          path: relPath,
+          archivePath: `artifacts/knowledge-archive/${relPath}`,
+          indexPath: "wiki/index.md",
+          logPath: "wiki/log.md",
+          lockPath: ".tmp/knowledge-update.lock",
+        }),
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.stopReason, "unsafe-failure");
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, false);
+    assert.equal(response.errors[0]?.reason, "archive-verification-failed");
+    assert.equal(existsSync(join(workspace, ...relPath.split("/"))), true);
+  });
+
   it("stops after a failed archive when post-failure state no longer matches", () => {
     const workspace = createWorkspace();
     const relPath = "wiki/pages/project/history/release-2026-01-01.md";
@@ -384,9 +447,129 @@ describe("knowledge maintenance", () => {
     assertMaintenanceOk(response);
     assert.equal(response.stopReason, "unsafe-failure");
     assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, true);
     assert.equal(response.errors[0]?.reason, "injected-unsafe-failure");
     assert.equal(response.bytesAfter, Buffer.byteLength("changed\n"));
     assert.equal(existsSync(join(workspace, ...relPath.split("/"))), true);
+  });
+
+  it("marks a throwing updater with state drift as unsafe and mutated", () => {
+    const workspace = createWorkspace();
+    const relPath = "wiki/pages/project/history/release-2026-01-01.md";
+    addPage(workspace, relPath, frontmatter("Unsafe throw"));
+    writeExactIndexSize(workspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const response = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: workspace,
+        now: () => NOW,
+        executeUpdate: () => {
+          writeFileSync(join(workspace, "wiki/index.md"), "changed by throw\n", "utf8");
+          throw new Error("Injected throw with state drift.");
+        },
+      },
+    );
+
+    assertMaintenanceOk(response);
+    assert.equal(response.stopReason, "unsafe-failure");
+    assert.equal(response.archivedCount, 0);
+    assert.equal(response.mutated, true);
+    assert.equal(response.errors[0]?.reason, "archive-threw");
+  });
+
+  it("revalidates candidate bytes and low-watermark pressure under the archive lock", () => {
+    const changedWorkspace = createWorkspace();
+    const changedPath = "wiki/pages/project/history/release-2026-01-01.md";
+    const changedPage = addPage(changedWorkspace, changedPath, frontmatter("Changed under lock"));
+    writeExactIndexSize(changedWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const changedResponse = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: changedWorkspace,
+        now: () => NOW,
+        executeUpdate: (args, deps) => {
+          writeFileSync(
+            changedPage.absPath,
+            formatKnowledgePage(
+              frontmatter("Changed under lock", "Now current", "when work resumes"),
+              "# Current again\n",
+            ),
+            "utf8",
+          );
+          utimesSync(changedPage.absPath, NOW, NOW);
+          return executeKnowledgeUpdate(args, deps);
+        },
+      },
+    );
+    assertMaintenanceOk(changedResponse);
+    assert.equal(changedResponse.archivedCount, 0);
+    assert.equal(changedResponse.stopReason, "eligible-exhausted");
+    assert.equal(changedResponse.mutated, false);
+    assert.equal(changedResponse.errors[0]?.reason, "archive-precondition-changed");
+    assert.equal(existsSync(changedPage.absPath), true);
+
+    const lowWorkspace = createWorkspace();
+    const lowPath = "wiki/pages/project/history/release-2026-01-01.md";
+    const lowPage = addPage(lowWorkspace, lowPath, frontmatter("Pressure cleared"));
+    writeExactIndexSize(lowWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+    const lowResponse = executeKnowledgeMaintenance(
+      {},
+      {
+        agentWorkspaceRoot: lowWorkspace,
+        now: () => NOW,
+        executeUpdate: (args, deps) => {
+          writeExactIndexSize(lowWorkspace, KNOWLEDGE_MAINTENANCE_LOW_WATERMARK_BYTES);
+          return executeKnowledgeUpdate(args, deps);
+        },
+      },
+    );
+    assertMaintenanceOk(lowResponse);
+    assert.equal(lowResponse.archivedCount, 0);
+    assert.equal(lowResponse.stopReason, "low-watermark-reached");
+    assert.equal(lowResponse.bytesAfter, KNOWLEDGE_MAINTENANCE_LOW_WATERMARK_BYTES);
+    assert.equal(lowResponse.mutated, false);
+    assert.equal(existsSync(lowPage.absPath), true);
+  });
+
+  it("fails closed before mutation when the project scan root is symlinked or unreadable", () => {
+    const symlinkWorkspace = createWorkspace();
+    const outside = mkdtempSync(join(tmpdir(), "minime-knowledge-maintenance-outside-"));
+    fixtures.push(outside);
+    const outsidePage = writeWorkspaceFile(
+      outside,
+      "release-2026-01-01.md",
+      formatKnowledgePage(frontmatter("Outside"), "# Outside\n"),
+    );
+    utimesSync(outsidePage, OLD, OLD);
+    mkdirSync(join(symlinkWorkspace, "wiki/pages"), { recursive: true });
+    symlinkSync(outside, join(symlinkWorkspace, "wiki/pages/project"), "dir");
+    writeExactIndexSize(symlinkWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+
+    const symlinkResponse = executeKnowledgeMaintenance(
+      {},
+      { agentWorkspaceRoot: symlinkWorkspace, now: () => NOW },
+    );
+    assertMaintenanceOk(symlinkResponse);
+    assert.equal(symlinkResponse.stopReason, "unsafe-failure");
+    assert.equal(symlinkResponse.archivedCount, 0);
+    assert.equal(symlinkResponse.mutated, false);
+    assert.equal(symlinkResponse.errors[0]?.reason, "symlink-rejected");
+    assert.equal(existsSync(outsidePage), true);
+
+    const unreadableWorkspace = createWorkspace();
+    writeWorkspaceFile(unreadableWorkspace, "wiki/pages/project", "not a directory");
+    writeExactIndexSize(unreadableWorkspace, KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1);
+    const unreadableResponse = executeKnowledgeMaintenance(
+      {},
+      { agentWorkspaceRoot: unreadableWorkspace, now: () => NOW },
+    );
+    assertMaintenanceOk(unreadableResponse);
+    assert.equal(unreadableResponse.stopReason, "unsafe-failure");
+    assert.equal(unreadableResponse.archivedCount, 0);
+    assert.equal(unreadableResponse.mutated, false);
+    assert.equal(unreadableResponse.errors[0]?.reason, "scan-failed");
   });
 
   it("bounds closed evidence and error arrays without mutating rejected candidates", () => {

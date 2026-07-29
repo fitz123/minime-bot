@@ -351,7 +351,10 @@ page from `wiki/index.md` and default search, and returns both paths. Restoring
 uses the same original `wiki/pages/**` path to move those bytes back into the
 active corpus. The helper rejects missing sources, symlinks, path escapes, and
 occupied or duplicate active/archive destinations instead of overwriting
-either copy.
+either copy. When first-party Pi extensions are enabled, their integrity guard
+also blocks direct write, edit, and mutating shell access to both
+`wiki/pages/**` and `artifacts/knowledge-archive/**`; use `knowledge update`
+for either side of the managed move.
 
 Every committed modifying operation appends a structural entry to
 `wiki/log.md`: `create`, `update`, `archive`, or `restore`. An upsert records
@@ -384,6 +387,15 @@ same fixed-schema evidence to a contained workspace JSON path outside
 an otherwise quiet run print its summary. The manifest reports before/after
 bytes, archived and skipped counts, bounded paths/errors, stop reason, and
 whether mutation occurred.
+
+Closed-issue evidence accepts at most 1,000 array entries. A manifest retains
+at most 100 archived paths and 20 errors (each error message is at most 240
+characters); `archivedPathsOmitted` and `errorsOmitted` report additional
+entries. `stopReason` is one of `below-high-watermark`,
+`low-watermark-reached`, `eligible-exhausted`, or `unsafe-failure`. An
+`unsafe-failure` manifest is still emitted or reported as requested, but the
+CLI exits with status 1 so scheduled callers can alert on incomplete scans or
+unverified state changes.
 
 A one-time cleanup is deliberately separate from periodic maintenance:
 operators review completed dated pages and invoke explicit installed
