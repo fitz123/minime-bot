@@ -23,8 +23,12 @@ import {
   type OpsWorkerTaskStoreFaultPoint,
 } from "../ops-worker/task-store.js";
 import {
+  OPS_WORKER_TELEGRAM_VOICE_LIMITS,
+  OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK,
   OpsWorkerTelegramControl,
+  type OpsWorkerConversationHandler,
   type OpsWorkerTelegramFetch,
+  type OpsWorkerVoiceIngestor,
 } from "../ops-worker/telegram-control.js";
 import {
   createEmptyOpsWorkerLifecycleManifest,
@@ -130,8 +134,10 @@ function makeTask(id: string): OpsWorkerTask {
 
 class FakeTelegramTransport {
   readonly getUpdatesBodies: Record<string, unknown>[] = [];
+  readonly getFileBodies: Record<string, unknown>[] = [];
   readonly messages: Record<string, unknown>[] = [];
   readonly updates: unknown[][] = [];
+  readonly getFileResults: unknown[] = [];
   sendCalls = 0;
   sendFailures = 0;
 
@@ -141,6 +147,13 @@ class FakeTelegramTransport {
     if (url.endsWith("/getUpdates")) {
       this.getUpdatesBodies.push(body);
       return Response.json({ ok: true, result: this.updates.shift() ?? [] });
+    }
+    if (url.endsWith("/getFile")) {
+      this.getFileBodies.push(body);
+      return Response.json(this.getFileResults.shift() ?? {
+        ok: true,
+        result: { file_path: `voice/${String(body.file_id)}.oga` },
+      });
     }
     if (url.endsWith("/sendMessage")) {
       this.sendCalls += 1;
@@ -155,9 +168,9 @@ class FakeTelegramTransport {
   };
 }
 
-function update(
+function telegramMessage(
   updateId: number,
-  text: string,
+  content: Record<string, unknown>,
   options: { senderId?: number; chatId?: number } = {},
 ): Record<string, unknown> {
   return {
@@ -165,11 +178,39 @@ function update(
     message: {
       message_id: updateId,
       date: 1_753_000_000,
-      text,
+      ...content,
       from: { id: options.senderId ?? 100000000, is_bot: false },
       chat: { id: options.chatId ?? 100000000, type: "private" },
     },
   };
+}
+
+function update(
+  updateId: number,
+  text: string,
+  options: { senderId?: number; chatId?: number } = {},
+): Record<string, unknown> {
+  return telegramMessage(updateId, { text }, options);
+}
+
+function voiceUpdate(
+  updateId: number,
+  fileId: string,
+  options: {
+    duration?: number;
+    fileSize?: number;
+    mimeType?: string;
+  } = {},
+): Record<string, unknown> {
+  return telegramMessage(updateId, {
+    voice: {
+      file_id: fileId,
+      file_unique_id: `unique-${fileId}`,
+      duration: options.duration ?? 3,
+      ...(options.fileSize === undefined ? {} : { file_size: options.fileSize }),
+      ...(options.mimeType === undefined ? {} : { mime_type: options.mimeType }),
+    },
+  });
 }
 
 interface Harness {
@@ -230,6 +271,10 @@ function control(
   transport: FakeTelegramTransport,
   faultInjector?: ConstructorParameters<typeof OpsWorkerTelegramControl>[0]["faultInjector"],
   now: () => Date = () => new Date(NOW),
+  conversation: {
+    handleConversation?: OpsWorkerConversationHandler;
+    ingestVoice?: OpsWorkerVoiceIngestor;
+  } = {},
 ): OpsWorkerTelegramControl {
   return new OpsWorkerTelegramControl({
     config,
@@ -244,6 +289,7 @@ function control(
       parity: { configured: false },
     }),
     faultInjector,
+    ...conversation,
   });
 }
 
@@ -262,6 +308,158 @@ describe("ops worker dedicated Telegram control", () => {
       assert.doesNotMatch(source, /from\s+["']grammy["']/);
       assert.doesNotMatch(source, /from\s+["']\.\.\/telegram-(?:bot|adapter)\.js["']/);
     }
+  });
+
+  it("routes bounded voice and equivalent text through the same conversational method", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    const question = "Что сейчас требует моего внимания?";
+    transport.updates.push([
+      update(1, question),
+      voiceUpdate(2, "voice-file-2", {
+        duration: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxDurationSeconds,
+        fileSize: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
+        mimeType: "audio/ogg",
+      }),
+    ]);
+    const handled: string[] = [];
+    const ingestions: Array<{
+      url: string;
+      maxBytes: number;
+      downloadTimeoutMs: number | undefined;
+    }> = [];
+
+    await control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: (text) => {
+        handled.push(text);
+        return `Ответ: ${text}`;
+      },
+      ingestVoice: async (url, options) => {
+        ingestions.push({
+          url,
+          maxBytes: options.maxBytes,
+          downloadTimeoutMs: options.downloadTimeoutMs,
+        });
+        return question;
+      },
+    }).tick();
+
+    assert.deepStrictEqual(handled, [question, question]);
+    assert.deepStrictEqual(
+      transport.messages.map((message) => message.text),
+      [`Ответ: ${question}`, `Ответ: ${question}`],
+    );
+    assert.deepStrictEqual(transport.getFileBodies, [{ file_id: "voice-file-2" }]);
+    assert.deepStrictEqual(ingestions, [{
+      url: "https://api.telegram.org/file/botTEST_OPS_TOKEN/voice/voice-file-2.oga",
+      maxBytes: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
+      downloadTimeoutMs: OPS_WORKER_TELEGRAM_VOICE_LIMITS.downloadTimeoutMs,
+    }]);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 2);
+  });
+
+  it("rejects malformed, oversized, and non-voice Telegram media before ingestion", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    const invalid = [
+      telegramMessage(10, {
+        voice: { file_id: "voice-10", duration: 1 },
+      }),
+      voiceUpdate(11, "voice-11", { mimeType: "audio/mpeg" }),
+      voiceUpdate(12, "voice-12", {
+        duration: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxDurationSeconds + 1,
+      }),
+      voiceUpdate(13, "voice-13", {
+        fileSize: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes + 1,
+      }),
+      voiceUpdate(14, "invalid/file-id"),
+      telegramMessage(15, {
+        audio: {
+          file_id: "generic-audio",
+          file_unique_id: "generic-audio-unique",
+          duration: 1,
+        },
+      }),
+      telegramMessage(16, {
+        text: "ambiguous",
+        voice: {
+          file_id: "voice-16",
+          file_unique_id: "unique-voice-16",
+          duration: 1,
+        },
+      }),
+    ];
+    transport.updates.push(invalid);
+    let ingestionCalls = 0;
+    let conversationCalls = 0;
+
+    await control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return "unexpected";
+      },
+      ingestVoice: async () => {
+        ingestionCalls += 1;
+        return "unexpected";
+      },
+    }).tick();
+
+    assert.equal(ingestionCalls, 0);
+    assert.equal(conversationCalls, 0);
+    assert.equal(transport.getFileBodies.length, 0);
+    assert.equal(transport.messages.length, 0);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 16);
+  });
+
+  it("uses one safe deterministic voice fallback and leaves slash commands independent", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    transport.getFileResults.push(
+      { ok: true, result: { file_path: "../tokenized-secret.oga" } },
+      { ok: true, result: { file_path: "voice/transcription-error.oga" } },
+      { ok: true, result: { file_path: "voice/empty.oga" } },
+    );
+    transport.updates.push([
+      voiceUpdate(20, "voice-invalid-path"),
+      voiceUpdate(21, "voice-sensitive-error"),
+      voiceUpdate(22, "voice-empty"),
+      update(23, "/status"),
+    ]);
+    let ingestionCalls = 0;
+    let conversationCalls = 0;
+
+    await control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return "unexpected";
+      },
+      ingestVoice: async () => {
+        ingestionCalls += 1;
+        if (ingestionCalls === 1) {
+          throw new Error(
+            "transcript secret and https://api.telegram.org/file/botTEST_OPS_TOKEN/private",
+          );
+        }
+        return "";
+      },
+    }).tick();
+
+    assert.equal(ingestionCalls, 2);
+    assert.equal(conversationCalls, 0);
+    assert.deepStrictEqual(
+      transport.messages.slice(0, 3).map((message) => message.text),
+      Array.from({ length: 3 }, () => OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK),
+    );
+    assert.ok(String(transport.messages[3].text).startsWith("Ops worker status"));
+    assert.ok(transport.messages.every((message) => {
+      const text = String(message.text);
+      return !text.includes("TEST_OPS_TOKEN") && !text.includes("transcript secret");
+    }));
+    assert.equal(transport.getFileBodies.length, 3);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 23);
   });
 
   it("persists effects and offsets, rejects the allowlist, and replays duplicates as no-ops", async (t) => {

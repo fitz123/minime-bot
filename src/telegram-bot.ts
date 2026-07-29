@@ -11,11 +11,10 @@ import {
   MediaPipelineError,
   tempFilePath,
   downloadFile,
-  transcribeAudio,
+  ingestLocalAudio,
   cleanupTempFile,
   mediaPipelineFailureMessage,
   mediaPipelineStage,
-  requireTranscript,
   toMediaPipelineError,
 } from "./voice.js";
 import { allocateMediaPath, enforceMediaCap, releaseMediaPath, discardMediaPath } from "./media-store.js";
@@ -919,8 +918,6 @@ export function createTelegramBot(
     messagesReceived.inc({ type: "voice" });
 
     const key = sessionKey(chatId, topicId);
-    let tempPath: string | null = null;
-
     try {
       // Download voice file from Telegram
       const fileId = ctx.msg.voice.file_id;
@@ -929,11 +926,9 @@ export function createTelegramBot(
       });
       if (!file.file_path) throw new MediaPipelineError("metadata");
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-      tempPath = tempFilePath("voice", ".oga");
-      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
-
-      // Transcribe with whisper-cli
-      const transcript = requireTranscript(await transcribeAudio(tempPath));
+      const transcript = await ingestLocalAudio(url, {
+        maxBytes: config.sessionDefaults.maxMediaBytes,
+      });
 
       // Update index with actual transcript content
       recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), transcript, "in");
@@ -954,10 +949,6 @@ export function createTelegramBot(
       const stage = mediaPipelineStage(err, "transcription");
       log.error("telegram-bot", `Voice media pipeline failed stage=${stage}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
-    } finally {
-      if (tempPath) {
-        await cleanupTempFile(tempPath);
-      }
     }
   });
 

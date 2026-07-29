@@ -30,16 +30,53 @@ import {
   type OpsWorkerSteeringKind,
   type OpsWorkerTask,
 } from "./types.js";
+import {
+  ingestLocalAudio,
+  type LocalAudioIngestionOptions,
+} from "../voice.js";
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
 const MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS = 5 * 60 * 1_000;
 const TRUNCATION_MARKER = "\n… [truncated]";
+const TELEGRAM_FILE_ID_MAX_BYTES = 512;
+const TELEGRAM_FILE_PATH_MAX_BYTES = 1_024;
+const TELEGRAM_FILE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const TELEGRAM_FILE_PATH_PATTERN = /^[A-Za-z0-9_./-]+$/;
+
+export const OPS_WORKER_TELEGRAM_VOICE_LIMITS = Object.freeze({
+  maxBytes: 20 * 1024 * 1024,
+  maxDurationSeconds: 10 * 60,
+  downloadTimeoutMs: 30_000,
+});
+
+export const OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE =
+  "Conversational Ops is unavailable. Use /status, /tasks, or /task <id>.";
+
+export const OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK =
+  "Could not transcribe the voice message locally. Send text, or use /status, /tasks, or /task <id>.";
 
 export type OpsWorkerTelegramFetch = (
   input: string | URL | Request,
   init?: RequestInit,
 ) => Promise<Response>;
+
+export interface OpsWorkerConversationInput {
+  updateId: number;
+  senderId: string;
+  chatId: string;
+  receivedAt: string;
+}
+
+export type OpsWorkerConversationHandler = (
+  text: string,
+  input: OpsWorkerConversationInput,
+) => string | Promise<string>;
+
+export type OpsWorkerVoiceIngestor = (
+  url: string,
+  options: LocalAudioIngestionOptions,
+) => Promise<string>;
 
 export type OpsWorkerTelegramControlFaultPoint =
   | "after-effect-before-ledger"
@@ -54,6 +91,8 @@ export interface OpsWorkerTelegramControlOptions {
   inspectPolicy: () => OpsWorkerPolicySnapshot;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  handleConversation?: OpsWorkerConversationHandler;
+  ingestVoice?: OpsWorkerVoiceIngestor;
   sensitiveValues?: readonly string[];
   /** Test-only durable-boundary hook. Production callers should leave this unset. */
   faultInjector?: (
@@ -67,14 +106,27 @@ export interface OpsWorkerTelegramTickResult {
   reportTaskId: string | null;
 }
 
-interface ParsedTelegramMessage {
+interface ParsedTelegramMessageBase {
   updateId: number;
   fingerprint: string;
   senderId: string;
   chatId: string;
   receivedAt: string;
+}
+
+interface ParsedTelegramTextMessage extends ParsedTelegramMessageBase {
+  kind: "text";
   text: string;
 }
+
+interface ParsedTelegramVoiceMessage extends ParsedTelegramMessageBase {
+  kind: "voice";
+  fileId: string;
+}
+
+type ParsedTelegramMessage =
+  | ParsedTelegramTextMessage
+  | ParsedTelegramVoiceMessage;
 
 export class OpsWorkerTelegramTransportError extends Error {
   constructor(message: string) {
@@ -158,6 +210,38 @@ function numberId(value: unknown): string | null {
   return Number.isSafeInteger(value) ? String(value) : null;
 }
 
+function boundedTelegramFileId(value: unknown): string | null {
+  return typeof value === "string"
+    && value !== ""
+    && Buffer.byteLength(value, "utf8") <= TELEGRAM_FILE_ID_MAX_BYTES
+    && TELEGRAM_FILE_ID_PATTERN.test(value)
+    ? value
+    : null;
+}
+
+function parseVoice(
+  voice: Record<string, unknown>,
+): { fileId: string } | null {
+  const fileId = boundedTelegramFileId(voice.file_id);
+  const uniqueId = boundedTelegramFileId(voice.file_unique_id);
+  if (fileId === null || uniqueId === null) return null;
+  if (
+    !Number.isSafeInteger(voice.duration)
+    || (voice.duration as number) < 0
+    || (voice.duration as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxDurationSeconds
+  ) return null;
+  if (
+    voice.file_size !== undefined
+    && (
+      !Number.isSafeInteger(voice.file_size)
+      || (voice.file_size as number) < 0
+      || (voice.file_size as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes
+    )
+  ) return null;
+  if (voice.mime_type !== undefined && voice.mime_type !== "audio/ogg") return null;
+  return { fileId };
+}
+
 function parseMessage(
   update: Record<string, unknown>,
   fingerprint: string,
@@ -173,12 +257,6 @@ function parseMessage(
   if (senderId === null || chatId === null) return null;
   if (message.from.is_bot === true) return null;
   if (
-    typeof message.text !== "string"
-    || message.text.trim() === ""
-    || message.text.includes("\0")
-    || Buffer.byteLength(message.text, "utf8") > MAX_COMMAND_BYTES
-  ) return null;
-  if (
     !Number.isSafeInteger(message.date)
     || (message.date as number) < 0
     || (message.date as number) > 8_640_000_000
@@ -191,14 +269,59 @@ function parseMessage(
   if (messageDateMs > trustedNowMs + MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS) {
     return null;
   }
-  return {
+  const parsedBase: ParsedTelegramMessageBase = {
     updateId: updateId as number,
     fingerprint,
     senderId,
     chatId,
     receivedAt: new Date(messageDateMs).toISOString(),
-    text: message.text,
   };
+  const hasText = message.text !== undefined;
+  const hasVoice = message.voice !== undefined;
+  if (hasText === hasVoice) return null;
+  if (hasText) {
+    if (
+      typeof message.text !== "string"
+      || message.text.trim() === ""
+      || message.text.includes("\0")
+      || Buffer.byteLength(message.text, "utf8") > MAX_COMMAND_BYTES
+    ) return null;
+    return { ...parsedBase, kind: "text", text: message.text };
+  }
+  if (!isPlainObject(message.voice)) return null;
+  const voice = parseVoice(message.voice);
+  return voice === null
+    ? null
+    : { ...parsedBase, kind: "voice", fileId: voice.fileId };
+}
+
+function parseGetFilePath(value: unknown): string {
+  if (!isPlainObject(value) || !isPlainObject(value.result)) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid envelope");
+  }
+  const filePath = value.result.file_path;
+  if (
+    typeof filePath !== "string"
+    || filePath === ""
+    || Buffer.byteLength(filePath, "utf8") > TELEGRAM_FILE_PATH_MAX_BYTES
+    || !TELEGRAM_FILE_PATH_PATTERN.test(filePath)
+    || filePath.startsWith("/")
+    || filePath.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid file path");
+  }
+  const fileSize = value.result.file_size;
+  if (
+    fileSize !== undefined
+    && (
+      !Number.isSafeInteger(fileSize)
+      || (fileSize as number) < 0
+      || (fileSize as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes
+    )
+  ) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid file size");
+  }
+  return filePath;
 }
 
 async function readBoundedResponse(response: Response, maxBytes: number): Promise<unknown> {
@@ -318,6 +441,8 @@ export class OpsWorkerTelegramControl {
   private readonly inspectPolicy: () => OpsWorkerPolicySnapshot;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly handleConversation: OpsWorkerConversationHandler;
+  private readonly ingestVoice: OpsWorkerVoiceIngestor;
   private readonly redactAgentField: OpsWorkerFieldRedactor;
   private pendingReply: string | undefined;
   private readonly faultInjector:
@@ -335,6 +460,9 @@ export class OpsWorkerTelegramControl {
     this.inspectPolicy = options.inspectPolicy;
     this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? defaultSleep;
+    this.handleConversation = options.handleConversation
+      ?? (() => OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE);
+    this.ingestVoice = options.ingestVoice ?? ingestLocalAudio;
     this.redactAgentField = createOpsWorkerFieldRedactor([
       options.config.telegram.token,
       options.config.intake?.bearerToken ?? "",
@@ -377,7 +505,7 @@ export class OpsWorkerTelegramControl {
   }
 
   private async telegramApi(
-    method: "getUpdates" | "sendMessage",
+    method: "getUpdates" | "getFile" | "sendMessage",
     payload: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<unknown> {
@@ -470,7 +598,7 @@ export class OpsWorkerTelegramControl {
     }
     let reply: string;
     try {
-      reply = this.dispatchCommand(message);
+      reply = await this.dispatchMessage(message, signal);
     } catch (error) {
       if (!(error instanceof OpsWorkerSteeringCapacityError)) throw error;
       reply = "The task has no remaining steering capacity; the command was not recorded.";
@@ -485,7 +613,61 @@ export class OpsWorkerTelegramControl {
     await this.flushPendingReply(signal);
   }
 
-  private dispatchCommand(message: ParsedTelegramMessage): string {
+  private async dispatchMessage(
+    message: ParsedTelegramMessage,
+    signal: AbortSignal,
+  ): Promise<string> {
+    if (message.kind === "text") {
+      return message.text.trimStart().startsWith("/")
+        ? this.dispatchCommand(message)
+        : this.conversationReply(message.text, message);
+    }
+    try {
+      const value = await this.telegramApi("getFile", {
+        file_id: message.fileId,
+      }, signal);
+      const filePath = parseGetFilePath(value);
+      const transcript = await this.ingestVoice(
+        `https://api.telegram.org/file/bot${this.config.telegram.token}/${filePath}`,
+        {
+          maxBytes: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
+          downloadTimeoutMs: OPS_WORKER_TELEGRAM_VOICE_LIMITS.downloadTimeoutMs,
+        },
+      );
+      if (
+        typeof transcript !== "string"
+        || transcript.trim() === ""
+        || transcript.includes("\0")
+        || Buffer.byteLength(transcript, "utf8") > MAX_COMMAND_BYTES
+      ) return OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
+      return this.conversationReply(transcript, message);
+    } catch {
+      return OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
+    }
+  }
+
+  private async conversationReply(
+    text: string,
+    message: ParsedTelegramMessageBase,
+  ): Promise<string> {
+    try {
+      const reply = await this.handleConversation(text, {
+        updateId: message.updateId,
+        senderId: message.senderId,
+        chatId: message.chatId,
+        receivedAt: message.receivedAt,
+      });
+      return typeof reply === "string"
+        && reply.trim() !== ""
+        && !reply.includes("\0")
+        ? reply
+        : OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+    } catch {
+      return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+    }
+  }
+
+  private dispatchCommand(message: ParsedTelegramTextMessage): string {
     const match = /^\/([a-z]+)(?:\s+([\s\S]*))?$/.exec(message.text.trim());
     if (!match) return usage();
     const command = match[1];
@@ -629,7 +811,7 @@ export class OpsWorkerTelegramControl {
   }
 
   private controlSteering(
-    message: ParsedTelegramMessage,
+    message: ParsedTelegramMessageBase,
     kind: OpsWorkerSteeringKind,
     text: string,
   ): OpsWorkerSteeringEntry {
@@ -643,7 +825,7 @@ export class OpsWorkerTelegramControl {
     };
   }
 
-  private steeringId(message: ParsedTelegramMessage): string {
+  private steeringId(message: ParsedTelegramMessageBase): string {
     return `telegram:update:${message.updateId}:${message.fingerprint}`;
   }
 

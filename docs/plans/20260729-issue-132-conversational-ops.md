@@ -54,11 +54,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 2: Reuse local Telegram voice transcription in the dedicated Ops poller
 **Serves:** Telegram voice in the dedicated Ops chat must be locally transcribed and handled exactly like equivalent text, with no paid ASR/TTS or spoken reply.
-- [ ] Expose/reuse one package-owned local audio ingestion boundary from `src/voice.ts` so primary and Ops paths share ffmpeg/whisper execution, download retry/timeout/size checks, private temp-file handling, cleanup, empty-transcript handling, and safe errors.
-- [ ] Extend the dedicated raw Bot API parser for strictly validated Telegram voice metadata and bounded `getFile`/download handling; accept no generic document/audio execution path and never log tokenized URLs or transcript-sensitive errors.
-- [ ] Feed the resulting transcript into the exact same conversational method as text and return only a text reply/fallback.
-- [ ] Add tests proving text/voice parity, local binaries only, type/size/time limits, malformed metadata rejection, cleanup, and deterministic transcription fallback while slash commands remain usable.
-- [ ] Run the focused tests before Task 3.
+- [x] Expose/reuse one package-owned local audio ingestion boundary from `src/voice.ts` so primary and Ops paths share ffmpeg/whisper execution, download retry/timeout/size checks, private temp-file handling, cleanup, empty-transcript handling, and safe errors.
+- [x] Extend the dedicated raw Bot API parser for strictly validated Telegram voice metadata and bounded `getFile`/download handling; accept no generic document/audio execution path and never log tokenized URLs or transcript-sensitive errors.
+- [x] Feed the resulting transcript into the exact same conversational method as text and return only a text reply/fallback.
+- [x] Add tests proving text/voice parity, local binaries only, type/size/time limits, malformed metadata rejection, cleanup, and deterministic transcription fallback while slash commands remain usable.
+- [x] Run the focused tests before Task 3.
 
 ### Task 3: Add the tool-free bounded Ops conversation runner
 **Serves:** Ordinary Russian text must work naturally when provider/VPN is available, stay privacy-safe and bounded, and fail usefully when Pi/provider/quota/VPN is unavailable.

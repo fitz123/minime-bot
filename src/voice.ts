@@ -94,6 +94,11 @@ export interface DownloadFileOptions {
   timeoutMs?: number;
 }
 
+export interface LocalAudioIngestionOptions {
+  maxBytes: number;
+  downloadTimeoutMs?: number;
+}
+
 class DownloadAttemptError extends Error {
   constructor(
     readonly retryable: boolean,
@@ -289,6 +294,42 @@ export async function transcribeAudio(filePath: string): Promise<string> {
     }
   } finally {
     await cleanupTempFile(wavPath);
+  }
+}
+
+/**
+ * Download and transcribe one bounded audio source using only the package-owned
+ * local ffmpeg/whisper pipeline. The source audio and converted WAV are always
+ * reclaimed before this function settles.
+ */
+export async function ingestLocalAudio(
+  url: string,
+  options: LocalAudioIngestionOptions,
+): Promise<string> {
+  if (
+    !Number.isSafeInteger(options.maxBytes)
+    || options.maxBytes <= 0
+    || (
+      options.downloadTimeoutMs !== undefined
+      && (
+        !Number.isSafeInteger(options.downloadTimeoutMs)
+        || options.downloadTimeoutMs <= 0
+      )
+    )
+  ) {
+    throw new TypeError("Local audio ingestion requires positive integer limits");
+  }
+  const audioPath = tempFilePath("voice", ".oga");
+  try {
+    await downloadFile(url, audioPath, {
+      maxBytes: options.maxBytes,
+      ...(options.downloadTimeoutMs === undefined
+        ? {}
+        : { timeoutMs: options.downloadTimeoutMs }),
+    });
+    return requireTranscript(await transcribeAudio(audioPath));
+  } finally {
+    await cleanupTempFile(audioPath);
   }
 }
 
