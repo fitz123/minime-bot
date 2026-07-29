@@ -1,8 +1,7 @@
 export const OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS = 768;
 export const OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE = 78;
 
-const OUTPUT_TOKEN_FIELDS = [
-  "max_output_tokens",
+const OPENAI_COMPLETION_TOKEN_FIELDS = [
   "max_completion_tokens",
   "max_tokens",
 ] as const;
@@ -15,6 +14,46 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
       || Object.getPrototypeOf(value) === null);
 }
 
+function requireArrayField(
+  payload: Record<string, unknown>,
+  field: string,
+  api: string,
+): void {
+  if (!Array.isArray(payload[field])) {
+    throw new TypeError(`Conversation ${api} payload has invalid ${field}`);
+  }
+}
+
+function cloneObjectField(
+  payload: Record<string, unknown>,
+  field: string,
+  api: string,
+): Record<string, unknown> {
+  const value = payload[field];
+  if (!isPlainObject(value)) {
+    throw new TypeError(`Conversation ${api} payload has invalid ${field}`);
+  }
+  const cloned = { ...value };
+  payload[field] = cloned;
+  return cloned;
+}
+
+function clampOutputTokenField(
+  payload: Record<string, unknown>,
+  field: string,
+  maximum: number,
+): void {
+  if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+    payload[field] = maximum;
+    return;
+  }
+  const current = payload[field];
+  if (typeof current !== "number" || !Number.isFinite(current) || current < 1) {
+    throw new TypeError(`Conversation provider payload has invalid ${field}`);
+  }
+  payload[field] = Math.min(Math.trunc(current), maximum);
+}
+
 /**
  * Apply the conversation response-token ceiling at Pi's final provider-payload
  * boundary. The package-owned wrapper exits fail-closed if a future provider
@@ -22,6 +61,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 export function boundOpsWorkerConversationProviderPayload(
   payload: unknown,
+  api: string,
   maximum = OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS,
 ): Record<string, unknown> {
   if (!Number.isSafeInteger(maximum) || maximum < 1) {
@@ -32,25 +72,53 @@ export function boundOpsWorkerConversationProviderPayload(
   }
 
   const bounded = { ...payload };
-  let recognizedField = false;
-  for (const field of OUTPUT_TOKEN_FIELDS) {
-    if (!Object.prototype.hasOwnProperty.call(bounded, field)) continue;
-    const current = bounded[field];
-    if (typeof current !== "number" || !Number.isFinite(current) || current < 1) {
-      throw new TypeError(`Conversation provider payload has invalid ${field}`);
+  if (api === "anthropic-messages") {
+    requireArrayField(bounded, "messages", api);
+    clampOutputTokenField(bounded, "max_tokens", maximum);
+    return bounded;
+  }
+  if (api === "openai-completions") {
+    requireArrayField(bounded, "messages", api);
+    const fields = OPENAI_COMPLETION_TOKEN_FIELDS.filter((field) =>
+      Object.prototype.hasOwnProperty.call(bounded, field));
+    if (fields.length !== 1) {
+      throw new TypeError(
+        "Conversation openai-completions payload must have exactly one output-token field",
+      );
     }
-    bounded[field] = Math.min(Math.trunc(current), maximum);
-    recognizedField = true;
-  }
-  if (recognizedField) return bounded;
-
-  if (Array.isArray(bounded.input)) {
-    bounded.max_output_tokens = maximum;
+    clampOutputTokenField(bounded, fields[0], maximum);
     return bounded;
   }
-  if (Array.isArray(bounded.messages)) {
-    bounded.max_tokens = maximum;
+  if (
+    api === "openai-responses"
+    || api === "azure-openai-responses"
+    || api === "openai-codex-responses"
+  ) {
+    requireArrayField(bounded, "input", api);
+    clampOutputTokenField(bounded, "max_output_tokens", maximum);
     return bounded;
   }
-  throw new TypeError("Conversation provider payload has no recognized output-token field");
+  if (api === "mistral-conversations") {
+    requireArrayField(bounded, "messages", api);
+    clampOutputTokenField(bounded, "maxTokens", maximum);
+    return bounded;
+  }
+  if (api === "google-generative-ai" || api === "google-vertex") {
+    requireArrayField(bounded, "contents", api);
+    const config = cloneObjectField(bounded, "config", api);
+    clampOutputTokenField(config, "maxOutputTokens", maximum);
+    return bounded;
+  }
+  if (api === "bedrock-converse-stream") {
+    requireArrayField(bounded, "messages", api);
+    const inferenceConfig = cloneObjectField(bounded, "inferenceConfig", api);
+    clampOutputTokenField(inferenceConfig, "maxTokens", maximum);
+    return bounded;
+  }
+  if (api === "pi-messages") {
+    const options = cloneObjectField(bounded, "options", api);
+    clampOutputTokenField(options, "maxTokens", maximum);
+    return bounded;
+  }
+  throw new TypeError(`Conversation provider payload uses unsupported provider API ${api}`);
 }

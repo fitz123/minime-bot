@@ -628,20 +628,104 @@ describe("ops worker conversation runner", () => {
 describe("ops worker conversation provider bounds", () => {
   it("hard-clamps supported provider payloads to the fixed output-token limit", () => {
     assert.equal(OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS, 768);
-    assert.deepEqual(
-      boundOpsWorkerConversationProviderPayload({
-        input: [],
-        max_output_tokens: 32_000,
-      }),
-      { input: [], max_output_tokens: 768 },
-    );
-    assert.deepEqual(
-      boundOpsWorkerConversationProviderPayload({ messages: [] }),
-      { messages: [], max_tokens: 768 },
-    );
+    const cases: Array<{
+      api: string;
+      payload: Record<string, unknown>;
+      expected: Record<string, unknown>;
+    }> = [
+      {
+        api: "anthropic-messages",
+        payload: { messages: [], max_tokens: 32_000 },
+        expected: { messages: [], max_tokens: 768 },
+      },
+      {
+        api: "openai-completions",
+        payload: { messages: [], max_completion_tokens: 32_000 },
+        expected: { messages: [], max_completion_tokens: 768 },
+      },
+      {
+        api: "openai-completions",
+        payload: { messages: [], max_tokens: 32_000 },
+        expected: { messages: [], max_tokens: 768 },
+      },
+      {
+        api: "openai-responses",
+        payload: { input: [], max_output_tokens: 32_000 },
+        expected: { input: [], max_output_tokens: 768 },
+      },
+      {
+        api: "azure-openai-responses",
+        payload: { input: [], max_output_tokens: 32_000 },
+        expected: { input: [], max_output_tokens: 768 },
+      },
+      {
+        api: "openai-codex-responses",
+        payload: { input: [] },
+        expected: { input: [], max_output_tokens: 768 },
+      },
+      {
+        api: "mistral-conversations",
+        payload: { messages: [], maxTokens: 32_000 },
+        expected: { messages: [], maxTokens: 768 },
+      },
+      {
+        api: "google-generative-ai",
+        payload: {
+          contents: [],
+          config: { maxOutputTokens: 32_000 },
+        },
+        expected: {
+          contents: [],
+          config: { maxOutputTokens: 768 },
+        },
+      },
+      {
+        api: "google-vertex",
+        payload: {
+          contents: [],
+          config: { maxOutputTokens: 32_000 },
+        },
+        expected: {
+          contents: [],
+          config: { maxOutputTokens: 768 },
+        },
+      },
+      {
+        api: "bedrock-converse-stream",
+        payload: {
+          messages: [],
+          inferenceConfig: { maxTokens: 32_000 },
+        },
+        expected: {
+          messages: [],
+          inferenceConfig: { maxTokens: 768 },
+        },
+      },
+      {
+        api: "pi-messages",
+        payload: {
+          context: {},
+          options: { maxTokens: 32_000 },
+        },
+        expected: {
+          context: {},
+          options: { maxTokens: 768 },
+        },
+      },
+    ];
+    for (const { api, payload, expected } of cases) {
+      assert.deepEqual(
+        boundOpsWorkerConversationProviderPayload(payload, api),
+        expected,
+        api,
+      );
+    }
     assert.throws(
-      () => boundOpsWorkerConversationProviderPayload({ prompt: "unknown" }),
-      /no recognized output-token field/,
+      () => boundOpsWorkerConversationProviderPayload(
+        { messages: [], maxTokens: 32_000 },
+        "custom-provider-api",
+      ),
+      /unsupported provider API/,
     );
   });
 
@@ -663,7 +747,10 @@ describe("ops worker conversation provider bounds", () => {
   });
 
   it("registers the provider boundary and exits fail-closed on an unknown payload", async (t) => {
-    const handlers = new Map<string, (event: { payload: unknown }) => unknown>();
+    const handlers = new Map<string, (
+      event: { payload: unknown },
+      context: { model: { api: string } | undefined },
+    ) => unknown>();
     const wrapper = (await import(
       `${pathToFileURL(resolve(
         PACKAGE_ROOT,
@@ -673,17 +760,22 @@ describe("ops worker conversation provider bounds", () => {
       )).href}?test=${Date.now()}`
     )).default;
     wrapper({
-      on: (event: string, handler: (event: { payload: unknown }) => unknown) => {
+      on: (event: string, handler: (
+        event: { payload: unknown },
+        context: { model: { api: string } | undefined },
+      ) => unknown) => {
         handlers.set(event, handler);
       },
     } as unknown as ExtensionAPI);
     const handler = handlers.get("before_provider_request");
     assert.ok(handler);
     assert.deepEqual(handler({
-      payload: { input: [], max_output_tokens: 4_096 },
+      payload: { messages: [], maxTokens: 4_096 },
+    }, {
+      model: { api: "mistral-conversations" },
     }), {
-      input: [],
-      max_output_tokens: OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS,
+      messages: [],
+      maxTokens: OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS,
     });
 
     let exitCode: number | undefined;
@@ -692,7 +784,11 @@ describe("ops worker conversation provider bounds", () => {
       throw new Error("synthetic process exit");
     }) as typeof process.exit);
     assert.throws(
-      () => handler({ payload: { prompt: "unknown" } }),
+      () => handler({
+        payload: { prompt: "unknown" },
+      }, {
+        model: { api: "custom-provider-api" },
+      }),
       /synthetic process exit/,
     );
     assert.equal(exitCode, OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE);

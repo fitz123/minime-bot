@@ -832,6 +832,7 @@ export class OpsWorkerSupervisor {
 
   blocksConversationAdmission(): boolean {
     this.assertStarted();
+    this.isolateIncompatibleReportReceipts();
     const tasks = this.store.list();
     return this.piLaunchReservation !== null
       || tasks.some((task) =>
