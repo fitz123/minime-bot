@@ -13,6 +13,7 @@ import type { OpsWorkerAuthorizationVerifierRegistry } from "../ops-worker/autho
 import type { OpsWorkerControlConfig } from "../ops-worker/control-config.js";
 import { OpsWorkerControlLedger } from "../ops-worker/control-ledger.js";
 import { OpsWorkerDoneCheckRegistry } from "../ops-worker/done-checks.js";
+import { hashOpsWorkerCanonicalPayload } from "../ops-worker/lifecycle.js";
 import {
   OpsWorkerSupervisor,
   type OpsWorkerSupervisorOptions,
@@ -1039,6 +1040,91 @@ describe("ops worker dedicated Telegram control", () => {
       > Date.parse(claimed.queryObservedAt),
     );
     assert.equal(sent?.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("keeps polling and rotates past an incompatible claimed report receipt", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-a-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.lastOutcome = {
+      at: NOW,
+      kind: "DONE_CHECK",
+      result: "PRODUCT_FAILURE",
+      summary: "Fixture report payload changed after an earlier delivery claim.",
+    };
+    isolated.report.state = "PENDING";
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: "report:incompatible-fixture",
+      intentHash: hashOpsWorkerCanonicalPayload({
+        reportIdentity: "prior-report-identity",
+        reportPayloadHash: `sha256:${"c".repeat(64)}`,
+      }),
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    fixture.store.create(isolated);
+    const originalReceipt = structuredClone(isolated.mutationReceipts.report);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(51, "/status"),
+      update(52, `/task ${isolated.id}`),
+    ]);
+    const client = control(fixture, transport);
+
+    const firstTick = await client.tick();
+
+    assert.equal(firstTick.reportTaskId, null);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 52);
+    assert.equal(fixture.store.get(isolated.id)?.state, "BLOCKED");
+    assert.equal(fixture.store.get(isolated.id)?.custody.status, "RELEASED");
+    assert.deepEqual(
+      fixture.store.get(isolated.id)?.mutationReceipts.report,
+      originalReceipt,
+    );
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReconciliationBlocked=1")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReceipt=claimed/unknown")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReconciliation=required")), true);
+
+    const sendable = makeTask("task-b-sendable-after-reconciliation");
+    sendable.state = "CANCELLED";
+    sendable.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    };
+    sendable.lastOutcome = {
+      at: NOW,
+      kind: "OPERATOR",
+      result: "CANCELLED",
+      summary: "Fixture unrelated report remains deliverable.",
+    };
+    sendable.report.state = "PENDING";
+    fixture.store.create(sendable);
+    transport.updates.push([]);
+
+    const secondTick = await client.tick();
+
+    assert.equal(secondTick.reportTaskId, sendable.id);
+    assert.equal(fixture.store.get(sendable.id)?.report.state, "SENT");
+    assert.deepEqual(
+      fixture.store.get(isolated.id)?.mutationReceipts.report,
+      originalReceipt,
+    );
   });
 
   it("keeps a failed terminal report pending and retries it on the next tick", async (t) => {

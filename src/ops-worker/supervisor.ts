@@ -121,7 +121,8 @@ export interface OpsWorkerStartupReconciliation {
     | "QUOTA_PROBE_ERROR"
     | "AMBIGUOUS_ORPHAN"
     | "PREEMPTED"
-    | "CANCELLED";
+    | "CANCELLED"
+    | "REPORT_RECONCILIATION_REQUIRED";
 }
 
 export interface OpsWorkerSupervisorOptions {
@@ -623,6 +624,46 @@ function compatibleReportOperations(
   return [current, v5];
 }
 
+const REPORT_RECONCILIATION_REQUIRED_ERROR =
+  "Claimed report receipt requires external-outcome reconciliation";
+
+function reportIdentity(task: Readonly<OpsWorkerTask>): string {
+  return hashOpsWorkerCanonicalPayload({
+    taskId: task.id,
+    deliveryKey: task.source.deliveryKey,
+    createdAt: task.createdAt,
+  });
+}
+
+function matchesReportOperation(
+  operation: ReturnType<typeof reportOperation>,
+  receipt: NonNullable<OpsWorkerTask["mutationReceipts"]["report"]>,
+): boolean {
+  return operation.operationId === receipt.operationId
+    && hashOpsWorkerCanonicalPayload(operation.intent) === receipt.intentHash;
+}
+
+function hasIncompatibleClaimedReportReceipt(
+  task: Readonly<OpsWorkerTask>,
+): boolean {
+  const receipt = task.mutationReceipts.report;
+  if (
+    task.report.state !== "PENDING"
+    || receipt === null
+    || receipt.outcome !== null
+    || receipt.mutationStartedAt === null
+  ) return false;
+  return !compatibleReportOperations(task, reportIdentity(task))
+    .some((operation) => matchesReportOperation(operation, receipt));
+}
+
+export function isOpsWorkerReportReconciliationBlocked(
+  task: Readonly<OpsWorkerTask>,
+): boolean {
+  return task.report.state === "PENDING"
+    && task.report.lastError === REPORT_RECONCILIATION_REQUIRED_ERROR;
+}
+
 export class OpsWorkerSupervisor {
   private readonly store: OpsWorkerTaskStore;
   private readonly doneChecks: OpsWorkerDoneCheckRegistry;
@@ -1039,11 +1080,13 @@ export class OpsWorkerSupervisor {
 
   selectNextTask(): OpsWorkerScheduledTask | undefined {
     this.assertStarted();
+    this.isolateIncompatibleReportReceipts();
     return this.selectScheduledTask(this.store.list());
   }
 
   async claimNextTask(): Promise<OpsWorkerScheduledTask | undefined> {
     this.assertStarted();
+    this.isolateIncompatibleReportReceipts();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const scheduled = this.selectScheduledTask(this.store.list());
       if (!scheduled) return undefined;
@@ -2776,23 +2819,30 @@ export class OpsWorkerSupervisor {
         `Task ${taskId} exhausted its bounded report-attempt counter`,
       );
     }
-    const reportIdentity = hashOpsWorkerCanonicalPayload({
-      taskId: task.id,
-      deliveryKey: task.source.deliveryKey,
-      createdAt: task.createdAt,
-    });
+    if (isOpsWorkerReportReconciliationBlocked(task)) return task;
+    const currentReportIdentity = reportIdentity(task);
     const reportTask = structuredClone(task);
-    const operations = compatibleReportOperations(reportTask, reportIdentity);
+    const operations = compatibleReportOperations(
+      reportTask,
+      currentReportIdentity,
+    );
     const unfinishedReceipt = task.mutationReceipts.report;
+    if (
+      unfinishedReceipt?.outcome === null
+      && unfinishedReceipt.mutationStartedAt !== null
+      && !operations.some((candidate) =>
+        matchesReportOperation(candidate, unfinishedReceipt))
+    ) {
+      return this.isolateIncompatibleReportReceipt(taskId) ?? task;
+    }
     const operation = unfinishedReceipt?.outcome === null
       ? operations.find((candidate) =>
-          candidate.operationId === unfinishedReceipt.operationId
-          && hashOpsWorkerCanonicalPayload(candidate.intent) === unfinishedReceipt.intentHash)
+          matchesReportOperation(candidate, unfinishedReceipt))
         ?? operations[0]
       : operations[0];
     const reportIntentHash = hashOpsWorkerCanonicalPayload(operation.intent);
     task = this.lifecycle.updateLifecycleIdentity(taskId, {
-      report: reportIdentity,
+      report: currentReportIdentity,
     });
     const previousReceipt = task.mutationReceipts.report;
     const observedAt = previousReceipt?.mutationStartedAt === null
@@ -3034,7 +3084,59 @@ export class OpsWorkerSupervisor {
         this.#completeOperatorInterrupt(task.id, task.control.interrupt);
       }
     }
+    for (const isolated of this.isolateIncompatibleReportReceipts()) {
+      if (isolated.state !== "BLOCKED") continue;
+      const prior = reconciled.find((entry) => entry.taskId === isolated.id);
+      if (prior) {
+        prior.state = "BLOCKED";
+        prior.result = "REPORT_RECONCILIATION_REQUIRED";
+      } else {
+        reconciled.push({
+          taskId: isolated.id,
+          state: "BLOCKED",
+          result: "REPORT_RECONCILIATION_REQUIRED",
+        });
+      }
+    }
     return reconciled;
+  }
+
+  private isolateIncompatibleReportReceipts(): OpsWorkerTask[] {
+    return this.store.list().flatMap((task) => {
+      if (!hasIncompatibleClaimedReportReceipt(task)) return [];
+      const isolated = this.isolateIncompatibleReportReceipt(task.id);
+      return isolated === undefined ? [] : [isolated];
+    });
+  }
+
+  private isolateIncompatibleReportReceipt(
+    taskId: string,
+  ): OpsWorkerTask | undefined {
+    const existing = this.requireTask(taskId);
+    if (!hasIncompatibleClaimedReportReceipt(existing)) return undefined;
+    if (isOpsWorkerReportReconciliationBlocked(existing)) return existing;
+    const markReport = (task: OpsWorkerTask): void => {
+      task.report.lastError = REPORT_RECONCILIATION_REQUIRED_ERROR;
+    };
+    if (
+      isOpsWorkerTerminalState(existing.state)
+      || existing.activeRun !== null
+      || existing.unverifiedRun !== null
+    ) {
+      return this.store.mutate(
+        taskId,
+        {
+          event: "RECONCILIATION",
+          summary: "Fenced a claimed report receipt with an unknown external outcome",
+        },
+        markReport,
+      ).task;
+    }
+    return this.transition(taskId, "BLOCKED", (task) => {
+      task.schedule.nextRunAt = null;
+      task.schedule.nextCheckAt = null;
+      markReport(task);
+    }, "Isolated a task whose claimed report receipt requires reconciliation");
   }
 
   private blockAmbiguousRun(taskId: string, summary: string): OpsWorkerTask {

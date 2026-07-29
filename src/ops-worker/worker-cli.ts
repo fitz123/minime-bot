@@ -852,6 +852,10 @@ export async function runOpsWorkerCliCommand(
         writeLine(cliOptions.stdout, `Active process groups: ${summary.activeProcessGroups}`);
         writeLine(
           cliOptions.stdout,
+          `Report reconciliations blocked: ${summary.reportReconciliationBlocked}`,
+        );
+        writeLine(
+          cliOptions.stdout,
           `Custody owner: ${summary.custodyOwner
             ? `${summary.custodyOwner.id} ${summary.custodyOwner.state}`
             : "none"}`,

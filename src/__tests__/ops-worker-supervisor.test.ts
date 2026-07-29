@@ -48,6 +48,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  hashOpsWorkerReportPayload,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
@@ -3240,6 +3241,138 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.report.attempts, 2);
     assert.equal(sent.report.lastError, null);
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("isolates a stale claimed report receipt across startup until fixed receipt recovery", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-report-isolation-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-first",
+    });
+    first.store.create(makeTask("task-report-isolation"));
+    first.supervisor.markRunning(
+      "task-report-isolation",
+      activeRun("report-isolation-first"),
+    );
+    first.close();
+
+    const ambiguous = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-ambiguous",
+      reconcileActiveRun: () => ({
+        status: "AMBIGUOUS",
+        summary: "Fixture process ownership remains ambiguous.",
+      }),
+    });
+    let reportedTask: OpsWorkerTask | undefined;
+    const attempted = await ambiguous.supervisor.recordReportAttempt(
+      "task-report-isolation",
+      async (task) => {
+        reportedTask = structuredClone(task);
+        return {
+          sent: false,
+          error: "Synthetic report result is externally ambiguous.",
+        };
+      },
+    );
+    assert.ok(reportedTask);
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: reportedTask.id,
+      deliveryKey: reportedTask.source.deliveryKey,
+      createdAt: reportedTask.createdAt,
+    });
+    const operation = {
+      boundary: "report" as const,
+      operationId: attempted.mutationReceipts.report?.operationId ?? "",
+      intent: {
+        reportIdentity,
+        reportPayloadHash: hashOpsWorkerReportPayload(reportedTask),
+      },
+    };
+    const ambiguousReceipt = structuredClone(attempted.mutationReceipts.report);
+    assert.ok(ambiguousReceipt?.mutationStartedAt);
+    assert.equal(ambiguousReceipt.outcome, null);
+    ambiguous.close();
+
+    const reconciled = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-reconciled",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Fixture process group is proven gone.",
+      }),
+    });
+    const isolated = reconciled.store.get("task-report-isolation");
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.custody.status, "RELEASED");
+    assert.equal(isolated?.custody.releaseReason, "BLOCKED");
+    assert.equal(isolated?.activeRun, null);
+    assert.equal(isolated?.schedule.nextRunAt, null);
+    assert.equal(isolated?.schedule.nextCheckAt, null);
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    assert.deepEqual(isolated?.mutationReceipts.report, ambiguousReceipt);
+    assert.throws(
+      () => reconciled.supervisor.retryBlockedTask("task-report-isolation"),
+      /claimed report receipt still requires reconciliation/,
+    );
+    reconciled.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-restarted",
+    });
+    assert.deepEqual(
+      restarted.store.get("task-report-isolation")?.mutationReceipts.report,
+      ambiguousReceipt,
+    );
+    restarted.store.create(makeTask("task-unrelated-after-report-isolation"));
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-report-isolation",
+    );
+
+    const lifecycle = new OpsWorkerLifecycle(restarted.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.beginMutationReceipt("task-report-isolation", {
+      ...operation,
+      queryObservedAt: LATER,
+      queryResult: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt("task-report-isolation", {
+      ...operation,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    let unexpectedReportAttempts = 0;
+    const stillIsolated = await restarted.supervisor.recordReportAttempt(
+      "task-report-isolation",
+      async () => {
+        unexpectedReportAttempts += 1;
+        return { sent: true };
+      },
+    );
+    assert.equal(unexpectedReportAttempts, 0);
+    assert.match(
+      stillIsolated.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-report-isolation",
+    );
+    const retried = restarted.supervisor.retryBlockedTask("task-report-isolation");
+    assert.equal(retried.state, "RESUMABLE");
+    assert.equal(retried.report.state, "NONE");
+    assert.equal(retried.report.lastError, null);
+    assert.equal(
+      retried.mutationReceipts.report?.outcome?.result,
+      "ALREADY_APPLIED",
+    );
   });
 
   it("reconciles a durable unverified-launch fence after the process and group are gone", async (t) => {

@@ -824,6 +824,137 @@ describe("Alertmanager conversion and task-store submission", () => {
     assert.equal(sent.report.state, "SENT");
   });
 
+  it("keeps authenticated intake and unrelated incident processing available during report reconciliation", async (t) => {
+    const { intake, store, taskContracts } = fixture(
+      t,
+      () => new Date(NOW),
+      "PRESENT",
+    );
+    const first = intake.submit(body(webhook()), CONTENT_TYPE);
+    const originalTaskId = first.taskId ?? "";
+    const initial = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "intake-report-isolation-initial",
+      processStartToken: "intake-report-isolation-initial-start",
+      now: () => new Date(NOW),
+    });
+    await initial.start();
+    initial.markRunning(originalTaskId, {
+      attemptId: "attempt-intake-report-isolation",
+      supervisorInstanceId: initial.supervisorInstanceId,
+      pid: 321,
+      processGroupId: 321,
+      processStartedAt: NOW,
+      processStartToken: "intake-report-isolation-process",
+    });
+    initial.close();
+
+    const ambiguous = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "intake-report-isolation-ambiguous",
+      processStartToken: "intake-report-isolation-ambiguous-start",
+      now: () => new Date(NOW),
+      reconcileActiveRun: () => ({
+        status: "AMBIGUOUS",
+        summary: "Fixture prior process group remains ambiguous.",
+      }),
+    });
+    await ambiguous.start();
+    const attempted = await ambiguous.recordReportAttempt(
+      originalTaskId,
+      async () => ({
+        sent: false,
+        error: "Synthetic report outcome is externally ambiguous.",
+      }),
+    );
+    const originalReceipt = structuredClone(attempted.mutationReceipts.report);
+    assert.ok(originalReceipt?.mutationStartedAt);
+    ambiguous.close();
+
+    const supervisor = new OpsWorkerSupervisor({
+      store,
+      doneChecks: taskContracts.doneChecks,
+      authorizationVerifiers: taskContracts.authorizationVerifiers,
+      instanceId: "intake-report-isolation-recovered",
+      processStartToken: "intake-report-isolation-recovered-start",
+      now: () => new Date(LATER),
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Fixture prior process group is proven gone.",
+      }),
+    });
+    await supervisor.start();
+    t.after(() => supervisor.close());
+    const isolated = store.get(originalTaskId);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.custody.status, "RELEASED");
+    assert.deepEqual(isolated?.mutationReceipts.report, originalReceipt);
+
+    const server = await startOpsWorkerStatusServer({
+      supervisor,
+      inspectPolicy: () => inspectOpsWorkerPolicy({
+        authorizationVerifiers: taskContracts.authorizationVerifiers,
+        doneChecks: taskContracts.doneChecks,
+      }),
+      host: "127.0.0.1",
+      port: 0,
+      alertmanagerIntake: {
+        intake,
+        bearerTokenProvider: () => "TEST_INTAKE_TOKEN",
+      },
+    });
+    t.after(() => server.close());
+    const baseUrl = `http://127.0.0.1:${server.port}`;
+    const health = await fetch(`${baseUrl}/healthz`);
+    assert.equal(health.status, 200);
+    const status = await fetch(`${baseUrl}/status`);
+    assert.equal(status.status, 200);
+    assert.equal(
+      (await status.json() as { reportReconciliationBlocked: number })
+        .reportReconciliationBlocked,
+      1,
+    );
+
+    const unrelatedAlert = alert(
+      "2026-07-19T10:00:30.000Z",
+      "firing",
+      "UnrelatedServiceWarning",
+    );
+    const response = await fetch(`${baseUrl}/intake/alertmanager`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer TEST_INTAKE_TOKEN",
+        "content-type": CONTENT_TYPE,
+      },
+      body: JSON.stringify(webhook({
+        alerts: [unrelatedAlert],
+        groupLabels: { alertname: "UnrelatedServiceWarning" },
+        commonLabels: {
+          alertname: "UnrelatedServiceWarning",
+          instance: "local",
+        },
+        groupKey: "{}:{alertname=\"UnrelatedServiceWarning\", instance=\"local\"}",
+      })),
+    });
+    assert.equal(response.status, 200);
+    const accepted = await response.json() as { taskId?: string };
+    assert.ok(accepted.taskId);
+    assert.notEqual(accepted.taskId, originalTaskId);
+
+    await supervisor.requestDoneCheck(accepted.taskId);
+    const processed = await supervisor.runDoneCheck(accepted.taskId);
+    assert.equal(processed.lastOutcome?.result, "PRODUCT_FAILURE");
+    assert.deepEqual(
+      store.get(originalTaskId)?.mutationReceipts.report,
+      originalReceipt,
+    );
+    assert.equal(store.get(originalTaskId)?.custody.status, "RELEASED");
+  });
+
   it("reuses a still-active correlation and creates a fresh task for a later episode", (t) => {
     const { intake, store } = fixture(t);
     const first = intake.submit(body(webhook()), CONTENT_TYPE);

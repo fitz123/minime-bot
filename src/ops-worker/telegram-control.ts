@@ -14,6 +14,7 @@ import {
   type OpsWorkerFieldRedactor,
 } from "./reporting.js";
 import {
+  isOpsWorkerReportReconciliationBlocked,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -247,6 +248,16 @@ function taskSummary(task: OpsWorkerTask): string {
     `nextRunAt=${task.schedule.nextRunAt ?? "none"}`,
     `nextCheckAt=${task.schedule.nextCheckAt ?? "none"}`,
     `report=${task.report.state}/${task.report.attempts}`,
+    `reportReceipt=${task.mutationReceipts.report === null
+      ? "none"
+      : task.mutationReceipts.report.outcome !== null
+      ? `finished/${task.mutationReceipts.report.outcome.result}`
+      : task.mutationReceipts.report.mutationStartedAt === null
+      ? "queried/unclaimed"
+      : "claimed/unknown"}`,
+    `reportReconciliation=${isOpsWorkerReportReconciliationBlocked(task)
+      ? "required"
+      : "none"}`,
     `outcome=${outcome}`,
   ].join("\n");
 }
@@ -447,6 +458,7 @@ export class OpsWorkerTelegramControl {
       return [
         `Ops worker: tasks=${summary.totalTasks} activeGroups=${summary.activeProcessGroups}`,
         `custody=${summary.custodyOwner?.id ?? "none"}`,
+        `reportReconciliationBlocked=${summary.reportReconciliationBlocked}`,
         `states=${Object.entries(summary.states).map(([state, count]) => `${state}:${count}`).join(",")}`,
         `authorization=${policy.authorization.verifierCount}/${policy.authorization.contractsHash}`,
         `verification=${policy.verification.verifierCount}/${policy.verification.contractsHash}`,
@@ -596,10 +608,11 @@ export class OpsWorkerTelegramControl {
   }
 
   private async deliverOnePendingReport(signal: AbortSignal): Promise<string | null> {
-    const task = this.supervisor.listTasks()
+    const tasks = this.supervisor.listTasks()
       .filter((candidate) =>
         candidate.report.state === "PENDING"
-        && candidate.report.attempts < OPS_WORKER_LIMITS.maxReportAttempts)
+        && candidate.report.attempts < OPS_WORKER_LIMITS.maxReportAttempts
+        && !isOpsWorkerReportReconciliationBlocked(candidate))
       .sort((left, right) => {
         const leftObservedAt = left.mutationReceipts.report?.queryObservedAt;
         const rightObservedAt = right.mutationReceipts.report?.queryObservedAt;
@@ -609,20 +622,26 @@ export class OpsWorkerTelegramControl {
           return Date.parse(leftObservedAt ?? "") - Date.parse(rightObservedAt ?? "");
         }
         return left.id.localeCompare(right.id);
-      })[0];
-    if (!task) return null;
-    await this.supervisor.recordReportAttempt(task.id, async (prepared) => {
-      try {
-        await this.sendMessage(buildOpsWorkerTelegramReport(prepared, {
-          redact: this.redactAgentField,
-          maxBytes: this.config.reply.maxBytes,
-        }), signal);
-      } catch (error) {
-        return { sent: false, error: safeError(error) };
-      }
-      this.faultInjector?.("after-report-send-before-receipt-finish", -1);
-      return { sent: true };
-    });
-    return task.id;
+      });
+    for (const task of tasks) {
+      const result = await this.supervisor.recordReportAttempt(
+        task.id,
+        async (prepared) => {
+          try {
+            await this.sendMessage(buildOpsWorkerTelegramReport(prepared, {
+              redact: this.redactAgentField,
+              maxBytes: this.config.reply.maxBytes,
+            }), signal);
+          } catch (error) {
+            return { sent: false, error: safeError(error) };
+          }
+          this.faultInjector?.("after-report-send-before-receipt-finish", -1);
+          return { sent: true };
+        },
+      );
+      if (isOpsWorkerReportReconciliationBlocked(result)) continue;
+      return task.id;
+    }
+    return null;
   }
 }

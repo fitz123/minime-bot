@@ -89,11 +89,11 @@ npm pack --dry-run
 ambiguous external report while keeping worker health/status, intake, and
 unrelated incident processing available.
 
-- [ ] Add a task-local report-reconciliation boundary in the Ops supervisor/control path: detect an incompatible claimed unfinished report before attempting a new operation, preserve the receipt and unknown external outcome unchanged, and durably make only that process-free task blocked/non-runnable with custody released until package-owned receipt/cancel recovery.
-- [ ] Ensure one isolated report cannot terminate or starve the Telegram control loop, status server, authenticated intake, other pending reports, or scheduler work; do not classify lifecycle safety failures as Telegram transport retries.
-- [ ] Keep fixed `receipt-query`, `receipt-claim`, `receipt-finish`, `retry`, and `cancel` semantics authoritative, and expose enough bounded task/status evidence to diagnose the isolated state without payload or secret disclosure.
-- [ ] Add supervisor/control/intake regressions for repeated startup/ticks with `mutationStartedAt != null` and `outcome == null`, including acceptance and processing of another incident while the original receipt remains ambiguous.
-- [ ] Run the Task 1 focused Ops suites and keep them green before Task 2.
+- [x] Add a task-local report-reconciliation boundary in the Ops supervisor/control path: detect an incompatible claimed unfinished report before attempting a new operation, preserve the receipt and unknown external outcome unchanged, and durably make only that process-free task blocked/non-runnable with custody released until package-owned receipt/cancel recovery.
+- [x] Ensure one isolated report cannot terminate or starve the Telegram control loop, status server, authenticated intake, other pending reports, or scheduler work; do not classify lifecycle safety failures as Telegram transport retries.
+- [x] Keep fixed `receipt-query`, `receipt-claim`, `receipt-finish`, `retry`, and `cancel` semantics authoritative, and expose enough bounded task/status evidence to diagnose the isolated state without payload or secret disclosure.
+- [x] Add supervisor/control/intake regressions for repeated startup/ticks with `mutationStartedAt != null` and `outcome == null`, including acceptance and processing of another incident while the original receipt remains ambiguous.
+- [x] Run the Task 1 focused Ops suites and keep them green before Task 2.
 
 ### Task 2: Keep noncritical Ops failures quiet and retryable
 

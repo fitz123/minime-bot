@@ -606,6 +606,12 @@ closed on conflicting reuse. The `--payload`, `--intent`, `--query-result`, and
 `--evidence` values are bounded canonical JSON and are retained only as hashes;
 callers must retain any raw external observation they will need later. Operator
 retry also fails closed while a claimed report receipt remains unfinished.
+If a claimed report receipt no longer matches the current report payload, the
+supervisor isolates that process-free task as `BLOCKED`, releases its custody,
+and records a bounded reconciliation marker without changing the receipt or
+guessing the external outcome. Automatic reporting and scheduling skip that
+task until fixed receipt reconciliation followed by `retry`, or an explicit
+`cancel`, resolves the episode.
 Snapshots keep non-evicting replay fingerprints for up to 128 displaced
 checkpoints and 32 displaced completed operations per receipt boundary. A new
 identity fails closed when its ledger is full; old identities are never
@@ -623,8 +629,9 @@ are accepted bind addresses. The surface is read-only unless an explicit
 route:
 
 - `GET /healthz` returns process health.
-- `GET /status` returns bounded task-state counts and the number of active
-  process groups. It exposes at most one custody owner as task id and state. Its
+- `GET /status` returns bounded task-state counts, the number of active
+  process groups, and the count of tasks isolated for report-receipt
+  reconciliation. It exposes at most one custody owner as task id and state. Its
   `policy` section contains only authorization/composite contract hashes and
   counts, current typed quota metadata/evidence hash, and primary resource
   digests for parity. It never includes objectives, canonical task bodies,
