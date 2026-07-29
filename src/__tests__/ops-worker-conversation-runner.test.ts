@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -10,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE,
+  OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
   OPS_WORKER_CONVERSATION_RUNNER_LIMITS,
   OPS_WORKER_CONVERSATION_SYSTEM_POLICY,
   OpsWorkerConversationRunner,
@@ -155,7 +163,9 @@ interface ConversationHarness {
   prompts: string[];
   invocations: string[][];
   spawnOptions: SpawnOptions[];
+  spawnFences: unknown[];
   signals: NodeJS.Signals[];
+  fencePath: string;
   cleanup(): void;
 }
 
@@ -177,7 +187,12 @@ function harness(
   const prompts: string[] = [];
   const invocations: string[][] = [];
   const spawnOptions: SpawnOptions[] = [];
+  const spawnFences: unknown[] = [];
   const signals: NodeJS.Signals[] = [];
+  const fencePath = join(
+    workspace,
+    OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+  );
   let nextPid = 40_000;
   const children = new Map<number, {
     child: ChildProcess;
@@ -186,6 +201,7 @@ function harness(
   }>();
 
   const runner = new OpsWorkerConversationRunner({
+    stateDirectory: workspace,
     workspaceCwd: workspace,
     snapshot: options.snapshot ?? (() => structuredClone(SNAPSHOT)),
     model: "openai-codex/gpt-fixture",
@@ -201,9 +217,11 @@ function harness(
         return { command: "/package/node", args: ["/package/pi.js", ...args] };
       },
       buildEnv: () => ({ PATH: "/usr/bin" }),
+      randomId: () => `fixture-${nextPid}`,
       spawnProcess: (_command, _args, optionsValue) => {
         if (options.spawnThrows) throw new Error("synthetic spawn failure");
         spawnOptions.push(optionsValue);
+        spawnFences.push(JSON.parse(readFileSync(fencePath, "utf8")));
         const scenario = scenarios.shift() ?? {};
         const child = new EventEmitter() as ChildProcess;
         const stdin = scenario.noStdin ? null : new PassThrough();
@@ -251,6 +269,23 @@ function harness(
         children.get(pid)?.groupPresent === true
           ? { status: "PRESENT" }
           : { status: "GONE" },
+      readProcessIdentity: (pid) => {
+        const record = children.get(pid);
+        if (!record?.groupPresent) return { status: "GONE" };
+        const ownershipNonce = String(
+          (spawnOptions.at(-1)?.env as NodeJS.ProcessEnv | undefined)
+            ?.MINIME_OPS_WORKER_ATTEMPT_TOKEN,
+        );
+        return {
+          status: "OWNED",
+          identity: {
+            pid,
+            processGroupId: pid,
+            processStartToken: `sha256:${"a".repeat(64)}`,
+            ownershipNonce,
+          },
+        };
+      },
       signalProcessGroup: (pid, signal) => {
         signals.push(signal);
         const record = children.get(pid);
@@ -272,7 +307,9 @@ function harness(
     prompts,
     invocations,
     spawnOptions,
+    spawnFences,
     signals,
+    fencePath,
     cleanup(): void {
       rmSync(workspace, { recursive: true, force: true });
     },
@@ -317,6 +354,18 @@ describe("ops worker conversation runner", () => {
     assert.deepEqual(fixture.spawnOptions[0].stdio, ["pipe", "pipe", "pipe"]);
     assert.equal(fixture.spawnOptions[0].detached, true);
     assert.equal(fixture.spawnOptions[0].shell, false);
+    const spawnFence = fixture.spawnFences[0] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(spawnFence).sort(), [
+      "launchedAt",
+      "ownershipNonceHash",
+      "phase",
+      "schemaVersion",
+    ]);
+    assert.equal(spawnFence.schemaVersion, 1);
+    assert.equal(spawnFence.phase, "PRESPAWN");
+    assert.match(String(spawnFence.launchedAt), /^\d{4}-\d\d-\d\dT/);
+    assert.match(String(spawnFence.ownershipNonceHash), /^sha256:[a-f0-9]{64}$/);
+    assert.equal(existsSync(fixture.fencePath), false);
 
     const prompt = JSON.parse(fixture.prompts[0]) as Record<string, unknown>;
     assert.equal(prompt.contract, "minime-ops-conversation-input-v1");
@@ -580,6 +629,106 @@ describe("ops worker conversation runner", () => {
 
     assert.equal(result.status, "OK");
     assert.deepEqual(fixture.signals, ["SIGTERM"]);
+  });
+
+  it("reaps a durably fenced conversation process before restart can continue", async (t) => {
+    const stateDirectory = mkdtempSync(join(tmpdir(), "ops-conversation-restart-"));
+    t.after(() => rmSync(stateDirectory, { recursive: true, force: true }));
+    const ownershipNonce = "conversation-restart-fixture";
+    const ownershipNonceHash = `sha256:${createHash("sha256")
+      .update(`ownership-nonce:${ownershipNonce}`)
+      .digest("hex")}`;
+    const fencePath = join(
+      stateDirectory,
+      OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+    );
+    writeFileSync(fencePath, `${JSON.stringify({
+      schemaVersion: 1,
+      phase: "SPAWNED",
+      launchedAt: "2026-07-30T00:00:00.000Z",
+      ownershipNonceHash,
+      pid: 41_000,
+      expectedProcessGroupId: 41_000,
+    })}\n`, { mode: 0o600 });
+    let groupPresent = true;
+    const signals: NodeJS.Signals[] = [];
+    let spawned = false;
+    const runner = new OpsWorkerConversationRunner({
+      stateDirectory,
+      workspaceCwd: stateDirectory,
+      snapshot: () => structuredClone(SNAPSHOT),
+      termGraceMs: 5,
+      killGraceMs: 5,
+      dependencies: {
+        resolveBoundsExtensionPath: () =>
+          "/package/ops-worker-conversation-bounds.ts",
+        spawnProcess: () => {
+          spawned = true;
+          throw new Error("restart reconciliation must precede spawn");
+        },
+        readProcessIdentity: () => groupPresent
+          ? {
+              status: "OWNED",
+              identity: {
+                pid: 41_000,
+                processGroupId: 41_000,
+                processStartToken: `sha256:${"b".repeat(64)}`,
+                ownershipNonce,
+              },
+            }
+          : { status: "GONE" },
+        inspectProcessGroup: () => groupPresent
+          ? { status: "PRESENT" }
+          : { status: "GONE" },
+        signalProcessGroup: (_pid, signal) => {
+          signals.push(signal);
+          groupPresent = false;
+        },
+        sleep: async () => undefined,
+      },
+    });
+
+    await runner.start();
+
+    assert.deepEqual(signals, ["SIGTERM"]);
+    assert.equal(existsSync(fencePath), false);
+    assert.equal(spawned, false);
+  });
+
+  it("fails restart closed when a pre-spawn conversation fence has no child identity", async (t) => {
+    const stateDirectory = mkdtempSync(join(tmpdir(), "ops-conversation-prespawn-"));
+    t.after(() => rmSync(stateDirectory, { recursive: true, force: true }));
+    const fencePath = join(
+      stateDirectory,
+      OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+    );
+    writeFileSync(fencePath, `${JSON.stringify({
+      schemaVersion: 1,
+      phase: "PRESPAWN",
+      launchedAt: "2026-07-30T00:00:00.000Z",
+      ownershipNonceHash: `sha256:${"c".repeat(64)}`,
+    })}\n`, { mode: 0o600 });
+    let spawned = false;
+    const runner = new OpsWorkerConversationRunner({
+      stateDirectory,
+      workspaceCwd: stateDirectory,
+      snapshot: () => structuredClone(SNAPSHOT),
+      dependencies: {
+        resolveBoundsExtensionPath: () =>
+          "/package/ops-worker-conversation-bounds.ts",
+        spawnProcess: () => {
+          spawned = true;
+          throw new Error("ambiguous launch fence must prevent spawn");
+        },
+      },
+    });
+
+    await assert.rejects(
+      runner.start(),
+      /conversation launch fence has no persisted child identity/i,
+    );
+    assert.equal(spawned, false);
+    assert.equal(existsSync(fencePath), true);
   });
 
   it("retains an unreaped process-group fault and blocks later incident launch", async (t) => {

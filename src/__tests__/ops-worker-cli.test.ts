@@ -49,6 +49,9 @@ import type {
 } from "../ops-worker/types.js";
 import type { OpsWorkerCliDependencies } from "../ops-worker/worker-cli.js";
 import {
+  OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+} from "../ops-worker/conversation-runner.js";
+import {
   PI_BUILTIN_TOOL_NAMES,
   resolvePiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
@@ -1018,6 +1021,68 @@ reply:
     assert.ok(conversationArgs.includes("--no-tools"));
     assert.ok(conversationArgs.includes("--no-session"));
     assert.ok(conversationArgs.includes("--no-context-files"));
+  });
+
+  it("reconciles the durable conversation launch fence before polling or scheduling", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controlConfig = join(fixture.root, "ops-restart-fence-control.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+`);
+    mkdirSync(fixture.stateDirectory, { mode: 0o700 });
+    writeFileSync(
+      join(
+        fixture.stateDirectory,
+        OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+      ),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        phase: "PRESPAWN",
+        launchedAt: "2026-07-30T00:00:00.000Z",
+        ownershipNonceHash: `sha256:${"d".repeat(64)}`,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    let telegramCalled = false;
+    let conversationSpawned = false;
+
+    const result = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], fixture.root, dependencies(contracts, {
+      controlConfigEnv: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN" },
+      telegramFetch: async () => {
+        telegramCalled = true;
+        throw new Error("restart reconciliation must precede Telegram polling");
+      },
+      conversationRunnerDependencies: {
+        spawnProcess: () => {
+          conversationSpawned = true;
+          throw new Error("restart reconciliation must precede conversation spawn");
+        },
+      },
+    }));
+
+    assert.equal(result.code, 1);
+    assert.match(
+      result.stderr,
+      /conversation launch fence has no persisted child identity/i,
+    );
+    assert.equal(telegramCalled, false);
+    assert.equal(conversationSpawned, false);
   });
 
   it("fails once mode when a completed conversation process group cannot be proven reaped", async (t) => {

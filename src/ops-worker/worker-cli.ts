@@ -783,6 +783,7 @@ async function runStart(
     const conversationRunner = controlConfig === undefined
       ? undefined
       : new OpsWorkerConversationRunner({
+          stateDirectory: directory,
           workspaceCwd: workspace,
           snapshot: () => buildOpsWorkerConversationSnapshot(
             supervisor.listTasks(),
@@ -797,6 +798,7 @@ async function runStart(
           abortSignal: signal,
           dependencies: deps.conversationRunnerDependencies,
         });
+    await conversationRunner?.start();
     const conversationLane = conversationRunner === undefined
       ? undefined
       : new OpsWorkerConversationLane({

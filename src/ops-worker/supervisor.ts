@@ -836,8 +836,7 @@ export class OpsWorkerSupervisor {
     const tasks = this.store.list();
     return this.piLaunchReservation !== null
       || tasks.some((task) =>
-        task.custody.status === "HELD"
-        || task.state === "RUNNING"
+        task.state === "RUNNING"
         || task.activeRun !== null
         || task.unverifiedRun !== null
         || isOpsWorkerUnresolvedOrphan(task))

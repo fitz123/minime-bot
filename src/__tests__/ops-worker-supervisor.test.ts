@@ -723,6 +723,31 @@ describe("ops worker supervisor", () => {
     assert.equal(maintained?.report.lastError, null);
   });
 
+  it("admits conversation while held custody is deferred or paused, but blocks due work", async (t) => {
+    const harness = await makeHarness(t);
+    const checking = makeTask("task-conversation-deferred");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    checking.schedule.nextCheckAt = LATER;
+    harness.store.create(checking);
+
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.supervisor.blocksConversationAdmission(), false);
+
+    harness.setNow(LATER);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+    assert.equal(harness.supervisor.blocksConversationAdmission(), true);
+
+    harness.supervisor.setTaskPaused(checking.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.supervisor.blocksConversationAdmission(), false);
+  });
+
   it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => ({

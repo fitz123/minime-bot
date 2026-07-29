@@ -3,6 +3,7 @@ import {
   type ChildProcess,
   type SpawnOptions,
 } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import {
@@ -24,9 +25,20 @@ import {
 import type { PiThinkingLevel } from "../types.js";
 import type { OpsWorkerConversationSnapshot } from "./conversation-view.js";
 import {
+  OPS_WORKER_ATTEMPT_TOKEN_ENV,
   inspectOpsWorkerProcessGroup,
+  readOpsWorkerProcessIdentity,
+  stopOwnedProcessGroup,
+  type OpsWorkerProcessInspection,
   type OpsWorkerProcessGroupInspection,
 } from "./pi-attempt.js";
+import {
+  OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME,
+  OpsWorkerConversationProcessFenceStore,
+  type OpsWorkerConversationSpawnedFence,
+} from "./conversation-process-fence.js";
+
+export { OPS_WORKER_CONVERSATION_PROCESS_FENCE_FILE_NAME };
 
 export const OPS_WORKER_CONVERSATION_RUNNER_LIMITS = Object.freeze({
   maxInputBytes: 16 * 1024,
@@ -156,14 +168,18 @@ export interface OpsWorkerConversationRunnerDependencies {
   inspectProcessGroup?: (
     processGroupId: number,
   ) => OpsWorkerProcessGroupInspection;
+  readProcessIdentity?: (pid: number) => OpsWorkerProcessInspection;
   signalProcessGroup?: (
     processGroupId: number,
     signal: NodeJS.Signals,
   ) => void;
+  randomId?: () => string;
+  now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
 export interface OpsWorkerConversationRunnerOptions {
+  stateDirectory: string;
   workspaceCwd: string;
   snapshot: () => OpsWorkerConversationSnapshot;
   model?: string;
@@ -252,15 +268,24 @@ export class OpsWorkerConversationRunner {
   private readonly inspectProcessGroup: (
     processGroupId: number,
   ) => OpsWorkerProcessGroupInspection;
+  private readonly readProcessIdentity: (pid: number) => OpsWorkerProcessInspection;
   private readonly signalProcessGroup: (
     processGroupId: number,
     signal: NodeJS.Signals,
   ) => void;
+  private readonly randomId: () => string;
+  private readonly now: () => Date;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly processFence: OpsWorkerConversationProcessFenceStore;
   private running: RunningTurn | null = null;
   private unreapedProcessGroupId: number | null = null;
+  private fenceFault = false;
+  private startup: Promise<void> | null = null;
 
   constructor(options: OpsWorkerConversationRunnerOptions) {
+    this.processFence = new OpsWorkerConversationProcessFenceStore(
+      options.stateDirectory,
+    );
     this.workspaceCwd = validateWorkspace(options.workspaceCwd);
     this.snapshot = options.snapshot;
     this.model = normalizePiModel(options.model);
@@ -303,8 +328,13 @@ export class OpsWorkerConversationRunner {
     )();
     this.inspectProcessGroup = dependencies.inspectProcessGroup
       ?? inspectOpsWorkerProcessGroup;
+    this.readProcessIdentity = dependencies.readProcessIdentity
+      ?? readOpsWorkerProcessIdentity;
     this.signalProcessGroup = dependencies.signalProcessGroup
       ?? ((processGroupId, signal) => process.kill(-processGroupId, signal));
+    this.randomId = dependencies.randomId
+      ?? (() => randomBytes(16).toString("hex"));
+    this.now = dependencies.now ?? (() => new Date());
     this.sleep = dependencies.sleep
       ?? ((milliseconds) => new Promise((resolveSleep) => {
         setTimeout(resolveSleep, milliseconds);
@@ -312,10 +342,21 @@ export class OpsWorkerConversationRunner {
     this.abortSignal = options.abortSignal;
   }
 
+  async start(): Promise<void> {
+    this.startup ??= this.reconcileStartup();
+    return this.startup;
+  }
+
   async run(
     text: string,
     options: OpsWorkerConversationTurnOptions = {},
   ): Promise<OpsWorkerConversationTurnResult> {
+    try {
+      await this.start();
+    } catch {
+      return fallback("BUSY");
+    }
+    if (this.fenceFault) return fallback("BUSY");
     if (this.running !== null) return fallback("BUSY");
     if (this.unreapedProcessGroupId !== null) return fallback("BUSY");
     if (this.abortSignal?.aborted || options.signal?.aborted) {
@@ -348,10 +389,19 @@ export class OpsWorkerConversationRunner {
       return running.done;
     }
     const processGroupId = this.unreapedProcessGroupId;
-    if (processGroupId === null) return true;
+    if (processGroupId === null) return !this.fenceFault;
     const reaped = await this.stopProcessGroup(processGroupId);
-    if (reaped && this.unreapedProcessGroupId === processGroupId) {
-      this.unreapedProcessGroupId = null;
+    if (reaped) {
+      try {
+        this.processFence.clear();
+        this.fenceFault = false;
+      } catch {
+        this.fenceFault = true;
+        return false;
+      }
+      if (this.unreapedProcessGroupId === processGroupId) {
+        this.unreapedProcessGroupId = null;
+      }
     }
     return reaped;
   }
@@ -372,9 +422,28 @@ export class OpsWorkerConversationRunner {
       return fallback("SPAWN");
     }
 
+    const launchedAt = this.now().toISOString();
+    const ownershipNonce = `conversation-${this.randomId()}`;
+    if (!/^[A-Za-z0-9._:-]{1,255}$/.test(ownershipNonce)) {
+      return fallback("SPAWN");
+    }
+    const ownershipNonceHash = hashOwnershipNonce(ownershipNonce);
+    try {
+      this.processFence.write({
+        schemaVersion: 1,
+        phase: "PRESPAWN",
+        launchedAt,
+        ownershipNonceHash,
+      });
+    } catch {
+      this.fenceFault = true;
+      return fallback("IO");
+    }
+
     let child: ChildProcess;
     try {
       const env = this.buildEnv(this.workspaceCwd);
+      env[OPS_WORKER_ATTEMPT_TOKEN_ENV] = ownershipNonce;
       child = this.spawnProcess(invocation.command, invocation.args, {
         cwd: this.workspaceCwd,
         env,
@@ -383,7 +452,29 @@ export class OpsWorkerConversationRunner {
         shell: false,
       });
     } catch {
+      try {
+        this.processFence.clear();
+        this.fenceFault = false;
+      } catch {
+        this.fenceFault = true;
+      }
       return fallback("SPAWN");
+    }
+    let fenceBindFailed = false;
+    if (child.pid !== undefined) {
+      try {
+        this.processFence.write({
+          schemaVersion: 1,
+          phase: "SPAWNED",
+          launchedAt,
+          ownershipNonceHash,
+          pid: child.pid,
+          expectedProcessGroupId: child.pid,
+        });
+      } catch {
+        fenceBindFailed = true;
+        this.fenceFault = true;
+      }
     }
 
     let resolveDone!: (reaped: boolean) => void;
@@ -448,6 +539,9 @@ export class OpsWorkerConversationRunner {
         },
       }));
     }
+    if (fenceBindFailed) {
+      settleTrigger({ kind: "IO" });
+    }
     if (!child.stdin) {
       settleTrigger({ kind: "IO" });
     } else {
@@ -497,8 +591,19 @@ export class OpsWorkerConversationRunner {
       turnSignal?.removeEventListener("abort", abort);
       child.stdout?.off("data", onStdout);
       child.stderr?.off("data", onStderr);
+      if (processReaped) {
+        try {
+          this.processFence.clear();
+          this.fenceFault = false;
+        } catch {
+          processReaped = false;
+          this.fenceFault = true;
+        }
+      }
       if (!processReaped && child.pid !== undefined) {
         this.unreapedProcessGroupId = child.pid;
+      } else if (!processReaped) {
+        this.fenceFault = true;
       }
       if (this.running?.done === done) this.running = null;
       resolveDone(processReaped);
@@ -553,6 +658,98 @@ export class OpsWorkerConversationRunner {
         Math.max(1, deadline - Date.now()),
       ));
     }
+  }
+
+  private async reconcileStartup(): Promise<void> {
+    const fence = this.processFence.read();
+    if (fence === null) {
+      this.fenceFault = false;
+      return;
+    }
+    if (fence.phase === "PRESPAWN") {
+      this.fenceFault = true;
+      throw new Error(
+        "Conversation launch fence has no persisted child identity; restart reconciliation is ambiguous",
+      );
+    }
+    const initial = this.inspectPersistedFence(fence);
+    if (initial.status === "GONE") {
+      const group = this.inspectProcessGroup(fence.expectedProcessGroupId);
+      if (group.status === "GONE") {
+        this.processFence.clear();
+        this.fenceFault = false;
+        return;
+      }
+      this.fenceFault = true;
+      throw new Error(
+        group.status === "AMBIGUOUS"
+          ? group.summary
+          : "Conversation leader is gone while its persisted process group remains present",
+      );
+    }
+    if (initial.status === "AMBIGUOUS") {
+      const group = this.inspectProcessGroup(fence.expectedProcessGroupId);
+      if (group.status === "GONE") {
+        this.processFence.clear();
+        this.fenceFault = false;
+        return;
+      }
+      this.fenceFault = true;
+      throw new Error(initial.summary);
+    }
+    const run = {
+      attemptId: "conversation-restart",
+      supervisorInstanceId: "conversation-restart",
+      pid: fence.pid,
+      processGroupId: fence.expectedProcessGroupId,
+      processStartedAt: fence.launchedAt,
+      processStartToken: initial.identity.processStartToken,
+    };
+    const result = await stopOwnedProcessGroup(run, {
+      inspect: () => this.inspectPersistedFence(
+        fence,
+        initial.identity.processStartToken,
+      ),
+      inspectGroup: this.inspectProcessGroup,
+      signal: this.signalProcessGroup,
+      sleep: this.sleep,
+      termGraceMs: this.termGraceMs,
+      killGraceMs: this.killGraceMs,
+    });
+    if (result.status === "AMBIGUOUS") {
+      this.fenceFault = true;
+      throw new Error(
+        result.summary
+          ?? "Conversation process group could not be reconciled at restart",
+      );
+    }
+    this.processFence.clear();
+    this.fenceFault = false;
+  }
+
+  private inspectPersistedFence(
+    fence: OpsWorkerConversationSpawnedFence,
+    expectedStartToken?: string,
+  ): OpsWorkerProcessInspection {
+    const current = this.readProcessIdentity(fence.pid);
+    if (current.status !== "OWNED") return current;
+    if (
+      current.identity.pid !== fence.pid
+      || current.identity.processGroupId !== fence.expectedProcessGroupId
+      || (
+        expectedStartToken !== undefined
+        && current.identity.processStartToken !== expectedStartToken
+      )
+      || current.identity.ownershipNonce === undefined
+      || hashOwnershipNonce(current.identity.ownershipNonce)
+        !== fence.ownershipNonceHash
+    ) {
+      return {
+        status: "AMBIGUOUS",
+        summary: "Persisted conversation PID, group, start token, and nonce no longer match",
+      };
+    }
+    return current;
   }
 }
 
@@ -832,4 +1029,10 @@ function classifyProcessFailure(
       .test(combined)
   ) return "NETWORK";
   return "PROVIDER";
+}
+
+function hashOwnershipNonce(value: string): string {
+  return `sha256:${createHash("sha256")
+    .update(`ownership-nonce:${value}`)
+    .digest("hex")}`;
 }

@@ -179,6 +179,10 @@ conversation receives the deterministic command-guidance fallback. Runnable
 or active incident work closes conversation admission; if incident work
 arrives during a turn, the scheduler aborts and proves the separate
 conversation process group reaped before it launches incident Pi.
+Detached conversation launches are durably fenced under the worker state
+directory. On restart, the worker reconciles and reaps a proven persisted group
+before Telegram polling or incident scheduling begins; an ambiguous pre-spawn
+fence fails startup closed instead of permitting concurrent Pi ownership.
 
 The bounded command set is `/status`, `/tasks`, `/task <id>`, `/answer <id>
 <text>`, `/correct <id> <text>`, `/pause <id>`, `/resume <id>`, `/cancel <id>
