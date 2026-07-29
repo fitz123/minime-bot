@@ -828,9 +828,14 @@ async function runStart(
       return conversationLane.runIncident(async () => runner.runNext());
     };
     if (parsed.flags.has("once")) {
-      const result = await runIncidentFirst();
-      await telegramControl?.tick(signal);
-      await telegramControl?.waitForConversation();
+      let result: OpsWorkerTask | undefined;
+      try {
+        result = await runIncidentFirst();
+        await telegramControl?.tick(signal);
+        await telegramControl?.waitForConversation();
+      } finally {
+        await conversationLane?.close();
+      }
       writeLine(
         cliOptions.stdout,
         result ? `Processed ${result.id}: ${result.state}` : "No eligible ops-worker task.",

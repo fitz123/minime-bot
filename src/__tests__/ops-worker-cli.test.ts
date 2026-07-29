@@ -1020,6 +1020,88 @@ reply:
     assert.ok(conversationArgs.includes("--no-context-files"));
   });
 
+  it("fails once mode when a completed conversation process group cannot be proven reaped", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controlConfig = join(fixture.root, "ops-unreaped-control.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    let signalAttempts = 0;
+    const result = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], fixture.root, dependencies(contracts, {
+      controlConfigEnv: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN" },
+      telegramFetch: async (input) => {
+        const method = String(input).split("/").at(-1);
+        if (method === "getUpdates") {
+          return Response.json({
+            ok: true,
+            result: [{
+              update_id: 1,
+              message: {
+                message_id: 1,
+                date: Math.floor(Date.now() / 1_000),
+                text: "Что сейчас происходит?",
+                from: { id: 100000000, is_bot: false },
+                chat: { id: 100000000, type: "private" },
+              },
+            }],
+          });
+        }
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      },
+      conversationRunnerDependencies: {
+        resolveInvocation: () => ({
+          command: process.execPath,
+          args: [FAKE_OPS_CONVERSATION],
+        }),
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+        inspectProcessGroup: () => ({
+          status: "AMBIGUOUS",
+          summary: "Synthetic once-mode process-group ambiguity.",
+        }),
+        signalProcessGroup: () => {
+          signalAttempts += 1;
+          throw new Error("synthetic ambiguous process group");
+        },
+      },
+    }));
+
+    assert.equal(result.code, 1);
+    assert.match(
+      result.stderr,
+      /Conversational Ops process group could not be proven reaped/,
+    );
+    assert.equal(signalAttempts, 1);
+  });
+
   it("requires the quota dependency but bypasses closed initial admission for CLI operations", async (t) => {
     const fixture = fixtureRoot(t);
     const contracts = fixtureContracts();

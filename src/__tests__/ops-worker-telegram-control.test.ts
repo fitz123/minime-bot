@@ -669,6 +669,191 @@ describe("ops worker dedicated Telegram control", () => {
       message.text === `Recorded answer for ${task.id}.`));
   });
 
+  it("replays a confirmed natural control after a crash without losing or duplicating it", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const task = makeBlockedInputTask("task-natural-confirm-crash");
+    fixture.store.create(task);
+    const confirmation = update(33, "ПОДТВЕРЖДАЮ");
+    const transport = new FakeTelegramTransport();
+    transport.updates.push(
+      [update(32, "Используй восстановимый ответ")],
+      [confirmation],
+      [confirmation],
+    );
+    let armed = false;
+    let conversationCalls = 0;
+    const crashing = control(fixture, transport, (point, updateId) => {
+      if (armed && point === "after-effect-before-ledger" && updateId === 33) {
+        armed = false;
+        throw new Error("synthetic natural-control crash before acknowledgement");
+      }
+    }, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return {
+          status: "OK",
+          envelope: {
+            version: 1,
+            kind: "control",
+            language: "ru",
+            intent: "answer",
+            taskReference: null,
+            argument: "восстановимый ответ",
+          },
+        };
+      },
+    });
+
+    await crashing.tick();
+    await crashing.waitForConversation();
+    armed = true;
+    await assert.rejects(
+      crashing.tick(),
+      /synthetic natural-control crash before acknowledgement/,
+    );
+    assert.equal(fixture.store.get(task.id)?.steering.length, 1);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 32);
+
+    const restarted = control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return "The replay must not reach conversational Pi.";
+      },
+    });
+    await restarted.tick();
+    await restarted.waitForConversation();
+
+    assert.equal(conversationCalls, 1);
+    assert.equal(fixture.store.get(task.id)?.steering.length, 1);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 33);
+    assert.equal(
+      transport.messages.at(-1)?.text,
+      `The confirmed operation for ${task.id} was already applied.`,
+    );
+  });
+
+  it("rejects exact control confirmation by voice so acknowledgement cannot precede mutation", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const task = makeBlockedInputTask("task-natural-voice-confirm");
+    fixture.store.create(task);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push(
+      [update(34, "Используй текстовый ответ")],
+      [voiceUpdate(35, "voice-confirm")],
+    );
+    let conversationCalls = 0;
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      ingestVoice: async () => "ПОДТВЕРЖДАЮ",
+      handleConversation: () => {
+        conversationCalls += 1;
+        return {
+          status: "OK",
+          envelope: {
+            version: 1,
+            kind: "control",
+            language: "ru",
+            intent: "answer",
+            taskReference: null,
+            argument: "текстовый ответ",
+          },
+        };
+      },
+    });
+
+    await client.tick();
+    await client.waitForConversation();
+    await client.tick();
+    await client.waitForConversation();
+
+    assert.equal(conversationCalls, 1);
+    assert.equal(fixture.store.get(task.id)?.steering.length, 0);
+    assert.match(
+      String(transport.messages.at(-1)?.text),
+      /нужно отправить текстом; изменений нет/,
+    );
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 35);
+  });
+
+  it("does not retain natural controls whose exact confirmation cannot fit", async (t) => {
+    {
+      const fixture = await harness(t, { instanceId: "natural-long-confirmation" });
+      const task = makeBlockedInputTask("task-natural-long-confirmation");
+      fixture.store.create(task);
+      const transport = new FakeTelegramTransport();
+      transport.updates.push(
+        [update(36, "Используй длинный ответ")],
+        [update(37, "ПОДТВЕРЖДАЮ")],
+      );
+      let conversationCalls = 0;
+      const client = control(fixture, transport, undefined, () => new Date(NOW), {
+        handleConversation: () => {
+          conversationCalls += 1;
+          return {
+            status: "OK",
+            envelope: {
+              version: 1,
+              kind: "control",
+              language: "ru",
+              intent: "answer",
+              taskReference: null,
+              argument: "я".repeat(700),
+            },
+          };
+        },
+      });
+
+      await client.tick();
+      await client.waitForConversation();
+      assert.match(
+        String(transport.messages.at(-1)?.text),
+        /нельзя полностью показать/,
+      );
+      assert.ok(
+        Buffer.byteLength(String(transport.messages.at(-1)?.text), "utf8")
+          <= config.reply.maxBytes,
+      );
+      await client.tick();
+      await client.waitForConversation();
+      assert.equal(conversationCalls, 2);
+      assert.equal(fixture.store.get(task.id)?.steering.length, 0);
+      fixture.close();
+    }
+
+    {
+      const fixture = await harness(t, { instanceId: "natural-many-long-ids" });
+      const ids = Array.from({ length: 16 }, (_, index) =>
+        `t${String(index).padStart(2, "0")}-${"x".repeat(58)}`);
+      for (const id of ids) fixture.store.create(makeBlockedInputTask(id));
+      const transport = new FakeTelegramTransport();
+      transport.updates.push([update(38, "Приостанови одну задачу")]);
+      const client = control(fixture, transport, undefined, () => new Date(NOW), {
+        handleConversation: () => ({
+          status: "OK",
+          envelope: {
+            version: 1,
+            kind: "control",
+            language: "ru",
+            intent: "pause",
+            taskReference: null,
+            argument: null,
+          },
+        }),
+      });
+
+      await client.tick();
+      await client.waitForConversation();
+      assert.match(
+        String(transport.messages.at(-1)?.text),
+        /нельзя полностью показать/,
+      );
+      assert.ok(fixture.store.list().every((candidate) =>
+        candidate.control.paused === false));
+      fixture.close();
+    }
+  });
+
   it("confirms every supported natural lifecycle intent through the shared slash operation", async (t) => {
     const cases = [
       {

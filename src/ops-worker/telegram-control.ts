@@ -690,6 +690,44 @@ export class OpsWorkerTelegramControl {
     }
     const isConversation = message.kind === "voice"
       || !message.text.trimStart().startsWith("/");
+    if (isConversation && message.kind === "text") {
+      const replayedTaskId = this.findNaturalControlReplay(message);
+      if (replayedTaskId !== null) {
+        this.ledger.record(updateId, fingerprint, {
+          epoch,
+          acknowledgedAt: this.now(),
+        });
+        this.faultInjector?.("after-ledger-before-reply", updateId);
+        this.enqueueReply(
+          `The confirmed operation for ${replayedTaskId} was already applied.`,
+        );
+        await this.flushPendingReply(signal);
+        return;
+      }
+      const clarification = this.takeControlClarification();
+      if (clarification !== null) {
+        let reply: string;
+        try {
+          reply = this.resolveControlClarification(
+            message.text,
+            message,
+            clarification,
+          );
+        } catch (error) {
+          if (!(error instanceof OpsWorkerSteeringCapacityError)) throw error;
+          reply = "The task has no remaining steering capacity; the command was not recorded.";
+        }
+        this.faultInjector?.("after-effect-before-ledger", updateId);
+        this.ledger.record(updateId, fingerprint, {
+          epoch,
+          acknowledgedAt: this.now(),
+        });
+        this.faultInjector?.("after-ledger-before-reply", updateId);
+        this.enqueueReply(reply);
+        await this.flushPendingReply(signal);
+        return;
+      }
+    }
     if (isConversation) {
       this.ledger.record(updateId, fingerprint, {
         epoch,
@@ -780,11 +818,16 @@ export class OpsWorkerTelegramControl {
 
   private async conversationReply(
     text: string,
-    message: ParsedTelegramMessageBase,
+    message: ParsedTelegramMessage,
     signal: AbortSignal,
   ): Promise<string> {
     const clarification = this.takeClarification();
     if (clarification !== null && clarification.control !== null) {
+      if (message.kind === "voice") {
+        return clarification.control.language === "ru"
+          ? "Точное подтверждение или идентификатор задачи нужно отправить текстом; изменений нет."
+          : "Send the exact confirmation or task identifier as text; nothing changed.";
+      }
       return this.resolveControlClarification(text, message, clarification);
     }
     try {
@@ -1033,6 +1076,17 @@ export class OpsWorkerTelegramControl {
       : proposal.language === "ru"
         ? `Уточните задачу для ${operation}: ${ids.join(", ")}. Ответьте точным идентификатором.`
         : `Which task for ${operation}: ${ids.join(", ")}? Reply with the exact identifier.`;
+    if (
+      Buffer.byteLength(question, "utf8")
+        > Math.min(
+          this.config.reply.maxBytes,
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        )
+    ) {
+      return proposal.language === "ru"
+        ? "Предложенную операцию нельзя полностью показать в безопасном подтверждении; изменений нет. Используйте точную slash-команду."
+        : "The proposed operation cannot fit in a safe confirmation; nothing changed. Use an exact slash command.";
+    }
     this.storeClarification(operatorText, question, {
       intent: proposal.intent,
       argument: proposal.argument,
@@ -1128,6 +1182,20 @@ export class OpsWorkerTelegramControl {
     return clarification !== null && clarification.expiresAt >= this.now().getTime()
       ? clarification
       : null;
+  }
+
+  private takeControlClarification(): OpsWorkerClarificationSlot | null {
+    return this.clarification?.control === null
+      ? null
+      : this.takeClarification();
+  }
+
+  private findNaturalControlReplay(
+    message: ParsedTelegramTextMessage,
+  ): string | null {
+    const steeringId = this.steeringId(message);
+    return this.supervisor.listTasks().find((task) =>
+      task.steering.some((entry) => entry.steeringId === steeringId))?.id ?? null;
   }
 
   private storeClarification(

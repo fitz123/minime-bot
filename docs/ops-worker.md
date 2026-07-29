@@ -189,10 +189,12 @@ proposed existing control intent. The host recomputes lifecycle eligibility
 and never mutates from the model proposal alone. For exactly one eligible task,
 the host names the operation and task and requires a fixed exact confirmation
 token; for multiple eligible tasks, the next reply must be one exact task id
-from the single five-minute clarification slot. The confirmation/selection is
-resolved without Pi, then lifecycle eligibility is recomputed and the same
-operation used by the corresponding slash command is called. Ambiguity,
-provider failure, changed eligibility, and expiry perform no mutation.
+from the single five-minute clarification slot. Exact confirmations and task
+selections must be typed text so their durable update can be replayed without
+depending on transcription. The confirmation/selection is resolved without Pi,
+then lifecycle eligibility is recomputed and the same operation used by the
+corresponding slash command is called. Ambiguity, an oversized confirmation
+prompt, provider failure, changed eligibility, and expiry perform no mutation.
 Telegram can steer only an existing task. It cannot create tasks or select
 configuration, commands, destinations, URLs, models, tools, templates,
 profiles, or verifier components.
@@ -210,9 +212,11 @@ effect and ledger write is safe because the update-derived steering id makes
 redelivery an idempotent replay. A conversational update is fingerprinted and
 acknowledged before its in-memory turn starts; duplicate delivery therefore
 cannot spawn another turn. Any validated natural control still uses that same
-update-derived steering id in the shared operation path. Malformed and
-non-allowlisted updates receive no task effect or reply, but their fingerprints
-are retained before the offset advances.
+update-derived steering id in the shared operation path. A typed deterministic
+confirmation persists its task effect before acknowledging its update, just
+like a slash command, so crash redelivery observes the already-applied steering
+id. Malformed and non-allowlisted updates receive no task effect or reply, but
+their fingerprints are retained before the offset advances.
 The ledger also records the local acknowledgement time and an update-id epoch.
 After a full week without an update it polls once without the stale offset,
 because Telegram may randomize the next update id, and begins a new epoch when
