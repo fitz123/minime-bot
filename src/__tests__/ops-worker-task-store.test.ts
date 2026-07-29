@@ -1493,6 +1493,28 @@ describe("ops worker task contract", () => {
       () => parseOpsWorkerTask(oversizedEvidence, registry),
       /must be at most 4096 UTF-8 bytes/,
     );
+    const oversizedMarkerSpoof = clone(makeTask());
+    oversizedMarkerSpoof.evidence[0] = {
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: "report:marker-spoof",
+        intentHash: `sha256:${"a".repeat(64)}`,
+        intent: {
+          reportIdentity: `sha256:${"b".repeat(64)}`,
+          reportPayloadHash: "x".repeat(
+            OPS_WORKER_LIMITS.maxEvidenceSummaryBytes,
+          ),
+        },
+      }),
+      artifact: null,
+    };
+    assert.throws(
+      () => parseOpsWorkerTask(oversizedMarkerSpoof, registry),
+      /must be at most 4096 UTF-8 bytes/,
+    );
     const sparseEvidence = clone(makeTask());
     sparseEvidence.evidence = new Array(1);
     assert.throws(

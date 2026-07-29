@@ -22,6 +22,19 @@ export interface CronOutboxRecord {
   attempts: number;
 }
 
+export const CRON_HEALTH_TEXTFILE_DIR_ENV = "CRON_HEALTH_TEXTFILE_DIR";
+export const DEFAULT_CRON_HEALTH_TEXTFILE_DIR =
+  "/opt/homebrew/var/node_exporter/textfile";
+
+export interface CronHealthMetricArtifacts {
+  textfileDir: string;
+  fileStem: string;
+  exitFileName: string;
+  exitFilePath: string;
+  successFileName: string;
+  successFilePath: string;
+}
+
 export function shortStableHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
@@ -31,6 +44,30 @@ export function sanitizeCronMetricStem(cronName: string): string {
     .replace(/[^A-Za-z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "");
   return `${safeName || "unnamed"}_${shortStableHash(cronName)}`;
+}
+
+export function resolveCronHealthTextfileDir(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return env[CRON_HEALTH_TEXTFILE_DIR_ENV]?.trim()
+    || DEFAULT_CRON_HEALTH_TEXTFILE_DIR;
+}
+
+export function resolveCronHealthMetricArtifacts(
+  cronName: string,
+  textfileDir = resolveCronHealthTextfileDir(),
+): CronHealthMetricArtifacts {
+  const fileStem = sanitizeCronMetricStem(cronName);
+  const exitFileName = `minime_cron_${fileStem}.exit.prom`;
+  const successFileName = `minime_cron_${fileStem}.success.prom`;
+  return {
+    textfileDir,
+    fileStem,
+    exitFileName,
+    exitFilePath: join(textfileDir, exitFileName),
+    successFileName,
+    successFilePath: join(textfileDir, successFileName),
+  };
 }
 
 function resolveCronOutboxDir(): string {

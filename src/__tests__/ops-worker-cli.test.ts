@@ -314,6 +314,7 @@ describe("ops worker CLI and inactive runtime", () => {
         schemaVersion: 6,
         totalTasks: 1,
         activeProcessGroups: 0,
+        reportReconciliationBlocked: 0,
         custodyOwner: null,
         states: {
           QUEUED: 1,

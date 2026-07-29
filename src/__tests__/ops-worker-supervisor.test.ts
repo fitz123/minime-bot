@@ -37,6 +37,7 @@ import {
   type OpsWorkerTaskStoreFaultPoint,
 } from "../ops-worker/task-store.js";
 import {
+  getOpsWorkerReportReconciliationOperation,
   OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
   OpsWorkerSupervisorAlreadyRunningError,
@@ -48,6 +49,7 @@ import {
   createEmptyOpsWorkerLifecycleManifest,
   createEmptyOpsWorkerMutationReceipts,
   createUnclaimedOpsWorkerCustody,
+  hashOpsWorkerReportPayload,
   withOpsWorkerSubmissionFingerprint,
   type JsonObject,
   type OpsWorkerSourceKind,
@@ -632,6 +634,46 @@ describe("ops worker supervisor", () => {
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-operator");
     harness.setNow(LATER);
     assert.equal(harness.supervisor.selectNextTask()?.task.id, "task-later");
+  });
+
+  it("blocks a process-free reconciliation-marked task before scheduling it", async (t) => {
+    const harness = await makeHarness(t);
+    const fenced = makeTask("task-report-fence");
+    const legacyIntent = { legacyReportPayload: "incompatible" };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    fenced.state = "RESUMABLE";
+    fenced.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    fenced.report = {
+      state: "PENDING",
+      attempts: 0,
+      lastError: "Claimed report receipt requires external-outcome reconciliation",
+    };
+    fenced.mutationReceipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ state: "PENDING" }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    harness.store.create(fenced);
+    harness.store.create(makeTask("task-unrelated-after-fence"));
+
+    assert.equal(
+      harness.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-fence",
+    );
+    const isolated = harness.store.get(fenced.id);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.schedule.nextRunAt, null);
+    assert.equal(isolated?.schedule.nextCheckAt, null);
   });
 
   it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
@@ -1737,7 +1779,7 @@ describe("ops worker supervisor", () => {
       faultInjector: (point) => {
         if (!armed || point !== "after-snapshot-rename") return;
         renamedSnapshots += 1;
-        if (renamedSnapshots === 4) {
+        if (renamedSnapshots === 5) {
           throw new Error("Synthetic crash after atomic report snapshot rename");
         }
       },
@@ -1751,7 +1793,7 @@ describe("ops worker supervisor", () => {
       harness.supervisor.recordReportAttempt("task-report-crash", async () => ({ sent: true })),
       /Synthetic crash after atomic report snapshot rename/,
     );
-    assert.equal(renamedSnapshots, 4);
+    assert.equal(renamedSnapshots, 5);
     const persisted = harness.store.get("task-report-crash");
     assert.equal(persisted?.report.state, "SENT");
     assert.equal(persisted?.report.attempts, 1);
@@ -1823,6 +1865,200 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.mutationReceipts.report?.operationId, receipts.report
       && (receipts.report as { operationId: string }).operationId);
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("retains a schema-v5 report intent across startup state reconciliation", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-v5-report-fence-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-fence-first",
+    });
+    first.store.create(makeTask("task-v5-report-fence"));
+    const running = first.supervisor.markRunning(
+      "task-v5-report-fence",
+      activeRun("v5-report-fence-first"),
+    );
+    const legacyOutcomeSummary = '\u0001"\\'
+      .repeat(Math.floor(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 3))
+      .padEnd(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes, "\u0001");
+    assert.equal(
+      Buffer.byteLength(legacyOutcomeSummary, "utf8"),
+      OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+    );
+    const legacyOutcome = {
+      at: NOW,
+      kind: "PI_EXIT" as const,
+      result: "ERROR" as const,
+      summary: legacyOutcomeSummary,
+    };
+    const legacyIntent = {
+      reportIdentity: hashOpsWorkerCanonicalPayload({
+        taskId: running.id,
+        deliveryKey: running.source.deliveryKey,
+        createdAt: running.createdAt,
+      }),
+      taskState: running.state,
+      lastOutcome: legacyOutcome,
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    const operationId = `report:${intentHash.slice("sha256:".length, 31)}`;
+    const snapshotPath = join(first.store.tasksDirectory, `${running.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.schemaVersion = 5;
+    delete snapshot.agentResult;
+    snapshot.report = {
+      state: "PENDING",
+      attempts: 0,
+      lastError: null,
+    };
+    snapshot.lastOutcome = legacyOutcome;
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload(snapshot.report),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-fence-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "The legacy report process is proven gone.",
+      }),
+    });
+    const isolated = restarted.store.get(running.id);
+    assert.equal(isolated?.schemaVersion, 6);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    const operation = getOpsWorkerReportReconciliationOperation(isolated!);
+    assert.deepEqual(operation, {
+      boundary: "report",
+      operationId,
+      intent: legacyIntent,
+    });
+
+    restarted.setNow(LATER);
+    const lifecycle = new OpsWorkerLifecycle(restarted.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.beginMutationReceipt(running.id, {
+      ...operation!,
+      queryObservedAt: LATER,
+      queryResult: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt(running.id, {
+      ...operation!,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    const retried = restarted.supervisor.retryBlockedTask(running.id);
+    assert.equal(retried.state, "RESUMABLE");
+    assert.equal(retried.report.state, "NONE");
+    assert.equal(retried.report.lastError, null);
+    assert.equal(
+      retried.mutationReceipts.report?.outcome?.result,
+      "ALREADY_APPLIED",
+    );
+  });
+
+  it("recovers terminal report fences after fixed receipt outcomes", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-terminal-report-fence-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-first",
+    });
+    const operations = new Map<string, {
+      boundary: "report";
+      operationId: string;
+      intent: unknown;
+    }>();
+    for (const taskId of ["task-terminal-applied", "task-terminal-not-needed"]) {
+      first.store.create(makeTask(taskId));
+      await first.supervisor.requestDoneCheck(taskId);
+      await first.supervisor.runDoneCheck(taskId);
+      const intent = { legacyTerminalReport: taskId };
+      const intentHash = hashOpsWorkerCanonicalPayload(intent);
+      const operation = {
+        boundary: "report" as const,
+        operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+        intent,
+      };
+      operations.set(taskId, operation);
+      const snapshotPath = join(first.store.tasksDirectory, `${taskId}.json`);
+      const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as OpsWorkerTask;
+      snapshot.mutationReceipts.report = {
+        boundary: "report",
+        operationId: operation.operationId,
+        intentHash,
+        queryObservedAt: NOW,
+        queryResultHash: hashOpsWorkerCanonicalPayload({ state: "PENDING" }),
+        mutationStartedAt: NOW,
+        outcome: null,
+        replayHistory: [],
+      };
+      writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+    }
+    first.close();
+
+    const isolated = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-isolated",
+    });
+    for (const taskId of operations.keys()) {
+      assert.equal(isolated.store.get(taskId)?.state, "DONE");
+      assert.match(
+        isolated.store.get(taskId)?.report.lastError ?? "",
+        /external-outcome reconciliation/,
+      );
+    }
+    const lifecycle = new OpsWorkerLifecycle(isolated.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.finishMutationReceipt("task-terminal-applied", {
+      ...operations.get("task-terminal-applied")!,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt("task-terminal-not-needed", {
+      ...operations.get("task-terminal-not-needed")!,
+      result: "NOT_NEEDED",
+      evidence: { delivered: false },
+    });
+    isolated.close();
+
+    const recovered = await makeHarness(t, {
+      directory,
+      instanceId: "terminal-report-fence-recovered",
+    });
+    const applied = recovered.store.get("task-terminal-applied");
+    assert.equal(applied?.report.state, "SENT");
+    assert.equal(applied?.report.lastError, null);
+    const pending = recovered.store.get("task-terminal-not-needed");
+    assert.equal(pending?.report.state, "PENDING");
+    assert.equal(pending?.report.lastError, null);
+    let attempts = 0;
+    const sent = await recovered.supervisor.recordReportAttempt(
+      "task-terminal-not-needed",
+      async () => {
+        attempts += 1;
+        return { sent: true };
+      },
+    );
+    assert.equal(attempts, 1);
+    assert.equal(sent.report.state, "SENT");
   });
 
   it("records a report receipt for a maximum-sized valid typed result", async (t) => {
@@ -3240,6 +3476,209 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.report.attempts, 2);
     assert.equal(sent.report.lastError, null);
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
+  });
+
+  it("isolates a stale claimed report receipt across startup until fixed receipt recovery", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-report-isolation-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-first",
+    });
+    first.store.create(makeTask("task-report-isolation"));
+    first.supervisor.markRunning(
+      "task-report-isolation",
+      activeRun("report-isolation-first"),
+    );
+    first.close();
+
+    const ambiguous = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-ambiguous",
+      reconcileActiveRun: () => ({
+        status: "AMBIGUOUS",
+        summary: "Fixture process ownership remains ambiguous.",
+      }),
+    });
+    const attempted = await ambiguous.supervisor.recordReportAttempt(
+      "task-report-isolation",
+      async () => ({
+        sent: false,
+        error: "Synthetic report result is externally ambiguous.",
+      }),
+    );
+    const ambiguousReceipt = structuredClone(attempted.mutationReceipts.report);
+    assert.ok(ambiguousReceipt?.mutationStartedAt);
+    assert.equal(ambiguousReceipt.outcome, null);
+    ambiguous.close();
+
+    const reconciled = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-reconciled",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "Fixture process group is proven gone.",
+      }),
+    });
+    const isolated = reconciled.store.get("task-report-isolation");
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.custody.status, "RELEASED");
+    assert.equal(isolated?.custody.releaseReason, "BLOCKED");
+    assert.equal(isolated?.activeRun, null);
+    assert.equal(isolated?.schedule.nextRunAt, null);
+    assert.equal(isolated?.schedule.nextCheckAt, null);
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    assert.deepEqual(isolated?.mutationReceipts.report, ambiguousReceipt);
+    assert.throws(
+      () => reconciled.supervisor.retryBlockedTask("task-report-isolation"),
+      /claimed report receipt still requires reconciliation/,
+    );
+    reconciled.close();
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "report-isolation-restarted",
+    });
+    assert.deepEqual(
+      restarted.store.get("task-report-isolation")?.mutationReceipts.report,
+      ambiguousReceipt,
+    );
+    restarted.store.create(makeTask("task-unrelated-after-report-isolation"));
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-report-isolation",
+    );
+    const operation = getOpsWorkerReportReconciliationOperation(
+      restarted.store.get("task-report-isolation")!,
+    );
+    assert.ok(operation);
+    assert.equal(operation.operationId, ambiguousReceipt?.operationId);
+    assert.equal(
+      hashOpsWorkerCanonicalPayload(operation.intent),
+      ambiguousReceipt?.intentHash,
+    );
+
+    const lifecycle = new OpsWorkerLifecycle(restarted.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.beginMutationReceipt("task-report-isolation", {
+      ...operation,
+      queryObservedAt: LATER,
+      queryResult: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt("task-report-isolation", {
+      ...operation,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    let unexpectedReportAttempts = 0;
+    const stillIsolated = await restarted.supervisor.recordReportAttempt(
+      "task-report-isolation",
+      async () => {
+        unexpectedReportAttempts += 1;
+        return { sent: true };
+      },
+    );
+    assert.equal(unexpectedReportAttempts, 0);
+    assert.match(
+      stillIsolated.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-unrelated-after-report-isolation",
+    );
+    const retried = restarted.supervisor.retryBlockedTask("task-report-isolation");
+    assert.equal(retried.state, "RESUMABLE");
+    assert.equal(retried.report.state, "NONE");
+    assert.equal(retried.report.lastError, null);
+    assert.equal(
+      retried.mutationReceipts.report?.outcome?.result,
+      "ALREADY_APPLIED",
+    );
+  });
+
+  it("identifies a pre-marker stale report receipt whose exact intent is unavailable", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-markerless-report-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "markerless-report-first",
+    });
+    first.store.create(makeTask("task-markerless-report"));
+    const running = first.supervisor.markRunning(
+      "task-markerless-report",
+      activeRun("markerless-report-first"),
+    );
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: running.id,
+      deliveryKey: running.source.deliveryKey,
+      createdAt: running.createdAt,
+    });
+    const oldIntent = {
+      reportIdentity,
+      reportPayloadHash: hashOpsWorkerReportPayload(running),
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(oldIntent);
+    const snapshotPath = join(first.store.tasksDirectory, `${running.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.state = "RESUMABLE";
+    snapshot.activeRun = null;
+    snapshot.lastOutcome = {
+      at: LATER,
+      kind: "RECONCILIATION",
+      result: "CRASH",
+      summary: "A previous worker already evolved the task before retaining its report intent.",
+    };
+    snapshot.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Previous report delivery remained externally ambiguous.",
+    };
+    snapshot.updatedAt = LATER;
+    const lifecycle = snapshot.lifecycle as Record<string, unknown>;
+    lifecycle.report = reportIdentity;
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({
+        state: "PENDING",
+        attempts: 0,
+        lastError: null,
+      }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "markerless-report-restarted",
+    });
+    const isolated = restarted.store.get(running.id);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.custody.status, "RELEASED");
+    assert.equal(
+      getOpsWorkerReportReconciliationOperation(isolated!),
+      undefined,
+    );
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /exact package intent was not retained/,
+    );
+    restarted.store.create(makeTask("task-after-markerless-report"));
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-after-markerless-report",
+    );
   });
 
   it("reconciles a durable unverified-launch fence after the process and group are gone", async (t) => {

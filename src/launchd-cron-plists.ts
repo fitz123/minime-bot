@@ -35,6 +35,12 @@ import {
   type CronPlistDef,
 } from "./cron-plist.js";
 import {
+  CRON_HEALTH_TEXTFILE_DIR_ENV,
+  DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
+  resolveCronHealthMetricArtifacts,
+  resolveCronHealthTextfileDir,
+} from "./cron-outbox.js";
+import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
@@ -64,6 +70,11 @@ export interface CalendarInterval {
   Weekday?: number;
 }
 
+interface LaunchdCronPlistMetadata {
+  label: string;
+  cronHealthTextfileDir?: string;
+}
+
 export interface LaunchdCronContext {
   contract: ResolvedWorkspaceContract;
   launchAgentsDir: string;
@@ -75,6 +86,7 @@ export interface LaunchdCronContext {
   launchdDomain: string;
   launchctlBin: string;
   plutilBin: string;
+  cronHealthTextfileDir: string;
   env: NodeJS.ProcessEnv;
   cwd: string;
 }
@@ -114,6 +126,9 @@ export interface LaunchdCronPlanItem {
   reason?: "active" | "disabled" | "stale";
   deferredReason?: "active" | "unknown";
   scheduleSummary?: string;
+  metricRetirement?:
+    | { status: "planned" }
+    | { status: "applied"; removedArtifactCount: number };
 }
 
 export interface LaunchdCommandResult {
@@ -207,7 +222,10 @@ export function isOwnedCronLaunchdLabel(label: string): boolean {
 
 export function renderLaunchdCronPlist(
   cron: CronPlistDef,
-  context: Pick<LaunchdCronContext, "runCronScript" | "logDir" | "homeDir" | "contract" | "env">,
+  context: Pick<
+    LaunchdCronContext,
+    "runCronScript" | "logDir" | "homeDir" | "contract" | "cronHealthTextfileDir" | "env"
+  >,
 ): string {
   const label = cronLaunchdLabel(cron.name);
   const intervals = parseCronToCalendarIntervals(cron.schedule);
@@ -367,7 +385,7 @@ export function planLaunchdCronSync(
   }
 
   if (prune && existsSync(generated.context.launchAgentsDir)) {
-    for (const [label, plistPath] of listOwnedCronPlists(generated.context.launchAgentsDir)) {
+    for (const [label, plistPath] of listOwnedCronPlists(generated.context)) {
       if (desiredByLabel.has(label)) {
         continue;
       }
@@ -376,6 +394,9 @@ export function planLaunchdCronSync(
         label,
         plistPath,
         reason: generated.disabledLabels.has(label) ? "disabled" : "stale",
+        metricRetirement: {
+          status: "planned",
+        },
       });
     }
   }
@@ -415,7 +436,27 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       continue;
     }
     if (item.action === "delete") {
+      const metadata = readLaunchdCronPlistMetadata(
+        planned.context.plutilBin,
+        item.plistPath,
+      );
+      if (
+        metadata === undefined
+        || metadata.label !== item.label
+        || !isOwnedCronLaunchdLabel(metadata.label)
+      ) {
+        throw new Error("persisted cron plist ownership changed before retirement");
+      }
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
+      const removedArtifactCount = retireCronHealthMetricArtifacts(
+        cronNameFromLaunchdLabel(item.label),
+        metadata.cronHealthTextfileDir
+          ?? DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
+      );
+      item.metricRetirement = {
+        status: "applied",
+        removedArtifactCount,
+      };
       if (existsSync(item.plistPath)) {
         unlinkSync(item.plistPath);
       }
@@ -465,12 +506,25 @@ export function formatLaunchdCronSyncResult(result: SyncLaunchdCronsResult): str
   for (const item of result.items) {
     if (item.deferredReason === "active") {
       lines.push(`${prefix}deferred ${item.label} (active job running)`);
+      if (item.metricRetirement !== undefined) {
+        lines.push(`${prefix}terminal metric retirement pending ${item.label}`);
+      }
     } else if (item.deferredReason === "unknown") {
       lines.push(`${prefix}deferred ${item.label} (activity unknown)`);
+      if (item.metricRetirement !== undefined) {
+        lines.push(`${prefix}terminal metric retirement pending ${item.label}`);
+      }
     } else if (item.action === "unchanged") {
       lines.push(`${prefix}unchanged ${item.label} ${item.scheduleSummary ?? ""}`.trimEnd());
     } else if (item.action === "delete") {
       lines.push(`${prefix}delete ${item.label} (${item.reason ?? "stale"})`);
+      if (item.metricRetirement?.status === "applied") {
+        lines.push(
+          `${prefix}retired terminal metrics ${item.label} (${item.metricRetirement.removedArtifactCount} artifacts removed)`,
+        );
+      } else {
+        lines.push(`${prefix}retire terminal metrics ${item.label} (planned)`);
+      }
     } else {
       lines.push(`${prefix}${item.action} ${item.label} ${item.scheduleSummary ?? ""}`.trimEnd());
       lines.push(`${prefix}rebootstrap ${item.label}`);
@@ -500,6 +554,10 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
   const uid = options.uid ?? resolveUid();
   const launchctlBin = env.LAUNCHCTL_BIN?.trim() || DEFAULT_LAUNCHCTL_BIN;
   const plutilBin = env.PLUTIL_BIN?.trim() || DEFAULT_PLUTIL_BIN;
+  const cronHealthTextfileDir = resolveCliPath(
+    resolveCronHealthTextfileDir(env),
+    cwd,
+  );
   const runCronScript = options.runCronScript === undefined
     ? resolve(contract.paths.packageRoot, "scripts", "run-cron.sh")
     : validateExplicitRunCronScript(options.runCronScript);
@@ -514,6 +572,7 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
     launchdDomain: `gui/${uid}`,
     launchctlBin,
     plutilBin,
+    cronHealthTextfileDir,
     env,
     cwd,
   };
@@ -959,18 +1018,20 @@ function runCommand(
   return true;
 }
 
-function listOwnedCronPlists(launchAgentsDir: string): Map<string, string> {
+function listOwnedCronPlists(
+  context: Pick<LaunchdCronContext, "launchAgentsDir" | "plutilBin">,
+): Map<string, string> {
   const found = new Map<string, string>();
-  for (const entry of readdirSync(launchAgentsDir, { withFileTypes: true })) {
+  for (const entry of readdirSync(context.launchAgentsDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".plist")) {
       continue;
     }
-    const plistPath = resolve(launchAgentsDir, entry.name);
-    const label = readLaunchdPlistLabel(plistPath);
-    if (!isOwnedCronLaunchdLabel(label)) {
+    const plistPath = resolve(context.launchAgentsDir, entry.name);
+    const metadata = readLaunchdCronPlistMetadata(context.plutilBin, plistPath);
+    if (metadata === undefined || !isOwnedCronLaunchdLabel(metadata.label)) {
       continue;
     }
-    found.set(label, plistPath);
+    found.set(metadata.label, plistPath);
   }
   return found;
 }
@@ -1007,7 +1068,10 @@ function restorePreviousPlist(plistPath: string, previousContent: string | undef
 }
 
 function renderExplicitEnvEntries(
-  context: Pick<LaunchdCronContext, "contract" | "env">,
+  context: Pick<
+    LaunchdCronContext,
+    "contract" | "cronHealthTextfileDir" | "env"
+  >,
 ): string {
   const entries: string[] = [];
   const { contract, env } = context;
@@ -1021,6 +1085,12 @@ function renderExplicitEnvEntries(
   if (nodeRuntimeRoot?.trim()) {
     entries.push(renderEnvEntry(MINIME_NODE_RUNTIME_ROOT_ENV, nodeRuntimeRoot));
   }
+  entries.push(
+    renderEnvEntry(
+      CRON_HEALTH_TEXTFILE_DIR_ENV,
+      context.cronHealthTextfileDir,
+    ),
+  );
   return entries.join("");
 }
 
@@ -1034,14 +1104,73 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function readLaunchdPlistLabel(plistPath: string): string {
-  try {
-    const content = readFileSync(plistPath, "utf8");
-    const match = content.match(/<key>\s*Label\s*<\/key>\s*<string>([^<]+)<\/string>/);
-    return match ? xmlUnescape(match[1]) : "";
-  } catch {
-    return "";
+function cronNameFromLaunchdLabel(label: string): string {
+  if (!isOwnedCronLaunchdLabel(label)) {
+    throw new Error("internal error: cannot retire metrics for an unowned cron label");
   }
+  return label.slice(CRON_LAUNCHD_LABEL_PREFIX.length);
+}
+
+function retireCronHealthMetricArtifacts(
+  cronName: string,
+  textfileDir: string,
+): number {
+  const artifacts = resolveCronHealthMetricArtifacts(cronName, textfileDir);
+  let removed = 0;
+  for (const [kind, path] of [
+    ["exit", artifacts.exitFilePath],
+    ["success", artifacts.successFilePath],
+  ] as const) {
+    try {
+      unlinkSync(path);
+      removed += 1;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        continue;
+      }
+      const code = (err as NodeJS.ErrnoException).code;
+      throw new Error(
+        `failed to retire ${kind} cron health metric for "${cronName}"${code ? `: ${code}` : ""}`,
+      );
+    }
+  }
+  return removed;
+}
+
+function readLaunchdCronPlistMetadata(
+  plutilBin: string,
+  plistPath: string,
+): LaunchdCronPlistMetadata | undefined {
+  const parsed = parsePlistJson(plutilBin, plistPath);
+  if (!parsed.ok || !isPlainRecord(parsed.value)) return undefined;
+  const label = parsed.value.Label;
+  if (typeof label !== "string") return undefined;
+  if (!isOwnedCronLaunchdLabel(label)) return { label };
+
+  const environment = parsed.value.EnvironmentVariables;
+  if (environment === undefined) return { label };
+  if (!isPlainRecord(environment)) {
+    throw new Error("persisted cron plist has unsafe environment variables");
+  }
+  const selectedDir = environment[CRON_HEALTH_TEXTFILE_DIR_ENV];
+  if (selectedDir === undefined) return { label };
+  if (
+    typeof selectedDir !== "string"
+    || selectedDir.trim() !== selectedDir
+    || !isAbsolute(selectedDir)
+    || normalize(selectedDir) !== selectedDir
+  ) {
+    throw new Error("persisted cron health metric directory is unsafe");
+  }
+  return { label, cronHealthTextfileDir: selectedDir };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function isIgnorableBootoutFailure(args: readonly string[], result: LaunchdCommandResult): boolean {
@@ -1050,15 +1179,6 @@ function isIgnorableBootoutFailure(args: readonly string[], result: LaunchdComma
   }
   const message = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
   return /not loaded|no such process|could not find service|service .*not found|no such file/i.test(message);
-}
-
-function xmlUnescape(value: string): string {
-  return value
-    .replaceAll("&apos;", "'")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&gt;", ">")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&amp;", "&");
 }
 
 function countPlanItems(items: readonly LaunchdCronPlanItem[]): Record<LaunchdCronPlanAction, number> {

@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -164,6 +165,13 @@ function writeRunner(directory: string): string {
   writeFileSync(runner, "#!/bin/sh\nexit 0\n", "utf8");
   chmodSync(runner, 0o700);
   return realpathSync(runner);
+}
+
+function writeFixturePlutil(root: string): string {
+  const plutil = join(root, "fixture-plutil");
+  copyFileSync(new URL("./fixtures/plutil-convert.py", import.meta.url), plutil);
+  chmodSync(plutil, 0o700);
+  return plutil;
 }
 
 function shellQuote(value: string): string {
@@ -407,11 +415,12 @@ describe("minime-bot CLI", () => {
     mkdirSync(launchAgentsDir, { recursive: true });
     const stalePath = join(launchAgentsDir, "ai.minime.cron.old.plist");
     writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.old</string></dict></plist>\n", "utf8");
+    const plutil = writeFixturePlutil(workspace);
     try {
       const result = runWithCapture(
         ["launchd", "crons", "sync", "--workspace", workspace, "--launch-agents-dir", launchAgentsDir],
         workspace,
-        { HOME: home, LOG_DIR: join(workspace, "logs"), UID: "501" },
+        { HOME: home, LOG_DIR: join(workspace, "logs"), UID: "501", PLUTIL_BIN: plutil },
         { launchdCommandRunner: captureRunner(calls), launchdHomeDir: home, launchdUid: 501 },
       );
 

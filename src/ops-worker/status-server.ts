@@ -23,6 +23,7 @@ import {
   type PiPrimaryResourceContract,
 } from "../pi-primary-resources.js";
 import {
+  isOpsWorkerReportReconciliationBlocked,
   isOpsWorkerUnresolvedOrphan,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -46,6 +47,7 @@ export interface OpsWorkerTaskSummary {
   schemaVersion: typeof OPS_WORKER_TASK_SCHEMA_VERSION;
   totalTasks: number;
   activeProcessGroups: number;
+  reportReconciliationBlocked: number;
   custodyOwner: { id: string; state: OpsWorkerTaskState } | null;
   states: Record<OpsWorkerTaskState, number>;
 }
@@ -354,6 +356,9 @@ export function summarizeOpsWorkerTasks(
     totalTasks: tasks.length,
     activeProcessGroups: tasks.filter((task) =>
       task.state === "RUNNING" || isOpsWorkerUnresolvedOrphan(task)).length,
+    reportReconciliationBlocked: tasks.filter(
+      isOpsWorkerReportReconciliationBlocked,
+    ).length,
     custodyOwner: custodyOwners[0]
       ? { id: custodyOwners[0].id, state: custodyOwners[0].state }
       : null,

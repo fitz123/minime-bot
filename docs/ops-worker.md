@@ -606,6 +606,26 @@ closed on conflicting reuse. The `--payload`, `--intent`, `--query-result`, and
 `--evidence` values are bounded canonical JSON and are retained only as hashes;
 callers must retain any raw external observation they will need later. Operator
 retry also fails closed while a claimed report receipt remains unfinished.
+If a claimed report receipt no longer matches the current report payload, the
+supervisor isolates that process-free task as `BLOCKED`, releases its custody,
+and uses a bounded protected marker written before the package claims report
+delivery, without changing the receipt or guessing the external outcome. The
+marker retains the exact package-made operation id and intent needed by the
+fixed receipt controls; current intents contain hashes, while a migrated
+schema-v5 intent may also contain the same bounded task state and outcome
+summary already present in that legacy snapshot. `worker inspect --json` and
+the dedicated `/task` control show that fixed-receipt input so recovery does not
+depend on pre-crash process memory. When the bounded task summary exceeds one
+Telegram reply, `/task <id> [page]` returns numbered pages without truncating
+the retained operation.
+
+A historical claimed receipt may already have become incompatible before a
+marker-capable package retained its intent. Its hash preimage cannot be
+reconstructed truthfully. The task and `/task` control identify that intent as
+unavailable; recovery then requires the exact intent retained by the external
+operator, or an explicit `cancel`. Automatic reporting and scheduling skip
+either kind of isolated task until fixed receipt reconciliation followed by
+`retry`, or cancellation, resolves the episode.
 Snapshots keep non-evicting replay fingerprints for up to 128 displaced
 checkpoints and 32 displaced completed operations per receipt boundary. A new
 identity fails closed when its ledger is full; old identities are never
@@ -623,8 +643,9 @@ are accepted bind addresses. The surface is read-only unless an explicit
 route:
 
 - `GET /healthz` returns process health.
-- `GET /status` returns bounded task-state counts and the number of active
-  process groups. It exposes at most one custody owner as task id and state. Its
+- `GET /status` returns bounded task-state counts, the number of active
+  process groups, and the count of tasks isolated for report-receipt
+  reconciliation. It exposes at most one custody owner as task id and state. Its
   `policy` section contains only authorization/composite contract hashes and
   counts, current typed quota metadata/evidence hash, and primary resource
   digests for parity. It never includes objectives, canonical task bodies,
@@ -643,9 +664,10 @@ local task store.
 Ops intake does not replace the Node-independent native webhook. Optional
 forward-first bridge mode in `scripts/alertmanager_webhook.py` verifies the
 current exact routed group and receiver through Alertmanager's grouped API,
-then forwards the original bounded body to this route while retaining native
-fallback and critical escalation. With bridge configuration unset, the webhook
-and `scripts/monitoring_native.py` retain native-only behavior. See
+then forwards the original bounded body to this route. Noncritical source-query
+or Ops-intake failures stay quiet and retryable; critical groups retain
+independent native Telegram delivery. With bridge configuration unset, the
+webhook and `scripts/monitoring_native.py` retain native-only behavior. See
 `docs/monitoring.md` for the sink and rollback contract.
 
 The route accepts only a strictly bounded Alertmanager v4 JSON webhook and a

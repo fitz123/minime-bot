@@ -44,6 +44,7 @@ import type {
 import {
   clearCronOutboxRecord,
   readCronOutboxRecord,
+  resolveCronHealthMetricArtifacts,
   sanitizeCronMetricStem,
   writeCronOutboxRecord,
   type CronOutboxRecord,
@@ -1399,7 +1400,12 @@ bindings: []
       writeCronHealthMetric("Daily Pi / Main!", 0, "success");
 
       const files = readdirSync(METRIC_DIR).filter((name) => name.endsWith(".prom")).sort();
+      const artifacts = resolveCronHealthMetricArtifacts("Daily Pi / Main!", METRIC_DIR);
       assert.strictEqual(files.length, 2);
+      assert.deepStrictEqual(
+        files,
+        [artifacts.exitFileName, artifacts.successFileName].sort(),
+      );
       assert.ok(files.some((name) => /^minime_cron_Daily_Pi_Main_[a-f0-9]{12}\.success\.prom$/.test(name)), files.join(","));
       assert.ok(files.some((name) => /^minime_cron_Daily_Pi_Main_[a-f0-9]{12}\.exit\.prom$/.test(name)), files.join(","));
       const content = files.map((name) => readFileSync(join(METRIC_DIR, name), "utf8")).join("\n");

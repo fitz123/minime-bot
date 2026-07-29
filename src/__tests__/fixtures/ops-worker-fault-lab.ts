@@ -1,5 +1,21 @@
 import assert from "node:assert/strict";
+import {
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import {
+  createServer as createHttpServer,
+  type RequestListener,
+} from "node:http";
 import type { CodexQuotaSnapshot } from "../../pi-extensions/codex-usage.js";
+import {
+  syncLaunchdCrons,
+  type LaunchdCommandRunner,
+} from "../../launchd-cron-plists.js";
+import {
+  CRON_HEALTH_TEXTFILE_DIR_ENV,
+  resolveCronHealthMetricArtifacts,
+} from "../../cron-outbox.js";
 import { assemblePiContext } from "../../pi-context-assembler.js";
 import {
   PI_BUILTIN_TOOL_NAMES,
@@ -73,6 +89,9 @@ import {
   type OpsWorkerTaskContractRegistry,
 } from "../../ops-worker/types.js";
 import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -93,6 +112,10 @@ const SOURCE_IDENTITY = "lab-alertmanager";
 const CONTENT_TYPE = "application/json; charset=utf-8";
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const FAKE_PI_PROCESS = fileURLToPath(new URL("./fake-pi-process.mjs", import.meta.url));
+const PYTHON = process.env.PYTHON ?? "/usr/bin/python3";
+const ALERTMANAGER_WEBHOOK = join(PACKAGE_ROOT, "scripts", "alertmanager_webhook.py");
+const BRIDGE_TELEGRAM_TOKEN = "FAULT_LAB_TELEGRAM_TOKEN";
+const BRIDGE_OPS_BEARER = "FAULT_LAB_OPS_BEARER";
 
 export const OPS_WORKER_FAULT_LAB_SCENARIO_NAMES = [
   "schema-mismatch-false-terminal",
@@ -115,6 +138,7 @@ export const OPS_WORKER_FAULT_LAB_SCENARIO_NAMES = [
   "intake-duplicate-delivery-replay",
   "monitoring-silence-not-health",
   "report-crash-before-receipt-finish",
+  "complete-ops-alert-recovery-chain",
 ] as const;
 
 export type OpsWorkerFaultLabScenarioName =
@@ -496,7 +520,10 @@ async function runAvailability(readings: AvailabilityReadings) {
   );
 }
 
-function availabilityContracts() {
+function availabilityContracts(
+  clock: () => Date = () => new Date(NOW),
+  incidentServiceMode: () => "unavailable" | "healthy" = () => "healthy",
+) {
   return createOpsTaskContracts({
     alertmanagerAuthorizationSnapshotReader: {
       read: () => ({
@@ -507,26 +534,53 @@ function availabilityContracts() {
         profile: OPS_HOST_AVAILABILITY_AUTHORIZATION_PROFILE,
       }),
     },
-    clock: () => new Date(NOW),
+    clock,
     incidentMonitoringReader: {
-      readMonitoringFreshness: () => ({ observedAt: NOW, latestSampleAt: NOW }),
-      readResolutionStability: () => ({
-        observedAt: NOW,
-        latestMatchingSampleAt: null,
-        monitoringWindowStartedAt: "2026-07-19T11:55:00.000Z",
-      }),
+      readMonitoringFreshness: () => {
+        const observedAt = clock().toISOString();
+        return { observedAt, latestSampleAt: observedAt };
+      },
+      readResolutionStability: () => {
+        const observedAt = clock().toISOString();
+        return {
+          observedAt,
+          latestMatchingSampleAt: incidentServiceMode() === "unavailable"
+            ? observedAt
+            : null,
+          monitoringWindowStartedAt: new Date(
+            Date.parse(observedAt) - 5 * 60 * 1_000,
+          ).toISOString(),
+        };
+      },
     },
     incidentAlertmanagerReader: {
-      readExactGroupState: () => ({ observedAt: NOW, status: "ABSENT" }),
+      readExactGroupState: () => ({
+        observedAt: clock().toISOString(),
+        status: incidentServiceMode() === "unavailable"
+          ? "PRESENT"
+          : "ABSENT",
+      }),
     },
     monitoringFreshnessReader: {
-      readMonitoringFreshness: () => healthyReadings().monitoring as OpsMonitoringFreshnessReading,
+      readMonitoringFreshness: () => {
+        const observedAt = clock().toISOString();
+        return { observedAt, latestSampleAt: observedAt };
+      },
     },
     alertStateReader: {
-      read: () => healthyReadings().alerts as OpsAlertStateReading,
+      read: () => ({ observedAt: clock().toISOString(), status: "RESOLVED" }),
     },
     serviceAvailabilityReader: {
-      readServiceAvailability: () => healthyReadings().service as OpsServiceAvailabilityReading,
+      readServiceAvailability: () => {
+        const observedAt = clock().toISOString();
+        return {
+          observedAt,
+          status: "HEALTHY",
+          healthySince: new Date(
+            Date.parse(observedAt) - 6 * 60 * 1_000,
+          ).toISOString(),
+        };
+      },
     },
   });
 }
@@ -534,36 +588,48 @@ function availabilityContracts() {
 function alertmanagerWebhook(
   startsAt = "2026-07-19T11:59:00.000Z",
 ): Record<string, unknown> {
+  return alertmanagerGroupWebhook("MinimeBotUnavailable", "warning", startsAt);
+}
+
+function alertmanagerGroupWebhook(
+  alertname: string,
+  severity: "warning" | "critical",
+  startsAt = "2026-07-19T11:59:00.000Z",
+): Record<string, unknown> {
   return {
     receiver: "ops-worker",
     status: "firing",
     alerts: [{
       status: "firing",
-      labels: { alertname: "MinimeBotUnavailable", instance: "local" },
+      labels: { alertname, severity, instance: "local" },
       annotations: { summary: "The generic local service is unavailable." },
       startsAt,
       endsAt: "0001-01-01T00:00:00Z",
       generatorURL: "http://127.0.0.1:9090/graph?g0.expr=up",
-      fingerprint: "0123456789abcdef",
+      fingerprint: `fault-lab-${alertname.toLowerCase()}`,
     }],
-    groupLabels: { alertname: "MinimeBotUnavailable" },
-    commonLabels: { alertname: "MinimeBotUnavailable", instance: "local" },
+    groupLabels: { alertname },
+    commonLabels: { alertname, severity, instance: "local" },
     commonAnnotations: { summary: "The generic local service is unavailable." },
     externalURL: "http://127.0.0.1:9093",
     version: "4",
-    groupKey: "{}:{alertname=\"MinimeBotUnavailable\", instance=\"local\"}",
+    groupKey: `{}/{alertname="${alertname}"}`,
     truncatedAlerts: 0,
   };
 }
 
 function createIntake(
   context: ScenarioContext,
+  incidentServiceMode?: () => "unavailable" | "healthy",
 ): {
   intake: OpsWorkerAlertmanagerIntake;
   store: OpsWorkerTaskStore;
   contracts: ReturnType<typeof availabilityContracts>;
 } {
-  const contracts = availabilityContracts();
+  const contracts = availabilityContracts(
+    context.clock.now,
+    incidentServiceMode,
+  );
   const store = new OpsWorkerTaskStore(context.stateDirectory, {
     registry: contracts.taskRegistry,
     now: context.clock.now,
@@ -605,6 +671,7 @@ function quotaSnapshot(
 async function requestLoopback(options: {
   port: number;
   method: string;
+  path?: string;
   headers?: Record<string, string | number>;
   body?: Buffer;
 }): Promise<{ status: number; body: string }> {
@@ -612,7 +679,7 @@ async function requestLoopback(options: {
     const request = nodeHttpRequest({
       host: "127.0.0.1",
       port: options.port,
-      path: "/intake/alertmanager",
+      path: options.path ?? "/intake/alertmanager",
       method: options.method,
       headers: options.headers,
     }, (response) => {
@@ -627,6 +694,76 @@ async function requestLoopback(options: {
     if (options.body) request.write(options.body);
     request.end();
   });
+}
+
+async function startLoopbackServer(
+  context: ScenarioContext,
+  handler: RequestListener,
+): Promise<string> {
+  const server = createHttpServer(handler);
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  context.observe({ kind: "socket-bind", host: "127.0.0.1" });
+  context.defer(() => new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+  }));
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function reserveLoopbackPort(context: ScenarioContext): Promise<number> {
+  const server = createHttpServer((_request, response) => response.end());
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  context.observe({ kind: "socket-bind", host: "127.0.0.1" });
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+  });
+  return address.port;
+}
+
+function waitForWebhookReady(
+  child: ChildProcessWithoutNullStreams,
+): Promise<void> {
+  return new Promise((resolveReady, rejectReady) => {
+    let output = "";
+    const timer = setTimeout(
+      () => rejectReady(new Error(`Alertmanager webhook readiness timed out: ${output}`)),
+      5_000,
+    );
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      output += chunk;
+      if (!output.includes("webhook ready")) return;
+      clearTimeout(timer);
+      resolveReady();
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => {
+      output += chunk;
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      rejectReady(new Error(`Alertmanager webhook exited before ready: ${code}; ${output}`));
+    });
+  });
+}
+
+async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 }
 
 async function createPiRunnerFixture(context: ScenarioContext): Promise<{
@@ -1290,6 +1427,553 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       assert.ok(
         Date.parse(sent?.mutationReceipts.report?.queryObservedAt ?? "")
           > Date.parse(claimed.queryObservedAt),
+      );
+    },
+  },
+  {
+    name: "complete-ops-alert-recovery-chain",
+    summary: "The complete warning, Ops recovery, verified result, and cron-retirement chain stays truthful.",
+    async run(context) {
+      const repairStatePath = join(context.root, "bounded-repair-state.json");
+      writeFileSync(
+        repairStatePath,
+        `${JSON.stringify({ serviceMode: "unavailable" })}\n`,
+        { mode: 0o600 },
+      );
+      const readIncidentServiceMode = (): "unavailable" | "healthy" => {
+        const state = JSON.parse(readFileSync(repairStatePath, "utf8")) as {
+          serviceMode?: unknown;
+        };
+        assert.ok(
+          state.serviceMode === "unavailable"
+          || state.serviceMode === "healthy",
+        );
+        return state.serviceMode;
+      };
+      const created = createIntake(context, readIncidentServiceMode);
+      const createIncidentStore = () => new OpsWorkerTaskStore(context.stateDirectory, {
+        registry: created.contracts.taskRegistry,
+        now: context.clock.now,
+      });
+      const startIncidentSupervisor = async (
+        instanceId: string,
+        reconcileActiveRun?: OpsWorkerSupervisorOptions["reconcileActiveRun"],
+      ): Promise<{ store: OpsWorkerTaskStore; supervisor: OpsWorkerSupervisor }> => {
+        const store = createIncidentStore();
+        const supervisor = new OpsWorkerSupervisor({
+          store,
+          doneChecks: created.contracts.doneChecks,
+          authorizationVerifiers: created.contracts.authorizationVerifiers,
+          instanceId,
+          processStartToken: `${instanceId}-start`,
+          now: context.clock.now,
+          infrastructureRetryMs: 1_000,
+          authorizationQueryRetryMs: 1_000,
+          reconcileActiveRun,
+        });
+        await supervisor.start();
+        context.defer(() => supervisor.close());
+        return { store, supervisor };
+      };
+
+      const ambiguousSubmission = created.intake.submit(
+        Buffer.from(JSON.stringify(
+          alertmanagerGroupWebhook("AmbiguousReportWarning", "warning"),
+        )),
+        CONTENT_TYPE,
+      );
+      assert.ok(ambiguousSubmission.taskId);
+      const ambiguousTaskId = ambiguousSubmission.taskId;
+      const first = await startIncidentSupervisor("complete-chain-first");
+      first.supervisor.markRunning(
+        ambiguousTaskId,
+        activeRun(first.supervisor, "attempt-ambiguous-report"),
+      );
+      first.supervisor.close();
+
+      const ambiguous = await startIncidentSupervisor(
+        "complete-chain-ambiguous",
+        () => ({
+          status: "AMBIGUOUS",
+          summary: "The fixture process group has an unknown external outcome.",
+        }),
+      );
+      const attempted = await ambiguous.supervisor.recordReportAttempt(
+        ambiguousTaskId,
+        async () => ({
+          sent: false,
+          error: "The fixture report delivery has an unknown external outcome.",
+        }),
+      );
+      const ambiguousReceipt = structuredClone(attempted.mutationReceipts.report);
+      assert.ok(ambiguousReceipt?.mutationStartedAt);
+      assert.equal(ambiguousReceipt.outcome, null);
+      ambiguous.supervisor.close();
+
+      const recovered = await startIncidentSupervisor(
+        "complete-chain-recovered",
+        () => ({
+          status: "GONE",
+          summary: "The fixture process group is proven inactive.",
+        }),
+      );
+      const isolated = recovered.store.get(ambiguousTaskId);
+      assert.equal(isolated?.state, "BLOCKED");
+      assert.equal(isolated?.custody.status, "RELEASED");
+      assert.equal(isolated?.activeRun, null);
+      assert.deepEqual(isolated?.mutationReceipts.report, ambiguousReceipt);
+      assert.match(
+        isolated?.report.lastError ?? "",
+        /external-outcome reconciliation/,
+      );
+      assert.throws(
+        () => recovered.supervisor.retryBlockedTask(ambiguousTaskId),
+        /claimed report receipt still requires reconciliation/,
+      );
+
+      const statusServer = await startOpsWorkerStatusServer({
+        supervisor: recovered.supervisor,
+        inspectPolicy: () => inspectOpsWorkerPolicy({
+          authorizationVerifiers: created.contracts.authorizationVerifiers,
+          doneChecks: created.contracts.doneChecks,
+        }),
+        host: "127.0.0.1",
+        port: 0,
+        alertmanagerIntake: {
+          intake: created.intake,
+          bearerTokenProvider: () => BRIDGE_OPS_BEARER,
+        },
+      });
+      context.observe({ kind: "socket-bind", host: "127.0.0.1" });
+      context.defer(() => statusServer.close());
+
+      const health = await requestLoopback({
+        port: statusServer.port,
+        path: "/healthz",
+        method: "GET",
+      });
+      assert.equal(health.status, 200);
+      assert.equal((JSON.parse(health.body) as { ok: boolean }).ok, true);
+      const status = await requestLoopback({
+        port: statusServer.port,
+        path: "/status",
+        method: "GET",
+      });
+      assert.equal(status.status, 200);
+      assert.equal(
+        (JSON.parse(status.body) as { reportReconciliationBlocked: number })
+          .reportReconciliationBlocked,
+        1,
+      );
+
+      const recoveryWarning = alertmanagerGroupWebhook(
+        "RecoveryActionWarning",
+        "warning",
+      );
+      const recoveryBody = Buffer.from(JSON.stringify(recoveryWarning), "utf8");
+      const directlyAccepted = await requestLoopback({
+        port: statusServer.port,
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${BRIDGE_OPS_BEARER}`,
+          "content-type": CONTENT_TYPE,
+          "content-length": recoveryBody.byteLength,
+        },
+        body: recoveryBody,
+      });
+      assert.equal(directlyAccepted.status, 200);
+      const accepted = JSON.parse(directlyAccepted.body) as {
+        taskId: string;
+        replayed: boolean;
+      };
+      assert.equal(accepted.replayed, false);
+      assert.notEqual(accepted.taskId, ambiguousTaskId);
+      assert.deepEqual(
+        recovered.store.get(ambiguousTaskId)?.mutationReceipts.report,
+        ambiguousReceipt,
+      );
+
+      const bridgePayloads = new Map([
+        ["QuietRetryWarningA", alertmanagerGroupWebhook("QuietRetryWarningA", "warning")],
+        ["QuietRetryWarningB", alertmanagerGroupWebhook("QuietRetryWarningB", "warning")],
+        ["IndependentCritical", alertmanagerGroupWebhook("IndependentCritical", "critical")],
+        ["RecoveryActionWarning", recoveryWarning],
+      ]);
+      const sourceQueries = new Map<string, number>();
+      const opsAttempts = new Map<string, number>();
+      const nativeMessages: string[] = [];
+      let opsAvailable = false;
+      let recoveredIntakeResult: {
+        ok?: boolean;
+        taskId?: string;
+        replayed?: boolean;
+      } | undefined;
+      const syntheticBase = await startLoopbackServer(context, (request, response) => {
+        if (
+          request.method === "GET"
+          && request.url?.startsWith("/api/v2/alerts/groups?")
+        ) {
+          const filters = new URL(
+            request.url,
+            "http://127.0.0.1",
+          ).searchParams.getAll("filter");
+          const alertnameFilter = filters.find((value) =>
+            value.startsWith("alertname="));
+          assert.ok(alertnameFilter);
+          const alertname = JSON.parse(
+            alertnameFilter.slice("alertname=".length),
+          ) as string;
+          const payload = bridgePayloads.get(alertname);
+          assert.ok(payload);
+          sourceQueries.set(alertname, (sourceQueries.get(alertname) ?? 0) + 1);
+          const alert = (payload.alerts as Array<Record<string, unknown>>)[0];
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify([{
+            labels: payload.groupLabels,
+            routeLabels: {},
+            receiver: { name: payload.receiver },
+            alerts: [{
+              labels: alert.labels,
+              status: { state: "active" },
+              startsAt: alert.startsAt,
+              fingerprint: alert.fingerprint,
+            }],
+          }]));
+          return;
+        }
+
+        let body = "";
+        request.setEncoding("utf8").on("data", (chunk) => {
+          body += chunk;
+        });
+        request.on("end", () => {
+          void (async () => {
+            if (request.url === "/intake/alertmanager") {
+              const payload = JSON.parse(body) as {
+                alerts: Array<{ labels: { alertname: string } }>;
+              };
+              const alertname = payload.alerts[0].labels.alertname;
+              opsAttempts.set(alertname, (opsAttempts.get(alertname) ?? 0) + 1);
+              response.setHeader("content-type", "application/json");
+              if (!opsAvailable) {
+                response.statusCode = 503;
+                response.end(JSON.stringify({ ok: false }));
+                return;
+              }
+              const forwardedBody = Buffer.from(body, "utf8");
+              const forwarded = await requestLoopback({
+                port: statusServer.port,
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${BRIDGE_OPS_BEARER}`,
+                  "content-type": CONTENT_TYPE,
+                  "content-length": forwardedBody.byteLength,
+                },
+                body: forwardedBody,
+              });
+              response.statusCode = forwarded.status;
+              response.end(forwarded.body);
+              recoveredIntakeResult = JSON.parse(forwarded.body) as {
+                taskId?: string;
+                replayed?: boolean;
+              };
+              return;
+            }
+            if (request.url?.includes("/sendMessage")) {
+              nativeMessages.push(new URLSearchParams(body).get("text") ?? "");
+              response.setHeader("content-type", "application/json");
+              response.end(JSON.stringify({ ok: true, result: {} }));
+              return;
+            }
+            response.statusCode = 404;
+            response.end();
+          })().catch((error: unknown) => {
+            response.statusCode = 500;
+            response.end(JSON.stringify({
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            }));
+          });
+        });
+      });
+
+      const sops = join(context.root, "fault-lab-sops");
+      writeFileSync(
+        sops,
+        `#!/bin/sh\nprintf '%s\\n' '${BRIDGE_OPS_BEARER}'\n`,
+        { mode: 0o700 },
+      );
+      chmodSync(sops, 0o700);
+      const webhookPort = await reserveLoopbackPort(context);
+      const webhook = spawn(
+        PYTHON,
+        [ALERTMANAGER_WEBHOOK, "--port", String(webhookPort)],
+        {
+          cwd: PACKAGE_ROOT,
+          env: {
+            ...process.env,
+            MINIME_TELEGRAM_BOT_TOKEN: BRIDGE_TELEGRAM_TOKEN,
+            MINIME_TELEGRAM_API_BASE: syntheticBase,
+            MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API: "1",
+            MINIME_TELEGRAM_CHAT_ID: "10001",
+            MINIME_OPS_INTAKE_URL: `${syntheticBase}/intake/alertmanager`,
+            MINIME_ALERTMANAGER_URL: syntheticBase,
+            MINIME_OPS_INTAKE_SOPS_FILE: join(context.root, "ops.sops.yaml"),
+            MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+            MINIME_SOPS_EXECUTABLE: sops,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      context.defer(() => stopChild(webhook));
+      await waitForWebhookReady(webhook);
+      const postBridge = (payload: Record<string, unknown>) => {
+        const body = Buffer.from(JSON.stringify(payload), "utf8");
+        return requestLoopback({
+          port: webhookPort,
+          path: "/alertmanager",
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": body.byteLength,
+          },
+          body,
+        });
+      };
+
+      for (const alertname of ["QuietRetryWarningA", "QuietRetryWarningB"]) {
+        const payload = bridgePayloads.get(alertname);
+        assert.ok(payload);
+        assert.equal((await postBridge(payload)).status, 503);
+        assert.equal((await postBridge(payload)).status, 503);
+      }
+      assert.equal(nativeMessages.length, 0);
+      assert.equal(
+        (await postBridge(bridgePayloads.get("IndependentCritical") as Record<string, unknown>))
+          .status,
+        503,
+      );
+      assert.equal(nativeMessages.length, 1);
+      assert.deepEqual(
+        Object.fromEntries(
+          ["QuietRetryWarningA", "QuietRetryWarningB"].map((alertname) => [
+            alertname,
+            opsAttempts.get(alertname),
+          ]),
+        ),
+        { QuietRetryWarningA: 2, QuietRetryWarningB: 2 },
+      );
+
+      opsAvailable = true;
+      assert.equal((await postBridge(recoveryWarning)).status, 200);
+      assert.deepEqual(recoveredIntakeResult, {
+        ok: true,
+        taskId: accepted.taskId,
+        replayed: true,
+      });
+      const quietRecoveryPayload = bridgePayloads.get("QuietRetryWarningA");
+      assert.ok(quietRecoveryPayload);
+      assert.equal((await postBridge(quietRecoveryPayload)).status, 200);
+      const bridgeAccepted = structuredClone(recoveredIntakeResult);
+      assert.equal(bridgeAccepted?.ok, true);
+      assert.equal(bridgeAccepted?.replayed, false);
+      assert.ok(bridgeAccepted?.taskId);
+      const bridgedTaskId = bridgeAccepted.taskId;
+      assert.notEqual(bridgedTaskId, accepted.taskId);
+      assert.notEqual(bridgedTaskId, ambiguousTaskId);
+      assert.equal((await postBridge(quietRecoveryPayload)).status, 200);
+      assert.deepEqual(recoveredIntakeResult, {
+        ok: true,
+        taskId: bridgedTaskId,
+        replayed: false,
+      });
+      assert.equal(opsAttempts.get("QuietRetryWarningA"), 3);
+      assert.equal(nativeMessages.length, 1);
+      assert.deepEqual(
+        Object.fromEntries(sourceQueries),
+        {
+          QuietRetryWarningA: 3,
+          QuietRetryWarningB: 2,
+          IndependentCritical: 1,
+          RecoveryActionWarning: 1,
+        },
+      );
+
+      assert.equal(readIncidentServiceMode(), "unavailable");
+      const diagnosticAttempt = activeRun(
+        recovered.supervisor,
+        "attempt-before-recovery-action",
+      );
+      recovered.supervisor.markRunning(bridgedTaskId, diagnosticAttempt);
+      recovered.supervisor.recordPiAgentResult(bridgedTaskId, {
+        attemptId: diagnosticAttempt.attemptId,
+        kind: "remediation-complete",
+        summary: "Diagnosed the fixture service as unavailable before the bounded repair.",
+        actions: ["Confirmed the fixture remained unavailable before repair."],
+        requestedInput: null,
+        reason: null,
+      });
+      const stillUnavailable = await recovered.supervisor.runDoneCheck(
+        bridgedTaskId,
+      );
+      assert.equal(stillUnavailable.state, "RESUMABLE");
+      assert.equal(stillUnavailable.verification?.outcome, "PRODUCT_FAILURE");
+
+      writeFileSync(
+        repairStatePath,
+        `${JSON.stringify({ serviceMode: "healthy" })}\n`,
+        { mode: 0o600 },
+      );
+      assert.deepEqual(JSON.parse(readFileSync(repairStatePath, "utf8")), {
+        serviceMode: "healthy",
+      });
+      const recoveryAttempt = activeRun(
+        recovered.supervisor,
+        "attempt-recovery-action",
+      );
+      recovered.supervisor.markRunning(bridgedTaskId, recoveryAttempt);
+      recovered.supervisor.recordPiAgentResult(bridgedTaskId, {
+        attemptId: recoveryAttempt.attemptId,
+        kind: "remediation-complete",
+        summary: "Diagnosed the fixture service as unavailable before the bounded repair.",
+        actions: ["Changed the fixture service mode from unavailable to healthy."],
+        requestedInput: null,
+        reason: null,
+      });
+      const stabilizing = await recovered.supervisor.runDoneCheck(bridgedTaskId);
+      assert.equal(stabilizing.state, "CHECKING");
+      assert.equal(stabilizing.verification?.outcome, "NOT_READY");
+      context.clock.advance(5 * 60 * 1_000 + 1);
+      const passed = await recovered.supervisor.runDoneCheck(bridgedTaskId);
+      assert.equal(
+        passed.state,
+        "DONE",
+        JSON.stringify({
+          outcome: passed.verification?.outcome,
+          summary: passed.verification?.summary,
+          components: passed.verification?.components,
+        }),
+      );
+      assert.equal(passed.verification?.outcome, "PASS");
+      assert.equal(passed.report.state, "PENDING");
+      assert.equal(passed.agentResult?.actions.length, 1);
+
+      const resultTransport = new FakeTelegramTransport(context.observe);
+      const reportTick = await createTelegramControl(
+        context,
+        recovered.supervisor,
+        resultTransport,
+      ).tick();
+      assert.equal(reportTick.reportTaskId, bridgedTaskId);
+      assert.equal(resultTransport.messages.length, 1);
+      const resultReport = String(resultTransport.messages[0].text);
+      assert.match(resultReport, /typedOutcome=remediation-complete/);
+      assert.match(resultReport, /diagnosis=Diagnosed the fixture service/);
+      assert.match(resultReport, /actions=Changed the fixture service mode/);
+      assert.match(resultReport, /verification=PASS/);
+      for (const component of [
+        "monitoring-freshness/PASS",
+        "exact-group-absence/PASS",
+        "resolution-stability/PASS",
+      ]) {
+        assert.match(resultReport, new RegExp(component));
+      }
+      const reported = recovered.store.get(bridgedTaskId);
+      assert.equal(reported?.report.state, "SENT");
+      assert.equal(reported?.report.attempts, 1);
+      assert.equal(
+        reported?.mutationReceipts.report?.outcome?.result,
+        "APPLIED",
+      );
+      assert.deepEqual(
+        recovered.store.get(ambiguousTaskId)?.mutationReceipts.report,
+        ambiguousReceipt,
+      );
+
+      const cronWorkspace = join(context.root, "cron-workspace");
+      const cronHome = join(context.root, "cron-home");
+      const launchAgentsDir = join(cronHome, "Library", "LaunchAgents");
+      const metricDir = join(context.root, "cron-metrics");
+      mkdirSync(cronWorkspace, { recursive: true });
+      mkdirSync(launchAgentsDir, { recursive: true });
+      writeFileSync(join(cronWorkspace, "crons.yaml"), "crons: []\n", "utf8");
+      const cronName = "retired-failed-cron";
+      const cronLabel = `ai.minime.cron.${cronName}`;
+      const stalePlist = join(launchAgentsDir, `${cronLabel}.plist`);
+      writeFileSync(
+        stalePlist,
+        `<plist><dict><key>Label</key><string>${cronLabel}</string><key>EnvironmentVariables</key><dict><key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>${metricDir}</string></dict></dict></plist>\n`,
+        "utf8",
+      );
+      const artifacts = resolveCronHealthMetricArtifacts(cronName, metricDir);
+      mkdirSync(metricDir, { recursive: true });
+      writeFileSync(
+        artifacts.exitFilePath,
+        'minime_cron_last_exit_code{cron="retired-failed-cron"} 1\n',
+        "utf8",
+      );
+      writeFileSync(
+        artifacts.successFilePath,
+        'minime_cron_last_success_timestamp_seconds{cron="retired-failed-cron"} 0\n',
+        "utf8",
+      );
+      const unrelatedMetric = join(metricDir, "unrelated.prom");
+      writeFileSync(unrelatedMetric, "unrelated_metric 1\n", "utf8");
+      const ambiguousTaskArtifact = join(
+        recovered.store.tasksDirectory,
+        `${ambiguousTaskId}.json`,
+      );
+      const reportedTaskArtifact = join(
+        recovered.store.tasksDirectory,
+        `${bridgedTaskId}.json`,
+      );
+      const taskArtifactsBefore = [
+        readFileSync(ambiguousTaskArtifact, "utf8"),
+        readFileSync(reportedTaskArtifact, "utf8"),
+      ];
+      const commandRunner: LaunchdCommandRunner = (_command, args) => {
+        if (args[0] === "print") {
+          return { status: 3, stdout: "", stderr: "Could not find service" };
+        }
+        if (args[0] === "bootout") {
+          return { status: 3, stdout: "", stderr: "Could not find service" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+      const fixturePlutil = join(context.root, "fixture-plutil");
+      copyFileSync(new URL("./plutil-convert.py", import.meta.url), fixturePlutil);
+      chmodSync(fixturePlutil, 0o700);
+      const cronResult = syncLaunchdCrons({
+        workspace: cronWorkspace,
+        launchAgentsDir,
+        homeDir: cronHome,
+        uid: 501,
+        env: {
+          HOME: cronHome,
+          LOG_DIR: join(context.root, "cron-logs"),
+          PLUTIL_BIN: fixturePlutil,
+          UID: "501",
+          [CRON_HEALTH_TEXTFILE_DIR_ENV]: metricDir,
+        },
+        commandRunner,
+      });
+      assert.equal(existsSync(stalePlist), false);
+      assert.equal(existsSync(artifacts.exitFilePath), false);
+      assert.equal(existsSync(artifacts.successFilePath), false);
+      assert.equal(readFileSync(unrelatedMetric, "utf8"), "unrelated_metric 1\n");
+      assert.deepEqual(
+        cronResult.items.find((item) => item.label === cronLabel)?.metricRetirement,
+        {
+          status: "applied",
+          removedArtifactCount: 2,
+        },
+      );
+      assert.deepEqual(
+        [
+          readFileSync(ambiguousTaskArtifact, "utf8"),
+          readFileSync(reportedTaskArtifact, "utf8"),
+        ],
+        taskArtifactsBefore,
       );
     },
   },

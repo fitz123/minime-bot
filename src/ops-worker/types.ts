@@ -326,6 +326,34 @@ export interface OpsWorkerEvidence {
   artifact: string | null;
 }
 
+export const OPS_WORKER_REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE =
+  "ops-worker-report-reconciliation-intent-v1";
+
+export interface OpsWorkerCurrentReportReconciliationIntent {
+  reportIdentity: string;
+  reportPayloadHash: string;
+}
+
+export interface OpsWorkerV5ReportReconciliationIntent {
+  reportIdentity: string;
+  taskState: OpsWorkerTaskState;
+  lastOutcome: Pick<
+    OpsWorkerLastOutcome,
+    "at" | "kind" | "result" | "summary"
+  > | null;
+}
+
+export type OpsWorkerReportReconciliationIntent =
+  | OpsWorkerCurrentReportReconciliationIntent
+  | OpsWorkerV5ReportReconciliationIntent;
+
+export interface OpsWorkerReportReconciliationIntentEvidence {
+  type: typeof OPS_WORKER_REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE;
+  operationId: string;
+  intentHash: string;
+  intent: OpsWorkerReportReconciliationIntent;
+}
+
 export interface OpsWorkerDoneCheck {
   name: string;
   params: JsonObject;
@@ -838,6 +866,8 @@ export const OPS_WORKER_LIMITS = {
   maxObjectiveBytes: 8 * 1024,
   maxEvidenceEntries: 64,
   maxEvidenceSummaryBytes: 4 * 1024,
+  /** Covers worst-case JSON escaping of one valid 4 KiB legacy outcome summary. */
+  maxReportReconciliationIntentEvidenceBytes: 32 * 1024,
   maxAlertmanagerGroupCorrelationEvidenceBytes: 256 * 1024,
   maxAlertmanagerGroupLabelEntries: 64,
   maxAlertmanagerGroupLabelKeyBytes: 256,
@@ -1874,6 +1904,12 @@ function parseEvidenceSummary(
     <= OPS_WORKER_LIMITS.maxEvidenceSummaryBytes
   ) return summary;
   if (
+    kind === "system"
+    && trust === "trusted"
+    && parseOpsWorkerReportReconciliationIntentEvidenceSummary(summary)
+      !== undefined
+  ) return summary;
+  if (
     source.kind !== "alertmanager"
     || kind !== "alert"
     || trust !== "untrusted"
@@ -1915,6 +1951,123 @@ function parseEvidenceSummary(
   return summary;
 }
 
+function hasExactObjectKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length
+    && expected.every((key) => hasOwn(value, key));
+}
+
+function isBoundedOutcomeSummary(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && !value.includes("\0")
+    && Buffer.byteLength(value, "utf8")
+      <= OPS_WORKER_LIMITS.maxOutcomeSummaryBytes;
+}
+
+export function parseOpsWorkerReportReconciliationIntent(
+  value: unknown,
+): OpsWorkerReportReconciliationIntent | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const intent = value as Record<string, unknown>;
+  if (
+    hasExactObjectKeys(intent, ["reportIdentity", "reportPayloadHash"])
+  ) {
+    if (
+      typeof intent.reportIdentity !== "string"
+      || !SHA256_PATTERN.test(intent.reportIdentity)
+    ) return undefined;
+    if (
+      typeof intent.reportPayloadHash !== "string"
+      || !SHA256_PATTERN.test(intent.reportPayloadHash)
+    ) return undefined;
+    return {
+      reportIdentity: intent.reportIdentity,
+      reportPayloadHash: intent.reportPayloadHash,
+    };
+  }
+  if (
+    !hasExactObjectKeys(intent, ["reportIdentity", "taskState", "lastOutcome"])
+    || typeof intent.reportIdentity !== "string"
+    || !SHA256_PATTERN.test(intent.reportIdentity)
+    || typeof intent.taskState !== "string"
+    || !(OPS_WORKER_TASK_STATES as readonly string[]).includes(intent.taskState)
+  ) return undefined;
+  if (intent.lastOutcome === null) {
+    return {
+      reportIdentity: intent.reportIdentity,
+      taskState: intent.taskState as OpsWorkerTaskState,
+      lastOutcome: null,
+    };
+  }
+  if (
+    typeof intent.lastOutcome !== "object"
+    || Array.isArray(intent.lastOutcome)
+  ) return undefined;
+  const outcome = intent.lastOutcome as Record<string, unknown>;
+  if (
+    !hasExactObjectKeys(outcome, ["at", "kind", "result", "summary"])
+    || typeof outcome.at !== "string"
+    || !TIMESTAMP_PATTERN.test(outcome.at)
+    || Number.isNaN(Date.parse(outcome.at))
+    || typeof outcome.kind !== "string"
+    || !(OPS_WORKER_OUTCOME_KINDS as readonly string[]).includes(outcome.kind)
+    || typeof outcome.result !== "string"
+    || !(OPS_WORKER_OUTCOME_RESULTS as readonly string[]).includes(outcome.result)
+    || !isBoundedOutcomeSummary(outcome.summary)
+  ) return undefined;
+  return {
+    reportIdentity: intent.reportIdentity,
+    taskState: intent.taskState as OpsWorkerTaskState,
+    lastOutcome: {
+      at: outcome.at,
+      kind: outcome.kind as OpsWorkerLastOutcome["kind"],
+      result: outcome.result as OpsWorkerLastOutcome["result"],
+      summary: outcome.summary,
+    },
+  };
+}
+
+export function parseOpsWorkerReportReconciliationIntentEvidenceSummary(
+  summary: string,
+): OpsWorkerReportReconciliationIntentEvidence | undefined {
+  if (
+    Buffer.byteLength(summary, "utf8")
+    > OPS_WORKER_LIMITS.maxReportReconciliationIntentEvidenceBytes
+  ) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(summary) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const marker = value as Record<string, unknown>;
+  if (
+    !hasExactObjectKeys(marker, ["type", "operationId", "intentHash", "intent"])
+    || marker.type !== OPS_WORKER_REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
+    || typeof marker.operationId !== "string"
+    || !INSTANCE_ID_PATTERN.test(marker.operationId)
+    || typeof marker.intentHash !== "string"
+    || !SHA256_PATTERN.test(marker.intentHash)
+  ) return undefined;
+  const intent = parseOpsWorkerReportReconciliationIntent(marker.intent);
+  if (intent === undefined) return undefined;
+  return {
+    type: OPS_WORKER_REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE,
+    operationId: marker.operationId,
+    intentHash: marker.intentHash,
+    intent,
+  };
+}
+
 function parseEvidence(
   value: unknown,
   source: OpsWorkerTaskSource | OpsWorkerTaskSourceV1,
@@ -1949,12 +2102,26 @@ function parseEvidence(
       artifact,
     };
   });
+  const oversized = parsed.filter((evidence) =>
+    Buffer.byteLength(evidence.summary, "utf8")
+    > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes);
   if (
-    parsed.filter((evidence) =>
-      Buffer.byteLength(evidence.summary, "utf8")
-      > OPS_WORKER_LIMITS.maxEvidenceSummaryBytes).length > 1
+    oversized.filter((evidence) =>
+      source.kind === "alertmanager"
+      && evidence.kind === "alert"
+      && evidence.trust === "untrusted").length > 1
   ) {
     fail("task.evidence", "must contain at most one oversized Alertmanager group descriptor");
+  }
+  if (
+    oversized.filter((evidence) =>
+      evidence.kind === "system"
+      && evidence.trust === "trusted"
+      && parseOpsWorkerReportReconciliationIntentEvidenceSummary(
+        evidence.summary,
+      ) !== undefined).length > 1
+  ) {
+    fail("task.evidence", "must contain at most one oversized report reconciliation intent");
   }
   return parsed;
 }

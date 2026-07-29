@@ -13,6 +13,7 @@ import type { OpsWorkerAuthorizationVerifierRegistry } from "../ops-worker/autho
 import type { OpsWorkerControlConfig } from "../ops-worker/control-config.js";
 import { OpsWorkerControlLedger } from "../ops-worker/control-ledger.js";
 import { OpsWorkerDoneCheckRegistry } from "../ops-worker/done-checks.js";
+import { hashOpsWorkerCanonicalPayload } from "../ops-worker/lifecycle.js";
 import {
   OpsWorkerSupervisor,
   type OpsWorkerSupervisorOptions,
@@ -1041,6 +1042,247 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(sent?.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
+  it("keeps polling and rotates past an incompatible claimed report receipt", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-a-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.lastOutcome = {
+      at: NOW,
+      kind: "DONE_CHECK",
+      result: "PRODUCT_FAILURE",
+      summary: "Fixture report payload changed after an earlier delivery claim.",
+    };
+    isolated.report.state = "PENDING";
+    const reconciliationIntent = {
+      reportIdentity: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      reportPayloadHash: `sha256:${"c".repeat(64)}`,
+    };
+    const reconciliationIntentHash =
+      hashOpsWorkerCanonicalPayload(reconciliationIntent);
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: "report:incompatible-fixture",
+      intentHash: reconciliationIntentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    isolated.evidence.push({
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: "report:incompatible-fixture",
+        intentHash: reconciliationIntentHash,
+        intent: reconciliationIntent,
+      }),
+      artifact: null,
+    });
+    fixture.store.create(isolated);
+    const originalReceipt = structuredClone(isolated.mutationReceipts.report);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(51, "/status"),
+      update(52, `/task ${isolated.id}`),
+    ]);
+    const client = control(fixture, transport);
+
+    const firstTick = await client.tick();
+
+    assert.equal(firstTick.reportTaskId, null);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 52);
+    assert.equal(fixture.store.get(isolated.id)?.state, "BLOCKED");
+    assert.equal(fixture.store.get(isolated.id)?.custody.status, "RELEASED");
+    assert.deepEqual(
+      fixture.store.get(isolated.id)?.mutationReceipts.report,
+      originalReceipt,
+    );
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReconciliationBlocked=1")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReceipt=claimed/unknown")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes("reportReconciliation=required")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes(
+        'reportReconciliationIntent={"boundary":"report","operationId":"report:incompatible-fixture"',
+      )), true);
+
+    const sendable = makeTask("task-b-sendable-after-reconciliation");
+    sendable.state = "CANCELLED";
+    sendable.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "CANCELLED",
+    };
+    sendable.lastOutcome = {
+      at: NOW,
+      kind: "OPERATOR",
+      result: "CANCELLED",
+      summary: "Fixture unrelated report remains deliverable.",
+    };
+    sendable.report.state = "PENDING";
+    fixture.store.create(sendable);
+    transport.updates.push([]);
+
+    const secondTick = await client.tick();
+
+    assert.equal(secondTick.reportTaskId, sendable.id);
+    assert.equal(fixture.store.get(sendable.id)?.report.state, "SENT");
+    assert.deepEqual(
+      fixture.store.get(isolated.id)?.mutationReceipts.report,
+      originalReceipt,
+    );
+  });
+
+  it("paginates a maximum-size legacy v5 report reconciliation intent without truncation", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-max-v5-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Claimed report receipt requires external-outcome reconciliation",
+    };
+    const reconciliationIntent = {
+      reportIdentity: `sha256:${"a".repeat(64)}`,
+      taskState: "DONE",
+      lastOutcome: {
+        at: NOW,
+        kind: "DONE_CHECK",
+        result: "PASS",
+        summary: "\u0001".repeat(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 2)
+          + "x".repeat(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 2),
+      },
+    };
+    const reconciliationIntentHash =
+      hashOpsWorkerCanonicalPayload(reconciliationIntent);
+    const reconciliationOperation = {
+      boundary: "report",
+      operationId: "report:max-v5-reconciliation-fixture",
+      intent: reconciliationIntent,
+    };
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: reconciliationOperation.operationId,
+      intentHash: reconciliationIntentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    isolated.evidence.push({
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: reconciliationOperation.operationId,
+        intentHash: reconciliationIntentHash,
+        intent: reconciliationIntent,
+      }),
+      artifact: null,
+    });
+    fixture.store.create(isolated);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(54, `/task ${isolated.id}`),
+    ]);
+    const client = control(fixture, transport);
+
+    await client.tick();
+
+    const firstText = String(transport.messages[0]?.text);
+    const firstHeader = /^Task \S+ page 1\/(\d+)\n/.exec(firstText);
+    assert.ok(firstHeader);
+    const pageCount = Number(firstHeader[1]);
+    assert.ok(pageCount > 1);
+    assert.ok(pageCount <= 100);
+    transport.updates.push(Array.from(
+      { length: pageCount - 1 },
+      (_, index) =>
+        update(55 + index, `/task ${isolated.id} ${index + 2}`),
+    ));
+
+    await client.tick();
+
+    assert.equal(transport.messages.length, pageCount);
+    const reconstructed = transport.messages.map((message, index) => {
+      const text = String(message.text);
+      const header = `Task ${isolated.id} page ${index + 1}/${pageCount}\n`;
+      assert.equal(text.startsWith(header), true);
+      assert.ok(Buffer.byteLength(text, "utf8") <= config.reply.maxBytes);
+      assert.equal(text.includes("… [truncated]"), false);
+      return text.slice(header.length);
+    }).join("");
+    const operationLine = reconstructed.split("\n").find((line) =>
+      line.startsWith("reportReconciliationIntent="));
+    assert.ok(operationLine);
+    assert.deepEqual(
+      JSON.parse(operationLine.slice("reportReconciliationIntent=".length)),
+      reconciliationOperation,
+    );
+  });
+
+  it("shows when a blocked report receipt has no retained package intent", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-markerless-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Claimed report receipt requires external-outcome reconciliation; exact package intent was not retained",
+    };
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: "report:markerless-fixture",
+      intentHash: `sha256:${"a".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"b".repeat(64)}`,
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    fixture.store.create(isolated);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(53, `/task ${isolated.id}`),
+    ]);
+
+    await control(fixture, transport).tick();
+
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes(
+        "reportReconciliationIntent=unavailable",
+      )), true);
+  });
+
   it("keeps a failed terminal report pending and retries it on the next tick", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());
@@ -1130,6 +1372,62 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(delivered.reportTaskId, "task-b-sendable");
     assert.equal(fixture.store.get("task-a-denied")?.report.state, "PENDING");
     assert.equal(fixture.store.get("task-b-sendable")?.report.state, "SENT");
+    assert.equal(transport.sendCalls, 1);
+  });
+
+  it("keeps polling when authorization drift supersedes an unclaimed report receipt", async (t) => {
+    const fixture = await harness(t, {
+      authorizationVerifiers: {
+        "operator-cli": {
+          identity: "drift-fixture-authorization",
+          version: "1",
+          verify: (task) => task.id === "task-a-drifted"
+            ? {
+              status: "DRIFT",
+              evidenceHash: `sha256:${"e".repeat(64)}`,
+              summary: "Fixture authorization drifted before report claim.",
+            }
+            : {
+              status: "PASS",
+              evidenceHash: `sha256:${"f".repeat(64)}`,
+              summary: "Fixture authorization permits this report.",
+            },
+        },
+      },
+    });
+    t.after(() => fixture.close());
+    for (const taskId of ["task-a-drifted", "task-b-sendable"]) {
+      const pending = makeTask(taskId);
+      pending.state = taskId === "task-a-drifted" ? "BLOCKED" : "CANCELLED";
+      pending.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: pending.state,
+      };
+      pending.lastOutcome = {
+        at: NOW,
+        kind: pending.state === "BLOCKED" ? "INFRASTRUCTURE" : "OPERATOR",
+        result: pending.state === "BLOCKED" ? "BLOCKED" : "CANCELLED",
+        summary: "Fixture terminal report.",
+      };
+      pending.report.state = "PENDING";
+      fixture.store.create(pending);
+    }
+    const transport = new FakeTelegramTransport();
+    const client = control(fixture, transport);
+
+    const denied = await client.tick();
+    const delivered = await client.tick();
+    const retried = await client.tick();
+    const repeated = await client.tick();
+
+    assert.equal(denied.reportTaskId, "task-a-drifted");
+    assert.equal(delivered.reportTaskId, "task-b-sendable");
+    assert.equal(retried.reportTaskId, "task-a-drifted");
+    assert.equal(repeated.reportTaskId, "task-a-drifted");
+    assert.equal(fixture.store.get("task-a-drifted")?.state, "BLOCKED");
+    assert.equal(fixture.store.get("task-a-drifted")?.report.state, "PENDING");
     assert.equal(transport.sendCalls, 1);
   });
 

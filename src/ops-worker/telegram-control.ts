@@ -14,6 +14,8 @@ import {
   type OpsWorkerFieldRedactor,
 } from "./reporting.js";
 import {
+  getOpsWorkerReportReconciliationOperation,
+  isOpsWorkerReportReconciliationBlocked,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -111,6 +113,24 @@ function truncateUtf8(value: string, maxBytes: number): string {
     result += character;
   }
   return `${result}${TRUNCATION_MARKER}`;
+}
+
+function splitUtf8(value: string, maxBytes: number): string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+  let chunkBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (chunkBytes + characterBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = "";
+      chunkBytes = 0;
+    }
+    chunk += character;
+    chunkBytes += characterBytes;
+  }
+  chunks.push(chunk);
+  return chunks;
 }
 
 function safeError(error: unknown): string {
@@ -239,6 +259,8 @@ function taskSummary(task: OpsWorkerTask): string {
   const outcome = task.lastOutcome === null
     ? "none"
     : `${task.lastOutcome.kind}/${task.lastOutcome.result}: ${task.lastOutcome.summary}`;
+  const reportReconciliationOperation =
+    getOpsWorkerReportReconciliationOperation(task);
   return [
     `Task ${task.id}`,
     `state=${task.state} paused=${task.control.paused}`,
@@ -247,17 +269,72 @@ function taskSummary(task: OpsWorkerTask): string {
     `nextRunAt=${task.schedule.nextRunAt ?? "none"}`,
     `nextCheckAt=${task.schedule.nextCheckAt ?? "none"}`,
     `report=${task.report.state}/${task.report.attempts}`,
+    `reportReceipt=${task.mutationReceipts.report === null
+      ? "none"
+      : task.mutationReceipts.report.outcome !== null
+      ? `finished/${task.mutationReceipts.report.outcome.result}`
+      : task.mutationReceipts.report.mutationStartedAt === null
+      ? "queried/unclaimed"
+      : "claimed/unknown"}`,
+    `reportReconciliation=${isOpsWorkerReportReconciliationBlocked(task)
+      ? "required"
+      : "none"}`,
+    `reportReconciliationIntent=${reportReconciliationOperation === undefined
+      ? isOpsWorkerReportReconciliationBlocked(task)
+        ? "unavailable"
+        : "none"
+      : JSON.stringify(reportReconciliationOperation)}`,
     `outcome=${outcome}`,
   ].join("\n");
 }
 
+function taskSummaryPage(
+  task: OpsWorkerTask,
+  page: number,
+  maxBytes: number,
+): string {
+  const summary = taskSummary(task);
+  if (Buffer.byteLength(summary, "utf8") <= maxBytes) {
+    return page === 1
+      ? summary
+      : `Task ${task.id} has 1 page; request /task ${task.id}.`;
+  }
+  let pageCount = 2;
+  let pages: string[];
+  while (true) {
+    const largestHeader = `Task ${task.id} page ${pageCount}/${pageCount}\n`;
+    const contentBytes = maxBytes - Buffer.byteLength(largestHeader, "utf8");
+    if (contentBytes < 4) {
+      throw new TypeError("Telegram reply limit cannot fit a task page header");
+    }
+    pages = splitUtf8(summary, contentBytes);
+    if (pages.length === pageCount) break;
+    pageCount = pages.length;
+  }
+  if (page > pages.length) {
+    return `Task ${task.id} has ${pages.length} pages; request /task ${task.id} <page>.`;
+  }
+  return `Task ${task.id} page ${page}/${pages.length}\n${pages[page - 1]}`;
+}
+
 function usage(): string {
-  return "Usage: /status | /tasks | /task <id> | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>";
+  return "Usage: /status | /tasks | /task <id> [page] | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>";
 }
 
 function taskArgument(value: string | undefined): string | null {
   const taskId = value?.trim();
   return isOpsWorkerTaskId(taskId) ? taskId : null;
+}
+
+function taskPageArgument(
+  value: string | undefined,
+): { taskId: string; page: number } | null {
+  const match = /^(\S+)(?:\s+([1-9]\d*))?$/.exec(value?.trim() ?? "");
+  const taskId = taskArgument(match?.[1]);
+  const page = match?.[2] === undefined ? 1 : Number(match[2]);
+  return taskId !== null && Number.isSafeInteger(page)
+    ? { taskId, page }
+    : null;
 }
 
 export class OpsWorkerTelegramControl {
@@ -447,6 +524,7 @@ export class OpsWorkerTelegramControl {
       return [
         `Ops worker: tasks=${summary.totalTasks} activeGroups=${summary.activeProcessGroups}`,
         `custody=${summary.custodyOwner?.id ?? "none"}`,
+        `reportReconciliationBlocked=${summary.reportReconciliationBlocked}`,
         `states=${Object.entries(summary.states).map(([state, count]) => `${state}:${count}`).join(",")}`,
         `authorization=${policy.authorization.verifierCount}/${policy.authorization.contractsHash}`,
         `verification=${policy.verification.verifierCount}/${policy.verification.contractsHash}`,
@@ -462,10 +540,12 @@ export class OpsWorkerTelegramControl {
           `${task.id} ${task.state}${task.control.paused ? " paused" : ""}`).join("\n");
     }
     if (command === "task") {
-      const taskId = taskArgument(tail);
-      if (taskId === null) return usage();
-      const task = this.supervisor.getTask(taskId);
-      return task ? taskSummary(task) : `Unknown ops-worker task ${taskId}.`;
+      const argument = taskPageArgument(tail);
+      if (argument === null) return usage();
+      const task = this.supervisor.getTask(argument.taskId);
+      return task
+        ? taskSummaryPage(task, argument.page, this.config.reply.maxBytes)
+        : `Unknown ops-worker task ${argument.taskId}.`;
     }
     if (command === "answer" || command === "correct") {
       const steering = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");
@@ -596,10 +676,11 @@ export class OpsWorkerTelegramControl {
   }
 
   private async deliverOnePendingReport(signal: AbortSignal): Promise<string | null> {
-    const task = this.supervisor.listTasks()
+    const tasks = this.supervisor.listTasks()
       .filter((candidate) =>
         candidate.report.state === "PENDING"
-        && candidate.report.attempts < OPS_WORKER_LIMITS.maxReportAttempts)
+        && candidate.report.attempts < OPS_WORKER_LIMITS.maxReportAttempts
+        && !isOpsWorkerReportReconciliationBlocked(candidate))
       .sort((left, right) => {
         const leftObservedAt = left.mutationReceipts.report?.queryObservedAt;
         const rightObservedAt = right.mutationReceipts.report?.queryObservedAt;
@@ -609,20 +690,26 @@ export class OpsWorkerTelegramControl {
           return Date.parse(leftObservedAt ?? "") - Date.parse(rightObservedAt ?? "");
         }
         return left.id.localeCompare(right.id);
-      })[0];
-    if (!task) return null;
-    await this.supervisor.recordReportAttempt(task.id, async (prepared) => {
-      try {
-        await this.sendMessage(buildOpsWorkerTelegramReport(prepared, {
-          redact: this.redactAgentField,
-          maxBytes: this.config.reply.maxBytes,
-        }), signal);
-      } catch (error) {
-        return { sent: false, error: safeError(error) };
-      }
-      this.faultInjector?.("after-report-send-before-receipt-finish", -1);
-      return { sent: true };
-    });
-    return task.id;
+      });
+    for (const task of tasks) {
+      const result = await this.supervisor.recordReportAttempt(
+        task.id,
+        async (prepared) => {
+          try {
+            await this.sendMessage(buildOpsWorkerTelegramReport(prepared, {
+              redact: this.redactAgentField,
+              maxBytes: this.config.reply.maxBytes,
+            }), signal);
+          } catch (error) {
+            return { sent: false, error: safeError(error) };
+          }
+          this.faultInjector?.("after-report-send-before-receipt-finish", -1);
+          return { sent: true };
+        },
+      );
+      if (isOpsWorkerReportReconciliationBlocked(result)) continue;
+      return task.id;
+    }
+    return null;
   }
 }

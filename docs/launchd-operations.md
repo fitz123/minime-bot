@@ -381,9 +381,18 @@ requires the previous plist to be restored and bootstrapped.
 
 Prune is enabled by default for the package-owned `ai.minime.cron.*` namespace.
 Pruning means a stale or disabled owned cron label is booted out, its plist is
-deleted, and it is not bootstrapped again. `--no-prune` is an escape hatch for
-manual recovery or phased operations where existing owned cron plists should be
-left alone temporarily.
+deleted, its exact package-owned terminal `.exit.prom` and `.success.prom`
+snapshots are retired, and it is not bootstrapped again. Metric retirement uses
+the same hashed artifact naming as the cron runner and never scans the textfile
+directory. It happens only after sync proves the job inactive; active or
+unknown jobs retain both their plist and metrics for a later sync. Dry-run
+reports the planned retirement without deleting metrics, and `--no-prune` is an
+escape hatch for manual recovery or phased operations where existing owned cron
+plists and metrics should be left alone temporarily.
+
+When `CRON_HEALTH_TEXTFILE_DIR` selects a non-default collector directory, cron
+sync uses that directory for exact retirement and persists the same selection
+in generated cron plists.
 
 Cron sync never owns the bot service label. It must not bootout, bootstrap,
 kill, signal, or otherwise restart `ai.minime.telegram-bot`.

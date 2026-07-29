@@ -1,8 +1,27 @@
+import { createHash } from "node:crypto";
 import {
   OPS_WORKER_LIMITS,
+  parseOpsWorkerReportReconciliationIntentEvidenceSummary,
   type OpsWorkerEvidence,
+  type OpsWorkerReportReconciliationIntent,
   type OpsWorkerTask,
 } from "./types.js";
+
+function canonicalReportReconciliationIntent(
+  intent: OpsWorkerReportReconciliationIntent,
+): string {
+  if ("reportPayloadHash" in intent) {
+    return JSON.stringify({
+      reportIdentity: intent.reportIdentity,
+      reportPayloadHash: intent.reportPayloadHash,
+    });
+  }
+  return JSON.stringify({
+    lastOutcome: intent.lastOutcome,
+    reportIdentity: intent.reportIdentity,
+    taskState: intent.taskState,
+  });
+}
 
 function isProtectedAlertmanagerEvidence(
   task: Readonly<OpsWorkerTask>,
@@ -40,6 +59,40 @@ function isProtectedAlertmanagerEvidence(
   }
 }
 
+function isProtectedReportReconciliationIntent(
+  task: Readonly<OpsWorkerTask>,
+  evidence: Readonly<OpsWorkerEvidence>,
+): boolean {
+  const receipt = task.mutationReceipts.report;
+  if (
+    receipt === null
+    || receipt.outcome !== null
+    || evidence.kind !== "system"
+    || evidence.trust !== "trusted"
+  ) return false;
+  const marker = parseOpsWorkerReportReconciliationIntentEvidenceSummary(
+    evidence.summary,
+  );
+  if (
+    marker === undefined
+    || marker.operationId !== receipt.operationId
+    || marker.intentHash !== receipt.intentHash
+  ) return false;
+  const canonicalIntent = canonicalReportReconciliationIntent(marker.intent);
+  const intentHash = `sha256:${createHash("sha256")
+    .update(canonicalIntent)
+    .digest("hex")}`;
+  return intentHash === receipt.intentHash;
+}
+
+function isProtectedEvidence(
+  task: Readonly<OpsWorkerTask>,
+  evidence: Readonly<OpsWorkerEvidence>,
+): boolean {
+  return isProtectedAlertmanagerEvidence(task, evidence)
+    || isProtectedReportReconciliationIntent(task, evidence);
+}
+
 function serializedTaskBytes(task: Readonly<OpsWorkerTask>): number {
   return Buffer.byteLength(`${JSON.stringify(task)}\n`, "utf8");
 }
@@ -52,7 +105,7 @@ export function appendOpsWorkerEvidence(
   const entries = [...task.evidence, evidence];
   while (entries.length > OPS_WORKER_LIMITS.maxEvidenceEntries) {
     const evictable = entries.findIndex((entry) =>
-      !isProtectedAlertmanagerEvidence(task, entry));
+      !isProtectedEvidence(task, entry));
     if (evictable < 0) {
       throw new RangeError("Ops-worker evidence has no evictable entry capacity");
     }
@@ -65,7 +118,7 @@ export function appendOpsWorkerEvidence(
 export function compactOpsWorkerEvidenceForSnapshot(task: OpsWorkerTask): void {
   while (serializedTaskBytes(task) > OPS_WORKER_LIMITS.maxSnapshotBytes) {
     const evictable = task.evidence.findIndex((entry) =>
-      !isProtectedAlertmanagerEvidence(task, entry));
+      !isProtectedEvidence(task, entry));
     if (evictable < 0) return;
     task.evidence.splice(evictable, 1);
   }
