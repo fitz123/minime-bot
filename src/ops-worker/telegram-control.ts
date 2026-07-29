@@ -262,7 +262,9 @@ function taskSummary(task: OpsWorkerTask): string {
       ? "required"
       : "none"}`,
     `reportReconciliationIntent=${reportReconciliationOperation === undefined
-      ? "none"
+      ? isOpsWorkerReportReconciliationBlocked(task)
+        ? "unavailable"
+        : "none"
       : JSON.stringify(reportReconciliationOperation)}`,
     `outcome=${outcome}`,
   ].join("\n");

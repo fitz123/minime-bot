@@ -1146,6 +1146,46 @@ describe("ops worker dedicated Telegram control", () => {
     );
   });
 
+  it("shows when a blocked report receipt has no retained package intent", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const isolated = makeTask("task-markerless-report-reconciliation");
+    isolated.state = "BLOCKED";
+    isolated.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    isolated.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Claimed report receipt requires external-outcome reconciliation; exact package intent was not retained",
+    };
+    isolated.mutationReceipts.report = {
+      boundary: "report",
+      operationId: "report:markerless-fixture",
+      intentHash: `sha256:${"a".repeat(64)}`,
+      queryObservedAt: NOW,
+      queryResultHash: `sha256:${"b".repeat(64)}`,
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    fixture.store.create(isolated);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(53, `/task ${isolated.id}`),
+    ]);
+
+    await control(fixture, transport).tick();
+
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes(
+        "reportReconciliationIntent=unavailable",
+      )), true);
+  });
+
   it("keeps a failed terminal report pending and retries it on the next tick", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());

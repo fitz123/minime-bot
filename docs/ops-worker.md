@@ -608,13 +608,22 @@ callers must retain any raw external observation they will need later. Operator
 retry also fails closed while a claimed report receipt remains unfinished.
 If a claimed report receipt no longer matches the current report payload, the
 supervisor isolates that process-free task as `BLOCKED`, releases its custody,
-and records a bounded reconciliation marker containing only the package-made
-operation id and its two intent hashes, without changing the receipt or guessing
-the external outcome. `worker inspect --json` and the dedicated `/task` control
-show that exact fixed-receipt input so recovery does not depend on pre-crash
-process memory. Automatic reporting and scheduling skip that task until fixed
-receipt reconciliation followed by `retry`, or an explicit `cancel`, resolves
-the episode.
+and uses a bounded protected marker written before the package claims report
+delivery, without changing the receipt or guessing the external outcome. The
+marker retains the exact package-made operation id and intent needed by the
+fixed receipt controls; current intents contain hashes, while a migrated
+schema-v5 intent may also contain the same bounded task state and outcome
+summary already present in that legacy snapshot. `worker inspect --json` and
+the dedicated `/task` control show that fixed-receipt input so recovery does not
+depend on pre-crash process memory.
+
+A historical claimed receipt may already have become incompatible before a
+marker-capable package retained its intent. Its hash preimage cannot be
+reconstructed truthfully. The task and `/task` control identify that intent as
+unavailable; recovery then requires the exact intent retained by the external
+operator, or an explicit `cancel`. Automatic reporting and scheduling skip
+either kind of isolated task until fixed receipt reconciliation followed by
+`retry`, or cancellation, resolves the episode.
 Snapshots keep non-evicting replay fingerprints for up to 128 displaced
 checkpoints and 32 displaced completed operations per receipt boundary. A new
 identity fails closed when its ledger is full; old identities are never

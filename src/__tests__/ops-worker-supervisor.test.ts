@@ -1879,6 +1879,19 @@ describe("ops worker supervisor", () => {
       "task-v5-report-fence",
       activeRun("v5-report-fence-first"),
     );
+    const legacyOutcomeSummary = '\u0001"\\'
+      .repeat(Math.floor(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes / 3))
+      .padEnd(OPS_WORKER_LIMITS.maxOutcomeSummaryBytes, "\u0001");
+    assert.equal(
+      Buffer.byteLength(legacyOutcomeSummary, "utf8"),
+      OPS_WORKER_LIMITS.maxOutcomeSummaryBytes,
+    );
+    const legacyOutcome = {
+      at: NOW,
+      kind: "PI_EXIT" as const,
+      result: "ERROR" as const,
+      summary: legacyOutcomeSummary,
+    };
     const legacyIntent = {
       reportIdentity: hashOpsWorkerCanonicalPayload({
         taskId: running.id,
@@ -1886,7 +1899,7 @@ describe("ops worker supervisor", () => {
         createdAt: running.createdAt,
       }),
       taskState: running.state,
-      lastOutcome: running.lastOutcome,
+      lastOutcome: legacyOutcome,
     };
     const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
     const operationId = `report:${intentHash.slice("sha256:".length, 31)}`;
@@ -1899,6 +1912,7 @@ describe("ops worker supervisor", () => {
       attempts: 0,
       lastError: null,
     };
+    snapshot.lastOutcome = legacyOutcome;
     const receipts = snapshot.mutationReceipts as Record<string, unknown>;
     receipts.report = {
       boundary: "report",
@@ -3584,6 +3598,86 @@ describe("ops worker supervisor", () => {
     assert.equal(
       retried.mutationReceipts.report?.outcome?.result,
       "ALREADY_APPLIED",
+    );
+  });
+
+  it("identifies a pre-marker stale report receipt whose exact intent is unavailable", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-markerless-report-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "markerless-report-first",
+    });
+    first.store.create(makeTask("task-markerless-report"));
+    const running = first.supervisor.markRunning(
+      "task-markerless-report",
+      activeRun("markerless-report-first"),
+    );
+    const reportIdentity = hashOpsWorkerCanonicalPayload({
+      taskId: running.id,
+      deliveryKey: running.source.deliveryKey,
+      createdAt: running.createdAt,
+    });
+    const oldIntent = {
+      reportIdentity,
+      reportPayloadHash: hashOpsWorkerReportPayload(running),
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(oldIntent);
+    const snapshotPath = join(first.store.tasksDirectory, `${running.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.state = "RESUMABLE";
+    snapshot.activeRun = null;
+    snapshot.lastOutcome = {
+      at: LATER,
+      kind: "RECONCILIATION",
+      result: "CRASH",
+      summary: "A previous worker already evolved the task before retaining its report intent.",
+    };
+    snapshot.report = {
+      state: "PENDING",
+      attempts: 1,
+      lastError: "Previous report delivery remained externally ambiguous.",
+    };
+    snapshot.updatedAt = LATER;
+    const lifecycle = snapshot.lifecycle as Record<string, unknown>;
+    lifecycle.report = reportIdentity;
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId: `report:${intentHash.slice("sha256:".length, 31)}`,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload({
+        state: "PENDING",
+        attempts: 0,
+        lastError: null,
+      }),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "markerless-report-restarted",
+    });
+    const isolated = restarted.store.get(running.id);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.equal(isolated?.custody.status, "RELEASED");
+    assert.equal(
+      getOpsWorkerReportReconciliationOperation(isolated!),
+      undefined,
+    );
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /exact package intent was not retained/,
+    );
+    restarted.store.create(makeTask("task-after-markerless-report"));
+    assert.equal(
+      restarted.supervisor.selectNextTask()?.task.id,
+      "task-after-markerless-report",
     );
   });
 
