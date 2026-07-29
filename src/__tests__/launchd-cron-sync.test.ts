@@ -2291,4 +2291,73 @@ fi
       cleanup(fixture);
     }
   });
+
+  it("prunes an owned binary plist by its parsed top-level Label", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const binaryOwnedPath = join(fixture.launchAgentsDir, "manual-binary.plist");
+      writeFileSync(
+        binaryOwnedPath,
+        Buffer.from(
+          "YnBsaXN0MDDRAQJVTGFiZWxfEBthaS5taW5pbWUuY3Jvbi5iaW5hcnktc3RhbGUICxEAAAAAAAABAQAAAAAAAAADAAAAAAAAAAAAAAAAAAAALw==",
+          "base64",
+        ),
+      );
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner([]),
+      });
+
+      assert.equal(existsSync(binaryOwnedPath), false);
+      assert.ok(result.items.some((item) =>
+        item.action === "delete"
+        && item.label === "ai.minime.cron.binary-stale"));
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("does not prune an unrelated plist with an owned-looking nested Label", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const unrelatedPath = join(fixture.launchAgentsDir, "unrelated.plist");
+      writeFileSync(
+        unrelatedPath,
+        `<plist><dict>
+<key>EnvironmentVariables</key><dict>
+<key>Label</key><string>ai.minime.cron.nested-decoy</string>
+</dict>
+<key>Label</key><string>com.example.unrelated</string>
+</dict></plist>
+`,
+        "utf8",
+      );
+      const plutil = writeFixturePlutil(fixture);
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: { ...fixture.env, PLUTIL_BIN: plutil },
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner([]),
+      });
+
+      assert.equal(existsSync(unrelatedPath), true);
+      assert.equal(
+        result.items.some((item) => item.label === "ai.minime.cron.nested-decoy"),
+        false,
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
 });

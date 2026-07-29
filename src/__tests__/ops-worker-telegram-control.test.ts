@@ -1375,6 +1375,62 @@ describe("ops worker dedicated Telegram control", () => {
     assert.equal(transport.sendCalls, 1);
   });
 
+  it("keeps polling when authorization drift supersedes an unclaimed report receipt", async (t) => {
+    const fixture = await harness(t, {
+      authorizationVerifiers: {
+        "operator-cli": {
+          identity: "drift-fixture-authorization",
+          version: "1",
+          verify: (task) => task.id === "task-a-drifted"
+            ? {
+              status: "DRIFT",
+              evidenceHash: `sha256:${"e".repeat(64)}`,
+              summary: "Fixture authorization drifted before report claim.",
+            }
+            : {
+              status: "PASS",
+              evidenceHash: `sha256:${"f".repeat(64)}`,
+              summary: "Fixture authorization permits this report.",
+            },
+        },
+      },
+    });
+    t.after(() => fixture.close());
+    for (const taskId of ["task-a-drifted", "task-b-sendable"]) {
+      const pending = makeTask(taskId);
+      pending.state = taskId === "task-a-drifted" ? "BLOCKED" : "CANCELLED";
+      pending.custody = {
+        status: "RELEASED",
+        claimedAt: null,
+        releasedAt: NOW,
+        releaseReason: pending.state,
+      };
+      pending.lastOutcome = {
+        at: NOW,
+        kind: pending.state === "BLOCKED" ? "INFRASTRUCTURE" : "OPERATOR",
+        result: pending.state === "BLOCKED" ? "BLOCKED" : "CANCELLED",
+        summary: "Fixture terminal report.",
+      };
+      pending.report.state = "PENDING";
+      fixture.store.create(pending);
+    }
+    const transport = new FakeTelegramTransport();
+    const client = control(fixture, transport);
+
+    const denied = await client.tick();
+    const delivered = await client.tick();
+    const retried = await client.tick();
+    const repeated = await client.tick();
+
+    assert.equal(denied.reportTaskId, "task-a-drifted");
+    assert.equal(delivered.reportTaskId, "task-b-sendable");
+    assert.equal(retried.reportTaskId, "task-a-drifted");
+    assert.equal(repeated.reportTaskId, "task-a-drifted");
+    assert.equal(fixture.store.get("task-a-drifted")?.state, "BLOCKED");
+    assert.equal(fixture.store.get("task-a-drifted")?.report.state, "PENDING");
+    assert.equal(transport.sendCalls, 1);
+  });
+
   it("skips an exhausted report without stopping control or later reports", async (t) => {
     const fixture = await harness(t);
     t.after(() => fixture.close());

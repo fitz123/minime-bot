@@ -955,6 +955,38 @@ export class OpsWorkerSupervisor {
     task.report.lastError = null;
   }
 
+  private supersedeIncompatibleUnclaimedReportReceipt(
+    taskId: string,
+    expected: NonNullable<OpsWorkerTask["mutationReceipts"]["report"]>,
+  ): OpsWorkerTask {
+    return this.store.mutate(
+      taskId,
+      {
+        event: "UPDATED",
+        summary: "Superseded an unclaimed report receipt after report input changed",
+      },
+      (task) => {
+        const receipt = task.mutationReceipts.report;
+        if (
+          receipt === null
+          || receipt.operationId !== expected.operationId
+          || receipt.intentHash !== expected.intentHash
+          || receipt.outcome !== null
+          || receipt.mutationStartedAt !== null
+        ) return OPS_WORKER_TASK_STORE_NO_CHANGE;
+        receipt.outcome = {
+          recordedAt: timestampAtOrAfter(this.now(), receipt.queryObservedAt),
+          result: "NOT_NEEDED",
+          evidenceHash: hashOpsWorkerCanonicalPayload({
+            taskId,
+            operationId: receipt.operationId,
+            reason: "report input changed before mutation claim",
+          }),
+        };
+      },
+    ).task;
+  }
+
   #completeOperatorInterrupt(
     taskId: string,
     interrupt: OpsWorkerInterrupt,
@@ -2880,20 +2912,30 @@ export class OpsWorkerSupervisor {
       );
     }
     if (isOpsWorkerReportReconciliationBlocked(task)) return task;
-    const currentReportIdentity = reportIdentity(task);
-    const reportTask = structuredClone(task);
-    const operations = compatibleReportOperations(
+    let currentReportIdentity = reportIdentity(task);
+    let reportTask = structuredClone(task);
+    let operations = compatibleReportOperations(
       reportTask,
       currentReportIdentity,
     );
-    const unfinishedReceipt = task.mutationReceipts.report;
+    let unfinishedReceipt = task.mutationReceipts.report;
+    const priorReceipt = unfinishedReceipt;
     if (
-      unfinishedReceipt?.outcome === null
-      && unfinishedReceipt.mutationStartedAt !== null
+      priorReceipt?.outcome === null
       && !operations.some((candidate) =>
-        matchesReportOperation(candidate, unfinishedReceipt))
+        matchesReportOperation(candidate, priorReceipt))
     ) {
-      return this.isolateIncompatibleReportReceipt(taskId) ?? task;
+      if (priorReceipt.mutationStartedAt !== null) {
+        return this.isolateIncompatibleReportReceipt(taskId) ?? task;
+      }
+      task = this.supersedeIncompatibleUnclaimedReportReceipt(
+        taskId,
+        priorReceipt,
+      );
+      currentReportIdentity = reportIdentity(task);
+      reportTask = structuredClone(task);
+      operations = compatibleReportOperations(reportTask, currentReportIdentity);
+      unfinishedReceipt = task.mutationReceipts.report;
     }
     const operation = unfinishedReceipt?.outcome === null
       ? operations.find((candidate) =>

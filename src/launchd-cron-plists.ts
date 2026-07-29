@@ -70,6 +70,11 @@ export interface CalendarInterval {
   Weekday?: number;
 }
 
+interface LaunchdCronPlistMetadata {
+  label: string;
+  cronHealthTextfileDir?: string;
+}
+
 export interface LaunchdCronContext {
   contract: ResolvedWorkspaceContract;
   launchAgentsDir: string;
@@ -380,7 +385,7 @@ export function planLaunchdCronSync(
   }
 
   if (prune && existsSync(generated.context.launchAgentsDir)) {
-    for (const [label, plistPath] of listOwnedCronPlists(generated.context.launchAgentsDir)) {
+    for (const [label, plistPath] of listOwnedCronPlists(generated.context)) {
       if (desiredByLabel.has(label)) {
         continue;
       }
@@ -431,10 +436,21 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       continue;
     }
     if (item.action === "delete") {
+      const metadata = readLaunchdCronPlistMetadata(
+        planned.context.plutilBin,
+        item.plistPath,
+      );
+      if (
+        metadata === undefined
+        || metadata.label !== item.label
+        || !isOwnedCronLaunchdLabel(metadata.label)
+      ) {
+        throw new Error("persisted cron plist ownership changed before retirement");
+      }
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
       const removedArtifactCount = retireCronHealthMetricArtifacts(
         cronNameFromLaunchdLabel(item.label),
-        readPersistedCronHealthTextfileDir(item.plistPath)
+        metadata.cronHealthTextfileDir
           ?? DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
       );
       item.metricRetirement = {
@@ -1002,18 +1018,20 @@ function runCommand(
   return true;
 }
 
-function listOwnedCronPlists(launchAgentsDir: string): Map<string, string> {
+function listOwnedCronPlists(
+  context: Pick<LaunchdCronContext, "launchAgentsDir" | "plutilBin">,
+): Map<string, string> {
   const found = new Map<string, string>();
-  for (const entry of readdirSync(launchAgentsDir, { withFileTypes: true })) {
+  for (const entry of readdirSync(context.launchAgentsDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".plist")) {
       continue;
     }
-    const plistPath = resolve(launchAgentsDir, entry.name);
-    const label = readLaunchdPlistLabel(plistPath);
-    if (!isOwnedCronLaunchdLabel(label)) {
+    const plistPath = resolve(context.launchAgentsDir, entry.name);
+    const metadata = readLaunchdCronPlistMetadata(context.plutilBin, plistPath);
+    if (metadata === undefined || !isOwnedCronLaunchdLabel(metadata.label)) {
       continue;
     }
-    found.set(label, plistPath);
+    found.set(metadata.label, plistPath);
   }
   return found;
 }
@@ -1119,56 +1137,40 @@ function retireCronHealthMetricArtifacts(
   return removed;
 }
 
-function readPersistedCronHealthTextfileDir(
+function readLaunchdCronPlistMetadata(
+  plutilBin: string,
   plistPath: string,
-): string | undefined {
-  let content: string;
-  try {
-    content = readFileSync(plistPath, "utf8");
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    throw new Error(
-      `failed to read persisted cron health metric directory${code ? `: ${code}` : ""}`,
-    );
+): LaunchdCronPlistMetadata | undefined {
+  const parsed = parsePlistJson(plutilBin, plistPath);
+  if (!parsed.ok || !isPlainRecord(parsed.value)) return undefined;
+  const label = parsed.value.Label;
+  if (typeof label !== "string") return undefined;
+  if (!isOwnedCronLaunchdLabel(label)) return { label };
+
+  const environment = parsed.value.EnvironmentVariables;
+  if (environment === undefined) return { label };
+  if (!isPlainRecord(environment)) {
+    throw new Error("persisted cron plist has unsafe environment variables");
   }
-  const sections = [...content.matchAll(
-    /<key>\s*EnvironmentVariables\s*<\/key>\s*<dict>([\s\S]*?)<\/dict>/g,
-  )];
-  if (sections.length === 0) return undefined;
-  if (sections.length !== 1) {
-    throw new Error("persisted cron plist has ambiguous environment variables");
-  }
-  const values = [...sections[0][1].matchAll(
-    new RegExp(
-      `<key>\\s*${CRON_HEALTH_TEXTFILE_DIR_ENV}\\s*</key>\\s*<string>([^<]*)</string>`,
-      "g",
-    ),
-  )];
-  if (values.length === 0) return undefined;
-  if (values.length !== 1) {
-    throw new Error("persisted cron plist has ambiguous cron health metric directories");
-  }
-  const encoded = values[0][1];
-  const decoded = xmlUnescape(encoded);
+  const selectedDir = environment[CRON_HEALTH_TEXTFILE_DIR_ENV];
+  if (selectedDir === undefined) return { label };
   if (
-    xmlEscape(decoded) !== encoded
-    || decoded.trim() !== decoded
-    || !isAbsolute(decoded)
-    || normalize(decoded) !== decoded
+    typeof selectedDir !== "string"
+    || selectedDir.trim() !== selectedDir
+    || !isAbsolute(selectedDir)
+    || normalize(selectedDir) !== selectedDir
   ) {
     throw new Error("persisted cron health metric directory is unsafe");
   }
-  return decoded;
+  return { label, cronHealthTextfileDir: selectedDir };
 }
 
-function readLaunchdPlistLabel(plistPath: string): string {
-  try {
-    const content = readFileSync(plistPath, "utf8");
-    const match = content.match(/<key>\s*Label\s*<\/key>\s*<string>([^<]+)<\/string>/);
-    return match ? xmlUnescape(match[1]) : "";
-  } catch {
-    return "";
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
   }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function isIgnorableBootoutFailure(args: readonly string[], result: LaunchdCommandResult): boolean {
@@ -1177,15 +1179,6 @@ function isIgnorableBootoutFailure(args: readonly string[], result: LaunchdComma
   }
   const message = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
   return /not loaded|no such process|could not find service|service .*not found|no such file/i.test(message);
-}
-
-function xmlUnescape(value: string): string {
-  return value
-    .replaceAll("&apos;", "'")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&gt;", ">")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&amp;", "&");
 }
 
 function countPlanItems(items: readonly LaunchdCronPlanItem[]): Record<LaunchdCronPlanAction, number> {
