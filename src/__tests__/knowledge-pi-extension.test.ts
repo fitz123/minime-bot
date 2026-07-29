@@ -332,6 +332,8 @@ describe("Knowledge Pi extension helpers", () => {
       ["find artifacts -delete", "artifacts"],
       ["rsync -a --delete /tmp/empty/ artifacts/", "artifacts"],
       ["git restore artifacts", "artifacts"],
+      ["tar -xf payload.tar", workspace],
+      ["tar -xf payload.tar -Cartifacts", "artifacts"],
       ["node delete-tree.js artifacts", "artifacts"],
       ["node delete-tree.js --root=artifacts", "artifacts"],
       [
@@ -363,6 +365,8 @@ describe("Knowledge Pi extension helpers", () => {
       "git clean -fdx",
       "git reset --hard",
       "git stash --include-untracked",
+      "git checkout-index -a -f",
+      "git read-tree -u --reset HEAD^",
     ]) {
       assertBlocked(
         workspace,
@@ -395,6 +399,7 @@ describe("Knowledge Pi extension helpers", () => {
       "touch artifacts/maintenance-report.json",
       "mv source.md artifacts",
       "node report.js artifacts/maintenance",
+      "tar -xf payload.tar -Cartifacts/maintenance",
     ]) {
       assert.equal(
         classifyKnowledgeIntegrityToolCall(

@@ -245,6 +245,7 @@ const WORKTREE_MUTATING_GIT_SUBCOMMANDS = new Set([
   "am",
   "apply",
   "checkout",
+  "checkout-index",
   "cherry-pick",
   "merge",
   "pull",
@@ -513,6 +514,8 @@ function extractBashDestructiveAncestorTargetsAtDepth(
           /^-[^-]*[aRr]/.test(arg))
       ) {
         appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, env);
+      } else if (name === "tar" && tarExtracts(args)) {
+        appendTargetCandidates(targets, tarExtractionTargets(args, commandCwd, env), commandCwd, env);
       } else if (name === "git") {
         const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, env);
         if (worktreeTarget) {
@@ -931,6 +934,9 @@ function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boole
   if (subcommand === "clean") {
     return !args.some((arg) => arg === "--dry-run" || /^-[^-]*n/.test(arg));
   }
+  if (subcommand === "read-tree") {
+    return args.some((arg) => /^-[^-]*u/.test(arg));
+  }
   if (subcommand === "reset") {
     return args.some((arg) => arg === "--hard" || arg === "--merge" || arg === "--keep");
   }
@@ -939,6 +945,50 @@ function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boole
     return !action || !new Set(["clear", "create", "drop", "list", "show", "store"]).has(action);
   }
   return WORKTREE_MUTATING_GIT_SUBCOMMANDS.has(subcommand);
+}
+
+function tarExtracts(args: string[]): boolean {
+  return args.some((arg, index) =>
+    arg === "--extract" ||
+    arg === "--get" ||
+    (!arg.startsWith("--") && (
+      (arg.startsWith("-") && arg.slice(1).includes("x")) ||
+      (index === 0 && !arg.startsWith("-") && arg.includes("x"))
+    ))
+  );
+}
+
+function tarExtractionTargets(
+  args: string[],
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string[] {
+  const targets: string[] = [];
+  let effectiveCwd = cwd;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    let directory: string | undefined;
+    if (arg === "-C" || arg === "--directory") {
+      directory = args[index + 1];
+      index += 1;
+    } else if (arg.startsWith("-C") && arg.length > 2) {
+      directory = arg.slice(2);
+    } else if (arg.startsWith("--directory=")) {
+      directory = arg.slice("--directory=".length);
+    }
+    if (!directory) {
+      continue;
+    }
+
+    effectiveCwd = resolveCwdOption(directory, effectiveCwd, env);
+    appendTarget(targets, effectiveCwd ?? directory);
+  }
+
+  if (targets.length === 0) {
+    appendTarget(targets, effectiveCwd ?? ".");
+  }
+  return targets;
 }
 
 function resolveGitWorktreeOption(
