@@ -56,6 +56,9 @@ import {
 const FAKE_PI_PROCESS = fileURLToPath(
   new URL("./fixtures/fake-pi-process.mjs", import.meta.url),
 );
+const FAKE_OPS_CONVERSATION = fileURLToPath(
+  new URL("./fixtures/fake-ops-conversation.mjs", import.meta.url),
+);
 const TSX_IMPORT = import.meta.resolve("tsx");
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const CLI_PRIMARY_CONTEXT_AGENT = {
@@ -934,6 +937,87 @@ reply:
     ], fixture.root, deps);
     assert.equal(nonStart.code, 2);
     assert.match(nonStart.stderr, /unknown worker status option: --control-config/);
+  });
+
+  it("wires ordinary Ops text to the package conversation runner only under control config", async (t) => {
+    const fixture = fixtureRoot(t);
+    const contracts = fixtureContracts();
+    const controlConfig = join(fixture.root, "ops-conversation-control.yaml");
+    writeFileSync(controlConfig, `
+telegram:
+  tokenEnv: TEST_OPS_TOKEN
+  controlChatId: "100000000"
+  operatorIds: ["100000000"]
+poll:
+  longPollSeconds: 1
+  requestTimeoutMs: 2000
+  retryMinMs: 10
+  retryMaxMs: 20
+  maxResponseBytes: 65536
+reply:
+  maxBytes: 1024
+`);
+    const sent: string[] = [];
+    let conversationArgs: readonly string[] = [];
+    const result = await runWorkerCli([
+      "worker",
+      "start",
+      "--state-dir",
+      fixture.stateDirectory,
+      "--agent-workspace",
+      fixture.workspace,
+      "--port",
+      "0",
+      "--control-config",
+      controlConfig,
+      "--once",
+    ], fixture.root, dependencies(contracts, {
+      controlConfigEnv: { TEST_OPS_TOKEN: "TEST_OPS_TOKEN" },
+      telegramFetch: async (input, init) => {
+        const method = String(input).split("/").at(-1);
+        if (method === "getUpdates") {
+          return Response.json({
+            ok: true,
+            result: [{
+              update_id: 1,
+              message: {
+                message_id: 1,
+                date: Math.floor(Date.now() / 1_000),
+                text: "Что сейчас происходит?",
+                from: { id: 100000000, is_bot: false },
+                chat: { id: 100000000, type: "private" },
+              },
+            }],
+          });
+        }
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          text?: string;
+        };
+        sent.push(body.text ?? "");
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      },
+      conversationRunnerDependencies: {
+        resolveInvocation: (args) => {
+          conversationArgs = args;
+          return {
+            command: process.execPath,
+            args: [FAKE_OPS_CONVERSATION],
+          };
+        },
+        buildEnv: () => Object.fromEntries(
+          ["HOME", "PATH", "TMPDIR", "LANG"].flatMap((key) =>
+            process.env[key] === undefined
+              ? []
+              : [[key, process.env[key] as string]]),
+        ),
+      },
+    }));
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(sent, ["Локальный тестовый ответ Ops."]);
+    assert.ok(conversationArgs.includes("--no-tools"));
+    assert.ok(conversationArgs.includes("--no-session"));
+    assert.ok(conversationArgs.includes("--no-context-files"));
   });
 
   it("requires the quota dependency but bypasses closed initial admission for CLI operations", async (t) => {

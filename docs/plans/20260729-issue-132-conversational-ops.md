@@ -70,11 +70,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 4: Integrate incident-first admission and safe natural-language steering
 **Serves:** Conversation must not starve remediation or bypass lifecycle authorization, and unambiguous answer/retry/pause/resume/cancel intent must work without IDs while ambiguity performs no mutation.
-- [ ] Add one in-memory bounded conversation lane that acknowledges and continues polling independently, so long voice/provider work cannot delay later slash commands or report delivery.
-- [ ] Make scheduler admission deterministically higher priority: reject conversation while incident work is active/runnable, and abort/reap an in-flight conversational child before an incident Pi launch can proceed.
-- [ ] Centralize fixed command operations so slash and validated natural-language intents share exact task eligibility, replay IDs, authorization/lifecycle checks, audit writes, and replies; retain at most one expiring clarification with no mutation until exact selection.
-- [ ] Add race/fault tests for simultaneous Q&A and incident arrival, concurrency saturation, preemption, unambiguous steering audit, ambiguous clarification, duplicate Telegram delivery, command/provider independence, and unchanged custody ownership.
-- [ ] Run the full validation command set and perform a final scope/public-data cut pass.
+- [x] Add one in-memory bounded conversation lane that acknowledges and continues polling independently, so long voice/provider work cannot delay later slash commands or report delivery.
+- [x] Make scheduler admission deterministically higher priority: reject conversation while incident work is active/runnable, and abort/reap an in-flight conversational child before an incident Pi launch can proceed.
+- [x] Centralize fixed command operations so slash and validated natural-language intents share exact task eligibility, replay IDs, authorization/lifecycle checks, audit writes, and replies; retain at most one expiring clarification with no mutation until exact selection.
+- [x] Add race/fault tests for simultaneous Q&A and incident arrival, concurrency saturation, preemption, unambiguous steering audit, ambiguous clarification, duplicate Telegram delivery, command/provider independence, and unchanged custody ownership.
+- [x] Run the full validation command set and perform a final scope/public-data cut pass.
 
 ## Post-completion
 - Open one sanitized feature PR linked to #132 and complete CI/Copilot review.

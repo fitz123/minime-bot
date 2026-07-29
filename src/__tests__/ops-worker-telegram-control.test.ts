@@ -14,6 +14,7 @@ import type { OpsWorkerControlConfig } from "../ops-worker/control-config.js";
 import { OpsWorkerControlLedger } from "../ops-worker/control-ledger.js";
 import { OpsWorkerDoneCheckRegistry } from "../ops-worker/done-checks.js";
 import { hashOpsWorkerCanonicalPayload } from "../ops-worker/lifecycle.js";
+import { OpsWorkerConversationLane } from "../ops-worker/conversation-lane.js";
 import {
   OpsWorkerSupervisor,
   type OpsWorkerSupervisorOptions,
@@ -130,6 +131,33 @@ function makeTask(id: string): OpsWorkerTask {
     createdAt: NOW,
     updatedAt: NOW,
   });
+}
+
+function makeBlockedInputTask(id: string): OpsWorkerTask {
+  const task = makeTask(id);
+  task.state = "BLOCKED";
+  task.custody = {
+    status: "RELEASED",
+    claimedAt: null,
+    releasedAt: NOW,
+    releaseReason: "BLOCKED",
+  };
+  task.lastOutcome = {
+    at: NOW,
+    kind: "OPERATOR",
+    result: "BLOCKED",
+    summary: "Fixture requires bounded operator input.",
+  };
+  task.agentResult = {
+    attemptId: `attempt-${id}`,
+    kind: "input-needed",
+    summary: "Fixture asks one bounded question.",
+    actions: [],
+    requestedInput: "Which fixture value should be used?",
+    reason: "information",
+  };
+  task.report.state = "PENDING";
+  return task;
 }
 
 class FakeTelegramTransport {
@@ -274,6 +302,7 @@ function control(
   conversation: {
     handleConversation?: OpsWorkerConversationHandler;
     ingestVoice?: OpsWorkerVoiceIngestor;
+    conversationLane?: OpsWorkerConversationLane;
   } = {},
 ): OpsWorkerTelegramControl {
   return new OpsWorkerTelegramControl({
@@ -315,14 +344,14 @@ describe("ops worker dedicated Telegram control", () => {
     t.after(() => fixture.close());
     const transport = new FakeTelegramTransport();
     const question = "Что сейчас требует моего внимания?";
-    transport.updates.push([
-      update(1, question),
-      voiceUpdate(2, "voice-file-2", {
+    transport.updates.push(
+      [update(1, question)],
+      [voiceUpdate(2, "voice-file-2", {
         duration: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxDurationSeconds,
         fileSize: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
         mimeType: "audio/ogg",
-      }),
-    ]);
+      })],
+    );
     const handled: string[] = [];
     const ingestions: Array<{
       url: string;
@@ -330,7 +359,7 @@ describe("ops worker dedicated Telegram control", () => {
       downloadTimeoutMs: number | undefined;
     }> = [];
 
-    await control(fixture, transport, undefined, () => new Date(NOW), {
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
       handleConversation: (text) => {
         handled.push(text);
         return `Ответ: ${text}`;
@@ -343,7 +372,11 @@ describe("ops worker dedicated Telegram control", () => {
         });
         return question;
       },
-    }).tick();
+    });
+    await client.tick();
+    await client.waitForConversation();
+    await client.tick();
+    await client.waitForConversation();
 
     assert.deepStrictEqual(handled, [question, question]);
     assert.deepStrictEqual(
@@ -422,16 +455,16 @@ describe("ops worker dedicated Telegram control", () => {
       { ok: true, result: { file_path: "voice/transcription-error.oga" } },
       { ok: true, result: { file_path: "voice/empty.oga" } },
     );
-    transport.updates.push([
-      voiceUpdate(20, "voice-invalid-path"),
-      voiceUpdate(21, "voice-sensitive-error"),
-      voiceUpdate(22, "voice-empty"),
-      update(23, "/status"),
-    ]);
+    transport.updates.push(
+      [voiceUpdate(20, "voice-invalid-path")],
+      [voiceUpdate(21, "voice-sensitive-error")],
+      [voiceUpdate(22, "voice-empty")],
+      [update(23, "/status")],
+    );
     let ingestionCalls = 0;
     let conversationCalls = 0;
 
-    await control(fixture, transport, undefined, () => new Date(NOW), {
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
       handleConversation: () => {
         conversationCalls += 1;
         return "unexpected";
@@ -445,7 +478,11 @@ describe("ops worker dedicated Telegram control", () => {
         }
         return "";
       },
-    }).tick();
+    });
+    for (let index = 0; index < 4; index += 1) {
+      await client.tick();
+      await client.waitForConversation();
+    }
 
     assert.equal(ingestionCalls, 2);
     assert.equal(conversationCalls, 0);
@@ -460,6 +497,260 @@ describe("ops worker dedicated Telegram control", () => {
     }));
     assert.equal(transport.getFileBodies.length, 3);
     assert.equal(fixture.ledger.read().lastAckedUpdateId, 23);
+  });
+
+  it("acknowledges one bounded turn without delaying later commands or reports and rejects saturation", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([update(1, "Дай подробный статус")]);
+    let resolveConversation!: (reply: string) => void;
+    const pendingConversation = new Promise<string>((resolvePromise) => {
+      resolveConversation = resolvePromise;
+    });
+    let conversationCalls = 0;
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return pendingConversation;
+      },
+    });
+
+    await client.tick();
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 1);
+    assert.equal(conversationCalls, 1);
+
+    fixture.store.create(makeBlockedInputTask("task-report-during-conversation"));
+    transport.updates.push([
+      update(2, "И ещё один вопрос"),
+      update(3, "/status"),
+    ]);
+    await client.tick();
+
+    const repliesBeforeCompletion = transport.messages.map((message) =>
+      String(message.text));
+    assert.equal(conversationCalls, 1);
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 3);
+    assert.ok(repliesBeforeCompletion.some((text) => text.startsWith("Ops incident:")));
+    assert.ok(repliesBeforeCompletion.includes(
+      "Conversational Ops is unavailable. Use /status, /tasks, or /task <id>.",
+    ));
+    assert.ok(repliesBeforeCompletion.some((text) => text.startsWith("Ops worker status")));
+
+    resolveConversation("Подробный ответ готов.");
+    await client.waitForConversation();
+    assert.ok(transport.messages.some((message) =>
+      message.text === "Подробный ответ готов."));
+  });
+
+  it("acknowledges duplicate conversational delivery exactly once", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const transport = new FakeTelegramTransport();
+    const duplicate = update(10, "Что изменилось?");
+    transport.updates.push([duplicate], [duplicate]);
+    let conversationCalls = 0;
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => {
+        conversationCalls += 1;
+        return "Ничего не изменилось.";
+      },
+    });
+
+    await client.tick();
+    await client.waitForConversation();
+    await client.tick();
+    await client.waitForConversation();
+
+    assert.equal(conversationCalls, 1);
+    assert.deepEqual(
+      transport.messages.map((message) => message.text),
+      ["Ничего не изменилось."],
+    );
+    assert.equal(fixture.ledger.read().lastAckedUpdateId, 10);
+  });
+
+  it("applies one unambiguous natural answer through the slash operation and preserves custody", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const task = makeBlockedInputTask("task-natural-answer");
+    fixture.store.create(task);
+    const custodyBefore = structuredClone(task.custody);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([update(30, "Используй синюю конфигурацию")]);
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: () => ({
+        status: "OK",
+        envelope: {
+          version: 1,
+          kind: "control",
+          language: "ru",
+          intent: "answer",
+          taskReference: null,
+          argument: "используй синюю конфигурацию",
+        },
+      }),
+    });
+
+    await client.tick();
+    await client.waitForConversation();
+
+    const changed = fixture.store.get(task.id);
+    assert.deepEqual(changed?.custody, custodyBefore);
+    assert.equal(changed?.steering.length, 1);
+    assert.equal(changed?.steering[0].kind, "answer");
+    assert.equal(changed?.steering[0].text, "используй синюю конфигурацию");
+    assert.match(
+      changed?.steering[0].steeringId ?? "",
+      /^telegram:update:30:sha256:[a-f0-9]{64}$/,
+    );
+    const journal = readFileSync(fixture.store.journalPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { event: string; summary: string });
+    assert.ok(journal.some((entry) =>
+      entry.event === "EVIDENCE"
+      && entry.summary === "Recorded durable operator steering"));
+    assert.ok(transport.messages.some((message) =>
+      message.text === `Recorded answer for ${task.id}.`));
+  });
+
+  it("requires one exact bounded clarification before choosing among eligible tasks", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const first = makeBlockedInputTask("task-natural-a");
+    const second = makeBlockedInputTask("task-natural-b");
+    fixture.store.create(first);
+    fixture.store.create(second);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push(
+      [update(40, "Используй синий вариант")],
+      [update(41, "task-natural-b")],
+    );
+    let calls = 0;
+    let priorQuestion = "";
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      handleConversation: (_text, _input, options) => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            status: "OK",
+            envelope: {
+              version: 1,
+              kind: "control",
+              language: "ru",
+              intent: "answer",
+              taskReference: second.id,
+              argument: "используй синий вариант",
+            },
+          };
+        }
+        priorQuestion = options?.previousClarification?.question ?? "";
+        return {
+          status: "OK",
+          envelope: {
+            version: 1,
+            kind: "control",
+            language: "ru",
+            intent: "answer",
+            taskReference: second.id,
+            argument: "неавторитетный новый аргумент",
+          },
+        };
+      },
+    });
+
+    await client.tick();
+    await client.waitForConversation();
+    assert.equal(fixture.store.get(first.id)?.steering.length, 0);
+    assert.equal(fixture.store.get(second.id)?.steering.length, 0);
+    const clarification = transport.messages
+      .map((message) => String(message.text))
+      .find((text) => text.startsWith("Уточните задачу:"));
+    assert.ok(clarification?.includes(first.id));
+    assert.ok(clarification?.includes(second.id));
+
+    await client.tick();
+    await client.waitForConversation();
+    assert.equal(priorQuestion, clarification);
+    assert.equal(fixture.store.get(first.id)?.steering.length, 0);
+    assert.equal(fixture.store.get(second.id)?.steering.length, 1);
+    assert.equal(
+      fixture.store.get(second.id)?.steering[0].text,
+      "используй синий вариант",
+    );
+  });
+
+  it("preempts voice before incident launch and rejects conversation while incident work is runnable", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    const events: string[] = [];
+    const lane = new OpsWorkerConversationLane({
+      blocksAdmission: () => fixture.supervisor.blocksConversationAdmission(),
+      abortConversation: async () => {
+        events.push("conversation-reaped");
+        return true;
+      },
+    });
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      voiceUpdate(50, "voice-preempt"),
+      update(51, "/status"),
+    ]);
+    let resolveIngestionStarted!: () => void;
+    const ingestionStarted = new Promise<void>((resolvePromise) => {
+      resolveIngestionStarted = resolvePromise;
+    });
+    let conversationCalls = 0;
+    const client = control(fixture, transport, undefined, () => new Date(NOW), {
+      conversationLane: lane,
+      handleConversation: () => {
+        conversationCalls += 1;
+        return "unexpected";
+      },
+      ingestVoice: async (_url, options) => {
+        resolveIngestionStarted();
+        return await new Promise<string>((_resolve, reject) => {
+          const abort = (): void => {
+            events.push("voice-aborted");
+            reject(new Error("voice preempted"));
+          };
+          if (options.signal?.aborted) abort();
+          else options.signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
+    });
+
+    await client.tick();
+    await ingestionStarted;
+    assert.ok(transport.messages.some((message) =>
+      String(message.text).startsWith("Ops worker status")));
+
+    fixture.store.create(makeTask("task-incident-arrival"));
+    assert.equal(fixture.supervisor.blocksConversationAdmission(), true);
+    await lane.runIncident(async () => {
+      events.push("incident-launch");
+    });
+    await client.waitForConversation();
+
+    assert.deepEqual(events, [
+      "voice-aborted",
+      "conversation-reaped",
+      "incident-launch",
+    ]);
+    assert.equal(conversationCalls, 0);
+    assert.equal(
+      fixture.store.get("task-incident-arrival")?.custody.status,
+      "UNCLAIMED",
+    );
+
+    transport.updates.push([update(52, "Можно поговорить?")]);
+    await client.tick();
+    assert.equal(conversationCalls, 0);
+    assert.equal(
+      transport.messages.at(-1)?.text,
+      "Conversational Ops is unavailable. Use /status, /tasks, or /task <id>.",
+    );
   });
 
   it("persists effects and offsets, rejects the allowlist, and replays duplicates as no-ops", async (t) => {

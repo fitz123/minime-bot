@@ -19,6 +19,7 @@ import {
 } from "./reporting.js";
 import {
   isOpsWorkerReportReconciliationBlocked,
+  isOpsWorkerUnresolvedOrphan,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -34,7 +35,16 @@ import {
   ingestLocalAudio,
   type LocalAudioIngestionOptions,
 } from "../voice.js";
-import { OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE } from "./conversation-runner.js";
+import {
+  OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE,
+  OPS_WORKER_CONVERSATION_RUNNER_LIMITS,
+  type OpsWorkerConversationControlIntent,
+  type OpsWorkerConversationControlProposal,
+  type OpsWorkerConversationTurnOptions,
+  type OpsWorkerConversationTurnResult,
+  type OpsWorkerPreviousClarification,
+} from "./conversation-runner.js";
+import { OpsWorkerConversationLane } from "./conversation-lane.js";
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
@@ -44,6 +54,8 @@ const TELEGRAM_FILE_ID_MAX_BYTES = 512;
 const TELEGRAM_FILE_PATH_MAX_BYTES = 1_024;
 const TELEGRAM_FILE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const TELEGRAM_FILE_PATH_PATTERN = /^[A-Za-z0-9_./-]+$/;
+const CONVERSATION_CLARIFICATION_TTL_MS = 5 * 60 * 1_000;
+const MAX_CONVERSATION_CLARIFICATION_CANDIDATES = 16;
 
 export const OPS_WORKER_TELEGRAM_VOICE_LIMITS = Object.freeze({
   maxBytes: 20 * 1024 * 1024,
@@ -72,7 +84,11 @@ export interface OpsWorkerConversationInput {
 export type OpsWorkerConversationHandler = (
   text: string,
   input: OpsWorkerConversationInput,
-) => string | Promise<string>;
+  options?: OpsWorkerConversationTurnOptions,
+) =>
+  | string
+  | OpsWorkerConversationTurnResult
+  | Promise<string | OpsWorkerConversationTurnResult>;
 
 export type OpsWorkerVoiceIngestor = (
   url: string,
@@ -93,6 +109,7 @@ export interface OpsWorkerTelegramControlOptions {
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   handleConversation?: OpsWorkerConversationHandler;
+  conversationLane?: OpsWorkerConversationLane;
   ingestVoice?: OpsWorkerVoiceIngestor;
   sensitiveValues?: readonly string[];
   /** Test-only durable-boundary hook. Production callers should leave this unset. */
@@ -128,6 +145,24 @@ interface ParsedTelegramVoiceMessage extends ParsedTelegramMessageBase {
 type ParsedTelegramMessage =
   | ParsedTelegramTextMessage
   | ParsedTelegramVoiceMessage;
+
+interface OpsWorkerControlOperation {
+  command: OpsWorkerConversationControlIntent;
+  taskId: string;
+  argument: string | null;
+}
+
+interface OpsWorkerClarificationSlot {
+  expiresAt: number;
+  previous: OpsWorkerPreviousClarification;
+  control:
+    | {
+        intent: OpsWorkerConversationControlIntent;
+        argument: string | null;
+        candidateIds: readonly string[];
+      }
+    | null;
+}
 
 export class OpsWorkerTelegramTransportError extends Error {
   constructor(message: string) {
@@ -443,9 +478,12 @@ export class OpsWorkerTelegramControl {
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly handleConversation: OpsWorkerConversationHandler;
+  private readonly conversationLane: OpsWorkerConversationLane;
   private readonly ingestVoice: OpsWorkerVoiceIngestor;
   private readonly redactAgentField: OpsWorkerFieldRedactor;
   private pendingReply: string | undefined;
+  private conversationDelivery: Promise<void> | null = null;
+  private clarification: OpsWorkerClarificationSlot | null = null;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
     | undefined;
@@ -463,6 +501,11 @@ export class OpsWorkerTelegramControl {
     this.sleep = options.sleep ?? defaultSleep;
     this.handleConversation = options.handleConversation
       ?? (() => OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE);
+    this.conversationLane = options.conversationLane
+      ?? new OpsWorkerConversationLane({
+        blocksAdmission: () => this.supervisor.blocksConversationAdmission(),
+        abortConversation: async () => true,
+      });
     this.ingestVoice = options.ingestVoice ?? ingestLocalAudio;
     this.redactAgentField = createOpsWorkerFieldRedactor([
       options.config.telegram.token,
@@ -490,18 +533,28 @@ export class OpsWorkerTelegramControl {
     return { updates: updates.length, reportTaskId };
   }
 
+  async waitForConversation(): Promise<void> {
+    while (this.conversationDelivery !== null) {
+      await this.conversationDelivery;
+    }
+  }
+
   async run(signal: AbortSignal): Promise<void> {
     let backoff = this.config.poll.retryMinMs;
-    while (!signal.aborted) {
-      try {
-        await this.tick(signal);
-        backoff = this.config.poll.retryMinMs;
-      } catch (error) {
-        if (signal.aborted) return;
-        if (!(error instanceof OpsWorkerTelegramTransportError)) throw error;
-        await this.sleep(backoff, signal);
-        backoff = Math.min(this.config.poll.retryMaxMs, backoff * 2);
+    try {
+      while (!signal.aborted) {
+        try {
+          await this.tick(signal);
+          backoff = this.config.poll.retryMinMs;
+        } catch (error) {
+          if (signal.aborted) return;
+          if (!(error instanceof OpsWorkerTelegramTransportError)) throw error;
+          await this.sleep(backoff, signal);
+          backoff = Math.min(this.config.poll.retryMaxMs, backoff * 2);
+        }
       }
+    } finally {
+      await this.conversationLane.close();
     }
   }
 
@@ -597,9 +650,55 @@ export class OpsWorkerTelegramControl {
       });
       return;
     }
+    const isConversation = message.kind === "voice"
+      || !message.text.trimStart().startsWith("/");
+    if (isConversation) {
+      this.ledger.record(updateId, fingerprint, {
+        epoch,
+        acknowledgedAt: this.now(),
+      });
+      this.faultInjector?.("after-ledger-before-reply", updateId);
+      const turn = this.conversationLane.tryStart(
+        async (turnSignal) => this.dispatchConversationMessage(
+          message,
+          turnSignal,
+        ),
+      );
+      if (turn === null) {
+        this.pendingReply = OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+        await this.flushPendingReply(signal);
+        return;
+      }
+      let delivery!: Promise<void>;
+      delivery = (async () => {
+        let reply = OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+        try {
+          reply = await turn;
+        } catch {
+          // The reply remains the deterministic provider-independent fallback.
+        }
+        try {
+          await this.sendMessage(reply, signal);
+        } catch {
+          if (!signal.aborted && this.pendingReply === undefined) {
+            this.pendingReply = reply;
+          }
+        }
+      })().finally(() => {
+        if (this.conversationDelivery === delivery) {
+          this.conversationDelivery = null;
+        }
+      });
+      this.conversationDelivery = delivery;
+      return;
+    }
+
+    if (message.kind !== "text") {
+      throw new TypeError("Only text messages can reach slash-command dispatch");
+    }
     let reply: string;
     try {
-      reply = await this.dispatchMessage(message, signal);
+      reply = this.dispatchCommand(message);
     } catch (error) {
       if (!(error instanceof OpsWorkerSteeringCapacityError)) throw error;
       reply = "The task has no remaining steering capacity; the command was not recorded.";
@@ -614,25 +713,24 @@ export class OpsWorkerTelegramControl {
     await this.flushPendingReply(signal);
   }
 
-  private async dispatchMessage(
+  private async dispatchConversationMessage(
     message: ParsedTelegramMessage,
-    signal: AbortSignal,
+    turnSignal: AbortSignal,
   ): Promise<string> {
     if (message.kind === "text") {
-      return message.text.trimStart().startsWith("/")
-        ? this.dispatchCommand(message)
-        : this.conversationReply(message.text, message);
+      return this.conversationReply(message.text, message, turnSignal);
     }
     try {
       const value = await this.telegramApi("getFile", {
         file_id: message.fileId,
-      }, signal);
+      }, turnSignal);
       const filePath = parseGetFilePath(value);
       const transcript = await this.ingestVoice(
         `https://api.telegram.org/file/bot${this.config.telegram.token}/${filePath}`,
         {
           maxBytes: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
           downloadTimeoutMs: OPS_WORKER_TELEGRAM_VOICE_LIMITS.downloadTimeoutMs,
+          signal: turnSignal,
         },
       );
       if (
@@ -641,28 +739,49 @@ export class OpsWorkerTelegramControl {
         || transcript.includes("\0")
         || Buffer.byteLength(transcript, "utf8") > MAX_COMMAND_BYTES
       ) return OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
-      return this.conversationReply(transcript, message);
+      return this.conversationReply(transcript, message, turnSignal);
     } catch {
-      return OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
+      return turnSignal.aborted
+        ? OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE
+        : OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
     }
   }
 
   private async conversationReply(
     text: string,
     message: ParsedTelegramMessageBase,
+    signal: AbortSignal,
   ): Promise<string> {
+    const clarification = this.takeClarification();
     try {
       const reply = await this.handleConversation(text, {
         updateId: message.updateId,
         senderId: message.senderId,
         chatId: message.chatId,
         receivedAt: message.receivedAt,
+      }, {
+        signal,
+        ...(clarification === null
+          ? {}
+          : { previousClarification: clarification.previous }),
       });
-      return typeof reply === "string"
-        && reply.trim() !== ""
-        && !reply.includes("\0")
-        ? reply
-        : OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+      if (typeof reply === "string") {
+        return reply.trim() !== "" && !reply.includes("\0")
+          ? reply
+          : OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+      }
+      if (reply.status === "FALLBACK") return reply.reply;
+      if (reply.envelope.kind === "answer") return reply.envelope.text;
+      if (reply.envelope.kind === "clarification") {
+        this.storeClarification(text, reply.envelope.text, null);
+        return reply.envelope.text;
+      }
+      return this.dispatchNaturalControl(
+        reply.envelope,
+        text,
+        message,
+        clarification,
+      );
     } catch {
       return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
     }
@@ -711,10 +830,54 @@ export class OpsWorkerTelegramControl {
         || !text
         || Buffer.byteLength(text, "utf8") > OPS_WORKER_LIMITS.maxSteeringTextBytes
       ) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: text,
+      }, message);
+    }
+    if (command === "pause" || command === "resume" || command === "retry") {
+      const taskId = taskArgument(tail);
+      if (taskId === null) return usage();
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: null,
+      }, message);
+    }
+    if (command === "cancel") {
+      const cancellation = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");
+      const taskId = taskArgument(cancellation?.[1]);
+      const reason = cancellation?.[2]?.trim();
+      if (
+        taskId === null
+        || !reason
+        || Buffer.byteLength(reason, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
+      ) return usage();
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: reason,
+      }, message);
+    }
+    return usage();
+  }
+
+  private dispatchControlOperation(
+    operation: OpsWorkerControlOperation,
+    message: ParsedTelegramMessageBase,
+  ): string {
+    const { command, taskId, argument } = operation;
+    const task = this.supervisor.getTask(taskId);
+    if (!task) return `Unknown ops-worker task ${taskId}.`;
+    const steeringId = this.steeringId(message);
+    const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+
+    if (command === "answer" || command === "correct") {
+      if (
+        argument === null
+        || Buffer.byteLength(argument, "utf8") > OPS_WORKER_LIMITS.maxSteeringTextBytes
+      ) return usage();
       if ((task.state === "DONE" || task.state === "CANCELLED")
         && !replayed) {
         return `Task ${taskId} is terminal; steering was not recorded.`;
@@ -727,18 +890,14 @@ export class OpsWorkerTelegramControl {
         receivedAt: message.receivedAt,
         kind: command === "answer" ? "answer" : "correction",
         operatorRef: `telegram:${message.senderId}`,
-        text,
+        text: argument,
         consumedAt: null,
       });
       return `Recorded ${command === "answer" ? "answer" : "correction"} for ${taskId}.`;
     }
+
     if (command === "pause" || command === "resume" || command === "retry") {
-      const taskId = taskArgument(tail);
-      if (taskId === null) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+      if (argument !== null) return usage();
       if ((task.state === "DONE" || task.state === "CANCELLED") && !replayed) {
         return `Task ${taskId} is terminal; ${command} was not recorded.`;
       }
@@ -775,26 +934,22 @@ export class OpsWorkerTelegramControl {
       );
       return `${command === "pause" ? "Paused" : "Resumed"} ${taskId}; state=${changed.state}.`;
     }
+
     if (command === "cancel") {
-      const cancellation = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");
-      const taskId = taskArgument(cancellation?.[1]);
-      const reason = cancellation?.[2]?.trim();
       if (
-        taskId === null
-        || !reason
-        || Buffer.byteLength(reason, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
+        argument === null
+        || Buffer.byteLength(argument, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
       ) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if (task.state === "CANCELLED" && replayed) return `Cancellation for ${taskId} was already applied.`;
       if (task.state === "DONE" || task.state === "CANCELLED") {
         return `Task ${taskId} is terminal; cancellation was not recorded.`;
       }
       if (
         task.control.interrupt !== null
-        && (task.control.interrupt.mode !== "cancel" || task.control.interrupt.reason !== reason)
+        && (
+          task.control.interrupt.mode !== "cancel"
+          || task.control.interrupt.reason !== argument
+        )
         && !replayed
       ) return `Task ${taskId} already has a different pending interrupt.`;
       if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
@@ -803,12 +958,151 @@ export class OpsWorkerTelegramControl {
       const changed = this.supervisor.requestOperatorInterrupt(
         taskId,
         "cancel",
-        reason,
-        this.controlSteering(message, "cancel", reason),
+        argument,
+        this.controlSteering(message, "cancel", argument),
       );
       return `Cancellation recorded for ${taskId}; state=${changed.state}.`;
     }
     return usage();
+  }
+
+  private dispatchNaturalControl(
+    proposal: OpsWorkerConversationControlProposal,
+    operatorText: string,
+    message: ParsedTelegramMessageBase,
+    clarification: OpsWorkerClarificationSlot | null,
+  ): string {
+    if (clarification !== null && clarification.control !== null) {
+      const selection = clarification.control;
+      const selectedId = proposal.taskReference;
+      if (
+        proposal.intent === selection.intent
+        && selectedId !== null
+        && selection.candidateIds.includes(selectedId)
+      ) {
+        const selected = this.supervisor.getTask(selectedId);
+        if (
+          selected !== undefined
+          && this.isNaturalControlCandidate(selected, selection.intent, selection.argument)
+        ) {
+          return this.dispatchControlOperation({
+            command: selection.intent,
+            taskId: selectedId,
+            argument: selection.argument,
+          }, message);
+        }
+      }
+      return proposal.language === "ru"
+        ? "Выбор задачи не подтверждён; изменений нет. Используйте /tasks и точную slash-команду."
+        : "Task selection was not confirmed; nothing changed. Use /tasks and an exact slash command.";
+    }
+
+    const candidates = this.supervisor.listTasks()
+      .filter((task) =>
+        this.isNaturalControlCandidate(task, proposal.intent, proposal.argument))
+      .sort((left, right) =>
+        Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+        || left.id.localeCompare(right.id));
+    if (candidates.length === 0) {
+      return proposal.language === "ru"
+        ? "Нет задачи, для которой эта операция сейчас допустима; изменений нет."
+        : "No task is currently eligible for that operation; nothing changed.";
+    }
+    if (candidates.length === 1) {
+      return this.dispatchControlOperation({
+        command: proposal.intent,
+        taskId: candidates[0].id,
+        argument: proposal.argument,
+      }, message);
+    }
+    if (candidates.length > MAX_CONVERSATION_CLARIFICATION_CANDIDATES) {
+      return proposal.language === "ru"
+        ? "Подходящих задач слишком много для безопасного уточнения; изменений нет. Используйте /tasks."
+        : "Too many tasks are eligible for a safe clarification; nothing changed. Use /tasks.";
+    }
+
+    const ids = candidates.map((task) => task.id);
+    const question = proposal.language === "ru"
+      ? `Уточните задачу: ${ids.join(", ")}. Ответьте точным идентификатором.`
+      : `Which task: ${ids.join(", ")}? Reply with the exact identifier.`;
+    this.storeClarification(operatorText, question, {
+      intent: proposal.intent,
+      argument: proposal.argument,
+      candidateIds: ids,
+    });
+    return question;
+  }
+
+  private isNaturalControlCandidate(
+    task: OpsWorkerTask,
+    intent: OpsWorkerConversationControlIntent,
+    argument: string | null,
+  ): boolean {
+    if (task.state === "DONE" || task.state === "CANCELLED") return false;
+    if (task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) return false;
+    if (intent === "answer") {
+      return argument !== null
+        && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxSteeringTextBytes
+        && task.agentResult?.kind === "input-needed"
+        && task.agentResult.requestedInput !== null;
+    }
+    if (intent === "correct") {
+      return argument !== null
+        && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxSteeringTextBytes;
+    }
+    if (intent === "retry") {
+      return argument === null
+        && task.state === "BLOCKED"
+        && !isOpsWorkerUnresolvedOrphan(task)
+        && !isOpsWorkerReportReconciliationBlocked(task)
+        && !(
+          task.mutationReceipts.report?.outcome === null
+          && task.mutationReceipts.report.mutationStartedAt !== null
+        );
+    }
+    if (intent === "pause") {
+      return argument === null
+        && !task.control.paused
+        && task.control.interrupt === null;
+    }
+    if (intent === "resume") {
+      return argument === null
+        && task.control.paused
+        && task.control.interrupt === null;
+    }
+    return argument !== null
+      && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxInterruptReasonBytes
+      && task.control.interrupt === null;
+  }
+
+  private takeClarification(): OpsWorkerClarificationSlot | null {
+    const clarification = this.clarification;
+    this.clarification = null;
+    return clarification !== null && clarification.expiresAt >= this.now().getTime()
+      ? clarification
+      : null;
+  }
+
+  private storeClarification(
+    operatorText: string,
+    question: string,
+    control: OpsWorkerClarificationSlot["control"],
+  ): void {
+    const boundedQuestion = truncateUtf8(
+      question,
+      OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+    );
+    this.clarification = {
+      expiresAt: this.now().getTime() + CONVERSATION_CLARIFICATION_TTL_MS,
+      previous: {
+        operatorText: truncateUtf8(
+          operatorText,
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        ),
+        question: boundedQuestion,
+      },
+      control,
+    };
   }
 
   private controlSteering(

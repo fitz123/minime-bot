@@ -89,6 +89,42 @@ describe("downloadFile", () => {
     }
   });
 
+  it("aborts an in-flight download from the caller signal without retrying", async () => {
+    const originalFetch = globalThis.fetch;
+    const controller = new AbortController();
+    let calls = 0;
+    let resolveFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolvePromise) => {
+      resolveFetchStarted = resolvePromise;
+    });
+    globalThis.fetch = (async (_input, init) => {
+      calls += 1;
+      resolveFetchStarted();
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = (): void => reject(new DOMException("aborted", "AbortError"));
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }) as typeof fetch;
+
+    try {
+      const pending = downloadFile("https://example.com/abort", testDest, {
+        signal: controller.signal,
+      });
+      await fetchStarted;
+      controller.abort();
+      await assert.rejects(
+        pending,
+        (error: Error) =>
+          error instanceof MediaPipelineError && error.stage === "download",
+      );
+      assert.equal(calls, 1);
+      assert.equal(existsSync(testDest), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("aborts when fetched content exceeds the configured byte limit", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => ({

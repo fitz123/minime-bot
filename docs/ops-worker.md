@@ -154,19 +154,45 @@ above when omitted. Secret values never belong in the YAML. Intake is
 optional, but when present its host must be `127.0.0.1` or `::1` and its port
 is also the status server port.
 
+Ordinary allowlisted text is handled by one package-owned, tool-free,
+no-session Pi turn over a bounded redacted snapshot. Telegram voice uses the
+same path after bounded local ffmpeg/whisper transcription and receives only a
+text reply. This behavior is enabled by the existing `--control-config`; it
+requires no additional private configuration and never routes through the
+primary bot.
+
+The conversation lane has one in-flight turn and no queue. Its update is
+acknowledged before local transcription or provider work begins, so polling,
+slash commands, and report delivery continue independently. A second
+conversation receives the deterministic command-guidance fallback. Runnable
+or active incident work closes conversation admission; if incident work
+arrives during a turn, the scheduler aborts and proves the separate
+conversation process group reaped before it launches incident Pi.
+
 The bounded command set is `/status`, `/tasks`, `/task <id>`, `/answer <id>
 <text>`, `/correct <id> <text>`, `/pause <id>`, `/resume <id>`, `/cancel <id>
-<reason>`, and `/retry <id>`. Telegram text can select and steer only an
-existing task. It cannot create tasks or select configuration, commands,
-destinations, URLs, models, tools, templates, profiles, or verifier components.
+<reason>`, and `/retry <id>`. Slash commands are parsed before conversational
+admission and never depend on local transcription, Pi, the provider, or quota.
+Conversational Pi may return only a read-only answer, a clarification, or a
+proposed existing control intent. The host recomputes lifecycle eligibility
+and calls the same operation used by the corresponding slash command. It
+mutates only when exactly one task is eligible, or when the next reply selects
+one exact id from the single five-minute clarification slot; ambiguity and
+expiry perform no mutation. Telegram can steer only an existing task. It
+cannot create tasks or select configuration, commands, destinations, URLs,
+models, tools, templates, profiles, or verifier components.
 
 Every update is fingerprinted in the versioned ledger at
-`<state-dir>/control/telegram.json`. An allowlisted command's task or steering
-effect is persisted first, then the update fingerprint and monotonic offset are
-persisted, and only then is a reply sent. A crash between the task effect and
-ledger write is safe because the update-derived steering id makes redelivery an
-idempotent replay. Malformed and non-allowlisted updates receive no task effect
-or reply, but their fingerprints are retained before the offset advances.
+`<state-dir>/control/telegram.json`. An allowlisted slash command's task or
+steering effect is persisted first, then the update fingerprint and monotonic
+offset are persisted, and only then is a reply sent. A crash between the task
+effect and ledger write is safe because the update-derived steering id makes
+redelivery an idempotent replay. A conversational update is fingerprinted and
+acknowledged before its in-memory turn starts; duplicate delivery therefore
+cannot spawn another turn. Any validated natural control still uses that same
+update-derived steering id in the shared operation path. Malformed and
+non-allowlisted updates receive no task effect or reply, but their fingerprints
+are retained before the offset advances.
 The ledger also records the local acknowledgement time and an update-id epoch.
 After a full week without an update it polls once without the stale offset,
 because Telegram may randomize the next update id, and begins a new epoch when

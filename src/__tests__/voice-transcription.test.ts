@@ -88,10 +88,15 @@ describe("transcribeAudio ASR postprocessing", () => {
       return new Response(new Uint8Array([0x4f, 0x67, 0x67, 0x53]));
     }) as typeof fetch;
     whisperStdout = "Локальная расшифровка.\n";
+    const controller = new AbortController();
 
     const transcript = await ingestLocalAudio(
       "https://api.telegram.org/file/botTEST_TOKEN/voice/file.oga",
-      { maxBytes: 4, downloadTimeoutMs: 1_234 },
+      {
+        maxBytes: 4,
+        downloadTimeoutMs: 1_234,
+        signal: controller.signal,
+      },
     );
 
     assert.strictEqual(transcript, "Локальная расшифровка.");
@@ -104,6 +109,8 @@ describe("transcribeAudio ASR postprocessing", () => {
     assert.strictEqual(whisper.file, WHISPER_BIN);
     assert.strictEqual(ffmpeg.options.timeout, 30_000);
     assert.strictEqual(whisper.options.timeout, 120_000);
+    assert.strictEqual(ffmpeg.options.signal, controller.signal);
+    assert.strictEqual(whisper.options.signal, controller.signal);
     const sourcePath = ffmpeg.args[1];
     const wavPath = whisper.args[whisper.args.indexOf("-f") + 1];
     assert.match(sourcePath, /\/bot-voice-[A-Za-z0-9-]+\.oga$/);
