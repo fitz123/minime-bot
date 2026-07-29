@@ -57,7 +57,7 @@ import { loadMergedCrons } from "./cron-loader.js";
 import {
   clearCronOutboxRecord,
   readCronOutboxRecord,
-  sanitizeCronMetricStem,
+  resolveCronHealthMetricArtifacts,
   writeCronOutboxRecord,
   type CronOutboxRecord,
 } from "./cron-outbox.js";
@@ -68,7 +68,6 @@ const BOT_DIR = resolve(__dirname, "..");
 const DELIVER_SCRIPT = resolve(BOT_DIR, "scripts", "deliver.sh");
 
 const DEFAULT_TIMEOUT_MS = 900000; // 15 minutes
-const DEFAULT_CRON_HEALTH_TEXTFILE_DIR = "/opt/homebrew/var/node_exporter/textfile";
 const CRON_HEALTH_LOCK_RETRY_MS = 10;
 const CRON_HEALTH_STALE_LOCK_MS = 30_000;
 const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
@@ -486,17 +485,18 @@ function writeCronHealthMetric(
   exitCode: number,
   outcome: CronTerminalOutcome,
 ): void {
-  const fileStem = sanitizeCronMetricStem(cronName);
+  const artifacts = resolveCronHealthMetricArtifacts(cronName);
+  const { fileStem } = artifacts;
   const label = escapePrometheusLabelValue(cronName);
-  const dir = process.env.CRON_HEALTH_TEXTFILE_DIR ?? DEFAULT_CRON_HEALTH_TEXTFILE_DIR;
+  const dir = artifacts.textfileDir;
   const suppliedExitCode = Number.isFinite(exitCode) ? Math.trunc(exitCode) : 1;
   const normalizedExitCode = outcome === "success"
     ? 0
     : suppliedExitCode === 0
       ? 1
       : suppliedExitCode;
-  const exitFileName = `minime_cron_${fileStem}.exit.prom`;
-  const exitFilePath = join(dir, exitFileName);
+  const exitFileName = artifacts.exitFileName;
+  const exitFilePath = artifacts.exitFilePath;
 
   try {
     mkdirSync(dir, { recursive: true });
@@ -542,7 +542,7 @@ function writeCronHealthMetric(
       try {
         writeAtomicTextFile(
           dir,
-          `minime_cron_${fileStem}.success.prom`,
+          artifacts.successFileName,
           `minime_cron_last_success_timestamp{cron="${label}"} ${timestamp}\n`,
         );
       } catch (err) {

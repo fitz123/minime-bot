@@ -78,7 +78,9 @@ The runner writes these snapshots to
 `CRON_HEALTH_TEXTFILE_DIR` selects a different directory. The selected
 directory must be writable by the runner and must be the same host directory
 that node-exporter's textfile collector scans, or be mapped to it by the active
-container bind mount.
+container bind mount. Canonical launchd cron sync persists this selection in
+generated cron plists and, when pruning an inactive removed or disabled cron,
+retires only that cron identity's exact terminal snapshots.
 
 Terminal metric persistence is fail-closed. A directory, lock, prior-state
 read, or snapshot-write failure is emitted on standard error and makes the

@@ -111,11 +111,11 @@ forwarding is unavailable, while independent critical delivery remains intact.
 **Serves:** Operator input 3 — a cron removed through canonical sync must not
 leave a terminal failure snapshot that can never self-clear.
 
-- [ ] Share the existing deterministic cron metric artifact naming with canonical launchd sync without introducing a second naming rule or broad directory scan.
-- [ ] When pruning is enabled and sync has proven a removed/disabled cron job inactive, retire only that identity's package-owned terminal `.exit.prom` and `.success.prom` artifacts; make missing files idempotent, surface unsafe I/O failures, and preserve deferral for active/unknown jobs.
-- [ ] Keep dry-run and `--no-prune` mutation-free, and report planned/applied metric retirement in the bounded sync result without exposing metric contents.
-- [ ] Add launchd sync regressions for stale and disabled identities, missing/idempotent files, active/unknown deferral, dry-run, `--no-prune`, unrelated textfiles, and failure without overbroad deletion.
-- [ ] Run the launchd-cron-sync and cron-runner focused suites and keep them green before Task 4.
+- [x] Share the existing deterministic cron metric artifact naming with canonical launchd sync without introducing a second naming rule or broad directory scan.
+- [x] When pruning is enabled and sync has proven a removed/disabled cron job inactive, retire only that identity's package-owned terminal `.exit.prom` and `.success.prom` artifacts; make missing files idempotent, surface unsafe I/O failures, and preserve deferral for active/unknown jobs.
+- [x] Keep dry-run and `--no-prune` mutation-free, and report planned/applied metric retirement in the bounded sync result without exposing metric contents.
+- [x] Add launchd sync regressions for stale and disabled identities, missing/idempotent files, active/unknown deferral, dry-run, `--no-prune`, unrelated textfiles, and failure without overbroad deletion.
+- [x] Run the launchd-cron-sync and cron-runner focused suites and keep them green before Task 4.
 
 ### Task 4: Prove the complete incident and recovery contract
 

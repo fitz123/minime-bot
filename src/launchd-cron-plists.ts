@@ -35,6 +35,11 @@ import {
   type CronPlistDef,
 } from "./cron-plist.js";
 import {
+  CRON_HEALTH_TEXTFILE_DIR_ENV,
+  resolveCronHealthMetricArtifacts,
+  resolveCronHealthTextfileDir,
+} from "./cron-outbox.js";
+import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
@@ -75,6 +80,7 @@ export interface LaunchdCronContext {
   launchdDomain: string;
   launchctlBin: string;
   plutilBin: string;
+  cronHealthTextfileDir: string;
   env: NodeJS.ProcessEnv;
   cwd: string;
 }
@@ -114,6 +120,11 @@ export interface LaunchdCronPlanItem {
   reason?: "active" | "disabled" | "stale";
   deferredReason?: "active" | "unknown";
   scheduleSummary?: string;
+  metricRetirement?: {
+    status: "planned" | "applied";
+    plannedArtifactCount: 2;
+    removedArtifactCount?: number;
+  };
 }
 
 export interface LaunchdCommandResult {
@@ -207,7 +218,10 @@ export function isOwnedCronLaunchdLabel(label: string): boolean {
 
 export function renderLaunchdCronPlist(
   cron: CronPlistDef,
-  context: Pick<LaunchdCronContext, "runCronScript" | "logDir" | "homeDir" | "contract" | "env">,
+  context: Pick<
+    LaunchdCronContext,
+    "runCronScript" | "logDir" | "homeDir" | "contract" | "cronHealthTextfileDir" | "env"
+  >,
 ): string {
   const label = cronLaunchdLabel(cron.name);
   const intervals = parseCronToCalendarIntervals(cron.schedule);
@@ -376,6 +390,10 @@ export function planLaunchdCronSync(
         label,
         plistPath,
         reason: generated.disabledLabels.has(label) ? "disabled" : "stale",
+        metricRetirement: {
+          status: "planned",
+          plannedArtifactCount: 2,
+        },
       });
     }
   }
@@ -416,6 +434,15 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
     }
     if (item.action === "delete") {
       runLaunchctl(planned.context, runner, commands, ["bootout", `${planned.context.launchdDomain}/${item.label}`], true);
+      const removedArtifactCount = retireCronHealthMetricArtifacts(
+        cronNameFromLaunchdLabel(item.label),
+        planned.context.cronHealthTextfileDir,
+      );
+      item.metricRetirement = {
+        status: "applied",
+        plannedArtifactCount: 2,
+        removedArtifactCount,
+      };
       if (existsSync(item.plistPath)) {
         unlinkSync(item.plistPath);
       }
@@ -465,12 +492,25 @@ export function formatLaunchdCronSyncResult(result: SyncLaunchdCronsResult): str
   for (const item of result.items) {
     if (item.deferredReason === "active") {
       lines.push(`${prefix}deferred ${item.label} (active job running)`);
+      if (item.metricRetirement !== undefined) {
+        lines.push(`${prefix}terminal metric retirement pending ${item.label}`);
+      }
     } else if (item.deferredReason === "unknown") {
       lines.push(`${prefix}deferred ${item.label} (activity unknown)`);
+      if (item.metricRetirement !== undefined) {
+        lines.push(`${prefix}terminal metric retirement pending ${item.label}`);
+      }
     } else if (item.action === "unchanged") {
       lines.push(`${prefix}unchanged ${item.label} ${item.scheduleSummary ?? ""}`.trimEnd());
     } else if (item.action === "delete") {
       lines.push(`${prefix}delete ${item.label} (${item.reason ?? "stale"})`);
+      if (item.metricRetirement?.status === "applied") {
+        lines.push(
+          `${prefix}retired terminal metrics ${item.label} (${item.metricRetirement.removedArtifactCount ?? 0} artifacts removed)`,
+        );
+      } else {
+        lines.push(`${prefix}retire terminal metrics ${item.label} (planned)`);
+      }
     } else {
       lines.push(`${prefix}${item.action} ${item.label} ${item.scheduleSummary ?? ""}`.trimEnd());
       lines.push(`${prefix}rebootstrap ${item.label}`);
@@ -500,6 +540,10 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
   const uid = options.uid ?? resolveUid();
   const launchctlBin = env.LAUNCHCTL_BIN?.trim() || DEFAULT_LAUNCHCTL_BIN;
   const plutilBin = env.PLUTIL_BIN?.trim() || DEFAULT_PLUTIL_BIN;
+  const cronHealthTextfileDir = resolveCliPath(
+    resolveCronHealthTextfileDir(env),
+    cwd,
+  );
   const runCronScript = options.runCronScript === undefined
     ? resolve(contract.paths.packageRoot, "scripts", "run-cron.sh")
     : validateExplicitRunCronScript(options.runCronScript);
@@ -514,6 +558,7 @@ function resolveLaunchdCronContext(options: GenerateLaunchdCronPlistsOptions): L
     launchdDomain: `gui/${uid}`,
     launchctlBin,
     plutilBin,
+    cronHealthTextfileDir,
     env,
     cwd,
   };
@@ -1007,7 +1052,10 @@ function restorePreviousPlist(plistPath: string, previousContent: string | undef
 }
 
 function renderExplicitEnvEntries(
-  context: Pick<LaunchdCronContext, "contract" | "env">,
+  context: Pick<
+    LaunchdCronContext,
+    "contract" | "cronHealthTextfileDir" | "env"
+  >,
 ): string {
   const entries: string[] = [];
   const { contract, env } = context;
@@ -1021,6 +1069,14 @@ function renderExplicitEnvEntries(
   if (nodeRuntimeRoot?.trim()) {
     entries.push(renderEnvEntry(MINIME_NODE_RUNTIME_ROOT_ENV, nodeRuntimeRoot));
   }
+  if (env[CRON_HEALTH_TEXTFILE_DIR_ENV]?.trim()) {
+    entries.push(
+      renderEnvEntry(
+        CRON_HEALTH_TEXTFILE_DIR_ENV,
+        context.cronHealthTextfileDir,
+      ),
+    );
+  }
   return entries.join("");
 }
 
@@ -1032,6 +1088,39 @@ function renderEnvEntry(key: string, value: string): string {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function cronNameFromLaunchdLabel(label: string): string {
+  if (!isOwnedCronLaunchdLabel(label)) {
+    throw new Error("internal error: cannot retire metrics for an unowned cron label");
+  }
+  return label.slice(CRON_LAUNCHD_LABEL_PREFIX.length);
+}
+
+function retireCronHealthMetricArtifacts(
+  cronName: string,
+  textfileDir: string,
+): number {
+  const artifacts = resolveCronHealthMetricArtifacts(cronName, textfileDir);
+  let removed = 0;
+  for (const [kind, path] of [
+    ["exit", artifacts.exitFilePath],
+    ["success", artifacts.successFilePath],
+  ] as const) {
+    try {
+      unlinkSync(path);
+      removed += 1;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        continue;
+      }
+      const code = (err as NodeJS.ErrnoException).code;
+      throw new Error(
+        `failed to retire ${kind} cron health metric for "${cronName}"${code ? `: ${code}` : ""}`,
+      );
+    }
+  }
+  return removed;
 }
 
 function readLaunchdPlistLabel(plistPath: string): string {

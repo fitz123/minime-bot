@@ -22,6 +22,10 @@ import {
   type LaunchdCommandResult,
   type LaunchdCommandRunner,
 } from "../launchd-cron-plists.js";
+import {
+  CRON_HEALTH_TEXTFILE_DIR_ENV,
+  resolveCronHealthMetricArtifacts,
+} from "../cron-outbox.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
 
 interface Fixture {
@@ -29,6 +33,7 @@ interface Fixture {
   workspace: string;
   home: string;
   logDir: string;
+  metricDir: string;
   launchAgentsDir: string;
   env: NodeJS.ProcessEnv;
 }
@@ -43,6 +48,7 @@ function createFixture(prefix = "minime-launchd-crons-"): Fixture {
   const workspace = join(root, "workspace");
   const home = join(root, "home");
   const logDir = join(root, "logs");
+  const metricDir = join(root, "metrics");
   const launchAgentsDir = join(home, "Library", "LaunchAgents");
   mkdirSync(workspace, { recursive: true });
   mkdirSync(launchAgentsDir, { recursive: true });
@@ -51,6 +57,7 @@ function createFixture(prefix = "minime-launchd-crons-"): Fixture {
     workspace,
     home,
     logDir,
+    metricDir,
     launchAgentsDir,
     env: { HOME: home, LOG_DIR: logDir, UID: "501" },
   };
@@ -101,6 +108,21 @@ function captureRunner(
 
 function cleanup(fixture: Fixture): void {
   rmSync(fixture.root, { recursive: true, force: true });
+}
+
+function metricEnv(fixture: Fixture): NodeJS.ProcessEnv {
+  return {
+    ...fixture.env,
+    [CRON_HEALTH_TEXTFILE_DIR_ENV]: fixture.metricDir,
+  };
+}
+
+function writeMetricArtifacts(fixture: Fixture, cronName: string) {
+  const artifacts = resolveCronHealthMetricArtifacts(cronName, fixture.metricDir);
+  mkdirSync(fixture.metricDir, { recursive: true });
+  writeFileSync(artifacts.exitFilePath, `private terminal metric for ${cronName}\n`, "utf8");
+  writeFileSync(artifacts.successFilePath, `private success metric for ${cronName}\n`, "utf8");
+  return artifacts;
 }
 
 function writeRunner(directory: string, mode = 0o700): string {
@@ -1087,6 +1109,29 @@ fi
     }
   });
 
+  it("persists the selected cron health textfile directory in rendered plists", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+
+      const result = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+      });
+
+      assert.match(
+        result.plists[0].content,
+        new RegExp(
+          `<key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key>\\s*<string>${escapeRegex(fixture.metricDir)}</string>`,
+        ),
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("dry-run plans create and prune actions without writing files or running commands", () => {
     const fixture = createFixture();
     const calls: CommandCall[] = [];
@@ -1095,15 +1140,18 @@ fi
       const runner = writeRunner(join(fixture.root, "release", "scripts"));
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
+      const staleArtifacts = writeMetricArtifacts(fixture, "stale");
+      const unrelatedMetricPath = join(fixture.metricDir, "unrelated.prom");
       writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
       writeFileSync(botPath, "bot", "utf8");
+      writeFileSync(unrelatedMetricPath, "private unrelated metric\n", "utf8");
 
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
         runCronScript: runner,
         dryRun: true,
-        env: fixture.env,
+        env: metricEnv(fixture),
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls),
@@ -1114,11 +1162,21 @@ fi
       assert.equal(existsSync(join(fixture.launchAgentsDir, "ai.minime.cron.active.plist")), false);
       assert.match(readFileSync(stalePath, "utf8"), /ai\.minime\.cron\.stale/);
       assert.equal(readFileSync(botPath, "utf8"), "bot");
+      assert.equal(existsSync(staleArtifacts.exitFilePath), true);
+      assert.equal(existsSync(staleArtifacts.successFilePath), true);
+      assert.equal(readFileSync(unrelatedMetricPath, "utf8"), "private unrelated metric\n");
       assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}`), [
         "create:ai.minime.cron.active",
         "delete:ai.minime.cron.stale",
       ]);
+      assert.deepEqual(result.items[1].metricRetirement, {
+        status: "planned",
+        plannedArtifactCount: 2,
+      });
       assert.equal(result.items.some((item) => item.label === "ai.minime.telegram-bot"), false);
+      const output = formatLaunchdCronSyncResult(result);
+      assert.match(output, /retire terminal metrics ai\.minime\.cron\.stale \(planned\)/);
+      assert.doesNotMatch(output, /private (?:terminal|success|unrelated) metric/);
     } finally {
       cleanup(fixture);
     }
@@ -1133,13 +1191,14 @@ fi
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const previousActive = "old active plist";
       const previousStale = "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n";
+      const staleArtifacts = writeMetricArtifacts(fixture, "stale");
       writeFileSync(activePath, previousActive, "utf8");
       writeFileSync(stalePath, previousStale, "utf8");
 
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
-        env: fixture.env,
+        env: metricEnv(fixture),
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls, 0, [
@@ -1150,6 +1209,8 @@ fi
 
       assert.equal(readFileSync(activePath, "utf8"), previousActive);
       assert.equal(readFileSync(stalePath, "utf8"), previousStale);
+      assert.equal(existsSync(staleArtifacts.exitFilePath), true);
+      assert.equal(existsSync(staleArtifacts.successFilePath), true);
       assert.deepEqual(
         result.items.map((item) => `${item.action}:${item.label}:${item.deferredReason ?? "none"}`),
         [
@@ -1166,7 +1227,55 @@ fi
       const output = formatLaunchdCronSyncResult(result);
       assert.match(output, /deferred ai\.minime\.cron\.active \(active job running\)/);
       assert.match(output, /deferred ai\.minime\.cron\.stale \(active job running\)/);
+      assert.match(output, /terminal metric retirement pending ai\.minime\.cron\.stale/);
       assert.match(output, /Summary: create 0, update 1, unchanged 0, delete 1, deferred 2/);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("defers stale metric retirement when launchd activity is unknown", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(generated.plists[0].plistPath, generated.plists[0].content, "utf8");
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      writeFileSync(
+        stalePath,
+        "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n",
+        "utf8",
+      );
+      const staleArtifacts = writeMetricArtifacts(fixture, "stale");
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner(calls, 0, [
+          { status: 5, stdout: "", stderr: "Operation not permitted" },
+        ]),
+      });
+
+      const staleItem = result.items.find((item) => item.label === "ai.minime.cron.stale");
+      assert.equal(staleItem?.deferredReason, "unknown");
+      assert.equal(staleItem?.metricRetirement?.status, "planned");
+      assert.equal(existsSync(stalePath), true);
+      assert.equal(existsSync(staleArtifacts.exitFilePath), true);
+      assert.equal(existsSync(staleArtifacts.successFilePath), true);
+      assert.match(
+        formatLaunchdCronSyncResult(result),
+        /terminal metric retirement pending ai\.minime\.cron\.stale/,
+      );
     } finally {
       cleanup(fixture);
     }
@@ -1228,7 +1337,7 @@ fi
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
-        env: fixture.env,
+        env: metricEnv(fixture),
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls, 0, [
@@ -1239,6 +1348,12 @@ fi
 
       assert.match(readFileSync(activePath, "utf8"), /<string>ai\.minime\.cron\.active<\/string>/);
       assert.equal(existsSync(stalePath), false);
+      const staleItem = result.items.find((item) => item.label === "ai.minime.cron.stale");
+      assert.deepEqual(staleItem?.metricRetirement, {
+        status: "applied",
+        plannedArtifactCount: 2,
+        removedArtifactCount: 0,
+      });
       assert.equal(result.items.some((item) => item.deferredReason !== undefined), false);
       assert.deepEqual(
         calls.filter((call) => call.args[0] === "print").map((call) => call.args[1]),
@@ -1246,6 +1361,48 @@ fi
       );
       assert.equal(calls.filter((call) => call.args[0] === "bootout").length, 2);
       assert.equal(calls.filter((call) => call.args[0] === "bootstrap").length, 1);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("treats already-missing terminal metric artifacts as idempotently retired", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(generated.plists[0].plistPath, generated.plists[0].content, "utf8");
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      const stalePlist =
+        "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n";
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        writeFileSync(stalePath, stalePlist, "utf8");
+        const result = syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: metricEnv(fixture),
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls),
+        });
+        const staleItem = result.items.find((item) => item.label === "ai.minime.cron.stale");
+
+        assert.equal(existsSync(stalePath), false);
+        assert.deepEqual(staleItem?.metricRetirement, {
+          status: "applied",
+          plannedArtifactCount: 2,
+          removedArtifactCount: 0,
+        });
+      }
+      assert.equal(existsSync(fixture.metricDir), false);
     } finally {
       cleanup(fixture);
     }
@@ -1354,15 +1511,19 @@ fi
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       const disabledPath = join(fixture.launchAgentsDir, "ai.minime.cron.disabled.plist");
       const botPath = join(fixture.launchAgentsDir, "ai.minime.telegram-bot.plist");
+      const staleArtifacts = writeMetricArtifacts(fixture, "stale");
+      const disabledArtifacts = writeMetricArtifacts(fixture, "disabled");
+      const unrelatedMetricPath = join(fixture.metricDir, "unrelated.prom");
       writeFileSync(activePath, "old active plist", "utf8");
       writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
       writeFileSync(disabledPath, "<plist><dict><key>Label</key><string>ai.minime.cron.disabled</string></dict></plist>\n", "utf8");
       writeFileSync(botPath, "bot", "utf8");
+      writeFileSync(unrelatedMetricPath, "private unrelated metric\n", "utf8");
 
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
-        env: fixture.env,
+        env: metricEnv(fixture),
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls, 3),
@@ -1372,11 +1533,31 @@ fi
       assert.equal(existsSync(stalePath), false);
       assert.equal(existsSync(disabledPath), false);
       assert.equal(readFileSync(botPath, "utf8"), "bot");
+      for (const path of [
+        staleArtifacts.exitFilePath,
+        staleArtifacts.successFilePath,
+        disabledArtifacts.exitFilePath,
+        disabledArtifacts.successFilePath,
+      ]) {
+        assert.equal(existsSync(path), false, path);
+      }
+      assert.equal(readFileSync(unrelatedMetricPath, "utf8"), "private unrelated metric\n");
       assert.deepEqual(result.items.map((item) => `${item.action}:${item.label}:${item.reason}`), [
         "update:ai.minime.cron.active:active",
         "delete:ai.minime.cron.disabled:disabled",
         "delete:ai.minime.cron.stale:stale",
       ]);
+      for (const item of result.items.filter((candidate) => candidate.action === "delete")) {
+        assert.deepEqual(item.metricRetirement, {
+          status: "applied",
+          plannedArtifactCount: 2,
+          removedArtifactCount: 2,
+        });
+      }
+      const output = formatLaunchdCronSyncResult(result);
+      assert.match(output, /retired terminal metrics ai\.minime\.cron\.disabled \(2 artifacts removed\)/);
+      assert.match(output, /retired terminal metrics ai\.minime\.cron\.stale \(2 artifacts removed\)/);
+      assert.doesNotMatch(output, /private (?:terminal|success|unrelated) metric/);
 
       assert.ok(calls.some((call) => call.command.endsWith("plutil") && call.args.join(" ").startsWith(`-lint ${activePath}.tmp-`)));
       assert.ok(calls.some((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.active"));
@@ -1437,21 +1618,75 @@ fi
     try {
       writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      const staleArtifacts = writeMetricArtifacts(fixture, "stale");
       writeFileSync(stalePath, "stale", "utf8");
 
       const result = syncLaunchdCrons({
         workspace: fixture.workspace,
         launchAgentsDir: fixture.launchAgentsDir,
         prune: false,
-        env: fixture.env,
+        env: metricEnv(fixture),
         homeDir: fixture.home,
         uid: 501,
         commandRunner: captureRunner(calls),
       });
 
       assert.equal(existsSync(stalePath), true);
+      assert.equal(existsSync(staleArtifacts.exitFilePath), true);
+      assert.equal(existsSync(staleArtifacts.successFilePath), true);
       assert.equal(result.items.some((item) => item.label === "ai.minime.cron.stale"), false);
       assert.equal(calls.some((call) => call.args.some((arg) => arg.includes("ai.minime.cron.stale"))), false);
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("surfaces metric retirement failures without deleting the plist or other textfiles", () => {
+    const fixture = createFixture();
+    const calls: CommandCall[] = [];
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const generated = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+      });
+      writeFileSync(generated.plists[0].plistPath, generated.plists[0].content, "utf8");
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      writeFileSync(
+        stalePath,
+        "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n",
+        "utf8",
+      );
+      const staleArtifacts = resolveCronHealthMetricArtifacts("stale", fixture.metricDir);
+      mkdirSync(staleArtifacts.exitFilePath, { recursive: true });
+      writeFileSync(staleArtifacts.successFilePath, "private success metric\n", "utf8");
+      const unrelatedMetricPath = join(fixture.metricDir, "unrelated.prom");
+      writeFileSync(unrelatedMetricPath, "private unrelated metric\n", "utf8");
+
+      assert.throws(
+        () => syncLaunchdCrons({
+          workspace: fixture.workspace,
+          launchAgentsDir: fixture.launchAgentsDir,
+          env: metricEnv(fixture),
+          homeDir: fixture.home,
+          uid: 501,
+          commandRunner: captureRunner(calls, 3),
+        }),
+        /failed to retire exit cron health metric for "stale": (?:EISDIR|EPERM)/,
+      );
+
+      assert.equal(existsSync(stalePath), true);
+      assert.equal(existsSync(staleArtifacts.exitFilePath), true);
+      assert.equal(readFileSync(staleArtifacts.successFilePath, "utf8"), "private success metric\n");
+      assert.equal(readFileSync(unrelatedMetricPath, "utf8"), "private unrelated metric\n");
+      assert.equal(
+        calls.filter((call) => call.args.join(" ") === "bootout gui/501/ai.minime.cron.stale").length,
+        1,
+      );
+      assert.equal(calls.some((call) => call.args.some((arg) => arg.includes("unrelated"))), false);
     } finally {
       cleanup(fixture);
     }
