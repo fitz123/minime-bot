@@ -368,11 +368,13 @@ weekly schedule:
 
 - It measures the raw `wiki/index.md` size first. At or below 40 KiB (40960
   bytes), it does no candidate scan or mutation and emits no stdout by default.
-- Above 40 KiB, it considers only project pages whose filename is exactly
-  `release-YYYY-MM-DD.md` or `issue-N-YYYY-MM-DD.md`. Release records are
-  treated as completed; issue records require `N` in the caller-supplied
-  positive-integer JSON array passed with `--closed-issues`. The package does
-  not fetch issue state.
+- Above 40 KiB, it considers only project pages named for completed process
+  records: `release-YYYY-M-PATCH.md` (the package CalVer page convention) or
+  `issue-N.md` / `issue-N-<safe-slug>.md`. Release records are treated as
+  completed; issue records require `N` in the caller-supplied positive-integer
+  JSON array passed with `--closed-issues`. The package does not fetch issue
+  state. Record age comes from `mtime`, not from interpreting a filename suffix
+  as a calendar completion date.
 - A candidate must have been unmodified for at least 30 days. Filesystem
   `mtime` is the conservative age clock, so any recent edit restarts the wait.
   A page containing the optional `revisit_if` frontmatter field is treated as

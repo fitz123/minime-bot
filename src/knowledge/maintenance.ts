@@ -37,8 +37,8 @@ export const KNOWLEDGE_MAINTENANCE_MAX_ARCHIVED_PATHS = 100;
 export const KNOWLEDGE_MAINTENANCE_MAX_ERRORS = 20;
 
 const MIN_AGE_MS = KNOWLEDGE_MAINTENANCE_MIN_AGE_DAYS * 24 * 60 * 60 * 1_000;
-const ISSUE_RECORD_RE = /^issue-([1-9][0-9]*)-(\d{4})-(\d{2})-(\d{2})\.md$/;
-const RELEASE_RECORD_RE = /^release-(\d{4})-(\d{2})-(\d{2})\.md$/;
+const ISSUE_RECORD_RE = /^issue-([1-9][0-9]*)(?:-[a-z0-9][a-z0-9._-]*)?\.md$/;
+const RELEASE_RECORD_RE = /^release-(\d{4})-(\d{1,2})-(\d+)\.md$/;
 const MAX_ERROR_MESSAGE_LENGTH = 240;
 const KNOWLEDGE_UPDATE_LOCK_RELPATH = ".tmp/knowledge-update.lock";
 
@@ -266,36 +266,31 @@ function buildManifest(
   };
 }
 
-function parseValidDate(yearRaw: string, monthRaw: string, dayRaw: string): boolean {
-  const year = Number(yearRaw);
-  const month = Number(monthRaw);
-  const day = Number(dayRaw);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  return (
-    date.getUTCFullYear() === year &&
-    date.getUTCMonth() === month - 1 &&
-    date.getUTCDate() === day
-  );
-}
-
 function parseDatedRecord(filename: string): DatedRecord | undefined {
   const issue = ISSUE_RECORD_RE.exec(filename);
   if (issue) {
     const issueNumber = Number(issue[1]);
-    if (
-      Number.isSafeInteger(issueNumber) &&
-      parseValidDate(issue[2], issue[3], issue[4])
-    ) {
-      return { kind: "issue", issueNumber };
-    }
-    return undefined;
+    return Number.isSafeInteger(issueNumber)
+      ? { kind: "issue", issueNumber }
+      : undefined;
   }
 
   const release = RELEASE_RECORD_RE.exec(filename);
-  if (release && parseValidDate(release[1], release[2], release[3])) {
-    return { kind: "release" };
+  if (!release) {
+    return undefined;
   }
-  return undefined;
+  const year = Number(release[1]);
+  const month = Number(release[2]);
+  const patch = Number(release[3]);
+  return (
+    Number.isSafeInteger(year) &&
+    Number.isSafeInteger(month) &&
+    month >= 1 &&
+    month <= 12 &&
+    Number.isSafeInteger(patch)
+  )
+    ? { kind: "release" }
+    : undefined;
 }
 
 function normalizeClosedIssueNumbers(raw: unknown): Set<number> | KnowledgeMaintenanceFailure {

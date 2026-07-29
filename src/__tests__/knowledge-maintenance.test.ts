@@ -170,6 +170,38 @@ describe("knowledge maintenance", () => {
     assert.match(readFileSync(join(workspace, "wiki/log.md"), "utf8"), / archive /);
   });
 
+  it("recognizes deployed CalVer release and descriptive issue page names", () => {
+    const releaseWorkspace = createWorkspace();
+    const releasePath = "wiki/pages/project/minime-bot/release-2026-7-39.md";
+    addPage(releaseWorkspace, releasePath);
+    writeExactIndexSize(
+      releaseWorkspace,
+      KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+    );
+
+    const releaseResponse = executeKnowledgeMaintenance(
+      {},
+      { agentWorkspaceRoot: releaseWorkspace, now: () => NOW },
+    );
+    assertMaintenanceOk(releaseResponse);
+    assert.deepEqual(releaseResponse.archivedPaths, [releasePath]);
+
+    const issueWorkspace = createWorkspace();
+    const issuePath = "wiki/pages/project/minime-bot/issue-103-terminal-cron-health.md";
+    addPage(issueWorkspace, issuePath);
+    writeExactIndexSize(
+      issueWorkspace,
+      KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+    );
+
+    const issueResponse = executeKnowledgeMaintenance(
+      { closedIssueNumbers: [103] },
+      { agentWorkspaceRoot: issueWorkspace, now: () => NOW },
+    );
+    assertMaintenanceOk(issueResponse);
+    assert.deepEqual(issueResponse.archivedPaths, [issuePath]);
+  });
+
   it("treats exactly 30 days as eligible and a just-younger page as recent", () => {
     const workspace = createWorkspace();
     const exactPath = "wiki/pages/project/history/release-2026-04-01.md";
@@ -304,8 +336,8 @@ describe("knowledge maintenance", () => {
       ),
       addPage(
         workspace,
-        "wiki/pages/project/history/issue-10-2026-02-30.md",
-        frontmatter("Invalid filename date"),
+        "wiki/pages/project/history/issue-010-invalid-name.md",
+        frontmatter("Invalid issue number"),
       ),
       addPage(
         workspace,
