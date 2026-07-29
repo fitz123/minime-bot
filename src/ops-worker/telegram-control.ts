@@ -4,17 +4,20 @@ import {
   hashOpsWorkerTelegramUpdate,
   type OpsWorkerControlLedger,
 } from "./control-ledger.js";
+import type { OpsWorkerPolicySnapshot } from "./status-server.js";
 import {
-  summarizeOpsWorkerTasks,
-  type OpsWorkerPolicySnapshot,
-} from "./status-server.js";
+  buildOpsWorkerConversationSnapshot,
+  buildOpsWorkerTaskView,
+  renderOpsWorkerStatusNarrative,
+  renderOpsWorkerTaskNarrative,
+  renderOpsWorkerTasksNarrative,
+} from "./conversation-view.js";
 import {
   buildOpsWorkerTelegramReport,
   createOpsWorkerFieldRedactor,
   type OpsWorkerFieldRedactor,
 } from "./reporting.js";
 import {
-  getOpsWorkerReportReconciliationOperation,
   isOpsWorkerReportReconciliationBlocked,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
@@ -255,45 +258,15 @@ function parseGetUpdatesResult(value: unknown, offset: number | undefined): Reco
   });
 }
 
-function taskSummary(task: OpsWorkerTask): string {
-  const outcome = task.lastOutcome === null
-    ? "none"
-    : `${task.lastOutcome.kind}/${task.lastOutcome.result}: ${task.lastOutcome.summary}`;
-  const reportReconciliationOperation =
-    getOpsWorkerReportReconciliationOperation(task);
-  return [
-    `Task ${task.id}`,
-    `state=${task.state} paused=${task.control.paused}`,
-    `source=${task.source.kind}/${task.source.template}`,
-    `resource=${task.resource.key}`,
-    `nextRunAt=${task.schedule.nextRunAt ?? "none"}`,
-    `nextCheckAt=${task.schedule.nextCheckAt ?? "none"}`,
-    `report=${task.report.state}/${task.report.attempts}`,
-    `reportReceipt=${task.mutationReceipts.report === null
-      ? "none"
-      : task.mutationReceipts.report.outcome !== null
-      ? `finished/${task.mutationReceipts.report.outcome.result}`
-      : task.mutationReceipts.report.mutationStartedAt === null
-      ? "queried/unclaimed"
-      : "claimed/unknown"}`,
-    `reportReconciliation=${isOpsWorkerReportReconciliationBlocked(task)
-      ? "required"
-      : "none"}`,
-    `reportReconciliationIntent=${reportReconciliationOperation === undefined
-      ? isOpsWorkerReportReconciliationBlocked(task)
-        ? "unavailable"
-        : "none"
-      : JSON.stringify(reportReconciliationOperation)}`,
-    `outcome=${outcome}`,
-  ].join("\n");
-}
-
 function taskSummaryPage(
   task: OpsWorkerTask,
   page: number,
   maxBytes: number,
+  redact: OpsWorkerFieldRedactor,
 ): string {
-  const summary = taskSummary(task);
+  const summary = renderOpsWorkerTaskNarrative(
+    buildOpsWorkerTaskView(task, redact),
+  );
   if (Buffer.byteLength(summary, "utf8") <= maxBytes) {
     return page === 1
       ? summary
@@ -519,32 +492,31 @@ export class OpsWorkerTelegramControl {
     const tail = match[2]?.trim();
     if (command === "status" && tail === undefined) {
       const tasks = this.supervisor.listTasks();
-      const summary = summarizeOpsWorkerTasks(tasks);
-      const policy = this.inspectPolicy();
-      return [
-        `Ops worker: tasks=${summary.totalTasks} activeGroups=${summary.activeProcessGroups}`,
-        `custody=${summary.custodyOwner?.id ?? "none"}`,
-        `reportReconciliationBlocked=${summary.reportReconciliationBlocked}`,
-        `states=${Object.entries(summary.states).map(([state, count]) => `${state}:${count}`).join(",")}`,
-        `authorization=${policy.authorization.verifierCount}/${policy.authorization.contractsHash}`,
-        `verification=${policy.verification.verifierCount}/${policy.verification.contractsHash}`,
-        `quota=${policy.quota.configured ? "configured" : "unconfigured"}`,
-        `parity=${policy.parity.configured ? "configured" : "unconfigured"}`,
-      ].join("\n");
+      return renderOpsWorkerStatusNarrative(
+        buildOpsWorkerConversationSnapshot(tasks, this.inspectPolicy(), {
+          redact: this.redactAgentField,
+        }),
+      );
     }
     if (command === "tasks" && tail === undefined) {
       const tasks = this.supervisor.listTasks();
-      return tasks.length === 0
-        ? "No ops-worker tasks."
-        : tasks.map((task) =>
-          `${task.id} ${task.state}${task.control.paused ? " paused" : ""}`).join("\n");
+      return renderOpsWorkerTasksNarrative(
+        buildOpsWorkerConversationSnapshot(tasks, this.inspectPolicy(), {
+          redact: this.redactAgentField,
+        }),
+      );
     }
     if (command === "task") {
       const argument = taskPageArgument(tail);
       if (argument === null) return usage();
       const task = this.supervisor.getTask(argument.taskId);
       return task
-        ? taskSummaryPage(task, argument.page, this.config.reply.maxBytes)
+        ? taskSummaryPage(
+            task,
+            argument.page,
+            this.config.reply.maxBytes,
+            this.redactAgentField,
+          )
         : `Unknown ops-worker task ${argument.taskId}.`;
     }
     if (command === "answer" || command === "correct") {

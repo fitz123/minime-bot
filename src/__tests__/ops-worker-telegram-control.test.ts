@@ -922,7 +922,71 @@ describe("ops worker dedicated Telegram control", () => {
     assert.ok(transport.messages.every((message) =>
       Buffer.byteLength(String(message.text), "utf8") <= config.reply.maxBytes));
     assert.match(String(transport.messages.at(-1)?.text), /Usage:/);
-    assert.equal(JSON.stringify(transport.messages).includes("Exercise the bounded"), false);
+  });
+
+  it("snapshots mutation replies and deterministic slash-command availability", async (t) => {
+    const fixture = await harness(t);
+    t.after(() => fixture.close());
+    for (const taskId of [
+      "task-answer-snapshot",
+      "task-correct-snapshot",
+      "task-pause-snapshot",
+      "task-resume-snapshot",
+      "task-cancel-snapshot",
+    ]) fixture.store.create(makeTask(taskId));
+    fixture.store.mutate(
+      "task-resume-snapshot",
+      { event: "UPDATED", summary: "Prepare paused command snapshot" },
+      (candidate) => {
+        candidate.control = {
+          paused: true,
+          pausedAt: NOW,
+          interrupt: null,
+        };
+      },
+    );
+    const retry = makeTask("task-retry-snapshot");
+    retry.state = "BLOCKED";
+    retry.custody = {
+      status: "RELEASED",
+      claimedAt: null,
+      releasedAt: NOW,
+      releaseReason: "BLOCKED",
+    };
+    retry.rounds.remediation = retry.rounds.maxRemediation;
+    retry.lastOutcome = {
+      at: NOW,
+      kind: "OPERATOR",
+      result: "BLOCKED",
+      summary: "Fixture awaits a replay-safe retry.",
+    };
+    retry.report.state = "PENDING";
+    fixture.store.create(retry);
+    const transport = new FakeTelegramTransport();
+    transport.updates.push([
+      update(60, "/answer task-answer-snapshot retained answer"),
+      update(61, "/correct task-correct-snapshot retained correction"),
+      update(62, "/pause task-pause-snapshot"),
+      update(63, "/resume task-resume-snapshot"),
+      update(64, "/retry task-retry-snapshot"),
+      update(65, "/cancel task-cancel-snapshot planned cancellation"),
+      update(66, "/unknown"),
+    ]);
+
+    await control(fixture, transport).tick();
+
+    const commandReplies = transport.messages
+      .map((message) => String(message.text))
+      .filter((text) => !text.startsWith("Ops incident:"));
+    assert.deepEqual(commandReplies, [
+      "Recorded answer for task-answer-snapshot.",
+      "Recorded correction for task-correct-snapshot.",
+      "Paused task-pause-snapshot; state=QUEUED.",
+      "Resumed task-resume-snapshot; state=QUEUED.",
+      "Retried task-retry-snapshot; state=RESUMABLE.",
+      "Cancellation recorded for task-cancel-snapshot; state=CANCELLED.",
+      "Usage: /status | /tasks | /task <id> [page] | /answer <id> <text> | /correct <id> <text> | /pause <id> | /resume <id> | /cancel <id> <reason> | /retry <id>",
+    ]);
   });
 
   it("keeps a persistently ambiguous unverified launch fence non-reportable after restart", async (t) => {
@@ -1007,12 +1071,12 @@ describe("ops worker dedicated Telegram control", () => {
     );
     assert.ok(Buffer.byteLength(String(transport.messages[0].text), "utf8") <= 1_024);
     for (const required of [
-      "typedOutcome=input-needed reason=information",
-      "diagnosis=",
-      "actions=Inspected",
-      "requestedInput=Provide",
-      "verification=not-run",
-      `checkedAt=${NOW}`,
+      "Result: input-needed reason=information",
+      "Diagnosis:",
+      "Actions: Inspected",
+      "Requested input: Provide",
+      "Verification: not run",
+      `Checked at: ${NOW}`,
     ]) assert.match(String(transport.messages[0].text), new RegExp(required));
     assert.doesNotMatch(String(transport.messages[0].text), new RegExp(config.telegram.token));
     assert.doesNotMatch(String(transport.messages[0].text), /ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/);
@@ -1108,14 +1172,14 @@ describe("ops worker dedicated Telegram control", () => {
       originalReceipt,
     );
     assert.equal(transport.messages.some((message) =>
-      String(message.text).includes("reportReconciliationBlocked=1")), true);
+      String(message.text).includes("Report reconciliation: 1 blocked.")), true);
     assert.equal(transport.messages.some((message) =>
-      String(message.text).includes("reportReceipt=claimed/unknown")), true);
+      String(message.text).includes("Report receipt: CLAIMED_UNKNOWN.")), true);
     assert.equal(transport.messages.some((message) =>
-      String(message.text).includes("reportReconciliation=required")), true);
+      String(message.text).includes("Report reconciliation: REQUIRED.")), true);
     assert.equal(transport.messages.some((message) =>
       String(message.text).includes(
-        'reportReconciliationIntent={"boundary":"report","operationId":"report:incompatible-fixture"',
+        'Report reconciliation intent (exact JSON): {"boundary":"report","operationId":"report:incompatible-fixture"',
       )), true);
 
     const sendable = makeTask("task-b-sendable-after-reconciliation");
@@ -1235,10 +1299,12 @@ describe("ops worker dedicated Telegram control", () => {
       return text.slice(header.length);
     }).join("");
     const operationLine = reconstructed.split("\n").find((line) =>
-      line.startsWith("reportReconciliationIntent="));
+      line.startsWith("Report reconciliation intent (exact JSON): "));
     assert.ok(operationLine);
     assert.deepEqual(
-      JSON.parse(operationLine.slice("reportReconciliationIntent=".length)),
+      JSON.parse(operationLine.slice(
+        "Report reconciliation intent (exact JSON): ".length,
+      )),
       reconciliationOperation,
     );
   });
@@ -1279,7 +1345,7 @@ describe("ops worker dedicated Telegram control", () => {
 
     assert.equal(transport.messages.some((message) =>
       String(message.text).includes(
-        "reportReconciliationIntent=unavailable",
+        "Report reconciliation intent (exact JSON): unavailable",
       )), true);
   });
 

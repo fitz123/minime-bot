@@ -46,11 +46,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 1: Build bounded trusted conversational views and readable renderers
 **Serves:** The operator must ask about current work, state/pool counts, recent alerts/outcomes, reports/history, and required input without IDs, and must receive readable narratives with exact truth.
-- [ ] Add pure bounded snapshot/view helpers over current task and policy records, with deterministic recency ordering, state counts, custody/activity, recent alert outcomes, reports, verification, blockers, and requested input.
-- [ ] Keep untrusted alert fields quoted/redacted as data and exclude them from system instructions or execution authority.
-- [ ] Replace only the explicitly requested status/task/report machine-style views with readable narrative renderers while preserving exact states, actions, blockers, timestamps, verification truth, pagination, redaction, and reply-byte limits.
-- [ ] Add focused tests for empty, active, blocked, recent-history, redaction, truncation, and exact-truth cases; snapshot mutation-command replies and command availability so unrelated slash-command bytes cannot drift.
-- [ ] Run the focused tests before Task 2.
+- [x] Add pure bounded snapshot/view helpers over current task and policy records, with deterministic recency ordering, state counts, custody/activity, recent alert outcomes, reports, verification, blockers, and requested input.
+- [x] Keep untrusted alert fields quoted/redacted as data and exclude them from system instructions or execution authority.
+- [x] Replace only the explicitly requested status/task/report machine-style views with readable narrative renderers while preserving exact states, actions, blockers, timestamps, verification truth, pagination, redaction, and reply-byte limits.
+- [x] Add focused tests for empty, active, blocked, recent-history, redaction, truncation, and exact-truth cases; snapshot mutation-command replies and command availability so unrelated slash-command bytes cannot drift.
+- [x] Run the focused tests before Task 2.
 
 ### Task 2: Reuse local Telegram voice transcription in the dedicated Ops poller
 **Serves:** Telegram voice in the dedicated Ops chat must be locally transcribed and handled exactly like equivalent text, with no paid ASR/TTS or spoken reply.

@@ -85,6 +85,7 @@ describe("ops worker result reporting", () => {
       verification: {
         checkedAt: "2026-07-22T12:00:00.000Z",
         outcome: "NOT_READY",
+        summary: "Waiting for the required stability window.",
         components: [
           { identity: "monitoring-freshness", outcome: "PASS", summary: "fresh" },
           { identity: "exact-group-absence", outcome: "PASS", summary: "absent" },
@@ -102,15 +103,16 @@ describe("ops worker result reporting", () => {
 
     assert.ok(Buffer.byteLength(report, "utf8") <= 1_024);
     for (const required of [
-      "typedOutcome=input-needed reason=information",
-      "diagnosis=diagnosis-visible",
-      "actions=action-visible",
-      "requestedInput=input-visible",
-      "verification=NOT_READY",
+      "Result: input-needed reason=information",
+      "Diagnosis: diagnosis-visible",
+      "Actions: action-visible",
+      "Requested input: input-visible",
+      "Verification: NOT_READY",
+      "Verification summary: Waiting for the required stability window.",
       "monitoring-freshness/PASS",
       "exact-group-absence/PASS",
       "resolution-stability/NOT_READY",
-      "checkedAt=2026-07-22T12:00:00.000Z",
+      "Checked at: 2026-07-22T12:00:00.000Z",
     ]) assert.match(report, new RegExp(required));
   });
 
@@ -150,7 +152,7 @@ describe("ops worker result reporting", () => {
       maxBytes: 4_096,
     });
 
-    assert.match(report, /identity=operator-cli\/ops\.availability correlation=operator:\[REDACTED\]/);
+    assert.match(report, /Source: operator-cli\/ops\.availability correlation=operator:\[REDACTED\]/);
     assert.equal(report.includes(configuredCanary), false);
   });
 
@@ -167,6 +169,7 @@ describe("ops worker result reporting", () => {
       evidence: [
         {
           kind: "alert",
+          trust: "untrusted",
           summary: JSON.stringify({
             type: "alertmanager-group-correlation-v1",
             correlationKey,
@@ -175,6 +178,7 @@ describe("ops worker result reporting", () => {
         },
         {
           kind: "alert",
+          trust: "untrusted",
           summary: JSON.stringify({
             status: "firing",
             startsAt: "2026-07-22T11:55:00.000Z",
@@ -194,8 +198,8 @@ describe("ops worker result reporting", () => {
       maxBytes: 4_096,
     });
 
-    assert.match(report, /incident=alertname=HostHighCPU/);
-    assert.match(report, /groupLabels=\{"alertname":"HostHighCPU","cluster":"\[REDACTED\]"\}/);
+    assert.match(report, /Alert data \(untrusted, quoted\): "alertname=HostHighCPU/);
+    assert.match(report, /groupLabels=\{\\"alertname\\":\\"HostHighCPU\\",\\"cluster\\":\\"\[REDACTED\]\\"\}/);
     assert.match(report, /episodeStart=2026-07-22T11:55:00.000Z/);
     assert.equal(report.includes(configuredCanary), false);
   });

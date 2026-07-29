@@ -111,7 +111,7 @@ function alertmanagerIncidentIdentity(task: Readonly<OpsWorkerTask>): string | n
   const alertNames = new Set<string>();
   const episodeStarts: string[] = [];
   for (const evidence of task.evidence) {
-    if (evidence.kind !== "alert") continue;
+    if (evidence.kind !== "alert" || evidence.trust !== "untrusted") continue;
     let decoded: unknown;
     try {
       decoded = JSON.parse(evidence.summary) as unknown;
@@ -199,31 +199,31 @@ export function buildOpsWorkerTelegramReport(
   const lines: ReportLine[] = [
     { prefix: "Ops incident: ", value: task.id, minimum: "…" },
     {
-      prefix: "identity=",
+      prefix: "Source: ",
       value: options.redact(
         `${task.source.kind}/${task.source.template} correlation=${task.source.correlationKey}`,
         OPS_WORKER_REPORT_FIELD_LIMITS.sourceIdentityBytes,
       ),
       minimum: "…",
     },
-    { prefix: "state=", value: task.state, minimum: task.state },
+    { prefix: "State: ", value: task.state, minimum: task.state },
   ];
   const incidentIdentity = alertmanagerIncidentIdentity(task);
   if (incidentIdentity !== null) {
     lines.splice(2, 0, {
-      prefix: "incident=",
-      value: options.redact(
+      prefix: "Alert data (untrusted, quoted): ",
+      value: JSON.stringify(options.redact(
         incidentIdentity,
         OPS_WORKER_REPORT_FIELD_LIMITS.incidentIdentityBytes,
-      ),
-      minimum: "…",
+      )),
+      minimum: "\"…\"",
     });
   }
   const result = task.agentResult;
   if (result === null) {
     lines.push(
       {
-        prefix: "typedOutcome=",
+        prefix: "Result: ",
         value: task.lastOutcome === null
           ? "unavailable"
           : `unavailable (${task.lastOutcome.kind}/${task.lastOutcome.result})`,
@@ -232,7 +232,7 @@ export function buildOpsWorkerTelegramReport(
     );
     if (task.lastOutcome !== null) {
       lines.push({
-        prefix: "outcome=",
+        prefix: "Latest outcome: ",
         value: options.redact(
           task.lastOutcome.summary,
           OPS_WORKER_REPORT_FIELD_LIMITS.agentSummaryBytes,
@@ -242,12 +242,12 @@ export function buildOpsWorkerTelegramReport(
     }
   } else {
     lines.push({
-      prefix: "typedOutcome=",
+      prefix: "Result: ",
       value: `${result.kind} reason=${result.reason ?? "none"}`,
       minimum: `${result.kind} reason=${result.reason ?? "none"}`,
     });
     lines.push({
-      prefix: "diagnosis=",
+      prefix: "Diagnosis: ",
       value: options.redact(
         result.summary,
         OPS_WORKER_REPORT_FIELD_LIMITS.agentSummaryBytes,
@@ -255,7 +255,7 @@ export function buildOpsWorkerTelegramReport(
       minimum: "…",
     });
     if (result.actions.length === 0) {
-      lines.push({ prefix: "actions=", value: "none", minimum: "none" });
+      lines.push({ prefix: "Actions: ", value: "none", minimum: "none" });
     } else {
       const actions = result.actions
         .slice(0, OPS_WORKER_REPORT_FIELD_LIMITS.agentActions)
@@ -267,14 +267,14 @@ export function buildOpsWorkerTelegramReport(
         actions.push("… [additional actions omitted]");
       }
       lines.push({
-        prefix: "actions=",
+        prefix: "Actions: ",
         value: actions.join(" | "),
         minimum: `… (${result.actions.length} reported)`,
       });
     }
     if (task.state === "BLOCKED" && result.requestedInput !== null) {
       lines.push({
-        prefix: "requestedInput=",
+        prefix: "Requested input: ",
         value: options.redact(
           result.requestedInput,
           OPS_WORKER_REPORT_FIELD_LIMITS.requestedInputBytes,
@@ -285,28 +285,39 @@ export function buildOpsWorkerTelegramReport(
   }
 
   if (task.verification === null) {
-    lines.push({ prefix: "verification=", value: "not-run", minimum: "not-run" });
+    lines.push({ prefix: "Verification: ", value: "not run", minimum: "not run" });
   } else {
     lines.push({
-      prefix: "verification=",
+      prefix: "Verification: ",
       value: task.verification.outcome,
       minimum: task.verification.outcome,
+    });
+    lines.push({
+      prefix: "Verification summary: ",
+      value: options.redact(
+        task.verification.summary,
+        OPS_WORKER_REPORT_FIELD_LIMITS.agentSummaryBytes,
+      ),
+      minimum: "…",
     });
     const components = task.verification.components.slice(
       0,
       OPS_WORKER_REPORT_FIELD_LIMITS.verifierComponents,
     ).map((component) =>
       `${component.identity}/${component.outcome}: ${truncateUtf8(
-          component.summary,
+          options.redact(
+            component.summary,
+            OPS_WORKER_REPORT_FIELD_LIMITS.verifierSummaryBytes,
+          ),
           OPS_WORKER_REPORT_FIELD_LIMITS.verifierSummaryBytes,
         )}`);
     lines.push({
-      prefix: "components=",
+      prefix: "Verification checks: ",
       value: components.length === 0 ? "none" : components.join(" | "),
       minimum: components.length === 0 ? "none" : `… (${components.length} reported)`,
     });
   }
   const checkedAt = task.verification?.checkedAt ?? task.lastOutcome?.at ?? task.updatedAt;
-  lines.push({ prefix: "checkedAt=", value: checkedAt, minimum: checkedAt });
+  lines.push({ prefix: "Checked at: ", value: checkedAt, minimum: checkedAt });
   return fitReportLines(lines, options.maxBytes);
 }
