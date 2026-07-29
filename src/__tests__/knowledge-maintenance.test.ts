@@ -681,6 +681,29 @@ describe("knowledge maintenance", () => {
     assert.equal(unreadableResponse.archivedCount, 0);
     assert.equal(unreadableResponse.mutated, false);
     assert.equal(unreadableResponse.errors[0]?.reason, "scan-failed");
+
+    const nestedSymlinkWorkspace = createWorkspace();
+    const nestedCandidate = addPage(
+      nestedSymlinkWorkspace,
+      "wiki/pages/project/release-2026-01-01.md",
+    );
+    mkdirSync(join(nestedSymlinkWorkspace, "wiki/pages/project/history"), { recursive: true });
+    symlinkSync(outside, join(nestedSymlinkWorkspace, "wiki/pages/project/history/link"), "dir");
+    writeExactIndexSize(
+      nestedSymlinkWorkspace,
+      KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES + 1,
+    );
+
+    const nestedSymlinkResponse = executeKnowledgeMaintenance(
+      {},
+      { agentWorkspaceRoot: nestedSymlinkWorkspace, now: () => NOW },
+    );
+    assertMaintenanceOk(nestedSymlinkResponse);
+    assert.equal(nestedSymlinkResponse.stopReason, "unsafe-failure");
+    assert.equal(nestedSymlinkResponse.archivedCount, 0);
+    assert.equal(nestedSymlinkResponse.mutated, false);
+    assert.equal(existsSync(nestedCandidate.absPath), true);
+    assert.ok(nestedSymlinkResponse.errors.some((error) => error.reason === "symlink-rejected"));
   });
 
   it("bounds closed evidence and error arrays without mutating rejected candidates", () => {

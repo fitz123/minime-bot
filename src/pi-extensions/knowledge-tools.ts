@@ -241,6 +241,17 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   "show-ref",
   "status",
 ]);
+const WORKTREE_MUTATING_GIT_SUBCOMMANDS = new Set([
+  "am",
+  "apply",
+  "checkout",
+  "cherry-pick",
+  "merge",
+  "pull",
+  "rebase",
+  "revert",
+  "switch",
+]);
 const SUDO_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-D",
@@ -386,7 +397,8 @@ export function classifyKnowledgeIntegrityToolCall(
       deps.env,
     );
     for (const rawTarget of destructiveAncestorTargets) {
-      const absTarget = resolveShellPath(staticShellPathPrefix(rawTarget), cwd, deps.env);
+      const expandedTarget = expandShellPathVariables(rawTarget, cwd, deps.env) ?? rawTarget;
+      const absTarget = resolveShellPath(staticShellPathPrefix(expandedTarget), cwd, deps.env);
       if (!absTarget) {
         continue;
       }
@@ -501,6 +513,14 @@ function extractBashDestructiveAncestorTargetsAtDepth(
           /^-[^-]*[aRr]/.test(arg))
       ) {
         appendTargetCandidates(targets, copyLikeTargets(args), commandCwd, env);
+      } else if (name === "git") {
+        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, env);
+        if (worktreeTarget) {
+          appendTargetCandidates(targets, [worktreeTarget], commandCwd, env);
+        }
+        if (!isReadOnlyGitCommand(args)) {
+          appendTargetCandidates(targets, commandPathArguments(args), commandCwd, env);
+        }
       } else if (
         name !== "mkdir" &&
         name !== "touch" &&
@@ -840,6 +860,10 @@ function isReadOnlyGitCommand(args: string[]): boolean {
 }
 
 function gitSubcommand(args: string[]): string | undefined {
+  return gitSubcommandPosition(args)?.name;
+}
+
+function gitSubcommandPosition(args: string[]): { name: string; index: number } | undefined {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--") {
@@ -859,9 +883,73 @@ function gitSubcommand(args: string[]): string | undefined {
     if (arg.startsWith("-")) {
       continue;
     }
-    return arg;
+    return { name: arg, index };
   }
   return undefined;
+}
+
+function gitWorktreeMutationTarget(
+  args: string[],
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+  const command = gitSubcommandPosition(args);
+  if (!command || !gitSubcommandMutatesWorktree(command.name, args.slice(command.index + 1))) {
+    return undefined;
+  }
+
+  let effectiveCwd = cwd;
+  let explicitWorktree: string | undefined;
+  for (let index = 0; index < command.index; index += 1) {
+    const arg = args[index];
+    if (arg === "-C") {
+      effectiveCwd = resolveCwdOption(args[index + 1], effectiveCwd, env);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-C") && arg.length > 2) {
+      effectiveCwd = resolveCwdOption(arg.slice(2), effectiveCwd, env);
+      continue;
+    }
+    if (arg === "--work-tree") {
+      explicitWorktree = resolveGitWorktreeOption(args[index + 1], effectiveCwd, env);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--work-tree=")) {
+      explicitWorktree = resolveGitWorktreeOption(
+        arg.slice("--work-tree=".length),
+        effectiveCwd,
+        env,
+      );
+    }
+  }
+  return explicitWorktree ?? effectiveCwd;
+}
+
+function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {
+  if (subcommand === "clean") {
+    return !args.some((arg) => arg === "--dry-run" || /^-[^-]*n/.test(arg));
+  }
+  if (subcommand === "reset") {
+    return args.some((arg) => arg === "--hard" || arg === "--merge" || arg === "--keep");
+  }
+  if (subcommand === "stash") {
+    const action = args.find((arg) => !arg.startsWith("-"));
+    return !action || !new Set(["clear", "create", "drop", "list", "show", "store"]).has(action);
+  }
+  return WORKTREE_MUTATING_GIT_SUBCOMMANDS.has(subcommand);
+}
+
+function resolveGitWorktreeOption(
+  rawPath: string | undefined,
+  cwd: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+  if (!rawPath || !cwd) {
+    return rawPath;
+  }
+  return resolveShellPath(rawPath, cwd, env) ?? rawPath;
 }
 
 function cwdOptionValue(option: string, args: string[], index: number): { value?: string; nextIndex: number } {
@@ -1060,9 +1148,21 @@ function hasInPlaceEditFlag(args: string[]): boolean {
 function expandShellPathVariables(rawPath: string, cwd: string, env: NodeJS.ProcessEnv | undefined): string | undefined {
   const pwd = normalize(resolve(cwd));
   const envHome = typeof env?.HOME === "string" && env.HOME.trim() ? normalize(resolve(env.HOME)) : homedir();
-  const expanded = rawPath
+  const agentWorkspaceRoot =
+    typeof env?.[MINIME_AGENT_WORKSPACE_ROOT_ENV] === "string" &&
+    env[MINIME_AGENT_WORKSPACE_ROOT_ENV]?.trim()
+      ? normalize(resolve(env[MINIME_AGENT_WORKSPACE_ROOT_ENV] as string))
+      : undefined;
+  let expanded = rawPath
     .replace(/\$\{PWD\}|\$PWD(?=\/|$)/g, pwd)
     .replace(/\$\{HOME\}|\$HOME(?=\/|$)/g, envHome);
+  if (agentWorkspaceRoot) {
+    const workspacePattern = new RegExp(
+      `\\$\\{${MINIME_AGENT_WORKSPACE_ROOT_ENV}\\}|\\$${MINIME_AGENT_WORKSPACE_ROOT_ENV}(?=/|$)`,
+      "g",
+    );
+    expanded = expanded.replace(workspacePattern, () => agentWorkspaceRoot);
+  }
   if (expanded.includes("$") || expanded.includes("`")) {
     return undefined;
   }

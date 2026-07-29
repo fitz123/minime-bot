@@ -454,6 +454,7 @@ function collectMaintenanceCandidates(
       const absPath = join(dir, entry.name);
       const relPath = toWorkspaceRel(layout.agentWorkspaceRoot, absPath);
       if (entry.isSymbolicLink()) {
+        complete = false;
         addError(state, relPath, "symlink-rejected", "Maintenance does not follow symlinked project paths.");
         continue;
       }

@@ -354,6 +354,39 @@ describe("Knowledge Pi extension helpers", () => {
     );
   });
 
+  it("blocks implicit Git worktree mutations and canonical workspace-root ancestor targets", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/project/runtime.md": "# Runtime\n",
+    });
+
+    for (const command of [
+      "git clean -fdx",
+      "git reset --hard",
+      "git stash --include-untracked",
+    ]) {
+      assertBlocked(
+        workspace,
+        { toolName: "bash", input: { command } },
+        workspace,
+      );
+    }
+
+    const outside = createWorkspace();
+    const env = { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace };
+    for (const [command, target] of [
+      [`rm -rf $${MINIME_AGENT_WORKSPACE_ROOT_ENV}/artifacts`, "artifacts"],
+      [`git -C $${MINIME_AGENT_WORKSPACE_ROOT_ENV} clean -fdx`, workspace],
+      [`git --work-tree=$${MINIME_AGENT_WORKSPACE_ROOT_ENV} reset --hard`, workspace],
+    ] as const) {
+      const decision = classifyKnowledgeIntegrityToolCall(
+        { toolName: "bash", input: { command } },
+        { agentWorkspaceRoot: workspace, cwd: outside, env },
+      );
+      assert.equal(decision?.block, true, command);
+      assert.equal(decision.targetPath, target, command);
+    }
+  });
+
   it("allows unrelated writes beneath archive ancestors", () => {
     const workspace = createV2Workspace();
 
