@@ -14,6 +14,7 @@ import {
   type OpsWorkerFieldRedactor,
 } from "./reporting.js";
 import {
+  getOpsWorkerReportReconciliationOperation,
   isOpsWorkerReportReconciliationBlocked,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
@@ -240,6 +241,8 @@ function taskSummary(task: OpsWorkerTask): string {
   const outcome = task.lastOutcome === null
     ? "none"
     : `${task.lastOutcome.kind}/${task.lastOutcome.result}: ${task.lastOutcome.summary}`;
+  const reportReconciliationOperation =
+    getOpsWorkerReportReconciliationOperation(task);
   return [
     `Task ${task.id}`,
     `state=${task.state} paused=${task.control.paused}`,
@@ -258,6 +261,9 @@ function taskSummary(task: OpsWorkerTask): string {
     `reportReconciliation=${isOpsWorkerReportReconciliationBlocked(task)
       ? "required"
       : "none"}`,
+    `reportReconciliationIntent=${reportReconciliationOperation === undefined
+      ? "none"
+      : JSON.stringify(reportReconciliationOperation)}`,
     `outcome=${outcome}`,
   ].join("\n");
 }

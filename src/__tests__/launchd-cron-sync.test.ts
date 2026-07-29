@@ -24,6 +24,7 @@ import {
 } from "../launchd-cron-plists.js";
 import {
   CRON_HEALTH_TEXTFILE_DIR_ENV,
+  DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
   resolveCronHealthMetricArtifacts,
 } from "../cron-outbox.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
@@ -148,6 +149,7 @@ function renderReorderedPlistFixture(
   minute = 0,
 ): string {
   const replacements: Record<string, string> = {
+    CRON_HEALTH_TEXTFILE_DIR: DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
     CRON_NAME: cronName,
     HOME: fixture.home,
     HOUR: String(hour),
@@ -1132,6 +1134,69 @@ fi
     }
   });
 
+  it("persists the default cron health textfile directory in rendered plists", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+
+      const result = generateLaunchdCronPlists({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: fixture.env,
+        homeDir: fixture.home,
+      });
+
+      assert.match(
+        result.plists[0].content,
+        new RegExp(
+          `<key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key>\\s*<string>${escapeRegex(DEFAULT_CRON_HEALTH_TEXTFILE_DIR)}</string>`,
+        ),
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
+  it("does not retire from the current custom directory for a legacy default plist", () => {
+    const fixture = createFixture();
+    try {
+      writeCrons(fixture.workspace, cronYaml("active", "0 8 * * *"));
+      const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
+      const currentArtifacts = writeMetricArtifacts(fixture, "stale");
+      writeFileSync(
+        stalePath,
+        `<plist><dict>
+<key>Label</key><string>ai.minime.cron.stale</string>
+<key>EnvironmentVariables</key><dict>
+<key>HOME</key><string>${fixture.home}</string>
+</dict>
+</dict></plist>
+`,
+        "utf8",
+      );
+
+      const result = syncLaunchdCrons({
+        workspace: fixture.workspace,
+        launchAgentsDir: fixture.launchAgentsDir,
+        env: metricEnv(fixture),
+        homeDir: fixture.home,
+        uid: 501,
+        commandRunner: captureRunner([]),
+      });
+
+      assert.equal(existsSync(stalePath), false);
+      assert.equal(existsSync(currentArtifacts.exitFilePath), true);
+      assert.equal(existsSync(currentArtifacts.successFilePath), true);
+      assert.deepEqual(
+        result.items.find((item) => item.label === "ai.minime.cron.stale")
+          ?.metricRetirement,
+        { status: "applied", removedArtifactCount: 0 },
+      );
+    } finally {
+      cleanup(fixture);
+    }
+  });
+
   it("retires stale metrics from the custom directory persisted in the prior plist", () => {
     const fixture = createFixture();
     const previousMetricDir = join(fixture.root, "previous-cron-metrics");
@@ -1615,8 +1680,16 @@ fi
       const disabledArtifacts = writeMetricArtifacts(fixture, "disabled");
       const unrelatedMetricPath = join(fixture.metricDir, "unrelated.prom");
       writeFileSync(activePath, "old active plist", "utf8");
-      writeFileSync(stalePath, "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n", "utf8");
-      writeFileSync(disabledPath, "<plist><dict><key>Label</key><string>ai.minime.cron.disabled</string></dict></plist>\n", "utf8");
+      writeFileSync(
+        stalePath,
+        `<plist><dict><key>Label</key><string>ai.minime.cron.stale</string><key>EnvironmentVariables</key><dict><key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>${fixture.metricDir}</string></dict></dict></plist>\n`,
+        "utf8",
+      );
+      writeFileSync(
+        disabledPath,
+        `<plist><dict><key>Label</key><string>ai.minime.cron.disabled</string><key>EnvironmentVariables</key><dict><key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>${fixture.metricDir}</string></dict></dict></plist>\n`,
+        "utf8",
+      );
       writeFileSync(botPath, "bot", "utf8");
       writeFileSync(unrelatedMetricPath, "private unrelated metric\n", "utf8");
 
@@ -1756,7 +1829,7 @@ fi
       const stalePath = join(fixture.launchAgentsDir, "ai.minime.cron.stale.plist");
       writeFileSync(
         stalePath,
-        "<plist><dict><key>Label</key><string>ai.minime.cron.stale</string></dict></plist>\n",
+        `<plist><dict><key>Label</key><string>ai.minime.cron.stale</string><key>EnvironmentVariables</key><dict><key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>${fixture.metricDir}</string></dict></dict></plist>\n`,
         "utf8",
       );
       const staleArtifacts = resolveCronHealthMetricArtifacts("stale", fixture.metricDir);

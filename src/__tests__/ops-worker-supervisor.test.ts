@@ -37,6 +37,7 @@ import {
   type OpsWorkerTaskStoreFaultPoint,
 } from "../ops-worker/task-store.js";
 import {
+  getOpsWorkerReportReconciliationOperation,
   OpsWorkerStaleCheckResultError,
   OpsWorkerSupervisor,
   OpsWorkerSupervisorAlreadyRunningError,
@@ -1778,7 +1779,7 @@ describe("ops worker supervisor", () => {
       faultInjector: (point) => {
         if (!armed || point !== "after-snapshot-rename") return;
         renamedSnapshots += 1;
-        if (renamedSnapshots === 4) {
+        if (renamedSnapshots === 5) {
           throw new Error("Synthetic crash after atomic report snapshot rename");
         }
       },
@@ -1792,7 +1793,7 @@ describe("ops worker supervisor", () => {
       harness.supervisor.recordReportAttempt("task-report-crash", async () => ({ sent: true })),
       /Synthetic crash after atomic report snapshot rename/,
     );
-    assert.equal(renamedSnapshots, 4);
+    assert.equal(renamedSnapshots, 5);
     const persisted = harness.store.get("task-report-crash");
     assert.equal(persisted?.report.state, "SENT");
     assert.equal(persisted?.report.attempts, 1);
@@ -3393,31 +3394,13 @@ describe("ops worker supervisor", () => {
         summary: "Fixture process ownership remains ambiguous.",
       }),
     });
-    let reportedTask: OpsWorkerTask | undefined;
     const attempted = await ambiguous.supervisor.recordReportAttempt(
       "task-report-isolation",
-      async (task) => {
-        reportedTask = structuredClone(task);
-        return {
-          sent: false,
-          error: "Synthetic report result is externally ambiguous.",
-        };
-      },
+      async () => ({
+        sent: false,
+        error: "Synthetic report result is externally ambiguous.",
+      }),
     );
-    assert.ok(reportedTask);
-    const reportIdentity = hashOpsWorkerCanonicalPayload({
-      taskId: reportedTask.id,
-      deliveryKey: reportedTask.source.deliveryKey,
-      createdAt: reportedTask.createdAt,
-    });
-    const operation = {
-      boundary: "report" as const,
-      operationId: attempted.mutationReceipts.report?.operationId ?? "",
-      intent: {
-        reportIdentity,
-        reportPayloadHash: hashOpsWorkerReportPayload(reportedTask),
-      },
-    };
     const ambiguousReceipt = structuredClone(attempted.mutationReceipts.report);
     assert.ok(ambiguousReceipt?.mutationStartedAt);
     assert.equal(ambiguousReceipt.outcome, null);
@@ -3461,6 +3444,15 @@ describe("ops worker supervisor", () => {
     assert.equal(
       restarted.supervisor.selectNextTask()?.task.id,
       "task-unrelated-after-report-isolation",
+    );
+    const operation = getOpsWorkerReportReconciliationOperation(
+      restarted.store.get("task-report-isolation")!,
+    );
+    assert.ok(operation);
+    assert.equal(operation.operationId, ambiguousReceipt?.operationId);
+    assert.equal(
+      hashOpsWorkerCanonicalPayload(operation.intent),
+      ambiguousReceipt?.intentHash,
     );
 
     const lifecycle = new OpsWorkerLifecycle(restarted.store, {

@@ -626,6 +626,27 @@ function compatibleReportOperations(
 
 const REPORT_RECONCILIATION_REQUIRED_ERROR =
   "Claimed report receipt requires external-outcome reconciliation";
+const REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE =
+  "ops-worker-report-reconciliation-intent-v1";
+const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+
+interface OpsWorkerCurrentReportIntent {
+  reportIdentity: string;
+  reportPayloadHash: string;
+}
+
+export interface OpsWorkerReportReconciliationOperation {
+  boundary: "report";
+  operationId: string;
+  intent: OpsWorkerCurrentReportIntent;
+}
+
+interface OpsWorkerReportReconciliationIntentEvidence {
+  type: typeof REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE;
+  operationId: string;
+  intentHash: string;
+  intent: OpsWorkerCurrentReportIntent;
+}
 
 function reportIdentity(task: Readonly<OpsWorkerTask>): string {
   return hashOpsWorkerCanonicalPayload({
@@ -655,6 +676,90 @@ function hasIncompatibleClaimedReportReceipt(
   ) return false;
   return !compatibleReportOperations(task, reportIdentity(task))
     .some((operation) => matchesReportOperation(operation, receipt));
+}
+
+function parseReportReconciliationIntentEvidence(
+  evidence: Readonly<OpsWorkerEvidence>,
+): OpsWorkerReportReconciliationIntentEvidence | undefined {
+  if (evidence.kind !== "system" || evidence.trust !== "trusted") return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(evidence.summary) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const marker = value as Record<string, unknown>;
+  if (
+    marker.type !== REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
+    || typeof marker.operationId !== "string"
+    || typeof marker.intentHash !== "string"
+    || !SHA256_DIGEST_PATTERN.test(marker.intentHash)
+    || typeof marker.intent !== "object"
+    || marker.intent === null
+    || Array.isArray(marker.intent)
+  ) return undefined;
+  const intent = marker.intent as Record<string, unknown>;
+  if (
+    typeof intent.reportIdentity !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    || typeof intent.reportPayloadHash !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
+  ) return undefined;
+  return {
+    type: REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE,
+    operationId: marker.operationId,
+    intentHash: marker.intentHash,
+    intent: {
+      reportIdentity: intent.reportIdentity,
+      reportPayloadHash: intent.reportPayloadHash,
+    },
+  };
+}
+
+function currentReportIntent(
+  operation: ReturnType<typeof reportOperation>,
+): OpsWorkerCurrentReportIntent | undefined {
+  if (
+    typeof operation.intent !== "object"
+    || operation.intent === null
+    || Array.isArray(operation.intent)
+  ) return undefined;
+  const intent = operation.intent as Record<string, unknown>;
+  if (
+    typeof intent.reportIdentity !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    || typeof intent.reportPayloadHash !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
+  ) return undefined;
+  return {
+    reportIdentity: intent.reportIdentity,
+    reportPayloadHash: intent.reportPayloadHash,
+  };
+}
+
+export function getOpsWorkerReportReconciliationOperation(
+  task: Readonly<OpsWorkerTask>,
+): OpsWorkerReportReconciliationOperation | undefined {
+  const receipt = task.mutationReceipts.report;
+  if (receipt === null || receipt.outcome !== null) return undefined;
+  for (let index = task.evidence.length - 1; index >= 0; index -= 1) {
+    const marker = parseReportReconciliationIntentEvidence(task.evidence[index]);
+    if (
+      marker === undefined
+      || marker.operationId !== receipt.operationId
+      || marker.intentHash !== receipt.intentHash
+      || hashOpsWorkerCanonicalPayload(marker.intent) !== receipt.intentHash
+    ) continue;
+    return {
+      boundary: "report",
+      operationId: marker.operationId,
+      intent: marker.intent,
+    };
+  }
+  return undefined;
 }
 
 export function isOpsWorkerReportReconciliationBlocked(
@@ -2867,6 +2972,7 @@ export class OpsWorkerSupervisor {
         lastError: task.report.lastError,
       },
     });
+    task = this.persistReportReconciliationOperation(taskId, operation);
     let claimed = false;
     const authorization = await this.authorization.revalidate(taskId, {
       audit: {
@@ -2975,6 +3081,7 @@ export class OpsWorkerSupervisor {
           .join(", ")}`,
       );
     }
+    this.persistRecoverableReportReconciliationOperations(tasks);
     const running = tasks.filter((task) =>
       task.state === "RUNNING"
       || (
@@ -3104,6 +3211,70 @@ export class OpsWorkerSupervisor {
       }
     }
     return reconciled;
+  }
+
+  private persistRecoverableReportReconciliationOperations(
+    tasks: readonly OpsWorkerTask[],
+  ): void {
+    for (const task of tasks) {
+      const receipt = task.mutationReceipts.report;
+      if (
+        receipt === null
+        || receipt.outcome !== null
+        || receipt.mutationStartedAt === null
+        || getOpsWorkerReportReconciliationOperation(task) !== undefined
+      ) continue;
+      const operation = compatibleReportOperations(task, reportIdentity(task))
+        .find((candidate) => matchesReportOperation(candidate, receipt));
+      if (operation !== undefined) {
+        this.persistReportReconciliationOperation(task.id, operation);
+      }
+    }
+  }
+
+  private persistReportReconciliationOperation(
+    taskId: string,
+    operation: ReturnType<typeof reportOperation>,
+  ): OpsWorkerTask {
+    const intent = currentReportIntent(operation);
+    const existing = this.requireTask(taskId);
+    if (
+      intent === undefined
+      || getOpsWorkerReportReconciliationOperation(existing) !== undefined
+    ) return existing;
+    const receipt = existing.mutationReceipts.report;
+    const intentHash = hashOpsWorkerCanonicalPayload(intent);
+    if (
+      receipt === null
+      || receipt.outcome !== null
+      || receipt.operationId !== operation.operationId
+      || receipt.intentHash !== intentHash
+    ) return existing;
+    const summary = JSON.stringify({
+      type: REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE,
+      operationId: operation.operationId,
+      intentHash,
+      intent,
+    } satisfies OpsWorkerReportReconciliationIntentEvidence);
+    return this.store.mutate(
+      taskId,
+      {
+        event: "RECONCILIATION",
+        summary: "Retained bounded report intent for fixed receipt reconciliation",
+      },
+      (task) => {
+        task.evidence = task.evidence.filter(
+          (entry) => parseReportReconciliationIntentEvidence(entry) === undefined,
+        );
+        appendOpsWorkerEvidence(task, {
+          at: this.now().toISOString(),
+          kind: "system",
+          trust: "trusted",
+          summary,
+          artifact: null,
+        });
+      },
+    ).task;
   }
 
   private isolateIncompatibleReportReceipts(): OpsWorkerTask[] {

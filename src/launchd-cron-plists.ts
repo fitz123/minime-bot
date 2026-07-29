@@ -36,6 +36,7 @@ import {
 } from "./cron-plist.js";
 import {
   CRON_HEALTH_TEXTFILE_DIR_ENV,
+  DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
   resolveCronHealthMetricArtifacts,
   resolveCronHealthTextfileDir,
 } from "./cron-outbox.js";
@@ -434,7 +435,7 @@ export function syncLaunchdCrons(options: SyncLaunchdCronsOptions = {}): SyncLau
       const removedArtifactCount = retireCronHealthMetricArtifacts(
         cronNameFromLaunchdLabel(item.label),
         readPersistedCronHealthTextfileDir(item.plistPath)
-          ?? planned.context.cronHealthTextfileDir,
+          ?? DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
       );
       item.metricRetirement = {
         status: "applied",
@@ -1066,14 +1067,12 @@ function renderExplicitEnvEntries(
   if (nodeRuntimeRoot?.trim()) {
     entries.push(renderEnvEntry(MINIME_NODE_RUNTIME_ROOT_ENV, nodeRuntimeRoot));
   }
-  if (env[CRON_HEALTH_TEXTFILE_DIR_ENV]?.trim()) {
-    entries.push(
-      renderEnvEntry(
-        CRON_HEALTH_TEXTFILE_DIR_ENV,
-        context.cronHealthTextfileDir,
-      ),
-    );
-  }
+  entries.push(
+    renderEnvEntry(
+      CRON_HEALTH_TEXTFILE_DIR_ENV,
+      context.cronHealthTextfileDir,
+    ),
+  );
   return entries.join("");
 }
 

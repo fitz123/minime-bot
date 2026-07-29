@@ -1060,19 +1060,34 @@ describe("ops worker dedicated Telegram control", () => {
       summary: "Fixture report payload changed after an earlier delivery claim.",
     };
     isolated.report.state = "PENDING";
+    const reconciliationIntent = {
+      reportIdentity: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      reportPayloadHash: `sha256:${"c".repeat(64)}`,
+    };
+    const reconciliationIntentHash =
+      hashOpsWorkerCanonicalPayload(reconciliationIntent);
     isolated.mutationReceipts.report = {
       boundary: "report",
       operationId: "report:incompatible-fixture",
-      intentHash: hashOpsWorkerCanonicalPayload({
-        reportIdentity: "prior-report-identity",
-        reportPayloadHash: `sha256:${"c".repeat(64)}`,
-      }),
+      intentHash: reconciliationIntentHash,
       queryObservedAt: NOW,
       queryResultHash: hashOpsWorkerCanonicalPayload({ delivered: false }),
       mutationStartedAt: NOW,
       outcome: null,
       replayHistory: [],
     };
+    isolated.evidence.push({
+      at: NOW,
+      kind: "system",
+      trust: "trusted",
+      summary: JSON.stringify({
+        type: "ops-worker-report-reconciliation-intent-v1",
+        operationId: "report:incompatible-fixture",
+        intentHash: reconciliationIntentHash,
+        intent: reconciliationIntent,
+      }),
+      artifact: null,
+    });
     fixture.store.create(isolated);
     const originalReceipt = structuredClone(isolated.mutationReceipts.report);
     const transport = new FakeTelegramTransport();
@@ -1098,6 +1113,10 @@ describe("ops worker dedicated Telegram control", () => {
       String(message.text).includes("reportReceipt=claimed/unknown")), true);
     assert.equal(transport.messages.some((message) =>
       String(message.text).includes("reportReconciliation=required")), true);
+    assert.equal(transport.messages.some((message) =>
+      String(message.text).includes(
+        'reportReconciliationIntent={"boundary":"report","operationId":"report:incompatible-fixture"',
+      )), true);
 
     const sendable = makeTask("task-b-sendable-after-reconciliation");
     sendable.state = "CANCELLED";

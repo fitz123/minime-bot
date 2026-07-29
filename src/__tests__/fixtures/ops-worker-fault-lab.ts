@@ -1901,7 +1901,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       const stalePlist = join(launchAgentsDir, `${cronLabel}.plist`);
       writeFileSync(
         stalePlist,
-        `<plist><dict><key>Label</key><string>${cronLabel}</string></dict></plist>\n`,
+        `<plist><dict><key>Label</key><string>${cronLabel}</string><key>EnvironmentVariables</key><dict><key>${CRON_HEALTH_TEXTFILE_DIR_ENV}</key><string>${metricDir}</string></dict></dict></plist>\n`,
         "utf8",
       );
       const artifacts = resolveCronHealthMetricArtifacts(cronName, metricDir);
