@@ -53,7 +53,7 @@ function createFixture(prefix = "minime-launchd-crons-"): Fixture {
   const launchAgentsDir = join(home, "Library", "LaunchAgents");
   mkdirSync(workspace, { recursive: true });
   mkdirSync(launchAgentsDir, { recursive: true });
-  return {
+  const fixture: Fixture = {
     root,
     workspace,
     home,
@@ -62,6 +62,8 @@ function createFixture(prefix = "minime-launchd-crons-"): Fixture {
     launchAgentsDir,
     env: { HOME: home, LOG_DIR: logDir, UID: "501" },
   };
+  fixture.env.PLUTIL_BIN = writeFixturePlutil(fixture);
+  return fixture;
 }
 
 function writeCrons(workspace: string, body: string): void {
@@ -1774,7 +1776,7 @@ fi
       assert.doesNotMatch(content, new RegExp(`<string>${escapeRegex(canonicalRunner)}</string>`));
       assert.deepEqual(calls.map((call) => [call.command, call.args[0]]), [
         ["/bin/launchctl", "print"],
-        ["/usr/bin/plutil", "-lint"],
+        [result.context.plutilBin, "-lint"],
         ["/bin/launchctl", "bootout"],
         ["/bin/launchctl", "bootstrap"],
       ]);

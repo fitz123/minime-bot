@@ -90,6 +90,7 @@ import {
 } from "../../ops-worker/types.js";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1939,6 +1940,9 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         }
         return { status: 0, stdout: "", stderr: "" };
       };
+      const fixturePlutil = join(context.root, "fixture-plutil");
+      copyFileSync(new URL("./plutil-convert.py", import.meta.url), fixturePlutil);
+      chmodSync(fixturePlutil, 0o700);
       const cronResult = syncLaunchdCrons({
         workspace: cronWorkspace,
         launchAgentsDir,
@@ -1947,6 +1951,7 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
         env: {
           HOME: cronHome,
           LOG_DIR: join(context.root, "cron-logs"),
+          PLUTIL_BIN: fixturePlutil,
           UID: "501",
           [CRON_HEALTH_TEXTFILE_DIR_ENV]: metricDir,
         },
