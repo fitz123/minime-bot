@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   OPS_WORKER_LIMITS,
+  OPS_WORKER_OUTCOME_KINDS,
+  OPS_WORKER_OUTCOME_RESULTS,
+  OPS_WORKER_TASK_STATES,
   type OpsWorkerEvidence,
   type OpsWorkerTask,
 } from "./types.js";
@@ -8,6 +11,74 @@ import {
 const REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE =
   "ops-worker-report-reconciliation-intent-v1";
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+
+function hasExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length
+    && expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function canonicalReportReconciliationIntent(
+  value: unknown,
+): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const intent = value as Record<string, unknown>;
+  if (
+    hasExactKeys(intent, ["reportIdentity", "reportPayloadHash"])
+    && typeof intent.reportIdentity === "string"
+    && SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    && typeof intent.reportPayloadHash === "string"
+    && SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
+  ) {
+    return JSON.stringify({
+      reportIdentity: intent.reportIdentity,
+      reportPayloadHash: intent.reportPayloadHash,
+    });
+  }
+  if (
+    !hasExactKeys(intent, ["reportIdentity", "taskState", "lastOutcome"])
+    || typeof intent.reportIdentity !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    || typeof intent.taskState !== "string"
+    || !(OPS_WORKER_TASK_STATES as readonly string[]).includes(intent.taskState)
+  ) return undefined;
+  if (intent.lastOutcome === null) {
+    return JSON.stringify({
+      lastOutcome: null,
+      reportIdentity: intent.reportIdentity,
+      taskState: intent.taskState,
+    });
+  }
+  if (
+    typeof intent.lastOutcome !== "object"
+    || Array.isArray(intent.lastOutcome)
+  ) return undefined;
+  const outcome = intent.lastOutcome as Record<string, unknown>;
+  if (
+    !hasExactKeys(outcome, ["at", "kind", "result", "summary"])
+    || typeof outcome.at !== "string"
+    || typeof outcome.kind !== "string"
+    || !(OPS_WORKER_OUTCOME_KINDS as readonly string[]).includes(outcome.kind)
+    || typeof outcome.result !== "string"
+    || !(OPS_WORKER_OUTCOME_RESULTS as readonly string[]).includes(outcome.result)
+    || typeof outcome.summary !== "string"
+  ) return undefined;
+  return JSON.stringify({
+    lastOutcome: {
+      at: outcome.at,
+      kind: outcome.kind,
+      result: outcome.result,
+      summary: outcome.summary,
+    },
+    reportIdentity: intent.reportIdentity,
+    taskState: intent.taskState,
+  });
+}
 
 function isProtectedAlertmanagerEvidence(
   task: Readonly<OpsWorkerTask>,
@@ -66,27 +137,18 @@ function isProtectedReportReconciliationIntent(
       intent?: unknown;
     };
     if (
-      marker.type !== REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
+      !hasExactKeys(marker, ["type", "operationId", "intentHash", "intent"])
+      || marker.type !== REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
       || marker.operationId !== receipt.operationId
       || marker.intentHash !== receipt.intentHash
       || typeof marker.intentHash !== "string"
       || !SHA256_DIGEST_PATTERN.test(marker.intentHash)
-      || typeof marker.intent !== "object"
-      || marker.intent === null
-      || Array.isArray(marker.intent)
     ) return false;
-    const intent = marker.intent as Record<string, unknown>;
-    if (
-      Object.keys(intent).length !== 2
-      || typeof intent.reportIdentity !== "string"
-      || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
-      || typeof intent.reportPayloadHash !== "string"
-      || !SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
-    ) return false;
-    const intentHash = `sha256:${createHash("sha256").update(JSON.stringify({
-      reportIdentity: intent.reportIdentity,
-      reportPayloadHash: intent.reportPayloadHash,
-    })).digest("hex")}`;
+    const canonicalIntent = canonicalReportReconciliationIntent(marker.intent);
+    if (canonicalIntent === undefined) return false;
+    const intentHash = `sha256:${createHash("sha256")
+      .update(canonicalIntent)
+      .digest("hex")}`;
     return intentHash === receipt.intentHash;
   } catch {
     return false;

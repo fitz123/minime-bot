@@ -1867,6 +1867,98 @@ describe("ops worker supervisor", () => {
     assert.equal(sent.mutationReceipts.report?.outcome?.result, "APPLIED");
   });
 
+  it("retains a schema-v5 report intent across startup state reconciliation", async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-v5-report-fence-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const first = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-fence-first",
+    });
+    first.store.create(makeTask("task-v5-report-fence"));
+    const running = first.supervisor.markRunning(
+      "task-v5-report-fence",
+      activeRun("v5-report-fence-first"),
+    );
+    const legacyIntent = {
+      reportIdentity: hashOpsWorkerCanonicalPayload({
+        taskId: running.id,
+        deliveryKey: running.source.deliveryKey,
+        createdAt: running.createdAt,
+      }),
+      taskState: running.state,
+      lastOutcome: running.lastOutcome,
+    };
+    const intentHash = hashOpsWorkerCanonicalPayload(legacyIntent);
+    const operationId = `report:${intentHash.slice("sha256:".length, 31)}`;
+    const snapshotPath = join(first.store.tasksDirectory, `${running.id}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Record<string, unknown>;
+    snapshot.schemaVersion = 5;
+    delete snapshot.agentResult;
+    snapshot.report = {
+      state: "PENDING",
+      attempts: 0,
+      lastError: null,
+    };
+    const receipts = snapshot.mutationReceipts as Record<string, unknown>;
+    receipts.report = {
+      boundary: "report",
+      operationId,
+      intentHash,
+      queryObservedAt: NOW,
+      queryResultHash: hashOpsWorkerCanonicalPayload(snapshot.report),
+      mutationStartedAt: NOW,
+      outcome: null,
+      replayHistory: [],
+    };
+    first.close();
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+
+    const restarted = await makeHarness(t, {
+      directory,
+      instanceId: "v5-report-fence-restarted",
+      reconcileActiveRun: () => ({
+        status: "GONE",
+        summary: "The legacy report process is proven gone.",
+      }),
+    });
+    const isolated = restarted.store.get(running.id);
+    assert.equal(isolated?.schemaVersion, 6);
+    assert.equal(isolated?.state, "BLOCKED");
+    assert.match(
+      isolated?.report.lastError ?? "",
+      /requires external-outcome reconciliation/,
+    );
+    const operation = getOpsWorkerReportReconciliationOperation(isolated!);
+    assert.deepEqual(operation, {
+      boundary: "report",
+      operationId,
+      intent: legacyIntent,
+    });
+
+    restarted.setNow(LATER);
+    const lifecycle = new OpsWorkerLifecycle(restarted.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.beginMutationReceipt(running.id, {
+      ...operation!,
+      queryObservedAt: LATER,
+      queryResult: { delivered: true },
+    });
+    lifecycle.finishMutationReceipt(running.id, {
+      ...operation!,
+      result: "ALREADY_APPLIED",
+      evidence: { delivered: true },
+    });
+    const retried = restarted.supervisor.retryBlockedTask(running.id);
+    assert.equal(retried.state, "RESUMABLE");
+    assert.equal(retried.report.state, "NONE");
+    assert.equal(retried.report.lastError, null);
+    assert.equal(
+      retried.mutationReceipts.report?.outcome?.result,
+      "ALREADY_APPLIED",
+    );
+  });
+
   it("recovers terminal report fences after fixed receipt outcomes", async (t) => {
     const directory = mkdtempSync(join(tmpdir(), "minime-ops-worker-terminal-report-fence-"));
     t.after(() => rmSync(directory, { recursive: true, force: true }));

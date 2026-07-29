@@ -43,7 +43,10 @@ import {
 } from "./task-store.js";
 import {
   OPS_WORKER_LIMITS,
+  OPS_WORKER_OUTCOME_KINDS,
+  OPS_WORKER_OUTCOME_RESULTS,
   OPS_WORKER_QUOTA_PROBE_PROOF_VERSION,
+  OPS_WORKER_TASK_STATES,
   hashOpsWorkerPiLaunchSubject,
   hashOpsWorkerReportPayload,
   hashOpsWorkerVerificationSubject,
@@ -635,17 +638,30 @@ interface OpsWorkerCurrentReportIntent {
   reportPayloadHash: string;
 }
 
+interface OpsWorkerV5ReportIntent {
+  reportIdentity: string;
+  taskState: OpsWorkerTaskState;
+  lastOutcome: Pick<
+    OpsWorkerLastOutcome,
+    "at" | "kind" | "result" | "summary"
+  > | null;
+}
+
+type OpsWorkerReportReconciliationIntent =
+  | OpsWorkerCurrentReportIntent
+  | OpsWorkerV5ReportIntent;
+
 export interface OpsWorkerReportReconciliationOperation {
   boundary: "report";
   operationId: string;
-  intent: OpsWorkerCurrentReportIntent;
+  intent: OpsWorkerReportReconciliationIntent;
 }
 
 interface OpsWorkerReportReconciliationIntentEvidence {
   type: typeof REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE;
   operationId: string;
   intentHash: string;
-  intent: OpsWorkerCurrentReportIntent;
+  intent: OpsWorkerReportReconciliationIntent;
 }
 
 function reportIdentity(task: Readonly<OpsWorkerTask>): string {
@@ -678,6 +694,78 @@ function hasIncompatibleClaimedReportReceipt(
     .some((operation) => matchesReportOperation(operation, receipt));
 }
 
+function hasExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length
+    && expected.every((key) => hasOwn(value, key));
+}
+
+function parseReportReconciliationIntent(
+  value: unknown,
+): OpsWorkerReportReconciliationIntent | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const intent = value as Record<string, unknown>;
+  if (
+    hasExactKeys(intent, ["reportIdentity", "reportPayloadHash"])
+    && typeof intent.reportIdentity === "string"
+    && SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    && typeof intent.reportPayloadHash === "string"
+    && SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
+  ) {
+    return {
+      reportIdentity: intent.reportIdentity,
+      reportPayloadHash: intent.reportPayloadHash,
+    };
+  }
+  if (
+    !hasExactKeys(intent, ["reportIdentity", "taskState", "lastOutcome"])
+    || typeof intent.reportIdentity !== "string"
+    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
+    || typeof intent.taskState !== "string"
+    || !(OPS_WORKER_TASK_STATES as readonly string[]).includes(intent.taskState)
+  ) return undefined;
+  if (intent.lastOutcome === null) {
+    return {
+      reportIdentity: intent.reportIdentity,
+      taskState: intent.taskState as OpsWorkerTaskState,
+      lastOutcome: null,
+    };
+  }
+  if (
+    typeof intent.lastOutcome !== "object"
+    || Array.isArray(intent.lastOutcome)
+  ) return undefined;
+  const outcome = intent.lastOutcome as Record<string, unknown>;
+  if (
+    !hasExactKeys(outcome, ["at", "kind", "result", "summary"])
+    || typeof outcome.at !== "string"
+    || !TIMESTAMP_PATTERN.test(outcome.at)
+    || Number.isNaN(Date.parse(outcome.at))
+    || typeof outcome.kind !== "string"
+    || !(OPS_WORKER_OUTCOME_KINDS as readonly string[]).includes(outcome.kind)
+    || typeof outcome.result !== "string"
+    || !(OPS_WORKER_OUTCOME_RESULTS as readonly string[]).includes(outcome.result)
+    || typeof outcome.summary !== "string"
+    || Buffer.byteLength(outcome.summary, "utf8")
+      > OPS_WORKER_LIMITS.maxOutcomeSummaryBytes
+  ) return undefined;
+  return {
+    reportIdentity: intent.reportIdentity,
+    taskState: intent.taskState as OpsWorkerTaskState,
+    lastOutcome: {
+      at: outcome.at,
+      kind: outcome.kind as OpsWorkerLastOutcome["kind"],
+      result: outcome.result as OpsWorkerLastOutcome["result"],
+      summary: outcome.summary,
+    },
+  };
+}
+
 function parseReportReconciliationIntentEvidence(
   evidence: Readonly<OpsWorkerEvidence>,
 ): OpsWorkerReportReconciliationIntentEvidence | undefined {
@@ -693,51 +781,26 @@ function parseReportReconciliationIntentEvidence(
   }
   const marker = value as Record<string, unknown>;
   if (
-    marker.type !== REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
+    !hasExactKeys(marker, ["type", "operationId", "intentHash", "intent"])
+    || marker.type !== REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE
     || typeof marker.operationId !== "string"
     || typeof marker.intentHash !== "string"
     || !SHA256_DIGEST_PATTERN.test(marker.intentHash)
-    || typeof marker.intent !== "object"
-    || marker.intent === null
-    || Array.isArray(marker.intent)
   ) return undefined;
-  const intent = marker.intent as Record<string, unknown>;
-  if (
-    typeof intent.reportIdentity !== "string"
-    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
-    || typeof intent.reportPayloadHash !== "string"
-    || !SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
-  ) return undefined;
+  const intent = parseReportReconciliationIntent(marker.intent);
+  if (intent === undefined) return undefined;
   return {
     type: REPORT_RECONCILIATION_INTENT_EVIDENCE_TYPE,
     operationId: marker.operationId,
     intentHash: marker.intentHash,
-    intent: {
-      reportIdentity: intent.reportIdentity,
-      reportPayloadHash: intent.reportPayloadHash,
-    },
+    intent,
   };
 }
 
-function currentReportIntent(
+function reportReconciliationIntent(
   operation: ReturnType<typeof reportOperation>,
-): OpsWorkerCurrentReportIntent | undefined {
-  if (
-    typeof operation.intent !== "object"
-    || operation.intent === null
-    || Array.isArray(operation.intent)
-  ) return undefined;
-  const intent = operation.intent as Record<string, unknown>;
-  if (
-    typeof intent.reportIdentity !== "string"
-    || !SHA256_DIGEST_PATTERN.test(intent.reportIdentity)
-    || typeof intent.reportPayloadHash !== "string"
-    || !SHA256_DIGEST_PATTERN.test(intent.reportPayloadHash)
-  ) return undefined;
-  return {
-    reportIdentity: intent.reportIdentity,
-    reportPayloadHash: intent.reportPayloadHash,
-  };
+): OpsWorkerReportReconciliationIntent | undefined {
+  return parseReportReconciliationIntent(operation.intent);
 }
 
 export function getOpsWorkerReportReconciliationOperation(
@@ -3236,7 +3299,7 @@ export class OpsWorkerSupervisor {
     taskId: string,
     operation: ReturnType<typeof reportOperation>,
   ): OpsWorkerTask {
-    const intent = currentReportIntent(operation);
+    const intent = reportReconciliationIntent(operation);
     const existing = this.requireTask(taskId);
     if (
       intent === undefined
