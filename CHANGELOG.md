@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.7.41
+
+- Keep Ops intake and status available when one report receipt is externally
+  ambiguous, retain quiet retryable noncritical alert delivery and independent
+  critical delivery, and retire removed cron terminal metrics through canonical
+  sync with an end-to-end recovery/result-report regression (#173).
+
 ## 2026.7.40
 
 - Add managed byte-preserving Knowledge archive/restore operations with complete
