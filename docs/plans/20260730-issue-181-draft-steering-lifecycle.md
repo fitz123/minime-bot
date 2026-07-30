@@ -1,5 +1,9 @@
 # Plan: Telegram draft lifecycle across mid-turn steering
 
+Status: public-package implementation Tasks 1–3 complete and validated on
+2026-07-30. Iterative code review is in progress; PR, release, deployment, and
+issue closure remain pending under Post-completion.
+
 ## Goal
 
 Prevent Telegram iOS from replaying/flickering an active native `sendMessageDraft` after another message enters the same chat topic, while preserving acknowledged Pi steering, ordered fallback, media ownership, and exactly-once final delivery.

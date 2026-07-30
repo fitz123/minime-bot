@@ -1689,6 +1689,79 @@ describe("command handler wiring", () => {
     messageQueue.clearAll();
   });
 
+  it("suspends a relay only for an interleaved message in the same topic", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const topicChatId = -100999;
+    const topicConfig: BotConfig = {
+      ...handlerConfig,
+      bindings: [{
+        chatId: topicChatId,
+        agentId: "main",
+        kind: "group",
+        requireMention: false,
+      }],
+    };
+    const coordinator = new ActiveDraftCoordinator();
+    const registeredKeys: string[] = [];
+    let relaySuspensions = 0;
+    const originalRegister = coordinator.register.bind(coordinator);
+    coordinator.register = (key, suspend) => {
+      registeredKeys.push(key);
+      return originalRegister(key, () => {
+        relaySuspensions++;
+        suspend();
+      });
+    };
+    const manager = createSteeringSessionManager();
+    const topicFactory: typeof createTelegramBot = (_config, sessionManager, opts) =>
+      createTelegramBot(topicConfig, sessionManager, opts);
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      { draftCoordinator: coordinator },
+      undefined,
+      topicFactory,
+    );
+    const makeTopicUpdate = (text: string, updateId: number, topicId: number) => ({
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        message_thread_id: topicId,
+        is_topic_message: true as const,
+        from: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        chat: {
+          id: topicChatId,
+          type: "supergroup" as const,
+          title: "Test Forum",
+          is_forum: true as const,
+        },
+        date: 36_000,
+        text,
+      },
+    });
+
+    await bot.handleUpdate(makeTopicUpdate("initial request", 20, 1));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(registeredKeys, [`${topicChatId}:1`]);
+
+    await bot.handleUpdate(makeTopicUpdate("other topic", 21, 2));
+    assert.strictEqual(relaySuspensions, 0);
+
+    await bot.handleUpdate(makeTopicUpdate("same topic", 22, 1));
+    await bot.handleUpdate(makeTopicUpdate("same topic again", 23, 1));
+    assert.strictEqual(relaySuspensions, 1);
+
+    manager.releaseInitial();
+    await flushAsyncWork();
+    messageQueue.clearAll();
+  });
+
   it("notifies authenticated messages before commands, queueing, and media preprocessing", async () => {
     const coordinator = new ActiveDraftCoordinator();
     const events: string[] = [];
