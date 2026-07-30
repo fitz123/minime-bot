@@ -74,7 +74,7 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 1: Make a relay draft safely suspendable
 **Goal:** Add an idempotent cosmetic suspension boundary without changing answer accumulation or final delivery.
-**Serves:** Ninja's requirement to stop the visible draft loop while keeping the bot's answer and final delivery correct.
+**Serves:** The issue requirement to stop the visible draft loop while keeping the bot's answer and final delivery correct.
 
 - [x] Add the minimum relay registration option and a `DraftScheduler.suspend()` transition that blocks new/pending/refresh sends while allowing bounded in-flight settlement.
 - [x] Ensure `reset_response_text`, close, cancel, rate-limit, and refresh paths cannot reactivate a suspended scheduler.
@@ -83,7 +83,7 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 2: Suspend the active topic draft on interleaved Telegram input
 **Goal:** Connect the existing Telegram session boundary to the active relay without coupling draft state to message ownership.
-**Serves:** Ninja's explicit requirement that acknowledged steering and drafts interact correctly, including commands/messages received while processing.
+**Serves:** The explicit requirement that acknowledged steering and drafts interact correctly, including commands/messages received while processing.
 
 - [x] Add a small generation-safe active-draft coordinator keyed by the existing `sessionKey`, with idempotent suspend and fenced unregister behavior.
 - [x] Register/unregister each Telegram relay's suspension callback through the narrow relay hook.
@@ -93,7 +93,7 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 ### Task 3: Lock the cross-layer steering/fallback contract and documentation
 **Goal:** Prove the fix preserves delivery ownership and document the intentional degraded-streaming behavior after an interleaved input.
-**Serves:** Ninja's requirement to preserve correct steering rather than hide the flicker by dropping, duplicating, or prematurely finalizing messages.
+**Serves:** The requirement to preserve correct steering rather than hide the flicker by dropping, duplicating, or prematurely finalizing messages.
 
 - [x] Add or extend deterministic integration-level regression cases for accepted/consumed steering, rejected/unconsumed ordered fallback, multiple interleaved inputs, queued-continuation response reset, final draft settlement, and exactly-once permanent delivery.
 - [x] Confirm media cleanup/ownership and Discord behavior remain unchanged through existing tests; add a narrow regression only if the changed interface reaches those paths.
