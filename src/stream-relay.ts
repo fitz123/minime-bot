@@ -155,6 +155,9 @@ const MAX_DRAFT_PAUSE_MS = 60_000;
 /** Max time (ms) to wait for in-flight drafts before final delivery. */
 export const DRAFT_SETTLE_TIMEOUT_MS = 3000;
 
+/** Register a relay-local draft suspension callback and return its cleanup. */
+export type RegisterDraftSuspension = (suspend: () => void) => () => void;
+
 /**
  * O(1) per-stream draft scheduler: one request in flight and one replaceable
  * pending snapshot. Draft failures are cosmetic and never escape this class.
@@ -170,6 +173,7 @@ class DraftScheduler {
   private pauseUntil = 0;
   private nextRefreshAt = 0;
   private cancelled = false;
+  private suspended = false;
   private unsupported = false;
   private inFlightController: AbortController | null = null;
 
@@ -179,7 +183,7 @@ class DraftScheduler {
   ) {}
 
   enqueue(text: string): void {
-    if (this.cancelled || this.unsupported || !text) return;
+    if (this.cancelled || this.suspended || this.unsupported || !text) return;
     if (text === this.latestText) return;
     this.latestText = text;
     if (this.pendingText !== null) recordDraftSchedulerEvent("coalesced");
@@ -204,6 +208,12 @@ class DraftScheduler {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = null;
     }
+  }
+
+  suspend(): void {
+    if (this.cancelled || this.suspended) return;
+    this.suspended = true;
+    this.clearScheduled();
   }
 
   cancel(): void {
@@ -236,7 +246,15 @@ class DraftScheduler {
   }
 
   private startOrSchedule(): void {
-    if (this.cancelled || this.unsupported || this.inFlight !== null || this.pendingText === null) return;
+    if (
+      this.cancelled ||
+      this.suspended ||
+      this.unsupported ||
+      this.inFlight !== null ||
+      this.pendingText === null
+    ) {
+      return;
+    }
     const now = Date.now();
     const intervalUntil = this.lastStartedAt === null
       ? now
@@ -269,7 +287,7 @@ class DraftScheduler {
       .finally(() => {
         if (this.inFlightController === controller) this.inFlightController = null;
         this.inFlight = null;
-        if (!this.cancelled) {
+        if (!this.cancelled && !this.suspended) {
           this.startOrSchedule();
           this.scheduleRefresh();
         }
@@ -303,6 +321,7 @@ class DraftScheduler {
   private scheduleRefresh(): void {
     if (
       this.cancelled ||
+      this.suspended ||
       this.unsupported ||
       this.visibleText === null ||
       this.latestText === null ||
@@ -318,6 +337,7 @@ class DraftScheduler {
       this.refreshTimer = null;
       if (
         this.cancelled ||
+        this.suspended ||
         this.unsupported ||
         this.visibleText === null ||
         this.latestText === null ||
@@ -378,6 +398,7 @@ export async function relayStream(
   platform: PlatformContext,
   outboxPath?: string,
   onAgentOwnership?: () => void,
+  registerDraftSuspension?: RegisterDraftSuspension,
 ): Promise<void> {
   let accumulated = "";
   let typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -392,6 +413,9 @@ export async function relayStream(
     }
   };
   const draftScheduler = new DraftScheduler(platform, draftId);
+  const unregisterDraftSuspension = registerDraftSuspension?.(
+    () => draftScheduler.suspend(),
+  );
 
   // Take over pre-stream typing if active (clean handoff from message queue)
   if (platform.preStreamTypingTimer) {
@@ -523,5 +547,6 @@ export async function relayStream(
   } finally {
     stopPeriodicTyping();
     draftScheduler.cancel();
+    unregisterDraftSuspension?.();
   }
 }

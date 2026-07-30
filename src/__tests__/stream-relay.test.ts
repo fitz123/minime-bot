@@ -532,6 +532,190 @@ describe("relayStream draft streaming", () => {
 });
 
 describe("relayStream bounded draft scheduler", () => {
+  it("suspends before the first draft and unregisters after exactly-once final delivery", async () => {
+    const { platform, drafts, sends } = mockPlatform({ typingIndicator: false });
+    const start = deferred<void>();
+    let suspendDraft: (() => void) | undefined;
+    let unregisterCalls = 0;
+    async function* stream(): AsyncGenerator<StreamLine> {
+      await start.promise;
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "answer" } } } as StreamEvent;
+      yield { type: "result", result: "answer", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(
+      stream(),
+      platform,
+      undefined,
+      undefined,
+      (suspend) => {
+        suspendDraft = suspend;
+        return () => { unregisterCalls++; };
+      },
+    );
+    assert.ok(suspendDraft, "suspension is registered before stream processing");
+    suspendDraft();
+    suspendDraft();
+    start.resolve();
+    await relay;
+
+    assert.deepStrictEqual(drafts, []);
+    assert.deepStrictEqual(sends, [{ text: "answer" }]);
+    assert.strictEqual(unregisterCalls, 1);
+  });
+
+  it("suspends a visible draft without refreshing or sending later snapshots", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { platform, sends } = mockPlatform({ typingIndicator: false });
+    const calls: string[] = [];
+    platform.sendDraft = async (_draftId, text) => {
+      calls.push(text);
+      return { status: "sent" };
+    };
+    const update = deferred<void>();
+    const finish = deferred<void>();
+    let suspendDraft: (() => void) | undefined;
+    async function* stream(): AsyncGenerator<StreamLine> {
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "visible" } } } as StreamEvent;
+      await update.promise;
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: " later" } } } as StreamEvent;
+      await finish.promise;
+      yield { type: "result", result: "visible later", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(
+      stream(),
+      platform,
+      undefined,
+      undefined,
+      (suspend) => {
+        suspendDraft = suspend;
+        return () => {};
+      },
+    );
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, ["visible"]);
+    assert.ok(suspendDraft);
+    suspendDraft();
+    suspendDraft();
+    update.resolve();
+    await flushMicrotasks();
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS * 2);
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, ["visible"]);
+
+    finish.resolve();
+    await relay;
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, ["visible"]);
+    assert.deepStrictEqual(sends, [{ text: "visible later" }]);
+  });
+
+  it("discards pending coalesced text and lets only the in-flight draft settle", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { platform, sends } = mockPlatform({ typingIndicator: false });
+    const calls: string[] = [];
+    const firstResult = deferred<DraftSendResult>();
+    let draftSignal: AbortSignal | undefined;
+    platform.sendDraft = async (_draftId, text, signal) => {
+      calls.push(text);
+      draftSignal = signal;
+      return firstResult.promise;
+    };
+    const second = deferred<void>();
+    const third = deferred<void>();
+    const finish = deferred<void>();
+    let suspendDraft: (() => void) | undefined;
+    async function* stream(): AsyncGenerator<StreamLine> {
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "one" } } } as StreamEvent;
+      await second.promise;
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: " two" } } } as StreamEvent;
+      await third.promise;
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: " three" } } } as StreamEvent;
+      await finish.promise;
+      yield { type: "result", result: "one two three", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(
+      stream(),
+      platform,
+      undefined,
+      undefined,
+      (suspend) => {
+        suspendDraft = suspend;
+        return () => {};
+      },
+    );
+    await flushMicrotasks();
+    second.resolve();
+    await flushMicrotasks();
+    third.resolve();
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, ["one"]);
+    assert.ok(suspendDraft && draftSignal);
+    suspendDraft();
+    assert.strictEqual(draftSignal.aborted, false);
+    firstResult.resolve({ status: "rate_limited", retryAfterMs: 5_000 });
+    await flushMicrotasks();
+    t.mock.timers.tick(60_000);
+    await flushMicrotasks();
+    assert.deepStrictEqual(calls, ["one"], "pending and rate-limit paths stay suspended");
+
+    finish.resolve();
+    await relay;
+    assert.strictEqual(draftSignal.aborted, false);
+    assert.deepStrictEqual(sends, [{ text: "one two three" }]);
+  });
+
+  it("stays suspended across queued-continuation reset and delivers only the replacement", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const { platform, drafts, sends } = mockPlatform({ typingIndicator: false });
+    const reset = deferred<void>();
+    const replacement = deferred<void>();
+    const finish = deferred<void>();
+    let suspendDraft: (() => void) | undefined;
+    async function* stream(): AsyncGenerator<StreamLine> {
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "discarded" } } } as StreamEvent;
+      await reset.promise;
+      yield {
+        type: "assistant",
+        subtype: "control_request",
+        action: "reset_response_text",
+      } as unknown as StreamLine;
+      await replacement.promise;
+      yield { type: "stream_event", event: { delta: { type: "text_delta", text: "replacement" } } } as StreamEvent;
+      await finish.promise;
+      yield { type: "result", result: "replacement", session_id: "test" } as ResultMessage;
+    }
+
+    const relay = relayStream(
+      stream(),
+      platform,
+      undefined,
+      undefined,
+      (suspend) => {
+        suspendDraft = suspend;
+        return () => {};
+      },
+    );
+    await flushMicrotasks();
+    assert.deepStrictEqual(drafts.map(({ text }) => text), ["discarded"]);
+    assert.ok(suspendDraft);
+    suspendDraft();
+    reset.resolve();
+    await flushMicrotasks();
+    replacement.resolve();
+    await flushMicrotasks();
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
+    await flushMicrotasks();
+    assert.deepStrictEqual(drafts.map(({ text }) => text), ["discarded"]);
+
+    finish.resolve();
+    await relay;
+    assert.deepStrictEqual(sends, [{ text: "replacement" }]);
+  });
+
   it("refreshes the same visible draft during a no-delta gap longer than 30 seconds", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const { platform } = mockPlatform({ typingIndicator: false });

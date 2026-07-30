@@ -472,8 +472,16 @@ before the next model call; it does not interrupt a running tool or its sibling
 calls. The child lifecycle gate remains available through retry backoff,
 compaction, and queued continuations until `agent_settled`. Pi's configured
 steering mode remains authoritative. Telegram's idle 3-second debounce, queue
-cap and saturation policy, draft/final delivery, and outbox behavior are
-unchanged. Passive echo and shutdown steering remain best-effort, and Discord
+cap and saturation policy, permanent final delivery, and outbox behavior are
+unchanged.
+
+In Telegram DMs, native draft streaming pauses for the current relay as soon as
+another authenticated message enters the same chat topic. This cosmetic pause
+does not change steering or final delivery: consumed steering continues in the
+current Pi turn without reactivating the draft, including across queued-response
+resets. If steering is rejected or remains unconsumed, the ordered fallback runs
+after the current relay settles; that independent relay may stream a fresh
+draft. Passive echo and shutdown steering remain best-effort, and Discord
 message-queue behavior is unchanged.
 
 Media downloads retry transient network or stream failures and HTTP 408, 429,

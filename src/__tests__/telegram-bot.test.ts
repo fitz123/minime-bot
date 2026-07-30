@@ -11,6 +11,18 @@ import { existsSync } from "node:fs";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
+import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
+import { buildCollectPrompt } from "../message-queue.js";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 const testBindings: TelegramBinding[] = [
   { chatId: 111111111, agentId: "main", kind: "dm", label: "User1 DM" },
@@ -75,6 +87,41 @@ describe("sessionKey", () => {
 
   it("handles topicId 0 (General topic in forums)", () => {
     assert.strictEqual(sessionKey(123456, 0), "123456:0");
+  });
+});
+
+describe("ActiveDraftCoordinator", () => {
+  it("suspends only the active same-topic relay and ignores repeated or idle notifications", () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let topicOneSuspensions = 0;
+    let topicTwoSuspensions = 0;
+
+    coordinator.suspend("-100999:1");
+    coordinator.register("-100999:1", () => { topicOneSuspensions++; });
+    coordinator.register("-100999:2", () => { topicTwoSuspensions++; });
+
+    coordinator.suspend("-100999:1");
+    coordinator.suspend("-100999:1");
+
+    assert.strictEqual(topicOneSuspensions, 1);
+    assert.strictEqual(topicTwoSuspensions, 0);
+  });
+
+  it("fences stale unregister callbacks from a newer relay generation", () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let oldSuspensions = 0;
+    let newSuspensions = 0;
+    const unregisterOld = coordinator.register("111111111", () => { oldSuspensions++; });
+    const unregisterNew = coordinator.register("111111111", () => { newSuspensions++; });
+
+    unregisterOld();
+    coordinator.suspend("111111111");
+    assert.strictEqual(oldSuspensions, 0);
+    assert.strictEqual(newSuspensions, 1);
+
+    unregisterNew();
+    coordinator.suspend("111111111");
+    assert.strictEqual(newSuspensions, 1);
   });
 });
 
@@ -1378,7 +1425,7 @@ describe("command handler wiring", () => {
     mockSM: SessionManager,
     apiCalls: Array<{ method: string; payload: any }> = [],
     opts?: Parameters<typeof createTelegramBot>[2],
-    apiResult?: (method: string, payload: any) => unknown,
+    apiResult?: (method: string, payload: any) => unknown | Promise<unknown>,
     factory: typeof createTelegramBot = createTelegramBot,
   ) {
     const result = factory(handlerConfig, mockSM, opts);
@@ -1388,7 +1435,7 @@ describe("command handler wiring", () => {
       apiCalls.push({ method, payload });
       return {
         ok: true,
-        result: apiResult?.(String(method), payload) ?? true,
+        result: await apiResult?.(String(method), payload) ?? true,
       } as any;
     });
     // Provide bot info so handleUpdate works without calling getMe
@@ -1602,6 +1649,332 @@ describe("command handler wiring", () => {
     });
     assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 1);
     messageQueue.clear(String(testChatId));
+  });
+
+  it("registers and unregisters each Telegram relay under its session key", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const coordinator = new ActiveDraftCoordinator();
+    const lifecycle: string[] = [];
+    let relaySuspensions = 0;
+    const originalRegister = coordinator.register.bind(coordinator);
+    coordinator.register = (key, suspend) => {
+      lifecycle.push(`register:${key}`);
+      const unregister = originalRegister(key, () => {
+        relaySuspensions++;
+        suspend();
+      });
+      return () => {
+        lifecycle.push(`unregister:${key}`);
+        unregister();
+      };
+    };
+    const manager = createSteeringSessionManager();
+    const { bot, messageQueue } = initBot(manager, [], { draftCoordinator: coordinator });
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 9));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(lifecycle, [`register:${testChatId}`]);
+
+    await bot.handleUpdate(makeCommandUpdate("status", 10));
+    await bot.handleUpdate(makeCommandUpdate("status", 11));
+    assert.strictEqual(relaySuspensions, 1, "repeated inputs suspend the active relay once");
+
+    manager.releaseInitial();
+    await flushAsyncWork();
+    assert.deepStrictEqual(lifecycle, [
+      `register:${testChatId}`,
+      `unregister:${testChatId}`,
+    ]);
+    messageQueue.clearAll();
+  });
+
+  it("suspends a relay only for an interleaved message in the same topic", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const topicChatId = -100999;
+    const topicConfig: BotConfig = {
+      ...handlerConfig,
+      bindings: [{
+        chatId: topicChatId,
+        agentId: "main",
+        kind: "group",
+        requireMention: false,
+      }],
+    };
+    const coordinator = new ActiveDraftCoordinator();
+    const registeredKeys: string[] = [];
+    let relaySuspensions = 0;
+    const originalRegister = coordinator.register.bind(coordinator);
+    coordinator.register = (key, suspend) => {
+      registeredKeys.push(key);
+      return originalRegister(key, () => {
+        relaySuspensions++;
+        suspend();
+      });
+    };
+    const manager = createSteeringSessionManager();
+    const topicFactory: typeof createTelegramBot = (_config, sessionManager, opts) =>
+      createTelegramBot(topicConfig, sessionManager, opts);
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      { draftCoordinator: coordinator },
+      undefined,
+      topicFactory,
+    );
+    const makeTopicUpdate = (text: string, updateId: number, topicId: number) => ({
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        message_thread_id: topicId,
+        is_topic_message: true as const,
+        from: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        chat: {
+          id: topicChatId,
+          type: "supergroup" as const,
+          title: "Test Forum",
+          is_forum: true as const,
+        },
+        date: 36_000,
+        text,
+      },
+    });
+
+    await bot.handleUpdate(makeTopicUpdate("initial request", 20, 1));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(registeredKeys, [`${topicChatId}:1`]);
+
+    await bot.handleUpdate(makeTopicUpdate("other topic", 21, 2));
+    assert.strictEqual(relaySuspensions, 0);
+
+    await bot.handleUpdate(makeTopicUpdate("same topic", 22, 1));
+    await bot.handleUpdate(makeTopicUpdate("same topic again", 23, 1));
+    assert.strictEqual(relaySuspensions, 1);
+
+    manager.releaseInitial();
+    await flushAsyncWork();
+    messageQueue.clearAll();
+  });
+
+  it("notifies authenticated messages before commands, queueing, and media preprocessing", async () => {
+    const coordinator = new ActiveDraftCoordinator();
+    const events: string[] = [];
+    const manager = createMockSessionManager();
+    const originalGetSessionHealth = manager.getSessionHealth.bind(manager);
+    manager.getSessionHealth = (key) => {
+      events.push("command");
+      return originalGetSessionHealth(key);
+    };
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      { draftCoordinator: coordinator },
+      (method, payload) => {
+        if (method === "getFile") {
+          events.push("media");
+          return { file_id: payload.file_id };
+        }
+        return true;
+      },
+    );
+    const key = String(testChatId);
+
+    coordinator.register(key, () => { events.push("suspend-command"); });
+    await bot.handleUpdate(makeCommandUpdate("status", 13));
+    assert.deepStrictEqual(events.slice(0, 2), ["suspend-command", "command"]);
+
+    events.length = 0;
+    coordinator.register(key, () => { events.push("suspend-text"); });
+    messageQueue.enqueue = (() => { events.push("enqueue"); }) as typeof messageQueue.enqueue;
+    await bot.handleUpdate(makeTextUpdate("ordinary input", 14));
+    assert.deepStrictEqual(events, ["suspend-text", "enqueue"]);
+
+    events.length = 0;
+    coordinator.register(key, () => { events.push("suspend-media"); });
+    await bot.handleUpdate(makeMediaUpdate({
+      photo: [{
+        file_id: "photo-file",
+        file_unique_id: "photo-unique",
+        width: 10,
+        height: 10,
+      }],
+    }, 15) as never);
+    assert.deepStrictEqual(events.slice(0, 2), ["suspend-media", "media"]);
+  });
+
+  it("does not notify draft registrations for unauthorized messages", async () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let suspensions = 0;
+    coordinator.register("999999999", () => { suspensions++; });
+    const { bot } = initBot(createMockSessionManager(), [], { draftCoordinator: coordinator });
+
+    await bot.handleUpdate({
+      update_id: 16,
+      message: {
+        message_id: 16,
+        from: { id: 999999999, is_bot: false, first_name: "Unknown" },
+        chat: { id: 999999999, type: "private", first_name: "Unknown" },
+        date: 36_000,
+        text: "unauthorized",
+      },
+    });
+
+    assert.strictEqual(suspensions, 0);
+  });
+
+  it("preserves steering ownership and ordered fallback across the suspended draft lifecycle", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    let draftGeneration = 0;
+    t.mock.method(Math, "random", () => {
+      draftGeneration++;
+      return draftGeneration / 10;
+    });
+
+    const continueInitial = deferred<void>();
+    const settleInitialDraft = deferred<boolean>();
+    const sentPrompts: string[] = [];
+    const steerCalls: Array<{
+      text: string;
+      onEnqueued?: () => void;
+      resolve: (acknowledged: boolean) => void;
+    }> = [];
+    const manager = createMockSessionManager() as unknown as SessionManager & {
+      sentPrompts: string[];
+      steerCalls: typeof steerCalls;
+    };
+    manager.sentPrompts = sentPrompts;
+    manager.steerCalls = steerCalls;
+    manager.sendSessionMessage = (_chatId: string, _agentId: string, text: string) => {
+      const callIndex = sentPrompts.length;
+      sentPrompts.push(text);
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: `session-${callIndex}` } as const;
+        if (callIndex === 0) {
+          yield {
+            type: "stream_event",
+            event: { delta: { type: "text_delta", text: "obsolete preview" } },
+          } as const;
+          await continueInitial.promise;
+          yield {
+            type: "assistant",
+            subtype: "control_request",
+            action: "reset_response_text",
+          } as never;
+          yield {
+            type: "stream_event",
+            event: { delta: { type: "text_delta", text: "revised final" } },
+          } as const;
+          yield { type: "result", result: "revised final", session_id: "session-0" } as const;
+          return;
+        }
+        yield {
+          type: "stream_event",
+          event: { delta: { type: "text_delta", text: "fallback preview" } },
+        } as const;
+        yield { type: "result", result: "fallback preview", session_id: "session-1" } as const;
+      })();
+    };
+    manager.steerSessionMessage = (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      onEnqueued?: () => void,
+    ) => new Promise<boolean>((resolve) => {
+      steerCalls.push({ text, onEnqueued, resolve });
+    });
+
+    let initialDraftCalls = 0;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(
+      manager,
+      apiCalls,
+      undefined,
+      (method) => {
+        if (method === "sendMessageDraft" && initialDraftCalls++ === 0) {
+          return settleInitialDraft.promise;
+        }
+        return true;
+      },
+    );
+    const key = String(testChatId);
+    const framed = (text: string) => `[From: Test (@tester) | 10:00]\n${text}`;
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 50));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+    );
+
+    await bot.handleUpdate(makeTextUpdate("consumed correction", 51));
+    await bot.handleUpdate(makeTextUpdate("rejected correction", 52));
+    await bot.handleUpdate(makeTextUpdate("unsettled correction", 53));
+    assert.strictEqual(steerCalls.length, 1, "steering remains serial until enqueue acceptance");
+
+    steerCalls[0].onEnqueued?.();
+    assert.strictEqual(steerCalls.length, 2);
+    steerCalls[1].onEnqueued?.();
+    assert.strictEqual(steerCalls.length, 3);
+    steerCalls[0].resolve(true);
+    steerCalls[1].resolve(false);
+    await flushAsyncWork();
+    assert.strictEqual(messageQueue.getCollectCount(key), 2);
+
+    continueInitial.resolve();
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage"),
+      [],
+      "permanent delivery waits for the already in-flight draft to settle",
+    );
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+      "interleaved inputs and response reset cannot reactivate the suspended draft",
+    );
+
+    settleInitialDraft.resolve(true);
+    await flushAsyncWork();
+
+    const expectedFallback = buildCollectPrompt([
+      framed("rejected correction"),
+      framed("unsettled correction"),
+    ]);
+    assert.deepStrictEqual(sentPrompts, [
+      framed("initial request"),
+      expectedFallback,
+    ]);
+
+    const drafts = apiCalls.filter(({ method }) => method === "sendMessageDraft");
+    assert.deepStrictEqual(drafts.map(({ payload }) => payload.text), [
+      "obsolete preview",
+      "fallback preview",
+    ]);
+    assert.notStrictEqual(
+      drafts[0].payload.draft_id,
+      drafts[1].payload.draft_id,
+      "the fallback relay owns a fresh native draft",
+    );
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text),
+      ["revised final", "fallback preview"],
+      "each relay sends exactly one permanent final and consumed steering is not duplicated",
+    );
+
+    steerCalls[2].resolve(false);
+    await flushAsyncWork();
+    assert.deepStrictEqual(sentPrompts, [
+      framed("initial request"),
+      expectedFallback,
+    ], "a late unsettled result cannot create a duplicate fallback");
+    messageQueue.clearAll();
   });
 
   it("uses acknowledged steering for active-turn text and preserves exact Telegram context", async (t) => {
