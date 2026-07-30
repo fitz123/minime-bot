@@ -91,10 +91,10 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 **Goal:** Prove the fix preserves delivery ownership and document the intentional degraded-streaming behavior after an interleaved input.
 **Serves:** Ninja's requirement to preserve correct steering rather than hide the flicker by dropping, duplicating, or prematurely finalizing messages.
 
-- [ ] Add or extend deterministic integration-level regression cases for accepted/consumed steering, rejected/unconsumed ordered fallback, multiple interleaved inputs, queued-continuation response reset, final draft settlement, and exactly-once permanent delivery.
-- [ ] Confirm media cleanup/ownership and Discord behavior remain unchanged through existing tests; add a narrow regression only if the changed interface reaches those paths.
-- [ ] Update README/runtime documentation to state that native draft streaming pauses after an interleaved Telegram message and resumes with a later independent relay if fallback creates one.
-- [ ] Run the full test suite, lint/typecheck, build, package dry-run, schema/CLI/workspace gates, and privacy/diff checks.
+- [x] Add or extend deterministic integration-level regression cases for accepted/consumed steering, rejected/unconsumed ordered fallback, multiple interleaved inputs, queued-continuation response reset, final draft settlement, and exactly-once permanent delivery.
+- [x] Confirm media cleanup/ownership and Discord behavior remain unchanged through existing tests; add a narrow regression only if the changed interface reaches those paths.
+- [x] Update README/runtime documentation to state that native draft streaming pauses after an interleaved Telegram message and resumes with a later independent relay if fallback creates one.
+- [x] Run the full test suite, lint/typecheck, build, package dry-run, schema/CLI/workspace gates, and privacy/diff checks.
 
 ## Post-completion
 

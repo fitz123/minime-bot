@@ -12,6 +12,17 @@ import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
 import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
+import { buildCollectPrompt } from "../message-queue.js";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 const testBindings: TelegramBinding[] = [
   { chatId: 111111111, agentId: "main", kind: "dm", label: "User1 DM" },
@@ -1414,7 +1425,7 @@ describe("command handler wiring", () => {
     mockSM: SessionManager,
     apiCalls: Array<{ method: string; payload: any }> = [],
     opts?: Parameters<typeof createTelegramBot>[2],
-    apiResult?: (method: string, payload: any) => unknown,
+    apiResult?: (method: string, payload: any) => unknown | Promise<unknown>,
     factory: typeof createTelegramBot = createTelegramBot,
   ) {
     const result = factory(handlerConfig, mockSM, opts);
@@ -1424,7 +1435,7 @@ describe("command handler wiring", () => {
       apiCalls.push({ method, payload });
       return {
         ok: true,
-        result: apiResult?.(String(method), payload) ?? true,
+        result: await apiResult?.(String(method), payload) ?? true,
       } as any;
     });
     // Provide bot info so handleUpdate works without calling getMe
@@ -1742,6 +1753,155 @@ describe("command handler wiring", () => {
     });
 
     assert.strictEqual(suspensions, 0);
+  });
+
+  it("preserves steering ownership and ordered fallback across the suspended draft lifecycle", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    let draftGeneration = 0;
+    t.mock.method(Math, "random", () => {
+      draftGeneration++;
+      return draftGeneration / 10;
+    });
+
+    const continueInitial = deferred<void>();
+    const settleInitialDraft = deferred<boolean>();
+    const sentPrompts: string[] = [];
+    const steerCalls: Array<{
+      text: string;
+      onEnqueued?: () => void;
+      resolve: (acknowledged: boolean) => void;
+    }> = [];
+    const manager = createMockSessionManager() as unknown as SessionManager & {
+      sentPrompts: string[];
+      steerCalls: typeof steerCalls;
+    };
+    manager.sentPrompts = sentPrompts;
+    manager.steerCalls = steerCalls;
+    manager.sendSessionMessage = (_chatId: string, _agentId: string, text: string) => {
+      const callIndex = sentPrompts.length;
+      sentPrompts.push(text);
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: `session-${callIndex}` } as const;
+        if (callIndex === 0) {
+          yield {
+            type: "stream_event",
+            event: { delta: { type: "text_delta", text: "obsolete preview" } },
+          } as const;
+          await continueInitial.promise;
+          yield {
+            type: "assistant",
+            subtype: "control_request",
+            action: "reset_response_text",
+          } as never;
+          yield {
+            type: "stream_event",
+            event: { delta: { type: "text_delta", text: "revised final" } },
+          } as const;
+          yield { type: "result", result: "revised final", session_id: "session-0" } as const;
+          return;
+        }
+        yield {
+          type: "stream_event",
+          event: { delta: { type: "text_delta", text: "fallback preview" } },
+        } as const;
+        yield { type: "result", result: "fallback preview", session_id: "session-1" } as const;
+      })();
+    };
+    manager.steerSessionMessage = (
+      _chatId: string,
+      _agentId: string,
+      text: string,
+      onEnqueued?: () => void,
+    ) => new Promise<boolean>((resolve) => {
+      steerCalls.push({ text, onEnqueued, resolve });
+    });
+
+    let initialDraftCalls = 0;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(
+      manager,
+      apiCalls,
+      undefined,
+      (method) => {
+        if (method === "sendMessageDraft" && initialDraftCalls++ === 0) {
+          return settleInitialDraft.promise;
+        }
+        return true;
+      },
+    );
+    const key = String(testChatId);
+    const framed = (text: string) => `[From: Test (@tester) | 10:00]\n${text}`;
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 50));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+    );
+
+    await bot.handleUpdate(makeTextUpdate("consumed correction", 51));
+    await bot.handleUpdate(makeTextUpdate("rejected correction", 52));
+    await bot.handleUpdate(makeTextUpdate("unsettled correction", 53));
+    assert.strictEqual(steerCalls.length, 1, "steering remains serial until enqueue acceptance");
+
+    steerCalls[0].onEnqueued?.();
+    assert.strictEqual(steerCalls.length, 2);
+    steerCalls[1].onEnqueued?.();
+    assert.strictEqual(steerCalls.length, 3);
+    steerCalls[0].resolve(true);
+    steerCalls[1].resolve(false);
+    await flushAsyncWork();
+    assert.strictEqual(messageQueue.getCollectCount(key), 2);
+
+    continueInitial.resolve();
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage"),
+      [],
+      "permanent delivery waits for the already in-flight draft to settle",
+    );
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+      "interleaved inputs and response reset cannot reactivate the suspended draft",
+    );
+
+    settleInitialDraft.resolve(true);
+    await flushAsyncWork();
+
+    const expectedFallback = buildCollectPrompt([
+      framed("rejected correction"),
+      framed("unsettled correction"),
+    ]);
+    assert.deepStrictEqual(sentPrompts, [
+      framed("initial request"),
+      expectedFallback,
+    ]);
+
+    const drafts = apiCalls.filter(({ method }) => method === "sendMessageDraft");
+    assert.deepStrictEqual(drafts.map(({ payload }) => payload.text), [
+      "obsolete preview",
+      "fallback preview",
+    ]);
+    assert.notStrictEqual(
+      drafts[0].payload.draft_id,
+      drafts[1].payload.draft_id,
+      "the fallback relay owns a fresh native draft",
+    );
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text),
+      ["revised final", "fallback preview"],
+      "each relay sends exactly one permanent final and consumed steering is not duplicated",
+    );
+
+    steerCalls[2].resolve(false);
+    await flushAsyncWork();
+    assert.deepStrictEqual(sentPrompts, [
+      framed("initial request"),
+      expectedFallback,
+    ], "a late unsettled result cannot create a duplicate fallback");
+    messageQueue.clearAll();
   });
 
   it("uses acknowledged steering for active-turn text and preserves exact Telegram context", async (t) => {
