@@ -72,10 +72,10 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 **Goal:** Add an idempotent cosmetic suspension boundary without changing answer accumulation or final delivery.
 **Serves:** Ninja's requirement to stop the visible draft loop while keeping the bot's answer and final delivery correct.
 
-- [ ] Add the minimum relay registration option and a `DraftScheduler.suspend()` transition that blocks new/pending/refresh sends while allowing bounded in-flight settlement.
-- [ ] Ensure `reset_response_text`, close, cancel, rate-limit, and refresh paths cannot reactivate a suspended scheduler.
-- [ ] Add focused relay tests for suspension before the first draft, after a visible draft, with pending/coalesced text, during reset/queued continuation, and with one exactly-once final message.
-- [ ] Run focused stream-relay tests, lint, and typecheck before Task 2.
+- [x] Add the minimum relay registration option and a `DraftScheduler.suspend()` transition that blocks new/pending/refresh sends while allowing bounded in-flight settlement.
+- [x] Ensure `reset_response_text`, close, cancel, rate-limit, and refresh paths cannot reactivate a suspended scheduler.
+- [x] Add focused relay tests for suspension before the first draft, after a visible draft, with pending/coalesced text, during reset/queued continuation, and with one exactly-once final message.
+- [x] Run focused stream-relay tests, lint, and typecheck before Task 2.
 
 ### Task 2: Suspend the active topic draft on interleaved Telegram input
 **Goal:** Connect the existing Telegram session boundary to the active relay without coupling draft state to message ownership.
