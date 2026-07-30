@@ -1,4 +1,11 @@
-export const OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS = 768;
+export const OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS = 2_048;
+/**
+ * UTF-8 is a byte-level tokenizer input, so one emitted model token cannot
+ * consume less than one streamed byte. Keeping the streamed response at or
+ * below this byte count is therefore also a provider-independent token ceiling.
+ */
+export const OPS_WORKER_CONVERSATION_MAX_STREAM_BYTES =
+  OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS;
 export const OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE = 78;
 
 const OPENAI_COMPLETION_TOKEN_FIELDS = [
@@ -89,13 +96,16 @@ export function boundOpsWorkerConversationProviderPayload(
     clampOutputTokenField(bounded, fields[0], maximum);
     return bounded;
   }
-  if (
-    api === "openai-responses"
-    || api === "azure-openai-responses"
-    || api === "openai-codex-responses"
-  ) {
+  if (api === "openai-responses" || api === "azure-openai-responses") {
     requireArrayField(bounded, "input", api);
     clampOutputTokenField(bounded, "max_output_tokens", maximum);
+    return bounded;
+  }
+  if (api === "openai-codex-responses") {
+    requireArrayField(bounded, "input", api);
+    // The ChatGPT Codex Responses transport rejects max_output_tokens. Its
+    // explicit conversation wrapper runs with reasoning off and enforces the
+    // same fixed ceiling over streamed UTF-8 bytes instead.
     return bounded;
   }
   if (api === "mistral-conversations") {
