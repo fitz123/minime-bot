@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.7.44
+
+- Pause an active Telegram native draft after an interleaved message in the same
+  topic, preserving acknowledged steering, ordered fallback, and exactly-once
+  permanent delivery without replaying the animated draft (#181).
+
 ## 2026.7.43
 
 - Keep the dedicated Ops conversation compatible with the ChatGPT Codex
