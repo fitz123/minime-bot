@@ -81,11 +81,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 **Goal:** Connect the existing Telegram session boundary to the active relay without coupling draft state to message ownership.
 **Serves:** Ninja's explicit requirement that acknowledged steering and drafts interact correctly, including commands/messages received while processing.
 
-- [ ] Add a small generation-safe active-draft coordinator keyed by the existing `sessionKey`, with idempotent suspend and fenced unregister behavior.
-- [ ] Register/unregister each Telegram relay's suspension callback through the narrow relay hook.
-- [ ] Notify the coordinator for authenticated incoming Telegram messages before command, media preprocessing, or `MessageQueue` steering/fallback handling; keep topics isolated and idle notifications as no-ops.
-- [ ] Add tests proving same-topic suspension, cross-topic isolation, repeated-input idempotence, command/ordinary-message coverage, and stale-unregister safety.
-- [ ] Run focused Telegram, queue, session-manager, acknowledged-steer, and stream-relay tests before Task 3.
+- [x] Add a small generation-safe active-draft coordinator keyed by the existing `sessionKey`, with idempotent suspend and fenced unregister behavior.
+- [x] Register/unregister each Telegram relay's suspension callback through the narrow relay hook.
+- [x] Notify the coordinator for authenticated incoming Telegram messages before command, media preprocessing, or `MessageQueue` steering/fallback handling; keep topics isolated and idle notifications as no-ops.
+- [x] Add tests proving same-topic suspension, cross-topic isolation, repeated-input idempotence, command/ordinary-message coverage, and stale-unregister safety.
+- [x] Run focused Telegram, queue, session-manager, acknowledged-steer, and stream-relay tests before Task 3.
 
 ### Task 3: Lock the cross-layer steering/fallback contract and documentation
 **Goal:** Prove the fix preserves delivery ownership and document the intentional degraded-streaming behavior after an interleaved input.

@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
+import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
 
 const testBindings: TelegramBinding[] = [
   { chatId: 111111111, agentId: "main", kind: "dm", label: "User1 DM" },
@@ -75,6 +76,41 @@ describe("sessionKey", () => {
 
   it("handles topicId 0 (General topic in forums)", () => {
     assert.strictEqual(sessionKey(123456, 0), "123456:0");
+  });
+});
+
+describe("ActiveDraftCoordinator", () => {
+  it("suspends only the active same-topic relay and ignores repeated or idle notifications", () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let topicOneSuspensions = 0;
+    let topicTwoSuspensions = 0;
+
+    coordinator.suspend("-100999:1");
+    coordinator.register("-100999:1", () => { topicOneSuspensions++; });
+    coordinator.register("-100999:2", () => { topicTwoSuspensions++; });
+
+    coordinator.suspend("-100999:1");
+    coordinator.suspend("-100999:1");
+
+    assert.strictEqual(topicOneSuspensions, 1);
+    assert.strictEqual(topicTwoSuspensions, 0);
+  });
+
+  it("fences stale unregister callbacks from a newer relay generation", () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let oldSuspensions = 0;
+    let newSuspensions = 0;
+    const unregisterOld = coordinator.register("111111111", () => { oldSuspensions++; });
+    const unregisterNew = coordinator.register("111111111", () => { newSuspensions++; });
+
+    unregisterOld();
+    coordinator.suspend("111111111");
+    assert.strictEqual(oldSuspensions, 0);
+    assert.strictEqual(newSuspensions, 1);
+
+    unregisterNew();
+    coordinator.suspend("111111111");
+    assert.strictEqual(newSuspensions, 1);
   });
 });
 
@@ -1602,6 +1638,110 @@ describe("command handler wiring", () => {
     });
     assert.strictEqual(messageQueue.getPendingCount(String(testChatId)), 1);
     messageQueue.clear(String(testChatId));
+  });
+
+  it("registers and unregisters each Telegram relay under its session key", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const coordinator = new ActiveDraftCoordinator();
+    const lifecycle: string[] = [];
+    let relaySuspensions = 0;
+    const originalRegister = coordinator.register.bind(coordinator);
+    coordinator.register = (key, suspend) => {
+      lifecycle.push(`register:${key}`);
+      const unregister = originalRegister(key, () => {
+        relaySuspensions++;
+        suspend();
+      });
+      return () => {
+        lifecycle.push(`unregister:${key}`);
+        unregister();
+      };
+    };
+    const manager = createSteeringSessionManager();
+    const { bot, messageQueue } = initBot(manager, [], { draftCoordinator: coordinator });
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 9));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(lifecycle, [`register:${testChatId}`]);
+
+    await bot.handleUpdate(makeCommandUpdate("status", 10));
+    await bot.handleUpdate(makeCommandUpdate("status", 11));
+    assert.strictEqual(relaySuspensions, 1, "repeated inputs suspend the active relay once");
+
+    manager.releaseInitial();
+    await flushAsyncWork();
+    assert.deepStrictEqual(lifecycle, [
+      `register:${testChatId}`,
+      `unregister:${testChatId}`,
+    ]);
+    messageQueue.clearAll();
+  });
+
+  it("notifies authenticated messages before commands, queueing, and media preprocessing", async () => {
+    const coordinator = new ActiveDraftCoordinator();
+    const events: string[] = [];
+    const manager = createMockSessionManager();
+    const originalGetSessionHealth = manager.getSessionHealth.bind(manager);
+    manager.getSessionHealth = (key) => {
+      events.push("command");
+      return originalGetSessionHealth(key);
+    };
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      { draftCoordinator: coordinator },
+      (method, payload) => {
+        if (method === "getFile") {
+          events.push("media");
+          return { file_id: payload.file_id };
+        }
+        return true;
+      },
+    );
+    const key = String(testChatId);
+
+    coordinator.register(key, () => { events.push("suspend-command"); });
+    await bot.handleUpdate(makeCommandUpdate("status", 13));
+    assert.deepStrictEqual(events.slice(0, 2), ["suspend-command", "command"]);
+
+    events.length = 0;
+    coordinator.register(key, () => { events.push("suspend-text"); });
+    messageQueue.enqueue = (() => { events.push("enqueue"); }) as typeof messageQueue.enqueue;
+    await bot.handleUpdate(makeTextUpdate("ordinary input", 14));
+    assert.deepStrictEqual(events, ["suspend-text", "enqueue"]);
+
+    events.length = 0;
+    coordinator.register(key, () => { events.push("suspend-media"); });
+    await bot.handleUpdate(makeMediaUpdate({
+      photo: [{
+        file_id: "photo-file",
+        file_unique_id: "photo-unique",
+        width: 10,
+        height: 10,
+      }],
+    }, 15) as never);
+    assert.deepStrictEqual(events.slice(0, 2), ["suspend-media", "media"]);
+  });
+
+  it("does not notify draft registrations for unauthorized messages", async () => {
+    const coordinator = new ActiveDraftCoordinator();
+    let suspensions = 0;
+    coordinator.register("999999999", () => { suspensions++; });
+    const { bot } = initBot(createMockSessionManager(), [], { draftCoordinator: coordinator });
+
+    await bot.handleUpdate({
+      update_id: 16,
+      message: {
+        message_id: 16,
+        from: { id: 999999999, is_bot: false, first_name: "Unknown" },
+        chat: { id: 999999999, type: "private", first_name: "Unknown" },
+        date: 36_000,
+        text: "unauthorized",
+      },
+    });
+
+    assert.strictEqual(suspensions, 0);
   });
 
   it("uses acknowledged steering for active-turn text and preserves exact Telegram context", async (t) => {

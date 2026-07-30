@@ -34,6 +34,7 @@ import {
   type PollProgressProbe,
   type UpdateProcessingProbe,
 } from "./poll-progress.js";
+import { ActiveDraftCoordinator } from "./active-draft-coordinator.js";
 // Re-export for backward compatibility (tests import from here)
 export { isImageMimeType, imageExtensionForMime };
 
@@ -754,6 +755,7 @@ export function createTelegramBot(
   opts?: {
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
+    draftCoordinator?: ActiveDraftCoordinator;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -785,12 +787,19 @@ export function createTelegramBot(
 
   // Best-effort Pi steer for deliver.sh echo context only.
   const steerFn = makeSteerFn(sessionManager);
+  const draftCoordinator = opts?.draftCoordinator ?? new ActiveDraftCoordinator();
 
   // Message queue: debounce rapid messages and collect mid-turn messages
   const messageQueue = new MessageQueue(
     async (chatId, agentId, text, platform, onAgentOwnership) => {
       const stream = sessionManager.sendSessionMessage(chatId, agentId, text);
-      await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
+      await relayStream(
+        stream,
+        platform,
+        outboxDir(chatId),
+        onAgentOwnership,
+        (suspend) => draftCoordinator.register(chatId, suspend),
+      );
     },
     {
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
@@ -817,6 +826,18 @@ export function createTelegramBot(
       return; // Silent drop
     }
 
+    await next();
+  });
+
+  // An authenticated message mutates the Telegram timeline immediately. Stop
+  // cosmetic updates for the active relay before commands, media processing,
+  // or message ownership/steering logic runs.
+  bot.use(async (ctx, next) => {
+    if (ctx.message) {
+      draftCoordinator.suspend(
+        sessionKey(ctx.message.chat.id, ctx.message.message_thread_id),
+      );
+    }
     await next();
   });
 
