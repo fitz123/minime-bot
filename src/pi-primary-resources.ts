@@ -1593,3 +1593,15 @@ export function resolveOpsWorkerParityExtensionPath(): string {
   const relpath = piExtensionRelpathForDir(baseDir, "ops-worker-parity-attestation.ts");
   return strictTrustedFile(resolve(baseDir, relpath), "ops-worker parity extension");
 }
+
+export function resolveOpsWorkerConversationBoundsExtensionPath(): string {
+  const baseDir = resolveWorkspaceContract().paths.piExtensionDir;
+  const relpath = piExtensionRelpathForDir(
+    baseDir,
+    "ops-worker-conversation-bounds.ts",
+  );
+  return strictTrustedFile(
+    resolve(baseDir, relpath),
+    "ops-worker conversation bounds extension",
+  );
+}

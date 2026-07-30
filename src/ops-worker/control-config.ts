@@ -364,7 +364,7 @@ function parseReply(value: unknown): OpsWorkerControlReplyTuning {
       reply,
       "maxBytes",
       DEFAULT_OPS_WORKER_CONTROL_REPLY_TUNING.maxBytes,
-      256,
+      1_024,
       4_096,
       "reply",
     ),

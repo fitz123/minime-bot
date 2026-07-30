@@ -4,18 +4,22 @@ import {
   hashOpsWorkerTelegramUpdate,
   type OpsWorkerControlLedger,
 } from "./control-ledger.js";
+import type { OpsWorkerPolicySnapshot } from "./status-server.js";
 import {
-  summarizeOpsWorkerTasks,
-  type OpsWorkerPolicySnapshot,
-} from "./status-server.js";
+  buildOpsWorkerConversationSnapshot,
+  buildOpsWorkerTaskView,
+  renderOpsWorkerStatusNarrative,
+  renderOpsWorkerTaskNarrative,
+  renderOpsWorkerTasksNarrative,
+} from "./conversation-view.js";
 import {
   buildOpsWorkerTelegramReport,
   createOpsWorkerFieldRedactor,
   type OpsWorkerFieldRedactor,
 } from "./reporting.js";
 import {
-  getOpsWorkerReportReconciliationOperation,
   isOpsWorkerReportReconciliationBlocked,
+  isOpsWorkerUnresolvedOrphan,
   OpsWorkerSupervisorStateError,
   type OpsWorkerSupervisor,
 } from "./supervisor.js";
@@ -27,16 +31,70 @@ import {
   type OpsWorkerSteeringKind,
   type OpsWorkerTask,
 } from "./types.js";
+import {
+  ingestLocalAudio,
+  type LocalAudioIngestionOptions,
+} from "../voice.js";
+import {
+  OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE,
+  OPS_WORKER_CONVERSATION_RUNNER_LIMITS,
+  type OpsWorkerConversationControlIntent,
+  type OpsWorkerConversationControlProposal,
+  type OpsWorkerConversationTurnOptions,
+  type OpsWorkerConversationTurnResult,
+  type OpsWorkerPreviousClarification,
+} from "./conversation-runner.js";
+import { OpsWorkerConversationLane } from "./conversation-lane.js";
 
 const MAX_UPDATES_PER_POLL = 100;
 const MAX_COMMAND_BYTES = 16 * 1024;
 const MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS = 5 * 60 * 1_000;
 const TRUNCATION_MARKER = "\n… [truncated]";
+const TELEGRAM_FILE_ID_MAX_BYTES = 512;
+const TELEGRAM_FILE_PATH_MAX_BYTES = 1_024;
+const TELEGRAM_FILE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const TELEGRAM_FILE_PATH_PATTERN = /^[A-Za-z0-9_./-]+$/;
+const CONVERSATION_CLARIFICATION_TTL_MS = 5 * 60 * 1_000;
+const MAX_CONVERSATION_CLARIFICATION_CANDIDATES = 16;
+const MAX_PENDING_REPLIES = MAX_UPDATES_PER_POLL + 1;
+
+export const OPS_WORKER_TELEGRAM_VOICE_LIMITS = Object.freeze({
+  maxBytes: 20 * 1024 * 1024,
+  maxDurationSeconds: 10 * 60,
+  downloadTimeoutMs: 30_000,
+});
+
+export const OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE =
+  OPS_WORKER_CONVERSATION_FALLBACK_MESSAGE;
+
+export const OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK =
+  "Could not transcribe the voice message locally. Send text, or use /status, /tasks, or /task <id>.";
 
 export type OpsWorkerTelegramFetch = (
   input: string | URL | Request,
   init?: RequestInit,
 ) => Promise<Response>;
+
+export interface OpsWorkerConversationInput {
+  updateId: number;
+  senderId: string;
+  chatId: string;
+  receivedAt: string;
+}
+
+export type OpsWorkerConversationHandler = (
+  text: string,
+  input: OpsWorkerConversationInput,
+  options?: OpsWorkerConversationTurnOptions,
+) =>
+  | string
+  | OpsWorkerConversationTurnResult
+  | Promise<string | OpsWorkerConversationTurnResult>;
+
+export type OpsWorkerVoiceIngestor = (
+  url: string,
+  options: LocalAudioIngestionOptions,
+) => Promise<string>;
 
 export type OpsWorkerTelegramControlFaultPoint =
   | "after-effect-before-ledger"
@@ -51,6 +109,9 @@ export interface OpsWorkerTelegramControlOptions {
   inspectPolicy: () => OpsWorkerPolicySnapshot;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  handleConversation?: OpsWorkerConversationHandler;
+  conversationLane?: OpsWorkerConversationLane;
+  ingestVoice?: OpsWorkerVoiceIngestor;
   sensitiveValues?: readonly string[];
   /** Test-only durable-boundary hook. Production callers should leave this unset. */
   faultInjector?: (
@@ -64,12 +125,50 @@ export interface OpsWorkerTelegramTickResult {
   reportTaskId: string | null;
 }
 
-interface ParsedTelegramMessage {
+interface ParsedTelegramMessageBase {
   updateId: number;
   fingerprint: string;
   senderId: string;
   chatId: string;
   receivedAt: string;
+}
+
+interface ParsedTelegramTextMessage extends ParsedTelegramMessageBase {
+  kind: "text";
+  text: string;
+}
+
+interface ParsedTelegramVoiceMessage extends ParsedTelegramMessageBase {
+  kind: "voice";
+  fileId: string;
+}
+
+type ParsedTelegramMessage =
+  | ParsedTelegramTextMessage
+  | ParsedTelegramVoiceMessage;
+
+interface OpsWorkerControlOperation {
+  command: OpsWorkerConversationControlIntent;
+  taskId: string;
+  argument: string | null;
+}
+
+interface OpsWorkerClarificationSlot {
+  expiresAt: number;
+  previous: OpsWorkerPreviousClarification;
+  control:
+    | {
+        intent: OpsWorkerConversationControlIntent;
+        argument: string | null;
+        candidateIds: readonly string[];
+        confirmationToken: string | null;
+        language: OpsWorkerConversationControlProposal["language"];
+      }
+    | null;
+}
+
+interface OpsWorkerPendingReply {
+  sequence: number;
   text: string;
 }
 
@@ -155,6 +254,38 @@ function numberId(value: unknown): string | null {
   return Number.isSafeInteger(value) ? String(value) : null;
 }
 
+function boundedTelegramFileId(value: unknown): string | null {
+  return typeof value === "string"
+    && value !== ""
+    && Buffer.byteLength(value, "utf8") <= TELEGRAM_FILE_ID_MAX_BYTES
+    && TELEGRAM_FILE_ID_PATTERN.test(value)
+    ? value
+    : null;
+}
+
+function parseVoice(
+  voice: Record<string, unknown>,
+): { fileId: string } | null {
+  const fileId = boundedTelegramFileId(voice.file_id);
+  const uniqueId = boundedTelegramFileId(voice.file_unique_id);
+  if (fileId === null || uniqueId === null) return null;
+  if (
+    !Number.isSafeInteger(voice.duration)
+    || (voice.duration as number) < 0
+    || (voice.duration as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxDurationSeconds
+  ) return null;
+  if (
+    voice.file_size !== undefined
+    && (
+      !Number.isSafeInteger(voice.file_size)
+      || (voice.file_size as number) < 0
+      || (voice.file_size as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes
+    )
+  ) return null;
+  if (voice.mime_type !== undefined && voice.mime_type !== "audio/ogg") return null;
+  return { fileId };
+}
+
 function parseMessage(
   update: Record<string, unknown>,
   fingerprint: string,
@@ -170,12 +301,6 @@ function parseMessage(
   if (senderId === null || chatId === null) return null;
   if (message.from.is_bot === true) return null;
   if (
-    typeof message.text !== "string"
-    || message.text.trim() === ""
-    || message.text.includes("\0")
-    || Buffer.byteLength(message.text, "utf8") > MAX_COMMAND_BYTES
-  ) return null;
-  if (
     !Number.isSafeInteger(message.date)
     || (message.date as number) < 0
     || (message.date as number) > 8_640_000_000
@@ -188,14 +313,59 @@ function parseMessage(
   if (messageDateMs > trustedNowMs + MAX_TELEGRAM_MESSAGE_FUTURE_SKEW_MS) {
     return null;
   }
-  return {
+  const parsedBase: ParsedTelegramMessageBase = {
     updateId: updateId as number,
     fingerprint,
     senderId,
     chatId,
     receivedAt: new Date(messageDateMs).toISOString(),
-    text: message.text,
   };
+  const hasText = message.text !== undefined;
+  const hasVoice = message.voice !== undefined;
+  if (hasText === hasVoice) return null;
+  if (hasText) {
+    if (
+      typeof message.text !== "string"
+      || message.text.trim() === ""
+      || message.text.includes("\0")
+      || Buffer.byteLength(message.text, "utf8") > MAX_COMMAND_BYTES
+    ) return null;
+    return { ...parsedBase, kind: "text", text: message.text };
+  }
+  if (!isPlainObject(message.voice)) return null;
+  const voice = parseVoice(message.voice);
+  return voice === null
+    ? null
+    : { ...parsedBase, kind: "voice", fileId: voice.fileId };
+}
+
+function parseGetFilePath(value: unknown): string {
+  if (!isPlainObject(value) || !isPlainObject(value.result)) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid envelope");
+  }
+  const filePath = value.result.file_path;
+  if (
+    typeof filePath !== "string"
+    || filePath === ""
+    || Buffer.byteLength(filePath, "utf8") > TELEGRAM_FILE_PATH_MAX_BYTES
+    || !TELEGRAM_FILE_PATH_PATTERN.test(filePath)
+    || filePath.startsWith("/")
+    || filePath.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid file path");
+  }
+  const fileSize = value.result.file_size;
+  if (
+    fileSize !== undefined
+    && (
+      !Number.isSafeInteger(fileSize)
+      || (fileSize as number) < 0
+      || (fileSize as number) > OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes
+    )
+  ) {
+    throw new OpsWorkerTelegramTransportError("Telegram getFile returned an invalid file size");
+  }
+  return filePath;
 }
 
 async function readBoundedResponse(response: Response, maxBytes: number): Promise<unknown> {
@@ -255,45 +425,15 @@ function parseGetUpdatesResult(value: unknown, offset: number | undefined): Reco
   });
 }
 
-function taskSummary(task: OpsWorkerTask): string {
-  const outcome = task.lastOutcome === null
-    ? "none"
-    : `${task.lastOutcome.kind}/${task.lastOutcome.result}: ${task.lastOutcome.summary}`;
-  const reportReconciliationOperation =
-    getOpsWorkerReportReconciliationOperation(task);
-  return [
-    `Task ${task.id}`,
-    `state=${task.state} paused=${task.control.paused}`,
-    `source=${task.source.kind}/${task.source.template}`,
-    `resource=${task.resource.key}`,
-    `nextRunAt=${task.schedule.nextRunAt ?? "none"}`,
-    `nextCheckAt=${task.schedule.nextCheckAt ?? "none"}`,
-    `report=${task.report.state}/${task.report.attempts}`,
-    `reportReceipt=${task.mutationReceipts.report === null
-      ? "none"
-      : task.mutationReceipts.report.outcome !== null
-      ? `finished/${task.mutationReceipts.report.outcome.result}`
-      : task.mutationReceipts.report.mutationStartedAt === null
-      ? "queried/unclaimed"
-      : "claimed/unknown"}`,
-    `reportReconciliation=${isOpsWorkerReportReconciliationBlocked(task)
-      ? "required"
-      : "none"}`,
-    `reportReconciliationIntent=${reportReconciliationOperation === undefined
-      ? isOpsWorkerReportReconciliationBlocked(task)
-        ? "unavailable"
-        : "none"
-      : JSON.stringify(reportReconciliationOperation)}`,
-    `outcome=${outcome}`,
-  ].join("\n");
-}
-
 function taskSummaryPage(
   task: OpsWorkerTask,
   page: number,
   maxBytes: number,
+  redact: OpsWorkerFieldRedactor,
 ): string {
-  const summary = taskSummary(task);
+  const summary = renderOpsWorkerTaskNarrative(
+    buildOpsWorkerTaskView(task, redact),
+  );
   if (Buffer.byteLength(summary, "utf8") <= maxBytes) {
     return page === 1
       ? summary
@@ -345,8 +485,15 @@ export class OpsWorkerTelegramControl {
   private readonly inspectPolicy: () => OpsWorkerPolicySnapshot;
   private readonly now: () => Date;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly handleConversation: OpsWorkerConversationHandler;
+  private readonly conversationLane: OpsWorkerConversationLane;
+  private readonly ingestVoice: OpsWorkerVoiceIngestor;
   private readonly redactAgentField: OpsWorkerFieldRedactor;
-  private pendingReply: string | undefined;
+  private readonly pendingReplies: OpsWorkerPendingReply[] = [];
+  private replyDelivery: Promise<void> | null = null;
+  private nextReplySequence = 1;
+  private readonly conversationDeliveries = new Set<Promise<void>>();
+  private clarification: OpsWorkerClarificationSlot | null = null;
   private readonly faultInjector:
     | ((point: OpsWorkerTelegramControlFaultPoint, updateId: number) => void)
     | undefined;
@@ -362,6 +509,14 @@ export class OpsWorkerTelegramControl {
     this.inspectPolicy = options.inspectPolicy;
     this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? defaultSleep;
+    this.handleConversation = options.handleConversation
+      ?? (() => OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE);
+    this.conversationLane = options.conversationLane
+      ?? new OpsWorkerConversationLane({
+        blocksAdmission: () => this.supervisor.blocksConversationAdmission(),
+        abortConversation: async () => true,
+      });
+    this.ingestVoice = options.ingestVoice ?? ingestLocalAudio;
     this.redactAgentField = createOpsWorkerFieldRedactor([
       options.config.telegram.token,
       options.config.intake?.bearerToken ?? "",
@@ -388,23 +543,33 @@ export class OpsWorkerTelegramControl {
     return { updates: updates.length, reportTaskId };
   }
 
+  async waitForConversation(): Promise<void> {
+    while (this.conversationDeliveries.size > 0) {
+      await Promise.all([...this.conversationDeliveries]);
+    }
+  }
+
   async run(signal: AbortSignal): Promise<void> {
     let backoff = this.config.poll.retryMinMs;
-    while (!signal.aborted) {
-      try {
-        await this.tick(signal);
-        backoff = this.config.poll.retryMinMs;
-      } catch (error) {
-        if (signal.aborted) return;
-        if (!(error instanceof OpsWorkerTelegramTransportError)) throw error;
-        await this.sleep(backoff, signal);
-        backoff = Math.min(this.config.poll.retryMaxMs, backoff * 2);
+    try {
+      while (!signal.aborted) {
+        try {
+          await this.tick(signal);
+          backoff = this.config.poll.retryMinMs;
+        } catch (error) {
+          if (signal.aborted) return;
+          if (!(error instanceof OpsWorkerTelegramTransportError)) throw error;
+          await this.sleep(backoff, signal);
+          backoff = Math.min(this.config.poll.retryMaxMs, backoff * 2);
+        }
       }
+    } finally {
+      await this.conversationLane.close();
     }
   }
 
   private async telegramApi(
-    method: "getUpdates" | "sendMessage",
+    method: "getUpdates" | "getFile" | "sendMessage",
     payload: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<unknown> {
@@ -454,10 +619,38 @@ export class OpsWorkerTelegramControl {
     }, signal);
   }
 
+  private enqueueReply(text: string): void {
+    if (this.pendingReplies.length >= MAX_PENDING_REPLIES) {
+      throw new OpsWorkerTelegramTransportError(
+        "Telegram reply outbox reached its fixed bound",
+      );
+    }
+    this.pendingReplies.push({
+      sequence: this.nextReplySequence,
+      text,
+    });
+    this.nextReplySequence += 1;
+  }
+
   private async flushPendingReply(signal: AbortSignal): Promise<void> {
-    if (this.pendingReply === undefined) return;
-    await this.sendMessage(this.pendingReply, signal);
-    this.pendingReply = undefined;
+    while (this.pendingReplies.length > 0) {
+      const existing = this.replyDelivery;
+      if (existing !== null) {
+        await existing;
+        continue;
+      }
+      const pending = this.pendingReplies[0];
+      let delivery!: Promise<void>;
+      delivery = this.sendMessage(pending.text, signal).finally(() => {
+        if (this.replyDelivery === delivery) this.replyDelivery = null;
+      });
+      this.replyDelivery = delivery;
+      await delivery;
+      if (this.pendingReplies[0]?.sequence !== pending.sequence) {
+        throw new Error("Telegram reply outbox order changed during delivery");
+      }
+      this.pendingReplies.shift();
+    }
   }
 
   private async processUpdate(
@@ -495,6 +688,83 @@ export class OpsWorkerTelegramControl {
       });
       return;
     }
+    const isConversation = message.kind === "voice"
+      || !message.text.trimStart().startsWith("/");
+    if (isConversation && message.kind === "text") {
+      const replayedTaskId = this.findNaturalControlReplay(message);
+      if (replayedTaskId !== null) {
+        this.ledger.record(updateId, fingerprint, {
+          epoch,
+          acknowledgedAt: this.now(),
+        });
+        this.faultInjector?.("after-ledger-before-reply", updateId);
+        this.enqueueReply(
+          `The confirmed operation for ${replayedTaskId} was already applied.`,
+        );
+        await this.flushPendingReply(signal);
+        return;
+      }
+      const clarification = this.takeControlClarification();
+      if (clarification !== null) {
+        let reply: string;
+        try {
+          reply = this.resolveControlClarification(
+            message.text,
+            message,
+            clarification,
+          );
+        } catch (error) {
+          if (!(error instanceof OpsWorkerSteeringCapacityError)) throw error;
+          reply = "The task has no remaining steering capacity; the command was not recorded.";
+        }
+        this.faultInjector?.("after-effect-before-ledger", updateId);
+        this.ledger.record(updateId, fingerprint, {
+          epoch,
+          acknowledgedAt: this.now(),
+        });
+        this.faultInjector?.("after-ledger-before-reply", updateId);
+        this.enqueueReply(reply);
+        await this.flushPendingReply(signal);
+        return;
+      }
+    }
+    if (isConversation) {
+      this.ledger.record(updateId, fingerprint, {
+        epoch,
+        acknowledgedAt: this.now(),
+      });
+      this.faultInjector?.("after-ledger-before-reply", updateId);
+      const turn = this.conversationLane.tryStart(
+        async (turnSignal) => this.dispatchConversationMessage(
+          message,
+          turnSignal,
+        ),
+      );
+      if (turn === null) {
+        this.enqueueReply(OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE);
+        await this.flushPendingReply(signal);
+        return;
+      }
+      let delivery!: Promise<void>;
+      delivery = (async () => {
+        let reply = OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+        try {
+          reply = await turn;
+        } catch {
+          // The reply remains the deterministic provider-independent fallback.
+        }
+        this.enqueueReply(reply);
+        await this.flushPendingReply(signal).catch(() => undefined);
+      })().finally(() => {
+        this.conversationDeliveries.delete(delivery);
+      });
+      this.conversationDeliveries.add(delivery);
+      return;
+    }
+
+    if (message.kind !== "text") {
+      throw new TypeError("Only text messages can reach slash-command dispatch");
+    }
     let reply: string;
     try {
       reply = this.dispatchCommand(message);
@@ -508,43 +778,122 @@ export class OpsWorkerTelegramControl {
       acknowledgedAt: this.now(),
     });
     this.faultInjector?.("after-ledger-before-reply", updateId);
-    this.pendingReply = reply;
+    this.enqueueReply(reply);
     await this.flushPendingReply(signal);
   }
 
-  private dispatchCommand(message: ParsedTelegramMessage): string {
+  private async dispatchConversationMessage(
+    message: ParsedTelegramMessage,
+    turnSignal: AbortSignal,
+  ): Promise<string> {
+    if (message.kind === "text") {
+      return this.conversationReply(message.text, message, turnSignal);
+    }
+    try {
+      const value = await this.telegramApi("getFile", {
+        file_id: message.fileId,
+      }, turnSignal);
+      const filePath = parseGetFilePath(value);
+      const transcript = await this.ingestVoice(
+        `https://api.telegram.org/file/bot${this.config.telegram.token}/${filePath}`,
+        {
+          maxBytes: OPS_WORKER_TELEGRAM_VOICE_LIMITS.maxBytes,
+          downloadTimeoutMs: OPS_WORKER_TELEGRAM_VOICE_LIMITS.downloadTimeoutMs,
+          signal: turnSignal,
+        },
+      );
+      if (
+        typeof transcript !== "string"
+        || transcript.trim() === ""
+        || transcript.includes("\0")
+        || Buffer.byteLength(transcript, "utf8") > MAX_COMMAND_BYTES
+      ) return OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
+      return this.conversationReply(transcript, message, turnSignal);
+    } catch {
+      return turnSignal.aborted
+        ? OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE
+        : OPS_WORKER_VOICE_TRANSCRIPTION_FALLBACK;
+    }
+  }
+
+  private async conversationReply(
+    text: string,
+    message: ParsedTelegramMessage,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const clarification = this.takeClarification();
+    if (clarification !== null && clarification.control !== null) {
+      if (message.kind === "voice") {
+        return clarification.control.language === "ru"
+          ? "Точное подтверждение или идентификатор задачи нужно отправить текстом; изменений нет."
+          : "Send the exact confirmation or task identifier as text; nothing changed.";
+      }
+      return this.resolveControlClarification(text, message, clarification);
+    }
+    try {
+      const reply = await this.handleConversation(text, {
+        updateId: message.updateId,
+        senderId: message.senderId,
+        chatId: message.chatId,
+        receivedAt: message.receivedAt,
+      }, {
+        signal,
+        ...(clarification === null
+          ? {}
+          : { previousClarification: clarification.previous }),
+      });
+      if (typeof reply === "string") {
+        return reply.trim() !== "" && !reply.includes("\0")
+          ? reply
+          : OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+      }
+      if (reply.status === "FALLBACK") return reply.reply;
+      if (reply.envelope.kind === "answer") return reply.envelope.text;
+      if (reply.envelope.kind === "clarification") {
+        this.storeClarification(text, reply.envelope.text, null);
+        return reply.envelope.text;
+      }
+      return this.dispatchNaturalControl(
+        reply.envelope,
+        text,
+      );
+    } catch {
+      return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+    }
+  }
+
+  private dispatchCommand(message: ParsedTelegramTextMessage): string {
     const match = /^\/([a-z]+)(?:\s+([\s\S]*))?$/.exec(message.text.trim());
     if (!match) return usage();
     const command = match[1];
     const tail = match[2]?.trim();
     if (command === "status" && tail === undefined) {
       const tasks = this.supervisor.listTasks();
-      const summary = summarizeOpsWorkerTasks(tasks);
-      const policy = this.inspectPolicy();
-      return [
-        `Ops worker: tasks=${summary.totalTasks} activeGroups=${summary.activeProcessGroups}`,
-        `custody=${summary.custodyOwner?.id ?? "none"}`,
-        `reportReconciliationBlocked=${summary.reportReconciliationBlocked}`,
-        `states=${Object.entries(summary.states).map(([state, count]) => `${state}:${count}`).join(",")}`,
-        `authorization=${policy.authorization.verifierCount}/${policy.authorization.contractsHash}`,
-        `verification=${policy.verification.verifierCount}/${policy.verification.contractsHash}`,
-        `quota=${policy.quota.configured ? "configured" : "unconfigured"}`,
-        `parity=${policy.parity.configured ? "configured" : "unconfigured"}`,
-      ].join("\n");
+      return renderOpsWorkerStatusNarrative(
+        buildOpsWorkerConversationSnapshot(tasks, this.inspectPolicy(), {
+          redact: this.redactAgentField,
+        }),
+      );
     }
     if (command === "tasks" && tail === undefined) {
       const tasks = this.supervisor.listTasks();
-      return tasks.length === 0
-        ? "No ops-worker tasks."
-        : tasks.map((task) =>
-          `${task.id} ${task.state}${task.control.paused ? " paused" : ""}`).join("\n");
+      return renderOpsWorkerTasksNarrative(
+        buildOpsWorkerConversationSnapshot(tasks, this.inspectPolicy(), {
+          redact: this.redactAgentField,
+        }),
+      );
     }
     if (command === "task") {
       const argument = taskPageArgument(tail);
       if (argument === null) return usage();
       const task = this.supervisor.getTask(argument.taskId);
       return task
-        ? taskSummaryPage(task, argument.page, this.config.reply.maxBytes)
+        ? taskSummaryPage(
+            task,
+            argument.page,
+            this.config.reply.maxBytes,
+            this.redactAgentField,
+          )
         : `Unknown ops-worker task ${argument.taskId}.`;
     }
     if (command === "answer" || command === "correct") {
@@ -556,10 +905,54 @@ export class OpsWorkerTelegramControl {
         || !text
         || Buffer.byteLength(text, "utf8") > OPS_WORKER_LIMITS.maxSteeringTextBytes
       ) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: text,
+      }, message);
+    }
+    if (command === "pause" || command === "resume" || command === "retry") {
+      const taskId = taskArgument(tail);
+      if (taskId === null) return usage();
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: null,
+      }, message);
+    }
+    if (command === "cancel") {
+      const cancellation = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");
+      const taskId = taskArgument(cancellation?.[1]);
+      const reason = cancellation?.[2]?.trim();
+      if (
+        taskId === null
+        || !reason
+        || Buffer.byteLength(reason, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
+      ) return usage();
+      return this.dispatchControlOperation({
+        command,
+        taskId,
+        argument: reason,
+      }, message);
+    }
+    return usage();
+  }
+
+  private dispatchControlOperation(
+    operation: OpsWorkerControlOperation,
+    message: ParsedTelegramMessageBase,
+  ): string {
+    const { command, taskId, argument } = operation;
+    const task = this.supervisor.getTask(taskId);
+    if (!task) return `Unknown ops-worker task ${taskId}.`;
+    const steeringId = this.steeringId(message);
+    const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+
+    if (command === "answer" || command === "correct") {
+      if (
+        argument === null
+        || Buffer.byteLength(argument, "utf8") > OPS_WORKER_LIMITS.maxSteeringTextBytes
+      ) return usage();
       if ((task.state === "DONE" || task.state === "CANCELLED")
         && !replayed) {
         return `Task ${taskId} is terminal; steering was not recorded.`;
@@ -572,18 +965,14 @@ export class OpsWorkerTelegramControl {
         receivedAt: message.receivedAt,
         kind: command === "answer" ? "answer" : "correction",
         operatorRef: `telegram:${message.senderId}`,
-        text,
+        text: argument,
         consumedAt: null,
       });
       return `Recorded ${command === "answer" ? "answer" : "correction"} for ${taskId}.`;
     }
+
     if (command === "pause" || command === "resume" || command === "retry") {
-      const taskId = taskArgument(tail);
-      if (taskId === null) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
+      if (argument !== null) return usage();
       if ((task.state === "DONE" || task.state === "CANCELLED") && !replayed) {
         return `Task ${taskId} is terminal; ${command} was not recorded.`;
       }
@@ -620,26 +1009,22 @@ export class OpsWorkerTelegramControl {
       );
       return `${command === "pause" ? "Paused" : "Resumed"} ${taskId}; state=${changed.state}.`;
     }
+
     if (command === "cancel") {
-      const cancellation = /^(\S+)\s+([\s\S]+)$/.exec(tail ?? "");
-      const taskId = taskArgument(cancellation?.[1]);
-      const reason = cancellation?.[2]?.trim();
       if (
-        taskId === null
-        || !reason
-        || Buffer.byteLength(reason, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
+        argument === null
+        || Buffer.byteLength(argument, "utf8") > OPS_WORKER_LIMITS.maxInterruptReasonBytes
       ) return usage();
-      const task = this.supervisor.getTask(taskId);
-      if (!task) return `Unknown ops-worker task ${taskId}.`;
-      const steeringId = this.steeringId(message);
-      const replayed = task.steering.some((entry) => entry.steeringId === steeringId);
       if (task.state === "CANCELLED" && replayed) return `Cancellation for ${taskId} was already applied.`;
       if (task.state === "DONE" || task.state === "CANCELLED") {
         return `Task ${taskId} is terminal; cancellation was not recorded.`;
       }
       if (
         task.control.interrupt !== null
-        && (task.control.interrupt.mode !== "cancel" || task.control.interrupt.reason !== reason)
+        && (
+          task.control.interrupt.mode !== "cancel"
+          || task.control.interrupt.reason !== argument
+        )
         && !replayed
       ) return `Task ${taskId} already has a different pending interrupt.`;
       if (!replayed && task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) {
@@ -648,16 +1033,195 @@ export class OpsWorkerTelegramControl {
       const changed = this.supervisor.requestOperatorInterrupt(
         taskId,
         "cancel",
-        reason,
-        this.controlSteering(message, "cancel", reason),
+        argument,
+        this.controlSteering(message, "cancel", argument),
       );
       return `Cancellation recorded for ${taskId}; state=${changed.state}.`;
     }
     return usage();
   }
 
+  private dispatchNaturalControl(
+    proposal: OpsWorkerConversationControlProposal,
+    operatorText: string,
+  ): string {
+    const candidates = this.supervisor.listTasks()
+      .filter((task) =>
+        this.isNaturalControlCandidate(task, proposal.intent, proposal.argument))
+      .sort((left, right) =>
+        Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+        || left.id.localeCompare(right.id));
+    if (candidates.length === 0) {
+      return proposal.language === "ru"
+        ? "Нет задачи, для которой эта операция сейчас допустима; изменений нет."
+        : "No task is currently eligible for that operation; nothing changed.";
+    }
+    if (candidates.length > MAX_CONVERSATION_CLARIFICATION_CANDIDATES) {
+      return proposal.language === "ru"
+        ? "Подходящих задач слишком много для безопасного уточнения; изменений нет. Используйте /tasks."
+        : "Too many tasks are eligible for a safe clarification; nothing changed. Use /tasks.";
+    }
+
+    const ids = candidates.map((task) => task.id);
+    const confirmationToken = candidates.length === 1
+      ? proposal.language === "ru" ? "ПОДТВЕРЖДАЮ" : "CONFIRM"
+      : null;
+    const operation = proposal.argument === null
+      ? proposal.intent
+      : `${proposal.intent} ${JSON.stringify(proposal.argument)}`;
+    const question = confirmationToken !== null
+      ? proposal.language === "ru"
+        ? `Подтвердите ${operation} для ${ids[0]}. Ответьте ровно: ${confirmationToken}`
+        : `Confirm ${operation} for ${ids[0]}. Reply exactly: ${confirmationToken}`
+      : proposal.language === "ru"
+        ? `Уточните задачу для ${operation}: ${ids.join(", ")}. Ответьте точным идентификатором.`
+        : `Which task for ${operation}: ${ids.join(", ")}? Reply with the exact identifier.`;
+    if (
+      Buffer.byteLength(question, "utf8")
+        > Math.min(
+          this.config.reply.maxBytes,
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        )
+    ) {
+      return proposal.language === "ru"
+        ? "Предложенную операцию нельзя полностью показать в безопасном подтверждении; изменений нет. Используйте точную slash-команду."
+        : "The proposed operation cannot fit in a safe confirmation; nothing changed. Use an exact slash command.";
+    }
+    this.storeClarification(operatorText, question, {
+      intent: proposal.intent,
+      argument: proposal.argument,
+      candidateIds: ids,
+      confirmationToken,
+      language: proposal.language,
+    });
+    return question;
+  }
+
+  private resolveControlClarification(
+    operatorText: string,
+    message: ParsedTelegramMessageBase,
+    clarification: OpsWorkerClarificationSlot,
+  ): string {
+    const selection = clarification.control;
+    if (selection === null) {
+      return OPS_WORKER_CONVERSATION_UNAVAILABLE_MESSAGE;
+    }
+    const normalized = operatorText.trim();
+    const selectedId = selection.confirmationToken === null
+      ? selection.candidateIds.find((candidateId) => candidateId === normalized)
+      : normalized === selection.confirmationToken
+        ? selection.candidateIds[0]
+        : undefined;
+    if (selectedId !== undefined) {
+      const selected = this.supervisor.getTask(selectedId);
+      if (
+        selected !== undefined
+        && this.isNaturalControlCandidate(
+          selected,
+          selection.intent,
+          selection.argument,
+        )
+      ) {
+        return this.dispatchControlOperation({
+          command: selection.intent,
+          taskId: selectedId,
+          argument: selection.argument,
+        }, message);
+      }
+    }
+    return selection.language === "ru"
+      ? "Выбор или подтверждение не принято; изменений нет. Используйте /tasks и точную slash-команду."
+      : "Selection or confirmation was not accepted; nothing changed. Use /tasks and an exact slash command.";
+  }
+
+  private isNaturalControlCandidate(
+    task: OpsWorkerTask,
+    intent: OpsWorkerConversationControlIntent,
+    argument: string | null,
+  ): boolean {
+    if (task.state === "DONE" || task.state === "CANCELLED") return false;
+    if (task.steering.length >= OPS_WORKER_LIMITS.maxSteeringEntries) return false;
+    if (intent === "answer") {
+      return argument !== null
+        && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxSteeringTextBytes
+        && task.agentResult?.kind === "input-needed"
+        && task.agentResult.requestedInput !== null;
+    }
+    if (intent === "correct") {
+      return argument !== null
+        && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxSteeringTextBytes;
+    }
+    if (intent === "retry") {
+      return argument === null
+        && task.state === "BLOCKED"
+        && !isOpsWorkerUnresolvedOrphan(task)
+        && !isOpsWorkerReportReconciliationBlocked(task)
+        && !(
+          task.mutationReceipts.report?.outcome === null
+          && task.mutationReceipts.report.mutationStartedAt !== null
+        );
+    }
+    if (intent === "pause") {
+      return argument === null
+        && !task.control.paused
+        && task.control.interrupt === null;
+    }
+    if (intent === "resume") {
+      return argument === null
+        && task.control.paused
+        && task.control.interrupt === null;
+    }
+    return argument !== null
+      && Buffer.byteLength(argument, "utf8") <= OPS_WORKER_LIMITS.maxInterruptReasonBytes
+      && task.control.interrupt === null;
+  }
+
+  private takeClarification(): OpsWorkerClarificationSlot | null {
+    const clarification = this.clarification;
+    this.clarification = null;
+    return clarification !== null && clarification.expiresAt >= this.now().getTime()
+      ? clarification
+      : null;
+  }
+
+  private takeControlClarification(): OpsWorkerClarificationSlot | null {
+    return this.clarification?.control === null
+      ? null
+      : this.takeClarification();
+  }
+
+  private findNaturalControlReplay(
+    message: ParsedTelegramTextMessage,
+  ): string | null {
+    const steeringId = this.steeringId(message);
+    return this.supervisor.listTasks().find((task) =>
+      task.steering.some((entry) => entry.steeringId === steeringId))?.id ?? null;
+  }
+
+  private storeClarification(
+    operatorText: string,
+    question: string,
+    control: OpsWorkerClarificationSlot["control"],
+  ): void {
+    const boundedQuestion = truncateUtf8(
+      question,
+      OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+    );
+    this.clarification = {
+      expiresAt: this.now().getTime() + CONVERSATION_CLARIFICATION_TTL_MS,
+      previous: {
+        operatorText: truncateUtf8(
+          operatorText,
+          OPS_WORKER_CONVERSATION_RUNNER_LIMITS.maxClarificationBytes,
+        ),
+        question: boundedQuestion,
+      },
+      control,
+    };
+  }
+
   private controlSteering(
-    message: ParsedTelegramMessage,
+    message: ParsedTelegramMessageBase,
     kind: OpsWorkerSteeringKind,
     text: string,
   ): OpsWorkerSteeringEntry {
@@ -671,7 +1235,7 @@ export class OpsWorkerTelegramControl {
     };
   }
 
-  private steeringId(message: ParsedTelegramMessage): string {
+  private steeringId(message: ParsedTelegramMessageBase): string {
     return `telegram:update:${message.updateId}:${message.fingerprint}`;
   }
 

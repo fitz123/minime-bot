@@ -1867,10 +1867,10 @@ const SCENARIOS: readonly ScenarioDefinition[] = [
       assert.equal(reportTick.reportTaskId, bridgedTaskId);
       assert.equal(resultTransport.messages.length, 1);
       const resultReport = String(resultTransport.messages[0].text);
-      assert.match(resultReport, /typedOutcome=remediation-complete/);
-      assert.match(resultReport, /diagnosis=Diagnosed the fixture service/);
-      assert.match(resultReport, /actions=Changed the fixture service mode/);
-      assert.match(resultReport, /verification=PASS/);
+      assert.match(resultReport, /Result: remediation-complete/);
+      assert.match(resultReport, /Diagnosis: Diagnosed the fixture service/);
+      assert.match(resultReport, /Actions: Changed the fixture service mode/);
+      assert.match(resultReport, /Verification: PASS/);
       for (const component of [
         "monitoring-freshness/PASS",
         "exact-group-absence/PASS",

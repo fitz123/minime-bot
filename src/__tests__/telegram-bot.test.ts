@@ -1870,14 +1870,14 @@ describe("command handler wiring", () => {
       "fetch",
       async () => new Response(new Uint8Array([1, 2, 3, 4])),
     );
-    const voicePaths: string[] = [];
+    const voiceSources: string[] = [];
     const actualVoice = await import("../voice.js");
     t.mock.module("../voice.js", {
       namedExports: {
         ...actualVoice,
-        transcribeAudio: async (path: string) => {
-          voicePaths.push(path);
-          return `voice correction ${voicePaths.length}`;
+        ingestLocalAudio: async (url: string) => {
+          voiceSources.push(url);
+          return `voice correction ${voiceSources.length}`;
         },
       },
     });
@@ -1908,7 +1908,7 @@ describe("command handler wiring", () => {
     assert.deepStrictEqual(manager.steerCalls.map(({ text }) => text), [
       "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 1",
     ]);
-    assert.strictEqual(existsSync(voicePaths[0]), false, "transcription temp file is reclaimed");
+    assert.match(voiceSources[0], /\/files\/voice-file-1$/);
     manager.steerCalls[0].resolve(true);
     await flushAsyncWork();
 
@@ -1919,7 +1919,7 @@ describe("command handler wiring", () => {
       manager.steerCalls[1].text,
       "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 2",
     );
-    assert.strictEqual(existsSync(voicePaths[1]), false, "fallback also reclaims the voice temp file");
+    assert.match(voiceSources[1], /\/files\/voice-file-2$/);
     manager.steerCalls[1].resolve(false);
     manager.releaseInitial();
     await flushAsyncWork();

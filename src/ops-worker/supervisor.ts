@@ -830,6 +830,19 @@ export class OpsWorkerSupervisor {
     return this.store.get(taskId);
   }
 
+  blocksConversationAdmission(): boolean {
+    this.assertStarted();
+    this.isolateIncompatibleReportReceipts();
+    const tasks = this.store.list();
+    return this.piLaunchReservation !== null
+      || tasks.some((task) =>
+        task.state === "RUNNING"
+        || task.activeRun !== null
+        || task.unverifiedRun !== null
+        || isOpsWorkerUnresolvedOrphan(task))
+      || this.selectScheduledTask(tasks) !== undefined;
+  }
+
   get stateDirectory(): string {
     return this.store.stateDirectory;
   }

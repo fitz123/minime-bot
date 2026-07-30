@@ -92,6 +92,13 @@ export function stripKnownTrailingAsrArtifacts(transcript: string): string {
 export interface DownloadFileOptions {
   maxBytes?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface LocalAudioIngestionOptions {
+  maxBytes: number;
+  downloadTimeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 class DownloadAttemptError extends Error {
@@ -115,8 +122,21 @@ function retryAfterMs(headers: Headers | { get?: (name: string) => string | null
   return Math.max(0, Math.min(delay, DOWNLOAD_MAX_RETRY_AFTER_MS));
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason);
+    };
+    function done(): void {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -128,8 +148,12 @@ async function downloadAttempt(
   destPath: string,
   maxBytes: number | undefined,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(signal?.reason);
+  if (signal?.aborted) abortFromParent();
+  else signal?.addEventListener("abort", abortFromParent, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -203,6 +227,7 @@ async function downloadAttempt(
     }
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromParent);
   }
 }
 
@@ -226,13 +251,19 @@ export async function downloadFile(
   await cleanupTempFile(destPath);
 
   for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+    if (options.signal?.aborted) {
+      throw new MediaPipelineError("download", options.signal.reason);
+    }
     try {
-      await downloadAttempt(url, destPath, maxBytes, timeoutMs);
+      await downloadAttempt(url, destPath, maxBytes, timeoutMs, options.signal);
       if (attempt > 1) recordMediaDownloadRetry("recovered");
       return;
     } catch (error) {
       await cleanupTempFile(destPath);
       if (error instanceof MediaPipelineError) throw error;
+      if (options.signal?.aborted) {
+        throw new MediaPipelineError("download", options.signal.reason);
+      }
       const retryable = error instanceof DownloadAttemptError && error.retryable;
       if (!retryable || attempt === DOWNLOAD_MAX_ATTEMPTS) {
         if (retryable) recordMediaDownloadRetry("exhausted");
@@ -240,7 +271,11 @@ export async function downloadFile(
         throw new MediaPipelineError("download", cause);
       }
       const backoff = DOWNLOAD_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
-      await wait(error.retryAfterMs ?? backoff);
+      try {
+        await wait(error.retryAfterMs ?? backoff, options.signal);
+      } catch (waitError) {
+        throw new MediaPipelineError("download", waitError);
+      }
     }
   }
 }
@@ -249,7 +284,10 @@ export async function downloadFile(
  * Convert an audio file to 16kHz mono WAV using ffmpeg.
  * Returns the path to the generated WAV file.
  */
-export async function convertToWav(inputPath: string): Promise<string> {
+export async function convertToWav(
+  inputPath: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const wavPath = tempFilePath("voice-wav", ".wav");
   try {
     await execFileAsync(FFMPEG_BIN, [
@@ -259,7 +297,7 @@ export async function convertToWav(inputPath: string): Promise<string> {
       "-f", "wav",
       wavPath,
       "-y",
-    ], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024, signal });
     await chmod(wavPath, 0o600);
   } catch (err) {
     await cleanupTempFile(wavPath);
@@ -272,8 +310,11 @@ export async function convertToWav(inputPath: string): Promise<string> {
  * Transcribe an audio file using local whisper-cli.
  * Converts to WAV first since whisper-cli cannot decode Opus-in-OGG directly.
  */
-export async function transcribeAudio(filePath: string): Promise<string> {
-  const wavPath = await convertToWav(filePath);
+export async function transcribeAudio(
+  filePath: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const wavPath = await convertToWav(filePath, signal);
   try {
     try {
       const { stdout } = await execFileAsync(WHISPER_BIN, [
@@ -282,13 +323,50 @@ export async function transcribeAudio(filePath: string): Promise<string> {
         "--no-timestamps",
         "--no-prints",
         "--language", process.env.WHISPER_LANGUAGE ?? "auto",
-      ], { timeout: 120_000 });
+      ], { timeout: 120_000, signal });
       return stripKnownTrailingAsrArtifacts(stdout.trim());
     } catch (error) {
       throw toMediaPipelineError(error, "transcription");
     }
   } finally {
     await cleanupTempFile(wavPath);
+  }
+}
+
+/**
+ * Download and transcribe one bounded audio source using only the package-owned
+ * local ffmpeg/whisper pipeline. The source audio and converted WAV are always
+ * reclaimed before this function settles.
+ */
+export async function ingestLocalAudio(
+  url: string,
+  options: LocalAudioIngestionOptions,
+): Promise<string> {
+  if (
+    !Number.isSafeInteger(options.maxBytes)
+    || options.maxBytes <= 0
+    || (
+      options.downloadTimeoutMs !== undefined
+      && (
+        !Number.isSafeInteger(options.downloadTimeoutMs)
+        || options.downloadTimeoutMs <= 0
+      )
+    )
+  ) {
+    throw new TypeError("Local audio ingestion requires positive integer limits");
+  }
+  const audioPath = tempFilePath("voice", ".oga");
+  try {
+    await downloadFile(url, audioPath, {
+      maxBytes: options.maxBytes,
+      ...(options.downloadTimeoutMs === undefined
+        ? {}
+        : { timeoutMs: options.downloadTimeoutMs }),
+      signal: options.signal,
+    });
+    return requireTranscript(await transcribeAudio(audioPath, options.signal));
+  } finally {
+    await cleanupTempFile(audioPath);
   }
 }
 

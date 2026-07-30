@@ -1,17 +1,41 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 let whisperStdout = "";
+let execFailure: "ffmpeg" | "whisper" | null = null;
+const execFileCalls: Array<{
+  file: string;
+  args: string[];
+  options: Record<string, unknown>;
+  inputMode?: number;
+}> = [];
+const originalFetch = globalThis.fetch;
 
 function execFileMock(): never {
   throw new Error("unexpected callback-style execFile invocation");
 }
 
 Object.defineProperty(execFileMock, promisify.custom, {
-  value: async (_file: string, args: string[]) => {
-    if (args.includes("--no-timestamps")) {
+  value: async (
+    file: string,
+    args: string[],
+    options: Record<string, unknown>,
+  ) => {
+    execFileCalls.push({
+      file,
+      args,
+      options,
+      ...(args[0] === "-i" && existsSync(args[1])
+        ? { inputMode: statSync(args[1]).mode & 0o777 }
+        : {}),
+    });
+    const whisper = args.includes("--no-timestamps");
+    if (
+      execFailure === (whisper ? "whisper" : "ffmpeg")
+    ) throw new Error(`synthetic ${execFailure} failure`);
+    if (whisper) {
       return { stdout: whisperStdout, stderr: "" };
     }
 
@@ -27,13 +51,19 @@ mock.module("node:child_process", {
 });
 
 const {
+  FFMPEG_BIN,
   MediaPipelineError,
+  WHISPER_BIN,
+  ingestLocalAudio,
   requireTranscript,
   transcribeAudio,
 } = await import("../voice.js");
 
 afterEach(() => {
   whisperStdout = "";
+  execFailure = null;
+  execFileCalls.length = 0;
+  globalThis.fetch = originalFetch;
 });
 
 describe("transcribeAudio ASR postprocessing", () => {
@@ -55,5 +85,79 @@ describe("transcribeAudio ASR postprocessing", () => {
       () => requireTranscript(artifactOnlyTranscript),
       (error: Error) => error instanceof MediaPipelineError && error.stage === "empty-transcript",
     );
+  });
+
+  it("owns bounded local download, binaries, private files, and cleanup", async () => {
+    const sourceUrls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      sourceUrls.push(String(input));
+      return new Response(new Uint8Array([0x4f, 0x67, 0x67, 0x53]));
+    }) as typeof fetch;
+    whisperStdout = "Локальная расшифровка.\n";
+    const controller = new AbortController();
+
+    const transcript = await ingestLocalAudio(
+      "https://api.telegram.org/file/botTEST_TOKEN/voice/file.oga",
+      {
+        maxBytes: 4,
+        downloadTimeoutMs: 1_234,
+        signal: controller.signal,
+      },
+    );
+
+    assert.strictEqual(transcript, "Локальная расшифровка.");
+    assert.deepStrictEqual(sourceUrls, [
+      "https://api.telegram.org/file/botTEST_TOKEN/voice/file.oga",
+    ]);
+    assert.strictEqual(execFileCalls.length, 2);
+    const [ffmpeg, whisper] = execFileCalls;
+    assert.strictEqual(ffmpeg.file, FFMPEG_BIN);
+    assert.strictEqual(whisper.file, WHISPER_BIN);
+    assert.strictEqual(ffmpeg.options.timeout, 30_000);
+    assert.strictEqual(whisper.options.timeout, 120_000);
+    assert.strictEqual(ffmpeg.options.signal, controller.signal);
+    assert.strictEqual(whisper.options.signal, controller.signal);
+    const sourcePath = ffmpeg.args[1];
+    const wavPath = whisper.args[whisper.args.indexOf("-f") + 1];
+    assert.match(sourcePath, /\/bot-voice-[A-Za-z0-9-]+\.oga$/);
+    assert.match(wavPath, /\/bot-voice-wav-[A-Za-z0-9-]+\.wav$/);
+    assert.strictEqual(ffmpeg.inputMode, 0o600);
+    assert.strictEqual(existsSync(sourcePath), false);
+    assert.strictEqual(existsSync(wavPath), false);
+  });
+
+  it("reclaims private source and WAV files on conversion, transcription, and empty-result failures", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0x4f, 0x67, 0x67, 0x53]))) as typeof fetch;
+
+    for (const failure of ["ffmpeg", "whisper", "empty"] as const) {
+      execFileCalls.length = 0;
+      execFailure = failure === "empty" ? null : failure;
+      whisperStdout = "";
+
+      await assert.rejects(
+        ingestLocalAudio(
+          `https://api.telegram.org/file/botTEST_TOKEN/voice/${failure}.oga`,
+          { maxBytes: 4 },
+        ),
+        (error: unknown) =>
+          error instanceof MediaPipelineError
+          && error.stage === (
+            failure === "ffmpeg"
+              ? "conversion"
+              : failure === "whisper"
+                ? "transcription"
+                : "empty-transcript"
+          ),
+      );
+
+      const ffmpeg = execFileCalls[0];
+      assert.ok(ffmpeg);
+      const sourcePath = ffmpeg.args[1];
+      const wavPath = ffmpeg.args.at(-2);
+      assert.ok(wavPath);
+      assert.equal(existsSync(sourcePath), false);
+      assert.equal(existsSync(wavPath), false);
+    }
   });
 });

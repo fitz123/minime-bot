@@ -40,6 +40,13 @@ import {
   type OpsWorkerTelegramFetch,
 } from "./telegram-control.js";
 import {
+  OpsWorkerConversationRunner,
+  type OpsWorkerConversationRunnerDependencies,
+} from "./conversation-runner.js";
+import { OpsWorkerConversationLane } from "./conversation-lane.js";
+import { buildOpsWorkerConversationSnapshot } from "./conversation-view.js";
+import { createOpsWorkerFieldRedactor } from "./reporting.js";
+import {
   DEFAULT_OPS_WORKER_STATUS_HOST,
   DEFAULT_OPS_WORKER_STATUS_PORT,
   inspectOpsWorkerPolicy,
@@ -97,6 +104,7 @@ export interface OpsWorkerCliDependencies {
   controlConfigSecretResolver?: (options: ResolveSecretOptions) => string;
   telegramFetch?: OpsWorkerTelegramFetch;
   telegramSleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  conversationRunnerDependencies?: OpsWorkerConversationRunnerDependencies;
 }
 
 export interface RunOpsWorkerCliOptions {
@@ -772,23 +780,64 @@ async function runStart(
             },
           }),
     });
+    const conversationRunner = controlConfig === undefined
+      ? undefined
+      : new OpsWorkerConversationRunner({
+          stateDirectory: directory,
+          workspaceCwd: workspace,
+          snapshot: () => buildOpsWorkerConversationSnapshot(
+            supervisor.listTasks(),
+            inspectPolicy(deps),
+            {
+              redact: createOpsWorkerFieldRedactor([
+                controlConfig.telegram.token,
+                controlConfig.intake?.bearerToken ?? "",
+              ]),
+            },
+          ),
+          abortSignal: signal,
+          dependencies: deps.conversationRunnerDependencies,
+        });
+    await conversationRunner?.start();
+    const conversationLane = conversationRunner === undefined
+      ? undefined
+      : new OpsWorkerConversationLane({
+          blocksAdmission: () => supervisor.blocksConversationAdmission(),
+          abortConversation: async () => conversationRunner.abort(),
+        });
     const telegramControl = controlConfig === undefined
+      || conversationRunner === undefined
+      || conversationLane === undefined
       ? undefined
       : new OpsWorkerTelegramControl({
-        config: controlConfig,
-        supervisor,
-        ledger: new OpsWorkerControlLedger(directory),
-        fetch: deps.telegramFetch,
-        inspectPolicy: () => inspectPolicy(deps),
-        sleep: deps.telegramSleep,
-      });
+          config: controlConfig,
+          supervisor,
+          ledger: new OpsWorkerControlLedger(directory),
+          fetch: deps.telegramFetch,
+          inspectPolicy: () => inspectPolicy(deps),
+          sleep: deps.telegramSleep,
+          conversationLane,
+          handleConversation: async (text, _input, options) =>
+            conversationRunner.run(text, options),
+        });
     writeLine(
       cliOptions.stdout,
     `Ops worker started; status http://${statusServer.host.includes(":") ? `[${statusServer.host}]` : statusServer.host}:${statusServer.port}/status`,
     );
+    const runIncidentFirst = async (): Promise<OpsWorkerTask | undefined> => {
+      if (conversationLane === undefined) return runner.runNext();
+      if (!supervisor.blocksConversationAdmission()) return undefined;
+      return conversationLane.runIncident(async () => runner.runNext());
+    };
     if (parsed.flags.has("once")) {
-      const result = await runner.runNext();
-      await telegramControl?.tick(signal);
+      let result: OpsWorkerTask | undefined;
+      try {
+        result = await runIncidentFirst();
+        await telegramControl?.tick(signal);
+        await telegramControl?.waitForConversation();
+      } finally {
+        await conversationLane?.close();
+      }
       writeLine(
         cliOptions.stdout,
         result ? `Processed ${result.id}: ${result.state}` : "No eligible ops-worker task.",
@@ -798,7 +847,7 @@ async function runStart(
     const pollMs = validateSchedulerPollMs(deps.schedulerPollMs);
     const schedulerLoop = async (): Promise<void> => {
       while (!signal.aborted) {
-        const result = await runner.runNext();
+        const result = await runIncidentFirst();
         if (!result) await abortableDelay(pollMs, signal);
       }
     };

@@ -676,6 +676,78 @@ describe("ops worker supervisor", () => {
     assert.equal(isolated?.schedule.nextCheckAt, null);
   });
 
+  it("applies a resolved terminal report fence during conversation admission maintenance", async (t) => {
+    const harness = await makeHarness(t);
+    const task = makeTask("task-terminal-report-fence");
+    harness.store.create(task);
+    harness.supervisor.cancelTask(task.id, "Fixture terminal state");
+    const intent = { legacyReportPayload: "externally-confirmed" };
+    const intentHash = hashOpsWorkerCanonicalPayload(intent);
+    const operationId = `report:${intentHash.slice("sha256:".length, 31)}`;
+    harness.store.mutate(
+      task.id,
+      {
+        event: "RECONCILIATION",
+        summary: "Installed a resolved terminal report fence fixture",
+      },
+      (current) => {
+        current.report.lastError =
+          "Claimed report receipt requires external-outcome reconciliation";
+        current.mutationReceipts.report = {
+          boundary: "report",
+          operationId,
+          intentHash,
+          queryObservedAt: NOW,
+          queryResultHash: hashOpsWorkerCanonicalPayload({ state: "PENDING" }),
+          mutationStartedAt: NOW,
+          outcome: null,
+          replayHistory: [],
+        };
+      },
+    );
+    const lifecycle = new OpsWorkerLifecycle(harness.store, {
+      now: () => new Date(LATER),
+    });
+    lifecycle.finishMutationReceipt(task.id, {
+      boundary: "report",
+      operationId,
+      intent,
+      result: "APPLIED",
+      evidence: { delivered: true },
+    });
+
+    assert.equal(harness.store.get(task.id)?.report.state, "PENDING");
+    assert.equal(harness.supervisor.blocksConversationAdmission(), false);
+    const maintained = harness.store.get(task.id);
+    assert.equal(maintained?.report.state, "SENT");
+    assert.equal(maintained?.report.lastError, null);
+  });
+
+  it("admits conversation while held custody is deferred or paused, but blocks due work", async (t) => {
+    const harness = await makeHarness(t);
+    const checking = makeTask("task-conversation-deferred");
+    checking.state = "CHECKING";
+    checking.custody = {
+      status: "HELD",
+      claimedAt: NOW,
+      releasedAt: null,
+      releaseReason: null,
+    };
+    checking.schedule.nextCheckAt = LATER;
+    harness.store.create(checking);
+
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.supervisor.blocksConversationAdmission(), false);
+
+    harness.setNow(LATER);
+    assert.equal(harness.supervisor.selectNextTask()?.action, "CHECK");
+    assert.equal(harness.supervisor.blocksConversationAdmission(), true);
+
+    harness.supervisor.setTaskPaused(checking.id, true);
+    assert.equal(harness.supervisor.selectNextTask(), undefined);
+    assert.equal(harness.supervisor.blocksConversationAdmission(), false);
+  });
+
   it("holds paused RUN, CHECK, and quota-probe work without yielding custody or queue position", async (t) => {
     const harness = await makeHarness(t, {
       quotaAdmission: { check: () => ({
