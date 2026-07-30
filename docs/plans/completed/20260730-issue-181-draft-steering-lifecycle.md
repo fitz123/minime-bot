@@ -1,8 +1,8 @@
 # Plan: Telegram draft lifecycle across mid-turn steering
 
-Status: public-package implementation Tasks 1–3 complete and validated on
-2026-07-30. Iterative code review is in progress; PR, release, deployment, and
-issue closure remain pending under Post-completion.
+Status: public-package implementation Tasks 1–3 and iterative code review
+completed and validated on 2026-07-30. PR, release, deployment, and issue
+closure remain pending under Post-completion.
 
 ## Goal
 
