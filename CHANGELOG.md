@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 2026.7.43
+
+- Keep the dedicated Ops conversation compatible with the ChatGPT Codex
+  Responses transport by omitting its unsupported output-token parameter while
+  retaining a fixed fail-closed streamed-output ceiling (#132).
+
+## 2026.7.42
+
+- Add bounded natural Russian text and local voice conversation, readable task
+  narratives, and safe ID-less steering to the independently supervised Ops
+  Telegram channel while preserving deterministic commands and incident-first
+  process custody (#132).
+
 ## 2026.7.41
 
 - Keep Ops intake and status available when one report receipt is externally
