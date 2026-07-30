@@ -158,9 +158,12 @@ is also the status server port.
 Ordinary allowlisted text is handled by one package-owned, tool-free,
 no-session Pi turn over a bounded redacted snapshot. Telegram voice uses the
 same path after bounded local ffmpeg/whisper transcription and receives only a
-text reply. This behavior is enabled by the existing `--control-config`; it
-requires no additional private configuration and never routes through the
-primary bot.
+text reply. The turn runs with reasoning disabled, clamps provider token fields
+where supported, and always enforces the same 2,048-byte streamed-output ceiling;
+the ChatGPT Codex transport intentionally receives no unsupported
+`max_output_tokens` field. This behavior is enabled by the existing
+`--control-config`; it requires no additional private configuration and never
+routes through the primary bot.
 
 Voice requires local `ffmpeg` and `whisper-cli` binaries plus a Whisper model
 on the worker host. Their defaults are `/opt/homebrew/bin/ffmpeg`,

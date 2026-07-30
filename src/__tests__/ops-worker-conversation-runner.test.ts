@@ -35,6 +35,7 @@ import type { OpsWorkerConversationSnapshot } from "../ops-worker/conversation-v
 import {
   OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE,
   OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS,
+  OPS_WORKER_CONVERSATION_MAX_STREAM_BYTES,
   boundOpsWorkerConversationProviderPayload,
 } from "../pi-extensions/ops-worker-conversation-bounds.js";
 
@@ -181,6 +182,7 @@ function harness(
     snapshot?: () => OpsWorkerConversationSnapshot;
     spawnThrows?: boolean;
     unreapable?: boolean;
+    useDefaultThinking?: boolean;
   } = {},
 ): ConversationHarness {
   const workspace = mkdtempSync(join(tmpdir(), "ops-conversation-runner-"));
@@ -205,7 +207,7 @@ function harness(
     workspaceCwd: workspace,
     snapshot: options.snapshot ?? (() => structuredClone(SNAPSHOT)),
     model: "openai-codex/gpt-fixture",
-    thinking: "low",
+    ...(options.useDefaultThinking ? {} : { thinking: "low" as const }),
     runtimeMs: options.runtimeMs ?? 500,
     stallMs: options.stallMs ?? 500,
     termGraceMs: 5,
@@ -372,6 +374,19 @@ describe("ops worker conversation runner", () => {
     assert.equal(prompt.operator_language, "ru");
     assert.equal(prompt.operator_text, "Что сейчас выполняется?");
     assert.deepEqual(prompt.current_snapshot, SNAPSHOT);
+  });
+
+  it("disables reasoning by default for the Codex streamed-output ceiling", async (t) => {
+    const fixture = harness([{ stdout: answer("Система спокойна.") }], {
+      useDefaultThinking: true,
+    });
+    t.after(fixture.cleanup);
+
+    assert.equal((await fixture.runner.run("Что происходит?")).status, "OK");
+    const args = fixture.invocations[0];
+    const thinkingIndex = args.indexOf("--thinking");
+    assert.notEqual(thinkingIndex, -1);
+    assert.equal(args[thinkingIndex + 1], "off");
   });
 
   it("serializes Russian current-work, pool, alert, report, history, and input questions with their bounded snapshot sections", async (t) => {
@@ -776,7 +791,7 @@ describe("ops worker conversation runner", () => {
 
 describe("ops worker conversation provider bounds", () => {
   it("hard-clamps supported provider payloads to the fixed output-token limit", () => {
-    assert.equal(OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS, 768);
+    assert.equal(OPS_WORKER_CONVERSATION_MAX_OUTPUT_TOKENS, 2_048);
     const cases: Array<{
       api: string;
       payload: Record<string, unknown>;
@@ -785,37 +800,37 @@ describe("ops worker conversation provider bounds", () => {
       {
         api: "anthropic-messages",
         payload: { messages: [], max_tokens: 32_000 },
-        expected: { messages: [], max_tokens: 768 },
+        expected: { messages: [], max_tokens: 2_048 },
       },
       {
         api: "openai-completions",
         payload: { messages: [], max_completion_tokens: 32_000 },
-        expected: { messages: [], max_completion_tokens: 768 },
+        expected: { messages: [], max_completion_tokens: 2_048 },
       },
       {
         api: "openai-completions",
         payload: { messages: [], max_tokens: 32_000 },
-        expected: { messages: [], max_tokens: 768 },
+        expected: { messages: [], max_tokens: 2_048 },
       },
       {
         api: "openai-responses",
         payload: { input: [], max_output_tokens: 32_000 },
-        expected: { input: [], max_output_tokens: 768 },
+        expected: { input: [], max_output_tokens: 2_048 },
       },
       {
         api: "azure-openai-responses",
         payload: { input: [], max_output_tokens: 32_000 },
-        expected: { input: [], max_output_tokens: 768 },
+        expected: { input: [], max_output_tokens: 2_048 },
       },
       {
         api: "openai-codex-responses",
         payload: { input: [] },
-        expected: { input: [], max_output_tokens: 768 },
+        expected: { input: [] },
       },
       {
         api: "mistral-conversations",
         payload: { messages: [], maxTokens: 32_000 },
-        expected: { messages: [], maxTokens: 768 },
+        expected: { messages: [], maxTokens: 2_048 },
       },
       {
         api: "google-generative-ai",
@@ -825,7 +840,7 @@ describe("ops worker conversation provider bounds", () => {
         },
         expected: {
           contents: [],
-          config: { maxOutputTokens: 768 },
+          config: { maxOutputTokens: 2_048 },
         },
       },
       {
@@ -836,7 +851,7 @@ describe("ops worker conversation provider bounds", () => {
         },
         expected: {
           contents: [],
-          config: { maxOutputTokens: 768 },
+          config: { maxOutputTokens: 2_048 },
         },
       },
       {
@@ -847,7 +862,7 @@ describe("ops worker conversation provider bounds", () => {
         },
         expected: {
           messages: [],
-          inferenceConfig: { maxTokens: 768 },
+          inferenceConfig: { maxTokens: 2_048 },
         },
       },
       {
@@ -858,7 +873,7 @@ describe("ops worker conversation provider bounds", () => {
         },
         expected: {
           context: {},
-          options: { maxTokens: 768 },
+          options: { maxTokens: 2_048 },
         },
       },
     ];
@@ -895,11 +910,12 @@ describe("ops worker conversation provider bounds", () => {
     );
   });
 
-  it("registers the provider boundary and exits fail-closed on an unknown payload", async (t) => {
-    const handlers = new Map<string, (
-      event: { payload: unknown },
-      context: { model: { api: string } | undefined },
-    ) => unknown>();
+  it("registers provider and stream boundaries and exits fail-closed", async (t) => {
+    type TestExtensionHandler = (
+      event: Record<string, unknown>,
+      context: Record<string, unknown>,
+    ) => unknown;
+    const handlers = new Map<string, TestExtensionHandler>();
     const wrapper = (await import(
       `${pathToFileURL(resolve(
         PACKAGE_ROOT,
@@ -909,10 +925,7 @@ describe("ops worker conversation provider bounds", () => {
       )).href}?test=${Date.now()}`
     )).default;
     wrapper({
-      on: (event: string, handler: (
-        event: { payload: unknown },
-        context: { model: { api: string } | undefined },
-      ) => unknown) => {
+      on: (event: string, handler: TestExtensionHandler) => {
         handlers.set(event, handler);
       },
     } as unknown as ExtensionAPI);
@@ -940,6 +953,25 @@ describe("ops worker conversation provider bounds", () => {
       }),
       /synthetic process exit/,
     );
+    assert.equal(exitCode, OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE);
+
+    const streamHandler = handlers.get("message_update");
+    assert.ok(streamHandler);
+    let aborted = 0;
+    exitCode = undefined;
+    assert.equal(OPS_WORKER_CONVERSATION_MAX_STREAM_BYTES, 2_048);
+    assert.throws(
+      () => streamHandler({
+        assistantMessageEvent: {
+          type: "text_delta",
+          delta: "я".repeat(OPS_WORKER_CONVERSATION_MAX_STREAM_BYTES / 2 + 1),
+        },
+      }, {
+        abort: () => { aborted += 1; },
+      }),
+      /synthetic process exit/,
+    );
+    assert.equal(aborted, 1);
     assert.equal(exitCode, OPS_WORKER_CONVERSATION_BOUNDS_FAILURE_EXIT_CODE);
   });
 });

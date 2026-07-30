@@ -72,7 +72,7 @@ export const OPS_WORKER_CONVERSATION_SYSTEM_POLICY = [
   'Read-only answer: {"version":1,"kind":"answer","language":"ru|en|other","text":"..."}',
   'Clarification: {"version":1,"kind":"clarification","language":"ru|en|other","text":"..."}',
   'Control proposal: {"version":1,"kind":"control","language":"ru|en|other","intent":"answer|correct|retry|pause|resume|cancel","taskReference":null|string,"argument":null|string}',
-  "Keep the response concise and within the fixed provider output-token limit.",
+  "Keep the complete JSON response concise and within 2048 UTF-8 bytes.",
 ].join("\n");
 
 export type OpsWorkerConversationLanguage = "ru" | "en" | "other";
@@ -289,7 +289,10 @@ export class OpsWorkerConversationRunner {
     this.workspaceCwd = validateWorkspace(options.workspaceCwd);
     this.snapshot = options.snapshot;
     this.model = normalizePiModel(options.model);
-    this.thinking = options.thinking ?? "low";
+    // The ChatGPT Codex transport has no supported server-side output-token
+    // parameter. Disabling reasoning lets the explicit streamed byte ceiling
+    // bound the complete provider output deterministically.
+    this.thinking = options.thinking ?? "off";
     if (!SAFE_RUNTIME_VALUE.test(this.model)) {
       throw new TypeError("Ops conversation model contains unsafe characters");
     }
