@@ -2,6 +2,7 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -47,6 +48,14 @@ function git(cwd: string, args: readonly string[]): string {
     `git ${args.join(" ")} failed in ${cwd}: ${(result.stderr || result.stdout).trim()}`,
   );
   return result.stdout.trim();
+}
+
+function gitCommand(args: readonly string[]): string | undefined {
+  let index = 0;
+  while (args[index] === "-c") {
+    index += 2;
+  }
+  return args[index];
 }
 
 function writeFiles(root: string, files: Record<string, string>): void {
@@ -224,7 +233,7 @@ describe("knowledge sync Git convergence", () => {
       const response = executeKnowledgeSync({
         agentWorkspaceRoot: fixture.workspace,
         git: (args, options) => {
-          if (args[0] === "push") {
+          if (gitCommand(args) === "push") {
             pushAttempts += 1;
             return { status: 1, stdout: "", stderr: "pushes are not permitted" };
           }
@@ -354,6 +363,43 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
   });
 
+  it("disables repository hooks for transaction-owned worktree, merge, commit, and push commands", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-hooks");
+    commitFiles(fixture.workspace, "local hook-safe entry", {
+      "diary/local-hook-safe.md": "# Local hook-safe entry\n",
+    });
+    commitFiles(peer, "remote hook-safe entry", {
+      "diary/remote-hook-safe.md": "# Remote hook-safe entry\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    const hooksPath = join(fixture.root, "hooks");
+    const sentinel = join(fixture.root, "hook-ran");
+    mkdirSync(hooksPath, { recursive: true });
+    for (const hook of [
+      "post-checkout",
+      "pre-merge-commit",
+      "post-merge",
+      "pre-commit",
+      "prepare-commit-msg",
+      "commit-msg",
+      "post-commit",
+      "pre-push",
+    ]) {
+      const hookPath = join(hooksPath, hook);
+      writeFileSync(hookPath, `#!/bin/sh\nprintf 'ran\\n' >> ${JSON.stringify(sentinel)}\n`, "utf8");
+      chmodSync(hookPath, 0o755);
+    }
+    git(fixture.workspace, ["config", "core.hooksPath", hooksPath]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(existsSync(sentinel), false);
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
   it("performs one bounded reconciliation retry when a remote commit wins the first push race", () => {
     const fixture = createSyncFixture();
     const racer = cloneRemote(fixture, "peer-racer");
@@ -365,7 +411,7 @@ describe("knowledge sync Git convergence", () => {
     const response = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (!raced && args[0] === "push") {
+        if (!raced && gitCommand(args) === "push") {
           raced = true;
           commitFiles(racer, "winning remote race entry", {
             "diary/remote-race.md": "# Remote race\n",
@@ -397,7 +443,7 @@ describe("knowledge sync Git convergence", () => {
     const response = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (args[0] === "push") {
+        if (gitCommand(args) === "push") {
           pushAttempts += 1;
           commitFiles(racer, `remote race ${pushAttempts}`, {
             [`diary/remote-race-${pushAttempts}.md`]: `# Remote race ${pushAttempts}\n`,
@@ -420,6 +466,44 @@ describe("knowledge sync Git convergence", () => {
     );
   });
 
+  it("accepts verified convergence when the second push succeeds but reports a transport failure", () => {
+    const fixture = createSyncFixture();
+    const racer = cloneRemote(fixture, "peer-lost-push-response");
+    commitFiles(fixture.workspace, "local lost-response entry", {
+      "diary/local-lost-response.md": "# Local lost response\n",
+    });
+    let pushAttempts = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) !== "push") {
+          return defaultKnowledgeSyncGitRunner(args, options);
+        }
+        pushAttempts += 1;
+        if (pushAttempts === 1) {
+          commitFiles(racer, "winning first push race", {
+            "diary/remote-first-race.md": "# Remote first race\n",
+          });
+          git(racer, ["push", "origin", "main"]);
+        }
+        const pushed = defaultKnowledgeSyncGitRunner(args, options);
+        if (pushAttempts === 2) {
+          assert.equal(pushed.status, 0);
+          return { status: 1, stdout: "", stderr: "simulated lost push response" };
+        }
+        return pushed;
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(response.attempts, 2);
+    assert.equal(pushAttempts, 2);
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
   it("retains recovery refs after an interrupted push and completes idempotently on retry", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-interrupted");
@@ -435,7 +519,7 @@ describe("knowledge sync Git convergence", () => {
     const interrupted = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (!refusedPush && args[0] === "push") {
+        if (!refusedPush && gitCommand(args) === "push") {
           refusedPush = true;
           return { status: 1, stdout: "", stderr: "simulated transport interruption" };
         }
@@ -716,6 +800,43 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), localVariant);
   });
 
+  it("rejects a union merge attribute on a renamed destination before it can hide a conflict", () => {
+    const fixture = createSyncFixture();
+    const oldPath = "wiki/pages/reference/rename-union-old.md";
+    const newPath = "wiki/pages/reference/rename-union-new.md";
+    const sharedBody = [
+      "# Rename union topic",
+      "",
+      ...Array.from({ length: 16 }, (_, index) => `Stable rename context ${index + 1}.`),
+      "",
+      "Claim: undecided.",
+      "",
+    ].join("\n");
+    const sharedVariant = page("Rename union topic", "A page renamed during divergent edits.", "reference", sharedBody);
+    commitFiles(fixture.workspace, "shared rename page with destination union driver", {
+      ".gitattributes": `${newPath} merge=union\n`,
+      [oldPath]: sharedVariant,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-rename-union-driver");
+    const localVariant = sharedVariant.replace("Claim: undecided.", "Claim: local.");
+    const remoteVariant = sharedVariant.replace("Claim: undecided.", "Claim: remote.");
+    git(fixture.workspace, ["mv", oldPath, newPath]);
+    writeFiles(fixture.workspace, { [newPath]: localVariant });
+    git(fixture.workspace, ["add", "-A"]);
+    git(fixture.workspace, ["commit", "-m", "rename and edit page locally"]);
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "edit old page remotely", { [oldPath]: remoteVariant });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "unsupported-merge-driver");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("retains the complete present variant and the deletion provenance for modify/delete", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/reference/deletion.md";
@@ -742,6 +863,43 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     const unresolved = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
     assert.ok(unresolved.includes(modifiedVariant.trimEnd()));
     assert.match(unresolved, /committed deletion/);
+    assert.match(unresolved, new RegExp(localTip));
+    assert.match(unresolved, new RegExp(remoteTip));
+  });
+
+  it("retains both index-stage variants when Git maps a rename/modify conflict to the destination", () => {
+    const fixture = createSyncFixture();
+    const oldPath = "wiki/pages/project/renamed-old.md";
+    const newPath = "wiki/pages/project/renamed-new.md";
+    const sharedBody = [
+      "# Renamed topic",
+      "",
+      ...Array.from({ length: 16 }, (_, index) => `Stable renamed context ${index + 1}.`),
+      "",
+      "Claim: undecided.",
+      "",
+    ].join("\n");
+    const sharedVariant = page("Renamed topic", "A page renamed during divergent edits.", "project", sharedBody);
+    commitFiles(fixture.workspace, "shared page before rename", { [oldPath]: sharedVariant });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-rename-modify");
+    const localVariant = sharedVariant.replace("Claim: undecided.", "Claim: local renamed variant.");
+    const remoteVariant = sharedVariant.replace("Claim: undecided.", "Claim: remote original-path variant.");
+    git(fixture.workspace, ["mv", oldPath, newPath]);
+    writeFiles(fixture.workspace, { [newPath]: localVariant });
+    git(fixture.workspace, ["add", "-A"]);
+    git(fixture.workspace, ["commit", "-m", "rename and edit page locally"]);
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "edit original page remotely", { [oldPath]: remoteVariant });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const unresolved = readFileSync(join(fixture.workspace, ...newPath.split("/")), "utf8");
+    assert.ok(unresolved.includes(localVariant.trimEnd()));
+    assert.ok(unresolved.includes(remoteVariant.trimEnd()));
+    assert.doesNotMatch(unresolved, /committed deletion/);
     assert.match(unresolved, new RegExp(localTip));
     assert.match(unresolved, new RegExp(remoteTip));
   });
@@ -1129,7 +1287,7 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(worktreePaths(fixture).length, 2);
   });
 
-  it("rejects a custom default merge driver before it can hide a non-Knowledge conflict", () => {
+  it("rechecks a repaired custom default merge driver instead of caching the rejection", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-custom-default-driver");
     git(fixture.workspace, ["config", "merge.default", "ours"]);
@@ -1147,6 +1305,12 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(localHead(fixture), localTip);
     assert.equal(remoteHead(fixture), remoteTip);
     assert.equal(readFileSync(join(fixture.workspace, "README.md"), "utf8"), localReadme);
+
+    git(fixture.workspace, ["config", "--unset", "merge.default"]);
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(retried.ok, false);
+    assert.equal(retried.reason, "non-knowledge-conflict");
   });
 
   it("reuses one retained candidate for repeated failures with identical tips", () => {

@@ -116,6 +116,7 @@ const LOCK_RECLAIM_RELPATH = ".tmp/knowledge-update.lock.reclaim" as const;
 const SYNC_WORKTREE_MARKER = ".minime-knowledge-sync-owner.json";
 const MAX_ATTEMPTS = 2;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
+const DISABLE_GIT_HOOKS = ["-c", "core.hooksPath=/dev/null"] as const;
 
 const defaultFs: KnowledgeSyncFs = {
   closeSync,
@@ -651,13 +652,19 @@ function unresolvedConflictPaths(candidateRoot: string, git: KnowledgeSyncGitRun
 const SAFE_DEFAULT_MERGE_DRIVERS = new Set(["text", "binary"]);
 const SAFE_MERGE_ATTRIBUTE_VALUES = new Set(["unspecified", "set", "unset", "text", "binary"]);
 
+interface ChangedPath {
+  paths: string[];
+}
+
 function changedPathsBetween(
   candidateRoot: string,
   base: string,
   tip: string,
   git: KnowledgeSyncGitRunner,
-): string[] | KnowledgeSyncFailure {
-  const changed = git(["diff", "--name-only", "-z", base, tip, "--"], { cwd: candidateRoot });
+): ChangedPath[] | KnowledgeSyncFailure {
+  const changed = git(["diff", "--name-status", "-z", "--find-renames", base, tip, "--"], {
+    cwd: candidateRoot,
+  });
   if (changed.status !== 0) {
     return failure(
       "error",
@@ -665,7 +672,31 @@ function changedPathsBetween(
       `knowledge sync could not inspect divergent changed paths: ${errorText(changed)}`,
     );
   }
-  return changed.stdout.split("\0").filter(Boolean);
+  const fields = changed.stdout.split("\0");
+  fields.pop();
+  const paths: ChangedPath[] = [];
+  for (let index = 0; index < fields.length;) {
+    const status = fields[index++];
+    if (!status) {
+      return failure(
+        "error",
+        "candidate-changed-path-inspection-failed",
+        "knowledge sync received an invalid divergent changed-path result.",
+      );
+    }
+    const pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1;
+    const recordPaths = fields.slice(index, index + pathCount);
+    if (recordPaths.length !== pathCount || recordPaths.some((path) => !path)) {
+      return failure(
+        "error",
+        "candidate-changed-path-inspection-failed",
+        "knowledge sync received an incomplete divergent changed-path result.",
+      );
+    }
+    paths.push({ paths: recordPaths });
+    index += pathCount;
+  }
+  return paths;
 }
 
 function validateMergeDrivers(
@@ -690,9 +721,25 @@ function validateMergeDrivers(
   if (!Array.isArray(remotePaths)) {
     return remotePaths;
   }
-  const remotePathSet = new Set(remotePaths);
-  const jointlyChangedPaths = localPaths.filter((path) => remotePathSet.has(path)).sort();
-  if (jointlyChangedPaths.length === 0) {
+  const remoteChangesByPath = new Map<string, ChangedPath[]>();
+  for (const remoteChange of remotePaths) {
+    for (const path of remoteChange.paths) {
+      const changes = remoteChangesByPath.get(path) ?? [];
+      changes.push(remoteChange);
+      remoteChangesByPath.set(path, changes);
+    }
+  }
+  const jointlyChangedPaths = new Set<string>();
+  for (const localChange of localPaths) {
+    for (const localPath of localChange.paths) {
+      for (const remoteChange of remoteChangesByPath.get(localPath) ?? []) {
+        for (const path of [...localChange.paths, ...remoteChange.paths]) {
+          jointlyChangedPaths.add(path);
+        }
+      }
+    }
+  }
+  if (jointlyChangedPaths.size === 0) {
     return undefined;
   }
 
@@ -712,7 +759,7 @@ function validateMergeDrivers(
     );
   }
 
-  for (const path of jointlyChangedPaths) {
+  for (const path of [...jointlyChangedPaths].sort()) {
     const attribute = git(["check-attr", "-z", "merge", "--", path], { cwd: candidateRoot });
     if (attribute.status !== 0) {
       return failure(
@@ -755,6 +802,57 @@ function isManagedKnowledgePath(path: string): boolean {
 interface CommitFileResult {
   ok: true;
   content?: string;
+}
+
+function readConflictIndexFile(
+  candidateRoot: string,
+  relPath: string,
+  stage: 2 | 3,
+  git: KnowledgeSyncGitRunner,
+): CommitFileResult | AttemptFailure {
+  const listed = git(["ls-files", "--stage", "-z", "--", relPath], { cwd: candidateRoot });
+  if (listed.status !== 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-inspection-failed",
+        `knowledge sync could not inspect conflict stage ${stage} for ${relPath}: ${errorText(listed)}`,
+      ),
+    };
+  }
+  let stagePresent = false;
+  for (const entry of listed.stdout.split("\0").filter(Boolean)) {
+    const match = /^(\d+) [0-9a-f]+ (\d+)\t([\s\S]+)$/u.exec(entry);
+    if (!match) {
+      return {
+        ok: false,
+        failure: failure(
+          "error",
+          "candidate-source-inspection-failed",
+          `knowledge sync could not parse conflict stages for ${relPath}.`,
+        ),
+      };
+    }
+    if (match[2] === String(stage) && match[3] === relPath) {
+      stagePresent = true;
+    }
+  }
+  if (!stagePresent) {
+    return { ok: true };
+  }
+  const shown = git(["show", `:${stage}:${relPath}`], { cwd: candidateRoot });
+  if (shown.status !== 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-read-failed",
+        `knowledge sync could not read conflict stage ${stage} for ${relPath}: ${errorText(shown)}`,
+      ),
+    };
+  }
+  return { ok: true, content: shown.stdout };
 }
 
 function readCommitFile(
@@ -947,11 +1045,11 @@ function resolveManagedPageConflict(
       ),
     };
   }
-  const local = readCommitFile(candidateRoot, tips.local, relPath, git);
+  const local = readConflictIndexFile(candidateRoot, relPath, 2, git);
   if (!local.ok) {
     return local;
   }
-  const remote = readCommitFile(candidateRoot, tips.remote, relPath, git);
+  const remote = readConflictIndexFile(candidateRoot, relPath, 3, git);
   if (!remote.ok) {
     return remote;
   }
@@ -1159,7 +1257,7 @@ function withTemporaryWorktree(
   );
   if (reusable) {
     const cached = parseCandidateOutcome(reusable.marker.outcome);
-    if (cached && (cached.ok || cached.failure.status !== "error")) {
+    if (cached?.ok) {
       return cached;
     }
     const resetMarker = { ...reusable.marker, outcome: undefined };
@@ -1178,7 +1276,9 @@ function withTemporaryWorktree(
         ),
       };
     }
-    const added = git(["worktree", "add", "--detach", reusable.path, startCommit], { cwd: workspaceRoot });
+    const added = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", reusable.path, startCommit], {
+      cwd: workspaceRoot,
+    });
     if (added.status !== 0) {
       try {
         fs.rmSync(dirname(reusable.path), { recursive: true, force: true });
@@ -1226,7 +1326,9 @@ function withTemporaryWorktree(
     }
     return { ok: false, failure: markerFailure };
   }
-  const add = git(["worktree", "add", "--detach", candidateRoot, startCommit], { cwd: workspaceRoot });
+  const add = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", candidateRoot, startCommit], {
+    cwd: workspaceRoot,
+  });
   if (add.status !== 0) {
     try {
       fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -1441,7 +1543,9 @@ function prepareCandidate(
     if (mergeDriverProblem) {
       return { ok: false, failure: mergeDriverProblem };
     }
-    const merged = git(["merge", "--no-ff", "--no-commit", tips.remote], { cwd: candidateRoot });
+    const merged = git([...DISABLE_GIT_HOOKS, "merge", "--no-ff", "--no-commit", tips.remote], {
+      cwd: candidateRoot,
+    });
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
     if (merged.status !== 0) {
       if (conflictPaths.length === 0) {
@@ -1509,6 +1613,7 @@ function prepareCandidate(
 
     const committed = git(
       [
+        ...DISABLE_GIT_HOOKS,
         "-c",
         "commit.gpgSign=false",
         "-c",
@@ -1555,7 +1660,7 @@ function fastForwardCanonical(
   if (current.stdout.trim() === commit) {
     return undefined;
   }
-  const merged = git(["merge", "--ff-only", commit], { cwd: workspaceRoot });
+  const merged = git([...DISABLE_GIT_HOOKS, "merge", "--ff-only", commit], { cwd: workspaceRoot });
   if (merged.status !== 0) {
     return failure(
       "error",
@@ -1581,6 +1686,10 @@ function convergeAttempt(
   const fastForwardFailure = fastForwardCanonical(workspaceRoot, candidate.commit, git);
   if (fastForwardFailure) {
     return { ok: false, failure: fastForwardFailure };
+  }
+  const canonicalValidationFailure = validateCandidateLayout(workspaceRoot, deps, git, fs);
+  if (canonicalValidationFailure) {
+    return { ok: false, failure: canonicalValidationFailure };
   }
   return { ok: true, commit: candidate.commit };
 }
@@ -1665,8 +1774,12 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
         return { ...convergence.failure, attempts };
       }
 
+      let verified: GitTips | KnowledgeSyncFailure | undefined;
       if (convergence.commit !== fetchedTips.remote) {
-        const pushed = git(["push", "origin", `${convergence.commit}:refs/heads/main`], { cwd: workspaceRoot });
+        const pushed = git(
+          [...DISABLE_GIT_HOOKS, "push", "origin", `${convergence.commit}:refs/heads/main`],
+          { cwd: workspaceRoot },
+        );
         if (pushed.status !== 0) {
           const afterFailure = fetchAndReadTips(workspaceRoot, git);
           if ("ok" in afterFailure) {
@@ -1676,21 +1789,24 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
           if (racedTipPreservationFailure) {
             return { ...racedTipPreservationFailure, attempts };
           }
-          if (afterFailure.remote !== fetchedTips.remote && attemptIndex + 1 < MAX_ATTEMPTS) {
+          if (afterFailure.local === afterFailure.remote) {
+            verified = afterFailure;
+          } else if (afterFailure.remote !== fetchedTips.remote && attemptIndex + 1 < MAX_ATTEMPTS) {
             continue;
+          } else {
+            return failure(
+              "error",
+              afterFailure.remote !== fetchedTips.remote ? "push-race-exhausted" : "push-failed",
+              afterFailure.remote !== fetchedTips.remote
+                ? "knowledge sync stopped after one bounded push-race retry; recovery refs retain every observed tip."
+                : `knowledge sync could not push validated main to origin/main: ${errorText(pushed)}`,
+              { attempts },
+            );
           }
-          return failure(
-            "error",
-            afterFailure.remote !== fetchedTips.remote ? "push-race-exhausted" : "push-failed",
-            afterFailure.remote !== fetchedTips.remote
-              ? "knowledge sync stopped after one bounded push-race retry; recovery refs retain every observed tip."
-              : `knowledge sync could not push validated main to origin/main: ${errorText(pushed)}`,
-            { attempts },
-          );
         }
       }
 
-      const verified = fetchAndReadTips(workspaceRoot, git);
+      verified ??= fetchAndReadTips(workspaceRoot, git);
       if ("ok" in verified) {
         return { ...verified, attempts };
       }
