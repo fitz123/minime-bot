@@ -126,6 +126,23 @@ const GIT_OPERATION_MARKERS = [
   "rebase-merge",
   "sequencer",
 ] as const;
+const MANAGED_KNOWLEDGE_PATHSPECS = [
+  "wiki/schema.md",
+  "wiki/index.md",
+  "wiki/log.md",
+  "wiki/issues.md",
+  "wiki/pages",
+  "artifacts/knowledge-archive",
+] as const;
+const CHECKIN_TRANSFORMATION_ATTRIBUTES = [
+  "filter",
+  "ident",
+  "working-tree-encoding",
+  "text",
+  "eol",
+  "crlf",
+] as const;
+const NEUTRAL_CHECKIN_ATTRIBUTE_VALUES = new Set(["unspecified", "unset"]);
 
 const defaultFs: KnowledgeSyncFs = {
   closeSync,
@@ -534,6 +551,75 @@ function candidateUpdateFailure(
   );
 }
 
+function trackedManagedKnowledgePaths(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): string[] | KnowledgeSyncFailure {
+  const listed = git(["ls-files", "--cached", "-z", "--", ...MANAGED_KNOWLEDGE_PATHSPECS], {
+    cwd: candidateRoot,
+  });
+  if (listed.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-path-inspection-failed",
+      `knowledge sync could not inspect tracked managed paths: ${errorText(listed)}`,
+    );
+  }
+  return [...new Set(listed.stdout.split("\0").filter(Boolean))].sort();
+}
+
+function validateManagedCheckinTransformations(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const trackedPaths = trackedManagedKnowledgePaths(candidateRoot, git);
+  if (!Array.isArray(trackedPaths)) {
+    return trackedPaths;
+  }
+  for (const relPath of trackedPaths) {
+    const result = git(
+      ["check-attr", "-z", ...CHECKIN_TRANSFORMATION_ATTRIBUTES, "--", relPath],
+      { cwd: candidateRoot },
+    );
+    if (result.status !== 0) {
+      return failure(
+        "error",
+        "candidate-managed-attribute-inspection-failed",
+        `knowledge sync could not inspect check-in attributes for ${relPath}: ${errorText(result)}`,
+      );
+    }
+    const fields = result.stdout.split("\0");
+    for (let index = 0; index < CHECKIN_TRANSFORMATION_ATTRIBUTES.length; index += 1) {
+      const offset = index * 3;
+      const expectedAttribute = CHECKIN_TRANSFORMATION_ATTRIBUTES[index];
+      const value = fields[offset + 2];
+      if (fields[offset] !== relPath || fields[offset + 1] !== expectedAttribute || !value) {
+        return failure(
+          "error",
+          "candidate-managed-attribute-inspection-failed",
+          `knowledge sync received an invalid check-in attribute result for ${relPath}.`,
+        );
+      }
+      if (NEUTRAL_CHECKIN_ATTRIBUTE_VALUES.has(value)) {
+        continue;
+      }
+      if (expectedAttribute === "filter") {
+        return failure(
+          "unsupported",
+          "candidate-unsupported-clean-filter",
+          `knowledge sync refused ${relPath} because its Git clean filter can alter committed Knowledge bytes.`,
+        );
+      }
+      return failure(
+        "unsupported",
+        "candidate-unsupported-checkin-transformation",
+        `knowledge sync refused ${relPath} because its Git ${expectedAttribute} attribute can alter committed Knowledge bytes.`,
+      );
+    }
+  }
+  return undefined;
+}
+
 function validateManagedGitEntries(
   layout: ResolvedKnowledgeV2Layout,
   git: KnowledgeSyncGitRunner,
@@ -544,12 +630,7 @@ function validateManagedGitEntries(
       "--stage",
       "-z",
       "--",
-      "wiki/schema.md",
-      "wiki/index.md",
-      "wiki/log.md",
-      "wiki/issues.md",
-      "wiki/pages",
-      "artifacts/knowledge-archive",
+      ...MANAGED_KNOWLEDGE_PATHSPECS,
     ],
     { cwd: layout.agentWorkspaceRoot },
   );
@@ -569,12 +650,7 @@ function validateManagedGitEntries(
       "--exclude-standard",
       "-z",
       "--",
-      "wiki/schema.md",
-      "wiki/index.md",
-      "wiki/log.md",
-      "wiki/issues.md",
-      "wiki/pages",
-      "artifacts/knowledge-archive",
+      ...MANAGED_KNOWLEDGE_PATHSPECS,
     ],
     { cwd: layout.agentWorkspaceRoot },
   );
@@ -633,32 +709,9 @@ function validateManagedGitEntries(
       }
     }
   }
-  for (const relPath of [...trackedPaths].sort()) {
-    const attribute = git(["check-attr", "-z", "filter", "--", relPath], {
-      cwd: layout.agentWorkspaceRoot,
-    });
-    if (attribute.status !== 0) {
-      return failure(
-        "error",
-        "candidate-managed-filter-inspection-failed",
-        `knowledge sync could not inspect the clean filter for ${relPath}: ${errorText(attribute)}`,
-      );
-    }
-    const fields = attribute.stdout.split("\0");
-    if (fields[0] !== relPath || fields[1] !== "filter" || !fields[2]) {
-      return failure(
-        "error",
-        "candidate-managed-filter-inspection-failed",
-        `knowledge sync received an invalid filter-attribute result for ${relPath}.`,
-      );
-    }
-    if (fields[2] !== "unspecified" && fields[2] !== "unset") {
-      return failure(
-        "unsupported",
-        "candidate-unsupported-clean-filter",
-        `knowledge sync refused ${relPath} because its Git clean filter can alter committed Knowledge bytes.`,
-      );
-    }
+  const transformationProblem = validateManagedCheckinTransformations(layout.agentWorkspaceRoot, git);
+  if (transformationProblem) {
+    return transformationProblem;
   }
   if (!trackedPaths.has("wiki/log.md")) {
     return failure(
@@ -1645,6 +1698,10 @@ function prepareCandidate(
   }
 
   return withTemporaryWorktree(workspaceRoot, tips.local, tips, classification, deps, git, fs, (candidateRoot) => {
+    const localTransformationProblem = validateManagedCheckinTransformations(candidateRoot, git);
+    if (localTransformationProblem) {
+      return { ok: false, failure: localTransformationProblem };
+    }
     const mergeDriverProblem = validateMergeDrivers(candidateRoot, tips, git);
     if (mergeDriverProblem) {
       return { ok: false, failure: mergeDriverProblem };
@@ -1697,6 +1754,11 @@ function prepareCandidate(
           ),
         };
       }
+    }
+
+    const mergedTransformationProblem = validateManagedCheckinTransformations(candidateRoot, git);
+    if (mergedTransformationProblem) {
+      return { ok: false, failure: mergedTransformationProblem };
     }
 
     const pageConflictPaths = conflictPaths.filter((path) => path.startsWith("wiki/pages/"));

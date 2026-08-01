@@ -387,9 +387,10 @@ captured Knowledge content.
 For paths changed on both sides, sync accepts only Git's standard text or binary
 merge behavior. It rejects `union` and custom merge drivers, configured
 overrides of the built-in `text` and `binary` driver names, and other settings
-that can hide conflicts. Sync also rejects clean filters on any managed Knowledge
-file because they can alter committed variants. Remove the override or filter
-before retrying.
+that can hide conflicts. Sync also rejects Git check-in transformations on any
+managed Knowledge file, including clean filters, `ident`,
+`working-tree-encoding`, and `text`/`eol` attributes, because they can alter
+committed variants. Remove the transformation before retrying.
 
 Before convergence, both observed tips are retained under synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and

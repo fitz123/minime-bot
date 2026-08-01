@@ -1057,6 +1057,77 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(remoteHead(fixture), remoteTip);
   });
 
+  it("rejects managed check-in transformations before preparing a divergent merge", () => {
+    for (const [name, attribute] of [
+      ["ident", "ident"],
+      ["working-tree-encoding", "working-tree-encoding=UTF-16"],
+      ["text", "text"],
+      ["eol", "eol=crlf"],
+    ] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/reference/${name}-transformation.md`;
+      commitFiles(fixture.workspace, `add shared ${name} page`, {
+        [relPath]: page(
+          `${name} transformation`,
+          `A managed page covered by the ${name} check-in attribute.`,
+          "reference",
+          "A committed variant must not be transformed during synchronization.\n",
+        ),
+      });
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const peer = cloneRemote(fixture, `peer-${name}-transformation`);
+      const localTip = commitFiles(fixture.workspace, `configure ${name} transformation`, {
+        ".gitattributes": `${relPath} ${attribute}\n`,
+      });
+      rmSync(join(fixture.workspace, ...relPath.split("/")));
+      git(fixture.workspace, ["checkout", "--", relPath]);
+      const remoteTip = commitFiles(peer, `diverge from ${name} transformation`, {
+        [`diary/remote-${name}.md`]: `# Remote ${name} history\n`,
+      });
+      git(peer, ["push", "origin", "main"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, name);
+      assert.equal(response.reason, "candidate-unsupported-checkin-transformation", name);
+      assert.equal(localHead(fixture), localTip, name);
+      assert.equal(remoteHead(fixture), remoteTip, name);
+    }
+  });
+
+  it("rejects a managed check-in transformation introduced by the remote branch", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/remote-ident-transformation.md";
+    const sharedVariant = page(
+      "Remote ident transformation",
+      "A shared page before the remote branch introduces an ident attribute.",
+      "reference",
+      "The shared committed claim is undecided.\n",
+    );
+    commitFiles(fixture.workspace, "add shared page before remote transformation", {
+      [relPath]: sharedVariant,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-remote-ident-transformation");
+    const localTip = commitFiles(fixture.workspace, "edit local page before remote transformation", {
+      [relPath]: sharedVariant.replace("undecided", "local"),
+    });
+    commitFiles(peer, "edit remote page before adding ident transformation", {
+      [relPath]: sharedVariant.replace("undecided", "remote"),
+    });
+    const remoteTip = commitFiles(peer, "configure remote ident transformation", {
+      ".gitattributes": `${relPath} ident\n`,
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-checkin-transformation");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("retains the complete present variant and the deletion provenance for modify/delete", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/reference/deletion.md";
