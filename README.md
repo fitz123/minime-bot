@@ -381,6 +381,8 @@ a temporary detached worktree, validates the complete Knowledge corpus, and
 fast-forwards canonical `main` only after validation. It then pushes and verifies
 that local and remote `main` are equal. The command never loads control-workspace
 secrets and does not force-push, reset, rebase, or select a silent winner.
+Fetch and push explicitly disable recursive submodule behavior, so synchronization
+does not contact or publish repositories referenced by submodules.
 Git command output is bounded at 64 MiB; an overflow fails without echoing the
 captured Knowledge content.
 
@@ -391,7 +393,11 @@ that can hide conflicts. Sync also rejects Git check-in transformations on any
 managed Knowledge file, including clean filters, `ident`,
 `working-tree-encoding`, and `text`/`eol` attributes, because they can alter
 committed variants. Effective `core.autocrlf` values other than `false` or unset
-are rejected for the same reason. Remove the transformation before retrying.
+are rejected for the same reason. Managed files carrying `skip-worktree` or
+`assume-unchanged` index flags are also rejected because complete-corpus
+validation requires every tracked Knowledge file to be materialized. Structural
+log history must be valid UTF-8. Remove the transformation or index flag before
+retrying.
 
 Before convergence, both observed tips are retained under synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and

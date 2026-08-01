@@ -216,6 +216,26 @@ describe("knowledge sync Git convergence", () => {
     }
   });
 
+  it("rejects hidden managed pages before an ahead commit can be pushed", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/hidden.md";
+    const malformedPage = "---\nname: [invalid yaml\n---\n\nHidden malformed bytes.\n";
+    const localTip = commitFiles(fixture.workspace, "commit a hidden malformed page", {
+      [relPath]: malformedPage,
+    });
+    const remoteTip = remoteHead(fixture);
+    git(fixture.workspace, ["update-index", "--skip-worktree", relPath]);
+    rmSync(join(fixture.workspace, ...relPath.split("/")));
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-hidden-managed-entry");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-behind");
@@ -318,6 +338,31 @@ describe("knowledge sync Git convergence", () => {
     );
   });
 
+  it("disables recursive submodule behavior for transaction fetches and pushes", () => {
+    const fixture = createSyncFixture();
+    commitFiles(fixture.workspace, "local submodule-safe diary entry", {
+      "diary/submodule-safe.md": "# Submodule-safe local diary\n",
+    });
+    let fetchArgs: readonly string[] | undefined;
+    let pushArgs: readonly string[] | undefined;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) === "fetch") {
+          fetchArgs = args;
+        } else if (gitCommand(args) === "push") {
+          pushArgs = args;
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assertSyncOk(response);
+    assert.ok(fetchArgs?.includes("--recurse-submodules=no"));
+    assert.ok(pushArgs?.includes("--recurse-submodules=no"));
+  });
+
   it("does not push an ahead commit that truncates structural-log history", () => {
     const fixture = createSyncFixture();
     const remoteTip = remoteHead(fixture);
@@ -378,6 +423,33 @@ describe("knowledge sync Git convergence", () => {
     assertSyncOk(response);
     assert.equal(response.classification, "diverged");
     assert.ok(readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8").startsWith(largeLog));
+  });
+
+  it("rejects invalid UTF-8 structural-log history before divergent reconstruction", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-invalid-structural-log");
+    const logPath = join(fixture.workspace, "wiki/log.md");
+    const invalidLog = Buffer.concat([
+      Buffer.from("# Knowledge Structural Log\n\n- invalid bytes: ", "utf8"),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("\n", "utf8"),
+    ]);
+    writeFileSync(logPath, invalidLog);
+    git(fixture.workspace, ["add", "wiki/log.md"]);
+    git(fixture.workspace, ["commit", "-m", "commit invalid structural-log bytes"]);
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "remote divergence from invalid structural log", {
+      "diary/remote-invalid-log.md": "# Remote history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-structural-log-invalid-encoding");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.deepEqual(readFileSync(logPath), invalidLog);
   });
 
   it("merges clean divergence in a detached worktree and keeps both pre-sync tips reachable", () => {
@@ -639,6 +711,71 @@ describe("knowledge sync Git convergence", () => {
     );
     git(fixture.workspace, ["config", "filter.late.clean", "cat"]);
     git(fixture.workspace, ["config", "filter.late.smudge", "sed 's/Knowledge Index/Filtered Index/'"]);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(retried.ok, false);
+    assert.equal(retried.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("revalidates retained candidates under current canonical worktree attributes", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-retained-worktree-attributes");
+    const neutralAttributes = join(fixture.root, "neutral-attributes");
+    const rejectingAttributes = join(fixture.root, "rejecting-attributes");
+    writeFileSync(neutralAttributes, "", "utf8");
+    writeFileSync(rejectingAttributes, "wiki/index.md filter=late\n", "utf8");
+    git(fixture.workspace, ["config", "extensions.worktreeConfig", "true"]);
+    git(fixture.workspace, ["config", "--worktree", "core.attributesFile", neutralAttributes]);
+    git(fixture.workspace, ["config", "filter.late.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.late.smudge", "sed 's/Knowledge Index/Filtered Index/'"]);
+    const localTip = commitFiles(fixture.workspace, "local retained-attribute divergence", {
+      "diary/local-retained-attribute.md": "# Local retained attribute history\n",
+    });
+    const relPath = "wiki/pages/reference/retained-attribute.md";
+    const remotePage = page(
+      "Retained attribute page",
+      "A page introduced by the remote divergent branch.",
+      "reference",
+      "Remote committed Knowledge.\n",
+    );
+    const remoteIndex = generateKnowledgeIndex([
+      {
+        absPath: join(peer, ...relPath.split("/")),
+        relPath,
+        linkPath: "pages/reference/retained-attribute.md",
+        frontmatter: {
+          name: "Retained attribute page",
+          description: "A page introduced by the remote divergent branch.",
+          type: "reference",
+        },
+      },
+    ]);
+    commitFiles(peer, "remote retained-attribute divergence", {
+      [relPath]: remotePage,
+      "wiki/index.md": remoteIndex,
+    });
+    git(peer, ["push", "origin", "main"]);
+    let refusedFastForward = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!refusedFastForward && gitCommand(args) === "merge" && args.includes("--ff-only")) {
+          refusedFastForward = true;
+          return { status: 1, stdout: "", stderr: "simulated canonical fast-forward interruption" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "canonical-fast-forward-failed");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(worktreePaths(fixture).length, 2);
+    git(fixture.workspace, ["config", "--worktree", "core.attributesFile", rejectingAttributes]);
 
     const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
 

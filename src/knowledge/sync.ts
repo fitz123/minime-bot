@@ -692,6 +692,42 @@ function validateManagedGitEntries(
     );
   }
 
+  const indexFlags = git(
+    ["ls-files", "-v", "-z", "--", ...MANAGED_KNOWLEDGE_PATHSPECS],
+    { cwd: layout.agentWorkspaceRoot },
+  );
+  if (indexFlags.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-path-inspection-failed",
+      `knowledge sync could not inspect managed candidate index flags: ${errorText(indexFlags)}`,
+    );
+  }
+  const hiddenPaths: string[] = [];
+  for (const entry of indexFlags.stdout.split("\0").filter(Boolean)) {
+    const match = /^([^ ]) ([\s\S]+)$/u.exec(entry);
+    if (!match) {
+      return failure(
+        "error",
+        "candidate-managed-path-inspection-failed",
+        "knowledge sync could not parse the managed candidate Git index flags.",
+      );
+    }
+    const [, tag, relPath] = match;
+    if (tag !== "H") {
+      hiddenPaths.push(relPath);
+    }
+  }
+  if (hiddenPaths.length > 0) {
+    hiddenPaths.sort();
+    return failure(
+      "rejected",
+      "candidate-hidden-managed-entry",
+      `knowledge sync requires managed Knowledge files to be materialized without skip-worktree or assume-unchanged index flags; restore normal tracking for: ${hiddenPaths.join(", ")}.`,
+      { conflictPaths: hiddenPaths },
+    );
+  }
+
   const ignored = git(
     [
       "ls-files",
@@ -791,6 +827,21 @@ function validateCandidateCorpus(
         "knowledge sync candidate managed-path validation failed",
       );
     }
+  }
+  try {
+    if (!isUtf8(fs.readFileSync(layout.paths.logPath))) {
+      return failure(
+        "rejected",
+        "candidate-structural-log-invalid-encoding",
+        "knowledge sync requires committed wiki/log.md structural history to be valid UTF-8.",
+      );
+    }
+  } catch (error) {
+    return failure(
+      "rejected",
+      "candidate-structural-log-unreadable",
+      `knowledge sync could not read the candidate structural log: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
   const pages = collectKnowledgePages(layout, fs);
   if (!Array.isArray(pages)) {
@@ -1095,7 +1146,27 @@ function readCommitFile(
       ),
     };
   }
-  return { ok: true, content: shown.stdout };
+  if (shown.stdoutBytes === undefined) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-byte-output-unavailable",
+        `knowledge sync could not read exact committed bytes for ${relPath}; the configured Git runner did not provide raw output.`,
+      ),
+    };
+  }
+  if (!isUtf8(shown.stdoutBytes)) {
+    return {
+      ok: false,
+      failure: failure(
+        "rejected",
+        "candidate-structural-log-invalid-encoding",
+        `knowledge sync requires committed ${relPath} structural history to be valid UTF-8.`,
+      ),
+    };
+  }
+  return { ok: true, content: shown.stdoutBytes.toString("utf8") };
 }
 
 function splitStableLines(content: string): string[] {
@@ -1501,7 +1572,9 @@ function withTemporaryWorktree(
     const cached = parseCandidateOutcome(reusable.marker.outcome);
     if (cached?.ok) {
       const invalid = validateCandidateLayout(reusable.path, deps, git, fs);
-      return invalid ? { ok: false, failure: invalid } : cached;
+      if (invalid) {
+        return { ok: false, failure: invalid };
+      }
     }
     const resetMarker = { ...reusable.marker, outcome: undefined };
     const resetMarkerFailure = writeSyncWorktreeMarker(reusable.markerPath, resetMarker, fs);
@@ -1945,9 +2018,10 @@ function convergeAttempt(
 }
 
 function fetchOriginMain(workspaceRoot: string, git: KnowledgeSyncGitRunner): KnowledgeSyncFailure | undefined {
-  const fetched = git(["fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"], {
-    cwd: workspaceRoot,
-  });
+  const fetched = git(
+    ["fetch", "--no-tags", "--recurse-submodules=no", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+    { cwd: workspaceRoot },
+  );
   if (fetched.status !== 0) {
     return failure("error", "fetch-failed", `knowledge sync could not fetch origin/main: ${errorText(fetched)}`);
   }
@@ -2027,7 +2101,14 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
       let verified: GitTips | KnowledgeSyncFailure | undefined;
       if (convergence.commit !== fetchedTips.remote) {
         const pushed = git(
-          [...DISABLE_GIT_HOOKS, "push", "--no-follow-tags", "origin", `${convergence.commit}:refs/heads/main`],
+          [
+            ...DISABLE_GIT_HOOKS,
+            "push",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            "origin",
+            `${convergence.commit}:refs/heads/main`,
+          ],
           { cwd: workspaceRoot },
         );
         if (pushed.status !== 0) {
