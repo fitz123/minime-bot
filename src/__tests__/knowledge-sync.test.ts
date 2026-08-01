@@ -301,6 +301,23 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
   });
 
+  it("does not publish annotated tags when push.followTags is enabled", () => {
+    const fixture = createSyncFixture();
+    commitFiles(fixture.workspace, "local tagged diary entry", {
+      "diary/tagged.md": "# Tagged local diary\n",
+    });
+    git(fixture.workspace, ["tag", "-a", "private-local-tag", "-m", "local-only tag"]);
+    git(fixture.workspace, ["config", "push.followTags", "true"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(
+      git(fixture.remote, ["for-each-ref", "--format=%(refname)", "refs/tags"]),
+      "",
+    );
+  });
+
   it("does not push an ahead commit that truncates structural-log history", () => {
     const fixture = createSyncFixture();
     const remoteTip = remoteHead(fixture);
@@ -585,6 +602,50 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(remoteHead(fixture), candidateCommit);
     assert.deepEqual(recoveryRefs(fixture), []);
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
+  it("revalidates a retained successful candidate before fast-forwarding canonical main", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-retained-candidate-revalidation");
+    const localTip = commitFiles(fixture.workspace, "local retained-candidate divergence", {
+      "diary/local-retained-candidate.md": "# Local retained candidate\n",
+    });
+    commitFiles(peer, "remote retained-candidate divergence", {
+      "diary/remote-retained-candidate.md": "# Remote retained candidate\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    let refusedFastForward = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!refusedFastForward && gitCommand(args) === "merge" && args.includes("--ff-only")) {
+          refusedFastForward = true;
+          return { status: 1, stdout: "", stderr: "simulated canonical fast-forward interruption" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "canonical-fast-forward-failed");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(worktreePaths(fixture).length, 2);
+
+    writeFileSync(
+      join(fixture.workspace, ".git", "info", "attributes"),
+      "wiki/index.md filter=late\n",
+      "utf8",
+    );
+    git(fixture.workspace, ["config", "filter.late.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.late.smudge", "sed 's/Knowledge Index/Filtered Index/'"]);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(retried.ok, false);
+    assert.equal(retried.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
   it("retries cleanup when a converged temporary worktree cannot initially be removed", () => {

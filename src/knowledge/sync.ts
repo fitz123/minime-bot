@@ -1500,7 +1500,8 @@ function withTemporaryWorktree(
   if (reusable) {
     const cached = parseCandidateOutcome(reusable.marker.outcome);
     if (cached?.ok) {
-      return cached;
+      const invalid = validateCandidateLayout(reusable.path, deps, git, fs);
+      return invalid ? { ok: false, failure: invalid } : cached;
     }
     const resetMarker = { ...reusable.marker, outcome: undefined };
     const resetMarkerFailure = writeSyncWorktreeMarker(reusable.markerPath, resetMarker, fs);
@@ -2026,7 +2027,7 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
       let verified: GitTips | KnowledgeSyncFailure | undefined;
       if (convergence.commit !== fetchedTips.remote) {
         const pushed = git(
-          [...DISABLE_GIT_HOOKS, "push", "origin", `${convergence.commit}:refs/heads/main`],
+          [...DISABLE_GIT_HOOKS, "push", "--no-follow-tags", "origin", `${convergence.commit}:refs/heads/main`],
           { cwd: workspaceRoot },
         );
         if (pushed.status !== 0) {
