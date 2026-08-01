@@ -764,6 +764,59 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(readFileSync(pagePath, "utf8"), unresolved);
   });
 
+  it("ignores a recorded rerere resolution for a current managed-page conflict", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/feedback/rerere.md";
+    const sharedVariant = page(
+      "Rerere preference",
+      "A shared preference before contradictory edits.",
+      "feedback",
+      "The shared preference is undecided.\n",
+    );
+    commitFiles(fixture.workspace, "shared page before rerere conflict", { [relPath]: sharedVariant });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-rerere");
+    const localVariant = sharedVariant.replace(
+      "The shared preference is undecided.",
+      "The current local preference must be retained.",
+    );
+    const remoteVariant = sharedVariant.replace(
+      "The shared preference is undecided.",
+      "The current remote preference must be retained.",
+    );
+    const staleResolution = sharedVariant.replace(
+      "The shared preference is undecided.",
+      "A stale recorded resolution must not be reused.",
+    );
+    const localTip = commitFiles(fixture.workspace, "local rerere preference", { [relPath]: localVariant });
+    const remoteTip = commitFiles(peer, "remote rerere preference", { [relPath]: remoteVariant });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, ["config", "rerere.enabled", "true"]);
+    git(fixture.workspace, ["config", "rerere.autoupdate", "true"]);
+    git(fixture.workspace, ["fetch", "origin", "main"]);
+    const conflicted = spawnSync("git", ["merge", "--no-ff", "--no-commit", "origin/main"], {
+      cwd: fixture.workspace,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.notEqual(conflicted.status, 0);
+    writeFiles(fixture.workspace, { [relPath]: staleResolution });
+    git(fixture.workspace, ["add", relPath]);
+    git(fixture.workspace, ["rerere"]);
+    git(fixture.workspace, ["merge", "--abort"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const unresolved = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
+    assert.match(unresolved, /UNRESOLVED: Both committed variants are retained/);
+    assert.match(unresolved, new RegExp(localTip));
+    assert.match(unresolved, new RegExp(remoteTip));
+    assert.ok(unresolved.includes(localVariant.trimEnd()));
+    assert.ok(unresolved.includes(remoteVariant.trimEnd()));
+    assert.doesNotMatch(unresolved, /A stale recorded resolution must not be reused/);
+  });
+
   it("rejects a union merge attribute before it can hide a managed page conflict", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/feedback/union.md";
@@ -1019,6 +1072,54 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(localHead(fixture), beforeHead);
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), beforeStatus);
     assert.equal(readFileSync(readmePath, "utf8"), beforeReadme);
+  });
+
+  it("rejects an unfinished merge even when porcelain status is empty", () => {
+    const fixture = createSyncFixture();
+    git(fixture.workspace, ["switch", "-c", "empty-merge-source"]);
+    git(fixture.workspace, ["commit", "--allow-empty", "-m", "empty merge source"]);
+    const mergeSource = git(fixture.workspace, ["rev-parse", "HEAD"]);
+    git(fixture.workspace, ["switch", "main"]);
+    const beforeHead = localHead(fixture);
+    git(fixture.workspace, ["merge", "--no-ff", "--no-commit", "empty-merge-source"]);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.equal(git(fixture.workspace, ["rev-parse", "--verify", "MERGE_HEAD"]), mergeSource);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "git-operation-in-progress");
+    assert.equal(localHead(fixture), beforeHead);
+    assert.equal(git(fixture.workspace, ["rev-parse", "--verify", "MERGE_HEAD"]), mergeSource);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("rechecks repository operation state after acquiring the Knowledge lock", () => {
+    const fixture = createSyncFixture();
+    git(fixture.workspace, ["switch", "-c", "late-merge-source"]);
+    git(fixture.workspace, ["commit", "--allow-empty", "-m", "late empty merge source"]);
+    const mergeSource = git(fixture.workspace, ["rev-parse", "HEAD"]);
+    git(fixture.workspace, ["switch", "main"]);
+    const beforeHead = localHead(fixture);
+    let statusChecks = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        const result = defaultKnowledgeSyncGitRunner(args, options);
+        if (gitCommand(args) === "status" && statusChecks === 0) {
+          statusChecks += 1;
+          git(fixture.workspace, ["merge", "--no-ff", "--no-commit", "late-merge-source"]);
+        }
+        return result;
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "git-operation-in-progress");
+    assert.equal(localHead(fixture), beforeHead);
+    assert.equal(git(fixture.workspace, ["rev-parse", "--verify", "MERGE_HEAD"]), mergeSource);
+    assert.equal(existsSync(join(fixture.workspace, ".tmp/knowledge-update.lock")), false);
   });
 
   it("rejects ignored untracked files under managed Knowledge paths", () => {

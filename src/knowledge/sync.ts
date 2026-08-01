@@ -117,6 +117,15 @@ const SYNC_WORKTREE_MARKER = ".minime-knowledge-sync-owner.json";
 const MAX_ATTEMPTS = 2;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DISABLE_GIT_HOOKS = ["-c", "core.hooksPath=/dev/null"] as const;
+const GIT_OPERATION_MARKERS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "REBASE_HEAD",
+  "rebase-apply",
+  "rebase-merge",
+  "sequencer",
+] as const;
 
 const defaultFs: KnowledgeSyncFs = {
   closeSync,
@@ -266,6 +275,42 @@ function validateCleanWorktree(workspaceRoot: string, git: KnowledgeSyncGitRunne
   return undefined;
 }
 
+function validateNoGitOperationInProgress(
+  workspaceRoot: string,
+  git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
+): KnowledgeSyncFailure | undefined {
+  for (const marker of GIT_OPERATION_MARKERS) {
+    const result = git(["rev-parse", "--git-path", marker], { cwd: workspaceRoot });
+    const gitPath = result.stdout.trim();
+    if (result.status !== 0 || !gitPath) {
+      return failure(
+        "error",
+        "git-operation-state-inspection-failed",
+        `knowledge sync could not inspect the repository operation state for ${marker}: ${errorText(result)}`,
+      );
+    }
+    const markerPath = isAbsolute(gitPath) ? gitPath : resolve(workspaceRoot, gitPath);
+    try {
+      fs.lstatSync(markerPath);
+      return failure(
+        "rejected",
+        "git-operation-in-progress",
+        `knowledge sync requires no unfinished Git operation; finish or abort the operation associated with ${marker} first.`,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return failure(
+          "error",
+          "git-operation-state-inspection-failed",
+          `knowledge sync could not inspect the repository operation state for ${marker}.`,
+        );
+      }
+    }
+  }
+  return undefined;
+}
+
 function validateRuntimeLockUntracked(
   workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
@@ -303,6 +348,7 @@ function preflight(
   return (
     validateGitRoot(workspaceRoot, git, fs) ??
     validateMainBranch(workspaceRoot, git) ??
+    validateNoGitOperationInProgress(workspaceRoot, git, fs) ??
     validateRuntimeLockUntracked(workspaceRoot, git) ??
     validateCleanWorktree(workspaceRoot, git) ??
     layout
@@ -1543,9 +1589,10 @@ function prepareCandidate(
     if (mergeDriverProblem) {
       return { ok: false, failure: mergeDriverProblem };
     }
-    const merged = git([...DISABLE_GIT_HOOKS, "merge", "--no-ff", "--no-commit", tips.remote], {
-      cwd: candidateRoot,
-    });
+    const merged = git(
+      [...DISABLE_GIT_HOOKS, "-c", "rerere.enabled=false", "merge", "--no-ff", "--no-commit", tips.remote],
+      { cwd: candidateRoot },
+    );
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
     if (merged.status !== 0) {
       if (conflictPaths.length === 0) {
@@ -1826,7 +1873,8 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
         );
       }
 
-      const cleanFailure = validateCleanWorktree(workspaceRoot, git);
+      const cleanFailure =
+        validateNoGitOperationInProgress(workspaceRoot, git, fs) ?? validateCleanWorktree(workspaceRoot, git);
       if (cleanFailure) {
         return { ...cleanFailure, attempts };
       }
