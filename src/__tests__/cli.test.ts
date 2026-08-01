@@ -24,6 +24,7 @@ import {
 } from "../launchd-cron-plists.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES } from "../knowledge/maintenance.js";
+import { generateKnowledgeIndex } from "../knowledge/update.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -108,6 +109,48 @@ function createKnowledgeWorkspace(): string {
   return workspace;
 }
 
+interface CliKnowledgeSyncFixture {
+  root: string;
+  workspace: string;
+  remote: string;
+}
+
+function git(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("git", [...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(
+    result.status,
+    0,
+    `git ${args.join(" ")} failed in ${cwd}: ${(result.stderr || result.stdout).trim()}`,
+  );
+  return result.stdout.trim();
+}
+
+function createCliKnowledgeSyncFixture(): CliKnowledgeSyncFixture {
+  const root = mkdtempSync(join(tmpdir(), "minime-cli-knowledge-sync-"));
+  const workspace = join(root, "workspace");
+  const remote = join(root, "remote.git");
+  mkdirSync(workspace, { recursive: true });
+  git(root, ["init", "--bare", "--initial-branch=main", remote]);
+  git(workspace, ["init", "--initial-branch=main"]);
+  git(workspace, ["config", "user.name", "Knowledge Sync CLI Test"]);
+  git(workspace, ["config", "user.email", "knowledge-sync-cli@users.noreply.github.com"]);
+  git(workspace, ["config", "commit.gpgSign", "false"]);
+  writeWorkspaceFile(workspace, ".gitignore", ".tmp/\n");
+  writeWorkspaceFile(workspace, "README.md", "# Synthetic agent workspace\n");
+  writeWorkspaceFile(workspace, "wiki/schema.md", generateKnowledgeV2Schema());
+  writeWorkspaceFile(workspace, "wiki/index.md", generateKnowledgeIndex([]));
+  writeWorkspaceFile(workspace, "wiki/log.md", "# Knowledge Structural Log\n");
+  git(workspace, ["add", "."]);
+  git(workspace, ["commit", "-m", "initial synthetic Knowledge workspace"]);
+  git(workspace, ["remote", "add", "origin", remote]);
+  git(workspace, ["push", "-u", "origin", "main"]);
+  return { root, workspace, remote };
+}
+
 function writeExactKnowledgeIndexSize(workspace: string, bytes: number): void {
   const prefix = "# Knowledge Index\n";
   writeWorkspaceFile(
@@ -189,6 +232,7 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+    assert.match(result.stdout, /minime-bot knowledge sync --workspace <agent-workspace> \[--json\]/);
     assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
     assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
@@ -559,6 +603,103 @@ describe("minime-bot CLI", () => {
     } finally {
       rmSync(controlWorkspace, { recursive: true, force: true });
       rmSync(agentWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("syncs committed Knowledge history with human and JSON success contracts without loading control secrets", () => {
+    const fixture = createCliKnowledgeSyncFixture();
+    try {
+      const env = {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: join(fixture.root, "private-control-workspace"),
+      };
+      const human = runWithCapture(
+        ["knowledge", "sync", "--workspace", fixture.workspace],
+        BOT_ROOT,
+        env,
+      );
+      assert.equal(human.code, 0);
+      assert.equal(human.stderr, "");
+      assert.match(
+        human.stdout,
+        /^Knowledge sync converged main with origin\/main at [0-9a-f]+ \(no-op, 1 attempt\)\.\n$/,
+      );
+      assert.equal(human.stdout.includes(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV]), false);
+
+      const json = runWithCapture(
+        ["knowledge", "sync", "--workspace", fixture.workspace, "--json"],
+        BOT_ROOT,
+        env,
+      );
+      assert.equal(json.code, 0);
+      assert.equal(json.stderr, "");
+      const response = JSON.parse(json.stdout) as {
+        ok: boolean;
+        status: string;
+        classification: string;
+        branch: string;
+        remote: string;
+        attempts: number;
+      };
+      assert.deepEqual(
+        {
+          ok: response.ok,
+          status: response.status,
+          classification: response.classification,
+          branch: response.branch,
+          remote: response.remote,
+          attempts: response.attempts,
+        },
+        {
+          ok: true,
+          status: "converged",
+          classification: "no-op",
+          branch: "main",
+          remote: "origin",
+          attempts: 1,
+        },
+      );
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a typed rejected sync contract and does not accept destructive escape options", () => {
+    const fixture = createCliKnowledgeSyncFixture();
+    try {
+      writeFileSync(join(fixture.workspace, "README.md"), "# Uncommitted synthetic edit\n", "utf8");
+      const rejected = runWithCapture(
+        ["knowledge", "sync", "--workspace", fixture.workspace, "--json"],
+        BOT_ROOT,
+      );
+      assert.equal(rejected.code, 2);
+      assert.equal(rejected.stderr, "");
+      const response = JSON.parse(rejected.stdout) as {
+        ok: boolean;
+        status: string;
+        reason: string;
+        message: string;
+      };
+      assert.equal(response.ok, false);
+      assert.equal(response.status, "rejected");
+      assert.equal(response.reason, "dirty-worktree");
+      assert.match(response.message, /requires a clean committed worktree/);
+
+      for (const [args, pattern] of [
+        [["--allow-dirty"], /knowledge sync does not accept --allow-dirty/],
+        [["--dry-run"], /knowledge sync does not accept --dry-run/],
+        [["--query", "anything"], /knowledge sync does not accept --query/],
+        [["--force"], /unknown knowledge option: --force/],
+        [["positional"], /unexpected argument: positional/],
+      ] as const) {
+        const result = runWithCapture(["knowledge", "sync", ...args], BOT_ROOT, {
+          [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: join(fixture.root, "private-control-workspace"),
+        });
+        assert.equal(result.code, 2, args.join(" "));
+        assert.equal(result.stdout, "", args.join(" "));
+        assert.match(result.stderr, pattern, args.join(" "));
+      }
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
     }
   });
 

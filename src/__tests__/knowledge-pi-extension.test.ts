@@ -82,7 +82,8 @@ describe("Knowledge Pi extension helpers", () => {
     assert.equal(KNOWLEDGE_UPDATE_TOOL.name, "knowledge_update");
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /archive, or restore/);
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /preserve page bytes/);
-    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /Direct manual writes/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /minime-bot knowledge sync/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /raw Git worktree mutations remain blocked/);
     assert.equal(KNOWLEDGE_UPDATE_TOOL.parameters.type, "object");
     assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.required, ["op"]);
     assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.properties.op.enum, [
@@ -375,6 +376,10 @@ describe("Knowledge Pi extension helpers", () => {
       "git read-tree -u --reset HEAD^",
       "git restore :/",
       "git rm -r :/",
+      "git merge origin/main",
+      "git pull --ff-only",
+      "git rebase origin/main",
+      "git cherry-pick HEAD^",
     ]) {
       assertBlocked(
         workspace,
@@ -382,6 +387,15 @@ describe("Knowledge Pi extension helpers", () => {
         workspace,
       );
     }
+
+    const mergeDecision = classifyKnowledgeIntegrityToolCall(
+      { toolName: "bash", input: { command: "git merge origin/main" } },
+      { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+    );
+    assert.equal(mergeDecision?.targetPath, workspace);
+    assert.match(mergeDecision?.reason ?? "", /raw Git worktree mutations are blocked/);
+    assert.match(mergeDecision?.reason ?? "", /knowledge_update/);
+    assert.match(mergeDecision?.reason ?? "", /minime-bot knowledge sync/);
 
     const outside = createWorkspace();
     const env = { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace };
@@ -484,13 +498,19 @@ describe("Knowledge Pi extension helpers", () => {
     });
 
     for (const workspace of [legacy, karpathy]) {
-      assert.equal(
-        classifyKnowledgeIntegrityToolCall(
-          { toolName: "write", input: { path: "wiki/index.md", content: "allowed pre-migration" } },
-          { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
-        ),
-        undefined,
-      );
+      for (const event of [
+        { toolName: "write", input: { path: "wiki/index.md", content: "allowed pre-migration" } },
+        { toolName: "bash", input: { command: "git merge origin/main" } },
+      ]) {
+        assert.equal(
+          classifyKnowledgeIntegrityToolCall(
+            event,
+            { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+          ),
+          undefined,
+          `${workspace}: ${event.toolName}`,
+        );
+      }
     }
   });
 });

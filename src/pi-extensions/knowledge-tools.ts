@@ -62,7 +62,9 @@ export const KNOWLEDGE_UPDATE_TOOL = {
     "managed path. Create/update/upsert require page type, flat frontmatter, and a Markdown body. Archive/restore " +
     "require only the original wiki/pages/<type>/**/*.md path and preserve page bytes under " +
     "artifacts/knowledge-archive. Successful operations refresh wiki/index.md and append a structural action to " +
-    "wiki/log.md. Direct manual writes to managed wiki paths are blocked when first-party extensions are enabled.",
+    "wiki/log.md. This tool changes pages; minime-bot knowledge sync separately reconciles clean committed main " +
+    "history with origin/main. Direct managed writes and raw Git worktree mutations remain blocked when first-party " +
+    "extensions are enabled.",
   promptSnippet:
     "Write or reversibly archive durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
   promptGuidelines: [
@@ -70,6 +72,7 @@ export const KNOWLEDGE_UPDATE_TOOL = {
     "For create, update, or upsert, provide type, a slug or managed page path, flat frontmatter, and a Markdown body without frontmatter.",
     "For archive or restore, provide only op and the original managed wiki/pages/<type>/**/*.md path; never fabricate write payload fields.",
     "knowledge_update is for synthesized durable knowledge, not arbitrary file editing or active task state.",
+    "After page changes are committed, use minime-bot knowledge sync for local main and origin/main reconciliation; do not run raw Git merge, pull, rebase, or cherry-pick commands in a Knowledge v2 workspace.",
   ] as string[],
   parameters: {
     type: "object",
@@ -275,6 +278,22 @@ const MAX_NESTED_SHELL_DEPTH = 4;
 const MANAGED_KNOWLEDGE_PATH_REFERENCE =
   /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*|artifacts\/knowledge-archive(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
 
+function managedWriteBlockReason(toolName: string, targetPath: string): string {
+  return (
+    "Knowledge v2 page and catalog mutations must use knowledge_update. " +
+    "Committed main history must be reconciled with minime-bot knowledge sync. " +
+    `Blocked direct ${toolName} target: ${targetPath}.`
+  );
+}
+
+function managedAncestorBlockReason(targetPath: string): string {
+  return (
+    "Destructive ancestor operations and raw Git worktree mutations are blocked for Knowledge v2. " +
+    "Use knowledge_update for managed page or archive mutations, then reconcile local main with origin/main using " +
+    `minime-bot knowledge sync. Blocked direct bash target: ${targetPath}.`
+  );
+}
+
 function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
   const root = deps.agentWorkspaceRoot;
   return typeof root === "string" && root.trim() ? root : undefined;
@@ -362,9 +381,7 @@ export function classifyKnowledgeIntegrityToolCall(
       return {
         block: true,
         targetPath: ambiguousManagedPath,
-        reason:
-          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-          `Blocked direct ${event.toolName} target: ${ambiguousManagedPath}.`,
+        reason: managedWriteBlockReason(event.toolName, ambiguousManagedPath),
       };
     }
     const absTarget = resolveShellPath(rawTarget, cwd, deps.env);
@@ -374,9 +391,7 @@ export function classifyKnowledgeIntegrityToolCall(
         return {
           block: true,
           targetPath: managedRawPath,
-          reason:
-            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-            `Blocked direct ${event.toolName} target: ${managedRawPath}.`,
+          reason: managedWriteBlockReason(event.toolName, managedRawPath),
         };
       }
       continue;
@@ -386,9 +401,7 @@ export function classifyKnowledgeIntegrityToolCall(
       return {
         block: true,
         targetPath: managedPath,
-        reason:
-          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-          `Blocked direct ${event.toolName} target: ${managedPath}.`,
+        reason: managedWriteBlockReason(event.toolName, managedPath),
       };
     }
   }
@@ -409,9 +422,7 @@ export function classifyKnowledgeIntegrityToolCall(
         return {
           block: true,
           targetPath: managedPath,
-          reason:
-            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-            `Blocked direct ${event.toolName} target: ${managedPath}.`,
+          reason: managedAncestorBlockReason(managedPath),
         };
       }
     }

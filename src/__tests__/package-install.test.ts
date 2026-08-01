@@ -176,6 +176,91 @@ function createKnowledgeFixture(agentWorkspace: string): void {
   );
 }
 
+interface InstalledKnowledgeGitFixture {
+  workspace: string;
+  remote: string;
+  peer: string;
+}
+
+function git(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("git", [...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(
+    result.status,
+    0,
+    `git ${args.join(" ")} failed in ${cwd}: ${(result.stderr || result.stdout).trim()}`,
+  );
+  return result.stdout.trim();
+}
+
+function configureGitIdentity(workspace: string): void {
+  git(workspace, ["config", "user.name", "Installed Knowledge Sync Test"]);
+  git(workspace, ["config", "user.email", "installed-knowledge-sync@users.noreply.github.com"]);
+  git(workspace, ["config", "commit.gpgSign", "false"]);
+}
+
+function commitWorkspaceFiles(
+  workspace: string,
+  message: string,
+  files: Record<string, string>,
+): string {
+  for (const [relPath, content] of Object.entries(files)) {
+    writeWorkspaceFile(workspace, relPath, content);
+  }
+  git(workspace, ["add", ...Object.keys(files)]);
+  git(workspace, ["commit", "-m", message]);
+  return git(workspace, ["rev-parse", "HEAD"]);
+}
+
+function createInstalledKnowledgeGitFixture(
+  root: string,
+  name: string,
+): InstalledKnowledgeGitFixture {
+  const fixtureRoot = join(root, name);
+  const workspace = join(fixtureRoot, "workspace");
+  const remote = join(fixtureRoot, "remote.git");
+  const peer = join(fixtureRoot, "peer");
+  mkdirSync(workspace, { recursive: true });
+  git(fixtureRoot, ["init", "--bare", "--initial-branch=main", remote]);
+  git(workspace, ["init", "--initial-branch=main"]);
+  configureGitIdentity(workspace);
+  commitWorkspaceFiles(workspace, "initial installed Knowledge fixture", {
+    ".gitignore": ".tmp/\n",
+    "README.md": "# Synthetic installed agent workspace\n\nShared baseline.\n",
+    "wiki/schema.md": generateKnowledgeV2Schema(),
+    "wiki/index.md": "# Knowledge Index\n\n_No active Knowledge pages._\n",
+    "wiki/log.md": "# Knowledge Structural Log\n",
+  });
+  git(workspace, ["remote", "add", "origin", remote]);
+  git(workspace, ["push", "-u", "origin", "main"]);
+  git(fixtureRoot, ["clone", remote, peer]);
+  configureGitIdentity(peer);
+  return { workspace, remote, peer };
+}
+
+function syntheticKnowledgePage(
+  name: string,
+  description: string,
+  type: "user" | "project" | "feedback" | "reference",
+  body: string,
+): string {
+  return [
+    "---",
+    `name: ${name}`,
+    `description: ${description}`,
+    `type: ${type}`,
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    body,
+    "",
+  ].join("\n");
+}
+
 function writeExactKnowledgeIndexSize(agentWorkspace: string, bytes: number): void {
   const prefix = "# Knowledge Index\n";
   writeWorkspaceFile(
@@ -247,6 +332,8 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/acknowledged-steer.js",
     "dist/pi-extensions/compaction-continuation.js",
     "dist/pi-extensions/knowledge-tools.js",
+    "dist/knowledge/sync.d.ts",
+    "dist/knowledge/sync.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/pi-extensions/ops-worker-conversation-bounds.js",
     "dist/pi-extensions/ops-worker-parity-attestation.js",
@@ -521,6 +608,7 @@ describe("package artifact install", () => {
       assert.equal(help.status, 0, help.stderr);
       assert.match(help.stdout, /minime-bot workspace validate --workspace <path>/);
       assert.match(help.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+      assert.match(help.stdout, /minime-bot knowledge sync --workspace <agent-workspace> \[--json\]/);
       assert.doesNotMatch(help.stdout, /minime-bot recovery/);
 
       const retiredRecovery = runInstalledBin(
@@ -771,6 +859,114 @@ describe("package artifact install", () => {
         updatedSearchJson.results.some((result) => result.path === "wiki/pages/project/installed-update.md"),
         updatedSearch.stdout,
       );
+
+      const syncFixture = createInstalledKnowledgeGitFixture(temp, "installed-sync-divergence");
+      const localTip = commitWorkspaceFiles(syncFixture.workspace, "local installed Knowledge page", {
+        "wiki/pages/project/local-sync.md": syntheticKnowledgePage(
+          "Local Sync",
+          "Synthetic installed local convergence record",
+          "project",
+          "Installed local convergence detail.",
+        ),
+        "wiki/index.md": "# Stale local installed index\n",
+        "wiki/log.md": "# Knowledge Structural Log\n\n- local installed structural entry\n",
+      });
+      const remoteTip = commitWorkspaceFiles(syncFixture.peer, "remote installed Knowledge page", {
+        "wiki/pages/user/remote-sync.md": syntheticKnowledgePage(
+          "Remote Sync",
+          "Synthetic installed remote convergence record",
+          "user",
+          "Installed remote convergence detail.",
+        ),
+        "wiki/index.md": "# Stale remote installed index\n",
+        "wiki/log.md": "# Knowledge Structural Log\n\n- remote installed structural entry\n",
+      });
+      git(syncFixture.peer, ["push", "origin", "main"]);
+
+      const installedSync = runInstalledBin(
+        projectDir,
+        ["knowledge", "sync", "--workspace", syncFixture.workspace, "--json"],
+        workspace,
+      );
+      assert.equal(installedSync.status, 0, installedSync.stderr || installedSync.stdout);
+      const installedSyncJson = JSON.parse(installedSync.stdout) as {
+        ok: boolean;
+        classification: string;
+        commit: string;
+      };
+      assert.equal(installedSyncJson.ok, true);
+      assert.equal(installedSyncJson.classification, "diverged");
+      assert.equal(
+        git(syncFixture.workspace, ["rev-parse", "refs/heads/main"]),
+        git(syncFixture.remote, ["rev-parse", "refs/heads/main"]),
+      );
+      git(syncFixture.workspace, ["merge-base", "--is-ancestor", localTip, installedSyncJson.commit]);
+      git(syncFixture.workspace, ["merge-base", "--is-ancestor", remoteTip, installedSyncJson.commit]);
+      const installedSyncIndex = readFileSync(join(syncFixture.workspace, "wiki/index.md"), "utf8");
+      assert.match(installedSyncIndex, /\[Local Sync\]\(pages\/project\/local-sync\.md\)/);
+      assert.match(installedSyncIndex, /\[Remote Sync\]\(pages\/user\/remote-sync\.md\)/);
+      assert.doesNotMatch(installedSyncIndex, /Stale (?:local|remote) installed index/);
+
+      const convergedSearch = runInstalledBin(
+        projectDir,
+        ["knowledge", "search", "--workspace", syncFixture.workspace, "--query", "installed convergence", "--json"],
+        workspace,
+      );
+      assert.equal(convergedSearch.status, 0, convergedSearch.stderr || convergedSearch.stdout);
+      const convergedPaths = (JSON.parse(convergedSearch.stdout) as {
+        results: Array<{ path: string }>;
+      }).results
+        .map((result) => result.path)
+        .filter((path) => path.startsWith("wiki/pages/"))
+        .sort();
+      assert.deepEqual(convergedPaths, [
+        "wiki/pages/project/local-sync.md",
+        "wiki/pages/user/remote-sync.md",
+      ]);
+      assert.equal(git(syncFixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+      const conflictFixture = createInstalledKnowledgeGitFixture(temp, "installed-sync-conflict");
+      const localReadme = "# Synthetic installed agent workspace\n\nLocal committed claim.\n";
+      const remoteReadme = "# Synthetic installed agent workspace\n\nRemote committed claim.\n";
+      const conflictLocalTip = commitWorkspaceFiles(conflictFixture.workspace, "local installed conflict", {
+        "README.md": localReadme,
+      });
+      const conflictRemoteTip = commitWorkspaceFiles(conflictFixture.peer, "remote installed conflict", {
+        "README.md": remoteReadme,
+      });
+      git(conflictFixture.peer, ["push", "origin", "main"]);
+
+      const installedConflict = runInstalledBin(
+        projectDir,
+        ["knowledge", "sync", "--workspace", conflictFixture.workspace, "--json"],
+        workspace,
+      );
+      assert.equal(installedConflict.status, 1, installedConflict.stderr || installedConflict.stdout);
+      assert.equal(installedConflict.stderr, "");
+      const conflictJson = JSON.parse(installedConflict.stdout) as {
+        ok: boolean;
+        status: string;
+        reason: string;
+        conflictPaths: string[];
+      };
+      assert.deepEqual(
+        {
+          ok: conflictJson.ok,
+          status: conflictJson.status,
+          reason: conflictJson.reason,
+          conflictPaths: conflictJson.conflictPaths,
+        },
+        {
+          ok: false,
+          status: "conflict",
+          reason: "non-knowledge-conflict",
+          conflictPaths: ["README.md"],
+        },
+      );
+      assert.equal(git(conflictFixture.workspace, ["rev-parse", "refs/heads/main"]), conflictLocalTip);
+      assert.equal(git(conflictFixture.remote, ["rev-parse", "refs/heads/main"]), conflictRemoteTip);
+      assert.equal(readFileSync(join(conflictFixture.workspace, "README.md"), "utf8"), localReadme);
+      assert.equal(git(conflictFixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
 
       const fakeBin = join(temp, "fake-bin");
       const payloadPath = join(temp, "telegram-payload.json");

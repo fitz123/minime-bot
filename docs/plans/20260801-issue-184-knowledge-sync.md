@@ -67,12 +67,12 @@ node dist/cli.js --help
 
 **Serves:** Ninja requires a first-party self-completing alternative so the guard helps fallible cooperative agents rather than blocking them into operator intervention.
 
-- [ ] Add `knowledge sync --workspace <agent-workspace> [--json]` to `src/cli.ts`, CLI help, response formatting, and installed package exports without loading control secrets or accepting destructive escape flags.
-- [ ] Update `src/pi-extensions/knowledge-tools.ts` block reasons and static context/documentation to distinguish `knowledge_update` for page mutations from `minime-bot knowledge sync` for committed-history reconciliation; keep raw worktree-mutating Git commands and direct managed writes blocked.
-- [ ] Extend `src/__tests__/knowledge-pi-extension.test.ts` and `src/__tests__/cli.test.ts` for actionable guard output, successful/failed sync exit contracts, strict option parsing, and unchanged legacy/pre-v2 behavior.
-- [ ] Extend `src/__tests__/package-install.test.ts` with an installed-package local/bare-remote fixture proving divergent Knowledge histories converge, search sees the regenerated corpus, and a non-Knowledge conflict leaves canonical state unchanged.
-- [ ] Update `src/pi-extensions/README.md` and the minimum relevant public documentation with the trusted-agent boundary, clean committed-input contract, recovery-ref behavior, unresolved-page semantics, and forbidden Git operations; include only synthetic public examples.
-- [ ] Run the focused validation commands, then `npm test`, `npm run build`, `npm pack --dry-run`, and `npm run check:schema-guard-contract`; review `git diff main...HEAD` for scope and public-data safety.
+- [x] Add `knowledge sync --workspace <agent-workspace> [--json]` to `src/cli.ts`, CLI help, response formatting, and installed package exports without loading control secrets or accepting destructive escape flags.
+- [x] Update `src/pi-extensions/knowledge-tools.ts` block reasons and static context/documentation to distinguish `knowledge_update` for page mutations from `minime-bot knowledge sync` for committed-history reconciliation; keep raw worktree-mutating Git commands and direct managed writes blocked.
+- [x] Extend `src/__tests__/knowledge-pi-extension.test.ts` and `src/__tests__/cli.test.ts` for actionable guard output, successful/failed sync exit contracts, strict option parsing, and unchanged legacy/pre-v2 behavior.
+- [x] Extend `src/__tests__/package-install.test.ts` with an installed-package local/bare-remote fixture proving divergent Knowledge histories converge, search sees the regenerated corpus, and a non-Knowledge conflict leaves canonical state unchanged.
+- [x] Update `src/pi-extensions/README.md` and the minimum relevant public documentation with the trusted-agent boundary, clean committed-input contract, recovery-ref behavior, unresolved-page semantics, and forbidden Git operations; include only synthetic public examples.
+- [x] Run the focused validation commands, then `npm test`, `npm run build`, `npm pack --dry-run`, and `npm run check:schema-guard-contract`; review `git diff main...HEAD` for scope and public-data safety.
 
 ## Post-Completion
 

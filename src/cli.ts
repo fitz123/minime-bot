@@ -26,6 +26,11 @@ import {
   type KnowledgeMaintenanceResponse,
 } from "./knowledge/maintenance.js";
 import {
+  executeKnowledgeSync,
+  formatKnowledgeSyncResponse,
+  type KnowledgeSyncResponse,
+} from "./knowledge/sync.js";
+import {
   validateWorkspaceContract,
   workspaceValidationErrors,
   workspaceValidationWarnings,
@@ -88,6 +93,7 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge get --workspace <agent-workspace> --path <relpath> [--from N] [--lines N]
   minime-bot knowledge update --workspace <agent-workspace> --op create|update|upsert --type <type> --slug <slug> --frontmatter <json> --body-file <file> [--json]
   minime-bot knowledge update --workspace <agent-workspace> --op archive|restore --path <wiki/pages/type/page.md> [--json]
+  minime-bot knowledge sync --workspace <agent-workspace> [--json]
   minime-bot knowledge maintain --workspace <agent-workspace> [--closed-issues <json-array>] [--json] [--report <workspace-json-path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
@@ -390,7 +396,8 @@ function knowledgeFailureExitCode(
     | KnowledgeGetResponse
     | KnowledgeUpdateResponse
     | KnowledgeMigrationResponse
-    | KnowledgeMaintenanceResponse,
+    | KnowledgeMaintenanceResponse
+    | KnowledgeSyncResponse,
 ): number {
   if (response.ok) {
     return 0;
@@ -404,7 +411,8 @@ function writeKnowledgeFailure(
     | KnowledgeGetResponse
     | KnowledgeUpdateResponse
     | KnowledgeMigrationResponse
-    | KnowledgeMaintenanceResponse,
+    | KnowledgeMaintenanceResponse
+    | KnowledgeSyncResponse,
   json: boolean,
   stdout: WriteFn,
   stderr: WriteFn,
@@ -647,6 +655,42 @@ function runKnowledgeMigrate(
   return 0;
 }
 
+function runKnowledgeSync(
+  parsed: ParsedArgs,
+  args: readonly string[],
+  options: CliRunOptions,
+  stdout: WriteFn,
+  stderr: WriteFn,
+): number {
+  const commandOptions = parseKnowledgeCommandOptions(args);
+  rejectUnexpectedKnowledgeOptions(
+    commandOptions,
+    new Set(),
+    new Set(["json"]),
+    "sync",
+  );
+  const json = commandOptions.flags.has("json");
+  const agentWorkspaceRoot = resolveKnowledgeAgentWorkspace(parsed, options);
+  const response = executeKnowledgeSync({
+    agentWorkspaceRoot,
+    env: options.env ?? process.env,
+  });
+
+  if (!response.ok) {
+    return writeKnowledgeFailure(response, json, stdout, stderr);
+  }
+  if (json) {
+    writeLine(stdout, formatKnowledgeSyncResponse(response));
+  } else {
+    writeLine(
+      stdout,
+      `Knowledge sync converged main with origin/main at ${response.commit} ` +
+        `(${response.classification}, ${response.attempts} ${response.attempts === 1 ? "attempt" : "attempts"}).`,
+    );
+  }
+  return 0;
+}
+
 function runKnowledgeCommand(
   action: string | undefined,
   args: readonly string[],
@@ -669,6 +713,9 @@ function runKnowledgeCommand(
   }
   if (action === "migrate") {
     return runKnowledgeMigrate(parsed, args, options, stdout, stderr);
+  }
+  if (action === "sync") {
+    return runKnowledgeSync(parsed, args, options, stdout, stderr);
   }
   throw new CliUsageError(`unknown knowledge command: ${action ?? ""}`.trimEnd());
 }

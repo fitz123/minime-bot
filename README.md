@@ -65,6 +65,7 @@ minime-bot knowledge get --workspace /path/to/agent-workspace --path wiki/pages/
 minime-bot knowledge update --workspace /path/to/agent-workspace --op upsert --type project --slug runtime --frontmatter '{"name":"Runtime","description":"Runtime notes","type":"project"}' --body-file /path/to/body.md --json
 minime-bot knowledge update --workspace /path/to/agent-workspace --op archive --path wiki/pages/project/history/issue-123-2026-05-01.md --json
 minime-bot knowledge update --workspace /path/to/agent-workspace --op restore --path wiki/pages/project/history/issue-123-2026-05-01.md --json
+minime-bot knowledge sync --workspace /path/to/agent-workspace --json
 minime-bot knowledge maintain --workspace /path/to/agent-workspace --closed-issues '[123,456]' --json --report artifacts/knowledge-maintenance/latest.json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --dry-run --report /path/to/report.json --json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --apply --allow-dirty --report /path/to/report.json --json
@@ -84,6 +85,9 @@ wiki paths are blocked when first-party Pi extensions are enabled. Its
 `create`, `update`, and `upsert` operations use the page write payload shown
 above. `archive` and `restore` instead accept only `--op` and the original
 managed `--path`; they do not accept type, slug, frontmatter, or body flags.
+`sync` is the separate committed-history path for reconciling local `main` with
+`origin/main`; it does not accept force, dirty-worktree, rebase, or other
+destructive escape options.
 Migration is dry-run by default. `--apply` writes planned files only when the
 agent workspace has a clean git worktree and no blocking review items;
 `--allow-dirty` bypasses only the git cleanliness gate after operator review.
@@ -362,6 +366,43 @@ for either side of the managed move. Explicitly destructive recursive,
 archive-extraction, and worktree-mutating Git operations are also blocked when
 they target an ancestor containing either managed tree. Read-only commands and
 mutations confined to unrelated subdirectories remain available.
+
+### Knowledge Git synchronization
+
+`minime-bot knowledge sync` is a coordination mechanism for a trusted,
+cooperative agent in a single-user workspace. The Pi protection and managed
+command provide safe defaults and actionable errors; they are not an access
+control boundary against another process running as the same user.
+
+The command accepts only a Knowledge v2 agent workspace that is itself the Git
+root, is on local `main`, has a clean worktree containing only committed input,
+and has an `origin/main`. It fetches `origin/main`, prepares divergent merges in
+a temporary detached worktree, validates the complete Knowledge corpus, and
+fast-forwards canonical `main` only after validation. It then pushes and verifies
+that local and remote `main` are equal. The command never loads control-workspace
+secrets and does not force-push, reset, rebase, or select a silent winner.
+
+Before convergence, both observed tips are retained under synthetic refs such as
+`refs/minime/knowledge-sync/recovery/local-<commit>` and
+`refs/minime/knowledge-sync/recovery/remote-<commit>`. Sync temporary worktrees
+are removed only after local and remote `main` are verified equal. Recovery refs
+are removed only after both observed tips are reachable from that canonical
+commit; a failed or interrupted convergence retains recovery state for an
+idempotent retry.
+
+Git handles ordinary three-way merges first. A conflicting managed page becomes
+one schema-valid unresolved page containing both complete committed variants,
+their source commit IDs, an explicit unresolved body marker, and `revisit_if`
+review guidance. `wiki/index.md` is regenerated from every active page and both
+structural-log histories are retained. Conflicts outside managed Knowledge, or
+unsupported schema, issues, and archive conflicts, stop without changing
+canonical `main`.
+
+Use `knowledge update` to create, edit, archive, or restore managed pages, commit
+those changes normally, and use `knowledge sync` to reconcile committed history.
+When the first-party Pi extension is enabled, direct managed writes and raw Git
+worktree commands such as `merge`, `pull`, `rebase`, `cherry-pick`, `checkout`,
+`switch`, and destructive `reset`, `restore`, or `clean` remain blocked.
 
 Every committed modifying operation appends a structural entry to
 `wiki/log.md`: `create`, `update`, `archive`, or `restore`. An upsert records
