@@ -39,7 +39,9 @@ For jointly changed paths it rejects `union` and custom merge drivers, including
 configured overrides of Git's built-in `text` and `binary` driver names. It also
 rejects check-in transformations on managed Knowledge files, including clean
 filters, `ident`, `working-tree-encoding`, and `text`/`eol` attributes, because
-they can alter staged variants; remove those settings before retrying.
+they can alter staged variants. Effective `core.autocrlf` values other than
+`false` or unset are rejected for the same reason; remove those settings before
+retrying.
 
 The sync transaction preserves observed local and remote tips under
 `refs/minime/knowledge-sync/recovery/**`, builds divergent candidates in a
@@ -49,9 +51,10 @@ verified equal, and removes recovery refs only after both observed tips are
 reachable from canonical `main`; convergence failures retain recovery state for
 retry. Conflicting managed pages retain both committed
 variants and commit provenance inside a schema-valid page marked unresolved with
-`revisit_if`. The catalog is regenerated and structural-log histories are
-preserved. Non-Knowledge conflicts and unsupported schema, issues, or archive
-conflicts leave canonical state unchanged.
+`revisit_if`; non-UTF-8 variants are explicitly marked and base64-encoded. The
+catalog is regenerated and structural-log histories are preserved. Non-Knowledge
+conflicts and unsupported schema, issues, or archive conflicts leave canonical
+state unchanged.
 
 Direct managed writes stay blocked. Raw worktree-mutating Git commands including
 `merge`, `pull`, `rebase`, `cherry-pick`, `checkout`, and `switch`, plus

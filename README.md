@@ -390,7 +390,8 @@ overrides of the built-in `text` and `binary` driver names, and other settings
 that can hide conflicts. Sync also rejects Git check-in transformations on any
 managed Knowledge file, including clean filters, `ident`,
 `working-tree-encoding`, and `text`/`eol` attributes, because they can alter
-committed variants. Remove the transformation before retrying.
+committed variants. Effective `core.autocrlf` values other than `false` or unset
+are rejected for the same reason. Remove the transformation before retrying.
 
 Before convergence, both observed tips are retained under synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and
@@ -403,7 +404,8 @@ idempotent retry.
 Git handles ordinary three-way merges first. A conflicting managed page becomes
 one schema-valid unresolved page containing both complete committed variants,
 their source commit IDs, an explicit unresolved body marker, and `revisit_if`
-review guidance. `wiki/index.md` is regenerated from every active page and both
+review guidance. Non-UTF-8 variants are retained as explicitly marked base64
+bytes. `wiki/index.md` is regenerated from every active page and both
 structural-log histories are retained. Conflicts outside managed Knowledge, or
 unsupported schema, issues, and archive conflicts, stop without changing
 canonical `main`.

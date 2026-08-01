@@ -99,6 +99,7 @@ function createSyncFixture(): SyncFixture {
   git(remote, ["init", "--bare", "--initial-branch=main"]);
   git(workspace, ["init", "--initial-branch=main"]);
   configureIdentity(workspace);
+  git(workspace, ["config", "core.autocrlf", "false"]);
   commitFiles(workspace, "initial Knowledge v2 workspace", {
     ".gitignore": ".tmp/\n",
     "README.md": "# Agent workspace\n\nShared baseline.\n",
@@ -1128,6 +1129,43 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(remoteHead(fixture), remoteTip);
   });
 
+  it("rejects effective core.autocrlf before it can transform reconciled Knowledge", () => {
+    for (const [name, configure] of [
+      ["common-input", (workspace: string) => git(workspace, ["config", "core.autocrlf", "input"])],
+      ["canonical-worktree-true", (workspace: string) => {
+        git(workspace, ["config", "extensions.worktreeConfig", "true"]);
+        git(workspace, ["config", "--worktree", "core.autocrlf", "true"]);
+      }],
+    ] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/reference/${name}.md`;
+      const sharedVariant = page(
+        "Autocrlf conflict",
+        "A shared page before conflicting line-ending variants.",
+        "reference",
+        "The shared line-ending claim is undecided.\n",
+      );
+      commitFiles(fixture.workspace, `add shared ${name} page`, { [relPath]: sharedVariant });
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const peer = cloneRemote(fixture, `peer-${name}`);
+      const localTip = commitFiles(fixture.workspace, `edit local ${name} page`, {
+        [relPath]: sharedVariant.replace("undecided", "local"),
+      });
+      const remoteTip = commitFiles(peer, `edit remote ${name} page`, {
+        [relPath]: sharedVariant.replace("undecided", "remote").replaceAll("\n", "\r\n"),
+      });
+      git(peer, ["push", "origin", "main"]);
+      configure(fixture.workspace);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, name);
+      assert.equal(response.reason, "candidate-unsupported-checkin-transformation", name);
+      assert.equal(localHead(fixture), localTip, name);
+      assert.equal(remoteHead(fixture), remoteTip, name);
+    }
+  });
+
   it("retains the complete present variant and the deletion provenance for modify/delete", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/reference/deletion.md";
@@ -1222,6 +1260,60 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.ok(unresolved.includes(malformedVariant.trimEnd()));
     assert.ok(unresolved.includes(validRemoteVariant.trimEnd()));
     assert.match(unresolved, /UNRESOLVED/);
+  });
+
+  it("retains a non-UTF-8 conflicting source variant as exact base64 bytes", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/user/binary.md";
+    const sharedVariant = page(
+      "Shared binary profile",
+      "A valid page before one committed variant becomes binary.",
+      "user",
+      "Shared body.\n",
+    );
+    commitFiles(fixture.workspace, "add shared page before binary edit", {
+      [relPath]: sharedVariant,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-binary-page");
+    const binaryVariant = Buffer.concat([
+      Buffer.from("---\nname: Binary profile\ntype: user\n---\n\nBinary bytes: ", "utf8"),
+      Buffer.from([0x00, 0xff, 0xfe]),
+      Buffer.from("\n", "utf8"),
+    ]);
+    writeFileSync(join(fixture.workspace, ...relPath.split("/")), binaryVariant);
+    git(fixture.workspace, ["add", relPath]);
+    git(fixture.workspace, ["commit", "-m", "commit binary local variant"]);
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "edit remote binary page as text", {
+      [relPath]: sharedVariant.replace("Shared body.", "Remote text body."),
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const missingRawOutput = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        const result = defaultKnowledgeSyncGitRunner(args, options);
+        if (gitCommand(args) === "show" && args.some((arg) => arg.startsWith(":"))) {
+          return { ...result, stdoutBytes: undefined };
+        }
+        return result;
+      },
+    });
+
+    assert.equal(missingRawOutput.ok, false);
+    assert.equal(missingRawOutput.reason, "candidate-source-byte-output-unavailable");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const unresolved = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
+    assert.match(unresolved, /not valid UTF-8/);
+    const encoded = /```base64\n([A-Za-z0-9+/=]+)\n```/u.exec(unresolved)?.[1];
+    assert.ok(encoded);
+    assert.deepEqual(Buffer.from(encoded, "base64"), binaryVariant);
   });
 
   it("fails closed on unsupported managed control, issues, and archive conflicts", () => {

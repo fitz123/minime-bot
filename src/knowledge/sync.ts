@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { isUtf8 } from "node:buffer";
 import {
   closeSync,
   existsSync,
@@ -65,6 +66,7 @@ export type KnowledgeSyncResponse = KnowledgeSyncSuccess | KnowledgeSyncFailure;
 export interface KnowledgeSyncGitResult {
   status: number;
   stdout: string;
+  stdoutBytes?: Buffer;
   stderr: string;
 }
 
@@ -165,19 +167,24 @@ const defaultFs: KnowledgeSyncFs = {
 export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, options) => {
   const result = spawnSync("git", [...args], {
     cwd: options.cwd,
-    encoding: "utf8",
+    encoding: null,
     maxBuffer: MAX_GIT_OUTPUT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const executionError = result.error as NodeJS.ErrnoException | undefined;
+  const stdoutBytes = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  const stderr = Buffer.isBuffer(result.stderr)
+    ? result.stderr.toString("utf8")
+    : result.stderr ?? "";
   return {
     status: result.status ?? 1,
-    stdout: executionError ? "" : result.stdout ?? "",
+    stdout: executionError ? "" : stdoutBytes.toString("utf8"),
+    stdoutBytes: executionError ? Buffer.alloc(0) : stdoutBytes,
     stderr: executionError
       ? executionError.code === "ENOBUFS"
         ? "git output exceeded the 64 MiB knowledge sync limit."
         : `git execution failed${executionError.code ? ` (${executionError.code})` : ""}.`
-      : result.stderr ?? "",
+      : stderr,
   };
 };
 
@@ -367,6 +374,7 @@ function preflight(
     validateMainBranch(workspaceRoot, git) ??
     validateNoGitOperationInProgress(workspaceRoot, git, fs) ??
     validateRuntimeLockUntracked(workspaceRoot, git) ??
+    validateEffectiveAutocrlf(workspaceRoot, git) ??
     validateCleanWorktree(workspaceRoot, git) ??
     layout
   );
@@ -568,10 +576,52 @@ function trackedManagedKnowledgePaths(
   return [...new Set(listed.stdout.split("\0").filter(Boolean))].sort();
 }
 
+function validateEffectiveAutocrlf(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const configured = git(["config", "--get", "core.autocrlf"], { cwd: candidateRoot });
+  if (configured.status === 1 && !configured.stdout.trim()) {
+    return undefined;
+  }
+  if (configured.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-config-inspection-failed",
+      `knowledge sync could not inspect the effective core.autocrlf setting: ${errorText(configured)}`,
+    );
+  }
+  const value = configured.stdout.trim().toLowerCase();
+  if (value !== "input") {
+    const booleanValue = git(["config", "--type=bool", "--get", "core.autocrlf"], {
+      cwd: candidateRoot,
+    });
+    if (booleanValue.status !== 0) {
+      return failure(
+        "error",
+        "candidate-managed-config-inspection-failed",
+        `knowledge sync could not interpret the effective core.autocrlf setting: ${errorText(booleanValue)}`,
+      );
+    }
+    if (booleanValue.stdout.trim() === "false") {
+      return undefined;
+    }
+  }
+  return failure(
+    "unsupported",
+    "candidate-unsupported-checkin-transformation",
+    "knowledge sync refused the effective core.autocrlf setting because it can alter committed Knowledge bytes; set core.autocrlf=false before retrying.",
+  );
+}
+
 function validateManagedCheckinTransformations(
   candidateRoot: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
+  const configProblem = validateEffectiveAutocrlf(candidateRoot, git);
+  if (configProblem) {
+    return configProblem;
+  }
   const trackedPaths = trackedManagedKnowledgePaths(candidateRoot, git);
   if (!Array.isArray(trackedPaths)) {
     return trackedPaths;
@@ -948,12 +998,17 @@ interface CommitFileResult {
   content?: string;
 }
 
+interface ConflictFileResult {
+  ok: true;
+  content?: Buffer;
+}
+
 function readConflictIndexFile(
   candidateRoot: string,
   relPath: string,
   stage: 2 | 3,
   git: KnowledgeSyncGitRunner,
-): CommitFileResult | AttemptFailure {
+): ConflictFileResult | AttemptFailure {
   const listed = git(["ls-files", "--stage", "-z", "--", relPath], { cwd: candidateRoot });
   if (listed.status !== 0) {
     return {
@@ -996,7 +1051,17 @@ function readConflictIndexFile(
       ),
     };
   }
-  return { ok: true, content: shown.stdout };
+  if (shown.stdoutBytes === undefined) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-byte-output-unavailable",
+        `knowledge sync could not read exact conflict bytes for ${relPath}; the configured Git runner did not provide raw output.`,
+      ),
+    };
+  }
+  return { ok: true, content: shown.stdoutBytes };
 }
 
 function readCommitFile(
@@ -1172,15 +1237,30 @@ function mergeStructuralLogs(
 function unresolvedVariantSection(
   label: "Local" | "Remote",
   commit: string,
-  content: string | undefined,
+  content: Buffer | undefined,
 ): string {
   const lines = [`## ${label} committed variant`, "", `Source commit: \`${commit}\``, ""];
   if (content === undefined) {
     lines.push("_This commit has no page at this path; the variant is a committed deletion._", "");
+  } else if (!isUtf8(content) || content.includes(0)) {
+    const reason = isUtf8(content)
+      ? "contains binary NUL bytes"
+      : "is not valid UTF-8";
+    lines.push(
+      `_This committed variant ${reason}. Its exact bytes are encoded as base64 below._`,
+      "",
+      `<!-- BEGIN ${label.toUpperCase()} COMMITTED VARIANT ${commit} BASE64 -->`,
+      "```base64",
+      content.toString("base64"),
+      "```",
+      `<!-- END ${label.toUpperCase()} COMMITTED VARIANT ${commit} BASE64 -->`,
+      "",
+    );
   } else {
+    const text = content.toString("utf8");
     lines.push(
       `<!-- BEGIN ${label.toUpperCase()} COMMITTED VARIANT ${commit} -->`,
-      content.endsWith("\n") ? content.slice(0, -1) : content,
+      text.endsWith("\n") ? text.slice(0, -1) : text,
       `<!-- END ${label.toUpperCase()} COMMITTED VARIANT ${commit} -->`,
       "",
     );
