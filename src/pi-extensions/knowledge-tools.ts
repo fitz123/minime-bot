@@ -999,11 +999,28 @@ function gitWorktreeMutationTarget(
   if (
     effectiveCwd &&
     knownGitWorktreeRoot &&
-    insideOrSame(normalize(resolve(knownGitWorktreeRoot)), normalize(resolve(effectiveCwd)))
+    insideOrSame(normalize(resolve(knownGitWorktreeRoot)), normalize(resolve(effectiveCwd))) &&
+    !hasNestedGitBoundary(effectiveCwd, knownGitWorktreeRoot)
   ) {
     return knownGitWorktreeRoot;
   }
   return effectiveCwd;
+}
+
+function hasNestedGitBoundary(path: string, outerWorktreeRoot: string): boolean {
+  const outerRoot = normalize(resolve(outerWorktreeRoot));
+  let current = normalize(resolve(path));
+  while (insideOrSame(outerRoot, current) && !samePath(current, outerRoot)) {
+    if (existsSync(join(current, ".git"))) {
+      return true;
+    }
+    const parent = dirname(current);
+    if (samePath(parent, current)) {
+      break;
+    }
+    current = parent;
+  }
+  return false;
 }
 
 function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {

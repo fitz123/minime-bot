@@ -77,6 +77,8 @@ interface PackResult {
 function commandEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
     npm_config_loglevel: "error",
     ...extra,
   };
@@ -186,6 +188,7 @@ function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], {
     cwd,
     encoding: "utf8",
+    env: commandEnv(),
     stdio: ["ignore", "pipe", "pipe"],
   });
   assert.equal(

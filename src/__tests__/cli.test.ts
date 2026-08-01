@@ -33,6 +33,10 @@ const CLI_TS = join(BOT_ROOT, "src", "cli.ts");
 const SAMPLER_TS = join(BOT_ROOT, "src", "codex-quota-sampler.ts");
 const TSX_LOADER = createRequire(import.meta.url).resolve("tsx");
 const MINIMAL_WORKSPACE_FIXTURE = join(BOT_ROOT, "test-fixtures", "minimal-workspace");
+const ISOLATED_GIT_ENV = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+};
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
 
 function createWorkspace(): string {
@@ -119,6 +123,7 @@ function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], {
     cwd,
     encoding: "utf8",
+    env: { ...process.env, ...ISOLATED_GIT_ENV },
     stdio: ["ignore", "pipe", "pipe"],
   });
   assert.equal(
@@ -610,6 +615,7 @@ describe("minime-bot CLI", () => {
     const fixture = createCliKnowledgeSyncFixture();
     try {
       const env = {
+        ...ISOLATED_GIT_ENV,
         [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: join(fixture.root, "private-control-workspace"),
       };
       const human = runWithCapture(
@@ -670,6 +676,7 @@ describe("minime-bot CLI", () => {
       const rejected = runWithCapture(
         ["knowledge", "sync", "--workspace", fixture.workspace, "--json"],
         BOT_ROOT,
+        ISOLATED_GIT_ENV,
       );
       assert.equal(rejected.code, 2);
       assert.equal(rejected.stderr, "");
@@ -692,6 +699,7 @@ describe("minime-bot CLI", () => {
         [["positional"], /unexpected argument: positional/],
       ] as const) {
         const result = runWithCapture(["knowledge", "sync", ...args], BOT_ROOT, {
+          ...ISOLATED_GIT_ENV,
           [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: join(fixture.root, "private-control-workspace"),
         });
         assert.equal(result.code, 2, args.join(" "));

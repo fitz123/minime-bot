@@ -412,6 +412,23 @@ describe("Knowledge Pi extension helpers", () => {
       assert.equal(decision.targetPath, workspace, command);
     }
 
+    const nestedRepository = join(workspace, "nested-repository");
+    mkdirSync(join(nestedRepository, ".git"), { recursive: true });
+    for (const [command, cwd] of [
+      ["git merge origin/main", nestedRepository],
+      ["git -C nested-repository merge origin/main", workspace],
+      ["cd nested-repository && git merge origin/main", workspace],
+    ] as const) {
+      assert.equal(
+        classifyKnowledgeIntegrityToolCall(
+          { toolName: "bash", input: { command } },
+          { agentWorkspaceRoot: workspace, cwd, env: {} },
+        ),
+        undefined,
+        command,
+      );
+    }
+
     const outside = createWorkspace();
     const env = { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace };
     for (const [command, target] of [

@@ -19,7 +19,8 @@ import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { formatKnowledgePage, generateKnowledgeIndex } from "../knowledge/update.js";
 import {
   defaultKnowledgeSyncGitRunner,
-  executeKnowledgeSync,
+  executeKnowledgeSync as executeKnowledgeSyncWithAmbientConfig,
+  type KnowledgeSyncDeps,
   type KnowledgeSyncResponse,
 } from "../knowledge/sync.js";
 
@@ -30,6 +31,17 @@ interface SyncFixture {
 }
 
 const fixtures: string[] = [];
+const ISOLATED_GIT_ENV = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+};
+
+function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyncResponse {
+  return executeKnowledgeSyncWithAmbientConfig({
+    ...deps,
+    env: { ...ISOLATED_GIT_ENV, ...(deps.env ?? {}) },
+  });
+}
 
 function filesystemIsCaseInsensitive(): boolean {
   const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-case-check-"));
@@ -53,6 +65,7 @@ function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], {
     cwd,
     encoding: "utf8",
+    env: { ...process.env, ...ISOLATED_GIT_ENV },
     stdio: ["ignore", "pipe", "pipe"],
   });
   assert.equal(
@@ -179,6 +192,25 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("does not repeat full corpus validation when canonical HEAD is unchanged", () => {
+    const fixture = createSyncFixture();
+    let attributeChecks = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) === "check-attr") {
+          attributeChecks += 1;
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "no-op");
+    assert.equal(attributeChecks, 3);
   });
 
   it("rejects a no-op corpus with no committed structural log", () => {
@@ -577,6 +609,32 @@ describe("knowledge sync Git convergence", () => {
     }
   });
 
+  it("rejects reordered structural history after an unrelated merge commit", () => {
+    const fixture = createSyncFixture();
+    const originalLog = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+    git(fixture.workspace, ["checkout", "-b", "unrelated-side"]);
+    commitFiles(fixture.workspace, "side history without Knowledge changes", {
+      "diary/unrelated-side.md": "# Unrelated side history\n",
+    });
+    git(fixture.workspace, ["checkout", "main"]);
+    commitFiles(fixture.workspace, "main history without Knowledge changes", {
+      "diary/unrelated-main.md": "# Unrelated main history\n",
+    });
+    git(fixture.workspace, ["merge", "--no-ff", "unrelated-side", "-m", "merge unrelated side history"]);
+    const rewrittenLog = `- prepended after merge\n${originalLog}`;
+    const localTip = commitFiles(fixture.workspace, "reorder structural history after merge", {
+      "wiki/log.md": rewrittenLog,
+    });
+    const remoteTip = remoteHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-log-history-not-preserved");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("reconciles committed structural logs larger than spawnSync's default output buffer", () => {
     const fixture = createSyncFixture();
     const largeLog = `# Knowledge Structural Log\n\n- ${"x".repeat(1_200_000)}\n`;
@@ -598,6 +656,27 @@ describe("knowledge sync Git convergence", () => {
     assertSyncOk(response);
     assert.equal(response.classification, "diverged");
     assert.ok(readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8").startsWith(largeLog));
+  });
+
+  it("fails privately when committed Git output exceeds the 64 MiB synchronization bound", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-output-overflow");
+    const localTip = localHead(fixture);
+    const privateMarker = "PRIVATE-KNOWLEDGE-OUTPUT-OVERFLOW-MARKER";
+    const oversizedLog = `# Knowledge Structural Log\n\n- ${privateMarker}${"x".repeat(64 * 1024 * 1024)}\n`;
+    const remoteTip = commitFiles(peer, "oversized committed structural history", {
+      "wiki/log.md": oversizedLog,
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-source-read-failed");
+    assert.match(response.message, /output exceeded the 64 MiB knowledge sync limit/);
+    assert.equal(response.message.includes(privateMarker), false);
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
   });
 
   it("rejects invalid UTF-8 structural-log history before divergent reconstruction", () => {
@@ -663,7 +742,60 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
   });
 
-  it("disables repository hooks for transaction-owned worktree, merge, commit, and push commands", () => {
+  it("ignores replacement refs when classifying and verifying the real commit graph", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-replacement-ref");
+    const localCommit = commitFiles(fixture.workspace, "local replacement-ref entry", {
+      "diary/local-replacement-ref.md": "# Local replacement-ref history\n",
+    });
+    const remoteCommit = commitFiles(peer, "remote replacement-ref entry", {
+      "diary/remote-replacement-ref.md": "# Remote replacement-ref history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, ["fetch", "origin", "main"]);
+    git(fixture.workspace, ["replace", "--graft", remoteCommit, localCommit]);
+    git(fixture.workspace, ["merge-base", "--is-ancestor", localCommit, remoteCommit]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "diverged");
+    git(fixture.workspace, ["--no-replace-objects", "merge-base", "--is-ancestor", localCommit, response.commit]);
+    git(fixture.workspace, ["--no-replace-objects", "merge-base", "--is-ancestor", remoteCommit, response.commit]);
+    assert.equal(existsSync(join(fixture.workspace, "diary/local-replacement-ref.md")), true);
+    assert.equal(existsSync(join(fixture.workspace, "diary/remote-replacement-ref.md")), true);
+    assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("fails closed when unresolved-conflict inspection fails", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-conflict-inspection-failure");
+    const localTip = commitFiles(fixture.workspace, "local conflict-inspection history", {
+      "diary/local-conflict-inspection.md": "# Local conflict-inspection history\n",
+    });
+    const remoteTip = commitFiles(peer, "remote conflict-inspection history", {
+      "diary/remote-conflict-inspection.md": "# Remote conflict-inspection history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) === "diff" && args.includes("--diff-filter=U")) {
+          return { status: 1, stdout: "", stderr: "simulated conflict inspection failure" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-conflict-inspection-failed");
+    assert.match(response.message, /simulated conflict inspection failure/);
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("disables repository hooks for every transaction-owned Git mutation", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-hooks");
     commitFiles(fixture.workspace, "local hook-safe entry", {
@@ -685,6 +817,7 @@ describe("knowledge sync Git convergence", () => {
       "commit-msg",
       "post-commit",
       "pre-push",
+      "reference-transaction",
     ]) {
       const hookPath = join(hooksPath, hook);
       writeFileSync(hookPath, `#!/bin/sh\nprintf 'ran\\n' >> ${JSON.stringify(sentinel)}\n`, "utf8");
@@ -1003,7 +1136,7 @@ describe("knowledge sync Git convergence", () => {
     const interrupted = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (!refusedDeletion && gitCommand(args) === "update-ref" && args[1] === "-d") {
+        if (!refusedDeletion && gitCommand(args) === "update-ref" && args.includes("-d")) {
           refusedDeletion = true;
           return { status: 1, stdout: "", stderr: "simulated recovery-ref deletion failure" };
         }
@@ -1021,41 +1154,43 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
   });
 
-  it("recovers when candidate outcome persistence fails after the merge commit", () => {
+  it("retains only candidate ownership and tip metadata between retries", () => {
     const fixture = createSyncFixture();
-    const peer = cloneRemote(fixture, "peer-outcome-interrupted");
-    const localTip = commitFiles(fixture.workspace, "local outcome interruption", {
-      "diary/local-outcome-interrupted.md": "# Local before outcome interruption\n",
+    const peer = cloneRemote(fixture, "peer-marker-metadata");
+    const localTip = commitFiles(fixture.workspace, "local marker metadata", {
+      "diary/local-marker-metadata.md": "# Local marker metadata\n",
     });
-    const remoteTip = commitFiles(peer, "remote outcome interruption", {
-      "diary/remote-outcome-interrupted.md": "# Remote before outcome interruption\n",
+    const remoteTip = commitFiles(peer, "remote marker metadata", {
+      "diary/remote-marker-metadata.md": "# Remote marker metadata\n",
     });
     git(peer, ["push", "origin", "main"]);
-    let refusedOutcomeWrite = false;
+    let refusedFastForward = false;
 
     const interrupted = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
-      fs: {
-        writeFileSync: ((...args: Parameters<typeof writeFileSync>) => {
-          const [path, data] = args;
-          if (
-            !refusedOutcomeWrite &&
-            String(path).includes(".minime-knowledge-sync-owner.json") &&
-            String(data).includes('"outcome"')
-          ) {
-            refusedOutcomeWrite = true;
-            throw new Error("simulated candidate outcome persistence interruption");
-          }
-          return writeFileSync(...args);
-        }) as typeof writeFileSync,
+      git: (args, options) => {
+        if (!refusedFastForward && gitCommand(args) === "merge" && args.includes("--ff-only")) {
+          refusedFastForward = true;
+          return { status: 1, stdout: "", stderr: "simulated canonical fast-forward interruption" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
       },
     });
 
     assert.equal(interrupted.ok, false);
-    assert.equal(interrupted.reason, "candidate-marker-create-failed");
+    assert.equal(interrupted.reason, "canonical-fast-forward-failed");
     assert.equal(localHead(fixture), localTip);
     assert.equal(remoteHead(fixture), remoteTip);
-    assert.equal(worktreePaths(fixture).length, 2);
+    const retainedPath = worktreePaths(fixture).find((path) => path !== realpathSync(fixture.workspace));
+    assert.ok(retainedPath);
+    const marker = JSON.parse(
+      readFileSync(join(dirname(retainedPath), ".minime-knowledge-sync-owner.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(marker.version, 2);
+    assert.equal(marker.localTip, localTip);
+    assert.equal(marker.remoteTip, remoteTip);
+    assert.equal(marker.classification, "diverged");
+    assert.equal("outcome" in marker, false);
 
     const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
 
@@ -2054,7 +2189,7 @@ describe("knowledge sync validation and failure boundaries", () => {
     const response = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (args[0] === "fetch") {
+        if (gitCommand(args) === "fetch") {
           throw new Error("injected Git failure after lock acquisition");
         }
         return defaultKnowledgeSyncGitRunner(args, options);
@@ -2077,7 +2212,7 @@ describe("knowledge sync validation and failure boundaries", () => {
     const response = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
       git: (args, options) => {
-        if (args[0] === "fetch") {
+        if (gitCommand(args) === "fetch") {
           return { status: 1, stdout: privateOutput, stderr: "" };
         }
         return defaultKnowledgeSyncGitRunner(args, options);

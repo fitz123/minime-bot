@@ -386,6 +386,20 @@ does not contact or publish repositories referenced by submodules.
 Git command output is bounded at 64 MiB; an overflow fails without echoing the
 captured Knowledge content.
 
+Preflight also rejects unfinished merge/rebase/cherry-pick state, ignored or
+otherwise uncommitted managed Knowledge files, and tracked copies of the runtime
+lock or reclaim marker. Sync shares `.tmp/knowledge-update.lock` with
+`knowledge update`; concurrent update/sync calls return a typed locked response,
+and an expired lock is reclaimed only when its recorded process is no longer the
+same live process.
+
+Sync evaluates the real commit graph with replacement refs and legacy graft
+overlays disabled. Repository hooks are disabled for transaction-owned fetch,
+recovery-ref, worktree, merge, commit, fast-forward, and push mutations so hooks
+cannot alter the canonical transaction. Divergent merge commits also disable
+commit signing and use the fixed `minime-bot` name with the
+`minime-bot@users.noreply.github.com` email address.
+
 For paths changed on both sides, sync accepts only Git's standard text or binary
 merge behavior. It rejects `union` and custom merge drivers, configured
 overrides of the built-in `text` and `binary` driver names, and other settings
@@ -411,10 +425,12 @@ Git handles ordinary three-way merges first. A conflicting managed page becomes
 one schema-valid unresolved page containing both complete committed variants,
 their source commit IDs, an explicit unresolved body marker, and `revisit_if`
 review guidance. Non-UTF-8 variants are retained as explicitly marked base64
-bytes. `wiki/index.md` is regenerated from every active page and both
-structural-log histories are retained. Conflicts outside managed Knowledge, or
-unsupported schema, issues, and archive conflicts, stop without changing
-canonical `main`.
+bytes. Divergent merges regenerate `wiki/index.md` from every active page and
+form a deterministic union of both structural logs. No-op and linear histories
+instead require the committed index to already equal the complete generated
+corpus; ahead/behind histories must also preserve append-only ancestor log
+history. Conflicts outside managed Knowledge, or unsupported schema, issues, and
+archive conflicts, stop without changing canonical `main`.
 
 Use `knowledge update` to create, edit, archive, or restore managed pages, commit
 those changes normally, and use `knowledge sync` to reconcile committed history.

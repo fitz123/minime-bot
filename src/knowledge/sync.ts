@@ -72,6 +72,7 @@ export interface KnowledgeSyncGitResult {
 
 export interface KnowledgeSyncGitOptions {
   cwd: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 export type KnowledgeSyncGitRunner = (
@@ -107,10 +108,7 @@ interface CandidateResult {
   commit: string;
 }
 
-interface AttemptFailure {
-  ok: false;
-  failure: KnowledgeSyncFailure;
-}
+type AttemptResult = CandidateResult | KnowledgeSyncFailure;
 
 const RECOVERY_REF_PREFIX = "refs/minime/knowledge-sync/recovery";
 const LOCK_RELPATH = ".tmp/knowledge-update.lock" as const;
@@ -168,6 +166,12 @@ export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, opti
   const result = spawnSync("git", [...args], {
     cwd: options.cwd,
     encoding: null,
+    env: {
+      ...process.env,
+      ...(options.env ?? {}),
+      GIT_GRAFT_FILE: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
+    },
     maxBuffer: MAX_GIT_OUTPUT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -445,7 +449,7 @@ function preserveTips(
 ): KnowledgeSyncFailure | undefined {
   for (const [kind, commit] of [["local", tips.local], ["remote", tips.remote]] as const) {
     const ref = recoveryRef(kind, commit);
-    const result = git(["update-ref", ref, commit], { cwd: workspaceRoot });
+    const result = git([...DISABLE_GIT_HOOKS, "update-ref", ref, commit], { cwd: workspaceRoot });
     if (result.status !== 0) {
       return failure(
         "error",
@@ -500,7 +504,9 @@ function removeReachableRecoveryRefs(
     }
   }
   for (const entry of refs) {
-    const deleted = git(["update-ref", "-d", entry.ref, entry.commit], { cwd: workspaceRoot });
+    const deleted = git([...DISABLE_GIT_HOOKS, "update-ref", "-d", entry.ref, entry.commit], {
+      cwd: workspaceRoot,
+    });
     if (deleted.status !== 0) {
       return failure(
         "error",
@@ -903,9 +909,19 @@ function validateCandidateCorpus(
   return undefined;
 }
 
-function unresolvedConflictPaths(candidateRoot: string, git: KnowledgeSyncGitRunner): string[] {
+function unresolvedConflictPaths(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): string[] | KnowledgeSyncFailure {
   const result = git(["diff", "--name-only", "--diff-filter=U", "-z"], { cwd: candidateRoot });
-  return result.status === 0 ? result.stdout.split("\0").filter(Boolean).sort() : [];
+  if (result.status !== 0) {
+    return failure(
+      "error",
+      "candidate-conflict-inspection-failed",
+      `knowledge sync could not inspect unresolved candidate paths: ${errorText(result)}`,
+    );
+  }
+  return result.stdout.split("\0").filter(Boolean).sort();
 }
 
 const SAFE_DEFAULT_MERGE_DRIVERS = new Set(["text", "binary"]);
@@ -1091,30 +1107,24 @@ function readConflictIndexFile(
   relPath: string,
   stage: 2 | 3,
   git: KnowledgeSyncGitRunner,
-): ConflictFileResult | AttemptFailure {
+): ConflictFileResult | KnowledgeSyncFailure {
   const listed = git(["ls-files", "--stage", "-z", "--", relPath], { cwd: candidateRoot });
   if (listed.status !== 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-inspection-failed",
-        `knowledge sync could not inspect conflict stage ${stage} for ${relPath}: ${errorText(listed)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-inspection-failed",
+      `knowledge sync could not inspect conflict stage ${stage} for ${relPath}: ${errorText(listed)}`,
+    );
   }
   let stagePresent = false;
   for (const entry of listed.stdout.split("\0").filter(Boolean)) {
     const match = /^(\d+) [0-9a-f]+ (\d+)\t([\s\S]+)$/u.exec(entry);
     if (!match) {
-      return {
-        ok: false,
-        failure: failure(
-          "error",
-          "candidate-source-inspection-failed",
-          `knowledge sync could not parse conflict stages for ${relPath}.`,
-        ),
-      };
+      return failure(
+        "error",
+        "candidate-source-inspection-failed",
+        `knowledge sync could not parse conflict stages for ${relPath}.`,
+      );
     }
     if (match[2] === String(stage) && match[3] === relPath) {
       stagePresent = true;
@@ -1125,24 +1135,18 @@ function readConflictIndexFile(
   }
   const shown = git(["show", `:${stage}:${relPath}`], { cwd: candidateRoot });
   if (shown.status !== 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-read-failed",
-        `knowledge sync could not read conflict stage ${stage} for ${relPath}: ${errorText(shown)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-read-failed",
+      `knowledge sync could not read conflict stage ${stage} for ${relPath}: ${errorText(shown)}`,
+    );
   }
   if (shown.stdoutBytes === undefined) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-byte-output-unavailable",
-        `knowledge sync could not read exact conflict bytes for ${relPath}; the configured Git runner did not provide raw output.`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-byte-output-unavailable",
+      `knowledge sync could not read exact conflict bytes for ${relPath}; the configured Git runner did not provide raw output.`,
+    );
   }
   return { ok: true, content: shown.stdoutBytes };
 }
@@ -1152,51 +1156,39 @@ function readCommitFile(
   commit: string,
   relPath: string,
   git: KnowledgeSyncGitRunner,
-): CommitFileResult | AttemptFailure {
+): CommitFileResult | KnowledgeSyncFailure {
   const listed = git(["ls-tree", "-z", commit, "--", relPath], { cwd: candidateRoot });
   if (listed.status !== 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-inspection-failed",
-        `knowledge sync could not inspect ${relPath} at ${commit}: ${errorText(listed)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-inspection-failed",
+      `knowledge sync could not inspect ${relPath} at ${commit}: ${errorText(listed)}`,
+    );
   }
   if (!listed.stdout) {
     return { ok: true };
   }
   const shown = git(["show", `${commit}:${relPath}`], { cwd: candidateRoot });
   if (shown.status !== 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-read-failed",
-        `knowledge sync could not read ${relPath} at ${commit}: ${errorText(shown)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-read-failed",
+      `knowledge sync could not read ${relPath} at ${commit}: ${errorText(shown)}`,
+    );
   }
   if (shown.stdoutBytes === undefined) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-source-byte-output-unavailable",
-        `knowledge sync could not read exact committed bytes for ${relPath}; the configured Git runner did not provide raw output.`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-source-byte-output-unavailable",
+      `knowledge sync could not read exact committed bytes for ${relPath}; the configured Git runner did not provide raw output.`,
+    );
   }
   if (!isUtf8(shown.stdoutBytes)) {
-    return {
-      ok: false,
-      failure: failure(
-        "rejected",
-        "candidate-structural-log-invalid-encoding",
-        `knowledge sync requires committed ${relPath} structural history to be valid UTF-8.`,
-      ),
-    };
+    return failure(
+      "rejected",
+      "candidate-structural-log-invalid-encoding",
+      `knowledge sync requires committed ${relPath} structural history to be valid UTF-8.`,
+    );
   }
   return { ok: true, content: shown.stdoutBytes.toString("utf8") };
 }
@@ -1209,14 +1201,15 @@ function splitStableLines(content: string): string[] {
   return (normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized).split("\n");
 }
 
-function stableThreeWayLineUnion(baseContent: string, localContent: string, remoteContent: string): string[] {
+function stableLineUnion(baseContent: string, sourceContents: readonly string[]): string[] {
   const baseLines = splitStableLines(baseContent);
   const baseCounts = new Map<string, number>();
   for (const line of baseLines) {
     baseCounts.set(line, (baseCounts.get(line) ?? 0) + 1);
   }
   const union = [...baseLines];
-  for (const sourceLines of [splitStableLines(localContent), splitStableLines(remoteContent)]) {
+  for (const sourceContent of sourceContents) {
+    const sourceLines = splitStableLines(sourceContent);
     const sourceCounts = new Map<string, number>();
     for (const line of sourceLines) {
       const occurrence = (sourceCounts.get(line) ?? 0) + 1;
@@ -1227,6 +1220,10 @@ function stableThreeWayLineUnion(baseContent: string, localContent: string, remo
     }
   }
   return union;
+}
+
+function stableThreeWayLineUnion(baseContent: string, localContent: string, remoteContent: string): string[] {
+  return stableLineUnion(baseContent, [localContent, remoteContent]);
 }
 
 function lineMultisetContains(candidate: string, source: string): boolean {
@@ -1245,6 +1242,92 @@ function lineMultisetContains(candidate: string, source: string): boolean {
   return true;
 }
 
+function lineSequenceStartsWith(candidate: string, prefix: string): boolean {
+  const candidateLines = splitStableLines(candidate);
+  const prefixLines = splitStableLines(prefix);
+  return prefixLines.every((line, index) => candidateLines[index] === line);
+}
+
+function readRequiredStructuralLog(
+  candidateRoot: string,
+  commit: string,
+  git: KnowledgeSyncGitRunner,
+): string | KnowledgeSyncFailure {
+  const result = readCommitFile(candidateRoot, commit, "wiki/log.md", git);
+  if (!result.ok) {
+    return result;
+  }
+  if (result.content === undefined) {
+    return failure(
+      "rejected",
+      "candidate-log-history-not-preserved",
+      `knowledge sync refused structural history because wiki/log.md is missing at ${commit}.`,
+    );
+  }
+  return result.content;
+}
+
+function validateStructuralLogCommit(
+  candidateRoot: string,
+  commit: string,
+  parents: readonly string[],
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const commitLog = readRequiredStructuralLog(candidateRoot, commit, git);
+  if (typeof commitLog !== "string") {
+    return commitLog;
+  }
+  if (parents.length === 0) {
+    return failure(
+      "rejected",
+      "candidate-log-history-not-preserved",
+      `knowledge sync refused unexpected root commit ${commit} in the linear synchronization range.`,
+    );
+  }
+  if (parents.length === 1) {
+    const parentLog = readRequiredStructuralLog(candidateRoot, parents[0], git);
+    if (typeof parentLog !== "string") {
+      return parentLog;
+    }
+    return lineSequenceStartsWith(commitLog, parentLog)
+      ? undefined
+      : failure(
+        "rejected",
+        "candidate-log-history-not-preserved",
+        `knowledge sync refused commit ${commit} because it did not append to its parent structural log.`,
+      );
+  }
+
+  const mergeBase = git(["merge-base", "--octopus", ...parents], { cwd: candidateRoot });
+  if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) {
+    return failure(
+      "error",
+      "candidate-history-inspection-failed",
+      `knowledge sync could not inspect the merge base for structural-log commit ${commit}: ${errorText(mergeBase)}`,
+    );
+  }
+  const baseLog = readRequiredStructuralLog(candidateRoot, mergeBase.stdout.trim(), git);
+  if (typeof baseLog !== "string") {
+    return baseLog;
+  }
+  const parentLogs: string[] = [];
+  for (const parent of parents) {
+    const parentLog = readRequiredStructuralLog(candidateRoot, parent, git);
+    if (typeof parentLog !== "string") {
+      return parentLog;
+    }
+    parentLogs.push(parentLog);
+  }
+  const expectedMergePrefix = `${stableLineUnion(baseLog, parentLogs).join("\n")}\n`;
+  return lineSequenceStartsWith(commitLog, expectedMergePrefix)
+    ? undefined
+    : failure(
+      "rejected",
+      "candidate-log-history-not-preserved",
+      `knowledge sync refused merge commit ${commit} because its structural log is not the deterministic parent-history union.`,
+    );
+}
+
 function validateLinearStructuralLogHistory(
   candidateRoot: string,
   tips: GitTips,
@@ -1253,41 +1336,41 @@ function validateLinearStructuralLogHistory(
 ): KnowledgeSyncFailure | undefined {
   const ancestorCommit = classification === "ahead" ? tips.remote : tips.local;
   const candidateCommit = classification === "ahead" ? tips.local : tips.remote;
-  const ancestorLog = readCommitFile(candidateRoot, ancestorCommit, "wiki/log.md", git);
-  if (!ancestorLog.ok) {
-    return ancestorLog.failure;
+  const ancestorLog = readRequiredStructuralLog(candidateRoot, ancestorCommit, git);
+  if (typeof ancestorLog !== "string") {
+    return ancestorLog;
   }
-  const candidateLog = readCommitFile(candidateRoot, candidateCommit, "wiki/log.md", git);
-  if (!candidateLog.ok) {
-    return candidateLog.failure;
+  const candidateLog = readRequiredStructuralLog(candidateRoot, candidateCommit, git);
+  if (typeof candidateLog !== "string") {
+    return candidateLog;
   }
-  if (candidateLog.content === undefined) {
-    return failure(
-      "rejected",
-      "candidate-log-history-not-preserved",
-      "knowledge sync refused a linear candidate that did not preserve its ancestor structural-log history.",
-    );
-  }
-  if (candidateLog.content.startsWith(ancestorLog.content ?? "")) {
+  if (lineSequenceStartsWith(candidateLog, ancestorLog)) {
     return undefined;
   }
-  const merge = git(
-    ["rev-list", "--merges", "--max-count=1", `${ancestorCommit}..${candidateCommit}`],
+  const history = git(
+    ["rev-list", "--topo-order", "--reverse", "--parents", `${ancestorCommit}..${candidateCommit}`],
     { cwd: candidateRoot },
   );
-  if (merge.status !== 0) {
+  if (history.status !== 0) {
     return failure(
       "error",
       "candidate-history-inspection-failed",
-      `knowledge sync could not inspect candidate merge history: ${errorText(merge)}`,
+      `knowledge sync could not inspect candidate structural-log history: ${errorText(history)}`,
     );
   }
-  if (!merge.stdout.trim() || !lineMultisetContains(candidateLog.content, ancestorLog.content ?? "")) {
-    return failure(
-      "rejected",
-      "candidate-log-history-not-preserved",
-      "knowledge sync refused a linear candidate that did not preserve its ancestor structural-log history.",
-    );
+  for (const line of history.stdout.split("\n").filter(Boolean)) {
+    const [commit, ...parents] = line.trim().split(/\s+/u);
+    if (!commit) {
+      return failure(
+        "error",
+        "candidate-history-inspection-failed",
+        "knowledge sync received an invalid structural-log history record.",
+      );
+    }
+    const invalid = validateStructuralLogCommit(candidateRoot, commit, parents, git);
+    if (invalid) {
+      return invalid;
+    }
   }
   return undefined;
 }
@@ -1377,18 +1460,15 @@ function resolveManagedPageConflict(
   tips: GitTips,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-): AttemptFailure | undefined {
+): KnowledgeSyncFailure | undefined {
   const managedPage = parseManagedKnowledgePagePath(relPath);
   if (isUpdateFailure(managedPage)) {
-    return {
-      ok: false,
-      failure: failure(
-        "conflict",
-        "unsupported-managed-conflict",
-        `knowledge sync cannot safely reconcile unsupported managed page path ${relPath}.`,
-        { conflictPaths: [relPath] },
-      ),
-    };
+    return failure(
+      "conflict",
+      "unsupported-managed-conflict",
+      `knowledge sync cannot safely reconcile unsupported managed page path ${relPath}.`,
+      { conflictPaths: [relPath] },
+    );
   }
   const local = readConflictIndexFile(candidateRoot, relPath, 2, git);
   if (!local.ok) {
@@ -1399,28 +1479,22 @@ function resolveManagedPageConflict(
     return remote;
   }
   if (local.content === undefined && remote.content === undefined) {
-    return {
-      ok: false,
-      failure: failure(
-        "conflict",
-        "managed-page-variants-missing",
-        `knowledge sync could not recover either committed variant for ${relPath}.`,
-        { conflictPaths: [relPath] },
-      ),
-    };
+    return failure(
+      "conflict",
+      "managed-page-variants-missing",
+      `knowledge sync could not recover either committed variant for ${relPath}.`,
+      { conflictPaths: [relPath] },
+    );
   }
 
   const absPath = join(candidateRoot, ...relPath.split("/"));
   const safePathProblem = assertSafeKnowledgeWorkspacePath(candidateRoot, absPath, fs);
   if (safePathProblem) {
-    return {
-      ok: false,
-      failure: candidateUpdateFailure(
-        safePathProblem,
-        "candidate-unsafe-managed-path",
-        `knowledge sync cannot safely reconcile ${relPath}`,
-      ),
-    };
+    return candidateUpdateFailure(
+      safePathProblem,
+      "candidate-unsafe-managed-path",
+      `knowledge sync cannot safely reconcile ${relPath}`,
+    );
   }
   const slug = basename(relPath, ".md");
   const body = [
@@ -1453,40 +1527,31 @@ function reconcileDerivedKnowledgeState(
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-): AttemptFailure | undefined {
+): KnowledgeSyncFailure | undefined {
   const layout = (deps.resolveLayout ?? resolveKnowledgeLayout)(candidateRoot);
   if (layout.kind !== "v2") {
-    return {
-      ok: false,
-      failure: failure(
-        "rejected",
-        "candidate-not-knowledge-v2",
-        "knowledge sync refused a merged candidate that does not contain a valid Knowledge v2 layout.",
-        { layoutKind: layout.kind },
-      ),
-    };
+    return failure(
+      "rejected",
+      "candidate-not-knowledge-v2",
+      "knowledge sync refused a merged candidate that does not contain a valid Knowledge v2 layout.",
+      { layoutKind: layout.kind },
+    );
   }
   const pages = collectKnowledgePages(layout, fs);
   if (!Array.isArray(pages)) {
-    return {
-      ok: false,
-      failure: candidateUpdateFailure(
-        pages,
-        "candidate-page-invalid",
-        "knowledge sync candidate page validation failed",
-      ),
-    };
+    return candidateUpdateFailure(
+      pages,
+      "candidate-page-invalid",
+      "knowledge sync candidate page validation failed",
+    );
   }
   const mergeBase = git(["merge-base", tips.local, tips.remote], { cwd: candidateRoot });
   if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-merge-base-unreadable",
-        `knowledge sync could not read the merge base for structural-log reconciliation: ${errorText(mergeBase)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-merge-base-unreadable",
+      `knowledge sync could not read the merge base for structural-log reconciliation: ${errorText(mergeBase)}`,
+    );
   }
   const baseLog = readCommitFile(candidateRoot, mergeBase.stdout.trim(), "wiki/log.md", git);
   if (!baseLog.ok) {
@@ -1515,27 +1580,21 @@ function reconcileDerivedKnowledgeState(
     !lineMultisetContains(mergedLog, localLogContent) ||
     !lineMultisetContains(mergedLog, remoteLogContent)
   ) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-log-history-not-preserved",
-        "knowledge sync refused a candidate that did not preserve both structural-log histories.",
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-log-history-not-preserved",
+      "knowledge sync refused a candidate that did not preserve both structural-log histories.",
+    );
   }
 
   for (const path of [layout.paths.indexPath, layout.paths.logPath]) {
     const safePathProblem = assertSafeKnowledgeWorkspacePath(candidateRoot, path, fs);
     if (safePathProblem) {
-      return {
-        ok: false,
-        failure: candidateUpdateFailure(
-          safePathProblem,
-          "candidate-unsafe-managed-path",
-          "knowledge sync cannot safely regenerate derived Knowledge state",
-        ),
-      };
+      return candidateUpdateFailure(
+        safePathProblem,
+        "candidate-unsafe-managed-path",
+        "knowledge sync cannot safely regenerate derived Knowledge state",
+      );
     }
   }
   fs.writeFileSync(layout.paths.indexPath, generateKnowledgeIndex(pages), "utf8");
@@ -1546,33 +1605,30 @@ function reconcileDerivedKnowledgeState(
     { cwd: candidateRoot },
   );
   if (staged.status !== 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-stage-failed",
-        `knowledge sync could not stage the reconciled candidate: ${errorText(staged)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-stage-failed",
+      `knowledge sync could not stage the reconciled candidate: ${errorText(staged)}`,
+    );
   }
   const unresolved = unresolvedConflictPaths(candidateRoot, git);
+  if (!Array.isArray(unresolved)) {
+    return unresolved;
+  }
   if (unresolved.length > 0) {
-    return {
-      ok: false,
-      failure: failure(
-        "conflict",
-        "candidate-unresolved-conflict",
-        `knowledge sync candidate still has unresolved paths: ${unresolved.join(", ")}.`,
-        { conflictPaths: unresolved },
-      ),
-    };
+    return failure(
+      "conflict",
+      "candidate-unresolved-conflict",
+      `knowledge sync candidate still has unresolved paths: ${unresolved.join(", ")}.`,
+      { conflictPaths: unresolved },
+    );
   }
   const mergeStateProblem = validateCandidateMergeState(candidateRoot, git);
   if (mergeStateProblem) {
-    return { ok: false, failure: mergeStateProblem };
+    return mergeStateProblem;
   }
   const invalid = validateCandidateCorpus(layout, git, fs);
-  return invalid ? { ok: false, failure: invalid } : undefined;
+  return invalid ?? undefined;
 }
 
 function withTemporaryWorktree(
@@ -1583,46 +1639,30 @@ function withTemporaryWorktree(
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-  work: (candidateRoot: string) => CandidateResult | AttemptFailure,
-): CandidateResult | AttemptFailure {
+  work: (candidateRoot: string) => AttemptResult,
+): AttemptResult {
   const commonDir = gitCommonDir(workspaceRoot, git, fs);
   if (typeof commonDir !== "string") {
-    return { ok: false, failure: commonDir };
+    return commonDir;
   }
   const existingWorktrees = listSyncTemporaryWorktrees(workspaceRoot, git, fs);
   if (!Array.isArray(existingWorktrees)) {
-    return { ok: false, failure: existingWorktrees };
+    return existingWorktrees;
   }
   const reusable = existingWorktrees.find(({ marker }) =>
-    marker.version === 2 &&
     marker.startCommit === startCommit &&
     marker.localTip === tips.local &&
     marker.remoteTip === tips.remote &&
     marker.classification === classification
   );
   if (reusable) {
-    const cached = parseCandidateOutcome(reusable.marker.outcome);
-    if (cached?.ok) {
-      const invalid = validateCandidateLayout(reusable.path, deps, git, fs);
-      if (invalid) {
-        return { ok: false, failure: invalid };
-      }
-    }
-    const resetMarker = { ...reusable.marker, outcome: undefined };
-    const resetMarkerFailure = writeSyncWorktreeMarker(reusable.markerPath, resetMarker, fs);
-    if (resetMarkerFailure) {
-      return { ok: false, failure: resetMarkerFailure };
-    }
     const removed = git(["worktree", "remove", "--force", reusable.path], { cwd: workspaceRoot });
     if (removed.status !== 0) {
-      return {
-        ok: false,
-        failure: failure(
-          "error",
-          "candidate-worktree-reset-failed",
-          `knowledge sync could not reset its retained candidate worktree: ${errorText(removed)}`,
-        ),
-      };
+      return failure(
+        "error",
+        "candidate-worktree-reset-failed",
+        `knowledge sync could not reset its retained candidate worktree: ${errorText(removed)}`,
+      );
     }
     const added = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", reusable.path, startCommit], {
       cwd: workspaceRoot,
@@ -1633,22 +1673,13 @@ function withTemporaryWorktree(
       } catch {
         // Git no longer owns the worktree; its temporary parent can be left for system cleanup.
       }
-      return {
-        ok: false,
-        failure: failure(
-          "error",
-          "candidate-worktree-create-failed",
-          `knowledge sync could not recreate its isolated candidate worktree: ${errorText(added)}`,
-        ),
-      };
+      return failure(
+        "error",
+        "candidate-worktree-create-failed",
+        `knowledge sync could not recreate its isolated candidate worktree: ${errorText(added)}`,
+      );
     }
-    const retried = work(reusable.path);
-    const markerFailure = writeSyncWorktreeMarker(
-      reusable.markerPath,
-      { ...reusable.marker, outcome: retried },
-      fs,
-    );
-    return markerFailure ? { ok: false, failure: markerFailure } : retried;
+    return work(reusable.path);
   }
 
   const base = deps.temporaryDirectory ?? tmpdir();
@@ -1672,7 +1703,7 @@ function withTemporaryWorktree(
     } catch {
       // The fresh temporary directory contains no registered worktree and is safe to leave for system cleanup.
     }
-    return { ok: false, failure: markerFailure };
+    return markerFailure;
   }
   const add = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", candidateRoot, startCommit], {
     cwd: workspaceRoot,
@@ -1683,34 +1714,27 @@ function withTemporaryWorktree(
     } catch {
       // Nothing was registered with Git; an unused temporary directory is safe to leave for system cleanup.
     }
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-worktree-create-failed",
-        `knowledge sync could not create an isolated candidate worktree: ${errorText(add)}`,
-      ),
-    };
+    return failure(
+      "error",
+      "candidate-worktree-create-failed",
+      `knowledge sync could not create an isolated candidate worktree: ${errorText(add)}`,
+    );
   }
-  const outcome = work(candidateRoot);
-  const outcomeMarkerFailure = writeSyncWorktreeMarker(markerPath, { ...marker, outcome }, fs);
-  return outcomeMarkerFailure ? { ok: false, failure: outcomeMarkerFailure } : outcome;
+  return work(candidateRoot);
 }
 
 interface SyncWorktreeMarker {
-  version: 1 | 2;
+  version: 2;
   repositoryGitCommonDir: string;
   candidateRoot: string;
-  startCommit?: string;
-  localTip?: string;
-  remoteTip?: string;
-  classification?: "behind" | "diverged";
-  outcome?: unknown;
+  startCommit: string;
+  localTip: string;
+  remoteTip: string;
+  classification: "behind" | "diverged";
 }
 
 interface SyncTemporaryWorktree {
   path: string;
-  markerPath: string;
   marker: SyncWorktreeMarker;
 }
 
@@ -1736,28 +1760,6 @@ function writeSyncWorktreeMarker(
       `knowledge sync could not mark its isolated candidate worktree: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-}
-
-function parseCandidateOutcome(value: unknown): CandidateResult | AttemptFailure | undefined {
-  if (typeof value !== "object" || value === null || !("ok" in value)) {
-    return undefined;
-  }
-  if (value.ok === true && "commit" in value && typeof value.commit === "string") {
-    return { ok: true, commit: value.commit };
-  }
-  if (value.ok !== false || !("failure" in value) || typeof value.failure !== "object" || value.failure === null) {
-    return undefined;
-  }
-  const cachedFailure = value.failure as Partial<KnowledgeSyncFailure>;
-  if (
-    cachedFailure.ok !== false ||
-    typeof cachedFailure.status !== "string" ||
-    typeof cachedFailure.reason !== "string" ||
-    typeof cachedFailure.message !== "string"
-  ) {
-    return undefined;
-  }
-  return { ok: false, failure: cachedFailure as KnowledgeSyncFailure };
 }
 
 function gitCommonDir(
@@ -1807,12 +1809,16 @@ function listSyncTemporaryWorktrees(
       const markerPath = join(dirname(path), SYNC_WORKTREE_MARKER);
       const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as Partial<SyncWorktreeMarker>;
       if (
-        (marker.version === 1 || marker.version === 2) &&
+        marker.version === 2 &&
         marker.repositoryGitCommonDir === commonDir &&
         typeof marker.candidateRoot === "string" &&
+        typeof marker.startCommit === "string" &&
+        typeof marker.localTip === "string" &&
+        typeof marker.remoteTip === "string" &&
+        (marker.classification === "behind" || marker.classification === "diverged") &&
         realOrResolved(marker.candidateRoot, fs) === realOrResolved(path, fs)
       ) {
-        owned.push({ path, markerPath, marker: marker as SyncWorktreeMarker });
+        owned.push({ path, marker: marker as SyncWorktreeMarker });
       }
     } catch {
       // Ignore unowned or malformed lookalikes.
@@ -1860,65 +1866,62 @@ function prepareCandidate(
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-): CandidateResult | AttemptFailure {
+): AttemptResult {
   if (classification === "no-op" || classification === "ahead") {
     const invalid = validateCandidateLayout(workspaceRoot, deps, git, fs);
     if (invalid) {
-      return { ok: false, failure: invalid };
+      return invalid;
     }
     const logHistoryProblem = classification === "ahead"
       ? validateLinearStructuralLogHistory(workspaceRoot, tips, classification, git)
       : undefined;
-    return logHistoryProblem ? { ok: false, failure: logHistoryProblem } : { ok: true, commit: tips.local };
+    return logHistoryProblem ?? { ok: true, commit: tips.local };
   }
 
   if (classification === "behind") {
     return withTemporaryWorktree(workspaceRoot, tips.remote, tips, classification, deps, git, fs, (candidateRoot) => {
       const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
       if (invalid) {
-        return { ok: false, failure: invalid };
+        return invalid;
       }
       const logHistoryProblem = validateLinearStructuralLogHistory(candidateRoot, tips, classification, git);
-      return logHistoryProblem ? { ok: false, failure: logHistoryProblem } : { ok: true, commit: tips.remote };
+      return logHistoryProblem ?? { ok: true, commit: tips.remote };
     });
   }
 
   return withTemporaryWorktree(workspaceRoot, tips.local, tips, classification, deps, git, fs, (candidateRoot) => {
     const localTransformationProblem = validateManagedCheckinTransformations(candidateRoot, git);
     if (localTransformationProblem) {
-      return { ok: false, failure: localTransformationProblem };
+      return localTransformationProblem;
     }
     const mergeDriverProblem = validateMergeDrivers(candidateRoot, tips, git);
     if (mergeDriverProblem) {
-      return { ok: false, failure: mergeDriverProblem };
+      return mergeDriverProblem;
     }
     const merged = git(
       [...DISABLE_GIT_HOOKS, "-c", "rerere.enabled=false", "merge", "--no-ff", "--no-commit", tips.remote],
       { cwd: candidateRoot },
     );
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
+    if (!Array.isArray(conflictPaths)) {
+      return conflictPaths;
+    }
     if (merged.status !== 0) {
       if (conflictPaths.length === 0) {
-        return {
-          ok: false,
-          failure: failure(
-            "error",
-            "candidate-merge-failed",
-            `knowledge sync could not prepare the isolated merge candidate: ${errorText(merged)}`,
-          ),
-        };
+        return failure(
+          "error",
+          "candidate-merge-failed",
+          `knowledge sync could not prepare the isolated merge candidate: ${errorText(merged)}`,
+        );
       }
       const outsideKnowledge = conflictPaths.filter((path) => !isManagedKnowledgePath(path));
       if (outsideKnowledge.length > 0) {
-        return {
-          ok: false,
-          failure: failure(
-            "conflict",
-            "non-knowledge-conflict",
-            `knowledge sync stopped because Git found conflicts outside managed Knowledge: ${outsideKnowledge.join(", ")}.`,
-            { conflictPaths },
-          ),
-        };
+        return failure(
+          "conflict",
+          "non-knowledge-conflict",
+          `knowledge sync stopped because Git found conflicts outside managed Knowledge: ${outsideKnowledge.join(", ")}.`,
+          { conflictPaths },
+        );
       }
       const unsupportedKnowledge = conflictPaths.filter((path) => {
         if (path === "wiki/index.md" || path === "wiki/log.md") {
@@ -1930,21 +1933,18 @@ function prepareCandidate(
         return isUpdateFailure(parseManagedKnowledgePagePath(path));
       });
       if (unsupportedKnowledge.length > 0) {
-        return {
-          ok: false,
-          failure: failure(
-            "conflict",
-            "unsupported-managed-conflict",
-            `knowledge sync stopped at unsupported managed control or archive conflicts: ${unsupportedKnowledge.join(", ")}.`,
-            { conflictPaths },
-          ),
-        };
+        return failure(
+          "conflict",
+          "unsupported-managed-conflict",
+          `knowledge sync stopped at unsupported managed control or archive conflicts: ${unsupportedKnowledge.join(", ")}.`,
+          { conflictPaths },
+        );
       }
     }
 
     const mergedTransformationProblem = validateManagedCheckinTransformations(candidateRoot, git);
     if (mergedTransformationProblem) {
-      return { ok: false, failure: mergedTransformationProblem };
+      return mergedTransformationProblem;
     }
 
     const pageConflictPaths = conflictPaths.filter((path) => path.startsWith("wiki/pages/"));
@@ -1982,24 +1982,22 @@ function prepareCandidate(
       { cwd: candidateRoot },
     );
     if (committed.status !== 0) {
-      return {
-        ok: false,
-        failure: failure(
-          "error",
-          "candidate-commit-failed",
-          `knowledge sync could not commit the isolated merge candidate: ${errorText(committed)}`,
-        ),
-      };
+      return failure(
+        "error",
+        "candidate-commit-failed",
+        `knowledge sync could not commit the isolated merge candidate: ${errorText(committed)}`,
+      );
     }
     const head = git(["rev-parse", "HEAD"], { cwd: candidateRoot });
     if (head.status !== 0) {
-      return {
-        ok: false,
-        failure: failure("error", "candidate-head-unreadable", `knowledge sync could not read candidate HEAD: ${errorText(head)}`),
-      };
+      return failure(
+        "error",
+        "candidate-head-unreadable",
+        `knowledge sync could not read candidate HEAD: ${errorText(head)}`,
+      );
     }
     const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
-    return invalid ? { ok: false, failure: invalid } : { ok: true, commit: head.stdout.trim() };
+    return invalid ?? { ok: true, commit: head.stdout.trim() };
   });
 }
 
@@ -2035,7 +2033,7 @@ function convergeAttempt(
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-): CandidateResult | AttemptFailure {
+): AttemptResult {
   const candidate = prepareCandidate(workspaceRoot, tips, classification, deps, git, fs);
   if (!candidate.ok) {
     return candidate;
@@ -2046,22 +2044,31 @@ function convergeAttempt(
     validateCleanWorktree(workspaceRoot, git) ??
     validateManagedWorktreeMaterialization(workspaceRoot, git);
   if (canonicalStateFailure) {
-    return { ok: false, failure: canonicalStateFailure };
+    return canonicalStateFailure;
   }
   const fastForwardFailure = fastForwardCanonical(workspaceRoot, candidate.commit, git);
   if (fastForwardFailure) {
-    return { ok: false, failure: fastForwardFailure };
+    return fastForwardFailure;
   }
-  const canonicalValidationFailure = validateCandidateLayout(workspaceRoot, deps, git, fs);
-  if (canonicalValidationFailure) {
-    return { ok: false, failure: canonicalValidationFailure };
+  if (classification === "behind" || classification === "diverged") {
+    const canonicalValidationFailure = validateCandidateLayout(workspaceRoot, deps, git, fs);
+    if (canonicalValidationFailure) {
+      return canonicalValidationFailure;
+    }
   }
   return { ok: true, commit: candidate.commit };
 }
 
 function fetchOriginMain(workspaceRoot: string, git: KnowledgeSyncGitRunner): KnowledgeSyncFailure | undefined {
   const fetched = git(
-    ["fetch", "--no-tags", "--recurse-submodules=no", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+    [
+      ...DISABLE_GIT_HOOKS,
+      "fetch",
+      "--no-tags",
+      "--recurse-submodules=no",
+      "origin",
+      "+refs/heads/main:refs/remotes/origin/main",
+    ],
     { cwd: workspaceRoot },
   );
   if (fetched.status !== 0) {
@@ -2095,7 +2102,11 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
   }
 
   const fs = { ...defaultFs, ...(deps.fs ?? {}) };
-  const git = deps.git ?? defaultKnowledgeSyncGitRunner;
+  const gitRunner = deps.git ?? defaultKnowledgeSyncGitRunner;
+  const git: KnowledgeSyncGitRunner = (args, options) => gitRunner(args, {
+    ...options,
+    env: deps.env,
+  });
   let lock: KnowledgeUpdateLockHandle | undefined;
   try {
     const initial = preflight(workspaceRoot, deps, git, fs);
@@ -2141,7 +2152,7 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
 
       const convergence = convergeAttempt(workspaceRoot, fetchedTips, classification, deps, git, fs);
       if (!convergence.ok) {
-        return { ...convergence.failure, attempts };
+        return { ...convergence, attempts };
       }
 
       let verified: GitTips | KnowledgeSyncFailure | undefined;

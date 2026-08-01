@@ -1086,6 +1086,72 @@ describe("knowledge_update", () => {
     assert.equal(nestedLock.status, "locked");
   });
 
+  it("does not reclaim a fresh lock that replaces the inspected stale lock", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z", token: "stale" })}\n`,
+      "utf8",
+    );
+    const successorLock = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: "2026-08-01T12:00:00.000Z",
+      token: "fresh-successor",
+    })}\n`;
+    let replaced = false;
+    const lockFs: KnowledgeUpdateFs = {
+      closeSync,
+      existsSync,
+      linkSync: ((
+        existingPath: Parameters<typeof linkSync>[0],
+        newPath: Parameters<typeof linkSync>[1],
+      ) => {
+        if (!replaced && existingPath === lockPath) {
+          replaced = true;
+          unlinkSync(lockPath);
+          writeFileSync(lockPath, successorLock, "utf8");
+        }
+        linkSync(existingPath, newPath);
+      }) as typeof linkSync,
+      lstatSync,
+      mkdirSync,
+      openSync,
+      readFileSync,
+      readdirSync,
+      realpathSync,
+      renameSync,
+      statSync,
+      unlinkSync,
+      writeFileSync,
+    };
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "stale-snapshot-race",
+        frontmatter: pageFrontmatter("Stale Snapshot Race"),
+        body: "# Stale Snapshot Race\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        fs: lockFs,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "locked");
+    assert.equal(readFileSync(lockPath, "utf8"), successorLock);
+    assert.equal(existsSync(reclaimPath), false);
+    assert.equal(existsSync(join(workspace, "wiki/pages/project/stale-snapshot-race.md")), false);
+  });
+
   it("recovers an abandoned stale-lock reclamation claim", () => {
     const workspace = createV2Workspace();
     const lockPath = join(workspace, ".tmp/knowledge-update.lock");
@@ -1157,6 +1223,45 @@ describe("knowledge_update", () => {
 
     assertUpdateOk(response);
     assert.equal(acquiredProcessIdentity, "current-process-instance");
+  });
+
+  it("keeps expired-looking locks when the live owner identity matches or cannot be inspected", () => {
+    for (const [name, currentIdentity] of [
+      ["matching", "same-process-instance"],
+      ["unavailable", undefined],
+    ] as const) {
+      const workspace = createV2Workspace();
+      const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+      mkdirSync(dirname(lockPath), { recursive: true });
+      const lockContent = `${JSON.stringify({
+        pid: 42,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        processIdentity: "same-process-instance",
+      })}\n`;
+      writeFileSync(lockPath, lockContent, "utf8");
+
+      const response = executeKnowledgeUpdate(
+        {
+          op: "create",
+          type: "project",
+          slug: `live-owner-${name}`,
+          frontmatter: pageFrontmatter(`Live Owner ${name}`),
+          body: `# Live Owner ${name}\n`,
+        },
+        {
+          agentWorkspaceRoot: workspace,
+          lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+          staleLockMs: 1,
+          isProcessAlive: () => true,
+          getProcessIdentity: () => currentIdentity,
+        },
+      );
+
+      assert.equal(response.ok, false, name);
+      assert.equal(response.status, "locked", name);
+      assert.equal(readFileSync(lockPath, "utf8"), lockContent, name);
+      assert.equal(existsSync(join(workspace, `wiki/pages/project/live-owner-${name}.md`)), false, name);
+    }
   });
 
   it("does not release a lock that has been replaced by a successor", () => {
