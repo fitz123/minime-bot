@@ -271,6 +271,30 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(remoteHead(fixture), remoteTip);
   });
 
+  it("rejects prepended structural-log entries in linear histories", () => {
+    for (const classification of ["ahead", "behind"] as const) {
+      const fixture = createSyncFixture();
+      const originalLog = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+      const rewrittenLog = `- 2026-08-01T00:00:00.000Z update wiki/pages/project/prepended.md\n${originalLog}`;
+      if (classification === "ahead") {
+        commitFiles(fixture.workspace, "prepend local structural history", {
+          "wiki/log.md": rewrittenLog,
+        });
+      } else {
+        const peer = cloneRemote(fixture, "peer-prepended-log");
+        commitFiles(peer, "prepend remote structural history", {
+          "wiki/log.md": rewrittenLog,
+        });
+        git(peer, ["push", "origin", "main"]);
+      }
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "candidate-log-history-not-preserved");
+    }
+  });
+
   it("reconciles committed structural logs larger than spawnSync's default output buffer", () => {
     const fixture = createSyncFixture();
     const largeLog = `# Knowledge Structural Log\n\n- ${"x".repeat(1_200_000)}\n`;
@@ -437,6 +461,52 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(retried.classification, "ahead");
     assert.equal(retried.commit, candidateCommit);
     assert.equal(remoteHead(fixture), candidateCommit);
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
+  it("recovers when candidate outcome persistence fails after the merge commit", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-outcome-interrupted");
+    const localTip = commitFiles(fixture.workspace, "local outcome interruption", {
+      "diary/local-outcome-interrupted.md": "# Local before outcome interruption\n",
+    });
+    const remoteTip = commitFiles(peer, "remote outcome interruption", {
+      "diary/remote-outcome-interrupted.md": "# Remote before outcome interruption\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    let refusedOutcomeWrite = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      fs: {
+        writeFileSync: ((...args: Parameters<typeof writeFileSync>) => {
+          const [path, data] = args;
+          if (
+            !refusedOutcomeWrite &&
+            String(path).includes(".minime-knowledge-sync-owner.json") &&
+            String(data).includes('"outcome"')
+          ) {
+            refusedOutcomeWrite = true;
+            throw new Error("simulated candidate outcome persistence interruption");
+          }
+          return writeFileSync(...args);
+        }) as typeof writeFileSync,
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "candidate-marker-create-failed");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(worktreePaths(fixture).length, 2);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(retried);
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assertAncestor(fixture, localTip, retried.commit);
+    assertAncestor(fixture, remoteTip, retried.commit);
     assert.deepEqual(recoveryRefs(fixture), []);
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
   });

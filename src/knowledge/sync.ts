@@ -761,7 +761,7 @@ function validateLinearStructuralLogHistory(
   }
   if (
     candidateLog.content === undefined ||
-    !lineMultisetContains(candidateLog.content, ancestorLog.content ?? "")
+    !candidateLog.content.startsWith(ancestorLog.content ?? "")
   ) {
     return failure(
       "rejected",
@@ -1070,6 +1070,38 @@ function withTemporaryWorktree(
     if (cached && (cached.ok || cached.failure.status !== "error")) {
       return cached;
     }
+    const resetMarker = { ...reusable.marker, outcome: undefined };
+    const resetMarkerFailure = writeSyncWorktreeMarker(reusable.markerPath, resetMarker, fs);
+    if (resetMarkerFailure) {
+      return { ok: false, failure: resetMarkerFailure };
+    }
+    const removed = git(["worktree", "remove", "--force", reusable.path], { cwd: workspaceRoot });
+    if (removed.status !== 0) {
+      return {
+        ok: false,
+        failure: failure(
+          "error",
+          "candidate-worktree-reset-failed",
+          `knowledge sync could not reset its retained candidate worktree: ${errorText(removed)}`,
+        ),
+      };
+    }
+    const added = git(["worktree", "add", "--detach", reusable.path, startCommit], { cwd: workspaceRoot });
+    if (added.status !== 0) {
+      try {
+        fs.rmSync(dirname(reusable.path), { recursive: true, force: true });
+      } catch {
+        // Git no longer owns the worktree; its temporary parent can be left for system cleanup.
+      }
+      return {
+        ok: false,
+        failure: failure(
+          "error",
+          "candidate-worktree-create-failed",
+          `knowledge sync could not recreate its isolated candidate worktree: ${errorText(added)}`,
+        ),
+      };
+    }
     const retried = work(reusable.path);
     const markerFailure = writeSyncWorktreeMarker(
       reusable.markerPath,
@@ -1145,10 +1177,17 @@ function writeSyncWorktreeMarker(
   marker: SyncWorktreeMarker,
   fs: KnowledgeSyncFs,
 ): KnowledgeSyncFailure | undefined {
+  const temporaryMarkerPath = `${markerPath}.tmp`;
   try {
-    fs.writeFileSync(markerPath, `${JSON.stringify(marker)}\n`, "utf8");
+    fs.writeFileSync(temporaryMarkerPath, `${JSON.stringify(marker)}\n`, "utf8");
+    fs.renameSync(temporaryMarkerPath, markerPath);
     return undefined;
   } catch (error) {
+    try {
+      fs.unlinkSync(temporaryMarkerPath);
+    } catch {
+      // The previous complete marker remains authoritative when temporary replacement fails.
+    }
     return failure(
       "error",
       "candidate-marker-create-failed",
