@@ -92,6 +92,7 @@ export interface KnowledgeSyncDeps {
   lockNow?: () => Date;
   staleLockMs?: number;
   isProcessAlive?: (pid: number) => boolean;
+  getProcessIdentity?: (pid: number) => string | undefined;
 }
 
 interface GitTips {
@@ -111,8 +112,10 @@ interface AttemptFailure {
 
 const RECOVERY_REF_PREFIX = "refs/minime/knowledge-sync/recovery";
 const LOCK_RELPATH = ".tmp/knowledge-update.lock" as const;
+const LOCK_RECLAIM_RELPATH = ".tmp/knowledge-update.lock.reclaim" as const;
 const SYNC_WORKTREE_MARKER = ".minime-knowledge-sync-owner.json";
 const MAX_ATTEMPTS = 2;
+const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 const defaultFs: KnowledgeSyncFs = {
   closeSync,
@@ -136,12 +139,18 @@ export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, opti
   const result = spawnSync("git", [...args], {
     cwd: options.cwd,
     encoding: "utf8",
+    maxBuffer: MAX_GIT_OUTPUT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const executionError = result.error as NodeJS.ErrnoException | undefined;
   return {
     status: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? (result.error ? String(result.error.message) : ""),
+    stdout: executionError ? "" : result.stdout ?? "",
+    stderr: executionError
+      ? executionError.code === "ENOBUFS"
+        ? "git output exceeded the 64 MiB knowledge sync limit."
+        : `git execution failed${executionError.code ? ` (${executionError.code})` : ""}.`
+      : result.stderr ?? "",
   };
 };
 
@@ -155,7 +164,7 @@ function failure(
 }
 
 function errorText(result: KnowledgeSyncGitResult): string {
-  return (result.stderr || result.stdout).trim() || `git exited with status ${result.status}`;
+  return result.stderr.trim() || `git exited with status ${result.status}`;
 }
 
 function isUpdateFailure(value: unknown): value is KnowledgeUpdateFailure {
@@ -231,7 +240,15 @@ function validateMainBranch(workspaceRoot: string, git: KnowledgeSyncGitRunner):
 
 function validateCleanWorktree(workspaceRoot: string, git: KnowledgeSyncGitRunner): KnowledgeSyncFailure | undefined {
   const result = git(
-    ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", `:(exclude)${LOCK_RELPATH}`],
+    [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--",
+      ".",
+      `:(exclude)${LOCK_RELPATH}`,
+      `:(exclude)${LOCK_RECLAIM_RELPATH}`,
+    ],
     { cwd: workspaceRoot },
   );
   if (result.status !== 0) {
@@ -252,7 +269,9 @@ function validateRuntimeLockUntracked(
   workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
-  const result = git(["ls-files", "--cached", "-z", "--", LOCK_RELPATH], { cwd: workspaceRoot });
+  const result = git(["ls-files", "--cached", "-z", "--", LOCK_RELPATH, LOCK_RECLAIM_RELPATH], {
+    cwd: workspaceRoot,
+  });
   if (result.status !== 0) {
     return failure(
       "error",
@@ -264,7 +283,7 @@ function validateRuntimeLockUntracked(
     return failure(
       "rejected",
       "tracked-runtime-lock",
-      `knowledge sync requires ${LOCK_RELPATH} to remain untracked runtime state; remove it from Git history first.`,
+      `knowledge sync requires ${LOCK_RELPATH} and its reclaim marker to remain untracked runtime state; remove them from Git history first.`,
     );
   }
   return undefined;
@@ -529,6 +548,7 @@ function validateManagedGitEntries(
     );
   }
 
+  const trackedPaths = new Set<string>();
   for (const entry of listed.stdout.split("\0").filter(Boolean)) {
     const match = /^(\d+) [0-9a-f]+ (\d+)\t([\s\S]+)$/u.exec(entry);
     if (!match) {
@@ -539,6 +559,7 @@ function validateManagedGitEntries(
       );
     }
     const [, mode, stage, relPath] = match;
+    trackedPaths.add(relPath);
     if (stage !== "0") {
       return failure(
         "conflict",
@@ -564,6 +585,13 @@ function validateManagedGitEntries(
         );
       }
     }
+  }
+  if (!trackedPaths.has("wiki/log.md")) {
+    return failure(
+      "rejected",
+      "candidate-structural-log-missing",
+      "knowledge sync requires a committed regular wiki/log.md structural history.",
+    );
   }
   return undefined;
 }
@@ -713,6 +741,35 @@ function lineMultisetContains(candidate: string, source: string): boolean {
     }
   }
   return true;
+}
+
+function validateLinearStructuralLogHistory(
+  candidateRoot: string,
+  tips: GitTips,
+  classification: "ahead" | "behind",
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const ancestorCommit = classification === "ahead" ? tips.remote : tips.local;
+  const candidateCommit = classification === "ahead" ? tips.local : tips.remote;
+  const ancestorLog = readCommitFile(candidateRoot, ancestorCommit, "wiki/log.md", git);
+  if (!ancestorLog.ok) {
+    return ancestorLog.failure;
+  }
+  const candidateLog = readCommitFile(candidateRoot, candidateCommit, "wiki/log.md", git);
+  if (!candidateLog.ok) {
+    return candidateLog.failure;
+  }
+  if (
+    candidateLog.content === undefined ||
+    !lineMultisetContains(candidateLog.content, ancestorLog.content ?? "")
+  ) {
+    return failure(
+      "rejected",
+      "candidate-log-history-not-preserved",
+      "knowledge sync refused a linear candidate that did not preserve its ancestor structural-log history.",
+    );
+  }
+  return undefined;
 }
 
 function validateCandidateMergeState(
@@ -986,6 +1043,8 @@ function reconcileDerivedKnowledgeState(
 function withTemporaryWorktree(
   workspaceRoot: string,
   startCommit: string,
+  tips: GitTips,
+  classification: "behind" | "diverged",
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
@@ -995,31 +1054,53 @@ function withTemporaryWorktree(
   if (typeof commonDir !== "string") {
     return { ok: false, failure: commonDir };
   }
+  const existingWorktrees = listSyncTemporaryWorktrees(workspaceRoot, git, fs);
+  if (!Array.isArray(existingWorktrees)) {
+    return { ok: false, failure: existingWorktrees };
+  }
+  const reusable = existingWorktrees.find(({ marker }) =>
+    marker.version === 2 &&
+    marker.startCommit === startCommit &&
+    marker.localTip === tips.local &&
+    marker.remoteTip === tips.remote &&
+    marker.classification === classification
+  );
+  if (reusable) {
+    const cached = parseCandidateOutcome(reusable.marker.outcome);
+    if (cached && (cached.ok || cached.failure.status !== "error")) {
+      return cached;
+    }
+    const retried = work(reusable.path);
+    const markerFailure = writeSyncWorktreeMarker(
+      reusable.markerPath,
+      { ...reusable.marker, outcome: retried },
+      fs,
+    );
+    return markerFailure ? { ok: false, failure: markerFailure } : retried;
+  }
+
   const base = deps.temporaryDirectory ?? tmpdir();
   fs.mkdirSync(base, { recursive: true });
   const tempRoot = fs.mkdtempSync(join(base, "minime-knowledge-sync-"));
   const candidateRoot = join(tempRoot, "candidate");
   const markerPath = join(tempRoot, SYNC_WORKTREE_MARKER);
-  try {
-    fs.writeFileSync(
-      markerPath,
-      `${JSON.stringify({ version: 1, repositoryGitCommonDir: commonDir, candidateRoot: normalize(resolve(candidateRoot)) })}\n`,
-      "utf8",
-    );
-  } catch (error) {
+  const marker: SyncWorktreeMarker = {
+    version: 2,
+    repositoryGitCommonDir: commonDir,
+    candidateRoot: normalize(resolve(candidateRoot)),
+    startCommit,
+    localTip: tips.local,
+    remoteTip: tips.remote,
+    classification,
+  };
+  const markerFailure = writeSyncWorktreeMarker(markerPath, marker, fs);
+  if (markerFailure) {
     try {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     } catch {
       // The fresh temporary directory contains no registered worktree and is safe to leave for system cleanup.
     }
-    return {
-      ok: false,
-      failure: failure(
-        "error",
-        "candidate-marker-create-failed",
-        `knowledge sync could not mark its isolated candidate worktree: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    };
+    return { ok: false, failure: markerFailure };
   }
   const add = git(["worktree", "add", "--detach", candidateRoot, startCommit], { cwd: workspaceRoot });
   if (add.status !== 0) {
@@ -1037,7 +1118,65 @@ function withTemporaryWorktree(
       ),
     };
   }
-  return work(candidateRoot);
+  const outcome = work(candidateRoot);
+  const outcomeMarkerFailure = writeSyncWorktreeMarker(markerPath, { ...marker, outcome }, fs);
+  return outcomeMarkerFailure ? { ok: false, failure: outcomeMarkerFailure } : outcome;
+}
+
+interface SyncWorktreeMarker {
+  version: 1 | 2;
+  repositoryGitCommonDir: string;
+  candidateRoot: string;
+  startCommit?: string;
+  localTip?: string;
+  remoteTip?: string;
+  classification?: "behind" | "diverged";
+  outcome?: unknown;
+}
+
+interface SyncTemporaryWorktree {
+  path: string;
+  markerPath: string;
+  marker: SyncWorktreeMarker;
+}
+
+function writeSyncWorktreeMarker(
+  markerPath: string,
+  marker: SyncWorktreeMarker,
+  fs: KnowledgeSyncFs,
+): KnowledgeSyncFailure | undefined {
+  try {
+    fs.writeFileSync(markerPath, `${JSON.stringify(marker)}\n`, "utf8");
+    return undefined;
+  } catch (error) {
+    return failure(
+      "error",
+      "candidate-marker-create-failed",
+      `knowledge sync could not mark its isolated candidate worktree: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function parseCandidateOutcome(value: unknown): CandidateResult | AttemptFailure | undefined {
+  if (typeof value !== "object" || value === null || !("ok" in value)) {
+    return undefined;
+  }
+  if (value.ok === true && "commit" in value && typeof value.commit === "string") {
+    return { ok: true, commit: value.commit };
+  }
+  if (value.ok !== false || !("failure" in value) || typeof value.failure !== "object" || value.failure === null) {
+    return undefined;
+  }
+  const cachedFailure = value.failure as Partial<KnowledgeSyncFailure>;
+  if (
+    cachedFailure.ok !== false ||
+    typeof cachedFailure.status !== "string" ||
+    typeof cachedFailure.reason !== "string" ||
+    typeof cachedFailure.message !== "string"
+  ) {
+    return undefined;
+  }
+  return { ok: false, failure: cachedFailure as KnowledgeSyncFailure };
 }
 
 function gitCommonDir(
@@ -1061,7 +1200,7 @@ function listSyncTemporaryWorktrees(
   workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
-): string[] | KnowledgeSyncFailure {
+): SyncTemporaryWorktree[] | KnowledgeSyncFailure {
   const commonDir = gitCommonDir(workspaceRoot, git, fs);
   if (typeof commonDir !== "string") {
     return commonDir;
@@ -1081,23 +1220,24 @@ function listSyncTemporaryWorktrees(
     .filter(
       (path) => basename(path) === "candidate" && basename(dirname(path)).startsWith("minime-knowledge-sync-"),
     );
-  return candidates.filter((path) => {
+  const owned: SyncTemporaryWorktree[] = [];
+  for (const path of candidates) {
     try {
-      const marker = JSON.parse(fs.readFileSync(join(dirname(path), SYNC_WORKTREE_MARKER), "utf8")) as {
-        version?: unknown;
-        repositoryGitCommonDir?: unknown;
-        candidateRoot?: unknown;
-      };
-      return (
-        marker.version === 1 &&
+      const markerPath = join(dirname(path), SYNC_WORKTREE_MARKER);
+      const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as Partial<SyncWorktreeMarker>;
+      if (
+        (marker.version === 1 || marker.version === 2) &&
         marker.repositoryGitCommonDir === commonDir &&
         typeof marker.candidateRoot === "string" &&
         realOrResolved(marker.candidateRoot, fs) === realOrResolved(path, fs)
-      );
+      ) {
+        owned.push({ path, markerPath, marker: marker as SyncWorktreeMarker });
+      }
     } catch {
-      return false;
+      // Ignore unowned or malformed lookalikes.
     }
-  });
+  }
+  return owned;
 }
 
 function removeSyncTemporaryWorktrees(
@@ -1105,11 +1245,11 @@ function removeSyncTemporaryWorktrees(
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
 ): KnowledgeSyncFailure | undefined {
-  const paths = listSyncTemporaryWorktrees(workspaceRoot, git, fs);
-  if (!Array.isArray(paths)) {
-    return paths;
+  const worktrees = listSyncTemporaryWorktrees(workspaceRoot, git, fs);
+  if (!Array.isArray(worktrees)) {
+    return worktrees;
   }
-  for (const path of paths) {
+  for (const { path, markerPath } of worktrees) {
     const removed = git(["worktree", "remove", "--force", path], { cwd: workspaceRoot });
     if (removed.status !== 0) {
       return failure(
@@ -1120,7 +1260,7 @@ function removeSyncTemporaryWorktrees(
     }
     const tempRoot = dirname(path);
     try {
-      fs.unlinkSync(join(tempRoot, SYNC_WORKTREE_MARKER));
+      fs.unlinkSync(markerPath);
       if (fs.readdirSync(tempRoot).length === 0) {
         fs.rmSync(tempRoot, { recursive: true, force: true });
       }
@@ -1145,17 +1285,27 @@ function prepareCandidate(
 ): CandidateResult | AttemptFailure {
   if (classification === "no-op" || classification === "ahead") {
     const invalid = validateCandidateLayout(workspaceRoot, deps, git, fs);
-    return invalid ? { ok: false, failure: invalid } : { ok: true, commit: tips.local };
+    if (invalid) {
+      return { ok: false, failure: invalid };
+    }
+    const logHistoryProblem = classification === "ahead"
+      ? validateLinearStructuralLogHistory(workspaceRoot, tips, classification, git)
+      : undefined;
+    return logHistoryProblem ? { ok: false, failure: logHistoryProblem } : { ok: true, commit: tips.local };
   }
 
   if (classification === "behind") {
-    return withTemporaryWorktree(workspaceRoot, tips.remote, deps, git, fs, (candidateRoot) => {
+    return withTemporaryWorktree(workspaceRoot, tips.remote, tips, classification, deps, git, fs, (candidateRoot) => {
       const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
-      return invalid ? { ok: false, failure: invalid } : { ok: true, commit: tips.remote };
+      if (invalid) {
+        return { ok: false, failure: invalid };
+      }
+      const logHistoryProblem = validateLinearStructuralLogHistory(candidateRoot, tips, classification, git);
+      return logHistoryProblem ? { ok: false, failure: logHistoryProblem } : { ok: true, commit: tips.remote };
     });
   }
 
-  return withTemporaryWorktree(workspaceRoot, tips.local, deps, git, fs, (candidateRoot) => {
+  return withTemporaryWorktree(workspaceRoot, tips.local, tips, classification, deps, git, fs, (candidateRoot) => {
     const merged = git(["merge", "--no-ff", "--no-commit", tips.remote], { cwd: candidateRoot });
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
     if (merged.status !== 0) {
@@ -1346,6 +1496,7 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
       lockNow: deps.lockNow,
       staleLockMs: deps.staleLockMs,
       isProcessAlive: deps.isProcessAlive,
+      getProcessIdentity: deps.getProcessIdentity,
     });
     if (isUpdateFailure(acquired)) {
       return mapLockFailure(acquired);

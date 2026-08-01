@@ -381,6 +381,8 @@ a temporary detached worktree, validates the complete Knowledge corpus, and
 fast-forwards canonical `main` only after validation. It then pushes and verifies
 that local and remote `main` are equal. The command never loads control-workspace
 secrets and does not force-push, reset, rebase, or select a silent winner.
+Git command output is bounded at 64 MiB; an overflow fails without echoing the
+captured Knowledge content.
 
 Before convergence, both observed tips are retained under synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -157,6 +158,19 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
+  it("rejects a no-op corpus with no committed structural log", () => {
+    const fixture = createSyncFixture();
+    git(fixture.workspace, ["rm", "wiki/log.md"]);
+    git(fixture.workspace, ["commit", "-m", "remove the structural log"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-structural-log-missing");
+    assert.equal(localHead(fixture), remoteHead(fixture));
+  });
+
   it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-behind");
@@ -174,6 +188,24 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(remoteHead(fixture), remoteCommit);
     assert.match(readFileSync(join(fixture.workspace, "diary/2026-08-01.md"), "utf8"), /Fetched history/);
     assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("rejects a behind commit that truncates structural-log history", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-truncated-log");
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "truncate structural history", {
+      "wiki/log.md": "# Replaced Structural Log\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-log-history-not-preserved");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8"), "# Knowledge Structural Log\n");
   });
 
   it("does not push when the validated commit already equals fetched origin/main", () => {
@@ -222,6 +254,44 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(response.commit, localCommit);
     assert.equal(remoteHead(fixture), localCommit);
     assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("does not push an ahead commit that truncates structural-log history", () => {
+    const fixture = createSyncFixture();
+    const remoteTip = remoteHead(fixture);
+    const localTip = commitFiles(fixture.workspace, "truncate local structural history", {
+      "wiki/log.md": "# Replaced Local Structural Log\n",
+    });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-log-history-not-preserved");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("reconciles committed structural logs larger than spawnSync's default output buffer", () => {
+    const fixture = createSyncFixture();
+    const largeLog = `# Knowledge Structural Log\n\n- ${"x".repeat(1_200_000)}\n`;
+    commitFiles(fixture.workspace, "grow structural history beyond one MiB", {
+      "wiki/log.md": largeLog,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-large-log");
+    commitFiles(fixture.workspace, "local large-log divergence", {
+      "diary/local-large-log.md": "# Local large-log branch\n",
+    });
+    commitFiles(peer, "remote large-log divergence", {
+      "diary/remote-large-log.md": "# Remote large-log branch\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "diverged");
+    assert.ok(readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8").startsWith(largeLog));
   });
 
   it("merges clean divergence in a detached worktree and keeps both pre-sync tips reachable", () => {
@@ -748,6 +818,52 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
+  it("rejects a tracked runtime reclaim marker without deleting committed bytes", () => {
+    const fixture = createSyncFixture();
+    const reclaimPath = join(fixture.workspace, ".tmp/knowledge-update.lock.reclaim");
+    const reclaimContent = "reserved runtime reclaim state\n";
+    writeFiles(fixture.workspace, { ".tmp/knowledge-update.lock.reclaim": reclaimContent });
+    git(fixture.workspace, ["add", "-f", ".tmp/knowledge-update.lock.reclaim"]);
+    git(fixture.workspace, ["commit", "-m", "track the reserved runtime reclaim path"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const committedTip = localHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "tracked-runtime-lock");
+    assert.equal(localHead(fixture), committedTip);
+    assert.equal(remoteHead(fixture), committedTip);
+    assert.equal(readFileSync(reclaimPath, "utf8"), reclaimContent);
+  });
+
+  it("recovers an untracked abandoned reclaim marker before locked preflight", () => {
+    const fixture = createSyncFixture();
+    git(fixture.workspace, ["rm", ".gitignore"]);
+    git(fixture.workspace, ["commit", "-m", "remove runtime ignore for reclaim coverage"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    writeFiles(fixture.workspace, {
+      ".tmp/knowledge-update.lock": `${JSON.stringify({
+        pid: 999_999,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+    });
+    linkSync(lockPath, reclaimPath);
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      lockNow: () => new Date(Date.now() + 60_000),
+      staleLockMs: 1,
+      isProcessAlive: () => false,
+    });
+
+    assertSyncOk(response);
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(existsSync(reclaimPath), false);
+  });
+
   it("rejects a tracked runtime lock introduced by fetched history before fast-forwarding", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-tracked-runtime-lock");
@@ -825,6 +941,8 @@ describe("knowledge sync validation and failure boundaries", () => {
     git(peer, ["push", "origin", "main"]);
 
     const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+    const pathsAfterFirst = worktreePaths(fixture);
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
 
     assert.equal(response.ok, false);
     assert.equal(response.reason, "candidate-not-knowledge-v2");
@@ -832,7 +950,10 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(localHead(fixture), beforeHead);
     assert.equal(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), generateKnowledgeIndex([]));
     assert.equal(recoveryRefs(fixture).length, 2);
-    assert.equal(worktreePaths(fixture).length, 2);
+    assert.equal(pathsAfterFirst.length, 2);
+    assert.equal(retried.ok, false);
+    assert.equal(retried.reason, "candidate-not-knowledge-v2");
+    assert.deepEqual(worktreePaths(fixture), pathsAfterFirst);
   });
 
   it("converts a post-lock Git exception into a typed failure and releases the lock", () => {
@@ -858,6 +979,25 @@ describe("knowledge sync validation and failure boundaries", () => {
     assertSyncOk(retried);
   });
 
+  it("does not include Git stdout in execution failures", () => {
+    const fixture = createSyncFixture();
+    const privateOutput = "private committed Knowledge bytes";
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (args[0] === "fetch") {
+          return { status: 1, stdout: privateOutput, stderr: "" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "fetch-failed");
+    assert.equal(response.message.includes(privateOutput), false);
+  });
+
   it("leaves canonical HEAD and files unchanged on a non-Knowledge conflict", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-conflict");
@@ -881,5 +1021,28 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(remoteHead(fixture), remoteTip);
     assert.equal(recoveryRefs(fixture).length, 2);
     assert.equal(worktreePaths(fixture).length, 2);
+  });
+
+  it("reuses one retained candidate for repeated failures with identical tips", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-repeated-conflict");
+    commitFiles(fixture.workspace, "local repeated conflict", {
+      "README.md": "# Agent workspace\n\nLocal repeated claim.\n",
+    });
+    commitFiles(peer, "remote repeated conflict", {
+      "README.md": "# Agent workspace\n\nRemote repeated claim.\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const first = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+    const pathsAfterFirst = worktreePaths(fixture);
+    const second = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(first.ok, false);
+    assert.equal(first.reason, "non-knowledge-conflict");
+    assert.equal(second.ok, false);
+    assert.equal(second.reason, "non-knowledge-conflict");
+    assert.equal(pathsAfterFirst.length, 2);
+    assert.deepEqual(worktreePaths(fixture), pathsAfterFirst);
   });
 });

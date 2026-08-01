@@ -68,6 +68,7 @@ export interface KnowledgeUpdateDeps {
   lockNow?: () => Date;
   staleLockMs?: number;
   isProcessAlive?: (pid: number) => boolean;
+  getProcessIdentity?: (pid: number) => string | undefined;
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
   archivePrecondition?: KnowledgeArchivePrecondition;
 }
@@ -149,6 +150,7 @@ export interface KnowledgeUpdateLockHandle {
 }
 
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
+const LOCK_RECLAIM_SUFFIX = ".reclaim";
 const KNOWN_PAGE_TYPES = new Set<string>(KNOWLEDGE_PAGE_TYPES);
 const REQUIRED_FRONTMATTER = ["name", "description", "type"] as const;
 const OPTIONAL_FRONTMATTER = ["confidence", "revisit_if", "originSessionId"] as const;
@@ -879,8 +881,13 @@ export function acquireKnowledgeUpdateLock(
   const now = deps.lockNow?.() ?? new Date();
   const staleLockMs = deps.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
   const isProcessAlive = deps.isProcessAlive ?? defaultProcessAlive;
+  const getProcessIdentity = deps.getProcessIdentity ?? defaultProcessIdentity;
   const token = randomUUID();
-  const lockSafetyProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs);
+  const reclaimPath = `${lockPath}${LOCK_RECLAIM_SUFFIX}`;
+  let ownedReclaim: LockFileIdentity | undefined;
+  const lockSafetyProblem =
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, reclaimPath, fs);
   if (lockSafetyProblem) {
     return lockSafetyProblem;
   }
@@ -890,33 +897,65 @@ export function acquireKnowledgeUpdateLock(
     return createdParentSafetyProblem;
   }
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!ownedReclaim && fs.existsSync(reclaimPath)) {
+      const reclaim = lockFileIdentity(reclaimPath, fs);
+      if (!reclaim || now.getTime() - reclaim.ctimeMs <= staleLockMs) {
+        return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+      }
+      try {
+        fs.unlinkSync(reclaimPath);
+      } catch {
+        if (fs.existsSync(reclaimPath)) {
+          return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+        }
+      }
+    }
+
     let fd: number | undefined;
     let createdLock = false;
     try {
       fd = fs.openSync(lockPath, "wx", 0o600);
       createdLock = true;
+      const processIdentity = getProcessIdentity(process.pid);
       fs.writeFileSync(
         fd,
-        `${JSON.stringify({ pid: process.pid, acquiredAt: now.toISOString(), path: lockRelPath, token }, null, 2)}\n`,
+        `${JSON.stringify({
+          pid: process.pid,
+          acquiredAt: now.toISOString(),
+          path: lockRelPath,
+          token,
+          ...(processIdentity ? { processIdentity } : {}),
+        }, null, 2)}\n`,
         { encoding: "utf8" },
       );
       if (fd !== undefined) {
         fs.closeSync(fd);
         fd = undefined;
       }
+      if (!ownedReclaim && fs.existsSync(reclaimPath)) {
+        removeLockOwnedByToken(lockPath, token, fs);
+        return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+      }
+      if (ownedReclaim) {
+        const currentReclaim = lockFileIdentity(reclaimPath, fs);
+        if (!currentReclaim || !sameLockFile(currentReclaim, ownedReclaim)) {
+          removeLockOwnedByToken(lockPath, token, fs);
+          return failure("locked", "knowledge-update-locked", "knowledge_update lost ownership of stale-lock reclamation.");
+        }
+        try {
+          fs.unlinkSync(reclaimPath);
+        } catch {
+          removeLockOwnedByToken(lockPath, token, fs);
+          return failure("locked", "knowledge-update-locked", "knowledge_update could not finish stale-lock reclamation.");
+        }
+        ownedReclaim = undefined;
+      }
       return {
         path: lockPath,
         relPath: lockRelPath,
         release: () => {
-          try {
-            const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { token?: unknown };
-            if (current.token === token) {
-              fs.unlinkSync(lockPath);
-            }
-          } catch {
-            // Lock release is best effort; the next caller has stale-lock recovery.
-          }
+          removeLockOwnedByToken(lockPath, token, fs);
         },
       };
     } catch (error) {
@@ -933,25 +972,118 @@ export function acquireKnowledgeUpdateLock(
         } catch {
           // Best effort cleanup of a lock file this process created but did not initialize.
         }
+        releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
         return failure("error", "knowledge-update-lock-write-failed", "knowledge_update could not initialize its lock file.");
       }
       if (!fs.existsSync(lockPath)) {
         continue;
       }
-      const stale = isStaleLock(lockPath, now, staleLockMs, fs, isProcessAlive);
-      if (stale && attempt === 0) {
-        try {
-          fs.unlinkSync(lockPath);
-          continue;
-        } catch {
-          return failure("locked", "knowledge-update-locked", "knowledge_update could not remove a stale lock file.");
+      const stale = isStaleLock(lockPath, now, staleLockMs, fs, isProcessAlive, getProcessIdentity);
+      if (stale && attempt < 2) {
+        const claimed = claimStaleLock(lockPath, reclaimPath, fs);
+        if (isUpdateFailure(claimed)) {
+          return claimed;
         }
+        if (!claimed) {
+          continue;
+        }
+        ownedReclaim = claimed;
+        continue;
       }
+      releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
       return failure("locked", "knowledge-update-locked", "knowledge_update is already running for this agent workspace.");
     }
   }
 
+  releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
   return failure("locked", "knowledge-update-locked", "knowledge_update could not acquire its workspace lock.");
+}
+
+interface LockFileIdentity {
+  dev: number;
+  ino: number;
+  ctimeMs: number;
+}
+
+function lockFileIdentity(path: string, fs: KnowledgeUpdateFs): LockFileIdentity | undefined {
+  try {
+    const stat = fs.lstatSync(path);
+    return { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameLockFile(left: LockFileIdentity, right: LockFileIdentity, includeChangeTime = false): boolean {
+  return left.dev === right.dev && left.ino === right.ino && (!includeChangeTime || left.ctimeMs === right.ctimeMs);
+}
+
+function removeLockOwnedByToken(lockPath: string, token: string, fs: KnowledgeUpdateFs): void {
+  try {
+    const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { token?: unknown };
+    if (current.token === token) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch {
+    // Lock release is best effort; the next caller has stale-lock recovery.
+  }
+}
+
+function releaseStaleLockClaim(
+  reclaimPath: string,
+  ownedReclaim: LockFileIdentity | undefined,
+  fs: KnowledgeUpdateFs,
+): void {
+  if (!ownedReclaim) {
+    return;
+  }
+  const current = lockFileIdentity(reclaimPath, fs);
+  if (!current || !sameLockFile(current, ownedReclaim)) {
+    return;
+  }
+  try {
+    fs.unlinkSync(reclaimPath);
+  } catch {
+    // The claim expires independently if this best-effort cleanup fails.
+  }
+}
+
+function claimStaleLock(
+  lockPath: string,
+  reclaimPath: string,
+  fs: KnowledgeUpdateFs,
+): LockFileIdentity | KnowledgeUpdateFailure | undefined {
+  try {
+    fs.linkSync(lockPath, reclaimPath);
+  } catch {
+    if (!fs.existsSync(lockPath)) {
+      return undefined;
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+  }
+
+  const claimed = lockFileIdentity(reclaimPath, fs);
+  const current = lockFileIdentity(lockPath, fs);
+  if (!claimed || !current || !sameLockFile(claimed, current, true)) {
+    try {
+      fs.unlinkSync(reclaimPath);
+    } catch {
+      // A successor reclaimer owns the shared claim now.
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update could not atomically claim the stale lock.");
+  }
+
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    try {
+      fs.unlinkSync(reclaimPath);
+    } catch {
+      // Best effort cleanup after a lost reclaim race.
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update could not remove the claimed stale lock.");
+  }
+  return lockFileIdentity(reclaimPath, fs) ?? claimed;
 }
 
 function defaultProcessAlive(pid: number): boolean {
@@ -962,25 +1094,42 @@ function defaultProcessAlive(pid: number): boolean {
   return result.error !== undefined || result.status === 0;
 }
 
+function defaultProcessIdentity(pid: number): string | undefined {
+  const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 1_000,
+  });
+  if (result.error || result.status !== 0) {
+    return undefined;
+  }
+  return result.stdout.trim() || undefined;
+}
+
 function isStaleLock(
   lockPath: string,
   now: Date,
   staleLockMs: number,
   fs: KnowledgeUpdateFs,
   isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
 ): boolean {
   let ownerPid: number | undefined;
+  let ownerProcessIdentity: string | undefined;
   try {
     const raw = fs.readFileSync(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as { acquiredAt?: unknown; pid?: unknown };
+    const parsed = JSON.parse(raw) as { acquiredAt?: unknown; pid?: unknown; processIdentity?: unknown };
     if (typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
       ownerPid = parsed.pid;
+    }
+    if (typeof parsed.processIdentity === "string" && parsed.processIdentity) {
+      ownerProcessIdentity = parsed.processIdentity;
     }
     if (typeof parsed.acquiredAt === "string") {
       const acquiredAt = Date.parse(parsed.acquiredAt);
       if (Number.isFinite(acquiredAt)) {
         const expired = now.getTime() - acquiredAt > staleLockMs;
-        return expired && !lockOwnerIsAlive(ownerPid, isProcessAlive);
+        return expired && !lockOwnerIsAlive(ownerPid, ownerProcessIdentity, isProcessAlive, getProcessIdentity);
       }
     }
   } catch {
@@ -989,18 +1138,30 @@ function isStaleLock(
 
   try {
     const expired = now.getTime() - fs.statSync(lockPath).mtimeMs > staleLockMs;
-    return expired && !lockOwnerIsAlive(ownerPid, isProcessAlive);
+    return expired && !lockOwnerIsAlive(ownerPid, ownerProcessIdentity, isProcessAlive, getProcessIdentity);
   } catch {
     return false;
   }
 }
 
-function lockOwnerIsAlive(ownerPid: number | undefined, isProcessAlive: (pid: number) => boolean): boolean {
+function lockOwnerIsAlive(
+  ownerPid: number | undefined,
+  ownerProcessIdentity: string | undefined,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
+): boolean {
   if (ownerPid === undefined) {
     return false;
   }
   try {
-    return isProcessAlive(ownerPid);
+    if (!isProcessAlive(ownerPid)) {
+      return false;
+    }
+    if (!ownerProcessIdentity) {
+      return true;
+    }
+    const currentProcessIdentity = getProcessIdentity(ownerPid);
+    return currentProcessIdentity === undefined || currentProcessIdentity === ownerProcessIdentity;
   } catch {
     return true;
   }

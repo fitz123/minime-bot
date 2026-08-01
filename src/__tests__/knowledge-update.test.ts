@@ -1,26 +1,34 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { generateKnowledgeV2Schema, resolveKnowledgeLayout } from "../knowledge/layout.js";
 import { executeKnowledgeSearch } from "../knowledge/tools.js";
 import {
+  acquireKnowledgeUpdateLock,
   executeKnowledgeUpdate,
   formatKnowledgePage,
   formatKnowledgeUpdateResponse,
+  type KnowledgeUpdateFs,
+  type KnowledgeUpdateLockHandle,
   type KnowledgeUpdateResponse,
 } from "../knowledge/update.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
@@ -1012,6 +1020,143 @@ describe("knowledge_update", () => {
     assert.equal(fresh.ok, false);
     assert.equal(fresh.status, "locked");
     rmSync(lockPath, { force: true });
+  });
+
+  it("serializes stale-lock reclamation against another cooperative caller", () => {
+    const workspace = createV2Workspace();
+    const layout = resolveKnowledgeLayout(workspace);
+    assert.equal(layout.kind, "v2");
+    if (layout.kind !== "v2") {
+      return;
+    }
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z" })}\n`,
+      "utf8",
+    );
+    let nestedLock: KnowledgeUpdateLockHandle | ReturnType<typeof executeKnowledgeUpdate> | undefined;
+    let interleaveOnPrimaryUnlink = true;
+    const lockFs: KnowledgeUpdateFs = {
+      closeSync,
+      existsSync,
+      linkSync,
+      lstatSync,
+      mkdirSync,
+      openSync,
+      readFileSync,
+      readdirSync,
+      realpathSync,
+      renameSync,
+      statSync,
+      unlinkSync: ((path: Parameters<typeof unlinkSync>[0]) => {
+        if (interleaveOnPrimaryUnlink && path === lockPath) {
+          interleaveOnPrimaryUnlink = false;
+          nestedLock = acquireKnowledgeUpdateLock(layout, lockFs, {
+            lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+            staleLockMs: 1,
+            isProcessAlive: () => false,
+          });
+        }
+        unlinkSync(path);
+      }) as typeof unlinkSync,
+      writeFileSync,
+    };
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "serialized-reclaim",
+        frontmatter: pageFrontmatter("Serialized Reclaim"),
+        body: "# Serialized Reclaim\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        fs: lockFs,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.ok(nestedLock && "ok" in nestedLock && nestedLock.ok === false);
+    assert.equal(nestedLock.status, "locked");
+  });
+
+  it("recovers an abandoned stale-lock reclamation claim", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z" })}\n`,
+      "utf8",
+    );
+    linkSync(lockPath, reclaimPath);
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "abandoned-reclaim",
+        frontmatter: pageFrontmatter("Abandoned Reclaim"),
+        body: "# Abandoned Reclaim\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        lockNow: () => new Date(Date.now() + 60_000),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(existsSync(reclaimPath), false);
+  });
+
+  it("reclaims an expired lock when its PID belongs to a different process instance", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({
+        pid: 42,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        processIdentity: "old-process-instance",
+      })}\n`,
+      "utf8",
+    );
+
+    let acquiredProcessIdentity: unknown;
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "reused-pid",
+        frontmatter: pageFrontmatter("Reused PID"),
+        body: "# Reused PID\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => true,
+        getProcessIdentity: (pid) => pid === 42 ? "new-process-instance" : "current-process-instance",
+        refreshSearchBackend: () => {
+          acquiredProcessIdentity = (JSON.parse(readFileSync(lockPath, "utf8")) as { processIdentity?: unknown })
+            .processIdentity;
+        },
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(acquiredProcessIdentity, "current-process-instance");
   });
 
   it("does not release a lock that has been replaced by a successor", () => {
