@@ -25,6 +25,11 @@ import {
 } from "./layout.js";
 import {
   acquireKnowledgeUpdateLock,
+  assertSafeKnowledgeWorkspacePath,
+  collectKnowledgePages,
+  formatKnowledgePage,
+  generateKnowledgeIndex,
+  parseManagedKnowledgePagePath,
   type KnowledgeUpdateFailure,
   type KnowledgeUpdateFs,
   type KnowledgeUpdateLockHandle,
@@ -158,8 +163,8 @@ function errorText(result: KnowledgeSyncGitResult): string {
   return (result.stderr || result.stdout).trim() || `git exited with status ${result.status}`;
 }
 
-function isUpdateFailure(value: KnowledgeUpdateLockHandle | KnowledgeUpdateFailure): value is KnowledgeUpdateFailure {
-  return "ok" in value && value.ok === false;
+function isUpdateFailure(value: unknown): value is KnowledgeUpdateFailure {
+  return typeof value === "object" && value !== null && "ok" in value && value.ok === false;
 }
 
 function workspaceRootFromDeps(deps: KnowledgeSyncDeps): string | undefined {
@@ -402,6 +407,7 @@ function validateCandidateLayout(
   candidateRoot: string,
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
 ): KnowledgeSyncFailure | undefined {
   const layout = (deps.resolveLayout ?? resolveKnowledgeLayout)(candidateRoot);
   if (layout.kind !== "v2") {
@@ -412,12 +418,142 @@ function validateCandidateLayout(
       { layoutKind: layout.kind },
     );
   }
+  const corpusProblem = validateCandidateCorpus(layout, git, fs);
+  if (corpusProblem) {
+    return corpusProblem;
+  }
   const clean = validateCleanWorktree(candidateRoot, git);
   if (clean) {
     return failure(
       clean.status,
       "candidate-worktree-not-clean",
       `knowledge sync candidate validation failed: ${clean.message}`,
+    );
+  }
+  return undefined;
+}
+
+function candidateUpdateFailure(
+  problem: KnowledgeUpdateFailure,
+  reason: string,
+  context: string,
+): KnowledgeSyncFailure {
+  return failure(
+    "rejected",
+    reason,
+    `${context}: ${problem.message}`,
+    problem.layoutKind ? { layoutKind: problem.layoutKind } : {},
+  );
+}
+
+function validateManagedGitEntries(
+  layout: ResolvedKnowledgeV2Layout,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const listed = git(
+    [
+      "ls-files",
+      "--stage",
+      "-z",
+      "--",
+      "wiki/schema.md",
+      "wiki/index.md",
+      "wiki/log.md",
+      "wiki/issues.md",
+      "wiki/pages",
+      "artifacts/knowledge-archive",
+    ],
+    { cwd: layout.agentWorkspaceRoot },
+  );
+  if (listed.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-path-inspection-failed",
+      `knowledge sync could not inspect managed candidate paths: ${errorText(listed)}`,
+    );
+  }
+
+  for (const entry of listed.stdout.split("\0").filter(Boolean)) {
+    const match = /^(\d+) [0-9a-f]+ (\d+)\t([\s\S]+)$/u.exec(entry);
+    if (!match) {
+      return failure(
+        "error",
+        "candidate-managed-path-inspection-failed",
+        "knowledge sync could not parse the managed candidate Git index.",
+      );
+    }
+    const [, mode, stage, relPath] = match;
+    if (stage !== "0") {
+      return failure(
+        "conflict",
+        "candidate-unresolved-conflict",
+        `knowledge sync candidate still has an unresolved managed path: ${relPath}.`,
+        { conflictPaths: [relPath] },
+      );
+    }
+    if (mode !== "100644" && mode !== "100755") {
+      return failure(
+        "rejected",
+        "candidate-unsafe-managed-entry",
+        `knowledge sync requires managed paths to be regular files; refused Git mode ${mode} at ${relPath}.`,
+      );
+    }
+    if (relPath.startsWith("wiki/pages/")) {
+      const managedPage = parseManagedKnowledgePagePath(relPath);
+      if (isUpdateFailure(managedPage)) {
+        return candidateUpdateFailure(
+          managedPage,
+          "candidate-invalid-managed-page-path",
+          `knowledge sync refused invalid active page path ${relPath}`,
+        );
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateCandidateCorpus(
+  layout: ResolvedKnowledgeV2Layout,
+  git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
+): KnowledgeSyncFailure | undefined {
+  const managedEntriesProblem = validateManagedGitEntries(layout, git);
+  if (managedEntriesProblem) {
+    return managedEntriesProblem;
+  }
+  for (const path of [layout.paths.schemaPath, layout.paths.indexPath, layout.paths.logPath]) {
+    const safePathProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, path, fs);
+    if (safePathProblem) {
+      return candidateUpdateFailure(
+        safePathProblem,
+        "candidate-unsafe-managed-path",
+        "knowledge sync candidate managed-path validation failed",
+      );
+    }
+  }
+  const pages = collectKnowledgePages(layout, fs);
+  if (!Array.isArray(pages)) {
+    return candidateUpdateFailure(
+      pages,
+      "candidate-page-invalid",
+      "knowledge sync candidate page validation failed",
+    );
+  }
+  let actualIndex: string;
+  try {
+    actualIndex = fs.readFileSync(layout.paths.indexPath, "utf8");
+  } catch (error) {
+    return failure(
+      "rejected",
+      "candidate-index-unreadable",
+      `knowledge sync could not read the candidate index: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (actualIndex !== generateKnowledgeIndex(pages)) {
+    return failure(
+      "rejected",
+      "candidate-index-page-set-mismatch",
+      "knowledge sync requires wiki/index.md to exactly match the generated complete active Knowledge page set.",
     );
   }
   return undefined;
@@ -438,6 +574,337 @@ function isManagedKnowledgePath(path: string): boolean {
     path === "artifacts/knowledge-archive" ||
     path.startsWith("artifacts/knowledge-archive/")
   );
+}
+
+interface CommitFileResult {
+  ok: true;
+  content?: string;
+}
+
+function readCommitFile(
+  candidateRoot: string,
+  commit: string,
+  relPath: string,
+  git: KnowledgeSyncGitRunner,
+): CommitFileResult | AttemptFailure {
+  const listed = git(["ls-tree", "-z", commit, "--", relPath], { cwd: candidateRoot });
+  if (listed.status !== 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-inspection-failed",
+        `knowledge sync could not inspect ${relPath} at ${commit}: ${errorText(listed)}`,
+      ),
+    };
+  }
+  if (!listed.stdout) {
+    return { ok: true };
+  }
+  const shown = git(["show", `${commit}:${relPath}`], { cwd: candidateRoot });
+  if (shown.status !== 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-source-read-failed",
+        `knowledge sync could not read ${relPath} at ${commit}: ${errorText(shown)}`,
+      ),
+    };
+  }
+  return { ok: true, content: shown.stdout };
+}
+
+function splitStableLines(content: string): string[] {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized) {
+    return [];
+  }
+  return (normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized).split("\n");
+}
+
+function stableLineUnion(localContent: string, remoteContent: string): string[] {
+  const localLines = splitStableLines(localContent);
+  const remoteLines = splitStableLines(remoteContent);
+  const localCounts = new Map<string, number>();
+  for (const line of localLines) {
+    localCounts.set(line, (localCounts.get(line) ?? 0) + 1);
+  }
+  const remoteCounts = new Map<string, number>();
+  const union = [...localLines];
+  for (const line of remoteLines) {
+    const occurrence = (remoteCounts.get(line) ?? 0) + 1;
+    remoteCounts.set(line, occurrence);
+    if (occurrence > (localCounts.get(line) ?? 0)) {
+      union.push(line);
+    }
+  }
+  return union;
+}
+
+function lineMultisetContains(candidate: string, source: string): boolean {
+  const candidateCounts = new Map<string, number>();
+  for (const line of splitStableLines(candidate)) {
+    candidateCounts.set(line, (candidateCounts.get(line) ?? 0) + 1);
+  }
+  const sourceCounts = new Map<string, number>();
+  for (const line of splitStableLines(source)) {
+    const count = (sourceCounts.get(line) ?? 0) + 1;
+    sourceCounts.set(line, count);
+    if (count > (candidateCounts.get(line) ?? 0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateCandidateMergeState(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const unstaged = git(["diff", "--quiet", "--"], { cwd: candidateRoot });
+  if (unstaged.status !== 0) {
+    return failure(
+      "error",
+      "candidate-unstaged-changes",
+      "knowledge sync refused a candidate whose reconciled files were not fully staged.",
+    );
+  }
+  const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: candidateRoot });
+  if (untracked.status !== 0) {
+    return failure(
+      "error",
+      "candidate-untracked-inspection-failed",
+      `knowledge sync could not inspect candidate untracked files: ${errorText(untracked)}`,
+    );
+  }
+  if (untracked.stdout) {
+    return failure(
+      "rejected",
+      "candidate-untracked-files",
+      "knowledge sync refused a merge candidate containing untracked files.",
+    );
+  }
+  return undefined;
+}
+
+function mergeStructuralLogs(
+  localContent: string,
+  remoteContent: string,
+  tips: GitTips,
+  unresolvedPageCount: number,
+): string {
+  const lines = stableLineUnion(localContent, remoteContent);
+  const provenance = `- knowledge-sync merge local=${tips.local} remote=${tips.remote} unresolved-pages=${unresolvedPageCount}`;
+  if (!lines.includes(provenance)) {
+    lines.push(provenance);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function unresolvedVariantSection(
+  label: "Local" | "Remote",
+  commit: string,
+  content: string | undefined,
+): string {
+  const lines = [`## ${label} committed variant`, "", `Source commit: \`${commit}\``, ""];
+  if (content === undefined) {
+    lines.push("_This commit has no page at this path; the variant is a committed deletion._", "");
+  } else {
+    lines.push(
+      `<!-- BEGIN ${label.toUpperCase()} COMMITTED VARIANT ${commit} -->`,
+      content.endsWith("\n") ? content.slice(0, -1) : content,
+      `<!-- END ${label.toUpperCase()} COMMITTED VARIANT ${commit} -->`,
+      "",
+    );
+  }
+  return lines.join("\n");
+}
+
+function resolveManagedPageConflict(
+  candidateRoot: string,
+  relPath: string,
+  tips: GitTips,
+  git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
+): AttemptFailure | undefined {
+  const managedPage = parseManagedKnowledgePagePath(relPath);
+  if (isUpdateFailure(managedPage)) {
+    return {
+      ok: false,
+      failure: failure(
+        "conflict",
+        "unsupported-managed-conflict",
+        `knowledge sync cannot safely reconcile unsupported managed page path ${relPath}.`,
+        { conflictPaths: [relPath] },
+      ),
+    };
+  }
+  const local = readCommitFile(candidateRoot, tips.local, relPath, git);
+  if (!local.ok) {
+    return local;
+  }
+  const remote = readCommitFile(candidateRoot, tips.remote, relPath, git);
+  if (!remote.ok) {
+    return remote;
+  }
+  if (local.content === undefined && remote.content === undefined) {
+    return {
+      ok: false,
+      failure: failure(
+        "conflict",
+        "managed-page-variants-missing",
+        `knowledge sync could not recover either committed variant for ${relPath}.`,
+        { conflictPaths: [relPath] },
+      ),
+    };
+  }
+
+  const absPath = join(candidateRoot, ...relPath.split("/"));
+  const safePathProblem = assertSafeKnowledgeWorkspacePath(candidateRoot, absPath, fs);
+  if (safePathProblem) {
+    return {
+      ok: false,
+      failure: candidateUpdateFailure(
+        safePathProblem,
+        "candidate-unsafe-managed-path",
+        `knowledge sync cannot safely reconcile ${relPath}`,
+      ),
+    };
+  }
+  const slug = basename(relPath, ".md");
+  const body = [
+    "# Unresolved Knowledge Conflict",
+    "",
+    "> UNRESOLVED: Both committed variants are retained below with provenance. This page does not declare either variant correct.",
+    "",
+    unresolvedVariantSection("Local", tips.local, local.content),
+    unresolvedVariantSection("Remote", tips.remote, remote.content),
+  ].join("\n");
+  const content = formatKnowledgePage(
+    {
+      name: `Unresolved conflict: ${slug}`,
+      description: "Conflicting committed Knowledge variants retained for review; no winner was selected.",
+      type: managedPage.type,
+      confidence: "unresolved",
+      revisit_if: `Resolve variants from local ${tips.local} and remote ${tips.remote}.`,
+    },
+    body,
+  );
+  fs.mkdirSync(dirname(absPath), { recursive: true });
+  fs.writeFileSync(absPath, content, "utf8");
+  return undefined;
+}
+
+function reconcileDerivedKnowledgeState(
+  candidateRoot: string,
+  tips: GitTips,
+  resolvedPagePaths: readonly string[],
+  deps: KnowledgeSyncDeps,
+  git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
+): AttemptFailure | undefined {
+  const layout = (deps.resolveLayout ?? resolveKnowledgeLayout)(candidateRoot);
+  if (layout.kind !== "v2") {
+    return {
+      ok: false,
+      failure: failure(
+        "rejected",
+        "candidate-not-knowledge-v2",
+        "knowledge sync refused a merged candidate that does not contain a valid Knowledge v2 layout.",
+        { layoutKind: layout.kind },
+      ),
+    };
+  }
+  const pages = collectKnowledgePages(layout, fs);
+  if (!Array.isArray(pages)) {
+    return {
+      ok: false,
+      failure: candidateUpdateFailure(
+        pages,
+        "candidate-page-invalid",
+        "knowledge sync candidate page validation failed",
+      ),
+    };
+  }
+  const localLog = readCommitFile(candidateRoot, tips.local, "wiki/log.md", git);
+  if (!localLog.ok) {
+    return localLog;
+  }
+  const remoteLog = readCommitFile(candidateRoot, tips.remote, "wiki/log.md", git);
+  if (!remoteLog.ok) {
+    return remoteLog;
+  }
+  const localLogContent = localLog.content ?? "";
+  const remoteLogContent = remoteLog.content ?? "";
+  const mergedLog = mergeStructuralLogs(
+    localLogContent,
+    remoteLogContent,
+    tips,
+    resolvedPagePaths.length,
+  );
+  if (
+    !lineMultisetContains(mergedLog, localLogContent) ||
+    !lineMultisetContains(mergedLog, remoteLogContent)
+  ) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-log-history-not-preserved",
+        "knowledge sync refused a candidate that did not preserve both structural-log histories.",
+      ),
+    };
+  }
+
+  for (const path of [layout.paths.indexPath, layout.paths.logPath]) {
+    const safePathProblem = assertSafeKnowledgeWorkspacePath(candidateRoot, path, fs);
+    if (safePathProblem) {
+      return {
+        ok: false,
+        failure: candidateUpdateFailure(
+          safePathProblem,
+          "candidate-unsafe-managed-path",
+          "knowledge sync cannot safely regenerate derived Knowledge state",
+        ),
+      };
+    }
+  }
+  fs.writeFileSync(layout.paths.indexPath, generateKnowledgeIndex(pages), "utf8");
+  fs.writeFileSync(layout.paths.logPath, mergedLog, "utf8");
+
+  const staged = git(
+    ["add", "--", "wiki/index.md", "wiki/log.md", ...resolvedPagePaths],
+    { cwd: candidateRoot },
+  );
+  if (staged.status !== 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "error",
+        "candidate-stage-failed",
+        `knowledge sync could not stage the reconciled candidate: ${errorText(staged)}`,
+      ),
+    };
+  }
+  const unresolved = unresolvedConflictPaths(candidateRoot, git);
+  if (unresolved.length > 0) {
+    return {
+      ok: false,
+      failure: failure(
+        "conflict",
+        "candidate-unresolved-conflict",
+        `knowledge sync candidate still has unresolved paths: ${unresolved.join(", ")}.`,
+        { conflictPaths: unresolved },
+      ),
+    };
+  }
+  const mergeStateProblem = validateCandidateMergeState(candidateRoot, git);
+  if (mergeStateProblem) {
+    return { ok: false, failure: mergeStateProblem };
+  }
+  const invalid = validateCandidateCorpus(layout, git, fs);
+  return invalid ? { ok: false, failure: invalid } : undefined;
 }
 
 function withTemporaryWorktree(
@@ -532,34 +999,82 @@ function prepareCandidate(
   fs: KnowledgeSyncFs,
 ): CandidateResult | AttemptFailure {
   if (classification === "no-op" || classification === "ahead") {
-    const invalid = validateCandidateLayout(workspaceRoot, deps, git);
+    const invalid = validateCandidateLayout(workspaceRoot, deps, git, fs);
     return invalid ? { ok: false, failure: invalid } : { ok: true, commit: tips.local };
   }
 
   if (classification === "behind") {
     return withTemporaryWorktree(workspaceRoot, tips.remote, deps, git, fs, (candidateRoot) => {
-      const invalid = validateCandidateLayout(candidateRoot, deps, git);
+      const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
       return invalid ? { ok: false, failure: invalid } : { ok: true, commit: tips.remote };
     });
   }
 
   return withTemporaryWorktree(workspaceRoot, tips.local, deps, git, fs, (candidateRoot) => {
     const merged = git(["merge", "--no-ff", "--no-commit", tips.remote], { cwd: candidateRoot });
+    const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
     if (merged.status !== 0) {
-      const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
+      if (conflictPaths.length === 0) {
+        return {
+          ok: false,
+          failure: failure(
+            "error",
+            "candidate-merge-failed",
+            `knowledge sync could not prepare the isolated merge candidate: ${errorText(merged)}`,
+          ),
+        };
+      }
       const outsideKnowledge = conflictPaths.filter((path) => !isManagedKnowledgePath(path));
-      const nonKnowledge = outsideKnowledge.length > 0;
-      return {
-        ok: false,
-        failure: failure(
-          "conflict",
-          nonKnowledge ? "non-knowledge-conflict" : "managed-knowledge-conflict",
-          nonKnowledge
-            ? `knowledge sync stopped because Git found conflicts outside managed Knowledge: ${outsideKnowledge.join(", ")}.`
-            : `knowledge sync cannot yet reconcile managed Knowledge conflicts: ${conflictPaths.join(", ") || errorText(merged)}.`,
-          { conflictPaths },
-        ),
-      };
+      if (outsideKnowledge.length > 0) {
+        return {
+          ok: false,
+          failure: failure(
+            "conflict",
+            "non-knowledge-conflict",
+            `knowledge sync stopped because Git found conflicts outside managed Knowledge: ${outsideKnowledge.join(", ")}.`,
+            { conflictPaths },
+          ),
+        };
+      }
+      const unsupportedKnowledge = conflictPaths.filter((path) => {
+        if (path === "wiki/index.md" || path === "wiki/log.md") {
+          return false;
+        }
+        if (!path.startsWith("wiki/pages/")) {
+          return true;
+        }
+        return isUpdateFailure(parseManagedKnowledgePagePath(path));
+      });
+      if (unsupportedKnowledge.length > 0) {
+        return {
+          ok: false,
+          failure: failure(
+            "conflict",
+            "unsupported-managed-conflict",
+            `knowledge sync stopped at unsupported managed control or archive conflicts: ${unsupportedKnowledge.join(", ")}.`,
+            { conflictPaths },
+          ),
+        };
+      }
+    }
+
+    const pageConflictPaths = conflictPaths.filter((path) => path.startsWith("wiki/pages/"));
+    for (const relPath of pageConflictPaths) {
+      const pageFailure = resolveManagedPageConflict(candidateRoot, relPath, tips, git, fs);
+      if (pageFailure) {
+        return pageFailure;
+      }
+    }
+    const derivedFailure = reconcileDerivedKnowledgeState(
+      candidateRoot,
+      tips,
+      pageConflictPaths,
+      deps,
+      git,
+      fs,
+    );
+    if (derivedFailure) {
+      return derivedFailure;
     }
 
     const committed = git(
@@ -593,7 +1108,7 @@ function prepareCandidate(
         failure: failure("error", "candidate-head-unreadable", `knowledge sync could not read candidate HEAD: ${errorText(head)}`),
       };
     }
-    const invalid = validateCandidateLayout(candidateRoot, deps, git);
+    const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
     return invalid ? { ok: false, failure: invalid } : { ok: true, commit: head.stdout.trim() };
   });
 }

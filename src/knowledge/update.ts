@@ -413,7 +413,9 @@ interface NormalizedMoveRequest {
 
 type NormalizedKnowledgeUpdateRequest = NormalizedWriteRequest | NormalizedMoveRequest;
 
-function normalizeManagedPagePath(raw: unknown): { relPath: string; type: KnowledgePageType } | KnowledgeUpdateFailure {
+export function parseManagedKnowledgePagePath(
+  raw: unknown,
+): { relPath: string; type: KnowledgePageType } | KnowledgeUpdateFailure {
   const relPath = normalizePagePath(raw);
   if (typeof relPath !== "string") {
     return relPath;
@@ -451,7 +453,7 @@ function normalizeKnowledgeUpdateRequest(
         `knowledge_update ${operation} accepts only the original managed page path; ${unexpectedField} is not allowed.`,
       );
     }
-    const managedPath = normalizeManagedPagePath(args.path);
+    const managedPath = parseManagedKnowledgePagePath(args.path);
     if (isUpdateFailure(managedPath)) {
       return managedPath;
     }
@@ -495,7 +497,11 @@ function isInsidePath(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function assertSafeWorkspaceWritePath(root: string, target: string, fs: KnowledgeUpdateFs): KnowledgeUpdateFailure | undefined {
+export function assertSafeKnowledgeWorkspacePath(
+  root: string,
+  target: string,
+  fs: KnowledgeUpdateFs = defaultFs,
+): KnowledgeUpdateFailure | undefined {
   const rootResolved = normalize(resolve(root));
   const targetResolved = normalize(resolve(target));
   if (!isInsidePath(rootResolved, targetResolved)) {
@@ -568,7 +574,7 @@ function assertTargetPath(
     return failure("rejected", "path-type-mismatch", `Page writes are constrained to wiki/pages/${type}/**/*.md.`);
   }
 
-  const symlinkProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, absPath, fs);
+  const symlinkProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, absPath, fs);
   if (symlinkProblem) {
     return symlinkProblem;
   }
@@ -590,7 +596,7 @@ function assertArchivePath(
       "knowledge_update archive path must stay inside artifacts/knowledge-archive.",
     );
   }
-  const symlinkProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, absPath, fs);
+  const symlinkProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, absPath, fs);
   if (symlinkProblem) {
     return symlinkProblem;
   }
@@ -758,7 +764,10 @@ function parseExistingPage(
   };
 }
 
-function collectPages(layout: ResolvedKnowledgeV2Layout, fs: KnowledgeUpdateFs): ParsedPage[] | KnowledgeUpdateFailure {
+export function collectKnowledgePages(
+  layout: ResolvedKnowledgeV2Layout,
+  fs: KnowledgeUpdateFs = defaultFs,
+): ParsedPage[] | KnowledgeUpdateFailure {
   const pages: ParsedPage[] = [];
   const problem = walkPageFiles(layout, layout.paths.pagesDir, pages, fs);
   if (problem) {
@@ -818,7 +827,7 @@ export function generateKnowledgeIndex(pages: readonly ParsedPage[]): string {
 
 export function knowledgeIndexMatchesActiveCorpus(layout: ResolvedKnowledgeV2Layout): boolean {
   try {
-    const pages = collectPages(layout, defaultFs);
+    const pages = collectKnowledgePages(layout, defaultFs);
     return (
       !isUpdateFailure(pages) &&
       defaultFs.readFileSync(layout.paths.indexPath, "utf8") === generateKnowledgeIndex(pages)
@@ -835,7 +844,7 @@ function verifyIndexInvariants(
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   const index = fs.readFileSync(layout.paths.indexPath, "utf8");
-  const pages = collectPages(layout, fs);
+  const pages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(pages)) {
     return pages;
   }
@@ -866,12 +875,12 @@ export function acquireKnowledgeUpdateLock(
   const lockPath = join(layout.agentWorkspaceRoot, ".tmp", "knowledge-update.lock");
   const now = deps.lockNow?.() ?? new Date();
   const staleLockMs = deps.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
-  const lockSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, lockPath, fs);
+  const lockSafetyProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs);
   if (lockSafetyProblem) {
     return lockSafetyProblem;
   }
   fs.mkdirSync(dirname(lockPath), { recursive: true });
-  const createdParentSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, lockPath, fs);
+  const createdParentSafetyProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs);
   if (createdParentSafetyProblem) {
     return createdParentSafetyProblem;
   }
@@ -1212,13 +1221,13 @@ function validateIndexAndLogPaths(
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   return (
-    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs) ??
     assertRegularFileIfExists(
       layout.paths.indexPath,
       fs,
       "knowledge_update index path must be a regular Markdown file.",
     ) ??
-    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
     assertRegularFileIfExists(layout.paths.logPath, fs, "knowledge_update log path must be a regular Markdown file.")
   );
 }
@@ -1253,7 +1262,7 @@ function executeWriteRequest(
     }
   }
 
-  const beforePages = collectPages(layout, fs);
+  const beforePages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(beforePages)) {
     return beforePages;
   }
@@ -1401,7 +1410,7 @@ function executeMoveRequest(
     }
   }
 
-  const beforePages = collectPages(layout, fs);
+  const beforePages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(beforePages)) {
     return beforePages;
   }
@@ -1438,7 +1447,7 @@ function executeMoveRequest(
       return moveProblem;
     }
     moveCommitted = true;
-    const nextPages = collectPages(layout, fs);
+    const nextPages = collectKnowledgePages(layout, fs);
     if (isUpdateFailure(nextPages)) {
       rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
       return nextPages;

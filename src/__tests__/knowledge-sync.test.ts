@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { formatKnowledgePage, generateKnowledgeIndex } from "../knowledge/update.js";
 import {
   defaultKnowledgeSyncGitRunner,
   executeKnowledgeSync,
@@ -67,6 +68,15 @@ function commitFiles(workspace: string, message: string, files: Record<string, s
   return git(workspace, ["rev-parse", "HEAD"]);
 }
 
+function page(
+  name: string,
+  description: string,
+  type: "user" | "project" | "feedback" | "reference",
+  body: string,
+): string {
+  return formatKnowledgePage({ name, description, type }, body);
+}
+
 function createSyncFixture(): SyncFixture {
   const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-test-"));
   fixtures.push(root);
@@ -81,7 +91,7 @@ function createSyncFixture(): SyncFixture {
     ".gitignore": ".tmp/\n",
     "README.md": "# Agent workspace\n\nShared baseline.\n",
     "wiki/schema.md": generateKnowledgeV2Schema(),
-    "wiki/index.md": "# Knowledge Index\n",
+    "wiki/index.md": generateKnowledgeIndex([]),
     "wiki/log.md": "# Knowledge Structural Log\n",
   });
   git(workspace, ["remote", "add", "origin", remote]);
@@ -328,6 +338,228 @@ describe("knowledge sync Git convergence", () => {
   });
 });
 
+describe("knowledge sync managed Knowledge reconciliation", () => {
+  it("merges independent pages, regenerates stale indexes, and preserves concurrent structural logs", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-independent-pages");
+    const localLogEntry = "- 2026-08-01T10:00:00.000Z create wiki/pages/user/local.md";
+    const remoteLogEntry = "- 2026-08-01T11:00:00.000Z create wiki/pages/project/remote.md";
+    const localTip = commitFiles(fixture.workspace, "local Knowledge page", {
+      "wiki/pages/user/local.md": page(
+        "Local profile",
+        "Knowledge committed on the local branch.",
+        "user",
+        "Local committed detail.\n",
+      ),
+      "wiki/index.md": "# Stale local index\n",
+      "wiki/log.md": `# Knowledge Structural Log\n\n${localLogEntry}\n`,
+    });
+    const remoteTip = commitFiles(peer, "remote Knowledge page", {
+      "wiki/pages/project/remote.md": page(
+        "Remote project",
+        "Knowledge committed on the remote branch.",
+        "project",
+        "Remote committed detail.\n",
+      ),
+      "wiki/index.md": "# Stale remote index\n",
+      "wiki/log.md": `# Knowledge Structural Log\n\n${remoteLogEntry}\n`,
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const index = readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8");
+    assert.match(index, /\[Local profile\]\(pages\/user\/local\.md\)/);
+    assert.match(index, /\[Remote project\]\(pages\/project\/remote\.md\)/);
+    assert.doesNotMatch(index, /Stale (?:local|remote) index/);
+    const log = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+    assert.match(log, new RegExp(localLogEntry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(log, new RegExp(remoteLogEntry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(log, new RegExp(`knowledge-sync merge local=${localTip} remote=${remoteTip}`));
+    assert.equal(log.match(/knowledge-sync merge/g)?.length, 1);
+  });
+
+  it("accepts Git's clean three-way result for compatible edits to one page", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/project/compatible.md";
+    const sharedBody = [
+      "# Compatible topic",
+      "",
+      "Local detail: pending.",
+      "",
+      ...Array.from({ length: 12 }, (_, index) => `Shared context ${index + 1}.`),
+      "",
+      "Remote detail: pending.",
+      "",
+    ].join("\n");
+    commitFiles(fixture.workspace, "shared compatible page", {
+      [relPath]: page("Compatible topic", "A page with independently editable details.", "project", sharedBody),
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-compatible-page");
+    commitFiles(fixture.workspace, "local compatible edit", {
+      [relPath]: page(
+        "Compatible topic",
+        "A page with independently editable details.",
+        "project",
+        sharedBody.replace("Local detail: pending.", "Local detail: committed locally."),
+      ),
+    });
+    commitFiles(peer, "remote compatible edit", {
+      [relPath]: page(
+        "Compatible topic",
+        "A page with independently editable details.",
+        "project",
+        sharedBody.replace("Remote detail: pending.", "Remote detail: committed remotely."),
+      ),
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const merged = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
+    assert.match(merged, /Local detail: committed locally\./);
+    assert.match(merged, /Remote detail: committed remotely\./);
+    assert.doesNotMatch(merged, /UNRESOLVED/);
+  });
+
+  it("wraps contradictory add/add variants with deterministic provenance and reruns idempotently", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-contradictory-page");
+    const relPath = "wiki/pages/feedback/preference.md";
+    const localVariant = page(
+      "Local preference",
+      "The preference as committed locally.",
+      "feedback",
+      "The user prefers the local variant.\n",
+    );
+    const remoteVariant = page(
+      "Remote preference",
+      "The preference as committed remotely.",
+      "feedback",
+      "The user prefers the remote variant.\n",
+    );
+    const localTip = commitFiles(fixture.workspace, "local contradictory page", { [relPath]: localVariant });
+    const remoteTip = commitFiles(peer, "remote contradictory page", { [relPath]: remoteVariant });
+    git(peer, ["push", "origin", "main"]);
+
+    const first = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(first);
+    const pagePath = join(fixture.workspace, ...relPath.split("/"));
+    const unresolved = readFileSync(pagePath, "utf8");
+    assert.match(unresolved, /type: feedback/);
+    assert.match(unresolved, /revisit_if:/);
+    assert.match(unresolved, /UNRESOLVED: Both committed variants are retained/);
+    assert.match(unresolved, new RegExp(localTip));
+    assert.match(unresolved, new RegExp(remoteTip));
+    assert.ok(unresolved.includes(localVariant.trimEnd()));
+    assert.ok(unresolved.includes(remoteVariant.trimEnd()));
+    assert.match(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), /Unresolved conflict: preference/);
+    const firstCommit = first.commit;
+
+    const second = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(second);
+    assert.equal(second.classification, "no-op");
+    assert.equal(second.commit, firstCommit);
+    assert.equal(readFileSync(pagePath, "utf8"), unresolved);
+  });
+
+  it("retains the complete present variant and the deletion provenance for modify/delete", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/deletion.md";
+    commitFiles(fixture.workspace, "shared page before deletion", {
+      [relPath]: page("Deletion topic", "A shared page before concurrent changes.", "reference", "Shared claim.\n"),
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-modify-delete");
+    const modifiedVariant = page(
+      "Deletion topic",
+      "A locally modified page retained through conflict.",
+      "reference",
+      "Locally modified committed claim.\n",
+    );
+    const localTip = commitFiles(fixture.workspace, "modify page locally", { [relPath]: modifiedVariant });
+    git(peer, ["rm", relPath]);
+    git(peer, ["commit", "-m", "delete page remotely"]);
+    const remoteTip = git(peer, ["rev-parse", "HEAD"]);
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const unresolved = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
+    assert.ok(unresolved.includes(modifiedVariant.trimEnd()));
+    assert.match(unresolved, /committed deletion/);
+    assert.match(unresolved, new RegExp(localTip));
+    assert.match(unresolved, new RegExp(remoteTip));
+  });
+
+  it("retains a malformed conflicting source variant inside a schema-valid unresolved page", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/user/malformed.md";
+    commitFiles(fixture.workspace, "shared page before malformed edit", {
+      [relPath]: page("Shared profile", "A valid shared profile.", "user", "Shared body.\n"),
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-malformed-page");
+    const malformedVariant = "---\nname: [invalid yaml\n---\n\nMalformed committed bytes.\n";
+    commitFiles(fixture.workspace, "malform local variant", { [relPath]: malformedVariant });
+    const validRemoteVariant = page(
+      "Remote profile",
+      "A valid conflicting remote profile.",
+      "user",
+      "Remote committed bytes.\n",
+    );
+    commitFiles(peer, "edit remote variant", { [relPath]: validRemoteVariant });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const unresolved = readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8");
+    assert.match(unresolved, /type: user/);
+    assert.ok(unresolved.includes(malformedVariant.trimEnd()));
+    assert.ok(unresolved.includes(validRemoteVariant.trimEnd()));
+    assert.match(unresolved, /UNRESOLVED/);
+  });
+
+  it("fails closed on unsupported managed control and archive conflicts", () => {
+    for (const scenario of ["control", "archive"] as const) {
+      const fixture = createSyncFixture();
+      const peer = cloneRemote(fixture, `peer-unsupported-${scenario}`);
+      const relPath =
+        scenario === "control"
+          ? "wiki/schema.md"
+          : "artifacts/knowledge-archive/wiki/pages/reference/retired.md";
+      const localContent =
+        scenario === "control"
+          ? generateKnowledgeV2Schema().replace("# Knowledge Schema", "# Local Knowledge Schema")
+          : "Local archived variant.\n";
+      const remoteContent =
+        scenario === "control"
+          ? generateKnowledgeV2Schema().replace("# Knowledge Schema", "# Remote Knowledge Schema")
+          : "Remote archived variant.\n";
+      const localTip = commitFiles(fixture.workspace, `local ${scenario} change`, { [relPath]: localContent });
+      const remoteTip = commitFiles(peer, `remote ${scenario} change`, { [relPath]: remoteContent });
+      git(peer, ["push", "origin", "main"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "unsupported-managed-conflict");
+      assert.deepEqual(response.conflictPaths, [relPath]);
+      assert.equal(localHead(fixture), localTip);
+      assert.equal(remoteHead(fixture), remoteTip);
+      assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), localContent);
+      assert.equal(recoveryRefs(fixture).length, 2);
+    }
+  });
+});
+
 describe("knowledge sync validation and failure boundaries", () => {
   it("rejects a Knowledge v2 directory that is not a Git repository", () => {
     const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-nonrepo-"));
@@ -411,7 +643,7 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(response.reason, "candidate-not-knowledge-v2");
     assert.equal(response.attempts, 1);
     assert.equal(localHead(fixture), beforeHead);
-    assert.equal(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), "# Knowledge Index\n");
+    assert.equal(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), generateKnowledgeIndex([]));
     assert.equal(recoveryRefs(fixture).length, 2);
     assert.equal(worktreePaths(fixture).length, 2);
   });

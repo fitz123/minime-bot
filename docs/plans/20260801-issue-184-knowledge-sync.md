@@ -53,13 +53,13 @@ node dist/cli.js --help
 
 **Serves:** Ninja requires different-page changes, same-page semantic changes, generated index drift, and append-only structural history to converge without operator Git repair; irreconcilable claims must remain explicit with provenance.
 
-- [ ] Extract the minimum reusable page collection/frontmatter/index/lock validation primitives from `src/knowledge/update.ts` for the sync candidate; do not create a second parser or index format.
-- [ ] Resolve `wiki/index.md` only by regenerating it from validated active pages, and merge `wiki/log.md` as a stable data-preserving union plus one bounded sync provenance entry.
-- [ ] For a Git-conflicting `wiki/pages/<type>/**/*.md`, first accept Git's clean three-way result; otherwise create one schema-valid unresolved page that retains both complete source variants, identifies their commit tips, preserves path-derived type, and carries an explicit `revisit_if`/body marker without declaring a winner.
-- [ ] Handle managed add/add, modify/modify, and modify/delete cases without losing a committed variant; fail closed on unsupported managed control/archive conflicts while preserving both recovery refs and canonical state.
-- [ ] Validate every candidate page, exact full-corpus index equality, structural-log preservation, managed-path safety, and clean candidate Git state before creating the merge commit.
-- [ ] Extend `src/__tests__/knowledge-sync.test.ts` for independent pages, stale concurrent indexes, concurrent structural logs, same-page compatible and contradictory edits, modify/delete, malformed variants, unsupported archive/control conflicts, and deterministic idempotent reruns.
-- [ ] Run `npm run test:file -- src/__tests__/knowledge-sync.test.ts src/__tests__/knowledge-update.test.ts` and fix all failures before Task 3.
+- [x] Extract the minimum reusable page collection/frontmatter/index/lock validation primitives from `src/knowledge/update.ts` for the sync candidate; do not create a second parser or index format.
+- [x] Resolve `wiki/index.md` only by regenerating it from validated active pages, and merge `wiki/log.md` as a stable data-preserving union plus one bounded sync provenance entry.
+- [x] For a Git-conflicting `wiki/pages/<type>/**/*.md`, first accept Git's clean three-way result; otherwise create one schema-valid unresolved page that retains both complete source variants, identifies their commit tips, preserves path-derived type, and carries an explicit `revisit_if`/body marker without declaring a winner.
+- [x] Handle managed add/add, modify/modify, and modify/delete cases without losing a committed variant; fail closed on unsupported managed control/archive conflicts while preserving both recovery refs and canonical state.
+- [x] Validate every candidate page, exact full-corpus index equality, structural-log preservation, managed-path safety, and clean candidate Git state before creating the merge commit.
+- [x] Extend `src/__tests__/knowledge-sync.test.ts` for independent pages, stale concurrent indexes, concurrent structural logs, same-page compatible and contradictory edits, modify/delete, malformed variants, unsupported archive/control conflicts, and deterministic idempotent reruns.
+- [x] Run `npm run test:file -- src/__tests__/knowledge-sync.test.ts src/__tests__/knowledge-update.test.ts` and fix all failures before Task 3.
 
 ### Task 3: Expose the managed path and preserve guard guidance
 
