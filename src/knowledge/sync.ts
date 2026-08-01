@@ -117,6 +117,12 @@ const SYNC_WORKTREE_MARKER = ".minime-knowledge-sync-owner.json";
 const MAX_ATTEMPTS = 2;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DISABLE_GIT_HOOKS = ["-c", "core.hooksPath=/dev/null"] as const;
+const FIXED_GIT_IDENTITY_ENV = {
+  GIT_AUTHOR_NAME: "minime-bot",
+  GIT_AUTHOR_EMAIL: "minime-bot@users.noreply.github.com",
+  GIT_COMMITTER_NAME: "minime-bot",
+  GIT_COMMITTER_EMAIL: "minime-bot@users.noreply.github.com",
+} as const;
 const GIT_OPERATION_MARKERS = [
   "MERGE_HEAD",
   "CHERRY_PICK_HEAD",
@@ -363,7 +369,7 @@ function validateRuntimeLockUntracked(
   return undefined;
 }
 
-function preflight(
+function preflightBeforeLock(
   workspaceRoot: string,
   deps: KnowledgeSyncDeps,
   git: KnowledgeSyncGitRunner,
@@ -379,9 +385,21 @@ function preflight(
     validateNoGitOperationInProgress(workspaceRoot, git, fs) ??
     validateRuntimeLockUntracked(workspaceRoot, git) ??
     validateEffectiveAutocrlf(workspaceRoot, git) ??
-    validateCleanWorktree(workspaceRoot, git) ??
     layout
   );
+}
+
+function preflight(
+  workspaceRoot: string,
+  deps: KnowledgeSyncDeps,
+  git: KnowledgeSyncGitRunner,
+  fs: KnowledgeSyncFs,
+): ResolvedKnowledgeV2Layout | KnowledgeSyncFailure {
+  const beforeLock = preflightBeforeLock(workspaceRoot, deps, git, fs);
+  if ("ok" in beforeLock) {
+    return beforeLock;
+  }
+  return validateCleanWorktree(workspaceRoot, git) ?? beforeLock;
 }
 
 function readTips(workspaceRoot: string, git: KnowledgeSyncGitRunner): GitTips | KnowledgeSyncFailure {
@@ -1328,25 +1346,12 @@ function validateStructuralLogCommit(
     );
 }
 
-function validateLinearStructuralLogHistory(
+function validateStructuralLogRange(
   candidateRoot: string,
-  tips: GitTips,
-  classification: "ahead" | "behind",
+  ancestorCommit: string,
+  candidateCommit: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
-  const ancestorCommit = classification === "ahead" ? tips.remote : tips.local;
-  const candidateCommit = classification === "ahead" ? tips.local : tips.remote;
-  const ancestorLog = readRequiredStructuralLog(candidateRoot, ancestorCommit, git);
-  if (typeof ancestorLog !== "string") {
-    return ancestorLog;
-  }
-  const candidateLog = readRequiredStructuralLog(candidateRoot, candidateCommit, git);
-  if (typeof candidateLog !== "string") {
-    return candidateLog;
-  }
-  if (lineSequenceStartsWith(candidateLog, ancestorLog)) {
-    return undefined;
-  }
   const history = git(
     ["rev-list", "--topo-order", "--reverse", "--parents", `${ancestorCommit}..${candidateCommit}`],
     { cwd: candidateRoot },
@@ -1373,6 +1378,37 @@ function validateLinearStructuralLogHistory(
     }
   }
   return undefined;
+}
+
+function validateLinearStructuralLogHistory(
+  candidateRoot: string,
+  tips: GitTips,
+  classification: "ahead" | "behind",
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const ancestorCommit = classification === "ahead" ? tips.remote : tips.local;
+  const candidateCommit = classification === "ahead" ? tips.local : tips.remote;
+  return validateStructuralLogRange(candidateRoot, ancestorCommit, candidateCommit, git);
+}
+
+function validateDivergentStructuralLogHistories(
+  candidateRoot: string,
+  tips: GitTips,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const mergeBase = git(["merge-base", tips.local, tips.remote], { cwd: candidateRoot });
+  if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) {
+    return failure(
+      "error",
+      "candidate-merge-base-unreadable",
+      `knowledge sync could not read the merge base before validating structural-log history: ${errorText(mergeBase)}`,
+    );
+  }
+  const base = mergeBase.stdout.trim();
+  return (
+    validateStructuralLogRange(candidateRoot, base, tips.local, git) ??
+    validateStructuralLogRange(candidateRoot, base, tips.remote, git)
+  );
 }
 
 function validateCandidateMergeState(
@@ -1889,6 +1925,11 @@ function prepareCandidate(
     });
   }
 
+  const divergentLogHistoryProblem = validateDivergentStructuralLogHistories(workspaceRoot, tips, git);
+  if (divergentLogHistoryProblem) {
+    return divergentLogHistoryProblem;
+  }
+
   return withTemporaryWorktree(workspaceRoot, tips.local, tips, classification, deps, git, fs, (candidateRoot) => {
     const localTransformationProblem = validateManagedCheckinTransformations(candidateRoot, git);
     if (localTransformationProblem) {
@@ -1979,7 +2020,7 @@ function prepareCandidate(
         "-m",
         `knowledge sync: merge ${tips.remote.slice(0, 12)} into ${tips.local.slice(0, 12)}`,
       ],
-      { cwd: candidateRoot },
+      { cwd: candidateRoot, env: FIXED_GIT_IDENTITY_ENV },
     );
     if (committed.status !== 0) {
       return failure(
@@ -2105,11 +2146,11 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
   const gitRunner = deps.git ?? defaultKnowledgeSyncGitRunner;
   const git: KnowledgeSyncGitRunner = (args, options) => gitRunner(args, {
     ...options,
-    env: deps.env,
+    env: { ...(deps.env ?? {}), ...(options.env ?? {}) },
   });
   let lock: KnowledgeUpdateLockHandle | undefined;
   try {
-    const initial = preflight(workspaceRoot, deps, git, fs);
+    const initial = preflightBeforeLock(workspaceRoot, deps, git, fs);
     if ("ok" in initial) {
       return initial;
     }

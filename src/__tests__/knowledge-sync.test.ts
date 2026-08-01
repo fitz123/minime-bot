@@ -480,6 +480,53 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8"), "# Knowledge Structural Log\n");
   });
 
+  it("rejects structural-log entries appended and then removed from linear history", () => {
+    for (const classification of ["ahead", "behind"] as const) {
+      const fixture = createSyncFixture();
+      const originalLog = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+      const branch = classification === "ahead"
+        ? fixture.workspace
+        : cloneRemote(fixture, `peer-intermediate-log-${classification}`);
+      commitFiles(branch, "append intermediate structural history", {
+        "wiki/log.md": `${originalLog}- intermediate structural entry\n`,
+      });
+      commitFiles(branch, "remove intermediate structural history", {
+        "wiki/log.md": originalLog,
+      });
+      if (classification === "behind") {
+        git(branch, ["push", "origin", "main"]);
+      }
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "candidate-log-history-not-preserved");
+    }
+  });
+
+  it("rejects a divergent branch that appended and then removed structural history", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-intermediate-divergent-log");
+    const originalLog = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+    commitFiles(fixture.workspace, "append local intermediate structural history", {
+      "wiki/log.md": `${originalLog}- local intermediate structural entry\n`,
+    });
+    const localTip = commitFiles(fixture.workspace, "remove local intermediate structural history", {
+      "wiki/log.md": originalLog,
+    });
+    const remoteTip = commitFiles(peer, "create remote divergence", {
+      "diary/remote-divergence.md": "# Remote divergence\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-log-history-not-preserved");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("does not push when the validated commit already equals fetched origin/main", () => {
     for (const scenario of ["no-op", "behind"] as const) {
       const fixture = createSyncFixture();
@@ -1259,6 +1306,34 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.match(log, new RegExp(remoteLogEntry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(log, new RegExp(`knowledge-sync merge local=${localTip} remote=${remoteTip}`));
     assert.equal(log.match(/knowledge-sync merge/g)?.length, 1);
+  });
+
+  it("uses the fixed package identity for divergent merge commits", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-fixed-merge-identity");
+    commitFiles(fixture.workspace, "create local identity divergence", {
+      "diary/local-identity.md": "# Local identity divergence\n",
+    });
+    commitFiles(peer, "create remote identity divergence", {
+      "diary/remote-identity.md": "# Remote identity divergence\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      env: {
+        GIT_AUTHOR_NAME: "Private Author",
+        GIT_AUTHOR_EMAIL: "private-author@example.test",
+        GIT_COMMITTER_NAME: "Private Committer",
+        GIT_COMMITTER_EMAIL: "private-committer@example.test",
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(
+      git(fixture.workspace, ["show", "-s", "--format=%an|%ae|%cn|%ce", response.commit]),
+      "minime-bot|minime-bot@users.noreply.github.com|minime-bot|minime-bot@users.noreply.github.com",
+    );
   });
 
   it("preserves identical structural-log entries independently appended on both branches", () => {
@@ -2134,6 +2209,27 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(response.reason, "knowledge-sync-locked");
     assert.match(response.message, /already running/);
     assert.match(readFileSync(lockPath, "utf8"), /knowledge-update\.lock/);
+  });
+
+  it("returns the typed lock response while the lock owner has dirty managed files", () => {
+    const fixture = createSyncFixture();
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
+    const lockContent = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      path: ".tmp/knowledge-update.lock",
+    })}\n`;
+    writeFiles(fixture.workspace, {
+      ".tmp/knowledge-update.lock": lockContent,
+      "wiki/log.md": "# Knowledge Structural Log\n\n- update in progress\n",
+    });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "locked");
+    assert.equal(response.reason, "knowledge-sync-locked");
+    assert.equal(readFileSync(lockPath, "utf8"), lockContent);
   });
 
   it("does not reclaim an old lock owned by a live process", () => {
