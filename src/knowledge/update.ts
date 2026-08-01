@@ -13,6 +13,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
@@ -65,6 +67,7 @@ export interface KnowledgeUpdateDeps {
   now?: () => Date;
   lockNow?: () => Date;
   staleLockMs?: number;
+  isProcessAlive?: (pid: number) => boolean;
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
   archivePrecondition?: KnowledgeArchivePrecondition;
 }
@@ -875,6 +878,8 @@ export function acquireKnowledgeUpdateLock(
   const lockPath = join(layout.agentWorkspaceRoot, ".tmp", "knowledge-update.lock");
   const now = deps.lockNow?.() ?? new Date();
   const staleLockMs = deps.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
+  const isProcessAlive = deps.isProcessAlive ?? defaultProcessAlive;
+  const token = randomUUID();
   const lockSafetyProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs);
   if (lockSafetyProblem) {
     return lockSafetyProblem;
@@ -891,9 +896,11 @@ export function acquireKnowledgeUpdateLock(
     try {
       fd = fs.openSync(lockPath, "wx", 0o600);
       createdLock = true;
-      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, acquiredAt: now.toISOString(), path: lockRelPath }, null, 2)}\n`, {
-        encoding: "utf8",
-      });
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({ pid: process.pid, acquiredAt: now.toISOString(), path: lockRelPath, token }, null, 2)}\n`,
+        { encoding: "utf8" },
+      );
       if (fd !== undefined) {
         fs.closeSync(fd);
         fd = undefined;
@@ -903,7 +910,10 @@ export function acquireKnowledgeUpdateLock(
         relPath: lockRelPath,
         release: () => {
           try {
-            fs.unlinkSync(lockPath);
+            const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { token?: unknown };
+            if (current.token === token) {
+              fs.unlinkSync(lockPath);
+            }
           } catch {
             // Lock release is best effort; the next caller has stale-lock recovery.
           }
@@ -928,7 +938,7 @@ export function acquireKnowledgeUpdateLock(
       if (!fs.existsSync(lockPath)) {
         continue;
       }
-      const stale = isStaleLock(lockPath, now, staleLockMs, fs);
+      const stale = isStaleLock(lockPath, now, staleLockMs, fs, isProcessAlive);
       if (stale && attempt === 0) {
         try {
           fs.unlinkSync(lockPath);
@@ -944,22 +954,55 @@ export function acquireKnowledgeUpdateLock(
   return failure("locked", "knowledge-update-locked", "knowledge_update could not acquire its workspace lock.");
 }
 
-function isStaleLock(lockPath: string, now: Date, staleLockMs: number, fs: KnowledgeUpdateFs): boolean {
+function defaultProcessAlive(pid: number): boolean {
+  const result = spawnSync("/bin/kill", ["-0", String(pid)], {
+    stdio: "ignore",
+    timeout: 1_000,
+  });
+  return result.error !== undefined || result.status === 0;
+}
+
+function isStaleLock(
+  lockPath: string,
+  now: Date,
+  staleLockMs: number,
+  fs: KnowledgeUpdateFs,
+  isProcessAlive: (pid: number) => boolean,
+): boolean {
+  let ownerPid: number | undefined;
   try {
     const raw = fs.readFileSync(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as { acquiredAt?: unknown };
+    const parsed = JSON.parse(raw) as { acquiredAt?: unknown; pid?: unknown };
+    if (typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
+      ownerPid = parsed.pid;
+    }
     if (typeof parsed.acquiredAt === "string") {
       const acquiredAt = Date.parse(parsed.acquiredAt);
-      return Number.isFinite(acquiredAt) && now.getTime() - acquiredAt > staleLockMs;
+      if (Number.isFinite(acquiredAt)) {
+        const expired = now.getTime() - acquiredAt > staleLockMs;
+        return expired && !lockOwnerIsAlive(ownerPid, isProcessAlive);
+      }
     }
   } catch {
     // Fall back to mtime below.
   }
 
   try {
-    return now.getTime() - fs.statSync(lockPath).mtimeMs > staleLockMs;
+    const expired = now.getTime() - fs.statSync(lockPath).mtimeMs > staleLockMs;
+    return expired && !lockOwnerIsAlive(ownerPid, isProcessAlive);
   } catch {
     return false;
+  }
+}
+
+function lockOwnerIsAlive(ownerPid: number | undefined, isProcessAlive: (pid: number) => boolean): boolean {
+  if (ownerPid === undefined) {
+    return false;
+  }
+  try {
+    return isProcessAlive(ownerPid);
+  } catch {
+    return true;
   }
 }
 

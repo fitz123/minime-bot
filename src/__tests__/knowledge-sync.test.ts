@@ -2,6 +2,7 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -175,6 +176,39 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
   });
 
+  it("does not push when the validated commit already equals fetched origin/main", () => {
+    for (const scenario of ["no-op", "behind"] as const) {
+      const fixture = createSyncFixture();
+      let expectedCommit = localHead(fixture);
+      if (scenario === "behind") {
+        const peer = cloneRemote(fixture, "peer-fetch-only");
+        expectedCommit = commitFiles(peer, "remote fetch-only entry", {
+          "diary/fetch-only.md": "# Remote fetch-only entry\n",
+        });
+        git(peer, ["push", "origin", "main"]);
+      }
+      let pushAttempts = 0;
+
+      const response = executeKnowledgeSync({
+        agentWorkspaceRoot: fixture.workspace,
+        git: (args, options) => {
+          if (args[0] === "push") {
+            pushAttempts += 1;
+            return { status: 1, stdout: "", stderr: "pushes are not permitted" };
+          }
+          return defaultKnowledgeSyncGitRunner(args, options);
+        },
+      });
+
+      assertSyncOk(response);
+      assert.equal(response.classification, scenario);
+      assert.equal(response.commit, expectedCommit);
+      assert.equal(pushAttempts, 0);
+      assert.equal(localHead(fixture), expectedCommit);
+      assert.equal(remoteHead(fixture), expectedCommit);
+    }
+  });
+
   it("pushes an ahead canonical main and verifies origin/main", () => {
     const fixture = createSyncFixture();
     const localCommit = commitFiles(fixture.workspace, "local diary entry", {
@@ -336,6 +370,22 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
   });
+
+  it("does not remove an unmarked lookalike worktree or its untracked files", () => {
+    const fixture = createSyncFixture();
+    const lookalikeRoot = join(fixture.root, "minime-knowledge-sync-user-owned");
+    const lookalikeWorktree = join(lookalikeRoot, "candidate");
+    mkdirSync(lookalikeRoot, { recursive: true });
+    git(fixture.workspace, ["worktree", "add", "--detach", lookalikeWorktree, "HEAD"]);
+    writeFiles(lookalikeWorktree, { "untracked-user-file.txt": "preserve me\n" });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(existsSync(lookalikeWorktree), true);
+    assert.equal(readFileSync(join(lookalikeWorktree, "untracked-user-file.txt"), "utf8"), "preserve me\n");
+    assert.ok(worktreePaths(fixture).includes(realpathSync(lookalikeWorktree)));
+  });
 });
 
 describe("knowledge sync managed Knowledge reconciliation", () => {
@@ -378,6 +428,28 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.match(log, new RegExp(remoteLogEntry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(log, new RegExp(`knowledge-sync merge local=${localTip} remote=${remoteTip}`));
     assert.equal(log.match(/knowledge-sync merge/g)?.length, 1);
+  });
+
+  it("preserves identical structural-log entries independently appended on both branches", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-identical-log-entry");
+    const sharedEntry = "- 2026-08-01T12:00:00.000Z update wiki/pages/reference/shared.md";
+    const branchLog = `# Knowledge Structural Log\n\n${sharedEntry}\n`;
+    commitFiles(fixture.workspace, "local identical structural entry", {
+      "wiki/log.md": branchLog,
+      "diary/local-identical-log.md": "# Local branch\n",
+    });
+    commitFiles(peer, "remote identical structural entry", {
+      "wiki/log.md": branchLog,
+      "diary/remote-identical-log.md": "# Remote branch\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    const log = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+    assert.equal(log.split(sharedEntry).length - 1, 2);
   });
 
   it("accepts Git's clean three-way result for compatible edits to one page", () => {
@@ -527,22 +599,28 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.match(unresolved, /UNRESOLVED/);
   });
 
-  it("fails closed on unsupported managed control and archive conflicts", () => {
-    for (const scenario of ["control", "archive"] as const) {
+  it("fails closed on unsupported managed control, issues, and archive conflicts", () => {
+    for (const scenario of ["control", "issues", "archive"] as const) {
       const fixture = createSyncFixture();
       const peer = cloneRemote(fixture, `peer-unsupported-${scenario}`);
       const relPath =
         scenario === "control"
           ? "wiki/schema.md"
+          : scenario === "issues"
+            ? "wiki/issues.md"
           : "artifacts/knowledge-archive/wiki/pages/reference/retired.md";
       const localContent =
         scenario === "control"
           ? generateKnowledgeV2Schema().replace("# Knowledge Schema", "# Local Knowledge Schema")
-          : "Local archived variant.\n";
+          : scenario === "issues"
+            ? "# Knowledge Issues\n\nLocal issue state.\n"
+            : "Local archived variant.\n";
       const remoteContent =
         scenario === "control"
           ? generateKnowledgeV2Schema().replace("# Knowledge Schema", "# Remote Knowledge Schema")
-          : "Remote archived variant.\n";
+          : scenario === "issues"
+            ? "# Knowledge Issues\n\nRemote issue state.\n"
+            : "Remote archived variant.\n";
       const localTip = commitFiles(fixture.workspace, `local ${scenario} change`, { [relPath]: localContent });
       const remoteTip = commitFiles(peer, `remote ${scenario} change`, { [relPath]: remoteContent });
       git(peer, ["push", "origin", "main"]);
@@ -609,6 +687,93 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(readFileSync(readmePath, "utf8"), beforeReadme);
   });
 
+  it("rejects ignored untracked files under managed Knowledge paths", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/ignored.md";
+    const ignoredPage = page(
+      "Ignored page",
+      "An ignored page must not masquerade as committed Knowledge.",
+      "reference",
+      "Ignored local bytes.\n",
+    );
+    writeFiles(fixture.workspace, { [relPath]: ignoredPage });
+    const committedIndex = generateKnowledgeIndex([
+      {
+        absPath: join(fixture.workspace, ...relPath.split("/")),
+        relPath,
+        linkPath: "pages/reference/ignored.md",
+        frontmatter: {
+          name: "Ignored page",
+          description: "An ignored page must not masquerade as committed Knowledge.",
+          type: "reference",
+        },
+      },
+    ]);
+    const committedTip = commitFiles(fixture.workspace, "ignore a managed page", {
+      ".gitignore": `.tmp/\n${relPath}\n`,
+      "wiki/index.md": committedIndex,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-untracked-managed-files");
+    assert.equal(localHead(fixture), committedTip);
+    assert.equal(remoteHead(fixture), committedTip);
+    assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), ignoredPage);
+  });
+
+  it("rejects a tracked runtime lock without deleting committed bytes", () => {
+    const fixture = createSyncFixture();
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
+    const lockContent = `${JSON.stringify({
+      pid: 999_999,
+      acquiredAt: "2000-01-01T00:00:00.000Z",
+      path: ".tmp/knowledge-update.lock",
+    })}\n`;
+    writeFiles(fixture.workspace, { ".tmp/knowledge-update.lock": lockContent });
+    git(fixture.workspace, ["add", "-f", ".tmp/knowledge-update.lock"]);
+    git(fixture.workspace, ["commit", "-m", "track the reserved runtime lock path"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const committedTip = localHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "tracked-runtime-lock");
+    assert.equal(localHead(fixture), committedTip);
+    assert.equal(remoteHead(fixture), committedTip);
+    assert.equal(readFileSync(lockPath, "utf8"), lockContent);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("rejects a tracked runtime lock introduced by fetched history before fast-forwarding", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-tracked-runtime-lock");
+    const localTip = localHead(fixture);
+    writeFiles(peer, {
+      ".tmp/knowledge-update.lock": `${JSON.stringify({
+        pid: 999_999,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        path: ".tmp/knowledge-update.lock",
+      })}\n`,
+    });
+    git(peer, ["add", "-f", ".tmp/knowledge-update.lock"]);
+    git(peer, ["commit", "-m", "track the reserved runtime lock remotely"]);
+    const remoteTip = git(peer, ["rev-parse", "HEAD"]);
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "tracked-runtime-lock");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(existsSync(join(fixture.workspace, ".tmp/knowledge-update.lock")), false);
+    assert.equal(recoveryRefs(fixture).length, 2);
+  });
+
   it("shares the Knowledge update lock and returns a typed locked response", () => {
     const fixture = createSyncFixture();
     const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
@@ -627,6 +792,28 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(response.reason, "knowledge-sync-locked");
     assert.match(response.message, /already running/);
     assert.match(readFileSync(lockPath, "utf8"), /knowledge-update\.lock/);
+  });
+
+  it("does not reclaim an old lock owned by a live process", () => {
+    const fixture = createSyncFixture();
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
+    const lockContent = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: "2000-01-01T00:00:00.000Z",
+      path: ".tmp/knowledge-update.lock",
+    })}\n`;
+    writeFiles(fixture.workspace, { ".tmp/knowledge-update.lock": lockContent });
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+      staleLockMs: 1,
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "locked");
+    assert.equal(response.reason, "knowledge-sync-locked");
+    assert.equal(readFileSync(lockPath, "utf8"), lockContent);
   });
 
   it("does not fast-forward canonical main when a fetched candidate is not Knowledge v2", () => {
@@ -648,19 +835,27 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(worktreePaths(fixture).length, 2);
   });
 
-  it("converts an injected Git exception into a typed failure", () => {
+  it("converts a post-lock Git exception into a typed failure and releases the lock", () => {
     const fixture = createSyncFixture();
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
 
     const response = executeKnowledgeSync({
       agentWorkspaceRoot: fixture.workspace,
-      git: () => {
-        throw new Error("injected Git failure");
+      git: (args, options) => {
+        if (args[0] === "fetch") {
+          throw new Error("injected Git failure after lock acquisition");
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
       },
     });
 
     assert.equal(response.ok, false);
     assert.equal(response.reason, "knowledge-sync-failed");
-    assert.match(response.message, /injected Git failure/);
+    assert.match(response.message, /injected Git failure after lock acquisition/);
+    assert.equal(existsSync(lockPath), false);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+    assertSyncOk(retried);
   });
 
   it("leaves canonical HEAD and files unchanged on a non-Knowledge conflict", () => {

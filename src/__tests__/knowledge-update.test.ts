@@ -984,6 +984,7 @@ describe("knowledge_update", () => {
         agentWorkspaceRoot: workspace,
         lockNow: () => new Date("2026-06-07T12:00:00.000Z"),
         staleLockMs: 1_000,
+        isProcessAlive: () => false,
       },
     );
     assertUpdateOk(stale);
@@ -1011,6 +1012,36 @@ describe("knowledge_update", () => {
     assert.equal(fresh.ok, false);
     assert.equal(fresh.status, "locked");
     rmSync(lockPath, { force: true });
+  });
+
+  it("does not release a lock that has been replaced by a successor", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const successorLock = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: "2026-06-07T12:00:01.000Z",
+      path: ".tmp/knowledge-update.lock",
+      token: "successor-token",
+    })}\n`;
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "successor-lock",
+        frontmatter: pageFrontmatter("Successor Lock"),
+        body: "# Successor Lock\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        refreshSearchBackend: () => {
+          writeFileSync(lockPath, successorLock, "utf8");
+        },
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(readFileSync(lockPath, "utf8"), successorLock);
   });
 
   it("rejects symlinked lock directory before creating the update lock", () => {
