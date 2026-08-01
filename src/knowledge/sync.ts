@@ -633,6 +633,33 @@ function validateManagedGitEntries(
       }
     }
   }
+  for (const relPath of [...trackedPaths].sort()) {
+    const attribute = git(["check-attr", "-z", "filter", "--", relPath], {
+      cwd: layout.agentWorkspaceRoot,
+    });
+    if (attribute.status !== 0) {
+      return failure(
+        "error",
+        "candidate-managed-filter-inspection-failed",
+        `knowledge sync could not inspect the clean filter for ${relPath}: ${errorText(attribute)}`,
+      );
+    }
+    const fields = attribute.stdout.split("\0");
+    if (fields[0] !== relPath || fields[1] !== "filter" || !fields[2]) {
+      return failure(
+        "error",
+        "candidate-managed-filter-inspection-failed",
+        `knowledge sync received an invalid filter-attribute result for ${relPath}.`,
+      );
+    }
+    if (fields[2] !== "unspecified" && fields[2] !== "unset") {
+      return failure(
+        "unsupported",
+        "candidate-unsupported-clean-filter",
+        `knowledge sync refused ${relPath} because its Git clean filter can alter committed Knowledge bytes.`,
+      );
+    }
+  }
   if (!trackedPaths.has("wiki/log.md")) {
     return failure(
       "rejected",
@@ -787,6 +814,24 @@ function validateMergeDrivers(
   }
   if (jointlyChangedPaths.size === 0) {
     return undefined;
+  }
+
+  for (const driver of SAFE_DEFAULT_MERGE_DRIVERS) {
+    const configured = git(["config", "--get", `merge.${driver}.driver`], { cwd: candidateRoot });
+    if (configured.status === 0) {
+      return failure(
+        "unsupported",
+        "unsupported-merge-driver",
+        `knowledge sync refused divergent paths because merge.${driver}.driver overrides Git's built-in ${driver} merge driver.`,
+      );
+    }
+    if (configured.stderr.trim()) {
+      return failure(
+        "error",
+        "candidate-merge-driver-inspection-failed",
+        `knowledge sync could not inspect merge.${driver}.driver: ${errorText(configured)}`,
+      );
+    }
   }
 
   const defaultDriver = git(["config", "--get", "merge.default"], { cwd: candidateRoot });
@@ -995,10 +1040,28 @@ function validateLinearStructuralLogHistory(
   if (!candidateLog.ok) {
     return candidateLog.failure;
   }
-  if (
-    candidateLog.content === undefined ||
-    !candidateLog.content.startsWith(ancestorLog.content ?? "")
-  ) {
+  if (candidateLog.content === undefined) {
+    return failure(
+      "rejected",
+      "candidate-log-history-not-preserved",
+      "knowledge sync refused a linear candidate that did not preserve its ancestor structural-log history.",
+    );
+  }
+  if (candidateLog.content.startsWith(ancestorLog.content ?? "")) {
+    return undefined;
+  }
+  const merge = git(
+    ["rev-list", "--merges", "--max-count=1", `${ancestorCommit}..${candidateCommit}`],
+    { cwd: candidateRoot },
+  );
+  if (merge.status !== 0) {
+    return failure(
+      "error",
+      "candidate-history-inspection-failed",
+      `knowledge sync could not inspect candidate merge history: ${errorText(merge)}`,
+    );
+  }
+  if (!merge.stdout.trim() || !lineMultisetContains(candidateLog.content, ancestorLog.content ?? "")) {
     return failure(
       "rejected",
       "candidate-log-history-not-preserved",
@@ -1528,7 +1591,7 @@ function removeSyncTemporaryWorktrees(
   if (!Array.isArray(worktrees)) {
     return worktrees;
   }
-  for (const { path, markerPath } of worktrees) {
+  for (const { path } of worktrees) {
     const removed = git(["worktree", "remove", "--force", path], { cwd: workspaceRoot });
     if (removed.status !== 0) {
       return failure(
@@ -1539,10 +1602,7 @@ function removeSyncTemporaryWorktrees(
     }
     const tempRoot = dirname(path);
     try {
-      fs.unlinkSync(markerPath);
-      if (fs.readdirSync(tempRoot).length === 0) {
-        fs.rmSync(tempRoot, { recursive: true, force: true });
-      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
     } catch {
       return failure(
         "error",

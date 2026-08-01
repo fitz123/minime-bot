@@ -410,6 +410,7 @@ export function classifyKnowledgeIntegrityToolCall(
       stringField(event.input, "command") ?? "",
       cwd,
       deps.env,
+      agentWorkspaceRoot,
     );
     for (const rawTarget of destructiveAncestorTargets) {
       const expandedTarget = expandShellPathVariables(rawTarget, cwd, deps.env) ?? rawTarget;
@@ -470,8 +471,9 @@ function extractBashDestructiveAncestorTargetsForCwd(
   command: string,
   cwd: string,
   env?: NodeJS.ProcessEnv,
+  knownGitWorktreeRoot?: string,
 ): string[] {
-  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env);
+  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env, knownGitWorktreeRoot);
 }
 
 function extractBashDestructiveAncestorTargetsAtDepth(
@@ -479,6 +481,7 @@ function extractBashDestructiveAncestorTargetsAtDepth(
   depth: number,
   cwd: string | undefined,
   env: NodeJS.ProcessEnv | undefined,
+  knownGitWorktreeRoot: string | undefined,
 ): string[] {
   if (depth > MAX_NESTED_SHELL_DEPTH) {
     return [];
@@ -504,6 +507,7 @@ function extractBashDestructiveAncestorTargetsAtDepth(
             depth + 1,
             commandCwd,
             commandEnv,
+            knownGitWorktreeRoot,
           )) {
             appendTarget(targets, target);
           }
@@ -553,7 +557,12 @@ function extractBashDestructiveAncestorTargetsAtDepth(
           commandEnv,
         );
       } else if (name === "git") {
-        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, commandEnv);
+        const worktreeTarget = gitWorktreeMutationTarget(
+          args,
+          commandCwd,
+          commandEnv,
+          knownGitWorktreeRoot,
+        );
         if (worktreeTarget) {
           appendTargetCandidates(targets, gitWorktreePathArguments(args), commandCwd, commandEnv);
           appendTargetCandidates(targets, [worktreeTarget], commandCwd, commandEnv);
@@ -951,6 +960,7 @@ function gitWorktreeMutationTarget(
   args: string[],
   cwd: string | undefined,
   env: NodeJS.ProcessEnv | undefined,
+  knownGitWorktreeRoot: string | undefined,
 ): string | undefined {
   const command = gitSubcommandPosition(args);
   if (!command || !gitSubcommandMutatesWorktree(command.name, args.slice(command.index + 1))) {
@@ -983,7 +993,17 @@ function gitWorktreeMutationTarget(
       );
     }
   }
-  return explicitWorktree ?? effectiveCwd;
+  if (explicitWorktree) {
+    return explicitWorktree;
+  }
+  if (
+    effectiveCwd &&
+    knownGitWorktreeRoot &&
+    insideOrSame(normalize(resolve(knownGitWorktreeRoot)), normalize(resolve(effectiveCwd)))
+  ) {
+    return knownGitWorktreeRoot;
+  }
+  return effectiveCwd;
 }
 
 function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {

@@ -35,6 +35,10 @@ archive/restore operations. After those changes are committed, use
 `minime-bot knowledge sync --workspace /path/to/agent-workspace` to reconcile a
 clean Knowledge v2 Git root on local `main` with `origin/main`. Sync does not
 accept dirty-input, force-push, reset, rebase, or winner-selection escape flags.
+For jointly changed paths it rejects `union` and custom merge drivers, including
+configured overrides of Git's built-in `text` and `binary` driver names. It also
+rejects clean filters on managed Knowledge files because they can alter staged
+variants; remove those settings before retrying.
 
 The sync transaction preserves observed local and remote tips under
 `refs/minime/knowledge-sync/recovery/**`, builds divergent candidates in a

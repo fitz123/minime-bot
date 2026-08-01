@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -178,6 +179,40 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(response.ok, false);
     assert.equal(response.reason, "candidate-structural-log-missing");
     assert.equal(localHead(fixture), remoteHead(fixture));
+  });
+
+  it("rejects stale committed indexes in no-op, ahead, and behind histories", () => {
+    for (const classification of ["no-op", "ahead", "behind"] as const) {
+      const fixture = createSyncFixture();
+      const files = {
+        "wiki/pages/reference/stale-index.md": page(
+          "Stale index",
+          "A committed page omitted from the committed index.",
+          "reference",
+          "This page must be indexed before synchronization.\n",
+        ),
+        "wiki/index.md": "# Stale committed index\n",
+      };
+      if (classification === "behind") {
+        const peer = cloneRemote(fixture, "peer-stale-index");
+        commitFiles(peer, "commit stale remote index", files);
+        git(peer, ["push", "origin", "main"]);
+      } else {
+        commitFiles(fixture.workspace, "commit stale local index", files);
+        if (classification === "no-op") {
+          git(fixture.workspace, ["push", "origin", "main"]);
+        }
+      }
+      const localTip = localHead(fixture);
+      const remoteTip = remoteHead(fixture);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, classification);
+      assert.equal(response.reason, "candidate-index-page-set-mismatch", classification);
+      assert.equal(localHead(fixture), localTip, classification);
+      assert.equal(remoteHead(fixture), remoteTip, classification);
+    }
   });
 
   it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
@@ -509,9 +544,11 @@ describe("knowledge sync Git convergence", () => {
     const peer = cloneRemote(fixture, "peer-interrupted");
     const localTip = commitFiles(fixture.workspace, "local interrupted entry", {
       "diary/local-interrupted.md": "# Local before interruption\n",
+      "wiki/log.md": "# Knowledge Structural Log\n\n- local interrupted structural entry\n",
     });
     const remoteTip = commitFiles(peer, "remote interrupted entry", {
       "diary/remote-interrupted.md": "# Remote before interruption\n",
+      "wiki/log.md": "# Knowledge Structural Log\n\n- remote interrupted structural entry\n",
     });
     git(peer, ["push", "origin", "main"]);
     let refusedPush = false;
@@ -547,6 +584,67 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(remoteHead(fixture), candidateCommit);
     assert.deepEqual(recoveryRefs(fixture), []);
     assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
+  it("retries cleanup when a converged temporary worktree cannot initially be removed", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-worktree-cleanup");
+    commitFiles(fixture.workspace, "local cleanup divergence", {
+      "diary/local-cleanup.md": "# Local cleanup branch\n",
+    });
+    commitFiles(peer, "remote cleanup divergence", {
+      "diary/remote-cleanup.md": "# Remote cleanup branch\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    let refusedRemoval = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!refusedRemoval && gitCommand(args) === "worktree" && args.includes("remove")) {
+          refusedRemoval = true;
+          return { status: 1, stdout: "", stderr: "simulated worktree removal failure" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "candidate-worktree-remove-failed");
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assert.ok(recoveryRefs(fixture).length > 0);
+    assert.equal(worktreePaths(fixture).length, 2);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(retried);
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
+  it("retries cleanup when a reachable recovery ref cannot initially be deleted", () => {
+    const fixture = createSyncFixture();
+    let refusedDeletion = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!refusedDeletion && gitCommand(args) === "update-ref" && args[1] === "-d") {
+          refusedDeletion = true;
+          return { status: 1, stdout: "", stderr: "simulated recovery-ref deletion failure" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "recovery-ref-delete-failed");
+    assert.ok(recoveryRefs(fixture).length > 0);
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(retried);
+    assert.deepEqual(recoveryRefs(fixture), []);
   });
 
   it("recovers when candidate outcome persistence fails after the merge commit", () => {
@@ -890,6 +988,75 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(remoteHead(fixture), remoteTip);
   });
 
+  it("rejects configured overrides of Git's built-in text and binary merge drivers", () => {
+    for (const driver of ["text", "binary"] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/feedback/overridden-${driver}.md`;
+      const sharedVariant = page(
+        `Overridden ${driver} driver`,
+        "A shared page whose merge driver name is overridden locally.",
+        "feedback",
+        "Shared committed body.\n",
+      );
+      commitFiles(fixture.workspace, `configure shared ${driver} attribute`, {
+        ".gitattributes": `${relPath} merge=${driver}\n`,
+        [relPath]: sharedVariant,
+      });
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const peer = cloneRemote(fixture, `peer-overridden-${driver}`);
+      const localTip = commitFiles(fixture.workspace, `local ${driver} driver variant`, {
+        [relPath]: sharedVariant.replace("Shared committed body.", "LOCAL.DRIVER.VARIANT"),
+      });
+      const remoteTip = commitFiles(peer, `remote ${driver} driver variant`, {
+        [relPath]: sharedVariant.replace("Shared committed body.", "REMOTE.DRIVER.VARIANT"),
+      });
+      git(peer, ["push", "origin", "main"]);
+      git(fixture.workspace, ["config", `merge.${driver}.driver`, "cp %B %A"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, driver);
+      assert.equal(response.reason, "unsupported-merge-driver", driver);
+      assert.equal(localHead(fixture), localTip, driver);
+      assert.equal(remoteHead(fixture), remoteTip, driver);
+    }
+  });
+
+  it("rejects a clean filter before it can alter a staged unresolved page", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/feedback/filtered.md";
+    commitFiles(fixture.workspace, "configure shared clean-filter attribute", {
+      ".gitattributes": `${relPath} filter=drop\n`,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-clean-filter");
+    const localTip = commitFiles(fixture.workspace, "local filtered variant", {
+      [relPath]: page(
+        "Local filtered variant",
+        "The local committed variant.",
+        "feedback",
+        "LOCAL.UNIQUE.BODY\n",
+      ),
+    });
+    const remoteTip = commitFiles(peer, "remote filtered variant", {
+      [relPath]: page(
+        "Remote filtered variant",
+        "The remote committed variant.",
+        "feedback",
+        "REMOTE.UNIQUE.BODY\n",
+      ),
+    });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, ["config", "filter.drop.clean", "sed '/REMOTE.UNIQUE.BODY/d'"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("retains the complete present variant and the deletion provenance for modify/delete", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/reference/deletion.md";
@@ -1053,6 +1220,29 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(localHead(fixture), before);
     assert.equal(git(fixture.workspace, ["branch", "--show-current"]), "topic");
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("rejects a fetched managed symlink before fast-forwarding canonical main", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-managed-symlink");
+    const relPath = "wiki/pages/reference/unsafe-link.md";
+    const linkPath = join(peer, ...relPath.split("/"));
+    mkdirSync(dirname(linkPath), { recursive: true });
+    symlinkSync("../../../README.md", linkPath);
+    git(peer, ["add", relPath]);
+    git(peer, ["commit", "-m", "track unsafe managed symlink"]);
+    git(peer, ["push", "origin", "main"]);
+    const localTip = localHead(fixture);
+    const remoteTip = remoteHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsafe-managed-entry");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(existsSync(join(fixture.workspace, ...relPath.split("/"))), false);
+    assert.ok(recoveryRefs(fixture).length > 0);
   });
 
   it("rejects dirty tracked or untracked state byte-for-byte", () => {

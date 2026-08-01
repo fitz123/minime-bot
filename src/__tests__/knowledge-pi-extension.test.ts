@@ -367,6 +367,8 @@ describe("Knowledge Pi extension helpers", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n",
     });
+    const notes = join(workspace, "notes");
+    mkdirSync(notes, { recursive: true });
 
     for (const command of [
       "git clean -fdx",
@@ -396,6 +398,19 @@ describe("Knowledge Pi extension helpers", () => {
     assert.match(mergeDecision?.reason ?? "", /raw Git worktree mutations are blocked/);
     assert.match(mergeDecision?.reason ?? "", /knowledge_update/);
     assert.match(mergeDecision?.reason ?? "", /minime-bot knowledge sync/);
+
+    for (const [command, cwd] of [
+      ["git merge origin/main", notes],
+      ["git -C notes merge origin/main", workspace],
+      ["cd notes && git merge origin/main", workspace],
+    ] as const) {
+      const decision = classifyKnowledgeIntegrityToolCall(
+        { toolName: "bash", input: { command } },
+        { agentWorkspaceRoot: workspace, cwd, env: {} },
+      );
+      assert.equal(decision?.block, true, command);
+      assert.equal(decision.targetPath, workspace, command);
+    }
 
     const outside = createWorkspace();
     const env = { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace };
