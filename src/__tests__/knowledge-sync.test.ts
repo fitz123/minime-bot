@@ -31,6 +31,18 @@ interface SyncFixture {
 
 const fixtures: string[] = [];
 
+function filesystemIsCaseInsensitive(): boolean {
+  const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-case-check-"));
+  try {
+    writeFileSync(join(root, "Case"), "case probe\n", "utf8");
+    return existsSync(join(root, "case"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const CASE_INSENSITIVE_FILESYSTEM = filesystemIsCaseInsensitive();
+
 after(() => {
   for (const fixture of fixtures) {
     rmSync(fixture, { recursive: true, force: true });
@@ -254,6 +266,169 @@ describe("knowledge sync Git convergence", () => {
     assert.match(readFileSync(join(fixture.workspace, "diary/2026-08-01.md"), "utf8"), /Fetched history/);
     assert.deepEqual(recoveryRefs(fixture), []);
   });
+
+  it("does not fast-forward behind main when a canonical managed file is hidden from the worktree", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind-hidden-canonical");
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "remote change behind hidden canonical state", {
+      "diary/remote-hidden-canonical.md": "# Remote history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, ["update-index", "--skip-worktree", "wiki/log.md"]);
+    rmSync(join(fixture.workspace, "wiki/log.md"));
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-hidden-managed-entry");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(existsSync(join(fixture.workspace, "diary/remote-hidden-canonical.md")), false);
+  });
+
+  it("preserves ignored canonical Knowledge bytes that collide with a fetched tracked page", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/ignored-collision.md";
+    const localIgnoredPage = page(
+      "Local ignored collision",
+      "Ignored local bytes must survive a rejected sync.",
+      "reference",
+      "Local ignored Knowledge bytes.\n",
+    );
+    const remotePage = page(
+      "Remote tracked collision",
+      "A remote tracked page collides with ignored local bytes.",
+      "reference",
+      "Remote committed Knowledge bytes.\n",
+    );
+    const localTip = commitFiles(fixture.workspace, "ignore a future managed page", {
+      ".gitignore": `.tmp/\n${relPath}\n`,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-ignored-collision");
+    writeFiles(peer, {
+      [relPath]: remotePage,
+      "wiki/index.md": generateKnowledgeIndex([
+        {
+          absPath: join(peer, ...relPath.split("/")),
+          relPath,
+          linkPath: "pages/reference/ignored-collision.md",
+          frontmatter: {
+            name: "Remote tracked collision",
+            description: "A remote tracked page collides with ignored local bytes.",
+            type: "reference",
+          },
+        },
+      ]),
+    });
+    git(peer, ["add", "-f", relPath]);
+    git(peer, ["add", "wiki/index.md"]);
+    git(peer, ["commit", "-m", "track the colliding remote page"]);
+    git(peer, ["push", "origin", "main"]);
+    const remoteTip = remoteHead(fixture);
+    writeFiles(fixture.workspace, { [relPath]: localIgnoredPage });
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-untracked-managed-files");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), localIgnoredPage);
+  });
+
+  it("rechecks canonical managed materialization immediately before fast-forward", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/reference/late-ignored.md";
+    const ignoredPage = page(
+      "Late ignored page",
+      "Ignored bytes introduced during candidate preparation must remain local.",
+      "reference",
+      "Late ignored Knowledge bytes.\n",
+    );
+    const localTip = commitFiles(fixture.workspace, "ignore a late managed page", {
+      ".gitignore": `.tmp/\n${relPath}\n`,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-late-ignored");
+    const remoteTip = commitFiles(peer, "remote history during canonical recheck", {
+      "diary/remote-late-ignored.md": "# Remote history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    let canonicalIgnoredChecks = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        const result = defaultKnowledgeSyncGitRunner(args, options);
+        if (
+          options.cwd === fixture.workspace &&
+          gitCommand(args) === "ls-files" &&
+          args.includes("--ignored") &&
+          canonicalIgnoredChecks++ === 0
+        ) {
+          writeFiles(fixture.workspace, { [relPath]: ignoredPage });
+        }
+        return result;
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-untracked-managed-files");
+    assert.equal(canonicalIgnoredChecks, 2);
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), ignoredPage);
+  });
+
+  it(
+    "rejects tracked page aliases that cannot be uniquely materialized",
+    { skip: !CASE_INSENSITIVE_FILESYSTEM },
+    () => {
+      const fixture = createSyncFixture();
+      const upperPath = "wiki/pages/reference/Case-Alias.md";
+      const lowerPath = "wiki/pages/reference/case-alias.md";
+      const aliasedPage = page(
+        "Case alias",
+        "Two tracked paths must not alias one materialized page.",
+        "reference",
+        "Aliased committed Knowledge bytes.\n",
+      );
+      writeFiles(fixture.workspace, { [upperPath]: aliasedPage });
+      const blob = git(fixture.workspace, ["hash-object", "-w", upperPath]);
+      git(fixture.workspace, ["update-index", "--add", "--cacheinfo", `100644,${blob},${upperPath}`]);
+      git(fixture.workspace, ["update-index", "--add", "--cacheinfo", `100644,${blob},${lowerPath}`]);
+      writeFiles(fixture.workspace, {
+        "wiki/index.md": generateKnowledgeIndex([
+          {
+            absPath: join(fixture.workspace, ...upperPath.split("/")),
+            relPath: upperPath,
+            linkPath: "pages/reference/Case-Alias.md",
+            frontmatter: {
+              name: "Case alias",
+              description: "Two tracked paths must not alias one materialized page.",
+              type: "reference",
+            },
+          },
+        ]),
+      });
+      git(fixture.workspace, ["add", "wiki/index.md"]);
+      git(fixture.workspace, ["commit", "-m", "track colliding case aliases"]);
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const committedTip = localHead(fixture);
+      assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "candidate-active-page-set-mismatch");
+      assert.equal(localHead(fixture), committedTip);
+      assert.equal(remoteHead(fixture), committedTip);
+    },
+  );
 
   it("rejects a behind commit that truncates structural-log history", () => {
     const fixture = createSyncFixture();

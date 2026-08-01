@@ -670,31 +670,13 @@ function validateManagedCheckinTransformations(
   return undefined;
 }
 
-function validateManagedGitEntries(
-  layout: ResolvedKnowledgeV2Layout,
+function validateManagedWorktreeMaterialization(
+  workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
-  const listed = git(
-    [
-      "ls-files",
-      "--stage",
-      "-z",
-      "--",
-      ...MANAGED_KNOWLEDGE_PATHSPECS,
-    ],
-    { cwd: layout.agentWorkspaceRoot },
-  );
-  if (listed.status !== 0) {
-    return failure(
-      "error",
-      "candidate-managed-path-inspection-failed",
-      `knowledge sync could not inspect managed candidate paths: ${errorText(listed)}`,
-    );
-  }
-
   const indexFlags = git(
     ["ls-files", "-v", "-z", "--", ...MANAGED_KNOWLEDGE_PATHSPECS],
-    { cwd: layout.agentWorkspaceRoot },
+    { cwd: workspaceRoot },
   );
   if (indexFlags.status !== 0) {
     return failure(
@@ -738,7 +720,7 @@ function validateManagedGitEntries(
       "--",
       ...MANAGED_KNOWLEDGE_PATHSPECS,
     ],
-    { cwd: layout.agentWorkspaceRoot },
+    { cwd: workspaceRoot },
   );
   if (ignored.status !== 0) {
     return failure(
@@ -757,7 +739,38 @@ function validateManagedGitEntries(
     );
   }
 
+  return undefined;
+}
+
+function validateManagedGitEntries(
+  layout: ResolvedKnowledgeV2Layout,
+  git: KnowledgeSyncGitRunner,
+): string[] | KnowledgeSyncFailure {
+  const listed = git(
+    [
+      "ls-files",
+      "--stage",
+      "-z",
+      "--",
+      ...MANAGED_KNOWLEDGE_PATHSPECS,
+    ],
+    { cwd: layout.agentWorkspaceRoot },
+  );
+  if (listed.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-path-inspection-failed",
+      `knowledge sync could not inspect managed candidate paths: ${errorText(listed)}`,
+    );
+  }
+
+  const materializationProblem = validateManagedWorktreeMaterialization(layout.agentWorkspaceRoot, git);
+  if (materializationProblem) {
+    return materializationProblem;
+  }
+
   const trackedPaths = new Set<string>();
+  const trackedPagePaths: string[] = [];
   for (const entry of listed.stdout.split("\0").filter(Boolean)) {
     const match = /^(\d+) [0-9a-f]+ (\d+)\t([\s\S]+)$/u.exec(entry);
     if (!match) {
@@ -785,6 +798,7 @@ function validateManagedGitEntries(
       );
     }
     if (relPath.startsWith("wiki/pages/")) {
+      trackedPagePaths.push(relPath);
       const managedPage = parseManagedKnowledgePagePath(relPath);
       if (isUpdateFailure(managedPage)) {
         return candidateUpdateFailure(
@@ -806,7 +820,7 @@ function validateManagedGitEntries(
       "knowledge sync requires a committed regular wiki/log.md structural history.",
     );
   }
-  return undefined;
+  return trackedPagePaths.sort();
 }
 
 function validateCandidateCorpus(
@@ -814,9 +828,9 @@ function validateCandidateCorpus(
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
 ): KnowledgeSyncFailure | undefined {
-  const managedEntriesProblem = validateManagedGitEntries(layout, git);
-  if (managedEntriesProblem) {
-    return managedEntriesProblem;
+  const trackedPagePaths = validateManagedGitEntries(layout, git);
+  if (!Array.isArray(trackedPagePaths)) {
+    return trackedPagePaths;
   }
   for (const path of [layout.paths.schemaPath, layout.paths.indexPath, layout.paths.logPath]) {
     const safePathProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, path, fs);
@@ -849,6 +863,24 @@ function validateCandidateCorpus(
       pages,
       "candidate-page-invalid",
       "knowledge sync candidate page validation failed",
+    );
+  }
+  const materializedPagePaths = pages.map(({ relPath }) => relPath).sort();
+  if (
+    trackedPagePaths.length !== materializedPagePaths.length ||
+    trackedPagePaths.some((relPath, index) => relPath !== materializedPagePaths[index])
+  ) {
+    const trackedPageSet = new Set(trackedPagePaths);
+    const materializedPageSet = new Set(materializedPagePaths);
+    const mismatchedPaths = [
+      ...trackedPagePaths.filter((relPath) => !materializedPageSet.has(relPath)),
+      ...materializedPagePaths.filter((relPath) => !trackedPageSet.has(relPath)),
+    ].sort();
+    return failure(
+      "rejected",
+      "candidate-active-page-set-mismatch",
+      `knowledge sync requires every tracked active page to be uniquely materialized and no untracked active pages; mismatched paths: ${mismatchedPaths.join(", ")}.`,
+      { conflictPaths: mismatchedPaths },
     );
   }
   let actualIndex: string;
@@ -1983,7 +2015,9 @@ function fastForwardCanonical(
   if (current.stdout.trim() === commit) {
     return undefined;
   }
-  const merged = git([...DISABLE_GIT_HOOKS, "merge", "--ff-only", commit], { cwd: workspaceRoot });
+  const merged = git([...DISABLE_GIT_HOOKS, "merge", "--ff-only", "--no-overwrite-ignore", commit], {
+    cwd: workspaceRoot,
+  });
   if (merged.status !== 0) {
     return failure(
       "error",
@@ -2005,6 +2039,14 @@ function convergeAttempt(
   const candidate = prepareCandidate(workspaceRoot, tips, classification, deps, git, fs);
   if (!candidate.ok) {
     return candidate;
+  }
+  const canonicalStateFailure =
+    validateMainBranch(workspaceRoot, git) ??
+    validateNoGitOperationInProgress(workspaceRoot, git, fs) ??
+    validateCleanWorktree(workspaceRoot, git) ??
+    validateManagedWorktreeMaterialization(workspaceRoot, git);
+  if (canonicalStateFailure) {
+    return { ok: false, failure: canonicalStateFailure };
   }
   const fastForwardFailure = fastForwardCanonical(workspaceRoot, candidate.commit, git);
   if (fastForwardFailure) {
@@ -2074,6 +2116,10 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
     const lockedPreflight = preflight(workspaceRoot, deps, git, fs);
     if ("ok" in lockedPreflight) {
       return lockedPreflight;
+    }
+    const canonicalMaterializationFailure = validateManagedWorktreeMaterialization(workspaceRoot, git);
+    if (canonicalMaterializationFailure) {
+      return canonicalMaterializationFailure;
     }
 
     let initialClassification: KnowledgeSyncClassification | undefined;
