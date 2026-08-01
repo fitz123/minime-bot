@@ -40,12 +40,12 @@ node dist/cli.js --help
 
 **Serves:** Ninja requires local `main`, remote `main`, and the working tree to converge autonomously while all committed information remains reachable and destructive Git operations stay forbidden.
 
-- [ ] Create `src/knowledge/sync.ts` with typed success/failure results, Knowledge v2/Git-root/current-branch/clean-worktree validation, injected Git/filesystem dependencies for tests, and the existing Knowledge workspace lock boundary.
-- [ ] Implement fetch and ahead/behind/diverged classification, durable local/remote recovery refs, an isolated temporary detached worktree for divergent candidates, canonical fast-forward only after validation, push verification, and one bounded push-race retry.
-- [ ] Keep recovery refs when convergence fails or their unique commits are not yet reachable from canonical history; remove temporary worktrees and recovery refs only after verified local/remote convergence.
-- [ ] Add `src/__tests__/knowledge-sync.test.ts` integration fixtures with temporary local/bare remotes covering no-op, behind fast-forward, ahead push, clean divergence, push race, interrupted/retried state, and pre-sync commit reachability.
-- [ ] Add error-path tests proving dirty/non-main/non-repository inputs and non-Knowledge conflicts leave canonical HEAD/worktree unchanged with bounded actionable failures.
-- [ ] Run `npm run test:file -- src/__tests__/knowledge-sync.test.ts` and fix all failures before Task 2.
+- [x] Create `src/knowledge/sync.ts` with typed success/failure results, Knowledge v2/Git-root/current-branch/clean-worktree validation, injected Git/filesystem dependencies for tests, and the existing Knowledge workspace lock boundary.
+- [x] Implement fetch and ahead/behind/diverged classification, durable local/remote recovery refs, an isolated temporary detached worktree for divergent candidates, canonical fast-forward only after validation, push verification, and one bounded push-race retry.
+- [x] Keep recovery refs when convergence fails or their unique commits are not yet reachable from canonical history; remove temporary worktrees and recovery refs only after verified local/remote convergence.
+- [x] Add `src/__tests__/knowledge-sync.test.ts` integration fixtures with temporary local/bare remotes covering no-op, behind fast-forward, ahead push, clean divergence, push race, interrupted/retried state, and pre-sync commit reachability.
+- [x] Add error-path tests proving dirty/non-main/non-repository inputs and non-Knowledge conflicts leave canonical HEAD/worktree unchanged with bounded actionable failures.
+- [x] Run `npm run test:file -- src/__tests__/knowledge-sync.test.ts` and fix all failures before Task 2.
 
 ### Task 2: Reconcile managed Knowledge conflicts data-preservingly
 

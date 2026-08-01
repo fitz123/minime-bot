@@ -139,7 +139,7 @@ interface AtomicWritePlan extends AtomicWrite {
   committed: boolean;
 }
 
-interface LockHandle {
+export interface KnowledgeUpdateLockHandle {
   path: string;
   relPath: ".tmp/knowledge-update.lock";
   release: () => void;
@@ -857,11 +857,11 @@ function verifyIndexInvariants(
   return undefined;
 }
 
-function acquireKnowledgeUpdateLock(
+export function acquireKnowledgeUpdateLock(
   layout: ResolvedKnowledgeV2Layout,
   fs: KnowledgeUpdateFs,
   deps: KnowledgeUpdateDeps,
-): LockHandle | KnowledgeUpdateFailure {
+): KnowledgeUpdateLockHandle | KnowledgeUpdateFailure {
   const lockRelPath = ".tmp/knowledge-update.lock" as const;
   const lockPath = join(layout.agentWorkspaceRoot, ".tmp", "knowledge-update.lock");
   const now = deps.lockNow?.() ?? new Date();
@@ -1511,7 +1511,7 @@ function executeMoveRequest(
 
 export function executeKnowledgeUpdate(args: KnowledgeUpdateArgs = {}, deps: KnowledgeUpdateDeps = {}): KnowledgeUpdateResponse {
   const fs = fsForDeps(deps);
-  let lock: LockHandle | undefined;
+  let lock: KnowledgeUpdateLockHandle | undefined;
 
   try {
     const request = normalizeKnowledgeUpdateRequest(args);

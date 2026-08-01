@@ -1,0 +1,458 @@
+import { after, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import {
+  defaultKnowledgeSyncGitRunner,
+  executeKnowledgeSync,
+  type KnowledgeSyncResponse,
+} from "../knowledge/sync.js";
+
+interface SyncFixture {
+  root: string;
+  workspace: string;
+  remote: string;
+}
+
+const fixtures: string[] = [];
+
+after(() => {
+  for (const fixture of fixtures) {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+function git(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("git", [...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(
+    result.status,
+    0,
+    `git ${args.join(" ")} failed in ${cwd}: ${(result.stderr || result.stdout).trim()}`,
+  );
+  return result.stdout.trim();
+}
+
+function writeFiles(root: string, files: Record<string, string>): void {
+  for (const [relPath, content] of Object.entries(files)) {
+    const path = join(root, ...relPath.split("/"));
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content, "utf8");
+  }
+}
+
+function configureIdentity(workspace: string): void {
+  git(workspace, ["config", "user.name", "Knowledge Sync Test"]);
+  git(workspace, ["config", "user.email", "knowledge-sync-test@users.noreply.github.com"]);
+  git(workspace, ["config", "commit.gpgSign", "false"]);
+}
+
+function commitFiles(workspace: string, message: string, files: Record<string, string>): string {
+  writeFiles(workspace, files);
+  git(workspace, ["add", ...Object.keys(files)]);
+  git(workspace, ["commit", "-m", message]);
+  return git(workspace, ["rev-parse", "HEAD"]);
+}
+
+function createSyncFixture(): SyncFixture {
+  const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-test-"));
+  fixtures.push(root);
+  const workspace = join(root, "workspace");
+  const remote = join(root, "remote.git");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(remote, { recursive: true });
+  git(remote, ["init", "--bare", "--initial-branch=main"]);
+  git(workspace, ["init", "--initial-branch=main"]);
+  configureIdentity(workspace);
+  commitFiles(workspace, "initial Knowledge v2 workspace", {
+    ".gitignore": ".tmp/\n",
+    "README.md": "# Agent workspace\n\nShared baseline.\n",
+    "wiki/schema.md": generateKnowledgeV2Schema(),
+    "wiki/index.md": "# Knowledge Index\n",
+    "wiki/log.md": "# Knowledge Structural Log\n",
+  });
+  git(workspace, ["remote", "add", "origin", remote]);
+  git(workspace, ["push", "-u", "origin", "main"]);
+  return { root, workspace, remote };
+}
+
+function cloneRemote(fixture: SyncFixture, name: string): string {
+  const clone = join(fixture.root, name);
+  git(fixture.root, ["clone", fixture.remote, clone]);
+  configureIdentity(clone);
+  return clone;
+}
+
+function remoteHead(fixture: SyncFixture): string {
+  return git(fixture.remote, ["rev-parse", "refs/heads/main"]);
+}
+
+function localHead(fixture: SyncFixture): string {
+  return git(fixture.workspace, ["rev-parse", "refs/heads/main"]);
+}
+
+function recoveryRefs(fixture: SyncFixture): string[] {
+  const output = git(fixture.workspace, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/minime/knowledge-sync/recovery",
+  ]);
+  return output ? output.split("\n").sort() : [];
+}
+
+function worktreePaths(fixture: SyncFixture): string[] {
+  return git(fixture.workspace, ["worktree", "list", "--porcelain"])
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+}
+
+function assertSyncOk(response: KnowledgeSyncResponse): asserts response is Extract<KnowledgeSyncResponse, { ok: true }> {
+  assert.equal(response.ok, true, JSON.stringify(response));
+}
+
+function assertAncestor(fixture: SyncFixture, ancestor: string, descendant: string): void {
+  git(fixture.workspace, ["merge-base", "--is-ancestor", ancestor, descendant]);
+}
+
+describe("knowledge sync Git convergence", () => {
+  it("is a verified no-op when local and remote main already match", () => {
+    const fixture = createSyncFixture();
+    const before = localHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "no-op");
+    assert.equal(response.attempts, 1);
+    assert.equal(response.commit, before);
+    assert.equal(localHead(fixture), before);
+    assert.equal(remoteHead(fixture), before);
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind");
+    const remoteCommit = commitFiles(peer, "remote diary entry", {
+      "diary/2026-08-01.md": "# Remote diary\n\nFetched history.\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "behind");
+    assert.equal(response.commit, remoteCommit);
+    assert.equal(localHead(fixture), remoteCommit);
+    assert.equal(remoteHead(fixture), remoteCommit);
+    assert.match(readFileSync(join(fixture.workspace, "diary/2026-08-01.md"), "utf8"), /Fetched history/);
+    assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("pushes an ahead canonical main and verifies origin/main", () => {
+    const fixture = createSyncFixture();
+    const localCommit = commitFiles(fixture.workspace, "local diary entry", {
+      "diary/2026-08-02.md": "# Local diary\n\nCommitted locally.\n",
+    });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "ahead");
+    assert.equal(response.commit, localCommit);
+    assert.equal(remoteHead(fixture), localCommit);
+    assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("merges clean divergence in a detached worktree and keeps both pre-sync tips reachable", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-diverged");
+    const localCommit = commitFiles(fixture.workspace, "local divergent entry", {
+      "diary/local.md": "# Local\n\nLocal committed history.\n",
+    });
+    const remoteCommit = commitFiles(peer, "remote divergent entry", {
+      "diary/remote.md": "# Remote\n\nRemote committed history.\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    const candidateBase = join(fixture.root, "candidate-worktrees");
+    let temporaryWorktrees = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      temporaryDirectory: candidateBase,
+      fs: {
+        mkdtempSync: ((prefix: string) => {
+          temporaryWorktrees += 1;
+          return mkdtempSync(prefix);
+        }) as typeof mkdtempSync,
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "diverged");
+    assert.equal(temporaryWorktrees, 1);
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assertAncestor(fixture, localCommit, response.commit);
+    assertAncestor(fixture, remoteCommit, response.commit);
+    assert.match(readFileSync(join(fixture.workspace, "diary/local.md"), "utf8"), /Local committed history/);
+    assert.match(readFileSync(join(fixture.workspace, "diary/remote.md"), "utf8"), /Remote committed history/);
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+
+  it("performs one bounded reconciliation retry when a remote commit wins the first push race", () => {
+    const fixture = createSyncFixture();
+    const racer = cloneRemote(fixture, "peer-racer");
+    const localCommit = commitFiles(fixture.workspace, "local race entry", {
+      "diary/local-race.md": "# Local race\n",
+    });
+    let raced = false;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!raced && args[0] === "push") {
+          raced = true;
+          commitFiles(racer, "winning remote race entry", {
+            "diary/remote-race.md": "# Remote race\n",
+          });
+          git(racer, ["push", "origin", "main"]);
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(raced, true);
+    assert.equal(response.classification, "ahead");
+    assert.equal(response.attempts, 2);
+    assert.equal(localHead(fixture), remoteHead(fixture));
+    assertAncestor(fixture, localCommit, response.commit);
+    assert.match(readFileSync(join(fixture.workspace, "diary/remote-race.md"), "utf8"), /Remote race/);
+    assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("stops after the single allowed push-race retry and preserves the last raced tip", () => {
+    const fixture = createSyncFixture();
+    const racer = cloneRemote(fixture, "peer-repeated-racer");
+    commitFiles(fixture.workspace, "local repeated race entry", {
+      "diary/local-repeated-race.md": "# Local repeated race\n",
+    });
+    let pushAttempts = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (args[0] === "push") {
+          pushAttempts += 1;
+          commitFiles(racer, `remote race ${pushAttempts}`, {
+            [`diary/remote-race-${pushAttempts}.md`]: `# Remote race ${pushAttempts}\n`,
+          });
+          git(racer, ["push", "origin", "main"]);
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "push-race-exhausted");
+    assert.equal(response.attempts, 2);
+    assert.equal(pushAttempts, 2);
+    assert.match(response.message, /one bounded push-race retry/);
+    const finalRemoteTip = remoteHead(fixture);
+    assert.ok(
+      recoveryRefs(fixture).some((ref) => ref.endsWith(`remote-${finalRemoteTip}`)),
+      "the final fetched racing tip must have a durable recovery ref",
+    );
+  });
+
+  it("retains recovery refs after an interrupted push and completes idempotently on retry", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-interrupted");
+    const localTip = commitFiles(fixture.workspace, "local interrupted entry", {
+      "diary/local-interrupted.md": "# Local before interruption\n",
+    });
+    const remoteTip = commitFiles(peer, "remote interrupted entry", {
+      "diary/remote-interrupted.md": "# Remote before interruption\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    let refusedPush = false;
+
+    const interrupted = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (!refusedPush && args[0] === "push") {
+          refusedPush = true;
+          return { status: 1, stdout: "", stderr: "simulated transport interruption" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.reason, "push-failed");
+    assert.equal(interrupted.attempts, 1);
+    const candidateCommit = localHead(fixture);
+    assert.notEqual(candidateCommit, localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assertAncestor(fixture, localTip, candidateCommit);
+    assertAncestor(fixture, remoteTip, candidateCommit);
+    assert.equal(recoveryRefs(fixture).length, 3);
+    assert.equal(worktreePaths(fixture).length, 2);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    const retried = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(retried);
+    assert.equal(retried.classification, "ahead");
+    assert.equal(retried.commit, candidateCommit);
+    assert.equal(remoteHead(fixture), candidateCommit);
+    assert.deepEqual(recoveryRefs(fixture), []);
+    assert.deepEqual(worktreePaths(fixture), [realpathSync(fixture.workspace)]);
+  });
+});
+
+describe("knowledge sync validation and failure boundaries", () => {
+  it("rejects a Knowledge v2 directory that is not a Git repository", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-nonrepo-"));
+    fixtures.push(root);
+    writeFiles(root, {
+      "wiki/schema.md": generateKnowledgeV2Schema(),
+      "wiki/index.md": "# Knowledge Index\n",
+    });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: root });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "not-a-git-repository");
+    assert.match(response.message, /Git repository root/);
+  });
+
+  it("rejects a non-main branch without changing HEAD or the worktree", () => {
+    const fixture = createSyncFixture();
+    git(fixture.workspace, ["switch", "-c", "topic"]);
+    const before = localHead(fixture);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "not-on-main");
+    assert.equal(localHead(fixture), before);
+    assert.equal(git(fixture.workspace, ["branch", "--show-current"]), "topic");
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  });
+
+  it("rejects dirty tracked or untracked state byte-for-byte", () => {
+    const fixture = createSyncFixture();
+    const readmePath = join(fixture.workspace, "README.md");
+    writeFileSync(readmePath, "# Agent workspace\n\nUncommitted edit.\n", "utf8");
+    writeFiles(fixture.workspace, { "notes/untracked.md": "untracked\n" });
+    const beforeHead = localHead(fixture);
+    const beforeStatus = git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    const beforeReadme = readFileSync(readmePath, "utf8");
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "dirty-worktree");
+    assert.match(response.message, /commit or remove/);
+    assert.equal(localHead(fixture), beforeHead);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), beforeStatus);
+    assert.equal(readFileSync(readmePath, "utf8"), beforeReadme);
+  });
+
+  it("shares the Knowledge update lock and returns a typed locked response", () => {
+    const fixture = createSyncFixture();
+    const lockPath = join(fixture.workspace, ".tmp/knowledge-update.lock");
+    writeFiles(fixture.workspace, {
+      ".tmp/knowledge-update.lock": `${JSON.stringify({
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+        path: ".tmp/knowledge-update.lock",
+      })}\n`,
+    });
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "locked");
+    assert.equal(response.reason, "knowledge-sync-locked");
+    assert.match(response.message, /already running/);
+    assert.match(readFileSync(lockPath, "utf8"), /knowledge-update\.lock/);
+  });
+
+  it("does not fast-forward canonical main when a fetched candidate is not Knowledge v2", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-invalid-candidate");
+    const beforeHead = localHead(fixture);
+    git(peer, ["rm", "wiki/index.md"]);
+    git(peer, ["commit", "-m", "remove required Knowledge index"]);
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-not-knowledge-v2");
+    assert.equal(response.attempts, 1);
+    assert.equal(localHead(fixture), beforeHead);
+    assert.equal(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), "# Knowledge Index\n");
+    assert.equal(recoveryRefs(fixture).length, 2);
+    assert.equal(worktreePaths(fixture).length, 2);
+  });
+
+  it("converts an injected Git exception into a typed failure", () => {
+    const fixture = createSyncFixture();
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: () => {
+        throw new Error("injected Git failure");
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "knowledge-sync-failed");
+    assert.match(response.message, /injected Git failure/);
+  });
+
+  it("leaves canonical HEAD and files unchanged on a non-Knowledge conflict", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-conflict");
+    const localReadme = "# Agent workspace\n\nLocal claim.\n";
+    const remoteReadme = "# Agent workspace\n\nRemote claim.\n";
+    const localTip = commitFiles(fixture.workspace, "local readme edit", { "README.md": localReadme });
+    const remoteTip = commitFiles(peer, "remote readme edit", { "README.md": remoteReadme });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "conflict");
+    assert.equal(response.reason, "non-knowledge-conflict");
+    assert.equal(response.attempts, 1);
+    assert.deepEqual(response.conflictPaths, ["README.md"]);
+    assert.match(response.message, /outside managed Knowledge/);
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(readFileSync(join(fixture.workspace, "README.md"), "utf8"), localReadme);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(recoveryRefs(fixture).length, 2);
+    assert.equal(worktreePaths(fixture).length, 2);
+  });
+});
