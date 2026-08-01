@@ -680,6 +680,42 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(readFileSync(pagePath, "utf8"), unresolved);
   });
 
+  it("rejects a union merge attribute before it can hide a managed page conflict", () => {
+    const fixture = createSyncFixture();
+    const relPath = "wiki/pages/feedback/union.md";
+    const sharedVariant = page(
+      "Union preference",
+      "A shared preference before contradictory edits.",
+      "feedback",
+      "The shared preference is undecided.\n",
+    );
+    commitFiles(fixture.workspace, "shared page with union merge attribute", {
+      ".gitattributes": `${relPath} merge=union\n`,
+      [relPath]: sharedVariant,
+    });
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const peer = cloneRemote(fixture, "peer-union-driver");
+    const localVariant = sharedVariant.replace(
+      "The shared preference is undecided.",
+      "The local preference is authoritative.",
+    );
+    const remoteVariant = sharedVariant.replace(
+      "The shared preference is undecided.",
+      "The remote preference is authoritative.",
+    );
+    const localTip = commitFiles(fixture.workspace, "local union preference", { [relPath]: localVariant });
+    const remoteTip = commitFiles(peer, "remote union preference", { [relPath]: remoteVariant });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "unsupported-merge-driver");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, ...relPath.split("/")), "utf8"), localVariant);
+  });
+
   it("retains the complete present variant and the deletion provenance for modify/delete", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/reference/deletion.md";
@@ -1091,6 +1127,26 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(remoteHead(fixture), remoteTip);
     assert.equal(recoveryRefs(fixture).length, 2);
     assert.equal(worktreePaths(fixture).length, 2);
+  });
+
+  it("rejects a custom default merge driver before it can hide a non-Knowledge conflict", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-custom-default-driver");
+    git(fixture.workspace, ["config", "merge.default", "ours"]);
+    git(fixture.workspace, ["config", "merge.ours.driver", "true"]);
+    const localReadme = "# Agent workspace\n\nLocal custom-driver claim.\n";
+    const remoteReadme = "# Agent workspace\n\nRemote custom-driver claim.\n";
+    const localTip = commitFiles(fixture.workspace, "local custom-driver readme", { "README.md": localReadme });
+    const remoteTip = commitFiles(peer, "remote custom-driver readme", { "README.md": remoteReadme });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "unsupported-merge-driver");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, "README.md"), "utf8"), localReadme);
   });
 
   it("reuses one retained candidate for repeated failures with identical tips", () => {

@@ -648,6 +648,98 @@ function unresolvedConflictPaths(candidateRoot: string, git: KnowledgeSyncGitRun
   return result.status === 0 ? result.stdout.split("\0").filter(Boolean).sort() : [];
 }
 
+const SAFE_DEFAULT_MERGE_DRIVERS = new Set(["text", "binary"]);
+const SAFE_MERGE_ATTRIBUTE_VALUES = new Set(["unspecified", "set", "unset", "text", "binary"]);
+
+function changedPathsBetween(
+  candidateRoot: string,
+  base: string,
+  tip: string,
+  git: KnowledgeSyncGitRunner,
+): string[] | KnowledgeSyncFailure {
+  const changed = git(["diff", "--name-only", "-z", base, tip, "--"], { cwd: candidateRoot });
+  if (changed.status !== 0) {
+    return failure(
+      "error",
+      "candidate-changed-path-inspection-failed",
+      `knowledge sync could not inspect divergent changed paths: ${errorText(changed)}`,
+    );
+  }
+  return changed.stdout.split("\0").filter(Boolean);
+}
+
+function validateMergeDrivers(
+  candidateRoot: string,
+  tips: GitTips,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const mergeBase = git(["merge-base", tips.local, tips.remote], { cwd: candidateRoot });
+  if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) {
+    return failure(
+      "error",
+      "candidate-merge-base-unreadable",
+      `knowledge sync could not read the merge base before validating merge drivers: ${errorText(mergeBase)}`,
+    );
+  }
+  const base = mergeBase.stdout.trim();
+  const localPaths = changedPathsBetween(candidateRoot, base, tips.local, git);
+  if (!Array.isArray(localPaths)) {
+    return localPaths;
+  }
+  const remotePaths = changedPathsBetween(candidateRoot, base, tips.remote, git);
+  if (!Array.isArray(remotePaths)) {
+    return remotePaths;
+  }
+  const remotePathSet = new Set(remotePaths);
+  const jointlyChangedPaths = localPaths.filter((path) => remotePathSet.has(path)).sort();
+  if (jointlyChangedPaths.length === 0) {
+    return undefined;
+  }
+
+  const defaultDriver = git(["config", "--get", "merge.default"], { cwd: candidateRoot });
+  if (defaultDriver.status === 0 && !SAFE_DEFAULT_MERGE_DRIVERS.has(defaultDriver.stdout.trim())) {
+    return failure(
+      "unsupported",
+      "unsupported-merge-driver",
+      "knowledge sync refused divergent paths because merge.default selects a union or custom merge driver; use Git's text or binary merge driver so conflicts remain explicit.",
+    );
+  }
+  if (defaultDriver.status !== 0 && defaultDriver.stderr.trim()) {
+    return failure(
+      "error",
+      "candidate-merge-driver-inspection-failed",
+      `knowledge sync could not inspect merge.default: ${errorText(defaultDriver)}`,
+    );
+  }
+
+  for (const path of jointlyChangedPaths) {
+    const attribute = git(["check-attr", "-z", "merge", "--", path], { cwd: candidateRoot });
+    if (attribute.status !== 0) {
+      return failure(
+        "error",
+        "candidate-merge-driver-inspection-failed",
+        `knowledge sync could not inspect the merge driver for ${path}: ${errorText(attribute)}`,
+      );
+    }
+    const fields = attribute.stdout.split("\0");
+    if (fields[0] !== path || fields[1] !== "merge" || !fields[2]) {
+      return failure(
+        "error",
+        "candidate-merge-driver-inspection-failed",
+        `knowledge sync received an invalid merge-attribute result for ${path}.`,
+      );
+    }
+    if (!SAFE_MERGE_ATTRIBUTE_VALUES.has(fields[2])) {
+      return failure(
+        "unsupported",
+        "unsupported-merge-driver",
+        `knowledge sync refused ${path} because its union or custom merge driver can hide a conflict; use Git's text or binary merge driver so conflicts remain explicit.`,
+      );
+    }
+  }
+  return undefined;
+}
+
 function isManagedKnowledgePath(path: string): boolean {
   return (
     path === "wiki/schema.md" ||
@@ -1345,6 +1437,10 @@ function prepareCandidate(
   }
 
   return withTemporaryWorktree(workspaceRoot, tips.local, tips, classification, deps, git, fs, (candidateRoot) => {
+    const mergeDriverProblem = validateMergeDrivers(candidateRoot, tips, git);
+    if (mergeDriverProblem) {
+      return { ok: false, failure: mergeDriverProblem };
+    }
     const merged = git(["merge", "--no-ff", "--no-commit", tips.remote], { cwd: candidateRoot });
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);
     if (merged.status !== 0) {
