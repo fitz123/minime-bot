@@ -2428,6 +2428,39 @@ describe("SessionManager gracefulShutdown", () => {
     assert.strictEqual(manager.getActiveCount(), 0);
   });
 
+  it("rejects new session startups after shutdown admission closes", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+
+    manager.beginShutdown();
+
+    await assert.rejects(
+      manager.getOrCreateSession("late-chat", "main"),
+      /Session manager is shutting down/,
+    );
+  });
+
+  it("waits for tracked session startups before closeAll returns", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
+    const startups = (manager as unknown as {
+      sessionStartups: Map<string, { generation: number; agentId: string; promise: Promise<ActiveSession> }>;
+    }).sessionStartups;
+    let resolveStartup!: (session: ActiveSession) => void;
+    const startupPromise = new Promise<ActiveSession>((resolve) => { resolveStartup = resolve; });
+    startups.set("starting-chat", { generation: 0, agentId: "main", promise: startupPromise });
+    void startupPromise.then(() => { startups.delete("starting-chat"); });
+
+    let closed = false;
+    const closing = manager.closeAll().then(() => { closed = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+
+    resolveStartup({} as ActiveSession);
+    await closing;
+    assert.equal(closed, true);
+  });
+
   it("returns immediately when active sessions are idle (not processing)", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);

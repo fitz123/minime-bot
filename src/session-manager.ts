@@ -266,6 +266,7 @@ export function waitForSpawn(child: ChildProcess, timeoutMs: number = STARTUP_TI
 
 export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
+  private acceptingSessionWork = true;
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
   /** Per-chat active-session teardown barrier before shared dirs can be reused. */
@@ -684,6 +685,9 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
+    if (!this.acceptingSessionWork) {
+      throw new Error("Session manager is shutting down");
+    }
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const inFlight = this.sessionStartups.get(chatId);
     if (inFlight?.generation === generation) {
@@ -1406,6 +1410,15 @@ export class SessionManager {
     }
   }
 
+  /** Reject new session work and supersede startups that have not published an active session. */
+  beginShutdown(): void {
+    if (!this.acceptingSessionWork) return;
+    this.acceptingSessionWork = false;
+    for (const chatId of this.sessionStartups.keys()) {
+      this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
+    }
+  }
+
   /**
    * Destroy a session: close it AND delete stored state.
    * Next message will pre-seed a completely fresh exact-path session.
@@ -1430,6 +1443,12 @@ export class SessionManager {
 
   /** Close all sessions gracefully. For shutdown. */
   async closeAll(): Promise<void> {
+    this.beginShutdown();
+    while (this.sessionStartups.size > 0) {
+      await Promise.allSettled(
+        [...this.sessionStartups.values()].map((startup) => startup.promise),
+      );
+    }
     const chatIds = [...this.active.keys()];
     await Promise.all(chatIds.map((id) => this.closeSession(id)));
   }

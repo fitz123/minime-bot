@@ -130,6 +130,8 @@ export function buildCollectPrompt(texts: string[]): string {
  */
 export class MessageQueue {
   private queues = new Map<string, ChatQueueState>();
+  private acceptingMessages = true;
+  private activeFlushes = new Set<Promise<void>>();
   private debounceMs: number;
   private queueCap: number;
   private processFn: ProcessFn;
@@ -220,6 +222,10 @@ export class MessageQueue {
     cleanup?: CleanupFn,
     dropCleanup?: CleanupFn,
   ): void {
+    if (!this.acceptingMessages) {
+      this.runCleanups([cleanup, dropCleanup]);
+      return;
+    }
     const state = this.getState(chatId, agentId);
     state.latestPlatform = platform;
 
@@ -256,9 +262,15 @@ export class MessageQueue {
     }
 
     state.debounceTimer = setTimeout(() => {
-      this.flush(chatId).catch((err) => {
-        log.error("message-queue", `Flush error for ${chatId}:`, err);
-      });
+      const pending = this.flush(chatId);
+      this.activeFlushes.add(pending);
+      void pending.then(
+        () => { this.activeFlushes.delete(pending); },
+        (err) => {
+          this.activeFlushes.delete(pending);
+          log.error("message-queue", `Flush error for ${chatId}:`, err);
+        },
+      );
     }, this.debounceMs);
   }
 
@@ -563,6 +575,19 @@ export class MessageQueue {
         clearTimeout(state.debounceTimer);
         state.debounceTimer = null;
       }
+    }
+  }
+
+  /** Stop accepting messages and prevent pending debounce work from starting. */
+  beginShutdown(): void {
+    this.acceptingMessages = false;
+    this.cancelAllDebounceTimers();
+  }
+
+  /** Wait for flushes that started before shutdown admission closed. */
+  async waitForIdle(): Promise<void> {
+    while (this.activeFlushes.size > 0) {
+      await Promise.allSettled([...this.activeFlushes]);
     }
   }
 

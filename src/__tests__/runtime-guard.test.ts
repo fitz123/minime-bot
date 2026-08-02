@@ -445,6 +445,8 @@ describe("bounded lifecycle integration", () => {
     const discordDrained = deferred();
     const sessionsDrained = deferred();
     const sessionsStarted = deferred();
+    const queuesDrained = deferred();
+    const queuesStarted = deferred();
     const teardown: string[] = [];
     const shutdown = shutdownServingRuntime({
       telegramBot: {
@@ -457,9 +459,20 @@ describe("bounded lifecycle integration", () => {
         teardown.push("discord-drained");
       },
       messageQueues: [{
+        beginShutdown: () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("queue-admission-closed");
+        },
         cancelAllDebounceTimers: () => {
           assert.ok(existsSync(servingOwner.lockPaths[0]));
-          teardown.push("queues-stopped");
+          teardown.push("queue-timers-cancelled");
+        },
+        waitForIdle: async () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("queues-draining");
+          queuesStarted.resolve();
+          await queuesDrained.promise;
+          teardown.push("queues-drained");
         },
         clearAll: () => {
           assert.ok(existsSync(servingOwner.lockPaths[0]));
@@ -467,6 +480,10 @@ describe("bounded lifecycle integration", () => {
         },
       }],
       sessionManager: {
+        beginShutdown: () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("session-admission-closed");
+        },
         gracefulShutdown: async () => {
           teardown.push("sessions-started");
           sessionsStarted.resolve();
@@ -494,13 +511,24 @@ describe("bounded lifecycle integration", () => {
     });
 
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
-    assert.deepEqual(teardown, ["telegram-stop", "discord-stop"]);
+    assert.deepEqual(teardown, [
+      "telegram-stop",
+      "discord-stop",
+      "queue-admission-closed",
+      "session-admission-closed",
+    ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
     assert.equal(oldMetrics.listening, true);
 
     pollingDrained.resolve();
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
-    assert.deepEqual(teardown, ["telegram-stop", "discord-stop", "polling-drained"]);
+    assert.deepEqual(teardown, [
+      "telegram-stop",
+      "discord-stop",
+      "queue-admission-closed",
+      "session-admission-closed",
+      "polling-drained",
+    ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
 
     discordDrained.resolve();
@@ -508,27 +536,52 @@ describe("bounded lifecycle integration", () => {
     assert.deepEqual(teardown, [
       "telegram-stop",
       "discord-stop",
+      "queue-admission-closed",
+      "session-admission-closed",
       "polling-drained",
       "discord-drained",
-      "queues-stopped",
+      "queue-timers-cancelled",
       "sessions-started",
     ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
     assert.equal(oldMetrics.listening, true);
 
     sessionsDrained.resolve();
+    await queuesStarted.promise;
+    assert.deepEqual(teardown, [
+      "telegram-stop",
+      "discord-stop",
+      "queue-admission-closed",
+      "session-admission-closed",
+      "polling-drained",
+      "discord-drained",
+      "queue-timers-cancelled",
+      "sessions-started",
+      "sessions-drained",
+      "media",
+      "sessions-closed",
+      "queues-draining",
+    ]);
+    assert.ok(existsSync(servingOwner.lockPaths[0]));
+    assert.equal(oldMetrics.listening, true);
+
+    queuesDrained.resolve();
     assert.equal(await shutdown, true);
     assert.deepEqual(teardown, [
       "telegram-stop",
       "discord-stop",
+      "queue-admission-closed",
+      "session-admission-closed",
       "polling-drained",
       "discord-drained",
-      "queues-stopped",
+      "queue-timers-cancelled",
       "sessions-started",
       "sessions-drained",
       "media",
-      "metrics",
       "sessions-closed",
+      "queues-draining",
+      "queues-drained",
+      "metrics",
       "claims",
     ]);
     assert.equal(existsSync(servingOwner.lockPaths[0]), false);

@@ -5,11 +5,14 @@ interface StoppableTelegramBot {
 }
 
 interface ShutdownMessageQueue {
+  beginShutdown(): void;
   cancelAllDebounceTimers(): void;
+  waitForIdle(): Promise<void>;
   clearAll(): void;
 }
 
 interface ShutdownSessionManager {
+  beginShutdown(): void;
   gracefulShutdown(timeoutMs: number): Promise<void>;
   closeAll(): Promise<void>;
 }
@@ -36,6 +39,8 @@ export async function shutdownServingRuntime(
     stopTelegramBotInBackground(options.telegramBot, options.onTelegramStopError);
   }
   const discordShutdown = options.shutdownDiscord?.().catch(options.onDiscordStopError);
+  for (const queue of options.messageQueues) queue.beginShutdown();
+  options.sessionManager.beginShutdown();
 
   await Promise.all([
     options.telegramPolling ?? Promise.resolve(),
@@ -47,7 +52,8 @@ export async function shutdownServingRuntime(
   for (const queue of options.messageQueues) queue.clearAll();
 
   options.persistTransportState?.();
-  await options.stopMetrics();
   await options.sessionManager.closeAll();
+  await Promise.all(options.messageQueues.map((queue) => queue.waitForIdle()));
+  await options.stopMetrics();
   return options.releaseRuntimeGuard();
 }

@@ -1552,6 +1552,59 @@ describe("MessageQueue mid-turn buffering", () => {
 });
 
 // -------------------------------------------------------------------
+// MessageQueue — shutdown barrier
+// -------------------------------------------------------------------
+
+describe("MessageQueue shutdown barrier", () => {
+  it("cancels pending debounce work and rejects later messages", async () => {
+    const mock = createMockProcess();
+    const queue = new MessageQueue(mock.processFn, { debounceMs: 20 });
+    let pendingCleanup = 0;
+    let rejectedCleanup = 0;
+
+    queue.enqueue("pending", "main", "pending", mockPlatform(), () => { pendingCleanup++; });
+    queue.beginShutdown();
+    queue.enqueue(
+      "rejected",
+      "main",
+      "rejected",
+      mockPlatform(),
+      () => { rejectedCleanup++; },
+      () => { rejectedCleanup++; },
+    );
+
+    await wait(40);
+    assert.equal(mock.calls.length, 0);
+    assert.equal(pendingCleanup, 0, "pending cleanup is retained until clearAll");
+    assert.equal(rejectedCleanup, 2, "rejected shutdown work is cleaned immediately");
+
+    queue.clearAll();
+    assert.equal(pendingCleanup, 1);
+  });
+
+  it("waits for a flush that started before shutdown", async () => {
+    const mock = createMockProcess();
+    mock.setBlocking(true);
+    const queue = new MessageQueue(mock.processFn, { debounceMs: 10 });
+    queue.enqueue("chat", "main", "active", mockPlatform());
+    await wait(30);
+    assert.equal(mock.calls.length, 1);
+
+    queue.beginShutdown();
+    let idle = false;
+    const waiting = queue.waitForIdle().then(() => { idle = true; });
+    await flushMicrotasks();
+    assert.equal(idle, false);
+
+    mock.setBlocking(false);
+    mock.unblock();
+    await waiting;
+    assert.equal(idle, true);
+    queue.clearAll();
+  });
+});
+
+// -------------------------------------------------------------------
 // MessageQueue — pre-stream typing indicator
 // -------------------------------------------------------------------
 
