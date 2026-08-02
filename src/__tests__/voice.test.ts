@@ -13,9 +13,13 @@ import {
   mediaPipelineFailureMessage,
   requireTranscript,
   stripKnownTrailingAsrArtifacts,
+  buildWhisperGlossaryPrompt,
   FFMPEG_BIN,
   WHISPER_BIN,
   WHISPER_MODEL,
+  WHISPER_GLOSSARY_PATH_ENV,
+  WHISPER_GLOSSARY_PROMPT_MAX_BYTES,
+  WHISPER_GLOSSARY_PROMPT_SEPARATOR,
 } from "../voice.js";
 import { mediaDownloadRetries } from "../metrics.js";
 
@@ -509,6 +513,60 @@ describe("stripKnownTrailingAsrArtifacts", () => {
       stripKnownTrailingAsrArtifacts("Это Продолжение следует, а это — конец."),
       "Это Продолжение следует, а это — конец.",
     );
+  });
+});
+
+describe("buildWhisperGlossaryPrompt", () => {
+  it("ignores blanks and comments while preserving trimmed first-seen terms", () => {
+    assert.strictEqual(
+      buildWhisperGlossaryPrompt([
+        "",
+        "  # synthetic comment",
+        "  Alpha Term  ",
+        "Beta # remains part of the term",
+        "\t",
+      ].join("\n")),
+      "Alpha Term, Beta # remains part of the term",
+    );
+  });
+
+  it("deduplicates NFKC- and case-insensitively without changing first spelling or order", () => {
+    assert.strictEqual(
+      buildWhisperGlossaryPrompt([
+        "Ａlpha",
+        "alpha",
+        "BETA",
+        "beta",
+        "Gamma",
+      ].join("\r\n")),
+      "Ａlpha, BETA, Gamma",
+    );
+  });
+
+  it("keeps the largest whole-term prefix within the UTF-8 byte bound", () => {
+    const first = "é".repeat(100);
+    const fittingSecond = "b".repeat(
+      WHISPER_GLOSSARY_PROMPT_MAX_BYTES
+        - Buffer.byteLength(first, "utf8")
+        - Buffer.byteLength(WHISPER_GLOSSARY_PROMPT_SEPARATOR, "utf8"),
+    );
+    const prompt = buildWhisperGlossaryPrompt([
+      first,
+      fittingSecond,
+      "term-after-the-bound",
+    ].join("\n"));
+
+    assert.strictEqual(prompt, `${first}${WHISPER_GLOSSARY_PROMPT_SEPARATOR}${fittingSecond}`);
+    assert.strictEqual(Buffer.byteLength(prompt ?? "", "utf8"), WHISPER_GLOSSARY_PROMPT_MAX_BYTES);
+    assert.strictEqual(
+      buildWhisperGlossaryPrompt(`${"🙂".repeat(56)}\nshorter-later-term`),
+      undefined,
+    );
+  });
+
+  it("exports the public selector and conservative byte limit", () => {
+    assert.strictEqual(WHISPER_GLOSSARY_PATH_ENV, "WHISPER_GLOSSARY_PATH");
+    assert.strictEqual(WHISPER_GLOSSARY_PROMPT_MAX_BYTES, 220);
   });
 });
 

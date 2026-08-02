@@ -62,12 +62,12 @@ gitleaks git --no-banner --redact --log-opts='main..HEAD' .
 
 **Serves:** Public issue #63 production decision: current per-message `whisper-cli` plus a bounded optional prompt from a plain-text glossary; missing/empty input must preserve current argv.
 
-- [ ] Add a documented `WHISPER_GLOSSARY_PATH` runtime selector and exported prompt-bound constants/types in `src/voice.ts` without changing existing binary/model/language defaults.
-- [ ] Implement a pure glossary parser/builder in `src/voice.ts` that ignores blank and `#` comment lines, preserves first-seen canonical spelling/order, deduplicates NFKC/case-insensitively, joins terms with a stable separator, and includes only the largest whole-term prefix within 220 UTF-8 bytes.
-- [ ] Load the glossary for every transcription so later private file edits apply without a bot restart; treat unset, missing, whitespace-only, comment-only, and overlong-first-term inputs as no prompt, while propagating other read failures through the existing bounded transcription error.
-- [ ] Append exactly `--prompt <value>` after the historical Whisper arguments only when the builder returns a non-empty prompt; keep current `transcribeAudio` and `ingestLocalAudio` callers/source compatibility.
-- [ ] Add synthetic unit and mocked-process tests in `src/__tests__/voice.test.ts` and `src/__tests__/voice-transcription.test.ts` for absent, missing, empty/commented, normal, duplicate, oversized, unreadable, hot-reload, argument-order, and exact unprompted-argv behavior.
-- [ ] Run the focused voice/transcription tests and lint; all must pass before Task 2.
+- [x] Add a documented `WHISPER_GLOSSARY_PATH` runtime selector and exported prompt-bound constants/types in `src/voice.ts` without changing existing binary/model/language defaults.
+- [x] Implement a pure glossary parser/builder in `src/voice.ts` that ignores blank and `#` comment lines, preserves first-seen canonical spelling/order, deduplicates NFKC/case-insensitively, joins terms with a stable separator, and includes only the largest whole-term prefix within 220 UTF-8 bytes.
+- [x] Load the glossary for every transcription so later private file edits apply without a bot restart; treat unset, missing, whitespace-only, comment-only, and overlong-first-term inputs as no prompt, while propagating other read failures through the existing bounded transcription error.
+- [x] Append exactly `--prompt <value>` after the historical Whisper arguments only when the builder returns a non-empty prompt; keep current `transcribeAudio` and `ingestLocalAudio` callers/source compatibility.
+- [x] Add synthetic unit and mocked-process tests in `src/__tests__/voice.test.ts` and `src/__tests__/voice-transcription.test.ts` for absent, missing, empty/commented, normal, duplicate, oversized, unreadable, hot-reload, argument-order, and exact unprompted-argv behavior.
+- [x] Run the focused voice/transcription tests and lint; all must pass before Task 2.
 
 ### Task 2: Document and verify the public contract [HIGH]
 

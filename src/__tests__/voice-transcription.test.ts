@@ -1,6 +1,6 @@
-import { afterEach, describe, it, mock } from "node:test";
+import { after, afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 let whisperStdout = "";
@@ -12,6 +12,19 @@ const execFileCalls: Array<{
   inputMode?: number;
 }> = [];
 const originalFetch = globalThis.fetch;
+const originalWhisperGlossaryPath = process.env.WHISPER_GLOSSARY_PATH;
+const originalWhisperLanguage = process.env.WHISPER_LANGUAGE;
+const glossaryPaths = new Set<string>();
+
+delete process.env.WHISPER_GLOSSARY_PATH;
+delete process.env.WHISPER_LANGUAGE;
+
+function createGlossary(contents: string): string {
+  const path = `/tmp/minime-test-voice-glossary-${crypto.randomUUID()}.txt`;
+  glossaryPaths.add(path);
+  writeFileSync(path, contents, { mode: 0o600 });
+  return path;
+}
 
 function execFileMock(): never {
   throw new Error("unexpected callback-style execFile invocation");
@@ -54,19 +67,128 @@ const {
   FFMPEG_BIN,
   MediaPipelineError,
   WHISPER_BIN,
+  WHISPER_MODEL,
   ingestLocalAudio,
   requireTranscript,
   transcribeAudio,
 } = await import("../voice.js");
+
+function whisperCalls(): typeof execFileCalls {
+  return execFileCalls.filter(({ args }) => args.includes("--no-timestamps"));
+}
+
+function historicalWhisperArgs(actualArgs: string[]): string[] {
+  const wavPath = actualArgs[actualArgs.indexOf("-f") + 1];
+  assert.ok(wavPath);
+  return [
+    "-m", WHISPER_MODEL,
+    "-f", wavPath,
+    "--no-timestamps",
+    "--no-prints",
+    "--language", "auto",
+  ];
+}
 
 afterEach(() => {
   whisperStdout = "";
   execFailure = null;
   execFileCalls.length = 0;
   globalThis.fetch = originalFetch;
+  delete process.env.WHISPER_GLOSSARY_PATH;
+  delete process.env.WHISPER_LANGUAGE;
+  for (const path of glossaryPaths) {
+    rmSync(path, { force: true });
+  }
+  glossaryPaths.clear();
+});
+
+after(() => {
+  if (originalWhisperGlossaryPath === undefined) delete process.env.WHISPER_GLOSSARY_PATH;
+  else process.env.WHISPER_GLOSSARY_PATH = originalWhisperGlossaryPath;
+  if (originalWhisperLanguage === undefined) delete process.env.WHISPER_LANGUAGE;
+  else process.env.WHISPER_LANGUAGE = originalWhisperLanguage;
 });
 
 describe("transcribeAudio ASR postprocessing", () => {
+  it("preserves the exact historical argv when the glossary is absent or unusable", async () => {
+    const cases: Array<{ path?: string; contents?: string }> = [
+      {},
+      { path: "/tmp/minime-test-missing-voice-glossary.txt" },
+      { contents: "  \n # comment only\n\t# another comment\n" },
+      { contents: "🙂".repeat(56) },
+    ];
+
+    for (const testCase of cases) {
+      execFileCalls.length = 0;
+      if (testCase.contents !== undefined) {
+        process.env.WHISPER_GLOSSARY_PATH = createGlossary(testCase.contents);
+      } else if (testCase.path !== undefined) {
+        process.env.WHISPER_GLOSSARY_PATH = testCase.path;
+      } else {
+        delete process.env.WHISPER_GLOSSARY_PATH;
+      }
+
+      await transcribeAudio("ignored-input.oga");
+      const [whisper] = whisperCalls();
+      assert.ok(whisper);
+      assert.deepStrictEqual(whisper.args, historicalWhisperArgs(whisper.args));
+    }
+  });
+
+  it("appends exactly one bounded prompt after all historical Whisper arguments", async () => {
+    process.env.WHISPER_GLOSSARY_PATH = createGlossary([
+      "# synthetic terms",
+      "Alpha",
+      "alpha",
+      "Beta",
+    ].join("\n"));
+
+    await transcribeAudio("ignored-input.oga");
+
+    const [whisper] = whisperCalls();
+    assert.ok(whisper);
+    assert.deepStrictEqual(whisper.args, [
+      ...historicalWhisperArgs(whisper.args),
+      "--prompt", "Alpha, Beta",
+    ]);
+    assert.strictEqual(whisper.args.filter((arg) => arg === "--prompt").length, 1);
+  });
+
+  it("reloads the configured glossary before every transcription", async () => {
+    const glossaryPath = createGlossary("First Term\n");
+    process.env.WHISPER_GLOSSARY_PATH = glossaryPath;
+
+    await transcribeAudio("first-input.oga");
+    writeFileSync(glossaryPath, "Second Term\nThird Term\n", { mode: 0o600 });
+    await transcribeAudio("second-input.oga");
+
+    assert.deepStrictEqual(
+      whisperCalls().map(({ args }) => args.slice(-2)),
+      [
+        ["--prompt", "First Term"],
+        ["--prompt", "Second Term, Third Term"],
+      ],
+    );
+  });
+
+  it("wraps non-missing glossary read failures as redacted transcription errors", async () => {
+    const glossaryPath = createGlossary("Synthetic Term\n");
+    chmodSync(glossaryPath, 0o000);
+    process.env.WHISPER_GLOSSARY_PATH = glossaryPath;
+
+    await assert.rejects(
+      transcribeAudio("ignored-input.oga"),
+      (error: Error) => {
+        assert.ok(error instanceof MediaPipelineError);
+        assert.strictEqual(error.stage, "transcription");
+        assert.strictEqual(error.message, "Audio transcription failed");
+        assert.doesNotMatch(error.message, /Synthetic Term|voice-glossary|\/tmp\//);
+        return true;
+      },
+    );
+    assert.strictEqual(whisperCalls().length, 0);
+  });
+
   it("normalizes mocked whisper stdout at the shared transcription boundary", async () => {
     const cases = [
       ["  Готово. Продолжение следует...  \n", "Готово."],
