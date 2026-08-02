@@ -18,6 +18,7 @@ interface ShutdownSessionManager {
 }
 
 export interface ServingRuntimeShutdownOptions {
+  abortTelegramPolling?: () => void;
   telegramBot?: StoppableTelegramBot;
   telegramPolling?: Promise<void>;
   shutdownDiscord?: () => Promise<void>;
@@ -35,6 +36,7 @@ export interface ServingRuntimeShutdownOptions {
 export async function shutdownServingRuntime(
   options: ServingRuntimeShutdownOptions,
 ): Promise<boolean> {
+  options.abortTelegramPolling?.();
   if (options.telegramBot) {
     stopTelegramBotInBackground(options.telegramBot, options.onTelegramStopError);
   }

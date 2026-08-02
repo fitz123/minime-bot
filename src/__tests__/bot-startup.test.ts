@@ -6,6 +6,7 @@ import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
   is409ConflictError,
+  logTelegramPollingFailure,
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
@@ -251,6 +252,38 @@ describe("is409ConflictError", () => {
   });
 });
 
+describe("logTelegramPollingFailure", () => {
+  it("omits raw details from duplicate-polling failures", (t) => {
+    const calls: unknown[][] = [];
+    t.mock.method(log, "error", (...args: unknown[]) => { calls.push(args); });
+    const error = new GrammyError(
+      "Conflict containing synthetic-token and /private/media-root",
+      {
+        ok: false,
+        error_code: 409,
+        description: "Conflict containing synthetic-token and /private/media-root",
+      } as any,
+      "getUpdates",
+      { offset: 123 },
+    );
+
+    logTelegramPollingFailure("Telegram polling unavailable (polling_failed)", error);
+
+    assert.deepEqual(calls, [["main", "Telegram polling unavailable (polling_failed)"]]);
+    assert.doesNotMatch(JSON.stringify(calls), /synthetic-token|private|media-root|offset/);
+  });
+
+  it("retains diagnostics for non-conflict polling failures", (t) => {
+    const calls: unknown[][] = [];
+    t.mock.method(log, "error", (...args: unknown[]) => { calls.push(args); });
+    const error = new Error("network failure");
+
+    logTelegramPollingFailure("Telegram polling unavailable (polling_failed)", error);
+
+    assert.deepEqual(calls, [["main", "Telegram polling unavailable (polling_failed)", error]]);
+  });
+});
+
 describe("startBotWithRetry", () => {
   const fakeSleep = async (_ms: number) => {};
 
@@ -352,6 +385,34 @@ describe("startBotWithRetry", () => {
     assert.deepEqual(conflictLogs, Array(3).fill(
       "MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling",
     ));
+  });
+
+  it("aborts a pending 409 backoff without starting another polling attempt", async (t) => {
+    captureConflictLogs(t);
+    const controller = new AbortController();
+    const abortReason = new Error("shutdown");
+    let callCount = 0;
+    let firstAttempt!: () => void;
+    const firstAttemptFinished = new Promise<void>((resolve) => { firstAttempt = resolve; });
+    const polling = startBotWithRetry(
+      async () => {
+        callCount++;
+        firstAttempt();
+        throw new GrammyError(
+          "Conflict",
+          { ok: false, error_code: 409, description: "Conflict" } as any,
+          "getUpdates",
+          {},
+        );
+      },
+      { maxRetries: 3, baseDelayMs: 60_000, signal: controller.signal },
+    );
+
+    await firstAttemptFinished;
+    controller.abort(abortReason);
+
+    await assert.rejects(polling, (error: unknown) => error === abortReason);
+    assert.equal(callCount, 1);
   });
 
   it("does not record or retry non-409 errors", async (t) => {

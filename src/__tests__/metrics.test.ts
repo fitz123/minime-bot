@@ -667,6 +667,24 @@ describe("metrics HTTP server", () => {
     assert.ok(body.includes("bot_claude_cost_usd_total"), "Expected costUsd metric");
   });
 
+  it("publishes zero baselines for every closed media pipeline series", async () => {
+    await startMetricsServer(0);
+
+    const metric = await mediaPipelineErrors.get();
+    assert.equal(metric.values.length, 60);
+    assert.ok(metric.values.every(({ value }) => value === 0));
+    assert.ok(metric.values.some(({ labels }) => (
+      labels.transport === "telegram"
+      && labels.media_type === "voice"
+      && labels.stage === "metadata"
+    )));
+    assert.ok(metric.values.some(({ labels }) => (
+      labels.transport === "discord"
+      && labels.media_type === "voice"
+      && labels.stage === "empty-transcript"
+    )));
+  });
+
   it("returns 404 for non-metrics paths", async () => {
     const server = await startMetricsServer(0);
     const addr = server.address() as { port: number };

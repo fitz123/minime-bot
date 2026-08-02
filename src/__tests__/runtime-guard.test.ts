@@ -449,6 +449,7 @@ describe("bounded lifecycle integration", () => {
     const queuesStarted = deferred();
     const teardown: string[] = [];
     const shutdown = shutdownServingRuntime({
+      abortTelegramPolling: () => { teardown.push("telegram-abort"); },
       telegramBot: {
         stop: async () => { teardown.push("telegram-stop"); },
       },
@@ -512,6 +513,7 @@ describe("bounded lifecycle integration", () => {
 
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
     assert.deepEqual(teardown, [
+      "telegram-abort",
       "telegram-stop",
       "discord-stop",
       "queue-admission-closed",
@@ -523,6 +525,7 @@ describe("bounded lifecycle integration", () => {
     pollingDrained.resolve();
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
     assert.deepEqual(teardown, [
+      "telegram-abort",
       "telegram-stop",
       "discord-stop",
       "queue-admission-closed",
@@ -534,6 +537,7 @@ describe("bounded lifecycle integration", () => {
     discordDrained.resolve();
     await sessionsStarted.promise;
     assert.deepEqual(teardown, [
+      "telegram-abort",
       "telegram-stop",
       "discord-stop",
       "queue-admission-closed",
@@ -549,6 +553,7 @@ describe("bounded lifecycle integration", () => {
     sessionsDrained.resolve();
     await queuesStarted.promise;
     assert.deepEqual(teardown, [
+      "telegram-abort",
       "telegram-stop",
       "discord-stop",
       "queue-admission-closed",
@@ -568,6 +573,7 @@ describe("bounded lifecycle integration", () => {
     queuesDrained.resolve();
     assert.equal(await shutdown, true);
     assert.deepEqual(teardown, [
+      "telegram-abort",
       "telegram-stop",
       "discord-stop",
       "queue-admission-closed",

@@ -226,16 +226,27 @@ export const mediaDownloadRetries = new client.Counter({
 
 // --- Terminal media-pipeline failures ---
 
-export type TelegramMediaType =
-  | "voice"
-  | "photo"
-  | "document"
-  | "animation"
-  | "video"
-  | "video_note"
-  | "audio"
-  | "sticker";
-export type DiscordMediaType = "image" | "voice";
+const TELEGRAM_MEDIA_TYPES = [
+  "voice",
+  "photo",
+  "document",
+  "animation",
+  "video",
+  "video_note",
+  "audio",
+  "sticker",
+] as const;
+const DISCORD_MEDIA_TYPES = ["image", "voice"] as const;
+const MEDIA_PIPELINE_STAGES: Record<MediaPipelineStage, true> = {
+  metadata: true,
+  download: true,
+  "size-limit": true,
+  conversion: true,
+  transcription: true,
+  "empty-transcript": true,
+};
+export type TelegramMediaType = (typeof TELEGRAM_MEDIA_TYPES)[number];
+export type DiscordMediaType = (typeof DISCORD_MEDIA_TYPES)[number];
 export type MediaPipelineErrorLabels =
   | { transport: "telegram"; mediaType: TelegramMediaType; stage: MediaPipelineStage }
   | { transport: "discord"; mediaType: DiscordMediaType; stage: MediaPipelineStage };
@@ -245,6 +256,21 @@ export const mediaPipelineErrors = new client.Counter({
   help: "Total terminal user-visible media pipeline failures by bounded classification",
   labelNames: ["transport", "media_type", "stage"] as const,
 });
+
+/** Expose zero baselines so Prometheus counts the first failure in each series. */
+function initializeMediaPipelineErrorSeries(): void {
+  const stages = Object.keys(MEDIA_PIPELINE_STAGES) as MediaPipelineStage[];
+  for (const mediaType of TELEGRAM_MEDIA_TYPES) {
+    for (const stage of stages) {
+      mediaPipelineErrors.inc({ transport: "telegram", media_type: mediaType, stage }, 0);
+    }
+  }
+  for (const mediaType of DISCORD_MEDIA_TYPES) {
+    for (const stage of stages) {
+      mediaPipelineErrors.inc({ transport: "discord", media_type: mediaType, stage }, 0);
+    }
+  }
+}
 
 // --- Streaming draft and final delivery reliability ---
 
@@ -456,6 +482,7 @@ export async function startMetricsServer(
   port: number,
   host?: string,
 ): Promise<Server> {
+  initializeMediaPipelineErrorSeries();
   const listenHost = host ?? "127.0.0.1";
   const server = createServer(async (req, res) => {
     if (req.url === "/metrics" && req.method === "GET") {

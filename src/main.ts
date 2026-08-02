@@ -17,6 +17,7 @@ import {
 import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
+  logTelegramPollingFailure,
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
@@ -102,6 +103,7 @@ async function main(): Promise<void> {
   let watchdog: Watchdog | undefined;
   let telegramStartupTimeout: ReturnType<typeof setTimeout> | undefined;
   let telegramPollingRestart: TelegramPollingRestartScheduler | undefined;
+  let telegramPollingAbortController: AbortController | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -119,6 +121,7 @@ async function main(): Promise<void> {
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
     const released = await shutdownServingRuntime({
+      abortTelegramPolling: () => telegramPollingAbortController?.abort(),
       telegramBot,
       telegramPolling,
       shutdownDiscord,
@@ -216,13 +219,15 @@ async function main(): Promise<void> {
           discordBindingCount: config.discord?.bindings.length ?? 0,
         });
         if (restartRequired) {
-          log.error("main", `Telegram polling unavailable (${reason}) — exiting for restart`, error);
+          logTelegramPollingFailure(
+            `Telegram polling unavailable (${reason}) — exiting for restart`,
+            error,
+          );
           requestShutdown("Telegram polling failure", 1);
           return;
         }
 
-        log.error(
-          "main",
+        logTelegramPollingFailure(
           `Telegram polling unavailable (${reason}); keeping the active conversational platform online`,
           error,
         );
@@ -247,6 +252,8 @@ async function main(): Promise<void> {
       const generation = ++telegramPollingGeneration;
       telegramFailureHandled = false;
       let startedSuccessfully = false;
+      const pollingAbortController = new AbortController();
+      telegramPollingAbortController = pollingAbortController;
 
       // A watchdog cannot be reused after it decides to restart, so each
       // supervised polling generation owns a fresh one.
@@ -312,6 +319,7 @@ async function main(): Promise<void> {
               );
             },
           }),
+        { signal: pollingAbortController.signal },
       ).catch((err) => handleTelegramPollingFailure(generation, "polling_failed", err));
     }
 
