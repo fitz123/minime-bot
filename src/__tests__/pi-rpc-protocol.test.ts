@@ -321,7 +321,12 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
   it("injects --system-prompt (persona), --append-system-prompt (bundle), and --no-context-files", () => {
     const ws = fullPiWorkspace();
-    const args = buildPiSpawnArgs(piAgent(ws), undefined, NO_EXTENSIONS);
+    const args = buildPiSpawnArgs(
+      piAgent(ws),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
 
     const personaIdx = args.indexOf("--system-prompt");
     const bundleIdx = args.indexOf("--append-system-prompt");
@@ -394,23 +399,22 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
-  it("degrades to no context args for an empty pi workspace", () => {
-    // No CLAUDE.md, no rules, no persona => assemblePiContext returns null =>
-    // none of the context CLI layers are emitted. Extension auto-discovery is
-    // still suppressed by the spawn builder's unconditional --no-extensions.
+  it("delivers file guidance for an empty interactive pi workspace", () => {
     const ws = makePiWorkspace({});
-    const args = buildPiSpawnArgs(piAgent(ws), undefined, NO_EXTENSIONS);
+    const args = buildPiSpawnArgs(
+      piAgent(ws),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
 
     assert.ok(!args.includes("--system-prompt"));
-    assert.ok(!args.includes("--append-system-prompt"));
-    assert.ok(!args.includes("--no-context-files"));
-    // The base command is intact.
-    assert.deepStrictEqual(args, [
-      "--mode", "rpc",
-      "--provider", "openai-codex",
-      "--model", "openai-codex/gpt-5.5",
-      "--no-extensions",
-    ]);
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "interactive file guidance is delivered");
+    assert.ok(args.includes("--no-context-files"));
+    const bundle = readFileSync(args[bundleIdx + 1], "utf8");
+    assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
+    assert.ok(bundle.includes(`\`${MINIME_OUTBOX_ENV}\``));
   });
 
   it("suppresses flat context loading when context artifact writes fail", () => {

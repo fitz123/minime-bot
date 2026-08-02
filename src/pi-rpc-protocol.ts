@@ -544,6 +544,7 @@ export function buildPiSpawnArgs(
   agent: AgentConfig,
   resumeSessionId?: string,
   extensionOptions?: PiSpawnExtensionOptions,
+  runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): string[] {
   const args = [
     "--mode", "rpc",
@@ -566,11 +567,14 @@ export function buildPiSpawnArgs(
   //                               from cwd (avoids double context).
   // At most ONE --system-prompt and ONE --append-system-prompt are emitted. The
   // assembler is fail-safe for source reads (bad source → warn+skip; empty
-  // workspace → null → bare spawn), but artifact writes can throw after source
-  // content has been classified. A throw must fail closed with --no-context-files
-  // so Pi does not flat-load context files the assembler could not safely deliver.
+  // workspace without an interactive outbox → null → bare spawn), but artifact
+  // writes can throw after source content has been classified. A throw must fail
+  // closed with --no-context-files so Pi does not flat-load context files the
+  // assembler could not safely deliver.
   try {
-    const context = assemblePiContext(agent);
+    const context = assemblePiContext(agent, {
+      includeFileDelivery: Boolean(runtimeEnvOptions?.outboxPath?.trim()),
+    });
     if (context) {
       if (context.systemPromptPath) {
         args.push("--system-prompt", context.systemPromptPath);
@@ -704,7 +708,7 @@ export function spawnPiRpcSession(
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
-  const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions);
+  const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions, runtimeEnvOptions);
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {

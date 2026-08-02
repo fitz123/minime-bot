@@ -827,21 +827,21 @@ describe("assemblePiContext", () => {
       { [MINIME_OUTBOX_ENV]: outboxPaths[0] },
       () => assemblePiContext(
         agentFor(sourceWorkspace, { id: "agent-one" }),
-        { artifactWorkspaceCwd: firstDestination },
+        { artifactWorkspaceCwd: firstDestination, includeFileDelivery: true },
       ),
     );
     const cached = withPatchedEnv(
       { [MINIME_OUTBOX_ENV]: outboxPaths[1] },
       () => assemblePiContext(
         agentFor(sourceWorkspace, { id: "agent-one" }),
-        { artifactWorkspaceCwd: cachedDestination },
+        { artifactWorkspaceCwd: cachedDestination, includeFileDelivery: true },
       ),
     );
     const otherAgent = withPatchedEnv(
       { [MINIME_OUTBOX_ENV]: outboxPaths[2] },
       () => assemblePiContext(
         agentFor(sourceWorkspace, { id: "agent-two" }),
-        { artifactWorkspaceCwd: otherAgentDestination },
+        { artifactWorkspaceCwd: otherAgentDestination, includeFileDelivery: true },
       ),
     );
 
@@ -856,6 +856,28 @@ describe("assemblePiContext", () => {
         assert.strictEqual(bundle.includes(outboxPath), false, "no absolute per-chat outbox path is embedded");
       }
     }
+  });
+
+  it("keeps file-delivery capability isolated across cache entries", () => {
+    const ws = makeWorkspace({ claudeMd: "# Context\n\nBODY" });
+    const agent = agentFor(ws, { id: "file-delivery-cache" });
+
+    const withoutDelivery = assemblePiContext(agent);
+    assert.ok(withoutDelivery);
+    const withoutDeliveryBundle = readFileSync(withoutDelivery.appendSystemPromptPath, "utf8");
+    const withDelivery = assemblePiContext(agent, { includeFileDelivery: true });
+    assert.ok(withDelivery);
+    const withDeliveryBundle = readFileSync(withDelivery.appendSystemPromptPath, "utf8");
+    const withoutDeliveryAgain = assemblePiContext(agent);
+    assert.ok(withoutDeliveryAgain);
+    const withoutDeliveryAgainBundle = readFileSync(
+      withoutDeliveryAgain.appendSystemPromptPath,
+      "utf8",
+    );
+
+    assert.strictEqual(withoutDeliveryBundle.includes("## File delivery"), false);
+    assert.strictEqual(withDeliveryBundle.includes("## File delivery"), true);
+    assert.strictEqual(withoutDeliveryAgainBundle.includes("## File delivery"), false);
   });
 
   it("omits the persona path when the agent has no output-style and no config systemPrompt", () => {
@@ -1234,7 +1256,7 @@ describe("assemblePiContext — redacted parity manifest", () => {
     const executionWorkspace = makeWorkspace({});
     const artifacts = assemblePiContext(
       agentFor(sourceWorkspace, { systemPrompt: "GENERIC_CONFIG_PERSONA_TOKEN" }),
-      { artifactWorkspaceCwd: executionWorkspace },
+      { artifactWorkspaceCwd: executionWorkspace, includeFileDelivery: true },
     );
     assert.ok(artifacts?.systemPromptPath);
 

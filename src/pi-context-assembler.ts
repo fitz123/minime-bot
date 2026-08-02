@@ -49,7 +49,8 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
  *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
  *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
  *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
- *   7. A fixed `## File delivery` directive (verbatim {@link FILE_DELIVERY_DIRECTIVE}).
+ *   7. For interactive sessions, a fixed `## File delivery` directive (verbatim
+ *      {@link FILE_DELIVERY_DIRECTIVE}).
  */
 
 /** Resolved artifact paths handed to the Pi spawn (paths, not inline content). */
@@ -92,6 +93,8 @@ export interface PiContextManifest {
 export interface PiContextAssemblyOptions {
   /** Private artifact destination. The context source workspace remains read-only. */
   artifactWorkspaceCwd?: string;
+  /** Include the package directive for sessions whose child environment has an outbox. */
+  includeFileDelivery?: boolean;
   /** Reject unsafe, missing, or unreadable declared sources instead of skipping them. */
   strict?: boolean;
 }
@@ -570,15 +573,21 @@ interface BundleResult {
    * escaping CLAUDE.md symlink also counts: a bare spawn could flat-load the same
    * outside-workspace target we refused to read.
    *
-   * False means the bundle contains only fixed package directives over a
-   * CLAUDE.md that had no body and no imports (or no CLAUDE.md at all) — nothing worth
-   * forcing `--no-context-files` for, so the caller may prefer a bare spawn.
+   * The interactive file-delivery directive also counts because it is the only
+   * way an empty-workspace session learns its outbox contract. False means the
+   * bundle contains only the fixed knowledge directive over a CLAUDE.md that had
+   * no body and no imports (or no CLAUDE.md at all) — nothing worth forcing
+   * `--no-context-files` for, so the caller may prefer a bare spawn.
    */
   hasContent: boolean;
 }
 
-/** Assemble the deterministic context bundle (order 1-6 above) from live files. */
-function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
+/** Assemble the deterministic context bundle (order 1-7 above) from live files. */
+function assembleBundle(
+  workspaceCwd: string,
+  strict = false,
+  includeFileDelivery = false,
+): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   if (strict) rejectDirectSymlink(claudeMdPath, "CLAUDE.md");
   const { content: rawBody, escaped } = safeReadContainedFile(claudeMdPath, workspaceCwd, {
@@ -631,12 +640,14 @@ function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
     "package:knowledge-access-v1",
     KNOWLEDGE_ACCESS_DIRECTIVE,
   ));
-  parts.push(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`);
-  sources.push(contextSource(
-    "package-directive",
-    "package:file-delivery-v1",
-    FILE_DELIVERY_DIRECTIVE,
-  ));
+  if (includeFileDelivery) {
+    parts.push(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`);
+    sources.push(contextSource(
+      "package-directive",
+      "package:file-delivery-v1",
+      FILE_DELIVERY_DIRECTIVE,
+    ));
+  }
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
@@ -647,7 +658,8 @@ function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
     knowledgeSections.length > 0 ||
     rules.length > 0 ||
     importLineCount > 0 ||
-    escaped;
+    escaped ||
+    includeFileDelivery;
   return { bundle: `${parts.join("\n\n")}\n`, sources, hasContent };
 }
 
@@ -693,9 +705,9 @@ function buildContextManifest(
   };
 }
 
-/** Build the context bundle markdown string for a workspace (order 1-6 above). */
+/** Build the full interactive context bundle markdown string for a workspace (order 1-7 above). */
 export function buildBundle(workspaceCwd: string): string {
-  return assembleBundle(workspaceCwd).bundle;
+  return assembleBundle(workspaceCwd, false, true).bundle;
 }
 
 /**
@@ -925,17 +937,19 @@ function computeManifestSignature(agent: AgentConfig): string {
  * assembler produced (and so a deleted artifact is transparently recreated).
  * Strict callers bypass the cache and assemble the accepted bytes afresh.
  *
- * Returns null only for a genuinely empty workspace with no persona. If artifact
- * writing fails after content was assembled, this throws; Pi callers must catch
- * and add `--no-context-files` so Pi does not fall back to flat context loading.
+ * Returns null only for a genuinely empty workspace with no persona and no
+ * interactive file-delivery capability. If artifact writing fails after content
+ * was assembled, this throws; Pi callers must catch and add `--no-context-files`
+ * so Pi does not fall back to flat context loading.
  */
 export function assemblePiContext(
   agent: AgentConfig,
   options: PiContextAssemblyOptions = {},
 ): PiContextArtifacts | null {
   const strict = options.strict === true;
+  const includeFileDelivery = options.includeFileDelivery === true;
   const signature = strict ? null : computeManifestSignature(agent);
-  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}`;
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}\0${includeFileDelivery}`;
   const cached = strict ? undefined : cache.get(cacheKey);
 
   let bundle: string;
@@ -950,7 +964,7 @@ export function assemblePiContext(
     persona = cached.persona;
     manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd, strict);
+    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery);
     const resolvedPersona = resolvePersonaWithSources(agent, strict);
     if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
