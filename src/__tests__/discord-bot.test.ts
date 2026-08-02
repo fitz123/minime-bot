@@ -13,6 +13,7 @@ import {
   installDiscordErrorHandlers,
 } from "../discord-bot.js";
 import { validateDiscordBinding } from "../config.js";
+import type { DiscordBotResult } from "../discord-bot.js";
 import type { BotConfig, DiscordBinding, DiscordConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 import { mediaPipelineErrors } from "../metrics.js";
@@ -126,6 +127,67 @@ describe("Discord media failure handling", () => {
 });
 
 describe("Discord shutdown", () => {
+  it("publishes a shutdown handle before login completes", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalDestroy = Client.prototype.destroy;
+    const originalPut = REST.prototype.put;
+    let finishLogin!: () => void;
+    const loginPending = new Promise<void>((resolve) => { finishLogin = resolve; });
+    let clientDestroyed = false;
+    let commandRegistrations = 0;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      await loginPending;
+      return "test-token";
+    };
+    Client.prototype.destroy = async function () {
+      clientDestroyed = true;
+    };
+    REST.prototype.put = async () => {
+      commandRegistrations++;
+      return {} as never;
+    };
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+    let created: DiscordBotResult | undefined;
+
+    try {
+      const starting = createDiscordBot(config, discordConfig, sessionManager, {
+        onCreated: (result) => { created = result; },
+      });
+      assert.ok(created);
+
+      await created.shutdown();
+      assert.equal(clientDestroyed, true);
+
+      finishLogin();
+      assert.equal(await starting, created);
+      assert.equal(commandRegistrations, 0);
+    } finally {
+      Client.prototype.login = originalLogin;
+      Client.prototype.destroy = originalDestroy;
+      REST.prototype.put = originalPut;
+      finishLogin();
+    }
+  });
+
   it("waits for an active message handler after disconnecting the client", async () => {
     const originalLogin = Client.prototype.login;
     const originalDestroy = Client.prototype.destroy;

@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, chmodSync, mkdirSync, realpathSync, symlinkSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   MEDIA_BASE,
   sessionMediaDir,
@@ -25,12 +25,22 @@ const quietPreflight = {
   writeLog: () => {},
 };
 
+function canonicalizeMissingPath(path: string): string {
+  const missing: string[] = [];
+  let ancestor = path;
+  while (!existsSync(ancestor)) {
+    missing.unshift(basename(ancestor));
+    ancestor = dirname(ancestor);
+  }
+  return join(realpathSync(ancestor), ...missing);
+}
+
 describe("preflightMediaStore", () => {
   beforeEach(resetMediaBase);
   afterEach(resetMediaBase);
 
   it("allows a missing root without creating it", () => {
-    assert.equal(preflightMediaRoot(MEDIA_BASE, quietPreflight), MEDIA_BASE);
+    assert.equal(preflightMediaRoot(MEDIA_BASE, quietPreflight), canonicalizeMissingPath(MEDIA_BASE));
     assert.equal(existsSync(MEDIA_BASE), false);
   });
 

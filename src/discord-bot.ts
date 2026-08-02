@@ -141,6 +141,11 @@ export interface DiscordBotResult {
   shutdown(): Promise<void>;
 }
 
+export interface DiscordBotCreationOptions {
+  /** Publish the shutdown handle before login or command registration can block. */
+  onCreated?(result: DiscordBotResult): void;
+}
+
 interface DiscordCommandInteractionLike {
   commandName: string;
   channelId: string;
@@ -251,6 +256,7 @@ export async function createDiscordBot(
   config: BotConfig,
   discordConfig: DiscordConfig,
   sessionManager: SessionManager,
+  options: DiscordBotCreationOptions = {},
 ): Promise<DiscordBotResult> {
   const client = new Client({
     intents: [
@@ -458,8 +464,23 @@ export async function createDiscordBot(
     });
   });
 
+  const result: DiscordBotResult = {
+    client,
+    messageQueue,
+    async shutdown(): Promise<void> {
+      acceptingHandlers = false;
+      try {
+        await client.destroy();
+      } finally {
+        await waitForActiveHandlers();
+      }
+    },
+  };
+  options.onCreated?.(result);
+
   // Login and register slash commands
   await client.login(discordConfig.token);
+  if (!acceptingHandlers) return result;
   log.info("discord-bot", `Discord bot logged in as ${client.user!.tag}`);
 
   // Register guild-scoped slash commands (instant, no 1-hour propagation delay)
@@ -473,6 +494,7 @@ export async function createDiscordBot(
   const guildIds = [...new Set(discordConfig.bindings.map((b) => b.guildId))];
 
   for (const guildId of guildIds) {
+    if (!acceptingHandlers) break;
     try {
       await rest.put(
         Routes.applicationGuildCommands(client.user!.id, guildId),
@@ -484,16 +506,5 @@ export async function createDiscordBot(
     }
   }
 
-  return {
-    client,
-    messageQueue,
-    async shutdown(): Promise<void> {
-      acceptingHandlers = false;
-      try {
-        await client.destroy();
-      } finally {
-        await waitForActiveHandlers();
-      }
-    },
-  };
+  return result;
 }

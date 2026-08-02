@@ -327,15 +327,22 @@ async function main(): Promise<void> {
   }
 
   // Start Discord bot if configured
-  if (config.discord) {
+  if (config.discord && !shuttingDown) {
     try {
-      const result = await createDiscordBot(config, config.discord, sessionManager);
+      const result = await createDiscordBot(config, config.discord, sessionManager, {
+        onCreated: (created) => {
+          shutdownDiscord = created.shutdown;
+          messageQueues.push(created.messageQueue);
+        },
+      });
+      if (shuttingDown) {
+        finishAgentPlatformStartup();
+        return;
+      }
       discordClient = result.client;
-      shutdownDiscord = result.shutdown;
-      messageQueues.push(result.messageQueue);
       log.info("main", "Discord bot started");
     } catch (err) {
-      log.error("main", "Failed to start Discord bot:", err);
+      if (!shuttingDown) log.error("main", "Failed to start Discord bot:", err);
     }
   }
 
