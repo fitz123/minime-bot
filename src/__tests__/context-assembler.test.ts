@@ -28,6 +28,7 @@ import {
 import { log } from "../logger.js";
 import type { AgentConfig } from "../types.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { MINIME_OUTBOX_ENV } from "../pi-runtime-env.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 
 // The verbatim knowledge directive — pinned here so a wording drift in the module
@@ -43,6 +44,11 @@ const KNOWLEDGE_DIRECTIVE = [
   "- Put actionable work in Beads, not wiki pages.",
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");
+
+const FILE_DELIVERY_DIRECTIVE = [
+  `To share a file with the user, write or copy it to the directory specified by the \`${MINIME_OUTBOX_ENV}\` environment variable.`,
+  "Files placed there will be automatically sent to the user after your response completes.",
+].join(" ");
 
 const created: string[] = [];
 
@@ -169,7 +175,7 @@ function captureWarn<T>(fn: () => T): { value: T; warnings: string[] } {
 }
 
 describe("buildBundle — deterministic order (D7)", () => {
-  it("assembles body, imports (in order), platform rules, custom rules, knowledge directive", () => {
+  it("assembles body, imports, rules, and package directives in order", () => {
     const ws = fullFixture();
     const bundle = buildBundle(ws);
 
@@ -180,8 +186,18 @@ describe("buildBundle — deterministic order (D7)", () => {
     const iPlatform = bundle.indexOf("## .claude/rules/platform/x.md");
     const iCustom = bundle.indexOf("## .claude/rules/custom/y.md");
     const iKnowledgeAccess = bundle.indexOf("## Knowledge access");
+    const iFileDelivery = bundle.indexOf("## File delivery");
 
-    for (const [name, idx] of Object.entries({ iBody, iImport, iMemorySection, iSkill, iPlatform, iCustom, iKnowledgeAccess })) {
+    for (const [name, idx] of Object.entries({
+      iBody,
+      iImport,
+      iMemorySection,
+      iSkill,
+      iPlatform,
+      iCustom,
+      iKnowledgeAccess,
+      iFileDelivery,
+    })) {
       assert.ok(idx >= 0, `${name} should be present in the bundle`);
     }
     assert.ok(iBody < iImport, "body precedes the first import section");
@@ -190,6 +206,7 @@ describe("buildBundle — deterministic order (D7)", () => {
     assert.ok(iSkill < iPlatform, "skill imports precede platform rules");
     assert.ok(iPlatform < iCustom, "platform rules precede custom rules");
     assert.ok(iCustom < iKnowledgeAccess, "custom rules precede the knowledge directive");
+    assert.ok(iKnowledgeAccess < iFileDelivery, "knowledge directive precedes file delivery");
   });
 
   it("expands import + rule content and removes every @-line from the body", () => {
@@ -214,6 +231,14 @@ describe("buildBundle — deterministic order (D7)", () => {
     const ws = fullFixture();
     const bundle = buildBundle(ws);
     assert.ok(bundle.includes(`## Knowledge access\n\n${KNOWLEDGE_DIRECTIVE}`));
+  });
+
+  it("includes the fixed file-delivery directive exactly once", () => {
+    const ws = fullFixture();
+    const bundle = buildBundle(ws);
+
+    assert.ok(bundle.includes(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`));
+    assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
   });
 
   it("auto-loads v2 schema and index without a root MEMORY.md", () => {
@@ -787,6 +812,84 @@ describe("assemblePiContext", () => {
     assert.strictEqual(readFileSync(result.systemPromptPath, "utf8"), "PERSONA_TOKEN body");
   });
 
+  it("keeps file-delivery guidance static across agents, outboxes, and cache destinations", () => {
+    const sourceWorkspace = makeWorkspace({ claudeMd: "# Context\n\nBODY" });
+    const firstDestination = makeWorkspace({});
+    const cachedDestination = makeWorkspace({});
+    const otherAgentDestination = makeWorkspace({});
+    const outboxPaths = [
+      join(firstDestination, "outbox-chat-one"),
+      join(cachedDestination, "outbox-chat-two"),
+      join(otherAgentDestination, "outbox-chat-three"),
+    ];
+
+    const first = withPatchedEnv(
+      { [MINIME_OUTBOX_ENV]: outboxPaths[0] },
+      () => assemblePiContext(
+        agentFor(sourceWorkspace, { id: "agent-one" }),
+        { artifactWorkspaceCwd: firstDestination, includeFileDelivery: true },
+      ),
+    );
+    const cached = withPatchedEnv(
+      { [MINIME_OUTBOX_ENV]: outboxPaths[1] },
+      () => assemblePiContext(
+        agentFor(sourceWorkspace, { id: "agent-one" }),
+        { artifactWorkspaceCwd: cachedDestination, includeFileDelivery: true },
+      ),
+    );
+    const otherAgent = withPatchedEnv(
+      { [MINIME_OUTBOX_ENV]: outboxPaths[2] },
+      () => assemblePiContext(
+        agentFor(sourceWorkspace, { id: "agent-two" }),
+        { artifactWorkspaceCwd: otherAgentDestination, includeFileDelivery: true },
+      ),
+    );
+
+    assert.ok(first && cached && otherAgent);
+    const bundles = [first, cached, otherAgent].map((artifacts) =>
+      readFileSync(artifacts.appendSystemPromptPath, "utf8"));
+    assert.strictEqual(new Set(bundles).size, 1, "agent identity, outbox, and cache path do not alter context");
+    for (const bundle of bundles) {
+      assert.ok(bundle.includes(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`));
+      assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
+      for (const outboxPath of outboxPaths) {
+        assert.strictEqual(bundle.includes(outboxPath), false, "no absolute per-chat outbox path is embedded");
+      }
+    }
+  });
+
+  it("keeps file-delivery capability isolated across cache entries", () => {
+    const ws = makeWorkspace({ claudeMd: "# Context\n\nBODY" });
+    const agent = agentFor(ws, { id: "file-delivery-cache" });
+
+    const withoutDelivery = assemblePiContext(agent);
+    assert.ok(withoutDelivery);
+    const withDelivery = assemblePiContext(agent, { includeFileDelivery: true });
+    assert.ok(withDelivery);
+    assert.notStrictEqual(
+      withDelivery.appendSystemPromptPath,
+      withoutDelivery.appendSystemPromptPath,
+      "capability variants must not overwrite a path a concurrent spawn may still read",
+    );
+    const withoutDeliveryBundle = readFileSync(withoutDelivery.appendSystemPromptPath, "utf8");
+    const withDeliveryBundle = readFileSync(withDelivery.appendSystemPromptPath, "utf8");
+    const withoutDeliveryAgain = assemblePiContext(agent);
+    assert.ok(withoutDeliveryAgain);
+    assert.strictEqual(
+      withoutDeliveryAgain.appendSystemPromptPath,
+      withoutDelivery.appendSystemPromptPath,
+      "the same capability reuses its stable artifact path",
+    );
+    const withoutDeliveryAgainBundle = readFileSync(
+      withoutDeliveryAgain.appendSystemPromptPath,
+      "utf8",
+    );
+
+    assert.strictEqual(withoutDeliveryBundle.includes("## File delivery"), false);
+    assert.strictEqual(withDeliveryBundle.includes("## File delivery"), true);
+    assert.strictEqual(withoutDeliveryAgainBundle.includes("## File delivery"), false);
+  });
+
   it("omits the persona path when the agent has no output-style and no config systemPrompt", () => {
     const ws = makeWorkspace({
       claudeMd: "# x\n\nBODY",
@@ -1163,7 +1266,7 @@ describe("assemblePiContext — redacted parity manifest", () => {
     const executionWorkspace = makeWorkspace({});
     const artifacts = assemblePiContext(
       agentFor(sourceWorkspace, { systemPrompt: "GENERIC_CONFIG_PERSONA_TOKEN" }),
-      { artifactWorkspaceCwd: executionWorkspace },
+      { artifactWorkspaceCwd: executionWorkspace, includeFileDelivery: true },
     );
     assert.ok(artifacts?.systemPromptPath);
 
@@ -1176,6 +1279,7 @@ describe("assemblePiContext — redacted parity manifest", () => {
       "platform-rule:workspace:.claude/rules/platform/platform.md",
       "custom-rule:workspace:.claude/rules/custom/custom.md",
       "package-directive:package:knowledge-access-v1",
+      "package-directive:package:file-delivery-v1",
       "output-style:workspace:.claude/output-styles/ops-persona.md",
       "agent-config:agent:system-prompt",
     ]);

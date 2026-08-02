@@ -19,6 +19,7 @@ import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
 import { resolveKnowledgeLayout } from "./knowledge/layout.js";
 import { loadRawMergedConfig, resolveConfigWorkspaceRoot } from "./config.js";
+import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
 
 /**
@@ -48,6 +49,8 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
  *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
  *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
  *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
+ *   7. For interactive sessions, a fixed `## File delivery` directive (verbatim
+ *      {@link FILE_DELIVERY_DIRECTIVE}).
  */
 
 /** Resolved artifact paths handed to the Pi spawn (paths, not inline content). */
@@ -56,6 +59,8 @@ export interface PiContextArtifacts {
   systemPromptPath?: string;
   /** Context-bundle file for `--append-system-prompt`. Always present on success. */
   appendSystemPromptPath: string;
+  /** Disable Pi's native context loading when the assembled layers replace it. */
+  suppressContextFiles?: boolean;
   /** Redacted deterministic identity of the accepted sources and assembled bytes. */
   manifest: PiContextManifest;
 }
@@ -90,8 +95,22 @@ export interface PiContextManifest {
 export interface PiContextAssemblyOptions {
   /** Private artifact destination. The context source workspace remains read-only. */
   artifactWorkspaceCwd?: string;
+  /** Include the package directive for sessions whose child environment has an outbox. */
+  includeFileDelivery?: boolean;
   /** Reject unsafe, missing, or unreadable declared sources instead of skipping them. */
   strict?: boolean;
+}
+
+/** Artifact-write failure annotated with the native-context decision already made by assembly. */
+export class PiContextArtifactWriteError extends Error {
+  constructor(
+    message: string,
+    readonly suppressContextFiles: boolean,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "PiContextArtifactWriteError";
+  }
 }
 
 /** A `## <relpath>` bundle section: a header + the file's content. */
@@ -169,6 +188,19 @@ const KNOWLEDGE_ACCESS_DIRECTIVE = [
   "- Put actionable work in Beads, not wiki pages.",
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");
+
+/**
+ * Static file-delivery guidance for interactive sessions. The child environment
+ * supplies the session-specific directory; keeping that value out of the bundle
+ * makes the assembled context identical across agents, chats, and cache paths.
+ */
+const FILE_DELIVERY_DIRECTIVE = [
+  `To share a file with the user, write or copy it to the directory specified by the \`${MINIME_OUTBOX_ENV}\` environment variable.`,
+  "Files placed there will be automatically sent to the user after your response completes.",
+].join(" ");
+
+/** Complete static section, also usable as Pi's inline artifact-write fallback. */
+export const FILE_DELIVERY_CONTEXT = `## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`;
 
 /**
  * Read one already-resolved regular file through a stable descriptor. The
@@ -548,25 +580,24 @@ interface BundleResult {
   bundle: string;
   sources: PiContextSourceManifest[];
   /**
-   * True when delivering the bundle (with `--no-context-files`) beats a bare Pi
-   * spawn — i.e. at least one REAL source contributed (a CLAUDE.md body, an
-   * expanded import, or a rule) OR the CLAUDE.md carried `@`-import lines that we
-   * stripped. The import case matters even when EVERY import failed to read: a
-   * bare spawn would let Pi flat-load the original CLAUDE.md and surface the
-   * literal `@<path>` lines (exactly what this assembler exists to strip), so the
-   * stripped bundle is strictly better and we must suppress flat loading. An
-   * escaping CLAUDE.md symlink also counts: a bare spawn could flat-load the same
-   * outside-workspace target we refused to read.
-   *
-   * False means the bundle is only the fixed memory directive over a CLAUDE.md
-   * that had no body and no imports (or no CLAUDE.md at all) — nothing worth
-   * forcing `--no-context-files` for, so the caller may prefer a bare spawn.
+   * True when the bundle has enough content to emit an artifact: either assembled
+   * workspace content or the interactive file-delivery directive.
    */
   hasContent: boolean;
+  /**
+   * True when assembled workspace content must replace Pi's flat context files.
+   * Failed imports and escaping CLAUDE.md symlinks count because native loading
+   * would expose the unsanitized source that the assembler deliberately skipped.
+   */
+  suppressContextFiles: boolean;
 }
 
-/** Assemble the deterministic context bundle (order 1-6 above) from live files. */
-function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
+/** Assemble the deterministic context bundle (order 1-7 above) from live files. */
+function assembleBundle(
+  workspaceCwd: string,
+  strict = false,
+  includeFileDelivery = false,
+): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   if (strict) rejectDirectSymlink(claudeMdPath, "CLAUDE.md");
   const { content: rawBody, escaped } = safeReadContainedFile(claudeMdPath, workspaceCwd, {
@@ -619,18 +650,32 @@ function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
     "package:knowledge-access-v1",
     KNOWLEDGE_ACCESS_DIRECTIVE,
   ));
+  if (includeFileDelivery) {
+    parts.push(FILE_DELIVERY_CONTEXT);
+    sources.push(contextSource(
+      "package-directive",
+      "package:file-delivery-v1",
+      FILE_DELIVERY_DIRECTIVE,
+    ));
+  }
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
   // lines intact, so the stripped bundle + `--no-context-files` is strictly better.
-  const hasContent =
+  const suppressContextFiles =
     trimmedBody !== "" ||
     sections.length > 0 ||
     knowledgeSections.length > 0 ||
     rules.length > 0 ||
     importLineCount > 0 ||
     escaped;
-  return { bundle: `${parts.join("\n\n")}\n`, sources, hasContent };
+  const hasContent = suppressContextFiles || includeFileDelivery;
+  return {
+    bundle: `${parts.join("\n\n")}\n`,
+    sources,
+    hasContent,
+    suppressContextFiles,
+  };
 }
 
 function sha256(value: string | Buffer): string {
@@ -675,9 +720,9 @@ function buildContextManifest(
   };
 }
 
-/** Build the context bundle markdown string for a workspace (order 1-6 above). */
+/** Build the full interactive context bundle markdown string for a workspace (order 1-7 above). */
 export function buildBundle(workspaceCwd: string): string {
-  return assembleBundle(workspaceCwd).bundle;
+  return assembleBundle(workspaceCwd, false, true).bundle;
 }
 
 /**
@@ -783,23 +828,24 @@ function readOutputStyleSource(
 
 /**
  * Atomically write a bundle/persona artifact to a STABLE per-agent path under
- * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>.<kind>.md`. Write a staging file
- * then `renameSync` over the final path, so a concurrent reader never sees a
- * half-written file. Stable path ⇒ no accumulation, no cleanup job. The `.tmp`
- * dir and artifact files are private because they contain assembled system
- * context. Returns the final path. May throw (e.g. unwritable `.tmp/`) — the
- * caller (assemblePiContext) wraps it in the fail-safe.
+ * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>[.<variant>].<kind>.md`.
+ * Write a staging file then `renameSync` over the final path, so a concurrent
+ * reader never sees a half-written file. Stable path ⇒ no accumulation, no
+ * cleanup job. The `.tmp` dir and artifact files are private because they contain
+ * assembled system context. Returns the final path. May throw (e.g. unwritable
+ * `.tmp/`) — the caller (assemblePiContext) wraps it in the fail-safe.
  */
 export function writeTempArtifact(
   workspaceCwd: string,
   agentId: string,
   kind: PiArtifactKind,
   content: string,
-  opts?: { stagingSuffix?: string },
+  opts?: { stagingSuffix?: string; variant?: "file-delivery" },
 ): string {
   const tmpDir = join(workspaceCwd, ".tmp");
   ensurePrivateArtifactDir(tmpDir);
-  const finalPath = join(tmpDir, `pi-context-${safeArtifactAgentId(agentId)}.${kind}.md`);
+  const variant = opts?.variant === undefined ? "" : `.${opts.variant}`;
+  const finalPath = join(tmpDir, `pi-context-${safeArtifactAgentId(agentId)}${variant}.${kind}.md`);
   const stagingSuffix = opts?.stagingSuffix ?? `${process.pid}.${Date.now()}.${randomBytes(6).toString("hex")}`;
   const stagingPath = `${finalPath}.tmp.${stagingSuffix}`;
   writeFileSync(stagingPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -813,6 +859,7 @@ interface CacheEntry {
   bundle: string;
   /** The resolved persona (the `--system-prompt` artifact body), or null when none. */
   persona: string | null;
+  suppressContextFiles: boolean;
   manifest: PiContextManifest;
 }
 
@@ -907,21 +954,24 @@ function computeManifestSignature(agent: AgentConfig): string {
  * assembler produced (and so a deleted artifact is transparently recreated).
  * Strict callers bypass the cache and assemble the accepted bytes afresh.
  *
- * Returns null only for a genuinely empty workspace with no persona. If artifact
- * writing fails after content was assembled, this throws; Pi callers must catch
- * and add `--no-context-files` so Pi does not fall back to flat context loading.
+ * Returns null only for a genuinely empty workspace with no persona and no
+ * interactive file-delivery capability. If artifact writing fails after content
+ * was assembled, this throws; Pi callers must catch and add `--no-context-files`
+ * so Pi does not fall back to flat context loading.
  */
 export function assemblePiContext(
   agent: AgentConfig,
   options: PiContextAssemblyOptions = {},
 ): PiContextArtifacts | null {
   const strict = options.strict === true;
+  const includeFileDelivery = options.includeFileDelivery === true;
   const signature = strict ? null : computeManifestSignature(agent);
-  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}`;
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}\0${includeFileDelivery}`;
   const cached = strict ? undefined : cache.get(cacheKey);
 
   let bundle: string;
   let persona: string | null;
+  let suppressContextFiles: boolean;
   let manifest: PiContextManifest;
   if (cached && cached.signature === signature) {
     // Source manifest unchanged: reuse the assembled content (skip the expensive
@@ -930,9 +980,10 @@ export function assemblePiContext(
     // content here is guaranteed meaningful — no empty-workspace re-check needed.
     bundle = cached.bundle;
     persona = cached.persona;
+    suppressContextFiles = cached.suppressContextFiles;
     manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd, strict);
+    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery);
     const resolvedPersona = resolvePersonaWithSources(agent, strict);
     if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
@@ -942,6 +993,7 @@ export function assemblePiContext(
     }
     bundle = assembled.bundle;
     persona = resolvedPersona.persona;
+    suppressContextFiles = assembled.suppressContextFiles || persona !== null;
     manifest = buildContextManifest(
       bundle,
       persona,
@@ -953,18 +1005,33 @@ export function assemblePiContext(
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
   const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
-  const appendSystemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "bundle", bundle);
+  let appendSystemPromptPath: string;
   let systemPromptPath: string | undefined;
-  if (persona !== null) {
-    systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
+  try {
+    appendSystemPromptPath = writeTempArtifact(
+      artifactWorkspaceCwd,
+      agent.id,
+      "bundle",
+      bundle,
+      includeFileDelivery ? { variant: "file-delivery" } : undefined,
+    );
+    if (persona !== null) {
+      systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
+    }
+  } catch (err) {
+    throw new PiContextArtifactWriteError(
+      err instanceof Error ? err.message : String(err),
+      suppressContextFiles,
+      { cause: err },
+    );
   }
 
   const result: PiContextArtifacts =
     systemPromptPath !== undefined
-      ? { systemPromptPath, appendSystemPromptPath, manifest }
-      : { appendSystemPromptPath, manifest };
+      ? { systemPromptPath, appendSystemPromptPath, suppressContextFiles, manifest }
+      : { appendSystemPromptPath, suppressContextFiles, manifest };
   if (signature !== null) {
-    cache.set(cacheKey, { signature, bundle, persona, manifest });
+    cache.set(cacheKey, { signature, bundle, persona, suppressContextFiles, manifest });
   }
   return result;
 }

@@ -13,7 +13,11 @@ import type {
   ControlRequest,
 } from "./types.js";
 import { log } from "./logger.js";
-import { assemblePiContext } from "./pi-context-assembler.js";
+import {
+  assemblePiContext,
+  FILE_DELIVERY_CONTEXT,
+  PiContextArtifactWriteError,
+} from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -33,6 +37,9 @@ import {
   parsePiAcknowledgedSteerResultNotice,
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
+import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
+
+export { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 
 export const PI_PROVIDER = "openai-codex";
 export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
@@ -156,6 +163,8 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 export interface PiSpawnRuntimeEnvOptions {
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
+  /** Deterministic per-chat outbox path supplied for an interactive session. */
+  outboxPath?: string;
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -173,6 +182,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_OUTBOX_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -538,6 +548,7 @@ export function buildPiSpawnArgs(
   agent: AgentConfig,
   resumeSessionId?: string,
   extensionOptions?: PiSpawnExtensionOptions,
+  runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): string[] {
   const args = [
     "--mode", "rpc",
@@ -555,29 +566,47 @@ export function buildPiSpawnArgs(
   // layers, REPLACING the old `agent.systemPrompt → --append-system-prompt` branch:
   //   --system-prompt <persona>   REPLACES Pi's base prompt (omitted when no persona
   //                               resolves — the agent then rides Pi's base prompt).
-  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle.
-  //   --no-context-files          so Pi does NOT ALSO flat-load CLAUDE.md/AGENTS.md
-  //                               from cwd (avoids double context).
+  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle,
+  //                                    or inline file-delivery fallback text.
+  //   --no-context-files          when assembled workspace/persona layers replace
+  //                               native context (omitted for delivery-only bundles
+  //                               so Pi can still load an AGENTS.md from cwd).
   // At most ONE --system-prompt and ONE --append-system-prompt are emitted. The
   // assembler is fail-safe for source reads (bad source → warn+skip; empty
-  // workspace → null → bare spawn), but artifact writes can throw after source
-  // content has been classified. A throw must fail closed with --no-context-files
-  // so Pi does not flat-load context files the assembler could not safely deliver.
+  // workspace without an interactive outbox → null → bare spawn), but artifact
+  // writes can throw after source content has been classified. A throw must fail
+  // closed with --no-context-files so Pi does not flat-load context files the
+  // assembler could not safely deliver.
+  const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
-    const context = assemblePiContext(agent);
+    const context = assemblePiContext(agent, {
+      includeFileDelivery,
+    });
     if (context) {
       if (context.systemPromptPath) {
         args.push("--system-prompt", context.systemPromptPath);
       }
       args.push("--append-system-prompt", context.appendSystemPromptPath);
-      args.push("--no-context-files");
+      if (context.suppressContextFiles !== false) {
+        args.push("--no-context-files");
+      }
     }
   } catch (err) {
+    const suppressContextFiles =
+      !(err instanceof PiContextArtifactWriteError) || err.suppressContextFiles;
+    const contextLoadingOutcome = suppressContextFiles
+      ? "suppressing flat context loading"
+      : "preserving native context loading";
     log.error(
       "pi-rpc",
-      `Pi context assembly threw for agent "${agent.id}", suppressing flat context loading: ${(err as Error).message}`,
+      `Pi context assembly threw for agent "${agent.id}", ${contextLoadingOutcome}: ${(err as Error).message}`,
     );
-    args.push("--no-context-files");
+    if (includeFileDelivery) {
+      args.push("--append-system-prompt", FILE_DELIVERY_CONTEXT);
+    }
+    if (suppressContextFiles) {
+      args.push("--no-context-files");
+    }
   }
 
   // Keep `--no-extensions` on every spawn to suppress Pi's ambient extension
@@ -641,6 +670,7 @@ function buildAllowedPiChildEnv(
   delete env[RETIRED_AGENT_WORKSPACE_ENV];
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+  delete env[MINIME_OUTBOX_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
@@ -649,6 +679,10 @@ function buildAllowedPiChildEnv(
   const askCallerAgentId = runtimeEnvOptions?.askCallerAgentId?.trim();
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
+  }
+  const outboxPath = runtimeEnvOptions?.outboxPath?.trim();
+  if (outboxPath) {
+    env[MINIME_OUTBOX_ENV] = outboxPath;
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
@@ -693,7 +727,7 @@ export function spawnPiRpcSession(
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
-  const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions);
+  const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions, runtimeEnvOptions);
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {

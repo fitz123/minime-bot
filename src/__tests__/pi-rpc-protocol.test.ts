@@ -16,11 +16,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { _resetPiContextCache } from "../pi-context-assembler.js";
+import {
+  _resetPiContextCache,
+  FILE_DELIVERY_CONTEXT,
+} from "../pi-context-assembler.js";
 import {
   NewlineOnlyJsonlSplitter,
   MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
+  MINIME_OUTBOX_ENV,
   PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
   PI_CRON_WRAPPER_RELPATHS,
@@ -320,7 +324,12 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
   it("injects --system-prompt (persona), --append-system-prompt (bundle), and --no-context-files", () => {
     const ws = fullPiWorkspace();
-    const args = buildPiSpawnArgs(piAgent(ws), undefined, NO_EXTENSIONS);
+    const args = buildPiSpawnArgs(
+      piAgent(ws),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
 
     const personaIdx = args.indexOf("--system-prompt");
     const bundleIdx = args.indexOf("--append-system-prompt");
@@ -333,12 +342,17 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     const personaPath = args[personaIdx + 1];
     const bundlePath = args[bundleIdx + 1];
     assert.ok(personaPath.endsWith(join(".tmp", "pi-context-pi.persona.md")), personaPath);
-    assert.ok(bundlePath.endsWith(join(".tmp", "pi-context-pi.bundle.md")), bundlePath);
+    assert.ok(bundlePath.endsWith(join(".tmp", "pi-context-pi.file-delivery.bundle.md")), bundlePath);
     assert.ok(existsSync(personaPath) && existsSync(bundlePath), "artifacts written to disk");
 
     assert.strictEqual(readFileSync(personaPath, "utf8"), "PERSONA_TOKEN body");
     const bundle = readFileSync(bundlePath, "utf8");
     assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Knowledge access"));
+    assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
+    assert.ok(
+      bundle.includes(`\`${MINIME_OUTBOX_ENV}\``),
+      "the static directive names the same package-owned key used by the spawn environment",
+    );
   });
 
   it("omits --system-prompt when the agent has no persona (rides Pi base), keeping the bundle + flag", () => {
@@ -388,23 +402,25 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
-  it("degrades to no context args for an empty pi workspace", () => {
-    // No CLAUDE.md, no rules, no persona => assemblePiContext returns null =>
-    // none of the context CLI layers are emitted. Extension auto-discovery is
-    // still suppressed by the spawn builder's unconditional --no-extensions.
-    const ws = makePiWorkspace({});
-    const args = buildPiSpawnArgs(piAgent(ws), undefined, NO_EXTENSIONS);
+  it("delivers file guidance without suppressing native AGENTS.md loading", () => {
+    const ws = makePiWorkspace({ files: { "AGENTS.md": "AGENTS_ONLY_TOKEN" } });
+    const args = buildPiSpawnArgs(
+      piAgent(ws),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
 
     assert.ok(!args.includes("--system-prompt"));
-    assert.ok(!args.includes("--append-system-prompt"));
-    assert.ok(!args.includes("--no-context-files"));
-    // The base command is intact.
-    assert.deepStrictEqual(args, [
-      "--mode", "rpc",
-      "--provider", "openai-codex",
-      "--model", "openai-codex/gpt-5.5",
-      "--no-extensions",
-    ]);
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "interactive file guidance is delivered");
+    assert.ok(
+      !args.includes("--no-context-files"),
+      "Pi must still load an AGENTS.md that the package assembler does not consume",
+    );
+    const bundle = readFileSync(args[bundleIdx + 1], "utf8");
+    assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
+    assert.ok(bundle.includes(`\`${MINIME_OUTBOX_ENV}\``));
   });
 
   it("suppresses flat context loading when context artifact writes fail", () => {
@@ -416,6 +432,44 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(!args.includes("--system-prompt"));
     assert.ok(!args.includes("--append-system-prompt"));
     assert.ok(args.includes("--no-context-files"));
+  });
+
+  it("falls back to inline file guidance when interactive context artifacts cannot be written", () => {
+    const ws = makePiWorkspace({ claudeMd: "# Pi Agent\n\nBODY" });
+    writeFileSync(join(ws, ".tmp"), "i am a file, not a dir", "utf8");
+
+    const args = buildPiSpawnArgs(
+      piAgent(ws, { id: "interactive-writefail" }),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
+
+    assert.ok(!args.includes("--system-prompt"));
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "fallback guidance is delivered inline");
+    assert.strictEqual(args[bundleIdx + 1], FILE_DELIVERY_CONTEXT);
+    assert.ok(args.includes("--no-context-files"));
+  });
+
+  it("preserves native AGENTS.md loading when delivery-only artifact writes fail", () => {
+    const ws = makePiWorkspace({ files: { "AGENTS.md": "AGENTS_ONLY_TOKEN" } });
+    writeFileSync(join(ws, ".tmp"), "i am a file, not a dir", "utf8");
+
+    const args = buildPiSpawnArgs(
+      piAgent(ws, { id: "delivery-only-writefail" }),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
+
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "fallback guidance is delivered inline");
+    assert.strictEqual(args[bundleIdx + 1], FILE_DELIVERY_CONTEXT);
+    assert.ok(
+      !args.includes("--no-context-files"),
+      "an artifact failure must not suppress a native-only AGENTS.md",
+    );
   });
 
   it("suppresses flat context loading when CLAUDE.md is an escaping symlink", () => {
@@ -1040,6 +1094,7 @@ describe("buildPiSpawnEnv", () => {
     assert.equal(shouldIncludePiChildEnvKey(MINIME_AGENT_WORKSPACE_ROOT_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_AGENT_ID_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_OUTBOX_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
   });
@@ -1086,6 +1141,7 @@ describe("buildPiSpawnEnv", () => {
       MINIME_AGENT_WORKSPACE_ROOT_ENV,
       MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
       MINIME_BOT_PI_SESSION_ENV,
+      MINIME_OUTBOX_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
       MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -1119,6 +1175,7 @@ describe("buildPiSpawnEnv", () => {
       process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
       process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
       process.env[MINIME_BOT_PI_SESSION_ENV] = "ambient";
+      process.env[MINIME_OUTBOX_ENV] = "/tmp/ambient-outbox";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -1141,6 +1198,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_ENV], "1");
+      assert.strictEqual(env[MINIME_OUTBOX_ENV], undefined);
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
@@ -1233,6 +1291,33 @@ describe("buildPiSpawnEnv", () => {
         delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
         process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+    }
+  });
+
+  it("sets the outbox env only for an explicit interactive session runtime path", () => {
+    const oldOutbox = process.env[MINIME_OUTBOX_ENV];
+
+    try {
+      process.env[MINIME_OUTBOX_ENV] = "/tmp/ambient-outbox";
+
+      const interactiveEnv = withWorkspaceRoot(
+        "/tmp",
+        () => buildPiSpawnEnv(undefined, { outboxPath: "/tmp/session-outbox" }),
+      );
+      const defaultInteractiveEnv = withWorkspaceRoot("/tmp", () => buildPiSpawnEnv());
+      const subagentEnv = withWorkspaceRoot("/tmp", () => buildPiSubagentChildSpawnEnv());
+      const askAgentEnv = withWorkspaceRoot("/tmp", () => buildPiAskAgentChildSpawnEnv());
+
+      assert.strictEqual(interactiveEnv[MINIME_OUTBOX_ENV], "/tmp/session-outbox");
+      assert.strictEqual(defaultInteractiveEnv[MINIME_OUTBOX_ENV], undefined);
+      assert.strictEqual(subagentEnv[MINIME_OUTBOX_ENV], undefined);
+      assert.strictEqual(askAgentEnv[MINIME_OUTBOX_ENV], undefined);
+    } finally {
+      if (oldOutbox === undefined) {
+        delete process.env[MINIME_OUTBOX_ENV];
+      } else {
+        process.env[MINIME_OUTBOX_ENV] = oldOutbox;
       }
     }
   });
