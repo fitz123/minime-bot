@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.8.2
+
+- Move interactive file-delivery guidance from repeated user prompts into one
+  static capability-aware Pi context directive, with the per-session outbox
+  path supplied through `MINIME_OUTBOX` while preserving native context and
+  existing post-response delivery (#151).
+
 ## 2026.8.1
 
 - Keep active Pi turns and queued per-session work alive past the resident-session idle timeout, then begin a fresh idle window at the accepted turn's terminal settlement boundary (#172).
