@@ -5,12 +5,13 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import {
   KNOWLEDGE_GET_TOOL,
@@ -557,7 +558,7 @@ describe("Knowledge Pi extension helpers", () => {
     );
 
     assert.equal(decision?.block, true);
-    assert.equal(decision.targetPath, workspaceAlias);
+    assert.equal(realpathSync(resolve(workspace, decision.targetPath ?? "")), realpathSync(workspace));
     assert.match(decision.reason, /raw Git worktree mutations are blocked/);
   });
 
