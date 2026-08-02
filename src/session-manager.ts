@@ -1093,6 +1093,12 @@ export class SessionManager {
     }
   }
 
+  private hasInFlightSessionWork(session: ActiveSession): boolean {
+    return session.processingStartedAt !== null ||
+      session.queue.pending > 0 ||
+      session.queue.size > 0;
+  }
+
   /**
    * Extend the idle window for an active session without creating one.
    * Called by message handlers while staging incoming payloads (e.g. media
@@ -1119,9 +1125,7 @@ export class SessionManager {
       session.idleTimer = null;
       if (
         this.active.get(chatId) !== session ||
-        session.processingStartedAt !== null ||
-        session.queue.pending > 0 ||
-        session.queue.size > 0
+        this.hasInFlightSessionWork(session)
       ) {
         return;
       }
@@ -1340,14 +1344,17 @@ export class SessionManager {
     return { resume: true, sessionId: stored.sessionId };
   }
 
-  /** LRU eviction: close the session with oldest lastActivity. */
+  /** LRU eviction: close the oldest resident session that has no in-flight work. */
   private async evictIfNeeded(config: BotConfig): Promise<void> {
     const maxConcurrentSessions = config.sessionDefaults.maxConcurrentSessions;
     if (this.active.size < maxConcurrentSessions) return;
 
-    // Find session with oldest lastActivity
+    // Find the oldest session that is not actively processing or queueing work.
     let oldest: { chatId: string; lastActivity: number } | null = null;
     for (const [chatId, session] of this.active) {
+      if (this.hasInFlightSessionWork(session)) {
+        continue;
+      }
       if (!oldest || session.lastActivity < oldest.lastActivity) {
         oldest = { chatId, lastActivity: session.lastActivity };
       }
