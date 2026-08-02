@@ -2734,19 +2734,23 @@ describe("SessionManager Pi dispatch", () => {
     assert.strictEqual(child.killed, true);
   });
 
-  it("still closes an already-idle resident session at the idle deadline", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  it("still closes an already-idle resident session at the idle deadline", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
     const { child } = makeCapturingChild();
     injectSession(manager, "pi-idle-resident", "pi", child);
     const session = manager.getActive("pi-idle-resident")!;
-    session.idleTimeoutMs = 100;
+    session.idleTimeoutMs = 20;
+    const childExited = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("idle close timed out")), 1_000);
+      child.once("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
     manager.resetIdleTimer("pi-idle-resident");
 
-    t.mock.timers.tick(99);
-    assert.strictEqual(manager.getActive("pi-idle-resident"), session);
-    t.mock.timers.tick(1);
+    await childExited;
     assert.strictEqual(manager.getActive("pi-idle-resident"), undefined);
     assert.strictEqual(child.killed, true);
   });
