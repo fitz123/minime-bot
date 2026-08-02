@@ -339,7 +339,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     const personaPath = args[personaIdx + 1];
     const bundlePath = args[bundleIdx + 1];
     assert.ok(personaPath.endsWith(join(".tmp", "pi-context-pi.persona.md")), personaPath);
-    assert.ok(bundlePath.endsWith(join(".tmp", "pi-context-pi.bundle.md")), bundlePath);
+    assert.ok(bundlePath.endsWith(join(".tmp", "pi-context-pi.file-delivery.bundle.md")), bundlePath);
     assert.ok(existsSync(personaPath) && existsSync(bundlePath), "artifacts written to disk");
 
     assert.strictEqual(readFileSync(personaPath, "utf8"), "PERSONA_TOKEN body");

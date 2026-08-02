@@ -813,23 +813,24 @@ function readOutputStyleSource(
 
 /**
  * Atomically write a bundle/persona artifact to a STABLE per-agent path under
- * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>.<kind>.md`. Write a staging file
- * then `renameSync` over the final path, so a concurrent reader never sees a
- * half-written file. Stable path ⇒ no accumulation, no cleanup job. The `.tmp`
- * dir and artifact files are private because they contain assembled system
- * context. Returns the final path. May throw (e.g. unwritable `.tmp/`) — the
- * caller (assemblePiContext) wraps it in the fail-safe.
+ * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>[.<variant>].<kind>.md`.
+ * Write a staging file then `renameSync` over the final path, so a concurrent
+ * reader never sees a half-written file. Stable path ⇒ no accumulation, no
+ * cleanup job. The `.tmp` dir and artifact files are private because they contain
+ * assembled system context. Returns the final path. May throw (e.g. unwritable
+ * `.tmp/`) — the caller (assemblePiContext) wraps it in the fail-safe.
  */
 export function writeTempArtifact(
   workspaceCwd: string,
   agentId: string,
   kind: PiArtifactKind,
   content: string,
-  opts?: { stagingSuffix?: string },
+  opts?: { stagingSuffix?: string; variant?: "file-delivery" },
 ): string {
   const tmpDir = join(workspaceCwd, ".tmp");
   ensurePrivateArtifactDir(tmpDir);
-  const finalPath = join(tmpDir, `pi-context-${safeArtifactAgentId(agentId)}.${kind}.md`);
+  const variant = opts?.variant === undefined ? "" : `.${opts.variant}`;
+  const finalPath = join(tmpDir, `pi-context-${safeArtifactAgentId(agentId)}${variant}.${kind}.md`);
   const stagingSuffix = opts?.stagingSuffix ?? `${process.pid}.${Date.now()}.${randomBytes(6).toString("hex")}`;
   const stagingPath = `${finalPath}.tmp.${stagingSuffix}`;
   writeFileSync(stagingPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -985,7 +986,13 @@ export function assemblePiContext(
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
   const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
-  const appendSystemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "bundle", bundle);
+  const appendSystemPromptPath = writeTempArtifact(
+    artifactWorkspaceCwd,
+    agent.id,
+    "bundle",
+    bundle,
+    includeFileDelivery ? { variant: "file-delivery" } : undefined,
+  );
   let systemPromptPath: string | undefined;
   if (persona !== null) {
     systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);

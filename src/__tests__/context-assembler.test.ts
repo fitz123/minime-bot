@@ -864,12 +864,22 @@ describe("assemblePiContext", () => {
 
     const withoutDelivery = assemblePiContext(agent);
     assert.ok(withoutDelivery);
-    const withoutDeliveryBundle = readFileSync(withoutDelivery.appendSystemPromptPath, "utf8");
     const withDelivery = assemblePiContext(agent, { includeFileDelivery: true });
     assert.ok(withDelivery);
+    assert.notStrictEqual(
+      withDelivery.appendSystemPromptPath,
+      withoutDelivery.appendSystemPromptPath,
+      "capability variants must not overwrite a path a concurrent spawn may still read",
+    );
+    const withoutDeliveryBundle = readFileSync(withoutDelivery.appendSystemPromptPath, "utf8");
     const withDeliveryBundle = readFileSync(withDelivery.appendSystemPromptPath, "utf8");
     const withoutDeliveryAgain = assemblePiContext(agent);
     assert.ok(withoutDeliveryAgain);
+    assert.strictEqual(
+      withoutDeliveryAgain.appendSystemPromptPath,
+      withoutDelivery.appendSystemPromptPath,
+      "the same capability reuses its stable artifact path",
+    );
     const withoutDeliveryAgainBundle = readFileSync(
       withoutDeliveryAgain.appendSystemPromptPath,
       "utf8",
