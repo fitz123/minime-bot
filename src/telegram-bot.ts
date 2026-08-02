@@ -20,7 +20,14 @@ import {
 import { allocateMediaPath, enforceMediaCap, releaseMediaPath, discardMediaPath } from "./media-store.js";
 import { isImageMimeType, imageExtensionForMime } from "./mime.js";
 import { log } from "./logger.js";
-import { recordTelegramApiError, recordTelegramApiCall, messagesReceived, messagesSent } from "./metrics.js";
+import {
+  recordTelegramApiError,
+  recordTelegramApiCall,
+  recordMediaPipelineError,
+  messagesReceived,
+  messagesSent,
+  type TelegramMediaType,
+} from "./metrics.js";
 import { setThread, getThread } from "./message-thread-cache.js";
 import { recordMessage, lookupMessage } from "./message-content-index.js";
 import type { MessageRecord } from "./message-content-index.js";
@@ -545,7 +552,7 @@ export function extractMediaInfo(msg: {
   video_note?: { file_id: string; file_size?: number };
   audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
   sticker?: { file_id: string; file_size?: number; is_animated?: boolean; is_video?: boolean };
-}): { media: MediaInfo; mediaType: string; typeLabel: string } {
+}): { media: MediaInfo; mediaType: Exclude<TelegramMediaType, "voice" | "photo" | "document">; typeLabel: string } {
   if (msg.video) return { media: msg.video, mediaType: "video", typeLabel: "Video" };
   if (msg.animation) return { media: msg.animation, mediaType: "animation", typeLabel: "Animation" };
   if (msg.video_note) return { media: msg.video_note, mediaType: "video_note", typeLabel: "Video Note" };
@@ -973,6 +980,7 @@ export function createTelegramBot(
       }
     } catch (err) {
       const stage = mediaPipelineStage(err, "transcription");
+      recordMediaPipelineError({ transport: "telegram", mediaType: "voice", stage });
       log.error("telegram-bot", `Voice media pipeline failed stage=${stage}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
     }
@@ -1037,6 +1045,7 @@ export function createTelegramBot(
       );
     } catch (err) {
       const stage = mediaPipelineStage(err, "download");
+      recordMediaPipelineError({ transport: "telegram", mediaType: "photo", stage });
       log.error("telegram-bot", `Photo media pipeline failed stage=${stage}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {
@@ -1066,6 +1075,12 @@ export function createTelegramBot(
     // Telegram Bot API limits file downloads to 20 MB
     const docSize = anim?.file_size ?? doc.file_size;
     if (docSize !== undefined && docSize > TELEGRAM_FILE_SIZE_LIMIT) {
+      const stage = mediaPipelineStage(new MediaPipelineError("size-limit"), "download");
+      recordMediaPipelineError({
+        transport: "telegram",
+        mediaType: anim ? "animation" : "document",
+        stage,
+      });
       await ctx.reply("File is too large (max 20 MB for bot downloads).").catch(() => {});
       return;
     }
@@ -1133,6 +1148,11 @@ export function createTelegramBot(
       );
     } catch (err) {
       const stage = mediaPipelineStage(err, "download");
+      recordMediaPipelineError({
+        transport: "telegram",
+        mediaType: anim ? "animation" : "document",
+        stage,
+      });
       log.error("telegram-bot", `${anim ? "Animation" : "Document"} media pipeline failed stage=${stage}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {
@@ -1158,6 +1178,8 @@ export function createTelegramBot(
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
     if (media.file_size !== undefined && media.file_size > TELEGRAM_FILE_SIZE_LIMIT) {
+      const stage = mediaPipelineStage(new MediaPipelineError("size-limit"), "download");
+      recordMediaPipelineError({ transport: "telegram", mediaType, stage });
       await ctx.reply("File is too large (max 20 MB for bot downloads).").catch(() => {});
       return;
     }
@@ -1207,6 +1229,7 @@ export function createTelegramBot(
       );
     } catch (err) {
       const stage = mediaPipelineStage(err, "download");
+      recordMediaPipelineError({ transport: "telegram", mediaType, stage });
       log.error("telegram-bot", `${typeLabel} media pipeline failed stage=${stage}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
       if (tempPath) {

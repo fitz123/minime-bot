@@ -98,11 +98,11 @@ npm pack --dry-run --ignore-scripts
 - Modify: `src/__tests__/telegram-bot.test.ts`
 - Modify: `src/__tests__/discord-bot.test.ts`
 
-- [ ] Add `minime_media_pipeline_errors_total{transport,media_type,stage}` and a typed recording helper whose closed media set is Telegram `voice|photo|document|animation|video|video_note|audio|sticker` plus Discord `image|voice`, paired only with existing `MediaPipelineStage` values.
-- [ ] Increment once at the single terminal outcome boundary for every Telegram media handler, including declared-size rejections before download, after deriving the existing bounded stage and before best-effort user reply/cleanup.
-- [ ] Increment once per failed Discord image/voice attachment after deriving the existing bounded stage, before best-effort user reply and cleanup.
-- [ ] Add metric and handler tests proving one increment per failed handler/attachment, correct bounded classifications for oversized Telegram document/generic media, sticker, representative later stages, and multi-attachment Discord failures; prove no increment on success or recovered internal retry and no identity/path/URL/error labels.
-- [ ] Run the Task 3 focused tests and lint; all must pass before Task 4.
+- [x] Add `minime_media_pipeline_errors_total{transport,media_type,stage}` and a typed recording helper whose closed media set is Telegram `voice|photo|document|animation|video|video_note|audio|sticker` plus Discord `image|voice`, paired only with existing `MediaPipelineStage` values.
+- [x] Increment once at the single terminal outcome boundary for every Telegram media handler, including declared-size rejections before download, after deriving the existing bounded stage and before best-effort user reply/cleanup.
+- [x] Increment once per failed Discord image/voice attachment after deriving the existing bounded stage, before best-effort user reply and cleanup.
+- [x] Add metric and handler tests proving one increment per failed handler/attachment, correct bounded classifications for oversized Telegram document/generic media, sticker, representative later stages, and multi-attachment Discord failures; prove no increment on success or recovered internal retry and no identity/path/URL/error labels.
+- [x] Run the Task 3 focused tests and lint; all must pass before Task 4.
 
 ### Task 4: Publish and verify the monitoring contract [HIGH]
 

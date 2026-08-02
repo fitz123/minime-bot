@@ -15,6 +15,7 @@ import {
 import { validateDiscordBinding } from "../config.js";
 import type { BotConfig, DiscordBinding, DiscordConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
+import { mediaPipelineErrors } from "../metrics.js";
 
 // --- discordSessionKey ---
 
@@ -47,7 +48,7 @@ describe("discordSessionKey", () => {
 });
 
 describe("Discord media failure handling", () => {
-  it("makes image and audio size failures visible from the actual message handler", async () => {
+  it("counts each failed image and voice attachment independently", async () => {
     const originalLogin = Client.prototype.login;
     const originalPut = REST.prototype.put;
     Client.prototype.login = async function () {
@@ -77,7 +78,11 @@ describe("Discord media failure handling", () => {
 
     try {
       const { client } = await createDiscordBot(config, discordConfig, sessionManager);
-      for (const [contentType, name] of [["image/png", "large.png"], ["audio/ogg", "large.ogg"]] as const) {
+      for (const [mediaType, contentType, name] of [
+        ["image", "image/png", "large.png"],
+        ["voice", "audio/ogg", "large.ogg"],
+      ] as const) {
+        mediaPipelineErrors.reset();
         const replies: string[] = [];
         const channel = {
           send: async () => ({}),
@@ -90,18 +95,28 @@ describe("Discord media failure handling", () => {
           guildId: "guild-1",
           createdTimestamp: Date.now(),
           mentions: { has: () => false },
-          attachments: new Map([["attachment-1", {
+          attachments: new Map([1, 2].map((index) => [`attachment-${index}`, {
             contentType,
-            name,
+            name: `${index}-${name}`,
             size: 11,
-            url: "https://example.invalid/media",
-          }]]),
+            url: `https://example.invalid/media-${index}`,
+          }])),
           content: "",
           reply: async (text: string) => { replies.push(text); },
         } as never);
         await new Promise<void>((resolve) => setImmediate(resolve));
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.deepStrictEqual(replies, ["Media is too large to process."]);
+        assert.deepStrictEqual(replies, [
+          "Media is too large to process.",
+          "Media is too large to process.",
+        ]);
+        assert.deepStrictEqual(
+          (await mediaPipelineErrors.get()).values.map(({ labels, value }) => ({ labels, value })),
+          [{
+            labels: { transport: "discord", media_type: mediaType, stage: "size-limit" },
+            value: 2,
+          }],
+        );
       }
     } finally {
       Client.prototype.login = originalLogin;

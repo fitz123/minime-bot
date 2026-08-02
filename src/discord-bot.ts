@@ -17,7 +17,7 @@ import {
 } from "./voice.js";
 import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath } from "./media-store.js";
 import { log } from "./logger.js";
-import { messagesReceived } from "./metrics.js";
+import { messagesReceived, recordMediaPipelineError } from "./metrics.js";
 import { isImageMimeType } from "./mime.js";
 import { readQuotaStatus } from "./quota-status.js";
 import { buildStatusReport } from "./status-report.js";
@@ -372,6 +372,7 @@ export async function createDiscordBot(
             );
           } catch (err) {
             const stage = mediaPipelineStage(err, "download");
+            recordMediaPipelineError({ transport: "discord", mediaType: "image", stage });
             log.error("discord-bot", `Image media pipeline failed stage=${stage}`);
             await message.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
             if (tempPath) discardMediaPath(tempPath);
@@ -398,6 +399,7 @@ export async function createDiscordBot(
             );
           } catch (err) {
             const stage = mediaPipelineStage(err, "transcription");
+            recordMediaPipelineError({ transport: "discord", mediaType: "voice", stage });
             log.error("discord-bot", `Voice media pipeline failed stage=${stage}`);
             await message.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
           } finally {

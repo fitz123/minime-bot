@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http";
 import client from "prom-client";
 import { log } from "./logger.js";
 import type { RuntimeIdentity, StartupConflictReason } from "./runtime-guard.js";
+import type { MediaPipelineStage } from "./voice.js";
 
 // Use the default registry
 const register = client.register;
@@ -223,6 +224,28 @@ export const mediaDownloadRetries = new client.Counter({
   labelNames: ["result"] as const,
 });
 
+// --- Terminal media-pipeline failures ---
+
+export type TelegramMediaType =
+  | "voice"
+  | "photo"
+  | "document"
+  | "animation"
+  | "video"
+  | "video_note"
+  | "audio"
+  | "sticker";
+export type DiscordMediaType = "image" | "voice";
+export type MediaPipelineErrorLabels =
+  | { transport: "telegram"; mediaType: TelegramMediaType; stage: MediaPipelineStage }
+  | { transport: "discord"; mediaType: DiscordMediaType; stage: MediaPipelineStage };
+
+export const mediaPipelineErrors = new client.Counter({
+  name: "minime_media_pipeline_errors_total",
+  help: "Total terminal user-visible media pipeline failures by bounded classification",
+  labelNames: ["transport", "media_type", "stage"] as const,
+});
+
 // --- Streaming draft and final delivery reliability ---
 
 export type DraftSchedulerEvent = "throttled" | "coalesced" | "rate_limited" | "failed";
@@ -390,6 +413,15 @@ export function recordMessageQueueRejectionNotice(
 /** Record the bounded final outcome of a media download retry sequence. */
 export function recordMediaDownloadRetry(result: MediaDownloadRetryResult): void {
   mediaDownloadRetries.inc({ result });
+}
+
+/** Record one terminal media outcome using only closed, non-identifying labels. */
+export function recordMediaPipelineError(labels: MediaPipelineErrorLabels): void {
+  mediaPipelineErrors.inc({
+    transport: labels.transport,
+    media_type: labels.mediaType,
+    stage: labels.stage,
+  });
 }
 
 /** Record a bounded cosmetic draft scheduler event. */

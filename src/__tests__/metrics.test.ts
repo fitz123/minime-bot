@@ -40,6 +40,8 @@ import {
   recordMessageQueueRejectionNotice,
   mediaDownloadRetries,
   recordMediaDownloadRetry,
+  mediaPipelineErrors,
+  recordMediaPipelineError,
   draftSchedulerEvents,
   finalDeliveryFailures,
   recordDraftSchedulerEvent,
@@ -393,6 +395,61 @@ describe("media download retry metrics", () => {
     assert.ok(names.includes("bot_media_download_retries_total"));
     recordMediaDownloadRetry("recovered");
     assert.match(await client.register.metrics(), /bot_media_download_retries_total\{result="recovered"\} 1/);
+  });
+});
+
+describe("terminal media pipeline metrics", () => {
+  it("records only the closed transport, media type, and stage labels", async () => {
+    recordMediaPipelineError({
+      transport: "telegram",
+      mediaType: "document",
+      stage: "size-limit",
+    });
+    recordMediaPipelineError({
+      transport: "discord",
+      mediaType: "voice",
+      stage: "conversion",
+    });
+
+    const values = await mediaPipelineErrors.get();
+    assert.deepStrictEqual(
+      values.values.map(({ labels, value }) => ({ labels, value })),
+      [
+        {
+          labels: { transport: "telegram", media_type: "document", stage: "size-limit" },
+          value: 1,
+        },
+        {
+          labels: { transport: "discord", media_type: "voice", stage: "conversion" },
+          value: 1,
+        },
+      ],
+    );
+    assert.ok(values.values.every(({ labels }) => (
+      Object.keys(labels).sort().join(",") === "media_type,stage,transport"
+    )));
+  });
+
+  it("registers and exposes the counter without identity or error-detail labels", async () => {
+    const names = client.register.getMetricsAsArray().map((metric) => metric.name);
+    assert.ok(names.includes("minime_media_pipeline_errors_total"));
+
+    recordMediaPipelineError({
+      transport: "telegram",
+      mediaType: "sticker",
+      stage: "metadata",
+    });
+    const body = await client.register.metrics();
+    assert.match(
+      body,
+      /minime_media_pipeline_errors_total\{transport="telegram",media_type="sticker",stage="metadata"\} 1/,
+    );
+
+    const metric = await mediaPipelineErrors.get();
+    const forbiddenLabels = ["user", "chat", "path", "url", "error", "detail"];
+    assert.ok(metric.values.every(({ labels }) => (
+      forbiddenLabels.every((label) => !(label in labels))
+    )));
   });
 });
 
