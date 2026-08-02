@@ -79,10 +79,10 @@ npm pack --dry-run --ignore-scripts
 - Modify: `src/bot-startup.ts`
 - Modify: `src/__tests__/bot-startup.test.ts`
 
-- [ ] Record `duplicate_telegram_polling` exactly once for each caught 409 attempt before bounded backoff or final propagation, without counting non-409 failures or exposing grammY error details.
-- [ ] Emit `MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling` through the shared conflict recorder and retain the existing retry count, delay cap, and eventual error behavior.
-- [ ] Add tests for first-attempt recovery, repeated/final 409 counting, wrapped `GrammyError`, non-409 exclusion, bounded labels, and redacted stable logging.
-- [ ] Run `src/__tests__/bot-startup.test.ts` and `src/__tests__/metrics.test.ts`; all must pass before Task 3.
+- [x] Record `duplicate_telegram_polling` exactly once for each caught 409 attempt before bounded backoff or final propagation, without counting non-409 failures or exposing grammY error details.
+- [x] Emit `MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling` through the shared conflict recorder and retain the existing retry count, delay cap, and eventual error behavior.
+- [x] Add tests for first-attempt recovery, repeated/final 409 counting, wrapped `GrammyError`, non-409 exclusion, bounded labels, and redacted stable logging.
+- [x] Run `src/__tests__/bot-startup.test.ts` and `src/__tests__/metrics.test.ts`; all must pass before Task 3.
 
 ### Task 3: Count terminal media-pipeline degradation [HIGH]
 

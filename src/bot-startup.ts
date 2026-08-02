@@ -1,5 +1,6 @@
 import { GrammyError } from "grammy";
 import { log } from "./logger.js";
+import { recordStartupConflict } from "./runtime-guard.js";
 
 /**
  * Check if an error is a Telegram 409 Conflict error.
@@ -182,7 +183,10 @@ export async function startBotWithRetry(
       await startFn();
       return;
     } catch (err) {
-      if (is409ConflictError(err) && attempt < maxRetries) {
+      if (is409ConflictError(err)) {
+        recordStartupConflict("duplicate_telegram_polling");
+        if (attempt >= maxRetries) throw err;
+
         const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), 60_000);
         log.warn(
           "main",
