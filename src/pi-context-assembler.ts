@@ -101,6 +101,18 @@ export interface PiContextAssemblyOptions {
   strict?: boolean;
 }
 
+/** Artifact-write failure annotated with the native-context decision already made by assembly. */
+export class PiContextArtifactWriteError extends Error {
+  constructor(
+    message: string,
+    readonly suppressContextFiles: boolean,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "PiContextArtifactWriteError";
+  }
+}
+
 /** A `## <relpath>` bundle section: a header + the file's content. */
 export interface ContextSection {
   relpath: string;
@@ -993,16 +1005,25 @@ export function assemblePiContext(
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
   const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
-  const appendSystemPromptPath = writeTempArtifact(
-    artifactWorkspaceCwd,
-    agent.id,
-    "bundle",
-    bundle,
-    includeFileDelivery ? { variant: "file-delivery" } : undefined,
-  );
+  let appendSystemPromptPath: string;
   let systemPromptPath: string | undefined;
-  if (persona !== null) {
-    systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
+  try {
+    appendSystemPromptPath = writeTempArtifact(
+      artifactWorkspaceCwd,
+      agent.id,
+      "bundle",
+      bundle,
+      includeFileDelivery ? { variant: "file-delivery" } : undefined,
+    );
+    if (persona !== null) {
+      systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
+    }
+  } catch (err) {
+    throw new PiContextArtifactWriteError(
+      err instanceof Error ? err.message : String(err),
+      suppressContextFiles,
+      { cause: err },
+    );
   }
 
   const result: PiContextArtifacts =

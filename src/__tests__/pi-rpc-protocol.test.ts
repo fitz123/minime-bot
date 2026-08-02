@@ -452,6 +452,26 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(args.includes("--no-context-files"));
   });
 
+  it("preserves native AGENTS.md loading when delivery-only artifact writes fail", () => {
+    const ws = makePiWorkspace({ files: { "AGENTS.md": "AGENTS_ONLY_TOKEN" } });
+    writeFileSync(join(ws, ".tmp"), "i am a file, not a dir", "utf8");
+
+    const args = buildPiSpawnArgs(
+      piAgent(ws, { id: "delivery-only-writefail" }),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
+
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "fallback guidance is delivered inline");
+    assert.strictEqual(args[bundleIdx + 1], FILE_DELIVERY_CONTEXT);
+    assert.ok(
+      !args.includes("--no-context-files"),
+      "an artifact failure must not suppress a native-only AGENTS.md",
+    );
+  });
+
   it("suppresses flat context loading when CLAUDE.md is an escaping symlink", () => {
     const parent = mkdtempSync(join(tmpdir(), "pi-spawn-ctx-symlink-"));
     fixtures.push(parent);

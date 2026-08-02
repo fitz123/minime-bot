@@ -16,6 +16,7 @@ import { log } from "./logger.js";
 import {
   assemblePiContext,
   FILE_DELIVERY_CONTEXT,
+  PiContextArtifactWriteError,
 } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
@@ -591,14 +592,21 @@ export function buildPiSpawnArgs(
       }
     }
   } catch (err) {
+    const suppressContextFiles =
+      !(err instanceof PiContextArtifactWriteError) || err.suppressContextFiles;
+    const contextLoadingOutcome = suppressContextFiles
+      ? "suppressing flat context loading"
+      : "preserving native context loading";
     log.error(
       "pi-rpc",
-      `Pi context assembly threw for agent "${agent.id}", suppressing flat context loading: ${(err as Error).message}`,
+      `Pi context assembly threw for agent "${agent.id}", ${contextLoadingOutcome}: ${(err as Error).message}`,
     );
     if (includeFileDelivery) {
       args.push("--append-system-prompt", FILE_DELIVERY_CONTEXT);
     }
-    args.push("--no-context-files");
+    if (suppressContextFiles) {
+      args.push("--no-context-files");
+    }
   }
 
   // Keep `--no-extensions` on every spawn to suppress Pi's ambient extension
