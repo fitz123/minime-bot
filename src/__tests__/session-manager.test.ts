@@ -2619,6 +2619,138 @@ describe("SessionManager Pi dispatch", () => {
     (manager as unknown as Record<string, Map<string, ActiveSession>>).active.set(chatId, session);
   }
 
+  it("keeps an active turn and its queued follow-up alive past the idle deadline", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-idle-busy", "pi", child);
+    const session = manager.getActive("pi-idle-busy")!;
+    session.idleTimeoutMs = 100;
+
+    const first = manager.sendSessionMessage("pi-idle-busy", "pi", "first");
+    const firstResultPromise = first.next();
+    while (stdinWrites.length < 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const second = manager.sendSessionMessage("pi-idle-busy", "pi", "second");
+    const secondResultPromise = second.next();
+    while (session.queue.size < 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    t.mock.timers.tick(100);
+    assert.strictEqual(manager.getActive("pi-idle-busy"), session);
+    assert.strictEqual(child.killed, false, "idle expiry must not kill the active turn");
+    assert.strictEqual(session.queue.pending, 1, "the first turn remains active");
+    assert.strictEqual(session.queue.size, 1, "the follow-up remains queued");
+
+    stdout.push(piAgentEnd("first answer"));
+    assert.strictEqual((await firstResultPromise).done, false);
+    assert.strictEqual((await first.next()).done, true);
+    while (stdinWrites.length < 2) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.strictEqual(child.killed, false);
+    assert.strictEqual(manager.getActive("pi-idle-busy"), session);
+
+    stdout.push(piAgentEnd("second answer"));
+    assert.strictEqual((await secondResultPromise).done, false);
+    assert.strictEqual((await second.next()).done, true);
+    await manager.closeAll();
+  });
+
+  it("does not refresh a replacement session when an older turn settles", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const older = makeCapturingChild();
+    injectSession(manager, "pi-idle-replaced", "pi", older.child);
+
+    const response = manager.sendSessionMessage("pi-idle-replaced", "pi", "older turn");
+    const resultPromise = response.next();
+    while (older.stdinWrites.length < 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const replacement = makeCapturingChild();
+    injectSession(manager, "pi-idle-replaced", "pi", replacement.child);
+    const replacementSession = manager.getActive("pi-idle-replaced")!;
+    assert.strictEqual(replacementSession.idleTimer, null);
+
+    older.stdout.push(piAgentEnd("older answer"));
+    assert.strictEqual((await resultPromise).done, false);
+    assert.strictEqual((await response.next()).done, true);
+    assert.strictEqual(
+      replacementSession.idleTimer,
+      null,
+      "an older turn must not modify the replacement incarnation's idle window",
+    );
+
+    await manager.closeAll();
+  });
+
+  it("starts a fresh idle window after a terminal error settles, then closes", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-idle-settled", "pi", child);
+    const session = manager.getActive("pi-idle-settled")!;
+    session.idleTimeoutMs = 100;
+
+    const response = manager.sendSessionMessage("pi-idle-settled", "pi", "fail");
+    const resultPromise = response.next();
+    while (stdinWrites.length < 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    t.mock.timers.tick(100);
+    assert.strictEqual(manager.getActive("pi-idle-settled"), session);
+
+    stdout.push([
+      JSON.stringify({
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "terminal failure",
+          content: [],
+        }],
+      }),
+      JSON.stringify({ type: "agent_settled" }),
+    ].join("\n") + "\n");
+    const result = await resultPromise;
+    assert.strictEqual(result.done, false);
+    assert.strictEqual(result.value.type, "result");
+    assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+    assert.strictEqual((await response.next()).done, true);
+
+    t.mock.timers.tick(99);
+    assert.strictEqual(manager.getActive("pi-idle-settled"), session);
+    t.mock.timers.tick(1);
+    assert.strictEqual(manager.getActive("pi-idle-settled"), undefined);
+    assert.strictEqual(child.killed, true);
+  });
+
+  it("still closes an already-idle resident session at the idle deadline", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child } = makeCapturingChild();
+    injectSession(manager, "pi-idle-resident", "pi", child);
+    const session = manager.getActive("pi-idle-resident")!;
+    session.idleTimeoutMs = 100;
+    manager.resetIdleTimer("pi-idle-resident");
+
+    t.mock.timers.tick(99);
+    assert.strictEqual(manager.getActive("pi-idle-resident"), session);
+    t.mock.timers.tick(1);
+    assert.strictEqual(manager.getActive("pi-idle-resident"), undefined);
+    assert.strictEqual(child.killed, true);
+  });
+
   it("routes an active session through sendPiPrompt + readPiStream", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
