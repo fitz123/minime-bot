@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.8.1
+
+- Keep active Pi turns and queued per-session work alive past the resident-session idle timeout, then begin a fresh idle window at the accepted turn's terminal settlement boundary (#172).
+
 ## 2026.8.0
 
 - Add first-party, data-preserving Knowledge Git synchronization that converges
