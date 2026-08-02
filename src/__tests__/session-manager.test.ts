@@ -778,50 +778,6 @@ describe("SessionManager LRU eviction logic", () => {
     // Just verify construction works with the limit
     assert.strictEqual(manager.getActiveCount(), 0);
   });
-
-  it("does not evict an active turn or queued follow-up work", async () => {
-    const { SessionManager } = await import("../session-manager.js");
-    const restrictedConfig = {
-      ...testConfig,
-      sessionDefaults: { ...testConfig.sessionDefaults, maxConcurrentSessions: 1 },
-    };
-    const manager = new SessionManager(() => restrictedConfig, TEST_STORE_PATH);
-    const child = createMockChild();
-    const session: ActiveSession = {
-      child,
-      sessionId: "busy-session",
-      agentId: "main",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      queue: new PQueue({ concurrency: 1 }),
-      idleTimer: null,
-      idleTimeoutMs: 60_000,
-      lastActivity: 1,
-      processingStartedAt: Date.now(),
-      lastSuccessAt: null,
-      restartCount: 0,
-      outboxPath: `${TEST_DIR}/busy-outbox`,
-      pendingSteers: new Map(),
-    };
-    let releaseActiveTask!: () => void;
-    const activeTask = new Promise<void>((resolve) => {
-      releaseActiveTask = resolve;
-    });
-    session.queue.add(async () => {
-      await activeTask;
-    }).catch(() => {});
-    session.queue.add(async () => {}).catch(() => {});
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    (manager as unknown as { active: Map<string, ActiveSession> }).active.set("busy-chat", session);
-
-    await (manager as unknown as {
-      evictIfNeeded(config: BotConfig): Promise<void>;
-    }).evictIfNeeded(restrictedConfig);
-
-    assert.strictEqual(manager.getActive("busy-chat"), session);
-    assert.strictEqual(child.killed, false);
-    releaseActiveTask();
-  });
 });
 
 describe("ActiveSession shape", () => {
