@@ -34,7 +34,7 @@ node dist/cli.js --help
 npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 git diff --check
 git diff --stat main...HEAD
-git diff --no-ext-diff main...HEAD | rg -n '/Users/|306600687|255582' || true
+git diff --no-ext-diff main...HEAD | rg -n '/(Users|home)/[^/[:space:]]+|requesting(Chat|Topic)Id' || true
 ```
 
 ## Tasks
