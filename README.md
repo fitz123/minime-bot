@@ -582,6 +582,15 @@ outcomes. Permanent HTTP, size-limit, conversion, transcription, and empty
 transcript failures are not retried; user replies identify the failed stage
 without exposing transport details.
 
+For locally transcribed Telegram and Discord voice, optional
+`WHISPER_GLOSSARY_PATH` selects a UTF-8 plain-text glossary with one trimmed
+term per line; blank lines and lines whose first non-whitespace character is
+`#` are ignored. The first spelling and order win under NFKC,
+case-insensitive deduplication, and only the largest whole-term prefix fitting
+the 220-byte prompt budget is used. The file is reread for every transcription
+so edits apply without a restart. An unset or missing path, or a file with no
+usable bounded terms, leaves the Whisper invocation unprompted.
+
 Streaming draft backpressure is reported by
 `bot_draft_scheduler_events_total`; its bounded `event` label is one of
 `throttled`, `coalesced`, `rate_limited`, or `failed`. These cosmetic outcomes

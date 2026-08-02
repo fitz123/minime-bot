@@ -1,6 +1,6 @@
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { open, writeFile, unlink, chmod } from "node:fs/promises";
+import { open, readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,6 +11,11 @@ const execFileAsync = promisify(execFileCb);
 export const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
 export const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli";
 export const WHISPER_MODEL = process.env.WHISPER_MODEL ?? join(homedir(), ".minime/models/ggml-medium.bin");
+/** Optional path to a plain-text, one-term-per-line Whisper recognition glossary. */
+export const WHISPER_GLOSSARY_PATH_ENV = "WHISPER_GLOSSARY_PATH";
+export const WHISPER_GLOSSARY_PROMPT_MAX_BYTES = 220;
+export const WHISPER_GLOSSARY_PROMPT_SEPARATOR = ", ";
+export type WhisperGlossaryPrompt = string | undefined;
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 100;
@@ -87,6 +92,49 @@ export function stripKnownTrailingAsrArtifacts(transcript: string): string {
     if (processed !== transcript) return processed.trimEnd();
   }
   return transcript;
+}
+
+/** Build a deterministic whole-term Whisper prompt from plain-text glossary contents. */
+export function buildWhisperGlossaryPrompt(contents: string): WhisperGlossaryPrompt {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  let promptBytes = 0;
+
+  for (const line of contents.split(/\r?\n/u)) {
+    const term = line.trim();
+    if (!term || term.startsWith("#")) continue;
+
+    const deduplicationKey = term.normalize("NFKC").toLowerCase();
+    if (seen.has(deduplicationKey)) continue;
+    seen.add(deduplicationKey);
+
+    const separatorBytes = terms.length === 0
+      ? 0
+      : Buffer.byteLength(WHISPER_GLOSSARY_PROMPT_SEPARATOR, "utf8");
+    const termBytes = Buffer.byteLength(term, "utf8");
+    if (promptBytes + separatorBytes + termBytes > WHISPER_GLOSSARY_PROMPT_MAX_BYTES) {
+      break;
+    }
+
+    terms.push(term);
+    promptBytes += separatorBytes + termBytes;
+  }
+
+  return terms.length === 0
+    ? undefined
+    : terms.join(WHISPER_GLOSSARY_PROMPT_SEPARATOR);
+}
+
+async function loadWhisperGlossaryPrompt(): Promise<WhisperGlossaryPrompt> {
+  const glossaryPath = process.env[WHISPER_GLOSSARY_PATH_ENV];
+  if (glossaryPath === undefined) return undefined;
+
+  try {
+    return buildWhisperGlossaryPrompt(await readFile(glossaryPath, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 export interface DownloadFileOptions {
@@ -317,13 +365,21 @@ export async function transcribeAudio(
   const wavPath = await convertToWav(filePath, signal);
   try {
     try {
-      const { stdout } = await execFileAsync(WHISPER_BIN, [
+      const whisperArgs = [
         "-m", WHISPER_MODEL,
         "-f", wavPath,
         "--no-timestamps",
         "--no-prints",
         "--language", process.env.WHISPER_LANGUAGE ?? "auto",
-      ], { timeout: 120_000, signal });
+      ];
+      const glossaryPrompt = await loadWhisperGlossaryPrompt();
+      if (glossaryPrompt !== undefined) {
+        whisperArgs.push("--prompt", glossaryPrompt);
+      }
+      const { stdout } = await execFileAsync(WHISPER_BIN, whisperArgs, {
+        timeout: 120_000,
+        signal,
+      });
       return stripKnownTrailingAsrArtifacts(stdout.trim());
     } catch (error) {
       throw toMediaPipelineError(error, "transcription");
