@@ -399,6 +399,63 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(readFileSync(join(fixture.workspace, "README.md"), "utf8"), "# Uncommitted hidden bytes\n");
   });
 
+  it("rejects active sparse checkout before behind or divergent main can advance", () => {
+    for (const classification of ["behind", "diverged"] as const) {
+      const fixture = createSyncFixture();
+      const peer = cloneRemote(fixture, `peer-${classification}-sparse-checkout`);
+      if (classification === "diverged") {
+        commitFiles(fixture.workspace, "local sparse-checkout divergence", {
+          "diary/local-sparse-checkout.md": "# Local history\n",
+        });
+      }
+      const localTip = localHead(fixture);
+      const relPath = `wiki/pages/reference/${classification}-sparse-checkout.md`;
+      const remotePage = page(
+        `${classification} sparse checkout`,
+        "A fetched page that canonical sparse patterns would omit.",
+        "reference",
+        "Fetched committed Knowledge.\n",
+      );
+      const remoteTip = commitFiles(peer, `add ${classification} sparse-checkout page`, {
+        [relPath]: remotePage,
+        "wiki/index.md": generateKnowledgeIndex([
+          {
+            absPath: join(peer, ...relPath.split("/")),
+            relPath,
+            linkPath: `pages/reference/${classification}-sparse-checkout.md`,
+            frontmatter: {
+              name: `${classification} sparse checkout`,
+              description: "A fetched page that canonical sparse patterns would omit.",
+              type: "reference",
+            },
+          },
+        ]),
+      });
+      git(peer, ["push", "origin", "main"]);
+      git(fixture.workspace, ["config", "extensions.worktreeConfig", "true"]);
+      git(fixture.workspace, ["config", "--worktree", "core.sparseCheckout", "true"]);
+      git(fixture.workspace, ["config", "--worktree", "core.sparseCheckoutCone", "false"]);
+      writeFileSync(
+        join(fixture.workspace, ".git", "info", "sparse-checkout"),
+        "/*\n!/wiki/pages/\n",
+        "utf8",
+      );
+      git(fixture.workspace, ["read-tree", "-mu", "HEAD"]);
+      assert.equal(
+        git(fixture.workspace, ["ls-files", "-v"]).split("\n").every((entry) => entry.startsWith("H ")),
+        true,
+      );
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, classification);
+      assert.equal(response.reason, "candidate-sparse-checkout-active", classification);
+      assert.equal(localHead(fixture), localTip, classification);
+      assert.equal(remoteHead(fixture), remoteTip, classification);
+      assert.equal(existsSync(join(fixture.workspace, ...relPath.split("/"))), false, classification);
+    }
+  });
+
   it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-behind");
@@ -457,6 +514,49 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(existsSync(sideEffectPath), false);
     assert.equal(localHead(fixture), localTip);
     assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("rejects an ambiguous smudge-only filter before canonical main can advance", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind-ambiguous-smudge-filter");
+    const localTip = localHead(fixture);
+    const relPath = "wiki/pages/reference/behind-ambiguous-smudge-filter.md";
+    const remotePage = page(
+      "Behind ambiguous smudge filter",
+      "A fetched page covered by a sentinel-valued filter attribute.",
+      "reference",
+      "Fetched committed Knowledge.\n",
+    );
+    const remoteTip = commitFiles(peer, "add fetched ambiguous smudge-filter page", {
+      ".gitattributes": "wiki/** filter=unset\n",
+      [relPath]: remotePage,
+      "wiki/index.md": generateKnowledgeIndex([
+        {
+          absPath: join(peer, ...relPath.split("/")),
+          relPath,
+          linkPath: "pages/reference/behind-ambiguous-smudge-filter.md",
+          frontmatter: {
+            name: "Behind ambiguous smudge filter",
+            description: "A fetched page covered by a sentinel-valued filter attribute.",
+            type: "reference",
+          },
+        },
+      ]),
+    });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, [
+      "config",
+      "filter.unset.smudge",
+      "sed 's/Knowledge Index/Filtered Index/'",
+    ]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
   it("resolves relative canonical attributes before validating a behind candidate", () => {

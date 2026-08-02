@@ -726,7 +726,11 @@ function validateManagedCheckinAttributes(
       }
       if (NEUTRAL_CHECKIN_ATTRIBUTE_VALUES.has(value)) {
         if (expectedAttribute === "filter") {
-          for (const key of [`filter.${value}.clean`, `filter.${value}.process`]) {
+          for (const key of [
+            `filter.${value}.clean`,
+            `filter.${value}.smudge`,
+            `filter.${value}.process`,
+          ]) {
             const configured = git([...configArgs, "config", "--get", key], {
               cwd: candidateRoot,
             });
@@ -858,6 +862,27 @@ function validateManagedWorktreeMaterialization(
   workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
+  const sparseCheckout = git(["config", "--type=bool", "--get", "core.sparseCheckout"], {
+    cwd: workspaceRoot,
+  });
+  if (sparseCheckout.status === 0 && sparseCheckout.stdout.trim() === "true") {
+    return failure(
+      "rejected",
+      "candidate-sparse-checkout-active",
+      "knowledge sync requires sparse checkout to be disabled so every tracked file remains materialized; disable sparse checkout before retrying.",
+    );
+  }
+  if (
+    (sparseCheckout.status !== 0 || sparseCheckout.stdout.trim() !== "false") &&
+    !(sparseCheckout.status === 1 && !sparseCheckout.stdout.trim() && !sparseCheckout.stderr.trim())
+  ) {
+    return failure(
+      "error",
+      "candidate-managed-config-inspection-failed",
+      `knowledge sync could not inspect the effective core.sparseCheckout setting: ${errorText(sparseCheckout)}`,
+    );
+  }
+
   const indexFlags = git(
     ["ls-files", "-v", "-z"],
     { cwd: workspaceRoot },
