@@ -670,6 +670,48 @@ describe("SessionManager exact Pi binding startup", () => {
     await manager.closeAll();
   });
 
+  it("reaps the registered child if final binding confirmation cannot be persisted", async () => {
+    let capturedChild: ChildProcess | null = null;
+    onGetState = (child) => {
+      capturedChild = child;
+    };
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const managerStore = (manager as unknown as { store: InstanceType<typeof SessionStore> }).store;
+    const compareAndSetSession = managerStore.compareAndSetSession.bind(managerStore);
+    let compareAndSetCalls = 0;
+    const compareAndSetMock = mock.method(
+      managerStore,
+      "compareAndSetSession",
+      (...args: Parameters<typeof managerStore.compareAndSetSession>) => {
+        compareAndSetCalls++;
+        if (compareAndSetCalls === 2) {
+          throw Object.assign(new Error("session store full"), { code: "ENOSPC" });
+        }
+        return compareAndSetSession(...args);
+      },
+    );
+    const activeBefore = (await sessionsActive.get()).values[0]?.value ?? 0;
+
+    try {
+      await assert.rejects(
+        () => manager.getOrCreateSession("pi-confirm-write-fail", "pi"),
+        /session store full/,
+      );
+    } finally {
+      compareAndSetMock.mock.restore();
+    }
+
+    assert.strictEqual(compareAndSetCalls, 2, "the final activation write is the injected failure");
+    assert.ok(capturedChild, "the child reached identity confirmation before the store failure");
+    assert.strictEqual((capturedChild as ChildProcess).killed, true, "the unconfirmed child is terminated");
+    assert.strictEqual(hasExited(capturedChild as ChildProcess), true, "the unconfirmed child is reaped");
+    assert.strictEqual(manager.getActive("pi-confirm-write-fail"), undefined);
+    assert.strictEqual(manager.getActiveCount(), 0);
+    assert.strictEqual((await sessionsActive.get()).values[0]?.value ?? 0, activeBefore);
+
+    await manager.closeAll();
+  });
+
   it("passes top-level piExtraExtensions to interactive Pi spawns", async () => {
     const extraExtensions = ["/approved/interactive-a.ts", "/approved/interactive-b.ts"];
     const manager = new SessionManager(() => makeConfig({ piExtraExtensions: extraExtensions }), TEST_STORE_PATH);

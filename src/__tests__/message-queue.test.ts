@@ -269,6 +269,142 @@ describe("MessageQueue recovery notices", () => {
     ]);
     queue.clearAll();
   });
+
+  it("does not submit a triggering prompt cleared while its recovery notice is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const processCalls: string[] = [];
+    let releaseNotice!: () => void;
+    let signalNoticeStarted!: () => void;
+    const noticeBlocked = new Promise<void>((resolve) => { releaseNotice = resolve; });
+    const noticeStarted = new Promise<void>((resolve) => { signalNoticeStarted = resolve; });
+    let cleanup = 0;
+    let dropCleanup = 0;
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, text) => {
+        processCalls.push(text);
+      },
+      {
+        debounceMs: 10,
+        recoveryNoticeFn: async () => {
+          signalNoticeStarted();
+          await noticeBlocked;
+        },
+      },
+    );
+
+    queue.enqueue(
+      "chat1",
+      "main",
+      "pre-clean message",
+      mockPlatform(undefined, false),
+      () => { cleanup++; },
+      () => { dropCleanup++; },
+    );
+    t.mock.timers.tick(10);
+    await noticeStarted;
+
+    queue.clear("chat1");
+    releaseNotice();
+    await flushMicrotasks();
+
+    assert.deepStrictEqual(processCalls, [], "a cleared pre-notice batch must not reach the agent");
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 1);
+  });
+
+  it("does not submit a collected follow-up cleared while session preparation is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const processCalls: string[] = [];
+    let releaseInitial!: () => void;
+    let releaseCollectedPrepare!: () => void;
+    let signalCollectedPrepareStarted!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    const collectedPrepareBlocked = new Promise<void>((resolve) => { releaseCollectedPrepare = resolve; });
+    const collectedPrepareStarted = new Promise<void>((resolve) => { signalCollectedPrepareStarted = resolve; });
+    let prepareCount = 0;
+    let cleanup = 0;
+    let dropCleanup = 0;
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, text) => {
+        processCalls.push(text);
+        if (processCalls.length === 1) await initialBlocked;
+      },
+      {
+        debounceMs: 10,
+        prepareSessionFn: async () => {
+          prepareCount++;
+          if (prepareCount === 2) {
+            signalCollectedPrepareStarted();
+            await collectedPrepareBlocked;
+          }
+        },
+      },
+    );
+    const platform = mockPlatform(undefined, false);
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    queue.enqueue(
+      "chat1",
+      "main",
+      "pre-clean follow-up",
+      platform,
+      () => { cleanup++; },
+      () => { dropCleanup++; },
+    );
+    releaseInitial();
+    await collectedPrepareStarted;
+
+    queue.clear("chat1");
+    releaseCollectedPrepare();
+    await flushMicrotasks();
+
+    assert.deepStrictEqual(processCalls, ["initial"], "a cleared collect batch must not reach the agent");
+    assert.strictEqual(cleanup, 1);
+    assert.strictEqual(dropCleanup, 1);
+  });
+
+  it("keeps the platform snapshot stable while preparation is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    let releaseFirstPrepare!: () => void;
+    let signalFirstPrepareStarted!: () => void;
+    const firstPrepareBlocked = new Promise<void>((resolve) => { releaseFirstPrepare = resolve; });
+    const firstPrepareStarted = new Promise<void>((resolve) => { signalFirstPrepareStarted = resolve; });
+    let prepareCount = 0;
+    const processPlatforms: PlatformContext[] = [];
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, _text, platform) => {
+        processPlatforms.push(platform);
+      },
+      {
+        debounceMs: 10,
+        prepareSessionFn: async () => {
+          prepareCount++;
+          if (prepareCount === 1) {
+            signalFirstPrepareStarted();
+            await firstPrepareBlocked;
+          }
+        },
+      },
+    );
+    const firstPlatform = mockPlatform();
+    const collectedPlatform = mockPlatform();
+
+    queue.enqueue("chat1", "main", "initial", firstPlatform);
+    t.mock.timers.tick(10);
+    await firstPrepareStarted;
+    assert.ok(firstPlatform.preStreamTypingTimer, "the initial platform owns the typing timer");
+
+    queue.enqueue("chat1", "main", "follow-up", collectedPlatform);
+    releaseFirstPrepare();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    assert.deepStrictEqual(processPlatforms, [firstPlatform, collectedPlatform]);
+    assert.strictEqual(firstPlatform.preStreamTypingTimer, undefined, "the initial typing timer is cleared");
+    assert.strictEqual(collectedPlatform.preStreamTypingTimer, undefined, "the collect typing timer is cleared");
+  });
 });
 
 // -------------------------------------------------------------------

@@ -927,7 +927,16 @@ export class SessionManager {
     // Republish only the exact pre-spawn snapshot after identity equality. The
     // compare-and-set prevents a concurrent /clean from being resurrected.
     const confirmedState = this.toSessionState(chatId, session) as BoundSessionState;
-    if (!this.store.compareAndSetSession(chatId, prepared.state, confirmedState)) {
+    let activationConfirmed: boolean;
+    try {
+      activationConfirmed = this.store.compareAndSetSession(chatId, prepared.state, confirmedState);
+    } catch (err) {
+      this.active.delete(chatId);
+      sessionsActive.dec();
+      await this.terminateStartupChild(child);
+      throw err;
+    }
+    if (!activationConfirmed) {
       this.active.delete(chatId);
       sessionsActive.dec();
       await this.terminateStartupChild(child);
