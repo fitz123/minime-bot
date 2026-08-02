@@ -13,6 +13,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
@@ -65,6 +67,8 @@ export interface KnowledgeUpdateDeps {
   now?: () => Date;
   lockNow?: () => Date;
   staleLockMs?: number;
+  isProcessAlive?: (pid: number) => boolean;
+  getProcessIdentity?: (pid: number) => string | undefined;
   refreshSearchBackend?: (layout: ResolvedKnowledgeV2Layout) => void;
   archivePrecondition?: KnowledgeArchivePrecondition;
 }
@@ -139,13 +143,14 @@ interface AtomicWritePlan extends AtomicWrite {
   committed: boolean;
 }
 
-interface LockHandle {
+export interface KnowledgeUpdateLockHandle {
   path: string;
   relPath: ".tmp/knowledge-update.lock";
   release: () => void;
 }
 
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
+const LOCK_RECLAIM_SUFFIX = ".reclaim";
 const KNOWN_PAGE_TYPES = new Set<string>(KNOWLEDGE_PAGE_TYPES);
 const REQUIRED_FRONTMATTER = ["name", "description", "type"] as const;
 const OPTIONAL_FRONTMATTER = ["confidence", "revisit_if", "originSessionId"] as const;
@@ -413,7 +418,9 @@ interface NormalizedMoveRequest {
 
 type NormalizedKnowledgeUpdateRequest = NormalizedWriteRequest | NormalizedMoveRequest;
 
-function normalizeManagedPagePath(raw: unknown): { relPath: string; type: KnowledgePageType } | KnowledgeUpdateFailure {
+export function parseManagedKnowledgePagePath(
+  raw: unknown,
+): { relPath: string; type: KnowledgePageType } | KnowledgeUpdateFailure {
   const relPath = normalizePagePath(raw);
   if (typeof relPath !== "string") {
     return relPath;
@@ -451,7 +458,7 @@ function normalizeKnowledgeUpdateRequest(
         `knowledge_update ${operation} accepts only the original managed page path; ${unexpectedField} is not allowed.`,
       );
     }
-    const managedPath = normalizeManagedPagePath(args.path);
+    const managedPath = parseManagedKnowledgePagePath(args.path);
     if (isUpdateFailure(managedPath)) {
       return managedPath;
     }
@@ -495,7 +502,11 @@ function isInsidePath(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function assertSafeWorkspaceWritePath(root: string, target: string, fs: KnowledgeUpdateFs): KnowledgeUpdateFailure | undefined {
+export function assertSafeKnowledgeWorkspacePath(
+  root: string,
+  target: string,
+  fs: KnowledgeUpdateFs = defaultFs,
+): KnowledgeUpdateFailure | undefined {
   const rootResolved = normalize(resolve(root));
   const targetResolved = normalize(resolve(target));
   if (!isInsidePath(rootResolved, targetResolved)) {
@@ -568,7 +579,7 @@ function assertTargetPath(
     return failure("rejected", "path-type-mismatch", `Page writes are constrained to wiki/pages/${type}/**/*.md.`);
   }
 
-  const symlinkProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, absPath, fs);
+  const symlinkProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, absPath, fs);
   if (symlinkProblem) {
     return symlinkProblem;
   }
@@ -590,7 +601,7 @@ function assertArchivePath(
       "knowledge_update archive path must stay inside artifacts/knowledge-archive.",
     );
   }
-  const symlinkProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, absPath, fs);
+  const symlinkProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, absPath, fs);
   if (symlinkProblem) {
     return symlinkProblem;
   }
@@ -674,6 +685,10 @@ export function formatKnowledgePage(frontmatter: KnowledgePageFrontmatter, body:
   return `---\n${formatFrontmatter(frontmatter)}\n---\n\n${normalizedBody}`;
 }
 
+export function compareKnowledgePaths(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 function safeRealpath(path: string, fs: KnowledgeUpdateFs): string | undefined {
   try {
     return fs.realpathSync(path);
@@ -698,7 +713,7 @@ function walkPageFiles(
     return failure("rejected", "path-unreadable", "knowledge_update could not enumerate active Knowledge pages.");
   }
 
-  for (const dirent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const dirent of dirents.sort((a, b) => compareKnowledgePaths(a.name, b.name))) {
     const absPath = join(dir, dirent.name);
     if (dirent.isSymbolicLink()) {
       return failure("rejected", "symlink-escape", "knowledge_update refuses to index symlinked wiki pages.");
@@ -730,7 +745,16 @@ function parseExistingPage(
   relPath: string,
   fs: KnowledgeUpdateFs,
 ): ParsedPage | KnowledgeUpdateFailure {
-  const frontmatterResult = parseMarkdownFrontmatter(fs.readFileSync(absPath, "utf8"));
+  const pageBytes = fs.readFileSync(absPath);
+  const pageText = pageBytes.toString("utf8");
+  if (pageBytes.includes(0) || !Buffer.from(pageText, "utf8").equals(pageBytes)) {
+    return failure(
+      "rejected",
+      "invalid-page-encoding",
+      "Knowledge v2 active pages must be valid UTF-8 Markdown without NUL bytes.",
+    );
+  }
+  const frontmatterResult = parseMarkdownFrontmatter(pageText);
   if (isUpdateFailure(frontmatterResult)) {
     return frontmatterResult;
   }
@@ -758,13 +782,16 @@ function parseExistingPage(
   };
 }
 
-function collectPages(layout: ResolvedKnowledgeV2Layout, fs: KnowledgeUpdateFs): ParsedPage[] | KnowledgeUpdateFailure {
+export function collectKnowledgePages(
+  layout: ResolvedKnowledgeV2Layout,
+  fs: KnowledgeUpdateFs = defaultFs,
+): ParsedPage[] | KnowledgeUpdateFailure {
   const pages: ParsedPage[] = [];
   const problem = walkPageFiles(layout, layout.paths.pagesDir, pages, fs);
   if (problem) {
     return problem;
   }
-  return pages.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return pages.sort((a, b) => compareKnowledgePaths(a.relPath, b.relPath));
 }
 
 function pageTypeForRelPath(relPath: string): KnowledgePageType | undefined {
@@ -818,7 +845,7 @@ export function generateKnowledgeIndex(pages: readonly ParsedPage[]): string {
 
 export function knowledgeIndexMatchesActiveCorpus(layout: ResolvedKnowledgeV2Layout): boolean {
   try {
-    const pages = collectPages(layout, defaultFs);
+    const pages = collectKnowledgePages(layout, defaultFs);
     return (
       !isUpdateFailure(pages) &&
       defaultFs.readFileSync(layout.paths.indexPath, "utf8") === generateKnowledgeIndex(pages)
@@ -835,7 +862,7 @@ function verifyIndexInvariants(
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   const index = fs.readFileSync(layout.paths.indexPath, "utf8");
-  const pages = collectPages(layout, fs);
+  const pages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(pages)) {
     return pages;
   }
@@ -857,47 +884,91 @@ function verifyIndexInvariants(
   return undefined;
 }
 
-function acquireKnowledgeUpdateLock(
+export function acquireKnowledgeUpdateLock(
   layout: ResolvedKnowledgeV2Layout,
   fs: KnowledgeUpdateFs,
   deps: KnowledgeUpdateDeps,
-): LockHandle | KnowledgeUpdateFailure {
+): KnowledgeUpdateLockHandle | KnowledgeUpdateFailure {
   const lockRelPath = ".tmp/knowledge-update.lock" as const;
   const lockPath = join(layout.agentWorkspaceRoot, ".tmp", "knowledge-update.lock");
   const now = deps.lockNow?.() ?? new Date();
   const staleLockMs = deps.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
-  const lockSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, lockPath, fs);
+  const isProcessAlive = deps.isProcessAlive ?? defaultProcessAlive;
+  const getProcessIdentity = deps.getProcessIdentity ?? defaultProcessIdentity;
+  const token = randomUUID();
+  const reclaimPath = `${lockPath}${LOCK_RECLAIM_SUFFIX}`;
+  let ownedReclaim: LockFileIdentity | undefined;
+  const lockSafetyProblem =
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, reclaimPath, fs);
   if (lockSafetyProblem) {
     return lockSafetyProblem;
   }
   fs.mkdirSync(dirname(lockPath), { recursive: true });
-  const createdParentSafetyProblem = assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, lockPath, fs);
+  const createdParentSafetyProblem = assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, lockPath, fs);
   if (createdParentSafetyProblem) {
     return createdParentSafetyProblem;
   }
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!ownedReclaim && fs.existsSync(reclaimPath)) {
+      const reclaim = lockFileIdentity(reclaimPath, fs);
+      if (!reclaim || now.getTime() - reclaim.ctimeMs <= staleLockMs) {
+        return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+      }
+      try {
+        fs.unlinkSync(reclaimPath);
+      } catch {
+        if (fs.existsSync(reclaimPath)) {
+          return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+        }
+      }
+    }
+
     let fd: number | undefined;
     let createdLock = false;
     try {
       fd = fs.openSync(lockPath, "wx", 0o600);
       createdLock = true;
-      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, acquiredAt: now.toISOString(), path: lockRelPath }, null, 2)}\n`, {
-        encoding: "utf8",
-      });
+      const processIdentity = getProcessIdentity(process.pid);
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({
+          pid: process.pid,
+          acquiredAt: now.toISOString(),
+          path: lockRelPath,
+          token,
+          ...(processIdentity ? { processIdentity } : {}),
+        }, null, 2)}\n`,
+        { encoding: "utf8" },
+      );
       if (fd !== undefined) {
         fs.closeSync(fd);
         fd = undefined;
+      }
+      if (!ownedReclaim && fs.existsSync(reclaimPath)) {
+        removeLockOwnedByToken(lockPath, token, fs);
+        return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+      }
+      if (ownedReclaim) {
+        const currentReclaim = lockFileIdentity(reclaimPath, fs);
+        if (!currentReclaim || !sameLockFile(currentReclaim, ownedReclaim)) {
+          removeLockOwnedByToken(lockPath, token, fs);
+          return failure("locked", "knowledge-update-locked", "knowledge_update lost ownership of stale-lock reclamation.");
+        }
+        try {
+          fs.unlinkSync(reclaimPath);
+        } catch {
+          removeLockOwnedByToken(lockPath, token, fs);
+          return failure("locked", "knowledge-update-locked", "knowledge_update could not finish stale-lock reclamation.");
+        }
+        ownedReclaim = undefined;
       }
       return {
         path: lockPath,
         relPath: lockRelPath,
         release: () => {
-          try {
-            fs.unlinkSync(lockPath);
-          } catch {
-            // Lock release is best effort; the next caller has stale-lock recovery.
-          }
+          removeLockOwnedByToken(lockPath, token, fs);
         },
       };
     } catch (error) {
@@ -914,43 +985,273 @@ function acquireKnowledgeUpdateLock(
         } catch {
           // Best effort cleanup of a lock file this process created but did not initialize.
         }
+        releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
         return failure("error", "knowledge-update-lock-write-failed", "knowledge_update could not initialize its lock file.");
       }
       if (!fs.existsSync(lockPath)) {
         continue;
       }
-      const stale = isStaleLock(lockPath, now, staleLockMs, fs);
-      if (stale && attempt === 0) {
-        try {
-          fs.unlinkSync(lockPath);
-          continue;
-        } catch {
-          return failure("locked", "knowledge-update-locked", "knowledge_update could not remove a stale lock file.");
+      const stale = staleLockSnapshot(lockPath, now, staleLockMs, fs, isProcessAlive, getProcessIdentity);
+      if (stale && attempt < 2) {
+        const claimed = claimStaleLock(
+          lockPath,
+          reclaimPath,
+          stale,
+          now,
+          staleLockMs,
+          fs,
+          isProcessAlive,
+          getProcessIdentity,
+        );
+        if (isUpdateFailure(claimed)) {
+          return claimed;
         }
+        if (!claimed) {
+          continue;
+        }
+        ownedReclaim = claimed;
+        continue;
       }
+      releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
       return failure("locked", "knowledge-update-locked", "knowledge_update is already running for this agent workspace.");
     }
   }
 
+  releaseStaleLockClaim(reclaimPath, ownedReclaim, fs);
   return failure("locked", "knowledge-update-locked", "knowledge_update could not acquire its workspace lock.");
 }
 
-function isStaleLock(lockPath: string, now: Date, staleLockMs: number, fs: KnowledgeUpdateFs): boolean {
+interface LockFileIdentity {
+  dev: number;
+  ino: number;
+  ctimeMs: number;
+}
+
+interface StaleLockSnapshot {
+  identity: LockFileIdentity;
+  content?: string;
+}
+
+function lockFileIdentity(path: string, fs: KnowledgeUpdateFs): LockFileIdentity | undefined {
+  try {
+    const stat = fs.lstatSync(path);
+    return { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameLockFile(left: LockFileIdentity, right: LockFileIdentity, includeChangeTime = false): boolean {
+  return left.dev === right.dev && left.ino === right.ino && (!includeChangeTime || left.ctimeMs === right.ctimeMs);
+}
+
+function removeLockOwnedByToken(lockPath: string, token: string, fs: KnowledgeUpdateFs): void {
+  try {
+    const current = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { token?: unknown };
+    if (current.token === token) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch {
+    // Lock release is best effort; the next caller has stale-lock recovery.
+  }
+}
+
+function releaseStaleLockClaim(
+  reclaimPath: string,
+  ownedReclaim: LockFileIdentity | undefined,
+  fs: KnowledgeUpdateFs,
+): void {
+  if (!ownedReclaim) {
+    return;
+  }
+  const current = lockFileIdentity(reclaimPath, fs);
+  if (!current || !sameLockFile(current, ownedReclaim)) {
+    return;
+  }
+  try {
+    fs.unlinkSync(reclaimPath);
+  } catch {
+    // The claim expires independently if this best-effort cleanup fails.
+  }
+}
+
+function claimStaleLock(
+  lockPath: string,
+  reclaimPath: string,
+  expected: StaleLockSnapshot,
+  now: Date,
+  staleLockMs: number,
+  fs: KnowledgeUpdateFs,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
+): LockFileIdentity | KnowledgeUpdateFailure | undefined {
+  try {
+    fs.linkSync(lockPath, reclaimPath);
+  } catch {
+    if (!fs.existsSync(lockPath)) {
+      return undefined;
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update is already reclaiming its workspace lock.");
+  }
+
+  const claimed = lockFileIdentity(reclaimPath, fs);
+  const current = lockFileIdentity(lockPath, fs);
+  let claimedContentMatches = true;
+  if (expected.content !== undefined) {
+    try {
+      claimedContentMatches = fs.readFileSync(reclaimPath, "utf8") === expected.content;
+    } catch {
+      claimedContentMatches = false;
+    }
+  }
+  if (
+    !claimed ||
+    !current ||
+    !sameLockFile(claimed, current, true) ||
+    !sameLockFile(claimed, expected.identity) ||
+    !claimedContentMatches
+  ) {
+    try {
+      fs.unlinkSync(reclaimPath);
+    } catch {
+      // A successor reclaimer owns the shared claim now.
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update could not atomically claim the stale lock.");
+  }
+
+  const revalidated = staleLockSnapshot(
+    reclaimPath,
+    now,
+    staleLockMs,
+    fs,
+    isProcessAlive,
+    getProcessIdentity,
+  );
+  const currentBeforeUnlink = lockFileIdentity(lockPath, fs);
+  if (
+    !revalidated ||
+    !sameLockFile(revalidated.identity, claimed) ||
+    !currentBeforeUnlink ||
+    !sameLockFile(currentBeforeUnlink, claimed, true)
+  ) {
+    releaseStaleLockClaim(reclaimPath, claimed, fs);
+    return failure("locked", "knowledge-update-locked", "knowledge_update lost its stale lock before reclamation.");
+  }
+
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    try {
+      fs.unlinkSync(reclaimPath);
+    } catch {
+      // Best effort cleanup after a lost reclaim race.
+    }
+    return failure("locked", "knowledge-update-locked", "knowledge_update could not remove the claimed stale lock.");
+  }
+  return lockFileIdentity(reclaimPath, fs) ?? claimed;
+}
+
+function defaultProcessAlive(pid: number): boolean {
+  const result = spawnSync("/bin/kill", ["-0", String(pid)], {
+    stdio: "ignore",
+    timeout: 1_000,
+  });
+  return result.error !== undefined || result.status === 0;
+}
+
+function defaultProcessIdentity(pid: number): string | undefined {
+  const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 1_000,
+  });
+  if (result.error || result.status !== 0) {
+    return undefined;
+  }
+  return result.stdout.trim() || undefined;
+}
+
+function staleLockSnapshot(
+  lockPath: string,
+  now: Date,
+  staleLockMs: number,
+  fs: KnowledgeUpdateFs,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
+): StaleLockSnapshot | undefined {
+  const before = lockFileIdentity(lockPath, fs);
+  if (!before) {
+    return undefined;
+  }
+  let ownerPid: number | undefined;
+  let ownerProcessIdentity: string | undefined;
+  let content: string | undefined;
+  let stale: boolean | undefined;
   try {
     const raw = fs.readFileSync(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as { acquiredAt?: unknown };
+    content = raw;
+    const parsed = JSON.parse(raw) as { acquiredAt?: unknown; pid?: unknown; processIdentity?: unknown };
+    if (typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
+      ownerPid = parsed.pid;
+    }
+    if (typeof parsed.processIdentity === "string" && parsed.processIdentity) {
+      ownerProcessIdentity = parsed.processIdentity;
+    }
     if (typeof parsed.acquiredAt === "string") {
       const acquiredAt = Date.parse(parsed.acquiredAt);
-      return Number.isFinite(acquiredAt) && now.getTime() - acquiredAt > staleLockMs;
+      if (Number.isFinite(acquiredAt)) {
+        const expired = now.getTime() - acquiredAt > staleLockMs;
+        stale = expired && !lockOwnerIsAlive(ownerPid, ownerProcessIdentity, isProcessAlive, getProcessIdentity);
+      }
     }
   } catch {
     // Fall back to mtime below.
   }
 
-  try {
-    return now.getTime() - fs.statSync(lockPath).mtimeMs > staleLockMs;
-  } catch {
+  if (stale === undefined) {
+    try {
+      const expired = now.getTime() - fs.statSync(lockPath).mtimeMs > staleLockMs;
+      stale = expired && !lockOwnerIsAlive(ownerPid, ownerProcessIdentity, isProcessAlive, getProcessIdentity);
+    } catch {
+      return undefined;
+    }
+  }
+  const after = lockFileIdentity(lockPath, fs);
+  if (!stale || !after || !sameLockFile(before, after, true)) {
+    return undefined;
+  }
+  if (content !== undefined) {
+    try {
+      if (fs.readFileSync(lockPath, "utf8") !== content) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return { identity: after, ...(content === undefined ? {} : { content }) };
+}
+
+function lockOwnerIsAlive(
+  ownerPid: number | undefined,
+  ownerProcessIdentity: string | undefined,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessIdentity: (pid: number) => string | undefined,
+): boolean {
+  if (ownerPid === undefined) {
     return false;
+  }
+  try {
+    if (!isProcessAlive(ownerPid)) {
+      return false;
+    }
+    if (!ownerProcessIdentity) {
+      return true;
+    }
+    const currentProcessIdentity = getProcessIdentity(ownerPid);
+    return currentProcessIdentity === undefined || currentProcessIdentity === ownerProcessIdentity;
+  } catch {
+    return true;
   }
 }
 
@@ -1212,13 +1513,13 @@ function validateIndexAndLogPaths(
   fs: KnowledgeUpdateFs,
 ): KnowledgeUpdateFailure | undefined {
   return (
-    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, layout.paths.indexPath, fs) ??
     assertRegularFileIfExists(
       layout.paths.indexPath,
       fs,
       "knowledge_update index path must be a regular Markdown file.",
     ) ??
-    assertSafeWorkspaceWritePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
+    assertSafeKnowledgeWorkspacePath(layout.agentWorkspaceRoot, layout.paths.logPath, fs) ??
     assertRegularFileIfExists(layout.paths.logPath, fs, "knowledge_update log path must be a regular Markdown file.")
   );
 }
@@ -1253,7 +1554,7 @@ function executeWriteRequest(
     }
   }
 
-  const beforePages = collectPages(layout, fs);
+  const beforePages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(beforePages)) {
     return beforePages;
   }
@@ -1265,7 +1566,7 @@ function executeWriteRequest(
   };
   const pagesByPath = new Map(beforePages.map((page) => [page.relPath, page]));
   pagesByPath.set(request.relPath, pageForIndex);
-  const nextPages = [...pagesByPath.values()].sort((a, b) => a.relPath.localeCompare(b.relPath));
+  const nextPages = [...pagesByPath.values()].sort((a, b) => compareKnowledgePaths(a.relPath, b.relPath));
   const pathProblem = validateIndexAndLogPaths(layout, fs);
   if (pathProblem) {
     return pathProblem;
@@ -1401,7 +1702,7 @@ function executeMoveRequest(
     }
   }
 
-  const beforePages = collectPages(layout, fs);
+  const beforePages = collectKnowledgePages(layout, fs);
   if (isUpdateFailure(beforePages)) {
     return beforePages;
   }
@@ -1438,7 +1739,7 @@ function executeMoveRequest(
       return moveProblem;
     }
     moveCommitted = true;
-    const nextPages = collectPages(layout, fs);
+    const nextPages = collectKnowledgePages(layout, fs);
     if (isUpdateFailure(nextPages)) {
       rollbackMove(sourcePath, destinationPath, expectedBytes, fs);
       return nextPages;
@@ -1511,7 +1812,7 @@ function executeMoveRequest(
 
 export function executeKnowledgeUpdate(args: KnowledgeUpdateArgs = {}, deps: KnowledgeUpdateDeps = {}): KnowledgeUpdateResponse {
   const fs = fsForDeps(deps);
-  let lock: LockHandle | undefined;
+  let lock: KnowledgeUpdateLockHandle | undefined;
 
   try {
     const request = normalizeKnowledgeUpdateRequest(args);

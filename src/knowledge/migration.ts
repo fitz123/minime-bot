@@ -23,6 +23,7 @@ import {
   type ResolvedKnowledgeLayout,
 } from "./layout.js";
 import {
+  compareKnowledgePaths,
   formatKnowledgePage,
   generateKnowledgeIndex,
   validateKnowledgePageFrontmatter,
@@ -1116,7 +1117,7 @@ function memorySectionClassificationSource(name: string, sectionIndex: number): 
 function walkFiles(root: string): string[] {
   const files: string[] = [];
   function walk(dir: string): void {
-    for (const dirent of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const dirent of readdirSync(dir, { withFileTypes: true }).sort((a, b) => compareKnowledgePaths(a.name, b.name))) {
       const absPath = join(dir, dirent.name);
       const relPath = toWorkspaceRel(root, absPath);
       if (dirent.isDirectory()) {
@@ -1546,7 +1547,7 @@ function collectPlannedPages(plan: MutablePlan): ParsedPage[] {
     });
   }
   return pages
-    .sort((a, b) => a.relPath.localeCompare(b.relPath));
+    .sort((a, b) => compareKnowledgePaths(a.relPath, b.relPath));
 }
 
 function hasExistingV2SchemaMarker(plan: MutablePlan): boolean {
@@ -1734,8 +1735,10 @@ function planMigration(workspaceRoot: string, deps: KnowledgeMigrationDeps): Mut
     classifyUnhandledFile(plan, relPath);
   }
 
-  plan.operations.sort((a, b) => a.targetPath.localeCompare(b.targetPath));
-  plan.reviewItems.sort((a, b) => a.path.localeCompare(b.path) || a.reason.localeCompare(b.reason));
+  plan.operations.sort((a, b) => compareKnowledgePaths(a.targetPath, b.targetPath));
+  plan.reviewItems.sort(
+    (a, b) => compareKnowledgePaths(a.path, b.path) || compareKnowledgePaths(a.reason, b.reason),
+  );
   return plan;
 }
 

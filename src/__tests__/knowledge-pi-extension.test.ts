@@ -5,12 +5,13 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import {
   KNOWLEDGE_GET_TOOL,
@@ -82,7 +83,8 @@ describe("Knowledge Pi extension helpers", () => {
     assert.equal(KNOWLEDGE_UPDATE_TOOL.name, "knowledge_update");
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /archive, or restore/);
     assert.match(KNOWLEDGE_UPDATE_TOOL.description, /preserve page bytes/);
-    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /Direct manual writes/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /minime-bot knowledge sync/);
+    assert.match(KNOWLEDGE_UPDATE_TOOL.description, /raw Git worktree mutations remain blocked/);
     assert.equal(KNOWLEDGE_UPDATE_TOOL.parameters.type, "object");
     assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.required, ["op"]);
     assert.deepEqual(KNOWLEDGE_UPDATE_TOOL.parameters.properties.op.enum, [
@@ -366,6 +368,8 @@ describe("Knowledge Pi extension helpers", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n",
     });
+    const notes = join(workspace, "notes");
+    mkdirSync(notes, { recursive: true });
 
     for (const command of [
       "git clean -fdx",
@@ -375,11 +379,76 @@ describe("Knowledge Pi extension helpers", () => {
       "git read-tree -u --reset HEAD^",
       "git restore :/",
       "git rm -r :/",
+      "git merge origin/main",
+      "git pull --ff-only",
+      "git rebase origin/main",
+      "git cherry-pick HEAD^",
+      "git sparse-checkout init --cone",
+      "git sparse-checkout set src",
+      "git sparse-checkout add notes",
+      "git sparse-checkout reapply",
     ]) {
       assertBlocked(
         workspace,
         { toolName: "bash", input: { command } },
         workspace,
+      );
+    }
+
+    const mergeDecision = classifyKnowledgeIntegrityToolCall(
+      { toolName: "bash", input: { command: "git merge origin/main" } },
+      { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+    );
+    assert.equal(mergeDecision?.targetPath, workspace);
+    assert.match(mergeDecision?.reason ?? "", /raw Git worktree mutations are blocked/);
+    assert.match(mergeDecision?.reason ?? "", /knowledge_update/);
+    assert.match(mergeDecision?.reason ?? "", /minime-bot knowledge sync/);
+
+    for (const [command, cwd] of [
+      ["git merge origin/main", notes],
+      ["git -C notes merge origin/main", workspace],
+      ["cd notes && git merge origin/main", workspace],
+      ["git sparse-checkout set src", notes],
+      ["git -C notes sparse-checkout reapply", workspace],
+      ["cd notes && git sparse-checkout init --cone", workspace],
+    ] as const) {
+      const decision = classifyKnowledgeIntegrityToolCall(
+        { toolName: "bash", input: { command } },
+        { agentWorkspaceRoot: workspace, cwd, env: {} },
+      );
+      assert.equal(decision?.block, true, command);
+      assert.equal(decision.targetPath, workspace, command);
+    }
+
+    const managedSubdirectory = join(workspace, "wiki", "pages", "project");
+    for (const command of [
+      "git --work-tree=. reset --hard HEAD",
+      "git --work-tree=. clean -fd",
+      "git --work-tree=. merge topic",
+    ]) {
+      const decision = classifyKnowledgeIntegrityToolCall(
+        { toolName: "bash", input: { command } },
+        { agentWorkspaceRoot: workspace, cwd: managedSubdirectory, env: {} },
+      );
+      assert.equal(decision?.block, true, command);
+      assert.match(decision?.targetPath ?? "", /^wiki\/pages\/project(?:\/|$)/, command);
+      assert.match(decision?.reason ?? "", /raw Git worktree mutations are blocked/, command);
+    }
+
+    const nestedRepository = join(workspace, "nested-repository");
+    mkdirSync(join(nestedRepository, ".git"), { recursive: true });
+    for (const [command, cwd] of [
+      ["git merge origin/main", nestedRepository],
+      ["git -C nested-repository merge origin/main", workspace],
+      ["cd nested-repository && git merge origin/main", workspace],
+    ] as const) {
+      assert.equal(
+        classifyKnowledgeIntegrityToolCall(
+          { toolName: "bash", input: { command } },
+          { agentWorkspaceRoot: workspace, cwd, env: {} },
+        ),
+        undefined,
+        command,
       );
     }
 
@@ -425,6 +494,25 @@ describe("Knowledge Pi extension helpers", () => {
     }
   });
 
+  it("allows sparse-checkout inspection and the disable recovery path", () => {
+    const workspace = createV2Workspace();
+
+    for (const command of [
+      "git sparse-checkout list",
+      "git sparse-checkout check-rules",
+      "git sparse-checkout disable",
+    ]) {
+      assert.equal(
+        classifyKnowledgeIntegrityToolCall(
+          { toolName: "bash", input: { command } },
+          { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+        ),
+        undefined,
+        command,
+      );
+    }
+  });
+
   it("allows bash read-only commands against managed knowledge paths", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime.md": "# Runtime\n",
@@ -442,6 +530,7 @@ describe("Knowledge Pi extension helpers", () => {
       "node inspect.js .",
       "npm test -- .",
       "git add .",
+      "git add -- wiki/pages/project/runtime.md wiki/index.md wiki/log.md",
       "git restore --staged :/",
       "git rm --cached -r :/",
     ]) {
@@ -454,6 +543,23 @@ describe("Knowledge Pi extension helpers", () => {
         command,
       );
     }
+  });
+
+  it("maps raw Git worktree mutations through a symlinked workspace root", () => {
+    const workspace = createV2Workspace();
+    const notes = join(workspace, "notes");
+    const workspaceAlias = join(workspace, "workspace-alias");
+    mkdirSync(notes, { recursive: true });
+    symlinkSync(".", workspaceAlias);
+
+    const decision = classifyKnowledgeIntegrityToolCall(
+      { toolName: "bash", input: { command: "git merge origin/main" } },
+      { agentWorkspaceRoot: workspaceAlias, cwd: notes, env: {} },
+    );
+
+    assert.equal(decision?.block, true);
+    assert.equal(realpathSync(resolve(workspace, decision.targetPath ?? "")), realpathSync(workspace));
+    assert.match(decision.reason, /raw Git worktree mutations are blocked/);
   });
 
   it("blocks symlink aliases that resolve into managed pages", () => {
@@ -484,13 +590,19 @@ describe("Knowledge Pi extension helpers", () => {
     });
 
     for (const workspace of [legacy, karpathy]) {
-      assert.equal(
-        classifyKnowledgeIntegrityToolCall(
-          { toolName: "write", input: { path: "wiki/index.md", content: "allowed pre-migration" } },
-          { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
-        ),
-        undefined,
-      );
+      for (const event of [
+        { toolName: "write", input: { path: "wiki/index.md", content: "allowed pre-migration" } },
+        { toolName: "bash", input: { command: "git merge origin/main" } },
+      ]) {
+        assert.equal(
+          classifyKnowledgeIntegrityToolCall(
+            event,
+            { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+          ),
+          undefined,
+          `${workspace}: ${event.toolName}`,
+        );
+      }
     }
   });
 });

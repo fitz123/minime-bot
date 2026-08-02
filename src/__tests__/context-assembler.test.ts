@@ -39,6 +39,7 @@ const KNOWLEDGE_DIRECTIVE = [
   "- Use `diary` or `all` scope for chronology and history.",
   "- Use `knowledge_get` for exact source lines before important assertions.",
   "- Use `knowledge_update` for durable Knowledge v2 writes, not arbitrary file editing.",
+  "- After managed page changes are committed, use `minime-bot knowledge sync` to reconcile local `main` with `origin/main`; do not run raw Git merge, pull, rebase, or cherry-pick commands.",
   "- Put actionable work in Beads, not wiki pages.",
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");

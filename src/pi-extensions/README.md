@@ -20,7 +20,46 @@ Most helpers here back the live Pi extensions:
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
-Knowledge v2 wiki and archive paths consistent with `knowledge_update`.
+Knowledge v2 wiki and archive paths consistent with `knowledge_update` and to
+route committed branch reconciliation through `minime-bot knowledge sync`.
+
+## Knowledge mutation and synchronization boundary
+
+The extension assumes a trusted, cooperative agent in a single-user workspace.
+Its scoped checks help a fallible agent choose the package-owned path; they are
+not an access-control boundary against a process running with the same user and
+filesystem access.
+
+Use `knowledge_update` for managed page create/update/upsert and reversible
+archive/restore operations. After those changes are committed, use
+`minime-bot knowledge sync --workspace /path/to/agent-workspace` to reconcile a
+clean Knowledge v2 Git root on local `main` with `origin/main`. Sync does not
+accept dirty-input, force-push, reset, rebase, or winner-selection escape flags.
+For jointly changed paths it rejects `union` and custom merge drivers, including
+configured overrides of Git's built-in `text` and `binary` driver names. It also
+rejects check-in transformations on managed Knowledge files, including clean
+filters, `ident`, `working-tree-encoding`, and `text`/`eol` attributes, because
+they can alter staged variants. Effective `core.autocrlf` values other than
+`false` or unset are rejected for the same reason; remove those settings before
+retrying.
+
+The sync transaction preserves observed local and remote tips under
+`refs/minime/knowledge-sync/recovery/**`, builds divergent candidates in a
+detached temporary worktree, and advances canonical `main` only after corpus
+validation. It removes temporary worktrees only after local/remote `main` are
+verified equal, and removes recovery refs only after both observed tips are
+reachable from canonical `main`; convergence failures retain recovery state for
+retry. Conflicting managed pages retain both committed
+variants and commit provenance inside a schema-valid page marked unresolved with
+`revisit_if`; non-UTF-8 variants are explicitly marked and base64-encoded. The
+catalog is regenerated and structural-log histories are preserved. Non-Knowledge
+conflicts and unsupported schema, issues, or archive conflicts leave canonical
+state unchanged.
+
+Direct managed writes stay blocked. Raw worktree-mutating Git commands including
+`merge`, `pull`, `rebase`, `cherry-pick`, `checkout`, and `switch`, plus
+destructive `reset`, `restore`, and `clean` forms, also stay blocked in positively
+detected Knowledge v2 workspaces. Read-only Git commands remain available.
 
 The standalone `extensions/pi/codex-usage.ts` wrapper is different: it is used
 only by the out-of-band Codex quota sampler and must not be added to the normal
@@ -183,9 +222,10 @@ In v2 workspaces, the assembler auto-loads `wiki/schema.md` and `wiki/index.md`
 even when root `MEMORY.md` is absent. During legacy compatibility, MEMORY.md keeps
 reaching the bundle through the existing CLAUDE.md `@MEMORY.md` import convention.
 The fixed directive tells agents to use `knowledge_search`, `knowledge_get`, and
-`knowledge_update` when the first-party Knowledge tools are available. If tools are
-unavailable, agents should fall back to the visible index or direct reads and
-report that limitation.
+`knowledge_update` when the first-party Knowledge tools are available, and to
+use `minime-bot knowledge sync` for committed local/remote reconciliation rather
+than raw worktree-mutating Git commands. If tools are unavailable, agents should
+fall back to the visible index or direct reads and report that limitation.
 
 ### Fail-safe, strict mode, manifest, and cache
 

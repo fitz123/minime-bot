@@ -65,6 +65,7 @@ minime-bot knowledge get --workspace /path/to/agent-workspace --path wiki/pages/
 minime-bot knowledge update --workspace /path/to/agent-workspace --op upsert --type project --slug runtime --frontmatter '{"name":"Runtime","description":"Runtime notes","type":"project"}' --body-file /path/to/body.md --json
 minime-bot knowledge update --workspace /path/to/agent-workspace --op archive --path wiki/pages/project/history/issue-123-2026-05-01.md --json
 minime-bot knowledge update --workspace /path/to/agent-workspace --op restore --path wiki/pages/project/history/issue-123-2026-05-01.md --json
+minime-bot knowledge sync --workspace /path/to/agent-workspace --json
 minime-bot knowledge maintain --workspace /path/to/agent-workspace --closed-issues '[123,456]' --json --report artifacts/knowledge-maintenance/latest.json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --dry-run --report /path/to/report.json --json
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --apply --allow-dirty --report /path/to/report.json --json
@@ -84,6 +85,9 @@ wiki paths are blocked when first-party Pi extensions are enabled. Its
 `create`, `update`, and `upsert` operations use the page write payload shown
 above. `archive` and `restore` instead accept only `--op` and the original
 managed `--path`; they do not accept type, slug, frontmatter, or body flags.
+`sync` is the separate committed-history path for reconciling local `main` with
+`origin/main`; it does not accept force, dirty-worktree, rebase, or other
+destructive escape options.
 Migration is dry-run by default. `--apply` writes planned files only when the
 agent workspace has a clean git worktree and no blocking review items;
 `--allow-dirty` bypasses only the git cleanliness gate after operator review.
@@ -362,6 +366,93 @@ for either side of the managed move. Explicitly destructive recursive,
 archive-extraction, and worktree-mutating Git operations are also blocked when
 they target an ancestor containing either managed tree. Read-only commands and
 mutations confined to unrelated subdirectories remain available.
+
+### Knowledge Git synchronization
+
+`minime-bot knowledge sync` is a coordination mechanism for a trusted,
+cooperative agent in a single-user workspace. The Pi protection and managed
+command provide safe defaults and actionable errors; they are not an access
+control boundary against another process running as the same user.
+
+The command accepts only a Knowledge v2 agent workspace that is itself the Git
+root, is on local `main`, has a clean worktree containing only committed input,
+and has an `origin/main`. It fetches `origin/main`, prepares divergent merges in
+a temporary detached worktree, validates the complete Knowledge corpus, and
+fast-forwards canonical `main` only after validation. It then pushes and verifies
+that local and remote `main` are equal. The command never loads control-workspace
+secrets and does not force-push, reset, rebase, or select a silent winner.
+Fetch and push explicitly disable recursive submodule behavior, so synchronization
+does not contact or publish repositories referenced by submodules.
+Git command output is bounded at 64 MiB; an overflow fails without echoing the
+captured Knowledge content. Each Git invocation is also non-interactive and
+bounded to two minutes; a timeout returns a typed command failure and releases
+the shared Knowledge lock.
+
+For automation, success exits `0`; rejected input exits `2`; and locked,
+conflict, unavailable, unsupported, or internal failures exit `1`. With
+`--json`, success and failure responses are written to stdout. Success includes
+`classification`, `commit`, and `attempts`; failure includes `status`, `reason`,
+and optional `conflictPaths` or `attempts`. Without `--json`, success is written
+to stdout and failures are written to stderr.
+
+Preflight also rejects unfinished merge/rebase/cherry-pick state, ignored or
+otherwise uncommitted managed Knowledge files, and tracked copies of the runtime
+lock or reclaim marker. Sync shares `.tmp/knowledge-update.lock` with
+`knowledge update`; concurrent update/sync calls return a typed locked response,
+and an expired lock is reclaimed only when its recorded process is no longer the
+same live process.
+
+Sync evaluates the real commit graph with replacement refs and legacy graft
+overlays disabled. Repository hooks are disabled for transaction-owned fetch,
+recovery-ref, worktree, merge, commit, fast-forward, and push mutations so hooks
+cannot alter the canonical transaction. Divergent merge commits also disable
+commit signing and use the fixed `minime-bot` name with the
+`minime-bot@users.noreply.github.com` email address.
+
+For paths changed on both sides, sync accepts only Git's standard text or binary
+merge behavior. It rejects `union` and custom merge drivers, configured
+overrides of the built-in `text` and `binary` driver names, and other settings
+that can hide conflicts. Sync also rejects Git check-in transformations on any
+managed Knowledge file, including clean filters, `ident`,
+`working-tree-encoding`, and `text`/`eol` attributes, because they can alter
+committed variants. Effective `core.autocrlf` values other than `false` or unset
+are rejected for the same reason. Tracked files carrying `skip-worktree` or
+`assume-unchanged` index flags are also rejected because those flags can hide
+uncommitted work from Git's cleanliness check. Structural log history and active
+pages must be valid UTF-8; active pages also cannot contain NUL bytes. Remove the
+transformation, invalid bytes, or index flag before retrying.
+
+Before any history-changing convergence, both observed tips are retained under
+synthetic refs such as
+`refs/minime/knowledge-sync/recovery/local-<commit>` and
+`refs/minime/knowledge-sync/recovery/remote-<commit>`. Sync temporary worktrees
+are removed only after local and remote `main` are verified equal. Recovery refs
+are removed only after both observed tips are reachable from that canonical
+commit; a failed or interrupted convergence retains recovery state for an
+idempotent retry.
+
+A nonzero result after candidate validation can mean canonical local `main` has
+already advanced, or that local and remote `main` converged but cleanup did not
+finish. Do not reset either branch. Rerun `knowledge sync`; retained recovery
+state makes that retry idempotent.
+
+Git handles ordinary three-way merges first. A conflicting managed page becomes
+one schema-valid unresolved page containing both complete committed variants,
+their source commit IDs, an explicit unresolved body marker, and `revisit_if`
+review guidance. Non-UTF-8 variants are retained as explicitly marked base64
+bytes. Divergent merges regenerate `wiki/index.md` from every active page in
+locale-independent UTF-8 byte order and form a deterministic union of both
+structural logs. No-op and linear histories
+instead require the committed index to already equal the complete generated
+corpus; ahead/behind histories must also preserve append-only ancestor log
+history. Conflicts outside managed Knowledge, or unsupported schema, issues, and
+archive conflicts, stop without changing canonical `main`.
+
+Use `knowledge update` to create, edit, archive, or restore managed pages, commit
+those changes normally, and use `knowledge sync` to reconcile committed history.
+When the first-party Pi extension is enabled, direct managed writes and raw Git
+worktree commands such as `merge`, `pull`, `rebase`, `cherry-pick`, `checkout`,
+`switch`, and destructive `reset`, `restore`, or `clean` remain blocked.
 
 Every committed modifying operation appends a structural entry to
 `wiki/log.md`: `create`, `update`, `archive`, or `restore`. An upsert records

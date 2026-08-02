@@ -1,26 +1,36 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
+import { generateKnowledgeV2Schema, resolveKnowledgeLayout } from "../knowledge/layout.js";
 import { executeKnowledgeSearch } from "../knowledge/tools.js";
 import {
+  acquireKnowledgeUpdateLock,
+  collectKnowledgePages,
+  compareKnowledgePaths,
   executeKnowledgeUpdate,
   formatKnowledgePage,
   formatKnowledgeUpdateResponse,
+  type KnowledgeUpdateFs,
+  type KnowledgeUpdateLockHandle,
   type KnowledgeUpdateResponse,
 } from "../knowledge/update.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
@@ -71,6 +81,33 @@ function pageFrontmatter(name: string, type = "project"): Record<string, unknown
 }
 
 describe("knowledge_update", () => {
+  it("orders Unicode page paths by locale-independent UTF-8 bytes", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/reference/ä.md": formatKnowledgePage(
+        { name: "Umlaut", description: "Unicode page ordering.", type: "reference" },
+        "# Umlaut\n",
+      ),
+      "wiki/pages/reference/z.md": formatKnowledgePage(
+        { name: "Zed", description: "ASCII page ordering.", type: "reference" },
+        "# Zed\n",
+      ),
+    });
+    const layout = resolveKnowledgeLayout(workspace);
+    assert.equal(layout.kind, "v2");
+    if (layout.kind !== "v2") {
+      return;
+    }
+
+    const pages = collectKnowledgePages(layout);
+
+    assert.ok(Array.isArray(pages));
+    assert.deepEqual(pages.map((entry) => entry.relPath), [
+      "wiki/pages/reference/z.md",
+      "wiki/pages/reference/ä.md",
+    ]);
+    assert.equal(compareKnowledgePaths("z", "ä") < 0, true);
+  });
+
   it("treats an explicit empty env as authoritative over the process env", () => {
     const workspace = createV2Workspace();
     const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
@@ -984,6 +1021,7 @@ describe("knowledge_update", () => {
         agentWorkspaceRoot: workspace,
         lockNow: () => new Date("2026-06-07T12:00:00.000Z"),
         staleLockMs: 1_000,
+        isProcessAlive: () => false,
       },
     );
     assertUpdateOk(stale);
@@ -1011,6 +1049,278 @@ describe("knowledge_update", () => {
     assert.equal(fresh.ok, false);
     assert.equal(fresh.status, "locked");
     rmSync(lockPath, { force: true });
+  });
+
+  it("serializes stale-lock reclamation against another cooperative caller", () => {
+    const workspace = createV2Workspace();
+    const layout = resolveKnowledgeLayout(workspace);
+    assert.equal(layout.kind, "v2");
+    if (layout.kind !== "v2") {
+      return;
+    }
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z" })}\n`,
+      "utf8",
+    );
+    let nestedLock: KnowledgeUpdateLockHandle | ReturnType<typeof executeKnowledgeUpdate> | undefined;
+    let interleaveOnPrimaryUnlink = true;
+    const lockFs: KnowledgeUpdateFs = {
+      closeSync,
+      existsSync,
+      linkSync,
+      lstatSync,
+      mkdirSync,
+      openSync,
+      readFileSync,
+      readdirSync,
+      realpathSync,
+      renameSync,
+      statSync,
+      unlinkSync: ((path: Parameters<typeof unlinkSync>[0]) => {
+        if (interleaveOnPrimaryUnlink && path === lockPath) {
+          interleaveOnPrimaryUnlink = false;
+          nestedLock = acquireKnowledgeUpdateLock(layout, lockFs, {
+            lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+            staleLockMs: 1,
+            isProcessAlive: () => false,
+          });
+        }
+        unlinkSync(path);
+      }) as typeof unlinkSync,
+      writeFileSync,
+    };
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "serialized-reclaim",
+        frontmatter: pageFrontmatter("Serialized Reclaim"),
+        body: "# Serialized Reclaim\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        fs: lockFs,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.ok(nestedLock && "ok" in nestedLock && nestedLock.ok === false);
+    assert.equal(nestedLock.status, "locked");
+  });
+
+  it("does not reclaim a fresh lock that replaces the inspected stale lock", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z", token: "stale" })}\n`,
+      "utf8",
+    );
+    const successorLock = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: "2026-08-01T12:00:00.000Z",
+      token: "fresh-successor",
+    })}\n`;
+    let replaced = false;
+    const lockFs: KnowledgeUpdateFs = {
+      closeSync,
+      existsSync,
+      linkSync: ((
+        existingPath: Parameters<typeof linkSync>[0],
+        newPath: Parameters<typeof linkSync>[1],
+      ) => {
+        if (!replaced && existingPath === lockPath) {
+          replaced = true;
+          unlinkSync(lockPath);
+          writeFileSync(lockPath, successorLock, "utf8");
+        }
+        linkSync(existingPath, newPath);
+      }) as typeof linkSync,
+      lstatSync,
+      mkdirSync,
+      openSync,
+      readFileSync,
+      readdirSync,
+      realpathSync,
+      renameSync,
+      statSync,
+      unlinkSync,
+      writeFileSync,
+    };
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "stale-snapshot-race",
+        frontmatter: pageFrontmatter("Stale Snapshot Race"),
+        body: "# Stale Snapshot Race\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        fs: lockFs,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assert.equal(response.ok, false);
+    assert.equal(response.status, "locked");
+    assert.equal(readFileSync(lockPath, "utf8"), successorLock);
+    assert.equal(existsSync(reclaimPath), false);
+    assert.equal(existsSync(join(workspace, "wiki/pages/project/stale-snapshot-race.md")), false);
+  });
+
+  it("recovers an abandoned stale-lock reclamation claim", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: 999_999, acquiredAt: "2000-01-01T00:00:00.000Z" })}\n`,
+      "utf8",
+    );
+    linkSync(lockPath, reclaimPath);
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "abandoned-reclaim",
+        frontmatter: pageFrontmatter("Abandoned Reclaim"),
+        body: "# Abandoned Reclaim\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        lockNow: () => new Date(Date.now() + 60_000),
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(existsSync(reclaimPath), false);
+  });
+
+  it("reclaims an expired lock when its PID belongs to a different process instance", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({
+        pid: 42,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        processIdentity: "old-process-instance",
+      })}\n`,
+      "utf8",
+    );
+
+    let acquiredProcessIdentity: unknown;
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "reused-pid",
+        frontmatter: pageFrontmatter("Reused PID"),
+        body: "# Reused PID\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+        staleLockMs: 1,
+        isProcessAlive: () => true,
+        getProcessIdentity: (pid) => pid === 42 ? "new-process-instance" : "current-process-instance",
+        refreshSearchBackend: () => {
+          acquiredProcessIdentity = (JSON.parse(readFileSync(lockPath, "utf8")) as { processIdentity?: unknown })
+            .processIdentity;
+        },
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(acquiredProcessIdentity, "current-process-instance");
+  });
+
+  it("keeps expired-looking locks when the live owner identity matches or cannot be inspected", () => {
+    for (const [name, currentIdentity] of [
+      ["matching", "same-process-instance"],
+      ["unavailable", undefined],
+    ] as const) {
+      const workspace = createV2Workspace();
+      const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+      mkdirSync(dirname(lockPath), { recursive: true });
+      const lockContent = `${JSON.stringify({
+        pid: 42,
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        processIdentity: "same-process-instance",
+      })}\n`;
+      writeFileSync(lockPath, lockContent, "utf8");
+
+      const response = executeKnowledgeUpdate(
+        {
+          op: "create",
+          type: "project",
+          slug: `live-owner-${name}`,
+          frontmatter: pageFrontmatter(`Live Owner ${name}`),
+          body: `# Live Owner ${name}\n`,
+        },
+        {
+          agentWorkspaceRoot: workspace,
+          lockNow: () => new Date("2026-08-01T12:00:00.000Z"),
+          staleLockMs: 1,
+          isProcessAlive: () => true,
+          getProcessIdentity: () => currentIdentity,
+        },
+      );
+
+      assert.equal(response.ok, false, name);
+      assert.equal(response.status, "locked", name);
+      assert.equal(readFileSync(lockPath, "utf8"), lockContent, name);
+      assert.equal(existsSync(join(workspace, `wiki/pages/project/live-owner-${name}.md`)), false, name);
+    }
+  });
+
+  it("does not release a lock that has been replaced by a successor", () => {
+    const workspace = createV2Workspace();
+    const lockPath = join(workspace, ".tmp/knowledge-update.lock");
+    const successorLock = `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: "2026-06-07T12:00:01.000Z",
+      path: ".tmp/knowledge-update.lock",
+      token: "successor-token",
+    })}\n`;
+
+    const response = executeKnowledgeUpdate(
+      {
+        op: "create",
+        type: "project",
+        slug: "successor-lock",
+        frontmatter: pageFrontmatter("Successor Lock"),
+        body: "# Successor Lock\n",
+      },
+      {
+        agentWorkspaceRoot: workspace,
+        refreshSearchBackend: () => {
+          writeFileSync(lockPath, successorLock, "utf8");
+        },
+      },
+    );
+
+    assertUpdateOk(response);
+    assert.equal(readFileSync(lockPath, "utf8"), successorLock);
   });
 
   it("rejects symlinked lock directory before creating the update lock", () => {

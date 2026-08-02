@@ -62,7 +62,9 @@ export const KNOWLEDGE_UPDATE_TOOL = {
     "managed path. Create/update/upsert require page type, flat frontmatter, and a Markdown body. Archive/restore " +
     "require only the original wiki/pages/<type>/**/*.md path and preserve page bytes under " +
     "artifacts/knowledge-archive. Successful operations refresh wiki/index.md and append a structural action to " +
-    "wiki/log.md. Direct manual writes to managed wiki paths are blocked when first-party extensions are enabled.",
+    "wiki/log.md. This tool changes pages; minime-bot knowledge sync separately reconciles clean committed main " +
+    "history with origin/main. Direct managed writes and raw Git worktree mutations remain blocked when first-party " +
+    "extensions are enabled.",
   promptSnippet:
     "Write or reversibly archive durable Knowledge v2 pages through knowledge_update, never by editing managed wiki files directly.",
   promptGuidelines: [
@@ -70,6 +72,7 @@ export const KNOWLEDGE_UPDATE_TOOL = {
     "For create, update, or upsert, provide type, a slug or managed page path, flat frontmatter, and a Markdown body without frontmatter.",
     "For archive or restore, provide only op and the original managed wiki/pages/<type>/**/*.md path; never fabricate write payload fields.",
     "knowledge_update is for synthesized durable knowledge, not arbitrary file editing or active task state.",
+    "After page changes are committed, use minime-bot knowledge sync for local main and origin/main reconciliation; do not run raw Git merge, pull, rebase, or cherry-pick commands in a Knowledge v2 workspace.",
   ] as string[],
   parameters: {
     type: "object",
@@ -254,6 +257,7 @@ const WORKTREE_MUTATING_GIT_SUBCOMMANDS = new Set([
   "revert",
   "switch",
 ]);
+const SPARSE_CHECKOUT_MUTATING_ACTIONS = new Set(["add", "init", "reapply", "set"]);
 const SUDO_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-D",
@@ -274,6 +278,22 @@ const SHELL_OPTIONS_WITH_VALUE = new Set(["-o", "--init-file", "--rcfile"]);
 const MAX_NESTED_SHELL_DEPTH = 4;
 const MANAGED_KNOWLEDGE_PATH_REFERENCE =
   /(?:^|[^A-Za-z0-9_-])((?:wiki\/(?:schema|index|log|issues)\.md|wiki\/pages(?:\/[A-Za-z0-9._~+@%=-]+)*|artifacts\/knowledge-archive(?:\/[A-Za-z0-9._~+@%=-]+)*))(?![A-Za-z0-9_/-])/g;
+
+function managedWriteBlockReason(toolName: string, targetPath: string): string {
+  return (
+    "Knowledge v2 page and catalog mutations must use knowledge_update. " +
+    "Committed main history must be reconciled with minime-bot knowledge sync. " +
+    `Blocked direct ${toolName} target: ${targetPath}.`
+  );
+}
+
+function managedAncestorBlockReason(targetPath: string): string {
+  return (
+    "Destructive ancestor operations and raw Git worktree mutations are blocked for Knowledge v2. " +
+    "Use knowledge_update for managed page or archive mutations, then reconcile local main with origin/main using " +
+    `minime-bot knowledge sync. Blocked direct bash target: ${targetPath}.`
+  );
+}
 
 function explicitAgentWorkspaceRoot(deps: PiKnowledgeToolDeps): string | undefined {
   const root = deps.agentWorkspaceRoot;
@@ -362,9 +382,7 @@ export function classifyKnowledgeIntegrityToolCall(
       return {
         block: true,
         targetPath: ambiguousManagedPath,
-        reason:
-          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-          `Blocked direct ${event.toolName} target: ${ambiguousManagedPath}.`,
+        reason: managedWriteBlockReason(event.toolName, ambiguousManagedPath),
       };
     }
     const absTarget = resolveShellPath(rawTarget, cwd, deps.env);
@@ -374,9 +392,7 @@ export function classifyKnowledgeIntegrityToolCall(
         return {
           block: true,
           targetPath: managedRawPath,
-          reason:
-            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-            `Blocked direct ${event.toolName} target: ${managedRawPath}.`,
+          reason: managedWriteBlockReason(event.toolName, managedRawPath),
         };
       }
       continue;
@@ -386,9 +402,7 @@ export function classifyKnowledgeIntegrityToolCall(
       return {
         block: true,
         targetPath: managedPath,
-        reason:
-          `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-          `Blocked direct ${event.toolName} target: ${managedPath}.`,
+        reason: managedWriteBlockReason(event.toolName, managedPath),
       };
     }
   }
@@ -397,6 +411,7 @@ export function classifyKnowledgeIntegrityToolCall(
       stringField(event.input, "command") ?? "",
       cwd,
       deps.env,
+      agentWorkspaceRoot,
     );
     for (const rawTarget of destructiveAncestorTargets) {
       const expandedTarget = expandShellPathVariables(rawTarget, cwd, deps.env) ?? rawTarget;
@@ -404,14 +419,14 @@ export function classifyKnowledgeIntegrityToolCall(
       if (!absTarget) {
         continue;
       }
-      const managedPath = managedKnowledgeAncestorRelPath(layout, absTarget);
+      const managedPath =
+        managedKnowledgeRelPath(layout, absTarget) ??
+        managedKnowledgeAncestorRelPath(layout, absTarget);
       if (managedPath) {
         return {
           block: true,
           targetPath: managedPath,
-          reason:
-            `Knowledge v2 managed paths are writable only through knowledge_update. ` +
-            `Blocked direct ${event.toolName} target: ${managedPath}.`,
+          reason: managedAncestorBlockReason(managedPath),
         };
       }
     }
@@ -459,8 +474,9 @@ function extractBashDestructiveAncestorTargetsForCwd(
   command: string,
   cwd: string,
   env?: NodeJS.ProcessEnv,
+  knownGitWorktreeRoot?: string,
 ): string[] {
-  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env);
+  return extractBashDestructiveAncestorTargetsAtDepth(command, 0, cwd, env, knownGitWorktreeRoot);
 }
 
 function extractBashDestructiveAncestorTargetsAtDepth(
@@ -468,6 +484,7 @@ function extractBashDestructiveAncestorTargetsAtDepth(
   depth: number,
   cwd: string | undefined,
   env: NodeJS.ProcessEnv | undefined,
+  knownGitWorktreeRoot: string | undefined,
 ): string[] {
   if (depth > MAX_NESTED_SHELL_DEPTH) {
     return [];
@@ -493,6 +510,7 @@ function extractBashDestructiveAncestorTargetsAtDepth(
             depth + 1,
             commandCwd,
             commandEnv,
+            knownGitWorktreeRoot,
           )) {
             appendTarget(targets, target);
           }
@@ -542,7 +560,12 @@ function extractBashDestructiveAncestorTargetsAtDepth(
           commandEnv,
         );
       } else if (name === "git") {
-        const worktreeTarget = gitWorktreeMutationTarget(args, commandCwd, commandEnv);
+        const worktreeTarget = gitWorktreeMutationTarget(
+          args,
+          commandCwd,
+          commandEnv,
+          knownGitWorktreeRoot,
+        );
         if (worktreeTarget) {
           appendTargetCandidates(targets, gitWorktreePathArguments(args), commandCwd, commandEnv);
           appendTargetCandidates(targets, [worktreeTarget], commandCwd, commandEnv);
@@ -904,7 +927,7 @@ function isReadOnlyShellCommand(name: string, args: string[]): boolean {
 
 function isReadOnlyGitCommand(args: string[]): boolean {
   const subcommand = gitSubcommand(args);
-  return subcommand ? READ_ONLY_GIT_SUBCOMMANDS.has(subcommand) : false;
+  return subcommand ? subcommand === "add" || READ_ONLY_GIT_SUBCOMMANDS.has(subcommand) : false;
 }
 
 function gitSubcommand(args: string[]): string | undefined {
@@ -940,6 +963,7 @@ function gitWorktreeMutationTarget(
   args: string[],
   cwd: string | undefined,
   env: NodeJS.ProcessEnv | undefined,
+  knownGitWorktreeRoot: string | undefined,
 ): string | undefined {
   const command = gitSubcommandPosition(args);
   if (!command || !gitSubcommandMutatesWorktree(command.name, args.slice(command.index + 1))) {
@@ -972,10 +996,50 @@ function gitWorktreeMutationTarget(
       );
     }
   }
-  return explicitWorktree ?? effectiveCwd;
+  if (explicitWorktree) {
+    return explicitWorktree;
+  }
+  if (effectiveCwd && knownGitWorktreeRoot) {
+    const containedPaths = containedPathPair(knownGitWorktreeRoot, effectiveCwd);
+    if (containedPaths && !hasNestedGitBoundary(containedPaths.child, containedPaths.parent)) {
+      return knownGitWorktreeRoot;
+    }
+  }
+  return effectiveCwd;
+}
+
+function containedPathPair(parentPath: string, childPath: string): { parent: string; child: string } | undefined {
+  for (const parent of pathCandidates(parentPath)) {
+    for (const child of pathCandidates(childPath)) {
+      if (insideOrSame(parent, child)) {
+        return { parent, child };
+      }
+    }
+  }
+  return undefined;
+}
+
+function hasNestedGitBoundary(path: string, outerWorktreeRoot: string): boolean {
+  const outerRoot = normalize(resolve(outerWorktreeRoot));
+  let current = normalize(resolve(path));
+  while (insideOrSame(outerRoot, current) && !samePath(current, outerRoot)) {
+    if (existsSync(join(current, ".git"))) {
+      return true;
+    }
+    const parent = dirname(current);
+    if (samePath(parent, current)) {
+      break;
+    }
+    current = parent;
+  }
+  return false;
 }
 
 function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {
+  if (subcommand === "sparse-checkout") {
+    const action = args.find((arg) => !arg.startsWith("-"));
+    return action ? SPARSE_CHECKOUT_MUTATING_ACTIONS.has(action) : false;
+  }
   if (subcommand === "clean") {
     return !args.some((arg) => arg === "--dry-run" || /^-[^-]*n/.test(arg));
   }
