@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 2026.8.0
+
+- Add first-party, data-preserving Knowledge Git synchronization that converges
+  clean committed local/remote v2 histories through an isolated validated
+  candidate, retains page variants and structural provenance, regenerates the
+  derived index, preserves recovery refs until convergence, and fails closed on
+  non-Knowledge conflicts (#184).
+
 ## 2026.7.44
 
 - Pause an active Telegram native draft after an interleaved message in the same
