@@ -482,6 +482,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
     assert.strictEqual(session.model, "openai-codex/gpt-5.5");
     assert.strictEqual(session.thinking, "xhigh");
     assert.strictEqual(session.outboxPath, outboxDir("pi-chat"));
+    assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
+      askCallerAgentId: "pi",
+      outboxPath: session.outboxPath,
+    });
     assert.ok(!session.outboxPath.startsWith("/tmp/bot-outbox"));
     assert.strictEqual(statSync(dirname(session.outboxPath)).mode & 0o777, 0o700);
     assert.strictEqual(statSync(session.outboxPath).mode & 0o777, 0o700);
@@ -614,7 +618,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
       assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
       assert.strictEqual(piSpawnCaptures[0].agent.id, "pi");
-      assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, { askCallerAgentId: "pi" });
+      assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
+        askCallerAgentId: "pi",
+        outboxPath: outboxDir("pi-caller"),
+      });
     } finally {
       if (oldCaller === undefined) {
         delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
@@ -877,6 +884,14 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
       piSpawnCaptures.map((capture) => capture.extensionOptions),
       [{ extraExtensions }, { extraExtensions }],
       "recovery retry keeps the configured extra extensions",
+    );
+    assert.deepStrictEqual(
+      piSpawnCaptures.map((capture) => capture.runtimeEnvOptions),
+      [
+        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
+        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
+      ],
+      "recovery retry keeps the exact session outbox path",
     );
 
     // The recovered session is live on the freshly-captured id, and it's persisted.

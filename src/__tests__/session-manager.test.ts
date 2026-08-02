@@ -2781,14 +2781,10 @@ describe("SessionManager Pi dispatch", () => {
     const sent = JSON.parse(stdinWrites[0]);
     assert.strictEqual(sent.type, "prompt", "pi path must write a Pi prompt command");
     assert.match(sent.id, /^minime-prompt-\d+$/, "pi prompt must carry a correlation id");
-    assert.ok(sent.message.startsWith("hello pi\n\n"), "user prompt should be preserved at the start");
+    assert.strictEqual(sent.message, "hello pi", "Pi must receive the accepted user text unchanged");
     assert.ok(
-      sent.message.includes("To share a file with the user, write or copy it to this outbox directory:"),
-      "prompt should include the per-session outbox instruction",
-    );
-    assert.ok(
-      sent.message.includes(`${TEST_DIR}/outbox-pi-chat`),
-      "prompt should include the session outbox path",
+      !sent.message.includes("outbox"),
+      "prompt must not include per-message outbox boilerplate",
     );
     // Defect B: the queue-driven Pi send path must NEVER deliver a bare prompt —
     // it always carries streamingBehavior:"followUp" so a prompt sent into a

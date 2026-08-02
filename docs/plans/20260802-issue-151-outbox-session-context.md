@@ -34,11 +34,11 @@ git diff --check
 **Goal:** Give every initial or fresh-retry interactive Pi child the correct per-chat outbox path without moving destructive outbox preparation ahead of startup ownership, then remove per-message outbox boilerplate.
 **Serves:** The approved spawn-env and per-message-removal outcomes while preserving existing session ownership and delivery behavior.
 
-- [ ] Define `MINIME_OUTBOX` as the package-owned outbox environment variable and add an explicit outbox-path runtime option in the existing Pi spawn environment path.
-- [ ] Separate pure deterministic outbox-path derivation from destructive directory preparation; pass the derived path to every applicable initial/retry interactive Pi spawn while retaining the post-generation-guard preparation point.
-- [ ] Remove `appendOutboxInstruction` and send the accepted user text unchanged through `sendPiPrompt(..., "followUp")`.
-- [ ] Add focused tests proving the interactive child receives the exact session outbox path, retry spawns retain it, unrelated child env paths do not gain it, and sent prompt text contains no outbox boilerplate.
-- [ ] Run the affected session-manager, Pi spawn/protocol, and stream-relay tests plus lint before Task 2.
+- [x] Define `MINIME_OUTBOX` as the package-owned outbox environment variable and add an explicit outbox-path runtime option in the existing Pi spawn environment path.
+- [x] Separate pure deterministic outbox-path derivation from destructive directory preparation; pass the derived path to every applicable initial/retry interactive Pi spawn while retaining the post-generation-guard preparation point.
+- [x] Remove `appendOutboxInstruction` and send the accepted user text unchanged through `sendPiPrompt(..., "followUp")`.
+- [x] Add focused tests proving the interactive child receives the exact session outbox path, retry spawns retain it, unrelated child env paths do not gain it, and sent prompt text contains no outbox boilerplate.
+- [x] Run the affected session-manager, Pi spawn/protocol, and stream-relay tests plus lint before Task 2.
 
 ### Task 2: Add one static file-delivery directive to assembled Pi context
 **Goal:** Make file-delivery semantics available once in package-owned session context without embedding chat-specific values.

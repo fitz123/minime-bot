@@ -21,8 +21,6 @@ const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = h
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
-const OUTBOX_PROMPT_PREFIX = "To share a file with the user, write or copy it to this outbox directory:";
-const OUTBOX_PROMPT_SUFFIX = "Files placed there will be automatically sent to the user after your response completes.";
 
 class SessionStartupSupersededError extends Error {
   constructor() {
@@ -90,23 +88,13 @@ function removeOutboxDirIfPresent(path: string): void {
   rmSync(path, { recursive: true, force: true });
 }
 
-function prepareOutboxDir(chatId: string): string {
+function prepareOutboxDir(outboxPath: string): void {
   const runtimeDir = resolveWorkspaceContract().paths.runtimeDir;
-  const outboxPath = join(runtimeDir, OUTBOX_DIR_NAME, chatId.replace(/[^a-zA-Z0-9_-]/g, "_"));
   const outboxBase = join(runtimeDir, OUTBOX_DIR_NAME);
   ensurePrivateDir(runtimeDir);
   ensurePrivateDir(outboxBase);
   removeOutboxDirIfPresent(outboxPath);
   ensurePrivateDir(outboxPath);
-  return outboxPath;
-}
-
-export function appendOutboxInstruction(text: string, outboxPath: string): string {
-  return [
-    text,
-    `${OUTBOX_PROMPT_PREFIX} ${outboxPath}`,
-    OUTBOX_PROMPT_SUFFIX,
-  ].join("\n\n");
 }
 
 /** Check whether a child process has exited (by exit code or signal). */
@@ -656,10 +644,11 @@ export class SessionManager {
     // Spawn the agent subprocess via Pi RPC. Only a genuine resume points
     // --session at the stored Pi-minted id; a fresh start omits it (an unknown
     // id makes Pi exit with "No session found matching").
+    const outboxPath = outboxDir(chatId);
     const extensionOptions: PiSpawnExtensionOptions | undefined = freshConfig.piExtraExtensions === undefined
       ? undefined
       : { extraExtensions: freshConfig.piExtraExtensions };
-    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId };
+    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath };
     let child = spawnPiRpcSession(agent, resume ? sessionId : undefined, extensionOptions, runtimeEnvOptions);
 
     // Graceful Pi resume-recovery state (signal-matched, inline, at-most-once):
@@ -786,9 +775,8 @@ export class SessionManager {
     // is destructive (it wipes the per-chat outbox), so a superseded older
     // startup must never reach it — otherwise it could blow away an outbox a
     // newer post-clean startup already owns.
-    let outboxPath: string;
     try {
-      outboxPath = prepareOutboxDir(chatId);
+      prepareOutboxDir(outboxPath);
     } catch (err) {
       await this.terminateStartupChild(child);
       throw err;
@@ -883,11 +871,7 @@ export class SessionManager {
         // from the child's real lifecycle, and a bare prompt sent into that
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
-        const promptId = sendPiPrompt(
-          session.child,
-          appendOutboxInstruction(text, session.outboxPath),
-          "followUp",
-        );
+        const promptId = sendPiPrompt(session.child, text, "followUp");
         session.lastActivity = Date.now();
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);

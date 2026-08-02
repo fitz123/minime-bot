@@ -129,6 +129,7 @@ export const PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = Object.freeze(
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
 export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
 export const MINIME_BOT_PI_SESSION_AGENT_ID_ENV = "MINIME_BOT_PI_SESSION_AGENT_ID";
+export const MINIME_OUTBOX_ENV = "MINIME_OUTBOX";
 
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */
@@ -156,6 +157,8 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 export interface PiSpawnRuntimeEnvOptions {
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
+  /** Deterministic per-chat outbox path supplied for an interactive session. */
+  outboxPath?: string;
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -173,6 +176,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_OUTBOX_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -641,6 +645,7 @@ function buildAllowedPiChildEnv(
   delete env[RETIRED_AGENT_WORKSPACE_ENV];
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+  delete env[MINIME_OUTBOX_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
@@ -649,6 +654,10 @@ function buildAllowedPiChildEnv(
   const askCallerAgentId = runtimeEnvOptions?.askCallerAgentId?.trim();
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
+  }
+  const outboxPath = runtimeEnvOptions?.outboxPath?.trim();
+  if (outboxPath) {
+    env[MINIME_OUTBOX_ENV] = outboxPath;
   }
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");

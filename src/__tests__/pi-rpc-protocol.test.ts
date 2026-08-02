@@ -21,6 +21,7 @@ import {
   NewlineOnlyJsonlSplitter,
   MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
   MINIME_BOT_PI_SESSION_ENV,
+  MINIME_OUTBOX_ENV,
   PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS,
   PI_CRON_WRAPPER_RELPATHS,
@@ -1040,6 +1041,7 @@ describe("buildPiSpawnEnv", () => {
     assert.equal(shouldIncludePiChildEnvKey(MINIME_AGENT_WORKSPACE_ROOT_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_AGENT_ID_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(MINIME_OUTBOX_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
   });
@@ -1086,6 +1088,7 @@ describe("buildPiSpawnEnv", () => {
       MINIME_AGENT_WORKSPACE_ROOT_ENV,
       MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
       MINIME_BOT_PI_SESSION_ENV,
+      MINIME_OUTBOX_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
       MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -1119,6 +1122,7 @@ describe("buildPiSpawnEnv", () => {
       process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = "/tmp/stale-agent-workspace";
       process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
       process.env[MINIME_BOT_PI_SESSION_ENV] = "ambient";
+      process.env[MINIME_OUTBOX_ENV] = "/tmp/ambient-outbox";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -1141,6 +1145,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env[MINIME_AGENT_WORKSPACE_ROOT_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_ENV], "1");
+      assert.strictEqual(env[MINIME_OUTBOX_ENV], undefined);
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);
@@ -1233,6 +1238,33 @@ describe("buildPiSpawnEnv", () => {
         delete process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
       } else {
         process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldCaller;
+      }
+    }
+  });
+
+  it("sets the outbox env only for an explicit interactive session runtime path", () => {
+    const oldOutbox = process.env[MINIME_OUTBOX_ENV];
+
+    try {
+      process.env[MINIME_OUTBOX_ENV] = "/tmp/ambient-outbox";
+
+      const interactiveEnv = withWorkspaceRoot(
+        "/tmp",
+        () => buildPiSpawnEnv(undefined, { outboxPath: "/tmp/session-outbox" }),
+      );
+      const defaultInteractiveEnv = withWorkspaceRoot("/tmp", () => buildPiSpawnEnv());
+      const subagentEnv = withWorkspaceRoot("/tmp", () => buildPiSubagentChildSpawnEnv());
+      const askAgentEnv = withWorkspaceRoot("/tmp", () => buildPiAskAgentChildSpawnEnv());
+
+      assert.strictEqual(interactiveEnv[MINIME_OUTBOX_ENV], "/tmp/session-outbox");
+      assert.strictEqual(defaultInteractiveEnv[MINIME_OUTBOX_ENV], undefined);
+      assert.strictEqual(subagentEnv[MINIME_OUTBOX_ENV], undefined);
+      assert.strictEqual(askAgentEnv[MINIME_OUTBOX_ENV], undefined);
+    } finally {
+      if (oldOutbox === undefined) {
+        delete process.env[MINIME_OUTBOX_ENV];
+      } else {
+        process.env[MINIME_OUTBOX_ENV] = oldOutbox;
       }
     }
   });
