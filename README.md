@@ -407,11 +407,10 @@ that can hide conflicts. Sync also rejects Git check-in transformations on any
 managed Knowledge file, including clean filters, `ident`,
 `working-tree-encoding`, and `text`/`eol` attributes, because they can alter
 committed variants. Effective `core.autocrlf` values other than `false` or unset
-are rejected for the same reason. Managed files carrying `skip-worktree` or
-`assume-unchanged` index flags are also rejected because complete-corpus
-validation requires every tracked Knowledge file to be materialized. Structural
-log history must be valid UTF-8. Remove the transformation or index flag before
-retrying.
+are rejected for the same reason. Tracked files carrying `skip-worktree` or
+`assume-unchanged` index flags are also rejected because those flags can hide
+uncommitted work from Git's cleanliness check. Structural log history must be
+valid UTF-8. Remove the transformation or index flag before retrying.
 
 Before convergence, both observed tips are retained under synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and

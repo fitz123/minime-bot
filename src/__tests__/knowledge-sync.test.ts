@@ -280,6 +280,27 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(remoteHead(fixture), remoteTip);
   });
 
+  it("rejects hidden non-Knowledge edits before canonical main can advance", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind-hidden-readme");
+    const localTip = localHead(fixture);
+    const remoteTip = commitFiles(peer, "remote history behind hidden readme", {
+      "diary/remote-hidden-readme.md": "# Remote history\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+    git(fixture.workspace, ["update-index", "--assume-unchanged", "README.md"]);
+    writeFileSync(join(fixture.workspace, "README.md"), "# Uncommitted hidden bytes\n", "utf8");
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-hidden-tracked-entry");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+    assert.equal(readFileSync(join(fixture.workspace, "README.md"), "utf8"), "# Uncommitted hidden bytes\n");
+  });
+
   it("fast-forwards a behind canonical main only after validating the fetched tree", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-behind");
@@ -1140,6 +1161,54 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
+  it("validates canonical main-only attributes before fast-forwarding a detached candidate", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-main-only-attributes");
+    const localTip = commitFiles(fixture.workspace, "local main-only-attribute divergence", {
+      "diary/local-main-only-attribute.md": "# Local history\n",
+    });
+    const relPath = "wiki/pages/reference/main-only-attribute.md";
+    const remotePage = page(
+      "Main-only attribute page",
+      "A remote page covered only by canonical main attributes.",
+      "reference",
+      "Remote committed Knowledge.\n",
+    );
+    const remoteIndex = generateKnowledgeIndex([
+      {
+        absPath: join(peer, ...relPath.split("/")),
+        relPath,
+        linkPath: "pages/reference/main-only-attribute.md",
+        frontmatter: {
+          name: "Main-only attribute page",
+          description: "A remote page covered only by canonical main attributes.",
+          type: "reference",
+        },
+      },
+    ]);
+    const remoteTip = commitFiles(peer, "remote main-only-attribute divergence", {
+      [relPath]: remotePage,
+      "wiki/index.md": remoteIndex,
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const attributesPath = join(fixture.root, "main-only.attributes");
+    const includePath = join(fixture.root, "main-only.config");
+    writeFileSync(attributesPath, `${relPath} filter=late\n`, "utf8");
+    writeFileSync(includePath, `[core]\n\tattributesFile = ${attributesPath}\n`, "utf8");
+    git(fixture.workspace, ["config", "extensions.worktreeConfig", "true"]);
+    git(fixture.workspace, ["config", "--worktree", "includeIf.onbranch:main.path", includePath]);
+    git(fixture.workspace, ["config", "filter.late.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.late.smudge", "cat"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("retries cleanup when a converged temporary worktree cannot initially be removed", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-worktree-cleanup");
@@ -1306,6 +1375,25 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.match(log, new RegExp(remoteLogEntry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(log, new RegExp(`knowledge-sync merge local=${localTip} remote=${remoteTip}`));
     assert.equal(log.match(/knowledge-sync merge/g)?.length, 1);
+  });
+
+  it("regenerates an index deleted by one side of a divergent merge", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-deleted-derived-index");
+    const localTip = commitFiles(fixture.workspace, "local divergence before deleted index", {
+      "diary/local-deleted-index.md": "# Local history\n",
+    });
+    git(peer, ["rm", "wiki/index.md"]);
+    git(peer, ["commit", "-m", "delete derived Knowledge index"]);
+    const remoteTip = git(peer, ["rev-parse", "HEAD"]);
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(readFileSync(join(fixture.workspace, "wiki/index.md"), "utf8"), generateKnowledgeIndex([]));
+    assertAncestor(fixture, localTip, response.commit);
+    assertAncestor(fixture, remoteTip, response.commit);
   });
 
   it("uses the fixed package identity for divergent merge commits", () => {

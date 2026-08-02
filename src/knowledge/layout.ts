@@ -65,6 +65,7 @@ export interface ResolvedKnowledgeLegacyLayout extends ResolvedKnowledgeLayoutBa
 
 export interface ResolvedKnowledgeNoneLayout extends ResolvedKnowledgeLayoutBase {
   kind: "none";
+  marker?: KnowledgeV2SchemaMarker;
   reason:
     | "missing"
     | "schema-unreadable"
@@ -209,6 +210,7 @@ export function resolveKnowledgeLayout(agentWorkspaceRoot: string): ResolvedKnow
       kind: "none",
       agentWorkspaceRoot: root,
       candidatePaths,
+      marker: markerResult.marker,
       reason: "v2-index-missing",
     };
   }

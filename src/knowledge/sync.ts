@@ -106,6 +106,7 @@ interface GitTips {
 interface CandidateResult {
   ok: true;
   commit: string;
+  root: string;
 }
 
 type AttemptResult = CandidateResult | KnowledgeSyncFailure;
@@ -650,9 +651,18 @@ function validateManagedCheckinTransformations(
   if (!Array.isArray(trackedPaths)) {
     return trackedPaths;
   }
+  return validateManagedCheckinAttributes(candidateRoot, trackedPaths, git);
+}
+
+function validateManagedCheckinAttributes(
+  candidateRoot: string,
+  trackedPaths: readonly string[],
+  git: KnowledgeSyncGitRunner,
+  configArgs: readonly string[] = [],
+): KnowledgeSyncFailure | undefined {
   for (const relPath of trackedPaths) {
     const result = git(
-      ["check-attr", "-z", ...CHECKIN_TRANSFORMATION_ATTRIBUTES, "--", relPath],
+      [...configArgs, "check-attr", "-z", ...CHECKIN_TRANSFORMATION_ATTRIBUTES, "--", relPath],
       { cwd: candidateRoot },
     );
     if (result.status !== 0) {
@@ -694,19 +704,57 @@ function validateManagedCheckinTransformations(
   return undefined;
 }
 
+function validateCanonicalCheckinTransformations(
+  workspaceRoot: string,
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const autocrlfProblem = validateEffectiveAutocrlf(workspaceRoot, git);
+  if (autocrlfProblem) {
+    return autocrlfProblem;
+  }
+  const configured = git(["config", "--path", "--get", "core.attributesFile"], {
+    cwd: workspaceRoot,
+  });
+  if (configured.status === 1 && !configured.stdout.trim()) {
+    return undefined;
+  }
+  if (configured.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-config-inspection-failed",
+      `knowledge sync could not inspect the canonical core.attributesFile setting: ${errorText(configured)}`,
+    );
+  }
+  const attributesFile = configured.stdout.trim();
+  if (!attributesFile) {
+    return undefined;
+  }
+  const trackedPaths = trackedManagedKnowledgePaths(candidateRoot, git);
+  if (!Array.isArray(trackedPaths)) {
+    return trackedPaths;
+  }
+  return validateManagedCheckinAttributes(
+    candidateRoot,
+    trackedPaths,
+    git,
+    ["-c", `core.attributesFile=${attributesFile}`],
+  );
+}
+
 function validateManagedWorktreeMaterialization(
   workspaceRoot: string,
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
   const indexFlags = git(
-    ["ls-files", "-v", "-z", "--", ...MANAGED_KNOWLEDGE_PATHSPECS],
+    ["ls-files", "-v", "-z"],
     { cwd: workspaceRoot },
   );
   if (indexFlags.status !== 0) {
     return failure(
       "error",
       "candidate-managed-path-inspection-failed",
-      `knowledge sync could not inspect managed candidate index flags: ${errorText(indexFlags)}`,
+      `knowledge sync could not inspect tracked candidate index flags: ${errorText(indexFlags)}`,
     );
   }
   const hiddenPaths: string[] = [];
@@ -716,7 +764,7 @@ function validateManagedWorktreeMaterialization(
       return failure(
         "error",
         "candidate-managed-path-inspection-failed",
-        "knowledge sync could not parse the managed candidate Git index flags.",
+        "knowledge sync could not parse the tracked candidate Git index flags.",
       );
     }
     const [, tag, relPath] = match;
@@ -726,10 +774,19 @@ function validateManagedWorktreeMaterialization(
   }
   if (hiddenPaths.length > 0) {
     hiddenPaths.sort();
+    const hiddenManagedPaths = hiddenPaths.filter((path) => isManagedKnowledgePath(path));
+    if (hiddenManagedPaths.length === 0) {
+      return failure(
+        "rejected",
+        "candidate-hidden-tracked-entry",
+        `knowledge sync requires all tracked files to be materialized without skip-worktree or assume-unchanged index flags; restore normal tracking for: ${hiddenPaths.join(", ")}.`,
+        { conflictPaths: hiddenPaths },
+      );
+    }
     return failure(
       "rejected",
       "candidate-hidden-managed-entry",
-      `knowledge sync requires managed Knowledge files to be materialized without skip-worktree or assume-unchanged index flags; restore normal tracking for: ${hiddenPaths.join(", ")}.`,
+      `knowledge sync requires all tracked files to be materialized without skip-worktree or assume-unchanged index flags; restore normal tracking for: ${hiddenPaths.join(", ")}.`,
       { conflictPaths: hiddenPaths },
     );
   }
@@ -1564,13 +1621,26 @@ function reconcileDerivedKnowledgeState(
   git: KnowledgeSyncGitRunner,
   fs: KnowledgeSyncFs,
 ): KnowledgeSyncFailure | undefined {
-  const layout = (deps.resolveLayout ?? resolveKnowledgeLayout)(candidateRoot);
-  if (layout.kind !== "v2") {
+  const detectedLayout = (deps.resolveLayout ?? resolveKnowledgeLayout)(candidateRoot);
+  const layout: ResolvedKnowledgeV2Layout | undefined = detectedLayout.kind === "v2"
+    ? detectedLayout
+    : detectedLayout.kind === "none" &&
+        detectedLayout.reason === "v2-index-missing" &&
+        detectedLayout.marker
+      ? {
+          kind: "v2",
+          agentWorkspaceRoot: detectedLayout.agentWorkspaceRoot,
+          candidatePaths: detectedLayout.candidatePaths,
+          marker: detectedLayout.marker,
+          paths: detectedLayout.candidatePaths.v2,
+        }
+      : undefined;
+  if (!layout) {
     return failure(
       "rejected",
       "candidate-not-knowledge-v2",
       "knowledge sync refused a merged candidate that does not contain a valid Knowledge v2 layout.",
-      { layoutKind: layout.kind },
+      { layoutKind: detectedLayout.kind },
     );
   }
   const pages = collectKnowledgePages(layout, fs);
@@ -1911,7 +1981,7 @@ function prepareCandidate(
     const logHistoryProblem = classification === "ahead"
       ? validateLinearStructuralLogHistory(workspaceRoot, tips, classification, git)
       : undefined;
-    return logHistoryProblem ?? { ok: true, commit: tips.local };
+    return logHistoryProblem ?? { ok: true, commit: tips.local, root: workspaceRoot };
   }
 
   if (classification === "behind") {
@@ -1921,7 +1991,7 @@ function prepareCandidate(
         return invalid;
       }
       const logHistoryProblem = validateLinearStructuralLogHistory(candidateRoot, tips, classification, git);
-      return logHistoryProblem ?? { ok: true, commit: tips.remote };
+      return logHistoryProblem ?? { ok: true, commit: tips.remote, root: candidateRoot };
     });
   }
 
@@ -2038,7 +2108,7 @@ function prepareCandidate(
       );
     }
     const invalid = validateCandidateLayout(candidateRoot, deps, git, fs);
-    return invalid ?? { ok: true, commit: head.stdout.trim() };
+    return invalid ?? { ok: true, commit: head.stdout.trim(), root: candidateRoot };
   });
 }
 
@@ -2087,6 +2157,14 @@ function convergeAttempt(
   if (canonicalStateFailure) {
     return canonicalStateFailure;
   }
+  const canonicalTransformationFailure = validateCanonicalCheckinTransformations(
+    workspaceRoot,
+    candidate.root,
+    git,
+  );
+  if (canonicalTransformationFailure) {
+    return canonicalTransformationFailure;
+  }
   const fastForwardFailure = fastForwardCanonical(workspaceRoot, candidate.commit, git);
   if (fastForwardFailure) {
     return fastForwardFailure;
@@ -2097,7 +2175,7 @@ function convergeAttempt(
       return canonicalValidationFailure;
     }
   }
-  return { ok: true, commit: candidate.commit };
+  return { ok: true, commit: candidate.commit, root: workspaceRoot };
 }
 
 function fetchOriginMain(workspaceRoot: string, git: KnowledgeSyncGitRunner): KnowledgeSyncFailure | undefined {
@@ -2256,7 +2334,9 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
       }
 
       const cleanFailure =
-        validateNoGitOperationInProgress(workspaceRoot, git, fs) ?? validateCleanWorktree(workspaceRoot, git);
+        validateNoGitOperationInProgress(workspaceRoot, git, fs) ??
+        validateCleanWorktree(workspaceRoot, git) ??
+        validateManagedWorktreeMaterialization(workspaceRoot, git);
       if (cleanFailure) {
         return { ...cleanFailure, attempts };
       }
