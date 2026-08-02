@@ -384,7 +384,16 @@ secrets and does not force-push, reset, rebase, or select a silent winner.
 Fetch and push explicitly disable recursive submodule behavior, so synchronization
 does not contact or publish repositories referenced by submodules.
 Git command output is bounded at 64 MiB; an overflow fails without echoing the
-captured Knowledge content.
+captured Knowledge content. Each Git invocation is also non-interactive and
+bounded to two minutes; a timeout returns a typed command failure and releases
+the shared Knowledge lock.
+
+For automation, success exits `0`; rejected input exits `2`; and locked,
+conflict, unavailable, unsupported, or internal failures exit `1`. With
+`--json`, success and failure responses are written to stdout. Success includes
+`classification`, `commit`, and `attempts`; failure includes `status`, `reason`,
+and optional `conflictPaths` or `attempts`. Without `--json`, success is written
+to stdout and failures are written to stderr.
 
 Preflight also rejects unfinished merge/rebase/cherry-pick state, ignored or
 otherwise uncommitted managed Knowledge files, and tracked copies of the runtime
@@ -409,10 +418,12 @@ managed Knowledge file, including clean filters, `ident`,
 committed variants. Effective `core.autocrlf` values other than `false` or unset
 are rejected for the same reason. Tracked files carrying `skip-worktree` or
 `assume-unchanged` index flags are also rejected because those flags can hide
-uncommitted work from Git's cleanliness check. Structural log history must be
-valid UTF-8. Remove the transformation or index flag before retrying.
+uncommitted work from Git's cleanliness check. Structural log history and active
+pages must be valid UTF-8; active pages also cannot contain NUL bytes. Remove the
+transformation, invalid bytes, or index flag before retrying.
 
-Before convergence, both observed tips are retained under synthetic refs such as
+Before any history-changing convergence, both observed tips are retained under
+synthetic refs such as
 `refs/minime/knowledge-sync/recovery/local-<commit>` and
 `refs/minime/knowledge-sync/recovery/remote-<commit>`. Sync temporary worktrees
 are removed only after local and remote `main` are verified equal. Recovery refs
@@ -420,12 +431,18 @@ are removed only after both observed tips are reachable from that canonical
 commit; a failed or interrupted convergence retains recovery state for an
 idempotent retry.
 
+A nonzero result after candidate validation can mean canonical local `main` has
+already advanced, or that local and remote `main` converged but cleanup did not
+finish. Do not reset either branch. Rerun `knowledge sync`; retained recovery
+state makes that retry idempotent.
+
 Git handles ordinary three-way merges first. A conflicting managed page becomes
 one schema-valid unresolved page containing both complete committed variants,
 their source commit IDs, an explicit unresolved body marker, and `revisit_if`
 review guidance. Non-UTF-8 variants are retained as explicitly marked base64
-bytes. Divergent merges regenerate `wiki/index.md` from every active page and
-form a deterministic union of both structural logs. No-op and linear histories
+bytes. Divergent merges regenerate `wiki/index.md` from every active page in
+locale-independent UTF-8 byte order and form a deterministic union of both
+structural logs. No-op and linear histories
 instead require the committed index to already equal the complete generated
 corpus; ahead/behind histories must also preserve append-only ancestor log
 history. Conflicts outside managed Knowledge, or unsupported schema, issues, and

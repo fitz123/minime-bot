@@ -926,7 +926,7 @@ function isReadOnlyShellCommand(name: string, args: string[]): boolean {
 
 function isReadOnlyGitCommand(args: string[]): boolean {
   const subcommand = gitSubcommand(args);
-  return subcommand ? READ_ONLY_GIT_SUBCOMMANDS.has(subcommand) : false;
+  return subcommand ? subcommand === "add" || READ_ONLY_GIT_SUBCOMMANDS.has(subcommand) : false;
 }
 
 function gitSubcommand(args: string[]): string | undefined {
@@ -998,15 +998,24 @@ function gitWorktreeMutationTarget(
   if (explicitWorktree) {
     return explicitWorktree;
   }
-  if (
-    effectiveCwd &&
-    knownGitWorktreeRoot &&
-    insideOrSame(normalize(resolve(knownGitWorktreeRoot)), normalize(resolve(effectiveCwd))) &&
-    !hasNestedGitBoundary(effectiveCwd, knownGitWorktreeRoot)
-  ) {
-    return knownGitWorktreeRoot;
+  if (effectiveCwd && knownGitWorktreeRoot) {
+    const containedPaths = containedPathPair(knownGitWorktreeRoot, effectiveCwd);
+    if (containedPaths && !hasNestedGitBoundary(containedPaths.child, containedPaths.parent)) {
+      return knownGitWorktreeRoot;
+    }
   }
   return effectiveCwd;
+}
+
+function containedPathPair(parentPath: string, childPath: string): { parent: string; child: string } | undefined {
+  for (const parent of pathCandidates(parentPath)) {
+    for (const child of pathCandidates(childPath)) {
+      if (insideOrSame(parent, child)) {
+        return { parent, child };
+      }
+    }
+  }
+  return undefined;
 }
 
 function hasNestedGitBoundary(path: string, outerWorktreeRoot: string): boolean {

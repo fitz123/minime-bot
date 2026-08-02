@@ -229,6 +229,26 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
   });
 
+  it("does not create recovery refs for an already converged no-op", () => {
+    const fixture = createSyncFixture();
+    let recoveryRefCreations = 0;
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) === "update-ref" && !args.includes("-d")) {
+          recoveryRefCreations += 1;
+          return { status: 1, stdout: "", stderr: "unexpected recovery ref creation" };
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "no-op");
+    assert.equal(recoveryRefCreations, 0);
+  });
+
   it("does not repeat full corpus validation when canonical HEAD is unchanged", () => {
     const fixture = createSyncFixture();
     let attributeChecks = 0;
@@ -259,6 +279,49 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(response.ok, false);
     assert.equal(response.reason, "candidate-structural-log-missing");
     assert.equal(localHead(fixture), remoteHead(fixture));
+  });
+
+  it("rejects active pages containing invalid UTF-8 or NUL bytes", () => {
+    for (const [name, invalidSuffix] of [
+      ["invalid-utf8", Buffer.from([0xff, 0xfe])],
+      ["nul", Buffer.from([0x00])],
+    ] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/reference/${name}.md`;
+      const pagePath = join(fixture.workspace, ...relPath.split("/"));
+      const validPage = page(
+        "Invalid byte fixture",
+        "A page whose committed body bytes are invalid.",
+        "reference",
+        "Valid body before corruption.\n",
+      );
+      commitFiles(fixture.workspace, `add ${name} page`, {
+        [relPath]: validPage,
+        "wiki/index.md": generateKnowledgeIndex([
+          {
+            absPath: pagePath,
+            relPath,
+            linkPath: `pages/reference/${name}.md`,
+            frontmatter: {
+              name: "Invalid byte fixture",
+              description: "A page whose committed body bytes are invalid.",
+              type: "reference",
+            },
+          },
+        ]),
+      });
+      writeFileSync(pagePath, Buffer.concat([Buffer.from(validPage, "utf8"), invalidSuffix]));
+      git(fixture.workspace, ["add", relPath]);
+      git(fixture.workspace, ["commit", "-m", `commit ${name} page bytes`]);
+      git(fixture.workspace, ["push", "origin", "main"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, name);
+      assert.equal(response.reason, "candidate-page-invalid", name);
+      assert.match(response.message, /valid UTF-8 Markdown without NUL bytes/, name);
+      assert.equal(localHead(fixture), remoteHead(fixture), name);
+    }
   });
 
   it("rejects stale committed indexes in no-op, ahead, and behind histories", () => {
@@ -1348,6 +1411,12 @@ describe("knowledge sync Git convergence", () => {
 
   it("retries cleanup when a reachable recovery ref cannot initially be deleted", () => {
     const fixture = createSyncFixture();
+    const tip = localHead(fixture);
+    git(fixture.workspace, [
+      "update-ref",
+      `refs/minime/knowledge-sync/recovery/local-${tip}`,
+      tip,
+    ]);
     let refusedDeletion = false;
 
     const interrupted = executeKnowledgeSync({
@@ -2268,6 +2337,119 @@ describe("knowledge sync validation and failure boundaries", () => {
     assert.equal(localHead(fixture), beforeHead);
     assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), beforeStatus);
     assert.equal(readFileSync(readmePath, "utf8"), beforeReadme);
+  });
+
+  it("ignores an ambient alternate Git index when checking canonical cleanliness", () => {
+    const fixture = createSyncFixture();
+    const alternateIndex = join(fixture.root, "alternate-index");
+    const readmePath = join(fixture.workspace, "README.md");
+    writeFileSync(alternateIndex, readFileSync(join(fixture.workspace, ".git", "index")));
+    writeFileSync(readmePath, "# Agent workspace\n\nStaged only in the alternate index.\n", "utf8");
+    const staged = spawnSync("git", ["add", "README.md"], {
+      cwd: fixture.workspace,
+      env: { ...process.env, ...ISOLATED_GIT_ENV, GIT_INDEX_FILE: alternateIndex },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.equal(staged.status, 0, staged.stderr);
+    assert.match(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), /README\.md/);
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      env: { GIT_INDEX_FILE: alternateIndex },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "dirty-worktree");
+    assert.match(readFileSync(readmePath, "utf8"), /alternate index/);
+  });
+
+  it("does not let submodule ignore or fsmonitor config hide dirty input", () => {
+    const fixture = createSyncFixture();
+    const submoduleSource = join(fixture.root, "submodule-source");
+    mkdirSync(submoduleSource, { recursive: true });
+    git(submoduleSource, ["init", "--initial-branch=main"]);
+    configureIdentity(submoduleSource);
+    commitFiles(submoduleSource, "initial submodule content", {
+      "README.md": "# Submodule\n",
+    });
+    git(fixture.workspace, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "--name",
+      "knowledge-fixture",
+      submoduleSource,
+      "vendor/dependency",
+    ]);
+    git(fixture.workspace, ["commit", "-m", "track submodule fixture"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+    git(fixture.workspace, ["config", "submodule.knowledge-fixture.ignore", "all"]);
+    writeFileSync(join(fixture.workspace, "vendor/dependency/README.md"), "# Dirty submodule\n", "utf8");
+    assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    const statusCalls: string[][] = [];
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      git: (args, options) => {
+        if (gitCommand(args) === "status") {
+          statusCalls.push([...args]);
+        }
+        return defaultKnowledgeSyncGitRunner(args, options);
+      },
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "dirty-worktree");
+    assert.ok(statusCalls.length > 0);
+    assert.ok(statusCalls.every((args) =>
+      args.includes("core.fsmonitor=false") && args.includes("--ignore-submodules=none")
+    ));
+  });
+
+  it("times out stalled non-interactive Git commands and releases the Knowledge lock", () => {
+    const fixture = createSyncFixture();
+    const fakeBin = join(fixture.root, "fake-bin");
+    const fakeGit = join(fakeBin, "git");
+    const promptCapture = join(fixture.root, "git-prompt-environment");
+    const gitLookup = spawnSync("which", ["git"], { encoding: "utf8" });
+    assert.equal(gitLookup.status, 0);
+    const realGit = gitLookup.stdout.trim();
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      fakeGit,
+      [
+        "#!/bin/sh",
+        "for arg in \"$@\"; do",
+        "  if [ \"$arg\" = \"fetch\" ]; then",
+        "    printf '%s|%s|%s\\n' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\" \"$SSH_ASKPASS_REQUIRE\" > \"$PROMPT_CAPTURE\"",
+        "    exec sleep 10",
+        "  fi",
+        "done",
+        `exec ${JSON.stringify(realGit)} \"$@\"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(fakeGit, 0o755);
+    const startedAt = Date.now();
+
+    const response = executeKnowledgeSync({
+      agentWorkspaceRoot: fixture.workspace,
+      env: {
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        PROMPT_CAPTURE: promptCapture,
+      },
+      git: (args, options) => defaultKnowledgeSyncGitRunner(args, { ...options, timeoutMs: 1_000 }),
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "fetch-failed");
+    assert.match(response.message, /timed out after 1000 ms/);
+    assert.equal(Date.now() - startedAt < 5_000, true);
+    assert.equal(readFileSync(promptCapture, "utf8"), "0|Never|never\n");
+    assert.equal(existsSync(join(fixture.workspace, ".tmp/knowledge-update.lock")), false);
   });
 
   it("rejects an unfinished merge even when porcelain status is empty", () => {

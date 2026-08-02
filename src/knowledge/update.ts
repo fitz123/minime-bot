@@ -685,6 +685,10 @@ export function formatKnowledgePage(frontmatter: KnowledgePageFrontmatter, body:
   return `---\n${formatFrontmatter(frontmatter)}\n---\n\n${normalizedBody}`;
 }
 
+export function compareKnowledgePaths(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 function safeRealpath(path: string, fs: KnowledgeUpdateFs): string | undefined {
   try {
     return fs.realpathSync(path);
@@ -709,7 +713,7 @@ function walkPageFiles(
     return failure("rejected", "path-unreadable", "knowledge_update could not enumerate active Knowledge pages.");
   }
 
-  for (const dirent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const dirent of dirents.sort((a, b) => compareKnowledgePaths(a.name, b.name))) {
     const absPath = join(dir, dirent.name);
     if (dirent.isSymbolicLink()) {
       return failure("rejected", "symlink-escape", "knowledge_update refuses to index symlinked wiki pages.");
@@ -741,7 +745,16 @@ function parseExistingPage(
   relPath: string,
   fs: KnowledgeUpdateFs,
 ): ParsedPage | KnowledgeUpdateFailure {
-  const frontmatterResult = parseMarkdownFrontmatter(fs.readFileSync(absPath, "utf8"));
+  const pageBytes = fs.readFileSync(absPath);
+  const pageText = pageBytes.toString("utf8");
+  if (pageBytes.includes(0) || !Buffer.from(pageText, "utf8").equals(pageBytes)) {
+    return failure(
+      "rejected",
+      "invalid-page-encoding",
+      "Knowledge v2 active pages must be valid UTF-8 Markdown without NUL bytes.",
+    );
+  }
+  const frontmatterResult = parseMarkdownFrontmatter(pageText);
   if (isUpdateFailure(frontmatterResult)) {
     return frontmatterResult;
   }
@@ -778,7 +791,7 @@ export function collectKnowledgePages(
   if (problem) {
     return problem;
   }
-  return pages.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return pages.sort((a, b) => compareKnowledgePaths(a.relPath, b.relPath));
 }
 
 function pageTypeForRelPath(relPath: string): KnowledgePageType | undefined {
@@ -1553,7 +1566,7 @@ function executeWriteRequest(
   };
   const pagesByPath = new Map(beforePages.map((page) => [page.relPath, page]));
   pagesByPath.set(request.relPath, pageForIndex);
-  const nextPages = [...pagesByPath.values()].sort((a, b) => a.relPath.localeCompare(b.relPath));
+  const nextPages = [...pagesByPath.values()].sort((a, b) => compareKnowledgePaths(a.relPath, b.relPath));
   const pathProblem = validateIndexAndLogPaths(layout, fs);
   if (pathProblem) {
     return pathProblem;

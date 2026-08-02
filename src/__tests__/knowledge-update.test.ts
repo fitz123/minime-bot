@@ -24,6 +24,8 @@ import { generateKnowledgeV2Schema, resolveKnowledgeLayout } from "../knowledge/
 import { executeKnowledgeSearch } from "../knowledge/tools.js";
 import {
   acquireKnowledgeUpdateLock,
+  collectKnowledgePages,
+  compareKnowledgePaths,
   executeKnowledgeUpdate,
   formatKnowledgePage,
   formatKnowledgeUpdateResponse,
@@ -79,6 +81,33 @@ function pageFrontmatter(name: string, type = "project"): Record<string, unknown
 }
 
 describe("knowledge_update", () => {
+  it("orders Unicode page paths by locale-independent UTF-8 bytes", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/reference/ä.md": formatKnowledgePage(
+        { name: "Umlaut", description: "Unicode page ordering.", type: "reference" },
+        "# Umlaut\n",
+      ),
+      "wiki/pages/reference/z.md": formatKnowledgePage(
+        { name: "Zed", description: "ASCII page ordering.", type: "reference" },
+        "# Zed\n",
+      ),
+    });
+    const layout = resolveKnowledgeLayout(workspace);
+    assert.equal(layout.kind, "v2");
+    if (layout.kind !== "v2") {
+      return;
+    }
+
+    const pages = collectKnowledgePages(layout);
+
+    assert.ok(Array.isArray(pages));
+    assert.deepEqual(pages.map((entry) => entry.relPath), [
+      "wiki/pages/reference/z.md",
+      "wiki/pages/reference/ä.md",
+    ]);
+    assert.equal(compareKnowledgePaths("z", "ä") < 0, true);
+  });
+
   it("treats an explicit empty env as authoritative over the process env", () => {
     const workspace = createV2Workspace();
     const previous = process.env[MINIME_AGENT_WORKSPACE_ROOT_ENV];

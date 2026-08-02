@@ -74,6 +74,7 @@ export interface KnowledgeSyncGitResult {
 export interface KnowledgeSyncGitOptions {
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
 }
 
 export type KnowledgeSyncGitRunner = (
@@ -118,7 +119,20 @@ const LOCK_RECLAIM_RELPATH = ".tmp/knowledge-update.lock.reclaim" as const;
 const SYNC_WORKTREE_MARKER = ".minime-knowledge-sync-owner.json";
 const MAX_ATTEMPTS = 2;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 const DISABLE_GIT_HOOKS = ["-c", "core.hooksPath=/dev/null"] as const;
+const REPOSITORY_SCOPING_GIT_ENV = [
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_QUARANTINE_PATH",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE",
+  "GIT_WORK_TREE",
+] as const;
 const FIXED_GIT_IDENTITY_ENV = {
   GIT_AUTHOR_NAME: "minime-bot",
   GIT_AUTHOR_EMAIL: "minime-bot@users.noreply.github.com",
@@ -172,17 +186,26 @@ const defaultFs: KnowledgeSyncFs = {
 };
 
 export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, options) => {
+  const env = { ...process.env, ...(options.env ?? {}) };
+  for (const name of REPOSITORY_SCOPING_GIT_ENV) {
+    delete env[name];
+  }
+  Object.assign(env, {
+    GCM_INTERACTIVE: "Never",
+    GIT_GRAFT_FILE: "/dev/null",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS_REQUIRE: "never",
+  });
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   const result = spawnSync("git", [...args], {
     cwd: options.cwd,
     encoding: null,
-    env: {
-      ...process.env,
-      ...(options.env ?? {}),
-      GIT_GRAFT_FILE: "/dev/null",
-      GIT_NO_REPLACE_OBJECTS: "1",
-    },
+    env,
+    killSignal: "SIGKILL",
     maxBuffer: MAX_GIT_OUTPUT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
   });
   const executionError = result.error as NodeJS.ErrnoException | undefined;
   const stdoutBytes = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
@@ -196,6 +219,8 @@ export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, opti
     stderr: executionError
       ? executionError.code === "ENOBUFS"
         ? "git output exceeded the 64 MiB knowledge sync limit."
+        : executionError.code === "ETIMEDOUT"
+          ? `git execution timed out after ${timeoutMs} ms.`
         : `git execution failed${executionError.code ? ` (${executionError.code})` : ""}.`
       : stderr,
   };
@@ -288,9 +313,12 @@ function validateMainBranch(workspaceRoot: string, git: KnowledgeSyncGitRunner):
 function validateCleanWorktree(workspaceRoot: string, git: KnowledgeSyncGitRunner): KnowledgeSyncFailure | undefined {
   const result = git(
     [
+      "-c",
+      "core.fsmonitor=false",
       "status",
       "--porcelain=v1",
       "--untracked-files=all",
+      "--ignore-submodules=none",
       "--",
       ".",
       `:(exclude)${LOCK_RELPATH}`,
@@ -2173,10 +2201,6 @@ function prepareCandidate(
         ...DISABLE_GIT_HOOKS,
         "-c",
         "commit.gpgSign=false",
-        "-c",
-        "user.name=minime-bot",
-        "-c",
-        "user.email=minime-bot@users.noreply.github.com",
         "commit",
         "-m",
         `knowledge sync: merge ${tips.remote.slice(0, 12)} into ${tips.local.slice(0, 12)}`,
@@ -2350,15 +2374,17 @@ export function executeKnowledgeSync(deps: KnowledgeSyncDeps = {}): KnowledgeSyn
       if ("ok" in fetchedTips) {
         return { ...fetchedTips, attempts };
       }
-      const preserveFailure = preserveTips(workspaceRoot, fetchedTips, git);
-      if (preserveFailure) {
-        return { ...preserveFailure, attempts };
-      }
       const classification = classifyTips(workspaceRoot, fetchedTips, git);
       if (typeof classification !== "string") {
         return { ...classification, attempts };
       }
       initialClassification ??= classification;
+      if (classification !== "no-op") {
+        const preserveFailure = preserveTips(workspaceRoot, fetchedTips, git);
+        if (preserveFailure) {
+          return { ...preserveFailure, attempts };
+        }
+      }
 
       const convergence = convergeAttempt(workspaceRoot, fetchedTips, classification, deps, git, fs);
       if (!convergence.ok) {

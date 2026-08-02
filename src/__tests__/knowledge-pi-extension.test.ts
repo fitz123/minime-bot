@@ -503,6 +503,7 @@ describe("Knowledge Pi extension helpers", () => {
       "node inspect.js .",
       "npm test -- .",
       "git add .",
+      "git add -- wiki/pages/project/runtime.md wiki/index.md wiki/log.md",
       "git restore --staged :/",
       "git rm --cached -r :/",
     ]) {
@@ -515,6 +516,23 @@ describe("Knowledge Pi extension helpers", () => {
         command,
       );
     }
+  });
+
+  it("maps raw Git worktree mutations through a symlinked workspace root", () => {
+    const workspace = createV2Workspace();
+    const notes = join(workspace, "notes");
+    const workspaceAlias = join(workspace, "workspace-alias");
+    mkdirSync(notes, { recursive: true });
+    symlinkSync(".", workspaceAlias);
+
+    const decision = classifyKnowledgeIntegrityToolCall(
+      { toolName: "bash", input: { command: "git merge origin/main" } },
+      { agentWorkspaceRoot: workspaceAlias, cwd: notes, env: {} },
+    );
+
+    assert.equal(decision?.block, true);
+    assert.equal(decision.targetPath, workspaceAlias);
+    assert.match(decision.reason, /raw Git worktree mutations are blocked/);
   });
 
   it("blocks symlink aliases that resolve into managed pages", () => {
