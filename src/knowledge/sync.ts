@@ -672,6 +672,7 @@ function validateEffectiveAutocrlf(
 function validateManagedCheckinTransformations(
   candidateRoot: string,
   git: KnowledgeSyncGitRunner,
+  cached = false,
 ): KnowledgeSyncFailure | undefined {
   const configProblem = validateEffectiveAutocrlf(candidateRoot, git);
   if (configProblem) {
@@ -681,7 +682,7 @@ function validateManagedCheckinTransformations(
   if (!Array.isArray(trackedPaths)) {
     return trackedPaths;
   }
-  return validateManagedCheckinAttributes(candidateRoot, trackedPaths, git);
+  return validateManagedCheckinAttributes(candidateRoot, trackedPaths, git, [], cached);
 }
 
 function validateManagedCheckinAttributes(
@@ -689,10 +690,19 @@ function validateManagedCheckinAttributes(
   trackedPaths: readonly string[],
   git: KnowledgeSyncGitRunner,
   configArgs: readonly string[] = [],
+  cached = false,
 ): KnowledgeSyncFailure | undefined {
   for (const relPath of trackedPaths) {
     const result = git(
-      [...configArgs, "check-attr", "-z", ...CHECKIN_TRANSFORMATION_ATTRIBUTES, "--", relPath],
+      [
+        ...configArgs,
+        "check-attr",
+        ...(cached ? ["--cached"] : []),
+        "-z",
+        ...CHECKIN_TRANSFORMATION_ATTRIBUTES,
+        "--",
+        relPath,
+      ],
       { cwd: candidateRoot },
     );
     if (result.status !== 0) {
@@ -781,6 +791,9 @@ function validateCanonicalCheckinTransformations(
   if (!attributesFile) {
     return undefined;
   }
+  const canonicalAttributesFile = isAbsolute(attributesFile)
+    ? attributesFile
+    : resolve(workspaceRoot, attributesFile);
   const trackedPaths = trackedManagedKnowledgePaths(candidateRoot, git);
   if (!Array.isArray(trackedPaths)) {
     return trackedPaths;
@@ -789,8 +802,56 @@ function validateCanonicalCheckinTransformations(
     candidateRoot,
     trackedPaths,
     git,
-    ["-c", `core.attributesFile=${attributesFile}`],
+    ["-c", `core.attributesFile=${canonicalAttributesFile}`],
   );
+}
+
+function disabledConfiguredFilterArgs(
+  candidateRoot: string,
+  git: KnowledgeSyncGitRunner,
+): string[] | KnowledgeSyncFailure {
+  const configured = git(
+    [
+      "config",
+      "--null",
+      "--name-only",
+      "--get-regexp",
+      "^filter\\..*\\.(clean|smudge|process|required)$",
+    ],
+    { cwd: candidateRoot },
+  );
+  if (configured.status === 1 && !configured.stdout) {
+    return [];
+  }
+  if (configured.status !== 0) {
+    return failure(
+      "error",
+      "candidate-managed-config-inspection-failed",
+      `knowledge sync could not inspect configured Git filters: ${errorText(configured)}`,
+    );
+  }
+  const drivers = new Set<string>();
+  for (const key of configured.stdout.split("\0").filter(Boolean)) {
+    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/iu.exec(key);
+    if (!match?.[1]) {
+      return failure(
+        "error",
+        "candidate-managed-config-inspection-failed",
+        "knowledge sync could not parse a configured Git filter name.",
+      );
+    }
+    drivers.add(match[1]);
+  }
+  return [...drivers].sort().flatMap((driver) => [
+    "-c",
+    `filter.${driver}.clean=`,
+    "-c",
+    `filter.${driver}.smudge=`,
+    "-c",
+    `filter.${driver}.process=`,
+    "-c",
+    `filter.${driver}.required=false`,
+  ]);
 }
 
 function validateManagedWorktreeMaterialization(
@@ -1856,6 +1917,58 @@ function reconcileDerivedKnowledgeState(
   return invalid ?? undefined;
 }
 
+function materializeTemporaryWorktree(
+  candidateRoot: string,
+  startCommit: string,
+  tips: GitTips,
+  classification: "behind" | "diverged",
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const commitsToInspect = classification === "diverged"
+    ? [startCommit, tips.remote]
+    : [startCommit];
+  for (const commit of commitsToInspect) {
+    const populated = git(["read-tree", "--reset", commit], { cwd: candidateRoot });
+    if (populated.status !== 0) {
+      return failure(
+        "error",
+        "candidate-index-create-failed",
+        `knowledge sync could not prepare an isolated candidate index: ${errorText(populated)}`,
+      );
+    }
+    const transformationProblem = validateManagedCheckinTransformations(candidateRoot, git, true);
+    if (transformationProblem) {
+      return transformationProblem;
+    }
+  }
+  if (commitsToInspect.at(-1) !== startCommit) {
+    const restored = git(["read-tree", "--reset", startCommit], { cwd: candidateRoot });
+    if (restored.status !== 0) {
+      return failure(
+        "error",
+        "candidate-index-create-failed",
+        `knowledge sync could not restore its isolated candidate index: ${errorText(restored)}`,
+      );
+    }
+  }
+  const filterArgs = disabledConfiguredFilterArgs(candidateRoot, git);
+  if (!Array.isArray(filterArgs)) {
+    return filterArgs;
+  }
+  const materialized = git(
+    [...filterArgs, ...DISABLE_GIT_HOOKS, "checkout-index", "--all", "--force"],
+    { cwd: candidateRoot },
+  );
+  if (materialized.status !== 0) {
+    return failure(
+      "error",
+      "candidate-worktree-materialization-failed",
+      `knowledge sync could not materialize its validated candidate worktree: ${errorText(materialized)}`,
+    );
+  }
+  return undefined;
+}
+
 function withTemporaryWorktree(
   workspaceRoot: string,
   startCommit: string,
@@ -1889,9 +2002,10 @@ function withTemporaryWorktree(
         `knowledge sync could not reset its retained candidate worktree: ${errorText(removed)}`,
       );
     }
-    const added = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", reusable.path, startCommit], {
-      cwd: workspaceRoot,
-    });
+    const added = git(
+      [...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", "--no-checkout", reusable.path, startCommit],
+      { cwd: workspaceRoot },
+    );
     if (added.status !== 0) {
       try {
         fs.rmSync(dirname(reusable.path), { recursive: true, force: true });
@@ -1903,6 +2017,16 @@ function withTemporaryWorktree(
         "candidate-worktree-create-failed",
         `knowledge sync could not recreate its isolated candidate worktree: ${errorText(added)}`,
       );
+    }
+    const materializationFailure = materializeTemporaryWorktree(
+      reusable.path,
+      startCommit,
+      tips,
+      classification,
+      git,
+    );
+    if (materializationFailure) {
+      return materializationFailure;
     }
     return work(reusable.path);
   }
@@ -1930,9 +2054,10 @@ function withTemporaryWorktree(
     }
     return markerFailure;
   }
-  const add = git([...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", candidateRoot, startCommit], {
-    cwd: workspaceRoot,
-  });
+  const add = git(
+    [...DISABLE_GIT_HOOKS, "worktree", "add", "--detach", "--no-checkout", candidateRoot, startCommit],
+    { cwd: workspaceRoot },
+  );
   if (add.status !== 0) {
     try {
       fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -1944,6 +2069,16 @@ function withTemporaryWorktree(
       "candidate-worktree-create-failed",
       `knowledge sync could not create an isolated candidate worktree: ${errorText(add)}`,
     );
+  }
+  const materializationFailure = materializeTemporaryWorktree(
+    candidateRoot,
+    startCommit,
+    tips,
+    classification,
+    git,
+  );
+  if (materializationFailure) {
+    return materializationFailure;
   }
   return work(candidateRoot);
 }
@@ -2128,8 +2263,21 @@ function prepareCandidate(
     if (mergeDriverProblem) {
       return mergeDriverProblem;
     }
+    const filterArgs = disabledConfiguredFilterArgs(candidateRoot, git);
+    if (!Array.isArray(filterArgs)) {
+      return filterArgs;
+    }
     const merged = git(
-      [...DISABLE_GIT_HOOKS, "-c", "rerere.enabled=false", "merge", "--no-ff", "--no-commit", tips.remote],
+      [
+        ...filterArgs,
+        ...DISABLE_GIT_HOOKS,
+        "-c",
+        "rerere.enabled=false",
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        tips.remote,
+      ],
       { cwd: candidateRoot },
     );
     const conflictPaths = unresolvedConflictPaths(candidateRoot, git);

@@ -418,6 +418,91 @@ describe("knowledge sync Git convergence", () => {
     assert.deepEqual(recoveryRefs(fixture), []);
   });
 
+  it("rejects a fetched managed smudge filter before materializing its page", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind-smudge-filter");
+    const localTip = localHead(fixture);
+    const relPath = "wiki/pages/reference/behind-smudge-filter.md";
+    const remotePage = page(
+      "Behind smudge filter",
+      "A fetched page whose attribute must be rejected before checkout.",
+      "reference",
+      "Fetched committed Knowledge.\n",
+    );
+    const remoteTip = commitFiles(peer, "add fetched smudge-filter page", {
+      ".gitattributes": `${relPath} filter=side-effect\n`,
+      [relPath]: remotePage,
+      "wiki/index.md": generateKnowledgeIndex([
+        {
+          absPath: join(peer, ...relPath.split("/")),
+          relPath,
+          linkPath: "pages/reference/behind-smudge-filter.md",
+          frontmatter: {
+            name: "Behind smudge filter",
+            description: "A fetched page whose attribute must be rejected before checkout.",
+            type: "reference",
+          },
+        },
+      ]),
+    });
+    git(peer, ["push", "origin", "main"]);
+    const sideEffectPath = join(fixture.root, "smudge-filter-ran");
+    git(fixture.workspace, ["config", "filter.side-effect.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.side-effect.smudge", `tee '${sideEffectPath}'`]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(existsSync(sideEffectPath), false);
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("resolves relative canonical attributes before validating a behind candidate", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-behind-relative-attributes");
+    const localTip = localHead(fixture);
+    const relPath = "wiki/pages/reference/behind-relative-attributes.md";
+    const remotePage = page(
+      "Behind relative attributes",
+      "A fetched page covered by a canonical relative attributes file.",
+      "reference",
+      "Fetched committed Knowledge.\n",
+    );
+    const remoteTip = commitFiles(peer, "add relative-attribute page", {
+      [relPath]: remotePage,
+      "wiki/index.md": generateKnowledgeIndex([
+        {
+          absPath: join(peer, ...relPath.split("/")),
+          relPath,
+          linkPath: "pages/reference/behind-relative-attributes.md",
+          frontmatter: {
+            name: "Behind relative attributes",
+            description: "A fetched page covered by a canonical relative attributes file.",
+            type: "reference",
+          },
+        },
+      ]),
+    });
+    git(peer, ["push", "origin", "main"]);
+    writeFileSync(
+      join(fixture.workspace, ".git", "info", "sync-attributes"),
+      `${relPath} filter=relative\n`,
+      "utf8",
+    );
+    git(fixture.workspace, ["config", "core.attributesFile", ".git/info/sync-attributes"]);
+    git(fixture.workspace, ["config", "filter.relative.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.relative.smudge", "cat"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
   it("does not fast-forward behind main when a canonical managed file is hidden from the worktree", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-behind-hidden-canonical");
@@ -2037,6 +2122,49 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
 
     assert.equal(response.ok, false);
     assert.equal(response.reason, "candidate-unsupported-checkin-transformation");
+    assert.equal(localHead(fixture), localTip);
+    assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("rejects a divergent remote smudge filter before merging its page", () => {
+    const fixture = createSyncFixture();
+    const peer = cloneRemote(fixture, "peer-remote-smudge-filter");
+    const localTip = commitFiles(fixture.workspace, "add local history before remote smudge filter", {
+      "diary/local-smudge-filter.md": "# Local history\n",
+    });
+    const relPath = "wiki/pages/reference/remote-smudge-filter.md";
+    const remotePage = page(
+      "Remote smudge filter",
+      "A divergent remote page whose filter must not run during merge.",
+      "reference",
+      "Remote committed Knowledge.\n",
+    );
+    const remoteTip = commitFiles(peer, "add divergent remote smudge-filter page", {
+      ".gitattributes": `${relPath} filter=side-effect\n`,
+      [relPath]: remotePage,
+      "wiki/index.md": generateKnowledgeIndex([
+        {
+          absPath: join(peer, ...relPath.split("/")),
+          relPath,
+          linkPath: "pages/reference/remote-smudge-filter.md",
+          frontmatter: {
+            name: "Remote smudge filter",
+            description: "A divergent remote page whose filter must not run during merge.",
+            type: "reference",
+          },
+        },
+      ]),
+    });
+    git(peer, ["push", "origin", "main"]);
+    const sideEffectPath = join(fixture.root, "merge-smudge-filter-ran");
+    git(fixture.workspace, ["config", "filter.side-effect.clean", "cat"]);
+    git(fixture.workspace, ["config", "filter.side-effect.smudge", `tee '${sideEffectPath}'`]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, "candidate-unsupported-clean-filter");
+    assert.equal(existsSync(sideEffectPath), false);
     assert.equal(localHead(fixture), localTip);
     assert.equal(remoteHead(fixture), remoteTip);
   });
