@@ -978,6 +978,14 @@ export class SessionManager {
         session.processingStartedAt = null;
         this.settlePendingSteers(session);
         finish(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        // A busy idle deadline is ignored below. Once this queue task reaches
+        // its terminal boundary, start a fresh full idle window only if this
+        // is still the chat's active incarnation; /clean or /reconnect may
+        // already have replaced it.
+        if (this.active.get(chatId) === session) {
+          this.resetIdleTimer(chatId);
+        }
       }
     });
 
@@ -1098,7 +1106,7 @@ export class SessionManager {
     this.resetIdleTimer(chatId);
   }
 
-  /** Reset the idle timer for a session. After timeout, session is closed. */
+  /** Reset the idle timer for a session. After an idle timeout, session is closed. */
   resetIdleTimer(chatId: string): void {
     const session = this.active.get(chatId);
     if (!session) return;
@@ -1108,6 +1116,15 @@ export class SessionManager {
     }
 
     session.idleTimer = setTimeout(() => {
+      session.idleTimer = null;
+      if (
+        this.active.get(chatId) !== session ||
+        session.processingStartedAt !== null ||
+        session.queue.pending > 0 ||
+        session.queue.size > 0
+      ) {
+        return;
+      }
       this.closeSession(chatId).catch(() => {});
     }, session.idleTimeoutMs);
   }
