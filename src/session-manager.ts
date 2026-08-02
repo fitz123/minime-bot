@@ -581,16 +581,6 @@ export class SessionManager {
       return this.publishPreseededBinding(chatId, agentId, agent, undefined, location);
     }
 
-    const agentDeleted = !(stored.agentId in config.agents);
-    if (stored.agentId !== agentId || agentDeleted) {
-      const reason = agentDeleted
-        ? `agent "${stored.agentId}" no longer exists`
-        : `agentId changed from "${stored.agentId}" to "${agentId}"`;
-      log.warn("session-manager", `Replacing stored session for chat ${chatId}: ${reason}`);
-      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
-      return this.publishPreseededBinding(chatId, agentId, agent, stored, location);
-    }
-
     if (stored.bindingState === "legacy-unresolved") {
       return this.publishPreseededBinding(
         chatId,
@@ -599,6 +589,28 @@ export class SessionManager {
         stored,
         location,
         { failedSessionId: stored.failedSessionId, reason: "legacy-unresolved" },
+      );
+    }
+
+    const agentDeleted = !(stored.agentId in config.agents);
+    if (stored.agentId !== agentId || agentDeleted) {
+      const reason = agentDeleted
+        ? `agent "${stored.agentId}" no longer exists`
+        : `agentId changed from "${stored.agentId}" to "${agentId}"`;
+      log.warn("session-manager", `Replacing stored session for chat ${chatId}: ${reason}`);
+      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
+      return this.publishPreseededBinding(
+        chatId,
+        agentId,
+        agent,
+        stored,
+        location,
+        stored.pendingRecoveryNotice
+          ? {
+            failedSessionId: stored.pendingRecoveryNotice.failedSessionId,
+            reason: stored.pendingRecoveryNotice.reason,
+          }
+          : undefined,
       );
     }
 

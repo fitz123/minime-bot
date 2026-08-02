@@ -960,6 +960,57 @@ describe("SessionManager exact Pi binding startup", () => {
     releaseMediaPath(inflightPath);
     await manager.closeAll();
   });
+
+  it("retains an unavailable legacy agent's failed ID when binding the replacement agent", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("legacy-agent-unavailable", {
+      bindingState: "legacy-unresolved",
+      failedSessionId: "legacy-failed-id",
+      legacyFailure: "agent-unavailable",
+      chatId: "legacy-agent-unavailable",
+      agentId: "removed-agent",
+      lastActivity: Date.now(),
+    });
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("legacy-agent-unavailable", "pi");
+
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("legacy-agent-unavailable")?.pendingRecoveryNotice,
+      {
+        failedSessionId: "legacy-failed-id",
+        replacementSessionId: session.sessionId,
+        reason: "legacy-unresolved",
+      },
+    );
+    await manager.closeAll();
+  });
+
+  it("carries a durable recovery notice across an agent rebind", async () => {
+    const prior = storedPiBinding("pending-agent-switch", "first-replacement-id", {
+      pendingRecoveryNotice: {
+        failedSessionId: "original-failed-id",
+        replacementSessionId: "first-replacement-id",
+        reason: "missing",
+      },
+    });
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pending-agent-switch", prior);
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pending-agent-switch", "main");
+
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pending-agent-switch")?.pendingRecoveryNotice,
+      {
+        failedSessionId: "original-failed-id",
+        replacementSessionId: session.sessionId,
+        reason: "missing",
+      },
+    );
+    await manager.closeAll();
+  });
 });
 
 describe("SessionManager exact-path recovery", () => {

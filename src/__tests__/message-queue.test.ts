@@ -226,6 +226,49 @@ describe("MessageQueue recovery notices", () => {
       "prompt:next message",
     ]);
   });
+
+  it("prepares a collected follow-up before checking for its recovery notice", async () => {
+    const events: string[] = [];
+    let releaseInitial!: () => void;
+    const initialBlocked = new Promise<void>((resolve) => { releaseInitial = resolve; });
+    let processCount = 0;
+    let noticePending = false;
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, text) => {
+        processCount += 1;
+        events.push(`prompt:${text}`);
+        if (processCount === 1) await initialBlocked;
+      },
+      {
+        debounceMs: 10,
+        prepareSessionFn: async () => {
+          events.push(`prepare:${processCount + 1}`);
+          if (processCount === 1) noticePending = true;
+        },
+        recoveryNoticeFn: async () => {
+          if (!noticePending) return;
+          events.push("notice");
+          noticePending = false;
+        },
+      },
+    );
+    const platform = mockPlatform(undefined, false);
+
+    queue.enqueue("chat1", "main", "initial", platform);
+    await wait(30);
+    queue.enqueue("chat1", "main", "follow-up", platform);
+    releaseInitial();
+    await wait(50);
+
+    assert.deepStrictEqual(events, [
+      "prepare:1",
+      "prompt:initial",
+      "prepare:2",
+      "notice",
+      "prompt:follow-up",
+    ]);
+    queue.clearAll();
+  });
 });
 
 // -------------------------------------------------------------------

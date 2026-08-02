@@ -373,6 +373,7 @@ export class MessageQueue {
       try {
         if (state.latestPlatform) {
           try {
+            await this.prepareSessionFn?.(chatId, state.agentId);
             await this.deliverRecoveryNotice(chatId, state.agentId, state.latestPlatform);
             await this.processFn(chatId, state.agentId, prompt, state.latestPlatform, transferOwnership);
           } finally {
