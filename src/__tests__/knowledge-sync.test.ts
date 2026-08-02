@@ -137,6 +137,41 @@ function createSyncFixture(): SyncFixture {
   return { root, workspace, remote };
 }
 
+function createPreV2SyncFixture(withLegacyWikiControls = false): SyncFixture {
+  const root = mkdtempSync(join(tmpdir(), "minime-knowledge-sync-pre-v2-test-"));
+  fixtures.push(root);
+  const workspace = join(root, "workspace");
+  const remote = join(root, "remote.git");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(remote, { recursive: true });
+  git(remote, ["init", "--bare", "--initial-branch=main"]);
+  git(workspace, ["init", "--initial-branch=main"]);
+  configureIdentity(workspace);
+  git(workspace, ["config", "core.autocrlf", "false"]);
+  commitFiles(workspace, "initial pre-v2 workspace", {
+    ".gitignore": ".tmp/\n",
+    "MEMORY.md": "# Legacy memory\n",
+    ...(withLegacyWikiControls
+      ? {
+        "wiki/schema.md": "---\nformat: karpathy-llm-wiki\nversion: 1\n---\n",
+        "wiki/index.md": "# Legacy index\n",
+        "wiki/log.md": "# Legacy structural log\n",
+      }
+      : {}),
+  });
+  git(workspace, ["remote", "add", "origin", remote]);
+  git(workspace, ["push", "-u", "origin", "main"]);
+  return { root, workspace, remote };
+}
+
+function emptyKnowledgeV2Files(): Record<string, string> {
+  return {
+    "wiki/schema.md": generateKnowledgeV2Schema(),
+    "wiki/index.md": generateKnowledgeIndex([]),
+    "wiki/log.md": "",
+  };
+}
+
 function cloneRemote(fixture: SyncFixture, name: string): string {
   const clone = join(fixture.root, name);
   git(fixture.root, ["clone", fixture.remote, clone]);
@@ -594,6 +629,44 @@ describe("knowledge sync Git convergence", () => {
     assert.equal(response.commit, localCommit);
     assert.equal(remoteHead(fixture), localCommit);
     assert.deepEqual(recoveryRefs(fixture), []);
+  });
+
+  it("pushes the commit that first migrates an ahead workspace to Knowledge v2", () => {
+    const fixture = createPreV2SyncFixture();
+    const migratedTip = commitFiles(
+      fixture.workspace,
+      "migrate workspace to Knowledge v2",
+      emptyKnowledgeV2Files(),
+    );
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "ahead");
+    assert.equal(response.commit, migratedTip);
+    assert.equal(remoteHead(fixture), migratedTip);
+  });
+
+  it("reconciles branches that independently introduced Knowledge v2", () => {
+    const fixture = createPreV2SyncFixture(true);
+    const peer = cloneRemote(fixture, "peer-pre-v2-migration");
+    const localTip = commitFiles(fixture.workspace, "migrate local workspace to Knowledge v2", {
+      ...emptyKnowledgeV2Files(),
+      "diary/local-migration.md": "# Local migration\n",
+    });
+    const remoteTip = commitFiles(peer, "migrate remote workspace to Knowledge v2", {
+      ...emptyKnowledgeV2Files(),
+      "diary/remote-migration.md": "# Remote migration\n",
+    });
+    git(peer, ["push", "origin", "main"]);
+
+    const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+    assertSyncOk(response);
+    assert.equal(response.classification, "diverged");
+    assertAncestor(fixture, localTip, response.commit);
+    assertAncestor(fixture, remoteTip, response.commit);
+    assert.equal(remoteHead(fixture), response.commit);
   });
 
   it("does not publish annotated tags when push.followTags is enabled", () => {

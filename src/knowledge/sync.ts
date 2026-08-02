@@ -20,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import {
+  parseKnowledgeV2SchemaMarker,
   resolveKnowledgeLayout,
   type ResolvedKnowledgeLayout,
   type ResolvedKnowledgeV2Layout,
@@ -1342,16 +1343,47 @@ function readRequiredStructuralLog(
   return result.content;
 }
 
+type HistoricalStructuralLog =
+  | { kind: "pre-v2" }
+  | { kind: "v2"; content: string };
+
+function readHistoricalStructuralLog(
+  candidateRoot: string,
+  commit: string,
+  git: KnowledgeSyncGitRunner,
+): HistoricalStructuralLog | KnowledgeSyncFailure {
+  const schema = readCommitFile(candidateRoot, commit, "wiki/schema.md", git);
+  if (!schema.ok) {
+    return schema;
+  }
+  const index = readCommitFile(candidateRoot, commit, "wiki/index.md", git);
+  if (!index.ok) {
+    return index;
+  }
+  const marker = schema.content === undefined
+    ? undefined
+    : parseKnowledgeV2SchemaMarker(schema.content);
+  if (!marker || index.content === undefined) {
+    return { kind: "pre-v2" };
+  }
+  const log = readRequiredStructuralLog(candidateRoot, commit, git);
+  return typeof log === "string" ? { kind: "v2", content: log } : log;
+}
+
 function validateStructuralLogCommit(
   candidateRoot: string,
   commit: string,
   parents: readonly string[],
   git: KnowledgeSyncGitRunner,
 ): KnowledgeSyncFailure | undefined {
-  const commitLog = readRequiredStructuralLog(candidateRoot, commit, git);
-  if (typeof commitLog !== "string") {
-    return commitLog;
+  const commitState = readHistoricalStructuralLog(candidateRoot, commit, git);
+  if (!("kind" in commitState)) {
+    return commitState;
   }
+  if (commitState.kind === "pre-v2") {
+    return undefined;
+  }
+  const commitLog = commitState.content;
   if (parents.length === 0) {
     return failure(
       "rejected",
@@ -1360,11 +1392,14 @@ function validateStructuralLogCommit(
     );
   }
   if (parents.length === 1) {
-    const parentLog = readRequiredStructuralLog(candidateRoot, parents[0], git);
-    if (typeof parentLog !== "string") {
-      return parentLog;
+    const parentState = readHistoricalStructuralLog(candidateRoot, parents[0], git);
+    if (!("kind" in parentState)) {
+      return parentState;
     }
-    return lineSequenceStartsWith(commitLog, parentLog)
+    if (parentState.kind === "pre-v2") {
+      return undefined;
+    }
+    return lineSequenceStartsWith(commitLog, parentState.content)
       ? undefined
       : failure(
         "rejected",
@@ -1381,19 +1416,26 @@ function validateStructuralLogCommit(
       `knowledge sync could not inspect the merge base for structural-log commit ${commit}: ${errorText(mergeBase)}`,
     );
   }
-  const baseLog = readRequiredStructuralLog(candidateRoot, mergeBase.stdout.trim(), git);
-  if (typeof baseLog !== "string") {
-    return baseLog;
+  const baseState = readHistoricalStructuralLog(candidateRoot, mergeBase.stdout.trim(), git);
+  if (!("kind" in baseState)) {
+    return baseState;
   }
   const parentLogs: string[] = [];
   for (const parent of parents) {
-    const parentLog = readRequiredStructuralLog(candidateRoot, parent, git);
-    if (typeof parentLog !== "string") {
-      return parentLog;
+    const parentState = readHistoricalStructuralLog(candidateRoot, parent, git);
+    if (!("kind" in parentState)) {
+      return parentState;
     }
-    parentLogs.push(parentLog);
+    if (parentState.kind === "v2") {
+      parentLogs.push(parentState.content);
+    }
   }
-  const expectedMergePrefix = `${stableLineUnion(baseLog, parentLogs).join("\n")}\n`;
+  if (parentLogs.length === 0) {
+    return undefined;
+  }
+  const baseLog = baseState.kind === "v2" ? baseState.content : "";
+  const expectedLines = stableLineUnion(baseLog, parentLogs);
+  const expectedMergePrefix = expectedLines.length === 0 ? "" : `${expectedLines.join("\n")}\n`;
   return lineSequenceStartsWith(commitLog, expectedMergePrefix)
     ? undefined
     : failure(
