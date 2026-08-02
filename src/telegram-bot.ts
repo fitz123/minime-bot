@@ -804,6 +804,10 @@ export function createTelegramBot(
     {
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
         sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued),
+      recoveryNoticeFn: async (chatId, agentId, platform) => {
+        await sessionManager.getOrCreateSession(chatId, agentId);
+        await sessionManager.deliverPendingRecoveryNotice(chatId, platform);
+      },
     },
   );
 
@@ -858,8 +862,8 @@ export function createTelegramBot(
   // Session lifecycle: create → compact → reconnect → resume. The reconnect
   // kills the Pi subprocess but the session file (with compacted conversation
   // history) remains on disk. When the next message arrives, getOrCreateSession()
-  // finds the file and resumes with --resume, so prior context may be partially
-  // retained through the compaction summary.
+  // validates the stored binding and opens that same absolute path, so prior
+  // context may be partially retained through the compaction summary.
   bot.command("reconnect", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);

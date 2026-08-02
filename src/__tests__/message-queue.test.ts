@@ -159,6 +159,44 @@ describe("MessageQueue defaults", () => {
   });
 });
 
+describe("MessageQueue recovery notices", () => {
+  it("attempts the durable notice before the prompt and never strands the prompt on transport failure", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const events: string[] = [];
+    let noticeAttempts = 0;
+    const queue = new MessageQueue(
+      async (_chatId, _agentId, text, _platform, onAgentOwnership) => {
+        events.push(`prompt:${text}`);
+        onAgentOwnership();
+      },
+      {
+        debounceMs: 10,
+        recoveryNoticeFn: async () => {
+          noticeAttempts += 1;
+          events.push(`notice:${noticeAttempts}`);
+          if (noticeAttempts === 1) throw new Error("transport unavailable");
+        },
+      },
+    );
+    const platform = mockPlatform(undefined, false);
+
+    queue.enqueue("chat1", "main", "triggering message", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.deepStrictEqual(events, ["notice:1", "prompt:triggering message"]);
+
+    queue.enqueue("chat1", "main", "next message", platform);
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.deepStrictEqual(events, [
+      "notice:1",
+      "prompt:triggering message",
+      "notice:2",
+      "prompt:next message",
+    ]);
+  });
+});
+
 // -------------------------------------------------------------------
 // MessageQueue — pre-send debounce
 // -------------------------------------------------------------------

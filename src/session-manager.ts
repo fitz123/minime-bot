@@ -5,18 +5,25 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
-import type { SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupRecord, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
 import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia } from "./media-store.js";
 import { resolveWorkspaceContract } from "./workspace-contract.js";
+import {
+  inspectInteractiveSessionBinding,
+  preseedInteractiveSessionBinding,
+  resolveInteractiveSessionLocation,
+  type InteractiveSessionBinding,
+  type InteractiveTranscriptFailure,
+} from "./interactive-session-binding.js";
 
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
-const PI_RESUME_NOT_FOUND_SETTLE_MS = 300;
+const PI_EXACT_OPEN_REJECTION_SETTLE_MS = 300;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
@@ -118,6 +125,8 @@ export interface ActiveSession {
   /** Exact durable transcript binding; populated by the exact-path lifecycle. */
   sessionFile?: string;
   workspaceRealpath?: string;
+  /** Durable recovery notice retained until the transport confirms delivery. */
+  pendingRecoveryNotice?: PendingSessionRecoveryNotice;
   agentId: string;
   /** Provider is retained temporarily for status/reporting while runtime is Pi-only. */
   provider: "pi";
@@ -168,6 +177,17 @@ interface SessionRuntimeSignature {
   provider: "pi";
   model: string;
   thinking?: AgentConfig["thinking"];
+}
+
+interface PreparedSessionBinding {
+  binding: InteractiveSessionBinding;
+  state: BoundSessionState;
+  /** A pending notice means this binding is already the one allowed replacement. */
+  rotationAllowed: boolean;
+}
+
+export function formatSessionRecoveryNotice(notice: PendingSessionRecoveryNotice): string {
+  return `I could not resume session ${notice.failedSessionId}. I started replacement session ${notice.replacementSessionId} and will continue your message there automatically.`;
 }
 
 function sessionRuntimeSignature(agent: AgentConfig): SessionRuntimeSignature {
@@ -298,6 +318,9 @@ export class SessionManager {
         sessionId: session.sessionId,
         sessionFile: session.sessionFile,
         workspaceRealpath: session.workspaceRealpath,
+        ...(session.pendingRecoveryNotice
+          ? { pendingRecoveryNotice: session.pendingRecoveryNotice }
+          : {}),
         ...common,
       };
     }
@@ -309,22 +332,15 @@ export class SessionManager {
     };
   }
 
-  /**
-   * Capture the Pi-minted session id by issuing get_state and reading the single
-   * SystemInit record it produces. Pi mints its own id and exposes it ONLY
-   * through a get_state response. Honors the single-consumer contract: this is
-   * the lone reader of child.stdout during spawn and is fully stopped before any
-   * sendSessionMessage opens its own fresh readPiStream. Returns null on timeout
-   * or if no id surfaces (e.g. the process went idle without a system record) —
-   * the session stays usable on its local id, and a later resume that can't
-   * match falls to resume recovery.
-   */
-  private async capturePiSessionId(child: ChildProcess): Promise<string | null> {
+  /** Assert Pi's correlated startup identity against the durable exact binding. */
+  private async assertPiStartupIdentity(
+    child: ChildProcess,
+    binding: InteractiveSessionBinding,
+  ): Promise<void> {
     const stdout = child.stdout;
-    // No stdout, or the child already died during/just-after spawn: nothing to
-    // read. Return null so the caller falls back to the local id (or, if the
-    // child exited, classifies the failure for recovery via hasExited).
-    if (!stdout || hasExited(child)) return null;
+    if (!stdout || hasExited(child)) {
+      throw new Error("Pi subprocess exited before startup identity was verified");
+    }
 
     // Read stdout directly with an abortable listener rather than an
     // async-generator over stdout.iterator(): a generator early-return/timeout
@@ -338,31 +354,30 @@ export class SessionManager {
     const onExit = () => controller.abort();
     child.once("exit", onExit);
     const splitter = new NewlineOnlyJsonlSplitter();
+    const responseId = `minime-startup-${randomUUID()}`;
     try {
-      sendPiGetState(child);
+      sendPiGetState(child, responseId);
       for await (const [chunk] of on(stdout, "data", { signal: controller.signal, close: ["close"] })) {
         for (const record of splitter.push(chunk as Buffer)) {
-          // This routes extension UI records before parsing get_state. A
-          // blocking startup request throws because Pi 0.82.1 cannot consume
-          // its correlated cancellation until session_start has completed.
-          const id = parsePiStartupRecord(child, record);
-          if (id) return id;
+          const identity = parsePiStartupIdentityRecord(child, record, responseId);
+          if (identity) {
+            assertPiSessionIdentityMatchesBinding(binding, identity);
+            return;
+          }
         }
       }
-      return null;
+      throw new Error("Pi startup ended before the exact session identity was reported");
     } catch (err) {
       if (err instanceof PiStartupBlockingUiError) {
         throw err;
       }
-      // Aborted (timeout or child exit) is an expected best-effort end: the
-      // session stays usable on its local id. Otherwise sendPiGetState may have
-      // thrown on a closed stdin (a spawn-then-exit race) — swallow it too, but
-      // log, so a dead child surfaces via normal crash recovery on the next
-      // message rather than as an uncaught rejection out of spawn.
-      if (!controller.signal.aborted) {
-        log.warn("session-manager", `Pi get_state capture failed: ${(err as Error).message}`);
+      if (controller.signal.aborted && !hasExited(child)) {
+        throw new Error(
+          `Pi did not report the exact session identity within ${this.startupTimeoutMs}ms`,
+          { cause: err },
+        );
       }
-      return null;
+      throw err;
     } finally {
       clearTimeout(timer);
       child.removeListener("exit", onExit);
@@ -373,8 +388,11 @@ export class SessionManager {
     }
   }
 
-  private hasPiResumeNotFoundSignal(child: ChildProcess): boolean {
-    return /No session found matching/.test(piStartupStderr(child));
+  private hasPiExactOpenRejectedSignal(
+    child: ChildProcess,
+    binding: InteractiveSessionBinding,
+  ): boolean {
+    return piStartupStderr(child).includes(`No session found matching '${binding.sessionFile}'`);
   }
 
   private async terminateStartupChild(child: ChildProcess): Promise<void> {
@@ -395,8 +413,11 @@ export class SessionManager {
     });
   }
 
-  private async waitForPiResumeNotFoundSettle(child: ChildProcess): Promise<void> {
-    if (this.hasPiResumeNotFoundSignal(child)) return;
+  private async waitForPiExactOpenRejectionSettle(
+    child: ChildProcess,
+    binding: InteractiveSessionBinding,
+  ): Promise<void> {
+    if (this.hasPiExactOpenRejectedSignal(child, binding)) return;
     await new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       let poll: ReturnType<typeof setInterval>;
@@ -405,9 +426,9 @@ export class SessionManager {
         clearInterval(poll);
         resolve();
       };
-      timer = setTimeout(done, PI_RESUME_NOT_FOUND_SETTLE_MS);
+      timer = setTimeout(done, PI_EXACT_OPEN_REJECTION_SETTLE_MS);
       poll = setInterval(() => {
-        if (this.hasPiResumeNotFoundSignal(child)) done();
+        if (this.hasPiExactOpenRejectedSignal(child, binding)) done();
       }, 5);
     });
   }
@@ -490,49 +511,132 @@ export class SessionManager {
     });
   }
 
-  /**
-   * Perform the Pi graceful resume-recovery action: discard the unresumable
-   * stored id (deletes the store record so a fresh Pi session is spawned), log,
-   * bump the metric, and return a fresh (no --session) child. Callers gate this
-   * on the at-most-once `alreadyRetried` flag + the "session not found" signal;
-   * this performs only the discard + fresh re-spawn.
-   *
-   * Media: the triggering turn's media has ALREADY been staged under this chat's
-   * media dir and is still tracked as in-flight — the fresh Pi session's prompt
-   * will reference those paths. So we must NOT wipe the whole dir (the prior
-   * `destroySession` path did, leaving the prompt pointing at deleted files).
-   * Use `cleanupStaleSessionMedia`, which removes only prior-session leftovers
-   * (including orphans from the failed-resume child) and preserves in-flight
-   * files for the current turn.
-   */
-  private async discardUnresumablePiSession(
+  private boundState(
     chatId: string,
     agentId: string,
     agent: AgentConfig,
-    staleSessionId: string,
-    extensionOptions?: PiSpawnExtensionOptions,
-    runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
-  ): Promise<ChildProcess> {
-    // Discard ONLY the unresumable stored id so a fresh Pi session is spawned.
-    // Deleting the store record directly (instead of destroySession) avoids the
-    // full media-dir wipe; in-flight files for the current turn must survive.
-    // The crash count is intentionally left untouched: a resume-recovery is NOT
-    // a clean reconnect, so a flapping chat keeps advancing toward the circuit
-    // breaker rather than resetting toward zero on every recovery.
-    this.store.deleteSession(chatId);
-    // Purge prior-session leftovers (including any orphan from the failed-resume
-    // child) WITHOUT deleting the file the handler just staged for this turn.
-    try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
-    log.warn("session-manager", `could not resume Pi session ${staleSessionId} — starting fresh`);
-    piSessionResumeDiscarded.inc({ agent_id: agentId });
-    return spawnPiRpcSession(agent, undefined, extensionOptions, runtimeEnvOptions);
+    binding: InteractiveSessionBinding,
+    pendingRecoveryNotice?: PendingSessionRecoveryNotice,
+  ): BoundSessionState {
+    return {
+      bindingState: "bound",
+      sessionId: binding.sessionId,
+      sessionFile: binding.sessionFile,
+      workspaceRealpath: binding.workspaceRealpath,
+      chatId,
+      agentId,
+      provider: "pi",
+      model: normalizedSessionModel(agent),
+      ...(agent.thinking === undefined ? {} : { thinking: agent.thinking }),
+      lastActivity: Date.now(),
+      ...(pendingRecoveryNotice ? { pendingRecoveryNotice } : {}),
+    };
+  }
+
+  private publishPreseededBinding(
+    chatId: string,
+    agentId: string,
+    agent: AgentConfig,
+    expected: SessionState | undefined,
+    location: ReturnType<typeof resolveInteractiveSessionLocation>,
+    pendingRecovery?: Pick<PendingSessionRecoveryNotice, "failedSessionId" | "reason">,
+  ): PreparedSessionBinding {
+    const binding = preseedInteractiveSessionBinding(location);
+    const notice = pendingRecovery
+      ? {
+        ...pendingRecovery,
+        replacementSessionId: binding.sessionId,
+      }
+      : undefined;
+    const state = this.boundState(chatId, agentId, agent, binding, notice);
+    if (!this.store.compareAndSetSession(chatId, expected, state)) {
+      throw new Error(`Session binding changed concurrently for chat ${chatId}`);
+    }
+    if (notice) {
+      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
+      log.warn(
+        "session-manager",
+        `could not open Pi session ${notice.failedSessionId} (${notice.reason}) — rotated to ${notice.replacementSessionId}`,
+      );
+      piSessionResumeDiscarded.inc({ agent_id: agentId });
+    }
+    return { binding, state, rotationAllowed: notice === undefined };
+  }
+
+  private prepareSessionBinding(
+    chatId: string,
+    agentId: string,
+    agent: AgentConfig,
+    config: BotConfig,
+  ): PreparedSessionBinding {
+    const location = resolveInteractiveSessionLocation(agent);
+    const stored = this.store.getSession(chatId);
+
+    if (!stored) {
+      return this.publishPreseededBinding(chatId, agentId, agent, undefined, location);
+    }
+
+    const agentDeleted = !(stored.agentId in config.agents);
+    if (stored.agentId !== agentId || agentDeleted) {
+      const reason = agentDeleted
+        ? `agent "${stored.agentId}" no longer exists`
+        : `agentId changed from "${stored.agentId}" to "${agentId}"`;
+      log.warn("session-manager", `Replacing stored session for chat ${chatId}: ${reason}`);
+      try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
+      return this.publishPreseededBinding(chatId, agentId, agent, stored, location);
+    }
+
+    if (stored.bindingState === "legacy-unresolved") {
+      return this.publishPreseededBinding(
+        chatId,
+        agentId,
+        agent,
+        stored,
+        location,
+        { failedSessionId: stored.failedSessionId, reason: "legacy-unresolved" },
+      );
+    }
+
+    const inspection = inspectInteractiveSessionBinding(
+      location,
+      stored.sessionFile,
+      stored.sessionId,
+    );
+    if (!inspection.valid) {
+      if (stored.pendingRecoveryNotice) {
+        throw new Error(
+          `Replacement Pi session ${stored.sessionId} is not usable: ${inspection.reason}`,
+        );
+      }
+      return this.publishPreseededBinding(
+        chatId,
+        agentId,
+        agent,
+        stored,
+        location,
+        { failedSessionId: stored.sessionId, reason: inspection.reason },
+      );
+    }
+
+    return {
+      binding: inspection.binding,
+      state: stored,
+      rotationAllowed: stored.pendingRecoveryNotice === undefined,
+    };
+  }
+
+  private localSpawnBindingFailure(error: unknown): InteractiveTranscriptFailure | undefined {
+    const match = (error as Error).message.match(
+      /^Interactive Pi session binding is not usable: (missing|unsafe|unreadable|invalid)$/,
+    );
+    return match?.[1] as InteractiveTranscriptFailure | undefined;
   }
 
   /**
    * Get or create a session for a given chatId.
    * If a session exists in memory with a live process, reuse it.
-   * If a session exists in store but process is dead, respawn with --resume.
-   * If no session exists, create a fresh one.
+   * If a session exists in store but process is dead, reopen its exact path.
+   * If no session exists, pre-seed and persist a verified binding before spawn.
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
@@ -633,9 +737,6 @@ export class SessionManager {
       await abortSupersededStartup();
     }
 
-    // Check if we have a stored session to resume (discards stale sessions)
-    const { resume, sessionId } = this.resolveStoredSession(chatId, agentId, freshConfig);
-
     // Crash backoff: prevent rapid crash→spawn→crash loops
     const prevCrashCount = this.restartCounts.get(chatId) ?? 0;
     if (prevCrashCount >= MAX_CRASH_RESTARTS) {
@@ -659,38 +760,20 @@ export class SessionManager {
     // prepareOutboxDir(chatId) is deferred until AFTER the generation guard.
     ensureSessionMediaDir(chatId);
 
-    // Spawn the agent subprocess via Pi RPC. Only a genuine resume points
-    // --session at the stored Pi-minted id; a fresh start omits it (an unknown
-    // id makes Pi exit with "No session found matching").
     const outboxPath = outboxDir(chatId);
     const extensionOptions: PiSpawnExtensionOptions | undefined = freshConfig.piExtraExtensions === undefined
       ? undefined
       : { extraExtensions: freshConfig.piExtraExtensions };
     const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath };
-    let child = spawnPiRpcSession(agent, resume ? sessionId : undefined, extensionOptions, runtimeEnvOptions);
+    let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig);
+    if (isStartupSuperseded()) {
+      await abortSupersededStartup();
+    }
 
-    // Graceful Pi resume-recovery state (signal-matched, inline, at-most-once):
-    // Pi flushes a session to disk only after agent_end/SIGTERM, so a restart
-    // MID-turn legitimately yields "No session found matching". Rather than
-    // crash-loop a chat to BLOCKED on a stale stored id, discard it and start
-    // fresh EXACTLY once. `effectiveResume` flips false after the discard so the
-    // fresh spawn's media handling matches a fresh start; `alreadyRetried` caps
-    // the recovery at one attempt (any second failure falls through to backoff).
-    let effectiveResume = resume;
-    let effectiveSessionId = sessionId;
-    let alreadyRetried = false;
-
-    // Verify the subprocess started and capture its Pi-minted session id.
-    // A real `pi` handed a stale --session does NOT fail at spawn: Node emits
-    // 'spawn' before all other events, so waitForSpawn RESOLVES, and only THEN
-    // does Pi print "No session found matching" and exit 1. So a resume failure
-    // surfaces during the get_state capture (the child is already dead by then),
-    // NOT as a spawn rejection. Detect that here and throw into the shared catch,
-    // which classifies BOTH a spawn rejection and a post-spawn startup exit the
-    // same way: the "session not found" signal → one inline fresh start;
-    // anything else → crash-backoff.
+    let child: ChildProcess | undefined;
     for (;;) {
       try {
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
         if (isStartupSuperseded()) {
           throw new SessionStartupSupersededError();
@@ -703,63 +786,40 @@ export class SessionManager {
           log.error("session-manager", `stdin error for chat ${chatId}: ${err.message}`);
         });
 
-        const piSessionId = await this.capturePiSessionId(child);
-        if (piSessionId) {
-          // Capture succeeded — the process is alive and answered get_state.
-          effectiveSessionId = piSessionId;
-        } else if (effectiveResume && !alreadyRetried) {
-          // A stale resume can close stdout before Node has delivered the stderr
-          // chunk or exit state. Give both streams a short chance to settle before
-          // accepting the local-id fallback for this resumed child.
-          await this.waitForPiResumeNotFoundSettle(child);
-          if (this.hasPiResumeNotFoundSignal(child)) {
-            throw new Error(`Pi resume session not found during startup: ${sessionId}`);
-          }
-          if (hasExited(child)) {
-            throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
-          }
-        } else if (hasExited(child)) {
-          // No id AND the child already exited: it spawned but died during
-          // startup (e.g. a stale --session). Throw into the shared catch for
-          // classification (recovery vs backoff), same as a spawn rejection.
-          throw new Error(`Pi subprocess exited during startup: code=${child.exitCode}`);
-        }
-        // Else: no id but the child is still alive — capture timed out or the
-        // process went idle without a SystemInit. The session stays functional
-        // on its local id (a later resume just can't target it).
+        await this.assertPiStartupIdentity(child, prepared.binding);
         break;
       } catch (err) {
         if (err instanceof SessionStartupSupersededError || isStartupSuperseded()) {
           await abortSupersededStartup(child);
         }
 
-        // Ensure child is dead and reaped before inspecting/throwing.
-        await this.terminateStartupChild(child);
+        if (child) {
+          await this.waitForPiExactOpenRejectionSettle(child, prepared.binding);
+          await this.terminateStartupChild(child);
+        }
         if (isStartupSuperseded()) {
           await abortSupersededStartup(child);
         }
 
-        // Pi-only graceful resume-recovery. Only when resuming, only on the
-        // specific "session not found" stderr signal, and
-        // only once: discard the unresumable stored session and start fresh
-        // INLINE (no recursion into getOrCreateSession, no --session). Any other
-        // failure — and any second failure — falls through to crash-backoff.
-        if (effectiveResume && !alreadyRetried && this.hasPiResumeNotFoundSignal(child)) {
-          alreadyRetried = true;
-          child = await this.discardUnresumablePiSession(chatId, agentId, agent, sessionId, extensionOptions, runtimeEnvOptions);
-          effectiveResume = false;
-          effectiveSessionId = randomUUID();
+        const localFailure = child === undefined
+          ? this.localSpawnBindingFailure(err)
+          : undefined;
+        const exactOpenRejected = child !== undefined
+          && this.hasPiExactOpenRejectedSignal(child, prepared.binding);
+        if (prepared.rotationAllowed && (localFailure || exactOpenRejected)) {
+          const reason: SessionRecoveryReason = localFailure ?? "exact-open-rejected";
+          prepared = this.publishPreseededBinding(
+            chatId,
+            agentId,
+            agent,
+            prepared.state,
+            resolveInteractiveSessionLocation(agent),
+            { failedSessionId: prepared.binding.sessionId, reason },
+          );
+          child = undefined;
           continue;
         }
 
-        // No session will be created to own files just downloaded for this turn;
-        // wipe the dir so they don't sit around until the next startup/cap eviction.
-        // Skip when resuming: the stored session record stays intact, so a later
-        // successful resume will continue the same conversation history — and that
-        // history may reference files already in this dir from prior turns.
-        if (!effectiveResume) {
-          try { cleanupSessionMediaDir(chatId); } catch { /* ignore */ }
-        }
         // Increment crash count so startup failures contribute to backoff
         const count = (this.restartCounts.get(chatId) ?? 0) + 1;
         this.restartCounts.set(chatId, count);
@@ -769,12 +829,16 @@ export class SessionManager {
     }
 
     // Pipe stderr to log file (on the child that ultimately started).
+    if (!child) {
+      throw new Error("Pi startup completed without a child process");
+    }
     this.setupStderrLogging(chatId, child);
 
     // Restart/crash count accumulates via setupCrashRecovery and survives
-    // active.delete(). Reset to 0 for fresh sessions (no existing, no resume).
+    // active.delete(). Preserve any accumulated failures; initialize only a
+    // lane that has never had a startup or runtime failure.
     const restartCount = this.restartCounts.get(chatId) ?? 0;
-    if (!existing && !resume) {
+    if (!existing && this.restartCounts.get(chatId) === undefined) {
       this.restartCounts.set(chatId, 0);
     }
 
@@ -802,7 +866,10 @@ export class SessionManager {
 
     const session: ActiveSession = {
       child,
-      sessionId: effectiveSessionId,
+      sessionId: prepared.binding.sessionId,
+      sessionFile: prepared.binding.sessionFile,
+      workspaceRealpath: prepared.binding.workspaceRealpath,
+      pendingRecoveryNotice: prepared.state.pendingRecoveryNotice,
       agentId,
       provider: "pi",
       model: normalizedSessionModel(agent),
@@ -821,8 +888,18 @@ export class SessionManager {
     this.active.set(chatId, session);
     sessionsActive.inc();
 
-    // Persist to store
-    this.store.setSession(chatId, this.toSessionState(chatId, session));
+    // Republish only the exact pre-spawn snapshot after identity equality. The
+    // compare-and-set prevents a concurrent /clean from being resurrected.
+    const confirmedState = this.toSessionState(chatId, session) as BoundSessionState;
+    if (!this.store.compareAndSetSession(chatId, prepared.state, confirmedState)) {
+      this.active.delete(chatId);
+      sessionsActive.dec();
+      await this.terminateStartupChild(child);
+      if (isStartupSuperseded()) {
+        await abortSupersededStartup();
+      }
+      throw new Error(`Session binding changed before activation for chat ${chatId}`);
+    }
 
     // Set up crash recovery
     this.setupCrashRecovery(chatId, child);
@@ -1235,11 +1312,11 @@ export class SessionManager {
 
   /**
    * Destroy a session: close it AND delete stored state.
-   * Next message will start a completely fresh session (no --resume).
+   * Next message will pre-seed a completely fresh exact-path session.
    *
    * Deletes from store BEFORE closing and skips closeSession's persist
-   * to prevent a concurrent getOrCreateSession from resuming with
-   * --resume during the child-exit await window.
+   * to prevent a concurrent getOrCreateSession from reopening the old exact
+   * transcript during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
     const hadActiveSession = this.active.has(chatId);
@@ -1271,6 +1348,32 @@ export class SessionManager {
     return this.active.get(chatId);
   }
 
+  /** Deliver and acknowledge only the exact durable recovery notice observed. */
+  async deliverPendingRecoveryNotice(
+    chatId: string,
+    platform: Pick<PlatformContext, "sendMessage">,
+  ): Promise<boolean> {
+    const stored = this.store.getSession(chatId);
+    if (stored?.bindingState !== "bound" || !stored.pendingRecoveryNotice) {
+      return false;
+    }
+    const notice = stored.pendingRecoveryNotice;
+    await platform.sendMessage(formatSessionRecoveryNotice(notice));
+    const acknowledged = this.store.acknowledgeRecoveryNotice(chatId, notice);
+    if (acknowledged) {
+      const active = this.active.get(chatId);
+      if (
+        active?.sessionId === notice.replacementSessionId
+        && active.pendingRecoveryNotice?.failedSessionId === notice.failedSessionId
+        && active.pendingRecoveryNotice.replacementSessionId === notice.replacementSessionId
+        && active.pendingRecoveryNotice.reason === notice.reason
+      ) {
+        active.pendingRecoveryNotice = undefined;
+      }
+    }
+    return acknowledged;
+  }
+
   /** Get subprocess health info for a session (for /status command). */
   getSessionHealth(chatId: string): SessionHealth | undefined {
     const session = this.active.get(chatId);
@@ -1298,17 +1401,18 @@ export class SessionManager {
    * Determine if a stored session should be resumed or discarded.
    * Discards and logs if the agentId changed or the stored agent was deleted.
    */
-  resolveStoredSession(chatId: string, agentId: string, config?: BotConfig): { resume: boolean; sessionId: string } {
+  resolveStoredSession(
+    chatId: string,
+    agentId: string,
+    config?: BotConfig,
+  ): { resume: false } | { resume: true; sessionId: string; sessionFile: string } {
     const stored = this.store.getSession(chatId);
     if (!stored) {
-      return { resume: false, sessionId: randomUUID() };
+      return { resume: false };
     }
 
-    // Task 3 replaces this transitional fresh result with the fenced one-time
-    // rotation path. The failed legacy ID remains durable and is never passed
-    // to Pi as a runtime binding.
     if (stored.bindingState === "legacy-unresolved") {
-      return { resume: false, sessionId: randomUUID() };
+      return { resume: false };
     }
 
     const agents = config ? config.agents : this.getFreshConfig().agents;
@@ -1327,7 +1431,7 @@ export class SessionManager {
       // preserved; anything else — including orphans from a crashed prior
       // process — is wiped.
       try { cleanupStaleSessionMedia(chatId); } catch { /* ignore */ }
-      return { resume: false, sessionId: randomUUID() };
+      return { resume: false };
     }
 
     const currentAgent = agents[agentId];
@@ -1346,7 +1450,7 @@ export class SessionManager {
       }
     }
 
-    return { resume: true, sessionId: stored.sessionId };
+    return { resume: true, sessionId: stored.sessionId, sessionFile: stored.sessionFile };
   }
 
   /** LRU eviction: close the session with oldest lastActivity. */

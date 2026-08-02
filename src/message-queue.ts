@@ -41,6 +41,13 @@ export type AcknowledgedSteerFn = (
   onEnqueued?: () => void,
 ) => Promise<boolean>;
 
+/** Prepare a lane and deliver any durable non-model recovery notice. */
+export type RecoveryNoticeFn = (
+  chatId: string,
+  agentId: string,
+  platform: PlatformContext,
+) => Promise<void>;
+
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
 export type CleanupFn = () => void;
 
@@ -121,6 +128,7 @@ export class MessageQueue {
   private queueCap: number;
   private processFn: ProcessFn;
   private acknowledgedSteerFn?: AcknowledgedSteerFn;
+  private recoveryNoticeFn?: RecoveryNoticeFn;
 
   constructor(
     processFn: ProcessFn,
@@ -128,12 +136,29 @@ export class MessageQueue {
       debounceMs?: number;
       queueCap?: number;
       acknowledgedSteerFn?: AcknowledgedSteerFn;
+      recoveryNoticeFn?: RecoveryNoticeFn;
     },
   ) {
     this.processFn = processFn;
     this.debounceMs = options?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.queueCap = options?.queueCap ?? DEFAULT_QUEUE_CAP;
     this.acknowledgedSteerFn = options?.acknowledgedSteerFn;
+    this.recoveryNoticeFn = options?.recoveryNoticeFn;
+  }
+
+  private async deliverRecoveryNotice(
+    chatId: string,
+    agentId: string,
+    platform: PlatformContext,
+  ): Promise<void> {
+    if (!this.recoveryNoticeFn) return;
+    try {
+      await this.recoveryNoticeFn(chatId, agentId, platform);
+    } catch (err) {
+      // Notice delivery is durable and retried on the next processing boundary.
+      // It must never strand the user message that caused the replacement.
+      log.warn("message-queue", `Recovery notice delivery failed for ${chatId}:`, err);
+    }
   }
 
   private getState(chatId: string, agentId: string): ChatQueueState {
@@ -264,6 +289,7 @@ export class MessageQueue {
     try {
       if (state.latestPlatform) {
         try {
+          await this.deliverRecoveryNotice(chatId, state.agentId, state.latestPlatform);
           await this.processFn(chatId, state.agentId, combinedText, state.latestPlatform, transferOwnership);
         } finally {
           this.settleBusyGeneration(state);
@@ -337,6 +363,7 @@ export class MessageQueue {
       try {
         if (state.latestPlatform) {
           try {
+            await this.deliverRecoveryNotice(chatId, state.agentId, state.latestPlatform);
             await this.processFn(chatId, state.agentId, prompt, state.latestPlatform, transferOwnership);
           } finally {
             this.settleBusyGeneration(state);

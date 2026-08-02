@@ -710,7 +710,7 @@ describe("SessionManager agentId mismatch detection", () => {
     const result = manager.resolveStoredSession("chat-1", "agent-b");
 
     assert.strictEqual(result.resume, false, "should not resume mismatched session");
-    assert.notStrictEqual(result.sessionId, "old-session-id", "should generate a fresh sessionId");
+    assert.ok(!("sessionId" in result), "no provisional replacement id is generated");
 
     // Verify store: stale session deleted, other session intact
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -733,7 +733,7 @@ describe("SessionManager agentId mismatch detection", () => {
     const result = manager.resolveStoredSession("chat-1", "main");
 
     assert.strictEqual(result.resume, false, "should not resume session with deleted agent");
-    assert.notStrictEqual(result.sessionId, "orphan-session-id", "should generate a fresh sessionId");
+    assert.ok(!("sessionId" in result), "no provisional replacement id is generated");
 
     // Verify store cleanup
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -746,7 +746,7 @@ describe("SessionManager agentId mismatch detection", () => {
 
     const result = manager.resolveStoredSession("new-chat", "main");
     assert.strictEqual(result.resume, false, "should not resume non-existent session");
-    assert.ok(result.sessionId, "should generate a sessionId");
+    assert.ok(!("sessionId" in result), "fresh identity is minted only by Pi pre-seeding");
   });
 
   it("rejects an empty stored sessionId", async () => {
