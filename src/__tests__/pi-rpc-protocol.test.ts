@@ -73,9 +73,9 @@ import {
   MAX_INTERACTIVE_SESSION_HEADER_BYTES,
   inspectInteractiveSessionBinding,
   listInteractiveSessionCandidates,
-  preseedInteractiveSessionBinding,
   resolveInteractiveSessionLocation,
 } from "../interactive-session-binding.js";
+import { preseedInteractiveSessionBinding } from "../interactive-session-seed.js";
 import {
   PI_ACKNOWLEDGED_STEER_COMMAND,
   buildPiAcknowledgedSteerResultNotice,

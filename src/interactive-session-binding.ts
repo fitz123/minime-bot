@@ -6,23 +6,21 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   realpathSync,
   statSync,
   type Stats,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
-import {
-  CURRENT_SESSION_VERSION,
-  SessionManager as PiSessionManager,
-  SettingsManager,
-} from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 import type { AgentConfig } from "./types.js";
 
 export const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 export const PI_SESSION_DIR_ENV = "PI_CODING_AGENT_SESSION_DIR";
+export const PI_CURRENT_SESSION_VERSION = 3;
 export const MAX_INTERACTIVE_SESSION_HEADER_BYTES = 64 * 1024;
 export const MAX_INTERACTIVE_SESSION_CANDIDATES = 2_048;
 
@@ -72,13 +70,13 @@ export interface InteractiveSessionSeedOptions extends InteractiveSessionInspect
     sessionFile: string,
     sessionDirectory: string,
     workspaceRealpath: string,
-  ) => Pick<PiSessionManager, "getSessionId" | "getSessionFile">;
+  ) => { getSessionId(): string; getSessionFile(): string | undefined };
   candidateName?: (attempt: number) => string;
   maxAttempts?: number;
 }
 
 function currentUid(): number | undefined {
-  return typeof process.getuid === "function" ? process.getuid.call(process) : undefined;
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
 function expectedUid(options?: { expectedUid?: number }): number | undefined {
@@ -97,7 +95,7 @@ function assertOwned(path: string, details: Stats, uid: number | undefined): voi
 
 function expandTilde(path: string, homeDirectory: string): string {
   if (path === "~") return homeDirectory;
-  if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) {
+  if (path.startsWith("~/") || (platform() === "win32" && path.startsWith("~\\"))) {
     return join(homeDirectory, path.slice(2));
   }
   return path;
@@ -152,6 +150,38 @@ function defaultPiSessionDirectory(workspaceRealpath: string, agentDirectory: st
   return join(agentDirectory, "sessions", safeWorkspace);
 }
 
+function readPiSettings(path: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Mirrors the read-only portion of Pi 0.82.1's global/project settings merge. */
+function readPiSettingsSessionDirectory(
+  workspaceRealpath: string,
+  agentDirectory: string,
+): string | undefined {
+  const globalSettings = readPiSettings(join(agentDirectory, "settings.json"));
+  const projectSettings = readPiSettings(join(workspaceRealpath, ".pi", "settings.json"));
+  const sessionDir = Object.hasOwn(projectSettings, "sessionDir")
+    ? projectSettings.sessionDir
+    : globalSettings.sessionDir;
+  if (!sessionDir) return undefined;
+  if (typeof sessionDir !== "string") {
+    throw new Error("Invalid Pi sessionDir setting: expected a string");
+  }
+  if (sessionDir === "~") return homedir();
+  if (sessionDir.startsWith("~/") || (platform() === "win32" && sessionDir.startsWith("~\\"))) {
+    return join(homedir(), sessionDir.slice(2));
+  }
+  return /^file:\/\//.test(sessionDir) ? fileURLToPath(sessionDir) : sessionDir;
+}
+
 /**
  * Resolve the canonical interactive workspace and session directory using Pi
  * 0.82.1's precedence: explicit --session-dir, environment, merged settings,
@@ -166,7 +196,7 @@ export function resolveInteractiveSessionLocation(
   const workspaceRealpath = canonicalWorkspace(agent);
   const configuredAgentDirectory = env[PI_AGENT_DIR_ENV]?.trim() || join(homeDirectory, ".pi", "agent");
   const agentDirectory = absolutePiPath(configuredAgentDirectory, workspaceRealpath, homeDirectory);
-  const settingsDirectory = SettingsManager.create(workspaceRealpath, agentDirectory).getSessionDir();
+  const settingsDirectory = readPiSettingsSessionDirectory(workspaceRealpath, agentDirectory);
   const selectedDirectory =
     options.sessionDirectory?.trim()
     || env[PI_SESSION_DIR_ENV]?.trim()
@@ -260,7 +290,7 @@ function inspectInteractiveSessionCandidate(
     );
     if (
       header?.type !== "session"
-      || header.version !== CURRENT_SESSION_VERSION
+      || header.version !== PI_CURRENT_SESSION_VERSION
       || typeof header.id !== "string"
       || header.id.length === 0
       || (expectedSessionId !== undefined && header.id !== expectedSessionId)
@@ -387,7 +417,7 @@ function defaultCandidateName(): string {
  * header. The returned binding is accepted only after exact path, identity,
  * header version, ownership, permissions, and cwd validation all succeed.
  */
-export function preseedInteractiveSessionBinding(
+export function preseedInteractiveSessionBindingCore(
   location: InteractiveSessionLocation,
   options: InteractiveSessionSeedOptions = {},
 ): InteractiveSessionBinding {
@@ -432,8 +462,10 @@ export function preseedInteractiveSessionBinding(
     throw new Error(`Unable to allocate a collision-free Pi transcript after ${maxAttempts} attempts`);
   }
 
-  const openSession = options.openSession
-    ?? ((path: string, directory: string, cwd: string) => PiSessionManager.open(path, directory, cwd));
+  const openSession = options.openSession;
+  if (!openSession) {
+    throw new Error("A pinned Pi session opener is required to author the transcript");
+  }
   const piSession = openSession(sessionFile, sessionDirectory, location.workspaceRealpath);
   const sessionId = piSession.getSessionId();
   const reportedFile = piSession.getSessionFile();

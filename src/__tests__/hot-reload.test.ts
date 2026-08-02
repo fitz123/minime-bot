@@ -5,7 +5,15 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import type { BotConfig } from "../types.js";
-import { NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, normalizePiModel, parsePiStartupRecord } from "../pi-rpc-protocol.js";
+import type { InteractiveSessionBinding } from "../interactive-session-binding.js";
+import {
+  NewlineOnlyJsonlSplitter,
+  PiStartupBlockingUiError,
+  assertPiSessionIdentityMatchesBinding,
+  normalizePiModel,
+  parsePiStartupIdentityRecord,
+  parsePiStartupRecord,
+} from "../pi-rpc-protocol.js";
 
 const TEST_DIR = "/tmp/minime-test-hot-reload";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -19,10 +27,11 @@ function cleanup() {
 /** Captured args from mocked spawnPiRpcSession calls. */
 interface CapturedSpawn {
   agent: { model: string; [key: string]: unknown };
-  resumeSessionId?: string;
+  sessionBinding: InteractiveSessionBinding;
 }
 
 const spawnCaptures: CapturedSpawn[] = [];
+const childBindings = new WeakMap<ChildProcess, InteractiveSessionBinding>();
 
 /** Create a mock ChildProcess that auto-emits 'spawn' on next tick. */
 function createAutoSpawnChild(): ChildProcess {
@@ -66,16 +75,25 @@ function createAutoSpawnChild(): ChildProcess {
 // ---------------------------------------------------------------------------
 mock.module("../pi-rpc-protocol.js", {
   namedExports: {
-    spawnPiRpcSession(agent: CapturedSpawn["agent"], resumeSessionId?: string) {
-      spawnCaptures.push({ agent, resumeSessionId });
-      return createAutoSpawnChild();
+    spawnPiRpcSession(agent: CapturedSpawn["agent"], sessionBinding: InteractiveSessionBinding) {
+      spawnCaptures.push({ agent, sessionBinding });
+      const child = createAutoSpawnChild();
+      childBindings.set(child, sessionBinding);
+      return child;
     },
-    sendPiGetState(child: ChildProcess) {
+    sendPiGetState(child: ChildProcess, id?: string) {
+      const binding = childBindings.get(child);
+      if (!binding) throw new Error("missing mocked exact session binding");
       child.stdout?.push(
         JSON.stringify({
           type: "response",
           success: true,
-          data: { sessionId: `pi-session-${spawnCaptures.length}` },
+          id,
+          command: "get_state",
+          data: {
+            sessionId: binding.sessionId,
+            sessionFile: binding.sessionFile,
+          },
         }) + "\n",
       );
     },
@@ -87,7 +105,9 @@ mock.module("../pi-rpc-protocol.js", {
     normalizePiModel,
     NewlineOnlyJsonlSplitter,
     PiStartupBlockingUiError,
+    assertPiSessionIdentityMatchesBinding,
     parsePiStartupRecord,
+    parsePiStartupIdentityRecord,
   },
 });
 
@@ -104,7 +124,7 @@ function makeConfig(model: string): BotConfig {
     agents: {
       main: {
         id: "main",
-        workspaceCwd: "/tmp/test-workspace",
+        workspaceCwd: `${TEST_DIR}/workspace`,
         model,
       },
     },
@@ -124,13 +144,19 @@ function makeConfig(model: string): BotConfig {
 // ---------------------------------------------------------------------------
 
 describe("Hot-reload: mutable config loader", () => {
+  let previousSessionDirectory: string | undefined;
+
   beforeEach(() => {
     cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    mkdirSync(`${TEST_DIR}/workspace`, { recursive: true });
+    previousSessionDirectory = process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_SESSION_DIR = `${TEST_DIR}/pi-sessions`;
     spawnCaptures.length = 0;
   });
 
   afterEach(async () => {
+    if (previousSessionDirectory === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDirectory;
     cleanup();
   });
 
@@ -186,9 +212,9 @@ describe("Hot-reload: mutable config loader", () => {
     assert.strictEqual(spawnCaptures.length, 2, "model change triggers a second spawn");
     assert.strictEqual(spawnCaptures[1].agent.model, "gpt-5.6-sol");
     assert.strictEqual(
-      spawnCaptures[1].resumeSessionId,
-      first.sessionId,
-      "automatic reconnect preserves the Pi session id/context",
+      spawnCaptures[1].sessionBinding.sessionFile,
+      first.sessionFile,
+      "automatic reconnect preserves the exact Pi transcript binding",
     );
     assert.strictEqual(second.model, "openai-codex/gpt-5.6-sol");
 
@@ -216,13 +242,19 @@ describe("Hot-reload: mutable config loader", () => {
 });
 
 describe("Hot-reload: config loader error propagation", () => {
+  let previousSessionDirectory: string | undefined;
+
   beforeEach(() => {
     cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    mkdirSync(`${TEST_DIR}/workspace`, { recursive: true });
+    previousSessionDirectory = process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_SESSION_DIR = `${TEST_DIR}/pi-sessions`;
     spawnCaptures.length = 0;
   });
 
   afterEach(async () => {
+    if (previousSessionDirectory === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDirectory;
     cleanup();
   });
 

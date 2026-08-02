@@ -16,10 +16,8 @@ import { Readable, Writable } from "node:stream";
 import { loadConfig } from "../config.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 import type { ExecFileSyncLike } from "../secrets.js";
-import {
-  preseedInteractiveSessionBinding,
-  resolveInteractiveSessionLocation,
-} from "../interactive-session-binding.js";
+import { resolveInteractiveSessionLocation } from "../interactive-session-binding.js";
+import { preseedInteractiveSessionBinding } from "../interactive-session-seed.js";
 
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");

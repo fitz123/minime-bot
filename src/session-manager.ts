@@ -14,11 +14,11 @@ import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia
 import { resolveWorkspaceContract } from "./workspace-contract.js";
 import {
   inspectInteractiveSessionBinding,
-  preseedInteractiveSessionBinding,
   resolveInteractiveSessionLocation,
   type InteractiveSessionBinding,
   type InteractiveTranscriptFailure,
 } from "./interactive-session-binding.js";
+import { preseedInteractiveSessionBinding } from "./interactive-session-seed.js";
 
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";

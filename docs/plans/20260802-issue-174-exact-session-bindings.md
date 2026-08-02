@@ -72,7 +72,7 @@ git diff --no-ext-diff main...HEAD | rg -n '/Users/|306600687|255582' || true
 ### Task 4: Lock the pinned-Pi exact-path contract and complete repository validation
 **Goal:** Prove the implementation against the real offline Pi runtime and settle the complete branch at one validated head.
 **Serves:** Exact-path opening, durable multi-turn history, workspace isolation, and slow-start identity stability must remain true across future Pi upgrades and full package integration.
-- [ ] Add bounded provider-free pinned-Pi integration coverage showing pre-seed creates a canonical private transcript and exact-path RPC reports the same ID/path without inspecting decoy sessions in another workspace.
-- [ ] Add an offline round-trip fixture that writes representative multi-turn session entries through Pi's session manager, exits, resumes the same absolute path, and proves the same history/identity remains; hash decoy and legacy transcripts before/after.
-- [ ] Add a delayed-start regression proving the prior startup threshold cannot mint or persist a second identity, plus bounded child/process/temp cleanup on success and failure.
-- [ ] Run all commands in `Validation Commands`; inspect `git diff --stat main...HEAD`, author metadata, generated artifacts, secrets/PII, and scope so the branch contains only issue #174 code, tests, and this plan.
+- [x] Add bounded provider-free pinned-Pi integration coverage showing pre-seed creates a canonical private transcript and exact-path RPC reports the same ID/path without inspecting decoy sessions in another workspace.
+- [x] Add an offline round-trip fixture that writes representative multi-turn session entries through Pi's session manager, exits, resumes the same absolute path, and proves the same history/identity remains; hash decoy and legacy transcripts before/after.
+- [x] Add a delayed-start regression proving the prior startup threshold cannot mint or persist a second identity, plus bounded child/process/temp cleanup on success and failure.
+- [x] Run all commands in `Validation Commands`; inspect `git diff --stat main...HEAD`, author metadata, generated artifacts, secrets/PII, and scope so the branch contains only issue #174 code, tests, and this plan.
