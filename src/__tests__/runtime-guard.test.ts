@@ -362,6 +362,40 @@ describe("media-root preflight", () => {
 });
 
 describe("bounded lifecycle integration", () => {
+  it("bounds a stalled transport drain without releasing ownership early", async () => {
+    const pollingDrained = deferred();
+    const teardown: string[] = [];
+    const shutdown = shutdownServingRuntime({
+      telegramPolling: pollingDrained.promise,
+      messageQueues: [],
+      sessionManager: {
+        beginShutdown: () => { teardown.push("session-admission-closed"); },
+        gracefulShutdown: async () => { teardown.push("sessions-drained"); },
+        closeAll: async () => { teardown.push("sessions-closed"); },
+      },
+      shutdownTimeoutMs: 20,
+      stopMetrics: async () => { teardown.push("metrics"); },
+      releaseRuntimeGuard: () => {
+        teardown.push("claims");
+        return true;
+      },
+      onTelegramStopError: () => assert.fail("Telegram stop should not fail"),
+      onDiscordStopError: () => assert.fail("Discord stop should not fail"),
+    });
+
+    await assert.rejects(
+      shutdown,
+      (error: unknown) => error instanceof Error
+        && error.name === "ServingRuntimeShutdownTimeoutError"
+        && error.message === "Serving runtime shutdown timed out during transport drain",
+    );
+    assert.deepEqual(teardown, ["session-admission-closed"]);
+
+    pollingDrained.resolve();
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    assert.deepEqual(teardown, ["session-admission-closed"]);
+  });
+
   it("cleans startup claims and exits nonzero when the configured metrics port is occupied", async () => {
     const workspace = tempRoot();
     mkdirSync(join(workspace, "agent"), { mode: 0o700 });

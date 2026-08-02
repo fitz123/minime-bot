@@ -32,10 +32,42 @@ export interface ServingRuntimeShutdownOptions {
   onDiscordStopError(error: unknown): void;
 }
 
+class ServingRuntimeShutdownTimeoutError extends Error {
+  constructor(readonly phase: string) {
+    super(`Serving runtime shutdown timed out during ${phase}`);
+    this.name = "ServingRuntimeShutdownTimeoutError";
+  }
+}
+
+async function waitForShutdownPhase<T>(
+  startWork: () => Promise<T>,
+  deadline: number,
+  phase: string,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) throw new ServingRuntimeShutdownTimeoutError(phase);
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      startWork(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new ServingRuntimeShutdownTimeoutError(phase)),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 /** Stop inbound work, drain its handlers, then release serving ownership last. */
 export async function shutdownServingRuntime(
   options: ServingRuntimeShutdownOptions,
 ): Promise<boolean> {
+  const deadline = Date.now() + Math.max(1, options.shutdownTimeoutMs);
   options.abortTelegramPolling?.();
   if (options.telegramBot) {
     stopTelegramBotInBackground(options.telegramBot, options.onTelegramStopError);
@@ -44,18 +76,34 @@ export async function shutdownServingRuntime(
   for (const queue of options.messageQueues) queue.beginShutdown();
   options.sessionManager.beginShutdown();
 
-  await Promise.all([
-    options.telegramPolling ?? Promise.resolve(),
-    discordShutdown ?? Promise.resolve(),
-  ]);
+  await waitForShutdownPhase(
+    () => Promise.all([
+      options.telegramPolling ?? Promise.resolve(),
+      discordShutdown ?? Promise.resolve(),
+    ]).then(() => undefined),
+    deadline,
+    "transport drain",
+  );
 
   for (const queue of options.messageQueues) queue.cancelAllDebounceTimers();
-  await options.sessionManager.gracefulShutdown(options.shutdownTimeoutMs);
+  await waitForShutdownPhase(
+    () => options.sessionManager.gracefulShutdown(Math.max(1, deadline - Date.now())),
+    deadline,
+    "session drain",
+  );
   for (const queue of options.messageQueues) queue.clearAll();
 
   options.persistTransportState?.();
-  await options.sessionManager.closeAll();
-  await Promise.all(options.messageQueues.map((queue) => queue.waitForIdle()));
-  await options.stopMetrics();
+  await waitForShutdownPhase(
+    () => options.sessionManager.closeAll(),
+    deadline,
+    "session close",
+  );
+  await waitForShutdownPhase(
+    () => Promise.all(options.messageQueues.map((queue) => queue.waitForIdle())).then(() => undefined),
+    deadline,
+    "queue drain",
+  );
+  await waitForShutdownPhase(() => options.stopMetrics(), deadline, "metrics stop");
   return options.releaseRuntimeGuard();
 }
