@@ -184,7 +184,7 @@ describe("Discord recovery notice delivery", () => {
       } as never);
       await new Promise<void>((resolve) => setImmediate(resolve));
       t.mock.timers.tick(3_000);
-      for (let i = 0; i < 6; i++) await Promise.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
 
       assert.deepStrictEqual(events, ["prepare", "notice", "prompt:true"]);
       assert.deepStrictEqual(sent, ["Session failed-old-id was replaced by new-session-id."]);

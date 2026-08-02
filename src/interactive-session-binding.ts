@@ -120,17 +120,15 @@ function privateSessionDirectory(
   create: boolean,
   uid: number | undefined,
 ): string {
-  let created = false;
   try {
     lstatSync(path);
   } catch (error) {
     if (!create || !isMissingError(error)) throw error;
     mkdirSync(path, { recursive: true, mode: 0o700 });
     chmodSync(path, 0o700);
-    created = true;
   }
 
-  const details = lstatSync(path);
+  let details = lstatSync(path);
   if (details.isSymbolicLink()) {
     throw new Error(`Refusing to use Pi session directory ${path}: it is a symlink`);
   }
@@ -139,8 +137,17 @@ function privateSessionDirectory(
   }
   assertOwned(path, details, uid);
   if ((details.mode & 0o777) !== 0o700) {
-    const provenance = created ? "created with unexpected permissions" : "not private";
-    throw new Error(`Refusing to use Pi session directory ${path}: ${provenance}`);
+    if (!create) {
+      throw new Error(`Refusing to use Pi session directory ${path}: not private`);
+    }
+    // Pi 0.82.1 creates its default session directory under the process umask,
+    // which is normally 0755. Once ownership/type/symlink checks pass, bring
+    // that existing directory up to the private exact-binding contract.
+    chmodSync(path, 0o700);
+    details = lstatSync(path);
+    if ((details.mode & 0o777) !== 0o700) {
+      throw new Error(`Refusing to use Pi session directory ${path}: could not make it private`);
+    }
   }
   return realpathSync(path);
 }

@@ -273,10 +273,11 @@ export async function createDiscordBot(
       await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
     },
     {
-      recoveryNoticeFn: async (chatId, agentId, platform) => {
+      prepareSessionFn: async (chatId, agentId) => {
         await sessionManager.getOrCreateSession(chatId, agentId);
-        await sessionManager.deliverPendingRecoveryNotice(chatId, platform);
       },
+      recoveryNoticeFn: (chatId, _agentId, platform) =>
+        sessionManager.deliverPendingRecoveryNotice(chatId, platform).then(() => undefined),
     },
   );
 

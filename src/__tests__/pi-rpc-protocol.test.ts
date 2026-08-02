@@ -286,20 +286,18 @@ describe("exact interactive Pi session bindings", () => {
     assert.strictEqual(lstatSync(location.sessionDirectory).mode & 0o777, 0o700);
   });
 
-  it("rejects unsafe session directories without repairing them", () => {
+  it("repairs Pi-style owner-controlled directory modes but rejects unsafe directory identities", () => {
     const { root, agent } = makeFixture();
     const publicDirectory = join(root, "public");
     mkdirSync(publicDirectory, { mode: 0o755 });
     chmodSync(publicDirectory, 0o755);
-    assert.throws(
-      () => resolveInteractiveSessionLocation(agent, {
-        sessionDirectory: publicDirectory,
-        env: {},
-        homeDirectory: root,
-      }),
-      /not private/,
-    );
-    assert.strictEqual(lstatSync(publicDirectory).mode & 0o777, 0o755);
+    const repaired = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: publicDirectory,
+      env: {},
+      homeDirectory: root,
+    });
+    assert.strictEqual(repaired.sessionDirectory, realpathSync(publicDirectory));
+    assert.strictEqual(lstatSync(publicDirectory).mode & 0o777, 0o700);
 
     const target = join(root, "target");
     const linked = join(root, "linked");

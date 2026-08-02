@@ -17,3 +17,25 @@ export function preseedInteractiveSessionBinding(
       ?? ((path, directory, cwd) => PiSessionManager.open(path, directory, cwd)),
   });
 }
+
+/**
+ * Exercise the pinned Pi open/context path for an already-verified transcript.
+ * Current-version transcripts are read without migration or rewriting.
+ */
+export function assertInteractiveSessionBindingOpenable(
+  binding: InteractiveSessionBinding,
+): void {
+  const session = PiSessionManager.open(
+    binding.sessionFile,
+    binding.sessionDirectory,
+    binding.workspaceRealpath,
+  );
+  if (
+    session.getSessionId() !== binding.sessionId
+    || session.getSessionFile() !== binding.sessionFile
+    || session.getCwd() !== binding.workspaceRealpath
+  ) {
+    throw new Error("Pi opened a different interactive session identity");
+  }
+  session.buildSessionContext();
+}

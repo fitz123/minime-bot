@@ -804,10 +804,11 @@ export function createTelegramBot(
     {
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
         sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued),
-      recoveryNoticeFn: async (chatId, agentId, platform) => {
+      prepareSessionFn: async (chatId, agentId) => {
         await sessionManager.getOrCreateSession(chatId, agentId);
-        await sessionManager.deliverPendingRecoveryNotice(chatId, platform);
       },
+      recoveryNoticeFn: (chatId, _agentId, platform) =>
+        sessionManager.deliverPendingRecoveryNotice(chatId, platform).then(() => undefined),
     },
   );
 

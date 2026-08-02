@@ -18,7 +18,10 @@ import {
   type InteractiveSessionBinding,
   type InteractiveTranscriptFailure,
 } from "./interactive-session-binding.js";
-import { preseedInteractiveSessionBinding } from "./interactive-session-seed.js";
+import {
+  assertInteractiveSessionBindingOpenable,
+  preseedInteractiveSessionBinding,
+} from "./interactive-session-seed.js";
 
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";
@@ -112,7 +115,7 @@ export function hasExited(child: ChildProcess): boolean {
 /**
  * Read the startup stderr buffered on a Pi child by `spawnPiRpcSession`. Returns
  * "" before any stderr arrived or when a mock child has no accessor. Used by
- * the spawn-failure classifier to detect Pi's "No session found matching" signal.
+ * the spawn-failure classifier to detect a deterministic exact-path open error.
  */
 function piStartupStderr(child: ChildProcess): string {
   const reader = (child as unknown as PiStartupDiagnostics).piStartupStderr;
@@ -392,7 +395,9 @@ export class SessionManager {
     child: ChildProcess,
     binding: InteractiveSessionBinding,
   ): boolean {
-    return piStartupStderr(child).includes(`No session found matching '${binding.sessionFile}'`);
+    return piStartupStderr(child).includes(
+      `Error: Session file is not a valid pi session: ${binding.sessionFile}`,
+    );
   }
 
   private async terminateStartupChild(child: ChildProcess): Promise<void> {
@@ -615,6 +620,25 @@ export class SessionManager {
         stored,
         location,
         { failedSessionId: stored.sessionId, reason: inspection.reason },
+      );
+    }
+
+    try {
+      assertInteractiveSessionBindingOpenable(inspection.binding);
+    } catch (error) {
+      if (stored.pendingRecoveryNotice) {
+        throw new Error(
+          `Replacement Pi session ${stored.sessionId} is not usable: exact-open-rejected`,
+          { cause: error },
+        );
+      }
+      return this.publishPreseededBinding(
+        chatId,
+        agentId,
+        agent,
+        stored,
+        location,
+        { failedSessionId: stored.sessionId, reason: "exact-open-rejected" },
       );
     }
 

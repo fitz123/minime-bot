@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, realpathSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, realpathSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
@@ -132,7 +132,7 @@ function createAutoSpawnChild(): ChildProcess {
  * default "ok" auto-spawn, so the Task 3 capture/resume tests are unaffected.
  *  - `{ failStderr }` models a Pi process that fails BEFORE 'spawn' (it never
  *    emits 'spawn', exits 1 → waitForSpawn rejects). This is the rare edge path.
- *  - `{ spawnThenExitStderr }` models the REAL `pi` timing for a stale --session:
+ *  - `{ spawnThenExitStderr }` models the REAL `pi` timing for an exact-open rejection:
  *    it execs cleanly (emits 'spawn', so waitForSpawn RESOLVES) and only THEN
  *    exits 1. The resume failure surfaces during the get_state capture, not as a
  *    spawn rejection — the production path the recovery must actually cover.
@@ -142,7 +142,7 @@ function createAutoSpawnChild(): ChildProcess {
  *  - `{ spawnThenDelayedStderrExitStderr }` models stdout closing before the
  *    buffered stderr signal has reached the startup classifier.
  * Both expose their stderr via the same piStartupStderr accessor the real
- * spawnPiRpcSession installs (Pi prints `No session found matching <id>`).
+ * spawnPiRpcSession installs.
  */
 type PiSpawnOutcome =
   | "ok"
@@ -175,7 +175,7 @@ function createFailingPiChild(failStderr: string): ChildProcess {
   });
 
   // Mirror spawnPiRpcSession: expose buffered startup stderr so the spawn-failure
-  // classifier can match Pi's "No session found matching" signal.
+  // classifier can match Pi's deterministic exact-path open signal.
   (child as unknown as { piStartupStderr: () => string }).piStartupStderr = () => failStderr;
 
   // Fail startup: exit 1, never 'spawn' → waitForSpawn rejects with code=1.
@@ -189,8 +189,8 @@ function createFailingPiChild(failStderr: string): ChildProcess {
 
 /**
  * A Pi child that execs successfully (emits 'spawn', so waitForSpawn RESOLVES)
- * and only THEN exits 1 with buffered stderr — the REAL `pi` timing for a stale
- * --session. Node guarantees 'spawn' fires before all other events, so the
+ * and only THEN exits 1 with buffered stderr — the REAL `pi` timing for an
+ * exact-open rejection. Node guarantees 'spawn' fires before all other events, so the
  * resume failure does NOT reach the waitForSpawn catch; it surfaces when the
  * get_state capture finds the child already dead. Marked `__resumeFailed` so the
  * mocked readPiStream yields no SystemInit (a dead process emits no records),
@@ -372,8 +372,8 @@ mock.module("../pi-rpc-protocol.js", {
       if ("throwBindingFailure" in outcome) {
         throw new Error(`Interactive Pi session binding is not usable: ${outcome.throwBindingFailure}`);
       }
-      const exactStderr = (stderr: string) => stderr === "No session found matching stored-pi-id"
-        ? `No session found matching '${sessionBinding.sessionFile}'`
+      const exactStderr = (stderr: string) => stderr === "exact-open-rejected"
+        ? `Error: Session file is not a valid pi session: ${sessionBinding.sessionFile}`
         : stderr;
       if ("failStderr" in outcome) return createFailingPiChild(exactStderr(outcome.failStderr));
       if ("spawnThenExitStderr" in outcome) return createSpawnThenExitChild(exactStderr(outcome.spawnThenExitStderr));
@@ -990,14 +990,45 @@ describe("SessionManager exact-path recovery", () => {
     try { rmSync(sessionMediaDir("pi-inflight"), { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  it("missing-session signal: discards once, warns once, increments metric, then starts fresh", async () => {
+  it("rotates a transcript whose body the pinned Pi runtime cannot open", async () => {
+    const prior = storedPiBinding("pi-malformed-body", "malformed-body-id");
+    appendFileSync(prior.sessionFile, `${JSON.stringify({
+      type: "message",
+      id: "malformed-entry",
+      parentId: null,
+      message: null,
+    })}\n`);
+    const priorBytes = readFileSync(prior.sessionFile);
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-malformed-body", prior);
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-malformed-body", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 1, "the malformed prior path is not spawned");
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.notStrictEqual(session.sessionFile, prior.sessionFile);
+    assert.deepStrictEqual(readFileSync(prior.sessionFile), priorBytes, "failed transcript is preserved");
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-malformed-body")?.pendingRecoveryNotice,
+      {
+        failedSessionId: prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: "exact-open-rejected",
+      },
+    );
+
+    await manager.closeAll();
+  });
+
+  it("exact-open rejection: rotates once, warns once, increments metric, then starts fresh", async () => {
     const extraExtensions = ["/approved/recovery-a.ts", "/approved/recovery-b.ts"];
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("pi-stale", storedPiBinding("pi-stale", "stored-pi-id"));
 
     // The exact resume fails with Pi's deterministic signal; the one
     // pre-seeded replacement then starts and get_state confirms its binding.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const before = await discardedCount("pi");
@@ -1079,9 +1110,9 @@ describe("SessionManager exact-path recovery", () => {
     const stalePath = `${sessionMediaDir("pi-inflight")}/prior-session.jpg`;
     writeFileSync(stalePath, "stale leftover");
 
-    // Resume fails with the "No session found" signal → recovery fires; the
+    // Resume fails with the deterministic exact-open signal → recovery fires; the
     // inline fresh re-spawn then succeeds.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
@@ -1110,7 +1141,7 @@ describe("SessionManager exact-path recovery", () => {
   it("retries a durable recovery notice after transport failure and acknowledges only successful delivery", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("pi-notice", storedPiBinding("pi-notice", "failed-old-id"));
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
     const session = await manager.getOrCreateSession("pi-notice", "pi");
@@ -1157,7 +1188,7 @@ describe("SessionManager exact-path recovery", () => {
     // Resume fails with the signal; the inline fresh re-spawn ALSO fails. The
     // second failure must propagate (no third spawn, no recursion).
     piSpawnOutcomes = [
-      { failStderr: "No session found matching stored-pi-id" },
+      { failStderr: "exact-open-rejected" },
       { failStderr: "still broken on the fresh start" },
     ];
 
@@ -1201,7 +1232,7 @@ describe("SessionManager exact-path recovery", () => {
     const replacement = new SessionStore(TEST_STORE_PATH).getSession("pi-doomed");
     assert.strictEqual(replacement?.bindingState, "bound");
     assert.ok(replacement?.pendingRecoveryNotice, "the one replacement remains durable after spawn failure");
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     const restarted = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
     await assert.rejects(
       restarted.getOrCreateSession("pi-doomed", "pi"),
@@ -1217,7 +1248,7 @@ describe("SessionManager exact-path recovery", () => {
     store.setSession("pi-flap", storedPiBinding("pi-flap", "stored-pi-id"));
 
     // Resume fails with the signal; the inline fresh re-spawn then succeeds.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
@@ -1257,7 +1288,7 @@ describe("SessionManager exact-path recovery", () => {
     const mediaFile = `${mediaDir}/prior-turn.jpg`;
     writeFileSync(mediaFile, "keep me");
 
-    // Resume fails, but NOT with the "No session found" signal → no recovery.
+    // Resume fails, but NOT with the deterministic exact-open signal → no recovery.
     piSpawnOutcomes = [{ failStderr: "codex: authentication token expired" }];
 
     const before = await discardedCount("pi");
@@ -1316,7 +1347,7 @@ describe("SessionManager exact-path recovery", () => {
 
     // The exact resume execs then exits 1 with the signal (real timing); the
     // one pre-seeded replacement then starts and get_state confirms its binding.
-    piSpawnOutcomes = [{ spawnThenExitStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ spawnThenExitStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const before = await discardedCount("pi");
@@ -1362,7 +1393,7 @@ describe("SessionManager exact-path recovery", () => {
     // shortly after, inside the bounded settle wait; the inline fresh re-spawn
     // then succeeds.
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 20 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 20 },
     ];
     nextPiSessionId = "fresh-pi-id";
 
@@ -1416,7 +1447,7 @@ describe("SessionManager exact-path recovery", () => {
     // exact-open rejection and must never keep the unverified child.
     piSpawnOutcomes = [
       {
-        spawnThenDelayedStderrExitStderr: "No session found matching stored-pi-id",
+        spawnThenDelayedStderrExitStderr: "exact-open-rejected",
         stderrDelayMs: 5,
         exitDelayMs: 20,
       },
@@ -1453,7 +1484,7 @@ describe("SessionManager exact-path recovery", () => {
     // final while the bounded stderr window is still open.
     piSpawnOutcomes = [
       {
-        spawnThenDelayedStderrExitStderr: "No session found matching stored-pi-id",
+        spawnThenDelayedStderrExitStderr: "exact-open-rejected",
         stderrDelayMs: 20,
         exitDelayMs: 5,
       },
@@ -1483,7 +1514,7 @@ describe("SessionManager exact-path recovery", () => {
     // exit until after the bounded settle wait. The signal is still decisive: the
     // failed resume is killed/reaped and the existing fresh-start recovery fires.
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 1_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 1_000 },
     ];
     nextPiSessionId = "fresh-pi-id";
 
@@ -1506,7 +1537,7 @@ describe("SessionManager exact-path recovery", () => {
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("pi-real-keep", storedPiBinding("pi-real-keep", "keep-pi-id"));
 
-    // Execs then exits 1, but NOT with the "No session found" signal → no recovery.
+    // Execs then exits 1, but NOT with the deterministic exact-open signal → no recovery.
     piSpawnOutcomes = [{ spawnThenExitStderr: "codex: authentication token expired" }];
 
     const before = await discardedCount("pi");
@@ -1834,7 +1865,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     store.setSession("clean-resume", storedPiBinding("clean-resume", "stored-pi-id"));
 
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 1_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 1_000 },
     ];
     nextPiSessionId = "old-local-id";
 
@@ -1904,7 +1935,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     );
 
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 10_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 10_000 },
     ];
     nextPiSessionId = "old-local-id";
 

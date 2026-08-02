@@ -41,11 +41,17 @@ export type AcknowledgedSteerFn = (
   onEnqueued?: () => void,
 ) => Promise<boolean>;
 
-/** Prepare a lane and deliver any durable non-model recovery notice. */
+/** Deliver any durable non-model recovery notice after lane preparation. */
 export type RecoveryNoticeFn = (
   chatId: string,
   agentId: string,
   platform: PlatformContext,
+) => Promise<void>;
+
+/** Prepare the lane before notice delivery; failures stop prompt processing. */
+export type PrepareSessionFn = (
+  chatId: string,
+  agentId: string,
 ) => Promise<void>;
 
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
@@ -128,6 +134,7 @@ export class MessageQueue {
   private queueCap: number;
   private processFn: ProcessFn;
   private acknowledgedSteerFn?: AcknowledgedSteerFn;
+  private prepareSessionFn?: PrepareSessionFn;
   private recoveryNoticeFn?: RecoveryNoticeFn;
 
   constructor(
@@ -136,6 +143,7 @@ export class MessageQueue {
       debounceMs?: number;
       queueCap?: number;
       acknowledgedSteerFn?: AcknowledgedSteerFn;
+      prepareSessionFn?: PrepareSessionFn;
       recoveryNoticeFn?: RecoveryNoticeFn;
     },
   ) {
@@ -143,6 +151,7 @@ export class MessageQueue {
     this.debounceMs = options?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.queueCap = options?.queueCap ?? DEFAULT_QUEUE_CAP;
     this.acknowledgedSteerFn = options?.acknowledgedSteerFn;
+    this.prepareSessionFn = options?.prepareSessionFn;
     this.recoveryNoticeFn = options?.recoveryNoticeFn;
   }
 
@@ -289,6 +298,7 @@ export class MessageQueue {
     try {
       if (state.latestPlatform) {
         try {
+          await this.prepareSessionFn?.(chatId, state.agentId);
           await this.deliverRecoveryNotice(chatId, state.agentId, state.latestPlatform);
           await this.processFn(chatId, state.agentId, combinedText, state.latestPlatform, transferOwnership);
         } finally {

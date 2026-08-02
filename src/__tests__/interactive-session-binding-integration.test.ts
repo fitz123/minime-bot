@@ -17,7 +17,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import {
+  CURRENT_SESSION_VERSION,
+  SessionManager as PiSessionManager,
+} from "@earendil-works/pi-coding-agent";
 import {
   listInteractiveSessionCandidates,
   resolveInteractiveSessionLocation,
@@ -302,6 +305,32 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
 }
 
 describe("pinned Pi exact interactive session integration", { concurrency: false }, () => {
+  it("privatizes a default-umask directory created by pinned Pi", () => {
+    const createdRoot = mkdtempSync(join(tmpdir(), "minime-exact-binding-mode-"));
+    chmodSync(createdRoot, 0o700);
+    const root = realpathSync(createdRoot);
+    const workspace = join(root, "agent-workspace");
+    const sessionDirectory = join(root, "sessions");
+    mkdirPrivate(workspace);
+    const priorUmask = process.umask(0o022);
+
+    try {
+      PiSessionManager.create(workspace, sessionDirectory);
+      assert.strictEqual(lstatSync(sessionDirectory).mode & 0o777, 0o755);
+
+      const location = resolveInteractiveSessionLocation(makeAgent(workspace), {
+        sessionDirectory,
+        env: {},
+        homeDirectory: root,
+      });
+      assert.strictEqual(location.sessionDirectory, realpathSync(sessionDirectory));
+      assert.strictEqual(lstatSync(sessionDirectory).mode & 0o777, 0o700);
+    } finally {
+      process.umask(priorUmask);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("pre-seeds one private transcript and opens only its exact path through offline RPC", {
     timeout: 15_000,
   }, async () => {
@@ -447,7 +476,7 @@ describe("pinned Pi exact interactive session integration", { concurrency: false
       "export default function (pi) {",
       "  pi.on('session_start', async () => {",
       `    writeFileSync(${JSON.stringify(pidMarker)}, String(process.pid));`,
-      "    await new Promise((resolve) => setTimeout(resolve, 4000));",
+      "    await new Promise((resolve) => setTimeout(resolve, 10000));",
       "  });",
       "}",
       "",
@@ -465,11 +494,11 @@ describe("pinned Pi exact interactive session integration", { concurrency: false
         () => makeConfig(agent, [extensionPath]),
         storePath,
         logDirectory,
-        { startupTimeoutMs: 2_000 },
+        { startupTimeoutMs: 5_000 },
       );
       await assert.rejects(
         delayedManager.getOrCreateSession(chatId, agent.id),
-        /did not report the exact session identity within 2000ms/,
+        /did not report the exact session identity within 5000ms/,
       );
 
       assert.ok(existsSync(pidMarker), "delayed real Pi reached session_start before timing out");

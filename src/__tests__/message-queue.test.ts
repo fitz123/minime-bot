@@ -160,6 +160,37 @@ describe("MessageQueue defaults", () => {
 });
 
 describe("MessageQueue recovery notices", () => {
+  it("does not retry prompt processing when lane preparation fails", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const events: string[] = [];
+    const errors: string[] = [];
+    const queue = new MessageQueue(
+      async () => {
+        events.push("prompt");
+      },
+      {
+        debounceMs: 10,
+        prepareSessionFn: async () => {
+          events.push("prepare");
+          throw new Error("startup failed");
+        },
+        recoveryNoticeFn: async () => {
+          events.push("notice");
+        },
+      },
+    );
+
+    queue.enqueue("chat1", "main", "triggering message", mockPlatform((error) => {
+      errors.push(error);
+    }, false));
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+
+    assert.deepStrictEqual(events, ["prepare"]);
+    assert.strictEqual(errors.length, 1);
+    assert.match(errors[0], /startup failed/);
+  });
+
   it("attempts the durable notice before the prompt and never strands the prompt on transport failure", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const events: string[] = [];
