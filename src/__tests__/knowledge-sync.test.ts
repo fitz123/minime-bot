@@ -560,6 +560,34 @@ describe("knowledge sync Git convergence", () => {
     }
   });
 
+  it("rejects structural-log truncation hidden behind a temporary v2 control deletion", () => {
+    for (const [relPath, restoredContent] of [
+      ["wiki/index.md", generateKnowledgeIndex([])],
+      ["wiki/schema.md", generateKnowledgeV2Schema()],
+    ] as const) {
+      const fixture = createSyncFixture();
+      const originalLog = readFileSync(join(fixture.workspace, "wiki/log.md"), "utf8");
+      commitFiles(fixture.workspace, `append structural history before deleting ${relPath}`, {
+        "wiki/log.md": `${originalLog}- intermediate structural entry\n`,
+      });
+      git(fixture.workspace, ["rm", relPath]);
+      writeFiles(fixture.workspace, { "wiki/log.md": originalLog });
+      git(fixture.workspace, ["add", "wiki/log.md"]);
+      git(fixture.workspace, ["commit", "-m", `delete ${relPath} and truncate structural history`]);
+      const localTip = commitFiles(fixture.workspace, `restore ${relPath}`, {
+        [relPath]: restoredContent,
+      });
+      const remoteTip = remoteHead(fixture);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, relPath);
+      assert.equal(response.reason, "candidate-log-history-not-preserved", relPath);
+      assert.equal(localHead(fixture), localTip, relPath);
+      assert.equal(remoteHead(fixture), remoteTip, relPath);
+    }
+  });
+
   it("rejects a divergent branch that appended and then removed structural history", () => {
     const fixture = createSyncFixture();
     const peer = cloneRemote(fixture, "peer-intermediate-divergent-log");
@@ -1767,6 +1795,40 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     }
   });
 
+  it("rejects custom merge drivers whose names match check-attr sentinel values", () => {
+    for (const driver of ["set", "unset", "unspecified"] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/feedback/sentinel-${driver}.md`;
+      const sharedVariant = page(
+        `Sentinel ${driver} driver`,
+        "A shared page whose custom merge driver name resembles a check-attr sentinel.",
+        "feedback",
+        "Shared committed body.\n",
+      );
+      commitFiles(fixture.workspace, `configure shared ${driver} merge attribute`, {
+        ".gitattributes": `${relPath} merge=${driver}\n`,
+        [relPath]: sharedVariant,
+      });
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const peer = cloneRemote(fixture, `peer-sentinel-${driver}`);
+      const localTip = commitFiles(fixture.workspace, `local ${driver} driver variant`, {
+        [relPath]: sharedVariant.replace("Shared committed body.", "LOCAL.DRIVER.VARIANT"),
+      });
+      const remoteTip = commitFiles(peer, `remote ${driver} driver variant`, {
+        [relPath]: sharedVariant.replace("Shared committed body.", "REMOTE.DRIVER.VARIANT"),
+      });
+      git(peer, ["push", "origin", "main"]);
+      git(fixture.workspace, ["config", `merge.${driver}.driver`, "cp %B %A"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, driver);
+      assert.equal(response.reason, "unsupported-merge-driver", driver);
+      assert.equal(localHead(fixture), localTip, driver);
+      assert.equal(remoteHead(fixture), remoteTip, driver);
+    }
+  });
+
   it("rejects a clean filter before it can alter a staged unresolved page", () => {
     const fixture = createSyncFixture();
     const relPath = "wiki/pages/feedback/filtered.md";
@@ -1800,6 +1862,43 @@ describe("knowledge sync managed Knowledge reconciliation", () => {
     assert.equal(response.reason, "candidate-unsupported-clean-filter");
     assert.equal(localHead(fixture), localTip);
     assert.equal(remoteHead(fixture), remoteTip);
+  });
+
+  it("rejects clean filters whose names match neutral check-attr sentinel values", () => {
+    for (const driver of ["unset", "unspecified"] as const) {
+      const fixture = createSyncFixture();
+      const relPath = `wiki/pages/feedback/sentinel-filter-${driver}.md`;
+      commitFiles(fixture.workspace, `configure shared ${driver} clean-filter attribute`, {
+        ".gitattributes": `${relPath} filter=${driver}\n`,
+      });
+      git(fixture.workspace, ["push", "origin", "main"]);
+      const peer = cloneRemote(fixture, `peer-sentinel-filter-${driver}`);
+      const localTip = commitFiles(fixture.workspace, `local ${driver} filtered variant`, {
+        [relPath]: page(
+          `Local ${driver} filtered variant`,
+          "The local committed variant.",
+          "feedback",
+          "LOCAL.UNIQUE.BODY\n",
+        ),
+      });
+      const remoteTip = commitFiles(peer, `remote ${driver} filtered variant`, {
+        [relPath]: page(
+          `Remote ${driver} filtered variant`,
+          "The remote committed variant.",
+          "feedback",
+          "REMOTE.UNIQUE.BODY\n",
+        ),
+      });
+      git(peer, ["push", "origin", "main"]);
+      git(fixture.workspace, ["config", `filter.${driver}.clean`, "sed '/REMOTE.UNIQUE.BODY/d'"]);
+
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false, driver);
+      assert.equal(response.reason, "candidate-unsupported-clean-filter", driver);
+      assert.equal(localHead(fixture), localTip, driver);
+      assert.equal(remoteHead(fixture), remoteTip, driver);
+    }
   });
 
   it("rejects managed check-in transformations before preparing a divergent merge", () => {

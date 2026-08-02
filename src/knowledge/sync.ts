@@ -151,6 +151,7 @@ const CHECKIN_TRANSFORMATION_ATTRIBUTES = [
   "crlf",
 ] as const;
 const NEUTRAL_CHECKIN_ATTRIBUTE_VALUES = new Set(["unspecified", "unset"]);
+const AMBIGUOUS_ATTRIBUTE_SENTINEL_VALUES = new Set(["set", "unset", "unspecified"]);
 
 const defaultFs: KnowledgeSyncFs = {
   closeSync,
@@ -686,6 +687,27 @@ function validateManagedCheckinAttributes(
         );
       }
       if (NEUTRAL_CHECKIN_ATTRIBUTE_VALUES.has(value)) {
+        if (expectedAttribute === "filter") {
+          for (const key of [`filter.${value}.clean`, `filter.${value}.process`]) {
+            const configured = git([...configArgs, "config", "--get", key], {
+              cwd: candidateRoot,
+            });
+            if (configured.status === 0) {
+              return failure(
+                "unsupported",
+                "candidate-unsupported-clean-filter",
+                `knowledge sync refused ${relPath} because its Git filter value is indistinguishable from the ${value} check-attr sentinel and ${key} can alter committed Knowledge bytes.`,
+              );
+            }
+            if (configured.status !== 1 || configured.stderr.trim()) {
+              return failure(
+                "error",
+                "candidate-managed-config-inspection-failed",
+                `knowledge sync could not inspect ${key}: ${errorText(configured)}`,
+              );
+            }
+          }
+        }
         continue;
       }
       if (expectedAttribute === "filter") {
@@ -1152,6 +1174,24 @@ function validateMergeDrivers(
         `knowledge sync refused ${path} because its union or custom merge driver can hide a conflict; use Git's text or binary merge driver so conflicts remain explicit.`,
       );
     }
+    if (AMBIGUOUS_ATTRIBUTE_SENTINEL_VALUES.has(fields[2])) {
+      const key = `merge.${fields[2]}.driver`;
+      const configured = git(["config", "--get", key], { cwd: candidateRoot });
+      if (configured.status === 0) {
+        return failure(
+          "unsupported",
+          "unsupported-merge-driver",
+          `knowledge sync refused ${path} because its Git merge value is indistinguishable from the ${fields[2]} check-attr sentinel and ${key} can hide a conflict.`,
+        );
+      }
+      if (configured.status !== 1 || configured.stderr.trim()) {
+        return failure(
+          "error",
+          "candidate-merge-driver-inspection-failed",
+          `knowledge sync could not inspect ${key}: ${errorText(configured)}`,
+        );
+      }
+    }
   }
   return undefined;
 }
@@ -1356,14 +1396,10 @@ function readHistoricalStructuralLog(
   if (!schema.ok) {
     return schema;
   }
-  const index = readCommitFile(candidateRoot, commit, "wiki/index.md", git);
-  if (!index.ok) {
-    return index;
-  }
   const marker = schema.content === undefined
     ? undefined
     : parseKnowledgeV2SchemaMarker(schema.content);
-  if (!marker || index.content === undefined) {
+  if (!marker) {
     return { kind: "pre-v2" };
   }
   const log = readRequiredStructuralLog(candidateRoot, commit, git);
@@ -1381,6 +1417,19 @@ function validateStructuralLogCommit(
     return commitState;
   }
   if (commitState.kind === "pre-v2") {
+    for (const parent of parents) {
+      const parentState = readHistoricalStructuralLog(candidateRoot, parent, git);
+      if (!("kind" in parentState)) {
+        return parentState;
+      }
+      if (parentState.kind === "v2") {
+        return failure(
+          "rejected",
+          "candidate-log-history-not-preserved",
+          `knowledge sync refused commit ${commit} because it removed or invalidated the Knowledge v2 schema after structural history began.`,
+        );
+      }
+    }
     return undefined;
   }
   const commitLog = commitState.content;
