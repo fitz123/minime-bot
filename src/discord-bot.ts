@@ -272,6 +272,13 @@ export async function createDiscordBot(
       const stream = sessionManager.sendSessionMessage(chatId, agentId, text);
       await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
     },
+    {
+      prepareSessionFn: async (chatId, agentId) => {
+        await sessionManager.getOrCreateSession(chatId, agentId);
+      },
+      recoveryNoticeFn: (chatId, _agentId, platform) =>
+        sessionManager.deliverPendingRecoveryNotice(chatId, platform).then(() => undefined),
+    },
   );
 
   // Thread support: join threads on creation so we receive their messages

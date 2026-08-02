@@ -41,6 +41,19 @@ export type AcknowledgedSteerFn = (
   onEnqueued?: () => void,
 ) => Promise<boolean>;
 
+/** Deliver any durable non-model recovery notice after lane preparation. */
+export type RecoveryNoticeFn = (
+  chatId: string,
+  agentId: string,
+  platform: PlatformContext,
+) => Promise<void>;
+
+/** Prepare the lane before notice delivery; failures stop prompt processing. */
+export type PrepareSessionFn = (
+  chatId: string,
+  agentId: string,
+) => Promise<void>;
+
 /** Fire-and-forget cleanup callback (e.g. delete a temp file after processing). */
 export type CleanupFn = () => void;
 
@@ -121,6 +134,8 @@ export class MessageQueue {
   private queueCap: number;
   private processFn: ProcessFn;
   private acknowledgedSteerFn?: AcknowledgedSteerFn;
+  private prepareSessionFn?: PrepareSessionFn;
+  private recoveryNoticeFn?: RecoveryNoticeFn;
 
   constructor(
     processFn: ProcessFn,
@@ -128,12 +143,31 @@ export class MessageQueue {
       debounceMs?: number;
       queueCap?: number;
       acknowledgedSteerFn?: AcknowledgedSteerFn;
+      prepareSessionFn?: PrepareSessionFn;
+      recoveryNoticeFn?: RecoveryNoticeFn;
     },
   ) {
     this.processFn = processFn;
     this.debounceMs = options?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.queueCap = options?.queueCap ?? DEFAULT_QUEUE_CAP;
     this.acknowledgedSteerFn = options?.acknowledgedSteerFn;
+    this.prepareSessionFn = options?.prepareSessionFn;
+    this.recoveryNoticeFn = options?.recoveryNoticeFn;
+  }
+
+  private async deliverRecoveryNotice(
+    chatId: string,
+    agentId: string,
+    platform: PlatformContext,
+  ): Promise<void> {
+    if (!this.recoveryNoticeFn) return;
+    try {
+      await this.recoveryNoticeFn(chatId, agentId, platform);
+    } catch (err) {
+      // Notice delivery is durable and retried on the next processing boundary.
+      // It must never strand the user message that caused the replacement.
+      log.warn("message-queue", `Recovery notice delivery failed for ${chatId}:`, err);
+    }
   }
 
   private getState(chatId: string, agentId: string): ChatQueueState {
@@ -243,10 +277,11 @@ export class MessageQueue {
     this.beginBusyGeneration(state);
 
     const combinedText = texts.length === 1 ? texts[0] : texts.join("\n\n");
+    const platform = state.latestPlatform;
 
     // Start pre-stream typing indicator (covers session spawn, queue wait, thinking phase)
     // relayStream() will clear this timer on handoff and start its own
-    this.startPreStreamTyping(state.latestPlatform);
+    this.startPreStreamTyping(platform);
 
     // Mutable holder so onAgentOwnership can drop the cleanups: once the
     // agent has accepted the prompt, the conversation references any media
@@ -262,9 +297,15 @@ export class MessageQueue {
     };
 
     try {
-      if (state.latestPlatform) {
+      if (platform) {
         try {
-          await this.processFn(chatId, state.agentId, combinedText, state.latestPlatform, transferOwnership);
+          await this.prepareSessionFn?.(chatId, state.agentId);
+          if (this.queues.get(chatId) === state) {
+            await this.deliverRecoveryNotice(chatId, state.agentId, platform);
+          }
+          if (this.queues.get(chatId) === state) {
+            await this.processFn(chatId, state.agentId, combinedText, platform, transferOwnership);
+          }
         } finally {
           this.settleBusyGeneration(state);
         }
@@ -273,13 +314,13 @@ export class MessageQueue {
       }
     } catch (err) {
       log.error("message-queue", `Send error for ${chatId}:`, err);
-      if (this.queues.get(chatId) === state && state.latestPlatform) {
-        await state.latestPlatform
+      if (this.queues.get(chatId) === state && platform) {
+        await platform
           .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
           .catch(() => {});
       }
     } finally {
-      this.stopPreStreamTyping(state.latestPlatform);
+      this.stopPreStreamTyping(platform);
       this.runCleanups(cleanups);
     }
 
@@ -319,6 +360,7 @@ export class MessageQueue {
       // handled by clear().
       const dropCleanups = entries.map(({ dropCleanup }) => dropCleanup);
       const prompt = buildCollectPrompt(collected);
+      const platform = state.latestPlatform;
 
       this.beginBusyGeneration(state);
       log.debug(
@@ -326,7 +368,7 @@ export class MessageQueue {
         `Draining ${collected.length} collected message(s) for ${chatId}`,
       );
 
-      this.startPreStreamTyping(state.latestPlatform);
+      this.startPreStreamTyping(platform);
 
       let liveDropCleanups: Array<CleanupFn | undefined> | null = dropCleanups;
       const transferOwnership = () => {
@@ -335,9 +377,15 @@ export class MessageQueue {
       };
 
       try {
-        if (state.latestPlatform) {
+        if (platform) {
           try {
-            await this.processFn(chatId, state.agentId, prompt, state.latestPlatform, transferOwnership);
+            await this.prepareSessionFn?.(chatId, state.agentId);
+            if (this.queues.get(chatId) === state) {
+              await this.deliverRecoveryNotice(chatId, state.agentId, platform);
+            }
+            if (this.queues.get(chatId) === state) {
+              await this.processFn(chatId, state.agentId, prompt, platform, transferOwnership);
+            }
           } finally {
             this.settleBusyGeneration(state);
           }
@@ -346,13 +394,13 @@ export class MessageQueue {
         }
       } catch (err) {
         log.error("message-queue", `Collect drain error for ${chatId}:`, err);
-        if (this.queues.get(chatId) === state && state.latestPlatform) {
-          await state.latestPlatform
+        if (this.queues.get(chatId) === state && platform) {
+          await platform
             .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
             .catch(() => {});
         }
       } finally {
-        this.stopPreStreamTyping(state.latestPlatform);
+        this.stopPreStreamTyping(platform);
         this.runCleanups(cleanups);
       }
 

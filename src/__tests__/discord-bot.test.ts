@@ -110,6 +110,92 @@ describe("Discord media failure handling", () => {
   });
 });
 
+describe("Discord recovery notice delivery", () => {
+  it("delivers the notice through the Discord adapter before the triggering prompt", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 10_000 });
+    const originalLogin = Client.prototype.login;
+    const originalPut = REST.prototype.put;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    REST.prototype.put = async () => ({}) as never;
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 209_715_200,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{
+        channelId: "channel-notice",
+        guildId: "guild-1",
+        agentId: "main",
+        kind: "channel",
+        requireMention: false,
+      }],
+    };
+    const events: string[] = [];
+    const sessionManager = {
+      getOrCreateSession: async () => {
+        events.push("prepare");
+        return {};
+      },
+      deliverPendingRecoveryNotice: async (_chatId: string, platform: { sendMessage(text: string): Promise<string> }) => {
+        events.push("notice");
+        await platform.sendMessage("Session failed-old-id was replaced by new-session-id.");
+        return true;
+      },
+      sendSessionMessage: (_chatId: string, _agentId: string, text: string) => {
+        events.push(`prompt:${text.includes("triggering prompt")}`);
+        return (async function* () {
+          yield { type: "result", result: "", session_id: "new-session-id" } as const;
+        })();
+      },
+    } as unknown as SessionManager;
+    const sent: string[] = [];
+
+    try {
+      const { client, messageQueue } = await createDiscordBot(config, discordConfig, sessionManager);
+      client.emit(Events.MessageCreate, {
+        author: { bot: false, username: "tester", globalName: "Tester" },
+        channel: {
+          send: async (text: string) => {
+            sent.push(text);
+            return { id: `sent-${sent.length}`, delete: async () => {} };
+          },
+          sendTyping: async () => {},
+          isThread: () => false,
+        },
+        channelId: "channel-notice",
+        guildId: "guild-1",
+        createdTimestamp: Date.now(),
+        mentions: { has: () => false },
+        attachments: new Map(),
+        content: "triggering prompt",
+        reply: async () => ({}),
+      } as never);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(3_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.deepStrictEqual(events, ["prepare", "notice", "prompt:true"]);
+      assert.deepStrictEqual(sent, ["Session failed-old-id was replaced by new-session-id."]);
+      messageQueue.clearAll();
+    } finally {
+      Client.prototype.login = originalLogin;
+      REST.prototype.put = originalPut;
+    }
+  });
+});
+
 describe("Discord stale-message handling", () => {
   it("continues dropping messages older than maxMessageAgeMs", async () => {
     const originalLogin = Client.prototype.login;

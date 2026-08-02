@@ -38,6 +38,10 @@ import {
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
+import {
+  inspectInteractiveSessionBinding,
+  type InteractiveSessionBinding,
+} from "./interactive-session-binding.js";
 
 export { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 
@@ -168,6 +172,19 @@ export interface PiSpawnRuntimeEnvOptions {
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
+
+export type PiSpawnPathBinding = Pick<
+  InteractiveSessionBinding,
+  "sessionDirectory" | "sessionFile"
+>;
+export type PiSpawnSessionBinding = InteractiveSessionBinding;
+
+export interface PiSessionIdentity {
+  sessionId: string;
+  sessionFile: string;
+}
+
+type LegacyInteractiveSessionInput = PiSpawnPathBinding | string | undefined;
 
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "CI",
@@ -546,7 +563,7 @@ export function resolveValidatedPiAgentWorkspaceCwd(agent: AgentConfig): string 
 
 export function buildPiSpawnArgs(
   agent: AgentConfig,
-  resumeSessionId?: string,
+  sessionBinding?: LegacyInteractiveSessionInput,
   extensionOptions?: PiSpawnExtensionOptions,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): string[] {
@@ -615,15 +632,48 @@ export function buildPiSpawnArgs(
   // checks live in the extension resolvers.
   args.push(...resolvePiSpawnExtensionArgs(extensionOptions));
 
-  // Pi mints its own session id (the bot cannot pre-assign one with
-  // --session-id). When resuming a stored session, point Pi at the
-  // captured id with --session; on a fresh start, omit it entirely (passing an
-  // unknown id makes Pi exit 1 with "No session found matching").
-  if (resumeSessionId) {
-    args.push("--session", resumeSessionId);
+  // A verified absolute path bypasses Pi's ID/prefix discovery completely.
+  // buildPiSpawnArgs remains usable without a binding for non-spawning argument
+  // unit tests, but any supplied value must be the exact-path pair. The actual
+  // interactive spawn below requires the pair unconditionally.
+  if (sessionBinding !== undefined) {
+    const exactBinding = assertPiSpawnSessionBinding(sessionBinding);
+    args.push(
+      "--session-dir", exactBinding.sessionDirectory,
+      "--session", exactBinding.sessionFile,
+    );
   }
 
   return args;
+}
+
+function assertPiSpawnSessionBinding(
+  input: LegacyInteractiveSessionInput,
+): PiSpawnPathBinding {
+  if (!input || typeof input !== "object") {
+    throw new Error(
+      "Interactive Pi sessions require an exact { sessionDirectory, sessionFile } binding; IDs are not accepted",
+    );
+  }
+  const sessionDirectory = input.sessionDirectory;
+  const sessionFile = input.sessionFile;
+  if (
+    typeof sessionDirectory !== "string"
+    || !isAbsolute(sessionDirectory)
+    || normalize(sessionDirectory) !== sessionDirectory
+  ) {
+    throw new Error("Interactive Pi sessionDirectory must be a normalized absolute path");
+  }
+  if (
+    typeof sessionFile !== "string"
+    || !isAbsolute(sessionFile)
+    || normalize(sessionFile) !== sessionFile
+    || !sessionFile.endsWith(".jsonl")
+    || dirname(sessionFile) !== sessionDirectory
+  ) {
+    throw new Error("Interactive Pi sessionFile must be a direct normalized absolute JSONL path");
+  }
+  return { sessionDirectory, sessionFile };
 }
 
 export function buildPiSpawnEnv(
@@ -720,14 +770,37 @@ const PI_STARTUP_STDERR_CAP = 64 * 1024;
 
 export function spawnPiRpcSession(
   agent: AgentConfig,
-  resumeSessionId?: string,
+  sessionBinding?: PiSpawnSessionBinding | string,
   extensionOptions?: PiSpawnExtensionOptions,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
 ): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
   const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
-  const args = buildPiSpawnArgs(spawnAgent, resumeSessionId, extensionOptions, runtimeEnvOptions);
+  const exactPath = assertPiSpawnSessionBinding(sessionBinding);
+  if (
+    !sessionBinding
+    || typeof sessionBinding !== "object"
+    || typeof sessionBinding.sessionId !== "string"
+    || sessionBinding.sessionId.length === 0
+    || typeof sessionBinding.workspaceRealpath !== "string"
+    || realpathSync(workspaceCwd) !== sessionBinding.workspaceRealpath
+  ) {
+    throw new Error("Interactive Pi spawn requires the complete verified session identity");
+  }
+  const inspection = inspectInteractiveSessionBinding(
+    {
+      sessionDirectory: exactPath.sessionDirectory,
+      workspaceRealpath: sessionBinding.workspaceRealpath,
+    },
+    exactPath.sessionFile,
+    sessionBinding.sessionId,
+  );
+  if (!inspection.valid) {
+    throw new Error(`Interactive Pi session binding is not usable: ${inspection.reason}`);
+  }
+  const exactBinding = inspection.binding;
+  const args = buildPiSpawnArgs(spawnAgent, exactBinding, extensionOptions, runtimeEnvOptions);
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {
@@ -920,7 +993,7 @@ export interface PiRpcEvent {
   // Command-response correlation fields (records with `type: "response"`).
   command?: string;
   success?: boolean;
-  data?: { sessionId?: string; [key: string]: unknown };
+  data?: { sessionId?: string; sessionFile?: string; [key: string]: unknown };
   error?: unknown;
   toolName?: string;
   tool?: { name?: string; [key: string]: unknown };
@@ -1634,6 +1707,59 @@ export function handlePiExtensionUiRecord(
 ): PiExtensionUiRequestHandling {
   const event = parsePiJsonlRecord(record);
   return event ? handlePiExtensionUiRequest(child, event) : "not_ui";
+}
+
+/**
+ * Parse only the successful get_state response for the caller's exact
+ * correlation id. Both Pi-authored identity fields are required; partial,
+ * unrelated, failed, or malformed responses cannot become an identity.
+ */
+export function parsePiGetStateIdentity(
+  event: PiRpcEvent,
+  expectedResponseId: string,
+): PiSessionIdentity | null {
+  if (
+    !expectedResponseId
+    || event.type !== "response"
+    || event.command !== "get_state"
+    || event.id !== expectedResponseId
+    || event.success !== true
+  ) {
+    return null;
+  }
+  const sessionId = nonEmptyText(event.data?.sessionId);
+  const sessionFile = nonEmptyText(event.data?.sessionFile);
+  return sessionId && sessionFile ? { sessionId, sessionFile } : null;
+}
+
+/** Assert get_state as evidence about an existing binding, never as a source. */
+export function assertPiSessionIdentityMatchesBinding(
+  binding: Pick<InteractiveSessionBinding, "sessionId" | "sessionFile">,
+  observed: PiSessionIdentity,
+): void {
+  if (observed.sessionId !== binding.sessionId) {
+    throw new Error(
+      `Pi get_state sessionId mismatch: expected ${binding.sessionId}, received ${observed.sessionId}`,
+    );
+  }
+  if (observed.sessionFile !== binding.sessionFile) {
+    throw new Error(
+      `Pi get_state sessionFile mismatch: expected ${binding.sessionFile}, received ${observed.sessionFile}`,
+    );
+  }
+}
+
+/** Route startup side channels and parse one correlated exact identity. */
+export function parsePiStartupIdentityRecord(
+  child: ChildProcess,
+  record: string,
+  expectedResponseId: string,
+): PiSessionIdentity | null {
+  if (handlePiExtensionUiRecord(child, record) === "blocking") {
+    throw new PiStartupBlockingUiError();
+  }
+  const event = parsePiJsonlRecord(record);
+  return event ? parsePiGetStateIdentity(event, expectedResponseId) : null;
 }
 
 /** Route startup side channels and extract a Pi-minted session id when present. */

@@ -1375,7 +1375,8 @@ describe("command handler wiring", () => {
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
       sendSessionMessage: () => { calls.push("sendSessionMessage"); throw new Error("unexpected"); },
-      getOrCreateSession: async () => { calls.push("getOrCreateSession"); throw new Error("unexpected"); },
+      getOrCreateSession: async () => { calls.push("getOrCreateSession"); return {} as never; },
+      deliverPendingRecoveryNotice: async () => false,
       closeAll: async () => {},
       resolveStoredSession: () => ({ resume: false }),
       getActiveCount: () => 1,
@@ -1543,6 +1544,43 @@ describe("command handler wiring", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     await Promise.resolve();
   }
+
+  it("delivers a recovery notice through Telegram before processing the triggering prompt", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const events: string[] = [];
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const manager = createMockSessionManager();
+    manager.getOrCreateSession = async () => {
+      events.push("prepare");
+      return {} as never;
+    };
+    manager.deliverPendingRecoveryNotice = async (_chatId, platform) => {
+      events.push("notice");
+      await platform.sendMessage("Session failed-old-id was replaced by new-session-id.");
+      return true;
+    };
+    manager.sendSessionMessage = (_chatId, _agentId, text) => {
+      events.push(`prompt:${text.includes("triggering prompt")}`);
+      return (async function* () {
+        yield { type: "result", result: "", session_id: "new-session-id" } as const;
+      })();
+    };
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, () => ({
+      message_id: 900,
+      date: 1,
+      chat: { id: testChatId, type: "private" },
+    }));
+
+    await bot.handleUpdate(makeTextUpdate("triggering prompt", 901));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+
+    assert.deepStrictEqual(events, ["prepare", "notice", "prompt:true"]);
+    assert.ok(apiCalls.some(
+      ({ method, payload }) => method === "sendMessage" && String(payload.text).includes("failed-old-id"),
+    ));
+    messageQueue.clearAll();
+  });
 
   it("retains grammY's normal API timeout for potentially large media uploads", () => {
     const { bot } = createTelegramBot(handlerConfig, createMockSessionManager());

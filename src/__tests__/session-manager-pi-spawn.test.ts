@@ -1,12 +1,13 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, realpathSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname } from "node:path";
-import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
+import type { AgentConfig, BotConfig, BoundSessionState, StreamLine } from "../types.js";
 import type { ActiveSession } from "../session-manager.js";
+import type { InteractiveSessionBinding } from "../interactive-session-binding.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
 import { log } from "../logger.js";
@@ -15,16 +16,37 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, normalizePiModel, parsePiStartupRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
+const MAIN_WORKSPACE = `${TEST_DIR}/workspace-main`;
+const PI_WORKSPACE = `${TEST_DIR}/workspace-pi`;
+const PI_SESSION_DIR = `${TEST_DIR}/pi-sessions`;
 
 function cleanup() {
   if (existsSync(TEST_DIR)) {
     rmSync(TEST_DIR, { recursive: true });
   }
+}
+
+function setupTestFilesystem(): void {
+  cleanup();
+  mkdirSync(TEST_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(MAIN_WORKSPACE, { recursive: true, mode: 0o700 });
+  mkdirSync(PI_WORKSPACE, { recursive: true, mode: 0o700 });
+  mkdirSync(PI_SESSION_DIR, { recursive: true, mode: 0o700 });
+  for (const path of [TEST_DIR, MAIN_WORKSPACE, PI_WORKSPACE, PI_SESSION_DIR]) {
+    chmodSync(path, 0o700);
+  }
+  process.env.PI_CODING_AGENT_SESSION_DIR = PI_SESSION_DIR;
+}
+
+function teardownTestFilesystem(): void {
+  cleanup();
+  delete process.env.PI_CODING_AGENT_SESSION_DIR;
 }
 
 // ---------------------------------------------------------------------------
@@ -34,7 +56,7 @@ function cleanup() {
 /** Args captured from the mocked Pi spawnPiRpcSession. */
 interface PiSpawnCapture {
   agent: AgentConfig;
-  resumeSessionId?: string;
+  sessionBinding: InteractiveSessionBinding;
   extensionOptions?: PiSpawnExtensionOptions;
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions;
 }
@@ -42,11 +64,12 @@ interface PiSpawnCapture {
 const piSpawnCaptures: PiSpawnCapture[] = [];
 
 /**
- * The session id the mocked readPiStream surfaces from get_state. Set to null to
- * model a Pi process that goes idle without ever emitting a SystemInit record
- * (capture must then fall back to the bot's local id).
+ * Optional get_state identity overrides. Null models an absent identity; unless
+ * forceIdentityOverride is set, the mock reports the exact selected binding.
  */
-let nextPiSessionId: string | null = "pi-generated-id";
+let nextPiSessionId: string | null | undefined;
+let nextPiSessionFile: string | null | undefined;
+let forceIdentityOverride = false;
 let suppressGetStateResponse = false;
 let startupRecords: Array<Record<string, unknown>> = [];
 const piStdinWrites: Array<Record<string, unknown>> = [];
@@ -55,18 +78,18 @@ const piStdinWrites: Array<Record<string, unknown>> = [];
  * When set, the mocked sendPiGetState throws this error — models the
  * spawn-then-exit race where the child dies after waitForSpawn resolves but
  * before get_state is written (the real writePiCommand rejects a closed stdin).
- * Capture must swallow it and fall back to the local id, never escaping spawn.
+ * Startup must fail closed without changing the durable binding.
  */
 let getStateError: Error | null = null;
 
 /**
  * Optional hook fired with the child whenever the mocked sendPiGetState is
  * invoked — lets a test observe the exact moment a startup is parked inside
- * capturePiSessionId (the window before active.set / store.setSession). Combine
+ * its identity assertion (the window before active.set). Combine
  * with `suppressGetStateResponse = true` to hold the capture open until the test
  * pushes the get_state reply manually.
  */
-let onGetState: ((child: ChildProcess) => void) | null = null;
+let onGetState: ((child: ChildProcess, responseId?: string) => void) | null = null;
 
 /** Create a mock ChildProcess that auto-emits 'spawn' on next tick. */
 function createAutoSpawnChild(): ChildProcess {
@@ -109,7 +132,7 @@ function createAutoSpawnChild(): ChildProcess {
  * default "ok" auto-spawn, so the Task 3 capture/resume tests are unaffected.
  *  - `{ failStderr }` models a Pi process that fails BEFORE 'spawn' (it never
  *    emits 'spawn', exits 1 → waitForSpawn rejects). This is the rare edge path.
- *  - `{ spawnThenExitStderr }` models the REAL `pi` timing for a stale --session:
+ *  - `{ spawnThenExitStderr }` models the REAL `pi` timing for an exact-open rejection:
  *    it execs cleanly (emits 'spawn', so waitForSpawn RESOLVES) and only THEN
  *    exits 1. The resume failure surfaces during the get_state capture, not as a
  *    spawn rejection — the production path the recovery must actually cover.
@@ -119,10 +142,11 @@ function createAutoSpawnChild(): ChildProcess {
  *  - `{ spawnThenDelayedStderrExitStderr }` models stdout closing before the
  *    buffered stderr signal has reached the startup classifier.
  * Both expose their stderr via the same piStartupStderr accessor the real
- * spawnPiRpcSession installs (Pi prints `No session found matching <id>`).
+ * spawnPiRpcSession installs.
  */
 type PiSpawnOutcome =
   | "ok"
+  | { throwBindingFailure: "missing" | "unsafe" | "unreadable" | "invalid" }
   | { failStderr: string }
   | { spawnThenExitStderr: string }
   | { spawnThenDelayedExitStderr: string; delayMs?: number }
@@ -151,7 +175,7 @@ function createFailingPiChild(failStderr: string): ChildProcess {
   });
 
   // Mirror spawnPiRpcSession: expose buffered startup stderr so the spawn-failure
-  // classifier can match Pi's "No session found matching" signal.
+  // classifier can match Pi's deterministic exact-path open signal.
   (child as unknown as { piStartupStderr: () => string }).piStartupStderr = () => failStderr;
 
   // Fail startup: exit 1, never 'spawn' → waitForSpawn rejects with code=1.
@@ -165,8 +189,8 @@ function createFailingPiChild(failStderr: string): ChildProcess {
 
 /**
  * A Pi child that execs successfully (emits 'spawn', so waitForSpawn RESOLVES)
- * and only THEN exits 1 with buffered stderr — the REAL `pi` timing for a stale
- * --session. Node guarantees 'spawn' fires before all other events, so the
+ * and only THEN exits 1 with buffered stderr — the REAL `pi` timing for an
+ * exact-open rejection. Node guarantees 'spawn' fires before all other events, so the
  * resume failure does NOT reach the waitForSpawn catch; it surfaces when the
  * get_state capture finds the child already dead. Marked `__resumeFailed` so the
  * mocked readPiStream yields no SystemInit (a dead process emits no records),
@@ -333,29 +357,40 @@ mock.module("../pi-rpc-protocol.js", {
   namedExports: {
     spawnPiRpcSession(
       agent: AgentConfig,
-      resumeSessionId?: string,
+      sessionBinding: InteractiveSessionBinding,
       extensionOptions?: PiSpawnExtensionOptions,
       runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
     ) {
-      piSpawnCaptures.push({ agent, resumeSessionId, extensionOptions, runtimeEnvOptions });
+      piSpawnCaptures.push({
+        agent,
+        sessionBinding,
+        extensionOptions,
+        runtimeEnvOptions,
+      });
       const outcome = piSpawnOutcomes.shift() ?? "ok";
       if (outcome === "ok") return createAutoSpawnChild();
-      if ("failStderr" in outcome) return createFailingPiChild(outcome.failStderr);
-      if ("spawnThenExitStderr" in outcome) return createSpawnThenExitChild(outcome.spawnThenExitStderr);
+      if ("throwBindingFailure" in outcome) {
+        throw new Error(`Interactive Pi session binding is not usable: ${outcome.throwBindingFailure}`);
+      }
+      const exactStderr = (stderr: string) => stderr === "exact-open-rejected"
+        ? `Error: Session file is not a valid pi session: ${sessionBinding.sessionFile}`
+        : stderr;
+      if ("failStderr" in outcome) return createFailingPiChild(exactStderr(outcome.failStderr));
+      if ("spawnThenExitStderr" in outcome) return createSpawnThenExitChild(exactStderr(outcome.spawnThenExitStderr));
       if ("spawnThenDelayedStderrExitStderr" in outcome) {
         return createSpawnThenDelayedStderrExitChild(
-          outcome.spawnThenDelayedStderrExitStderr,
+          exactStderr(outcome.spawnThenDelayedStderrExitStderr),
           outcome.stderrDelayMs,
           outcome.exitDelayMs,
         );
       }
-      return createSpawnThenDelayedExitChild(outcome.spawnThenDelayedExitStderr, outcome.delayMs);
+      return createSpawnThenDelayedExitChild(exactStderr(outcome.spawnThenDelayedExitStderr), outcome.delayMs);
     },
-    sendPiGetState(child: ChildProcess) {
+    sendPiGetState(child: ChildProcess, id?: string) {
       if (getStateError) throw getStateError;
-      onGetState?.(child);
+      onGetState?.(child, id);
       if (suppressGetStateResponse) return;
-      // capturePiSessionId reads child.stdout directly (abortable), so model Pi's
+      // The startup identity assertion reads child.stdout directly, so model Pi's
       // get_state reply by pushing the real JSONL record onto stdout. `null`
       // models a process that answers without a session id: end the stream so
       // capture returns promptly (close ends the read) instead of timing out.
@@ -368,9 +403,22 @@ mock.module("../pi-rpc-protocol.js", {
       for (const record of startupRecords) {
         stdout.push(`${JSON.stringify(record)}\n`);
       }
-      if (nextPiSessionId !== null) {
+      if (nextPiSessionId !== null && nextPiSessionFile !== null) {
+        const binding = piSpawnCaptures.at(-1)?.sessionBinding;
+        const sessionId = forceIdentityOverride
+          ? nextPiSessionId ?? binding?.sessionId
+          : binding?.sessionId;
+        const sessionFile = forceIdentityOverride
+          ? nextPiSessionFile ?? binding?.sessionFile
+          : binding?.sessionFile;
         stdout.push(
-          JSON.stringify({ type: "response", success: true, data: { sessionId: nextPiSessionId } }) + "\n",
+          JSON.stringify({
+            type: "response",
+            id,
+            command: "get_state",
+            success: true,
+            data: { sessionId, sessionFile },
+          }) + "\n",
         );
       } else {
         stdout.push(null);
@@ -388,11 +436,12 @@ mock.module("../pi-rpc-protocol.js", {
     // Re-export the genuine parse helpers the capture uses.
     NewlineOnlyJsonlSplitter,
     PiStartupBlockingUiError,
-    parsePiStartupRecord,
+    assertPiSessionIdentityMatchesBinding,
+    parsePiStartupIdentityRecord,
   },
 });
 
-const { SessionManager, outboxDir, hasExited } = await import("../session-manager.js");
+const { SessionManager, formatSessionRecoveryNotice, outboxDir, hasExited } = await import("../session-manager.js");
 const { SessionStore } = await import("../session-store.js");
 
 async function crashCount(agentId: string): Promise<number> {
@@ -417,12 +466,12 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     agents: {
       main: {
         id: "main",
-        workspaceCwd: "/tmp/test-workspace",
+        workspaceCwd: MAIN_WORKSPACE,
         model: "gpt-5.5",
       },
       pi: {
         id: "pi",
-        workspaceCwd: "/tmp/test-workspace-pi",
+        workspaceCwd: PI_WORKSPACE,
         model: "gpt-5.5",
         provider: "pi",
         thinking: "xhigh",
@@ -443,17 +492,48 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   };
 }
 
+function storedPiBinding(
+  chatId: string,
+  sessionId: string,
+  overrides: Partial<BoundSessionState> = {},
+): BoundSessionState {
+  const workspaceRealpath = realpathSync(PI_WORKSPACE);
+  const sessionFile = `${PI_SESSION_DIR}/${sessionId}.jsonl`;
+  writeFileSync(sessionFile, `${JSON.stringify({
+    type: "session",
+    version: CURRENT_SESSION_VERSION,
+    id: sessionId,
+    timestamp: "2026-08-02T00:00:00.000Z",
+    cwd: workspaceRealpath,
+  })}\n`, { mode: 0o600 });
+  chmodSync(sessionFile, 0o600);
+  return {
+    bindingState: "bound",
+    sessionId,
+    sessionFile,
+    workspaceRealpath,
+    chatId,
+    agentId: "pi",
+    provider: "pi",
+    model: "openai-codex/gpt-5.5",
+    thinking: "xhigh",
+    lastActivity: Date.now(),
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("SessionManager Pi session-id capture + resume", () => {
+describe("SessionManager exact Pi binding startup", () => {
   beforeEach(() => {
-    cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    setupTestFilesystem();
     piSpawnCaptures.length = 0;
     piSpawnOutcomes = [];
-    nextPiSessionId = "pi-generated-id";
+    nextPiSessionId = undefined;
+    nextPiSessionFile = undefined;
+    forceIdentityOverride = false;
     suppressGetStateResponse = false;
     startupRecords = [];
     piStdinWrites.length = 0;
@@ -462,22 +542,19 @@ describe("SessionManager Pi session-id capture + resume", () => {
   });
 
   afterEach(() => {
-    cleanup();
+    teardownTestFilesystem();
     onGetState = null;
   });
 
-  it("captures the Pi-minted session id via get_state and persists it", async () => {
-    nextPiSessionId = "pi-generated-id";
+  it("pre-seeds, persists, and asserts one exact Pi binding before spawn", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
 
     const session = await manager.getOrCreateSession("pi-chat", "pi");
 
-    // A fresh Pi spawn must NOT pass --session (no resume id).
     assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined, "fresh start: no resume id");
-
-    // The in-memory session adopts the Pi-minted id (not the local UUID).
-    assert.strictEqual(session.sessionId, "pi-generated-id", "session uses the captured Pi id");
+    assert.strictEqual(session.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
+    assert.strictEqual(session.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
+    assert.strictEqual(session.workspaceRealpath, piSpawnCaptures[0].sessionBinding.workspaceRealpath);
     assert.strictEqual(session.provider, "pi");
     assert.strictEqual(session.model, "openai-codex/gpt-5.5");
     assert.strictEqual(session.thinking, "xhigh");
@@ -496,13 +573,11 @@ describe("SessionManager Pi session-id capture + resume", () => {
     assert.strictEqual(health.model, "openai-codex/gpt-5.5");
     assert.strictEqual(health.thinking, "xhigh");
 
-    // ...and the captured id is persisted for resume across restarts.
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(
-      store.getSession("pi-chat")?.sessionId,
-      "pi-generated-id",
-      "captured Pi id is persisted to the store",
-    );
+    const stored = store.getSession("pi-chat");
+    assert.strictEqual(stored?.bindingState, "bound");
+    assert.strictEqual(stored?.sessionId, session.sessionId);
+    assert.strictEqual(stored?.sessionFile, session.sessionFile);
 
     await manager.closeAll();
   });
@@ -595,6 +670,48 @@ describe("SessionManager Pi session-id capture + resume", () => {
     await manager.closeAll();
   });
 
+  it("reaps the registered child if final binding confirmation cannot be persisted", async () => {
+    let capturedChild: ChildProcess | null = null;
+    onGetState = (child) => {
+      capturedChild = child;
+    };
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const managerStore = (manager as unknown as { store: InstanceType<typeof SessionStore> }).store;
+    const compareAndSetSession = managerStore.compareAndSetSession.bind(managerStore);
+    let compareAndSetCalls = 0;
+    const compareAndSetMock = mock.method(
+      managerStore,
+      "compareAndSetSession",
+      (...args: Parameters<typeof managerStore.compareAndSetSession>) => {
+        compareAndSetCalls++;
+        if (compareAndSetCalls === 2) {
+          throw Object.assign(new Error("session store full"), { code: "ENOSPC" });
+        }
+        return compareAndSetSession(...args);
+      },
+    );
+    const activeBefore = (await sessionsActive.get()).values[0]?.value ?? 0;
+
+    try {
+      await assert.rejects(
+        () => manager.getOrCreateSession("pi-confirm-write-fail", "pi"),
+        /session store full/,
+      );
+    } finally {
+      compareAndSetMock.mock.restore();
+    }
+
+    assert.strictEqual(compareAndSetCalls, 2, "the final activation write is the injected failure");
+    assert.ok(capturedChild, "the child reached identity confirmation before the store failure");
+    assert.strictEqual((capturedChild as ChildProcess).killed, true, "the unconfirmed child is terminated");
+    assert.strictEqual(hasExited(capturedChild as ChildProcess), true, "the unconfirmed child is reaped");
+    assert.strictEqual(manager.getActive("pi-confirm-write-fail"), undefined);
+    assert.strictEqual(manager.getActiveCount(), 0);
+    assert.strictEqual((await sessionsActive.get()).values[0]?.value ?? 0, activeBefore);
+
+    await manager.closeAll();
+  });
+
   it("passes top-level piExtraExtensions to interactive Pi spawns", async () => {
     const extraExtensions = ["/approved/interactive-a.ts", "/approved/interactive-b.ts"];
     const manager = new SessionManager(() => makeConfig({ piExtraExtensions: extraExtensions }), TEST_STORE_PATH);
@@ -632,17 +749,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
     }
   });
 
-  it("resumes a stored Pi session by spawning with the stored id as --session", async () => {
+  it("resumes a stored Pi session by spawning with its exact absolute path", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-resume", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-resume",
-      agentId: "pi",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
-      lastActivity: Date.now(),
-    });
+    const prior = storedPiBinding("pi-resume", "stored-pi-id");
+    store.setSession("pi-resume", prior);
     // On resume, Pi re-confirms the same id through get_state.
     nextPiSessionId = "stored-pi-id";
 
@@ -651,9 +761,9 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
     assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
     assert.strictEqual(
-      piSpawnCaptures[0].resumeSessionId,
-      "stored-pi-id",
-      "resume passes the stored Pi id as --session",
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      realpathSync(prior.sessionFile),
+      "resume passes the stored absolute transcript path",
     );
     assert.strictEqual(session.sessionId, "stored-pi-id", "resumed session keeps its id");
 
@@ -662,15 +772,8 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
   it("resumes stored Pi sessions with the current configured model after a model change", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-model-change", {
-      sessionId: "stored-model-change-id",
-      chatId: "pi-model-change",
-      agentId: "pi",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
-      lastActivity: Date.now(),
-    });
+    const prior = storedPiBinding("pi-model-change", "stored-model-change-id");
+    store.setSession("pi-model-change", prior);
     nextPiSessionId = "stored-model-change-id";
 
     const updatedConfig = makeConfig({
@@ -686,7 +789,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
     const session = await manager.getOrCreateSession("pi-model-change", "pi");
 
     assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-model-change-id");
+    assert.strictEqual(
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      realpathSync(prior.sessionFile),
+    );
     assert.strictEqual(piSpawnCaptures[0].agent.model, "gpt-5.6-sol");
     assert.strictEqual(session.sessionId, "stored-model-change-id", "context-preserving resume keeps the id");
     assert.strictEqual(session.model, "openai-codex/gpt-5.6-sol", "active session records current model");
@@ -697,28 +803,24 @@ describe("SessionManager Pi session-id capture + resume", () => {
     await manager.closeAll();
   });
 
-  it("falls back to the bot's local id when get_state surfaces no session id", async () => {
-    nextPiSessionId = null; // process goes idle without a SystemInit record
+  it("rejects absent get_state identity without replacing the pre-seeded binding", async () => {
+    nextPiSessionId = null;
+    nextPiSessionFile = null;
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
-    const session = await manager.getOrCreateSession("pi-noid", "pi");
-
-    // The session stays functional on its locally-generated id (resume just
-    // can't target it; Task 4 recovery handles a later "No session found").
-    assert.ok(session.sessionId.length > 0, "session keeps a usable local id");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined, "fresh start: no resume id");
+    await assert.rejects(
+      manager.getOrCreateSession("pi-noid", "pi"),
+      /before the exact session identity was reported/,
+    );
 
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(
-      store.getSession("pi-noid")?.sessionId,
-      session.sessionId,
-      "the local id is persisted",
-    );
+    assert.strictEqual(store.getSession("pi-noid")?.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
+    assert.strictEqual(manager.getActive("pi-noid"), undefined);
 
     await manager.closeAll();
   });
 
-  it("falls back to the bot's local id when get_state capture times out on an idle child", async () => {
+  it("rejects get_state timeout without minting or persisting a second identity", async () => {
     suppressGetStateResponse = true;
 
     const manager = new SessionManager(
@@ -727,54 +829,231 @@ describe("SessionManager Pi session-id capture + resume", () => {
       undefined,
       { startupTimeoutMs: 20 },
     );
-    const session = await manager.getOrCreateSession("pi-timeout", "pi");
-
-    assert.ok(session.sessionId.length > 0, "session keeps a usable local id");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined, "fresh start: no resume id");
+    await assert.rejects(
+      manager.getOrCreateSession("pi-timeout", "pi"),
+      /did not report the exact session identity/,
+    );
 
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(
-      store.getSession("pi-timeout")?.sessionId,
-      session.sessionId,
-      "the local id is persisted after capture timeout",
-    );
+    assert.strictEqual(store.getSession("pi-timeout")?.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
 
     await manager.closeAll();
   });
 
-  it("get_state throwing (child died right after spawn) falls back to the local id, not an uncaught throw", async () => {
+  it("rejects a get_state write failure and retains the pre-seeded identity", async () => {
     // Spawn succeeds (waitForSpawn resolves on 'spawn'), but the child dies before
     // get_state is written, so sendPiGetState throws — the spawn-then-exit race.
     getStateError = new Error("Pi RPC child process is not available");
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
 
-    // getOrCreateSession must NOT reject: capture swallows the throw and the
-    // session falls back to the bot's local id.
-    const session = await manager.getOrCreateSession("pi-getstate-fail", "pi");
+    await assert.rejects(
+      manager.getOrCreateSession("pi-getstate-fail", "pi"),
+      /Pi RPC child process is not available/,
+    );
 
     assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn, no recovery loop");
-    assert.ok(session.sessionId.length > 0, "session keeps a usable local id");
 
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(
-      store.getSession("pi-getstate-fail")?.sessionId,
-      session.sessionId,
-      "the local id is persisted",
-    );
+    assert.strictEqual(store.getSession("pi-getstate-fail")?.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
 
     await manager.closeAll();
   });
 
-  it("spawns an absent-provider agent via Pi and captures its Pi session id", async () => {
-    nextPiSessionId = "main-pi-id";
+  it("rejects mismatched get_state IDs and paths without rotating the durable binding", async () => {
+    forceIdentityOverride = true;
+    nextPiSessionId = "wrong-session-id";
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    await assert.rejects(
+      manager.getOrCreateSession("pi-id-mismatch", "pi"),
+      /get_state sessionId mismatch/,
+    );
+    const idBinding = piSpawnCaptures[0].sessionBinding;
+    assert.strictEqual(new SessionStore(TEST_STORE_PATH).getSession("pi-id-mismatch")?.sessionId, idBinding.sessionId);
+
+    nextPiSessionId = undefined;
+    nextPiSessionFile = `${PI_SESSION_DIR}/wrong-session.jsonl`;
+    await assert.rejects(
+      manager.getOrCreateSession("pi-path-mismatch", "pi"),
+      /get_state sessionFile mismatch/,
+    );
+    const pathBinding = piSpawnCaptures[1].sessionBinding;
+    assert.strictEqual(new SessionStore(TEST_STORE_PATH).getSession("pi-path-mismatch")?.sessionId, pathBinding.sessionId);
+    assert.strictEqual(piSpawnCaptures.length, 2, "identity mismatches never allocate a recovery binding");
+  });
+
+  it("rotates when Pi replaces a transcript that vanished after spawn validation", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    const prior = storedPiBinding("pi-open-race", "pi-open-race-old-id");
+    store.setSession("pi-open-race", prior);
+    const piAuthoredDifferentId = "pi-authored-after-disappearance";
+    let getStateCount = 0;
+    onGetState = () => {
+      getStateCount += 1;
+      if (getStateCount === 1) {
+        rmSync(prior.sessionFile);
+        writeFileSync(prior.sessionFile, `${JSON.stringify({
+          type: "session",
+          version: CURRENT_SESSION_VERSION,
+          id: piAuthoredDifferentId,
+          timestamp: "2026-08-02T00:00:00.000Z",
+          cwd: prior.workspaceRealpath,
+        })}\n`, { mode: 0o600 });
+        forceIdentityOverride = true;
+        nextPiSessionId = piAuthoredDifferentId;
+      } else {
+        forceIdentityOverride = false;
+        nextPiSessionId = undefined;
+      }
+    };
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-open-race", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 2, "the unavailable binding rotates exactly once");
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.notStrictEqual(session.sessionFile, prior.sessionFile);
+    assert.strictEqual(
+      JSON.parse(readFileSync(prior.sessionFile, "utf8").trim()).id,
+      piAuthoredDifferentId,
+      "the failed path is preserved after Pi authors the mismatched identity",
+    );
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-open-race")?.pendingRecoveryNotice,
+      {
+        failedSessionId: prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: "invalid",
+      },
+    );
+    await manager.closeAll();
+  });
+
+  it("coalesces concurrent same-lane startups onto one child and binding", async () => {
+    suppressGetStateResponse = true;
+    const startupRequests: Array<{ child: ChildProcess; responseId?: string }> = [];
+    onGetState = (child, responseId) => {
+      startupRequests.push({ child, responseId });
+    };
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const first = manager.getOrCreateSession("pi-concurrent-start", "pi");
+    const second = manager.getOrCreateSession("pi-concurrent-start", "pi");
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const spawnCountBeforeRelease = piSpawnCaptures.length;
+    for (const [index, request] of startupRequests.entries()) {
+      const binding = piSpawnCaptures[index].sessionBinding;
+      request.child.stdout!.push(`${JSON.stringify({
+        type: "response",
+        id: request.responseId,
+        command: "get_state",
+        success: true,
+        data: {
+          sessionId: binding.sessionId,
+          sessionFile: binding.sessionFile,
+        },
+      })}\n`);
+    }
+    const results = await Promise.allSettled([first, second]);
+
+    try {
+      assert.strictEqual(spawnCountBeforeRelease, 1, "one same-generation child is spawned");
+      assert.strictEqual(results[0].status, "fulfilled");
+      assert.strictEqual(results[1].status, "fulfilled");
+      if (results[0].status === "fulfilled" && results[1].status === "fulfilled") {
+        assert.strictEqual(results[0].value, results[1].value, "both callers receive the same active session");
+      }
+      assert.strictEqual(manager.getActiveCount(), 1);
+    } finally {
+      suppressGetStateResponse = false;
+      await manager.closeAll();
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        if (result.value.idleTimer) clearTimeout(result.value.idleTimer);
+        if (!hasExited(result.value.child)) result.value.child.kill("SIGKILL");
+      }
+    }
+  });
+
+  it("rotates locally missing, malformed, unsafe, and ID-mismatched transcripts before spawn", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    const cases = [
+      { chatId: "local-missing", mutate: (state: BoundSessionState) => rmSync(state.sessionFile), reason: "missing" },
+      {
+        chatId: "local-malformed",
+        mutate: (state: BoundSessionState) => writeFileSync(state.sessionFile, "not-json\n", { mode: 0o600 }),
+        reason: "invalid",
+      },
+      {
+        chatId: "local-unsafe",
+        mutate: (state: BoundSessionState) => chmodSync(state.sessionFile, 0o644),
+        reason: "unsafe",
+      },
+      {
+        chatId: "local-id-mismatch",
+        mutate: (state: BoundSessionState) => writeFileSync(state.sessionFile, `${JSON.stringify({
+          type: "session",
+          version: CURRENT_SESSION_VERSION,
+          id: "different-header-id",
+          timestamp: "2026-08-02T00:00:00.000Z",
+          cwd: state.workspaceRealpath,
+        })}\n`, { mode: 0o600 }),
+        reason: "invalid",
+      },
+    ] as const;
+
+    const preparedCases = cases.map((testCase) => {
+      const prior = storedPiBinding(testCase.chatId, `${testCase.chatId}-old-id`);
+      store.setSession(testCase.chatId, prior);
+      testCase.mutate(prior);
+      return { ...testCase, prior };
+    });
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    for (const testCase of preparedCases) {
+      const spawnCount = piSpawnCaptures.length;
+      const session = await manager.getOrCreateSession(testCase.chatId, "pi");
+      assert.strictEqual(piSpawnCaptures.length, spawnCount + 1, "invalid local binding is never spawned");
+      assert.notStrictEqual(session.sessionId, testCase.prior.sessionId);
+      assert.deepStrictEqual(new SessionStore(TEST_STORE_PATH).getSession(testCase.chatId)?.pendingRecoveryNotice, {
+        failedSessionId: testCase.prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: testCase.reason,
+      });
+    }
+    await manager.closeAll();
+  });
+
+  it("rotates once when spawn-time revalidation finds an unreadable transcript", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    const prior = storedPiBinding("local-unreadable", "local-unreadable-old-id");
+    store.setSession("local-unreadable", prior);
+    piSpawnOutcomes = [{ throwBindingFailure: "unreadable" }];
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("local-unreadable", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 2, "the unreadable binding and one replacement are attempted");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionFile, realpathSync(prior.sessionFile));
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("local-unreadable")?.pendingRecoveryNotice,
+      {
+        failedSessionId: prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: "unreadable",
+      },
+    );
+    await manager.closeAll();
+  });
+
+  it("spawns an absent-provider agent through one exact Pi binding", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
     const session = await manager.getOrCreateSession("main-chat", "main");
 
     assert.strictEqual(piSpawnCaptures.length, 1, "one Pi spawn");
     assert.strictEqual(piSpawnCaptures[0].agent.id, "main");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined);
-    assert.strictEqual(session.sessionId, "main-pi-id");
+    assert.strictEqual(session.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
     assert.strictEqual(session.provider, "pi");
     assert.strictEqual(session.model, "openai-codex/gpt-5.5");
     assert.strictEqual(session.thinking, undefined);
@@ -784,7 +1063,6 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
   it("rotates a live active session when the requested agent changes", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
-    nextPiSessionId = "main-live-id";
     const oldSession = await manager.getOrCreateSession("agent-switch", "main");
 
     const inflightPath = allocateMediaPath("agent-switch", "photo", ".jpg");
@@ -792,36 +1070,86 @@ describe("SessionManager Pi session-id capture + resume", () => {
     const stalePath = `${sessionMediaDir("agent-switch")}/prior-agent.jpg`;
     writeFileSync(stalePath, "stale prior agent media");
 
-    nextPiSessionId = "pi-live-id";
     const newSession = await manager.getOrCreateSession("agent-switch", "pi");
 
     assert.notStrictEqual(newSession, oldSession, "agent switch must not reuse the old active session");
     assert.strictEqual(oldSession.child.killed, true, "old agent child should be terminated");
     assert.strictEqual(newSession.agentId, "pi");
-    assert.strictEqual(newSession.sessionId, "pi-live-id");
+    assert.strictEqual(newSession.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     assert.strictEqual(piSpawnCaptures.length, 2, "old agent spawn + new agent spawn");
     assert.strictEqual(piSpawnCaptures[1].agent.id, "pi");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "new agent starts fresh");
+    assert.notStrictEqual(
+      piSpawnCaptures[1].sessionBinding.sessionId,
+      piSpawnCaptures[0].sessionBinding.sessionId,
+      "new agent receives a distinct Pi-authored binding",
+    );
 
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.deepEqual(store.getSession("agent-switch"), {
-      sessionId: "pi-live-id",
-      chatId: "agent-switch",
-      agentId: "pi",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
-      lastActivity: newSession.lastActivity,
-    });
+    const stored = store.getSession("agent-switch");
+    assert.strictEqual(stored?.bindingState, "bound");
+    assert.strictEqual(stored?.sessionId, newSession.sessionId);
+    assert.strictEqual(stored?.sessionFile, newSession.sessionFile);
+    assert.strictEqual(stored?.agentId, "pi");
     assert.ok(existsSync(inflightPath), "current-turn in-flight media survives active agent rotation");
     assert.strictEqual(existsSync(stalePath), false, "prior-agent media is purged on active agent rotation");
 
     releaseMediaPath(inflightPath);
     await manager.closeAll();
   });
+
+  it("retains an unavailable legacy agent's failed ID when binding the replacement agent", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("legacy-agent-unavailable", {
+      bindingState: "legacy-unresolved",
+      failedSessionId: "legacy-failed-id",
+      legacyFailure: "agent-unavailable",
+      chatId: "legacy-agent-unavailable",
+      agentId: "removed-agent",
+      lastActivity: Date.now(),
+    });
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("legacy-agent-unavailable", "pi");
+
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("legacy-agent-unavailable")?.pendingRecoveryNotice,
+      {
+        failedSessionId: "legacy-failed-id",
+        replacementSessionId: session.sessionId,
+        reason: "legacy-unresolved",
+      },
+    );
+    await manager.closeAll();
+  });
+
+  it("carries a durable recovery notice across an agent rebind", async () => {
+    const prior = storedPiBinding("pending-agent-switch", "first-replacement-id", {
+      pendingRecoveryNotice: {
+        failedSessionId: "original-failed-id",
+        replacementSessionId: "first-replacement-id",
+        reason: "missing",
+      },
+    });
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pending-agent-switch", prior);
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pending-agent-switch", "main");
+
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pending-agent-switch")?.pendingRecoveryNotice,
+      {
+        failedSessionId: "original-failed-id",
+        replacementSessionId: session.sessionId,
+        reason: "missing",
+      },
+    );
+    await manager.closeAll();
+  });
 });
 
-describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
+describe("SessionManager exact-path recovery", () => {
   /** Current value of the discard metric for an agent (0 if never set). */
   async function discardedCount(agentId: string): Promise<number> {
     const metric = await piSessionResumeDiscarded.get();
@@ -830,11 +1158,12 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
   }
 
   beforeEach(() => {
-    cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    setupTestFilesystem();
     piSpawnCaptures.length = 0;
     piSpawnOutcomes = [];
-    nextPiSessionId = "pi-generated-id";
+    nextPiSessionId = undefined;
+    nextPiSessionFile = undefined;
+    forceIdentityOverride = false;
     getStateError = null;
     // The media-preserved assertions write into the test media root; clear each
     // chat's dir between runs so a prior run's file can't mask a regression.
@@ -843,24 +1172,50 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
   });
 
   afterEach(() => {
-    cleanup();
+    teardownTestFilesystem();
     try { rmSync(sessionMediaDir("pi-keep"), { recursive: true, force: true }); } catch { /* ignore */ }
     try { rmSync(sessionMediaDir("pi-inflight"), { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  it("missing-session signal: discards once, warns once, increments metric, then starts fresh", async () => {
+  it("rotates a transcript whose body the pinned Pi runtime cannot open", async () => {
+    const prior = storedPiBinding("pi-malformed-body", "malformed-body-id");
+    appendFileSync(prior.sessionFile, `${JSON.stringify({
+      type: "message",
+      id: "malformed-entry",
+      parentId: null,
+      message: null,
+    })}\n`);
+    const priorBytes = readFileSync(prior.sessionFile);
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-malformed-body", prior);
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-malformed-body", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 1, "the malformed prior path is not spawned");
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.notStrictEqual(session.sessionFile, prior.sessionFile);
+    assert.deepStrictEqual(readFileSync(prior.sessionFile), priorBytes, "failed transcript is preserved");
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-malformed-body")?.pendingRecoveryNotice,
+      {
+        failedSessionId: prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: "exact-open-rejected",
+      },
+    );
+
+    await manager.closeAll();
+  });
+
+  it("exact-open rejection: rotates once, warns once, increments metric, then starts fresh", async () => {
     const extraExtensions = ["/approved/recovery-a.ts", "/approved/recovery-b.ts"];
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-stale", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-stale",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-stale", storedPiBinding("pi-stale", "stored-pi-id"));
 
-    // The resume spawn fails with Pi's "No session found" signal; the inline
-    // fresh re-spawn then succeeds and get_state mints a new id.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    // The exact resume fails with Pi's deterministic signal; the one
+    // pre-seeded replacement then starts and get_state confirms its binding.
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const before = await discardedCount("pi");
@@ -878,8 +1233,12 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
     // Exactly two spawns: the failed resume, then ONE inline fresh start.
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh (no --session)");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(
+      piSpawnCaptures[1].sessionBinding.sessionFile,
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      "recovery opens the one pre-seeded replacement path",
+    );
     assert.deepStrictEqual(
       piSpawnCaptures.map((capture) => capture.extensionOptions),
       [{ extraExtensions }, { extraExtensions }],
@@ -894,17 +1253,24 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
       "recovery retry keeps the exact session outbox path",
     );
 
-    // The recovered session is live on the freshly-captured id, and it's persisted.
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the new Pi id");
+    // The recovered session is live on the one pre-seeded replacement, and it is persisted.
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
+    assert.notStrictEqual(session.sessionId, "stored-pi-id");
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("pi-stale")?.sessionId, "fresh-pi-id", "fresh id persisted");
+    const recovered = storeAfter.getSession("pi-stale");
+    assert.strictEqual(recovered?.sessionId, session.sessionId, "replacement id persisted");
+    assert.deepStrictEqual(recovered?.pendingRecoveryNotice, {
+      failedSessionId: "stored-pi-id",
+      replacementSessionId: session.sessionId,
+      reason: "exact-open-rejected",
+    });
 
     // Exactly one discard warning + one metric increment.
     const recoveryWarns = warnCalls.filter(
       (a) =>
         a[0] === "session-manager" &&
         typeof a[1] === "string" &&
-        (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
+        (a[1] as string).includes("could not open Pi session stored-pi-id (exact-open-rejected)"),
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
@@ -919,12 +1285,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("resume-recovery preserves the current turn's in-flight media while discarding the stored id", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-inflight", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-inflight",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-inflight", storedPiBinding("pi-inflight", "stored-pi-id"));
 
     // The triggering turn already staged a media file under this chat's dir and
     // it is tracked as in-flight (allocateMediaPath registers it). The fresh Pi
@@ -936,9 +1297,9 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const stalePath = `${sessionMediaDir("pi-inflight")}/prior-session.jpg`;
     writeFileSync(stalePath, "stale leftover");
 
-    // Resume fails with the "No session found" signal → recovery fires; the
+    // Resume fails with the deterministic exact-open signal → recovery fires; the
     // inline fresh re-spawn then succeeds.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
@@ -952,7 +1313,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
     // Recovery happened: fresh id adopted, stored id discarded (then re-persisted
     // with the fresh id by the successful spawn).
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered onto the fresh id");
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
 
     // The in-flight file for the current turn SURVIVES (the bug fix): the fresh
     // Pi session's prompt can still reach it.
@@ -964,19 +1325,57 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     await manager.closeAll();
   });
 
+  it("retries a durable recovery notice after transport failure and acknowledges only successful delivery", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    store.setSession("pi-notice", storedPiBinding("pi-notice", "failed-old-id"));
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-notice", "pi");
+    const pending = new SessionStore(TEST_STORE_PATH).getSession("pi-notice")?.pendingRecoveryNotice;
+    assert.deepStrictEqual(pending, {
+      failedSessionId: "failed-old-id",
+      replacementSessionId: session.sessionId,
+      reason: "exact-open-rejected",
+    });
+
+    await assert.rejects(
+      manager.deliverPendingRecoveryNotice("pi-notice", {
+        sendMessage: async () => { throw new Error("transport failed"); },
+      }),
+      /transport failed/,
+    );
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-notice")?.pendingRecoveryNotice,
+      pending,
+      "failed delivery leaves the exact notice durable",
+    );
+
+    await manager.closeAll();
+    const restarted = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const delivered: string[] = [];
+    assert.strictEqual(await restarted.deliverPendingRecoveryNotice("pi-notice", {
+      sendMessage: async (text) => {
+        delivered.push(text);
+        return "transport-message-id";
+      },
+    }), true);
+    assert.deepStrictEqual(delivered, [formatSessionRecoveryNotice(pending!)]);
+    assert.strictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-notice")?.pendingRecoveryNotice,
+      undefined,
+      "successful transport completion acknowledges the exact notice",
+    );
+  });
+
   it("both spawns fail: discards once, warns once, then throws — no loop", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-doomed", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-doomed",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-doomed", storedPiBinding("pi-doomed", "stored-pi-id"));
 
     // Resume fails with the signal; the inline fresh re-spawn ALSO fails. The
     // second failure must propagate (no third spawn, no recursion).
     piSpawnOutcomes = [
-      { failStderr: "No session found matching stored-pi-id" },
+      { failStderr: "exact-open-rejected" },
       { failStderr: "still broken on the fresh start" },
     ];
 
@@ -997,14 +1396,18 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
     // At-most-once: exactly two spawn attempts (resume + one fresh), no loop.
     assert.strictEqual(piSpawnCaptures.length, 2, "exactly two spawns — recovery does not loop");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn was a fresh start");
+    assert.notStrictEqual(
+      piSpawnCaptures[1].sessionBinding.sessionFile,
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      "recovery attempts one exact replacement path",
+    );
 
     // The discard + warn + metric ran exactly once despite the fresh start failing.
     const recoveryWarns = warnCalls.filter(
       (a) =>
         a[0] === "session-manager" &&
         typeof a[1] === "string" &&
-        (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
+        (a[1] as string).includes("could not open Pi session stored-pi-id (exact-open-rejected)"),
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
@@ -1012,19 +1415,27 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     // The final failure feeds the normal crash backoff (restart count increments).
     const restartCounts = (manager as unknown as Record<string, Map<string, number>>).restartCounts;
     assert.strictEqual(restartCounts.get("pi-doomed"), 1, "second failure increments the crash count");
+
+    const replacement = new SessionStore(TEST_STORE_PATH).getSession("pi-doomed");
+    assert.strictEqual(replacement?.bindingState, "bound");
+    assert.ok(replacement?.pendingRecoveryNotice, "the one replacement remains durable after spawn failure");
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
+    const restarted = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    await assert.rejects(
+      restarted.getOrCreateSession("pi-doomed", "pi"),
+      /exited during startup/,
+    );
+    assert.strictEqual(piSpawnCaptures.length, 3, "restart retries the same replacement without a third allocation");
+    assert.strictEqual(piSpawnCaptures[2].sessionBinding.sessionId, replacement?.sessionId);
+    assert.strictEqual(new SessionStore(TEST_STORE_PATH).getSession("pi-doomed")?.sessionId, replacement?.sessionId);
   });
 
   it("preserves an accumulated crash count across a resume-recovery discard", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-flap", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-flap",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-flap", storedPiBinding("pi-flap", "stored-pi-id"));
 
     // Resume fails with the signal; the inline fresh re-spawn then succeeds.
-    piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
+    piSpawnOutcomes = [{ failStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
@@ -1044,7 +1455,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
       warnSpy.mock.restore();
     }
 
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered onto the fresh id");
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     assert.strictEqual(
       restartCounts.get("pi-flap"),
       1,
@@ -1056,12 +1467,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("non-matching startup failure: no discard, stored id + media preserved, normal backoff", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-keep", {
-      sessionId: "keep-pi-id",
-      chatId: "pi-keep",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-keep", storedPiBinding("pi-keep", "keep-pi-id"));
 
     // A media file from a prior turn — a non-recovery failure must preserve it so
     // a later successful resume can still reference it.
@@ -1069,7 +1475,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const mediaFile = `${mediaDir}/prior-turn.jpg`;
     writeFileSync(mediaFile, "keep me");
 
-    // Resume fails, but NOT with the "No session found" signal → no recovery.
+    // Resume fails, but NOT with the deterministic exact-open signal → no recovery.
     piSpawnOutcomes = [{ failStderr: "codex: authentication token expired" }];
 
     const before = await discardedCount("pi");
@@ -1089,7 +1495,11 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
     // Exactly one spawn — no inline recovery re-spawn.
     assert.strictEqual(piSpawnCaptures.length, 1, "no recovery spawn for a non-matching failure");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "keep-pi-id", "the resume attempt used the stored id");
+    assert.strictEqual(
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      realpathSync(`${PI_SESSION_DIR}/keep-pi-id.jsonl`),
+      "the resume attempt used the stored exact path",
+    );
 
     // No discard: stored id preserved (NOT deleted), media dir preserved.
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -1120,16 +1530,11 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("real pi timing (spawn then exit 1 with the signal): recovery still fires", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-real", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-real",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-real", storedPiBinding("pi-real", "stored-pi-id"));
 
-    // The resume spawn execs then exits 1 with the signal (real timing); the
-    // inline fresh re-spawn then succeeds and get_state mints a new id.
-    piSpawnOutcomes = [{ spawnThenExitStderr: "No session found matching stored-pi-id" }];
+    // The exact resume execs then exits 1 with the signal (real timing); the
+    // one pre-seeded replacement then starts and get_state confirms its binding.
+    piSpawnOutcomes = [{ spawnThenExitStderr: "exact-open-rejected" }];
     nextPiSessionId = "fresh-pi-id";
 
     const before = await discardedCount("pi");
@@ -1147,18 +1552,18 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     // Exactly two spawns: the failed resume, then ONE inline fresh start — even
     // though waitForSpawn RESOLVED for the failed resume (this is the bug fix).
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh (no --session)");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(piSpawnCaptures[1].sessionBinding.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
 
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the new Pi id");
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("pi-real")?.sessionId, "fresh-pi-id", "fresh id persisted");
+    assert.strictEqual(storeAfter.getSession("pi-real")?.sessionId, session.sessionId, "replacement id persisted");
 
     const recoveryWarns = warnCalls.filter(
       (a) =>
         a[0] === "session-manager" &&
         typeof a[1] === "string" &&
-        (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
+        (a[1] as string).includes("could not open Pi session stored-pi-id (exact-open-rejected)"),
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
@@ -1168,19 +1573,14 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("un-reaped stale resume window: waits for exitCode to settle, then recovers fresh", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-unreaped", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-unreaped",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-unreaped", storedPiBinding("pi-unreaped", "stored-pi-id"));
 
     // The resume child has already buffered Pi's stale-session stderr, but
     // get_state closes stdout with no id while exitCode is still null. It exits
     // shortly after, inside the bounded settle wait; the inline fresh re-spawn
     // then succeeds.
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 20 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 20 },
     ];
     nextPiSessionId = "fresh-pi-id";
 
@@ -1198,18 +1598,18 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     }
 
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh (no --session)");
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the new Pi id");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(piSpawnCaptures[1].sessionBinding.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
 
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("pi-unreaped")?.sessionId, "fresh-pi-id", "fresh id persisted");
+    assert.strictEqual(storeAfter.getSession("pi-unreaped")?.sessionId, session.sessionId, "replacement id persisted");
 
     const recoveryWarns = warnCalls.filter(
       (a) =>
         a[0] === "session-manager" &&
         typeof a[1] === "string" &&
-        (a[1] as string).includes("could not resume Pi session stored-pi-id — starting fresh"),
+        (a[1] as string).includes("could not open Pi session stored-pi-id (exact-open-rejected)"),
     );
     assert.strictEqual(recoveryWarns.length, 1, "exactly one recovery warning");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "metric incremented exactly once");
@@ -1222,21 +1622,19 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     await manager.closeAll();
   });
 
-  it("delayed stale resume stderr is recovered instead of becoming an active local-id session", async () => {
+  it("delayed exact-open rejection rotates instead of activating an unverified session", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-delayed-stderr", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-delayed-stderr",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "pi-delayed-stderr",
+      storedPiBinding("pi-delayed-stderr", "stored-pi-id"),
+    );
 
     // stdout closes with no id before the stderr listener has buffered Pi's
-    // stale-session message. Startup must briefly wait before deciding whether
-    // the resumed child is safe to keep as a local-id session.
+    // stale-session message. Startup must briefly wait for the deterministic
+    // exact-open rejection and must never keep the unverified child.
     piSpawnOutcomes = [
       {
-        spawnThenDelayedStderrExitStderr: "No session found matching stored-pi-id",
+        spawnThenDelayedStderrExitStderr: "exact-open-rejected",
         stderrDelayMs: 5,
         exitDelayMs: 20,
       },
@@ -1249,12 +1647,12 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const session = await manager.getOrCreateSession("pi-delayed-stderr", "pi");
 
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh");
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the fresh Pi id");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(piSpawnCaptures[1].sessionBinding.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
 
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("pi-delayed-stderr")?.sessionId, "fresh-pi-id", "fresh id persisted");
+    assert.strictEqual(storeAfter.getSession("pi-delayed-stderr")?.sessionId, session.sessionId, "replacement id persisted");
     assert.strictEqual((await discardedCount("pi")) - before, 1, "resume discard metric incremented once");
     assert.strictEqual(await crashCount("pi"), crashesBefore, "delayed stderr recovery is not a crash");
 
@@ -1263,19 +1661,17 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("exit-before-stderr stale resume signal is still recovered fresh", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-exit-before-stderr", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-exit-before-stderr",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "pi-exit-before-stderr",
+      storedPiBinding("pi-exit-before-stderr", "stored-pi-id"),
+    );
 
     // Node can observe process exit before the stderr data listener has appended
     // the stale-session message. The settle wait must not treat exit alone as
     // final while the bounded stderr window is still open.
     piSpawnOutcomes = [
       {
-        spawnThenDelayedStderrExitStderr: "No session found matching stored-pi-id",
+        spawnThenDelayedStderrExitStderr: "exact-open-rejected",
         stderrDelayMs: 20,
         exitDelayMs: 5,
       },
@@ -1288,29 +1684,24 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const session = await manager.getOrCreateSession("pi-exit-before-stderr", "pi");
 
     assert.strictEqual(piSpawnCaptures.length, 2, "resume spawn + one inline fresh re-spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh");
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the fresh Pi id");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(piSpawnCaptures[1].sessionBinding.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     assert.strictEqual((await discardedCount("pi")) - before, 1, "resume discard metric incremented once");
     assert.strictEqual(await crashCount("pi"), crashesBefore, "exit-before-stderr recovery is not a crash");
 
     await manager.closeAll();
   });
 
-  it("slow stale resume signal is still recovered instead of becoming an active local-id session", async () => {
+  it("slow exact-open rejection still rotates instead of activating an unverified session", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-slow-stale", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-slow-stale",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-slow-stale", storedPiBinding("pi-slow-stale", "stored-pi-id"));
 
     // The stale-resume signal is already buffered, but the child would not report
     // exit until after the bounded settle wait. The signal is still decisive: the
     // failed resume is killed/reaped and the existing fresh-start recovery fires.
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 1_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 1_000 },
     ];
     nextPiSessionId = "fresh-pi-id";
 
@@ -1320,9 +1711,9 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     const session = await manager.getOrCreateSession("pi-slow-stale", "pi");
 
     assert.strictEqual(piSpawnCaptures.length, 2, "slow stale resume still triggers one fresh recovery spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "first spawn resumed the stored id");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "recovery spawn starts fresh");
-    assert.strictEqual(session.sessionId, "fresh-pi-id", "recovered session adopts the fresh Pi id");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.notStrictEqual(piSpawnCaptures[1].sessionBinding.sessionFile, piSpawnCaptures[0].sessionBinding.sessionFile);
+    assert.strictEqual(session.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     assert.strictEqual((await discardedCount("pi")) - before, 1, "resume discard metric incremented once");
     assert.strictEqual(await crashCount("pi"), crashesBefore, "slow stale-resume recovery is not a crash");
 
@@ -1331,14 +1722,9 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("real pi timing (spawn then exit 1 with a non-matching error): no discard, crash count increments", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-real-keep", {
-      sessionId: "keep-pi-id",
-      chatId: "pi-real-keep",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-real-keep", storedPiBinding("pi-real-keep", "keep-pi-id"));
 
-    // Execs then exits 1, but NOT with the "No session found" signal → no recovery.
+    // Execs then exits 1, but NOT with the deterministic exact-open signal → no recovery.
     piSpawnOutcomes = [{ spawnThenExitStderr: "codex: authentication token expired" }];
 
     const before = await discardedCount("pi");
@@ -1349,7 +1735,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
     try {
       await assert.rejects(
         () => manager.getOrCreateSession("pi-real-keep", "pi"),
-        /exited during startup/,
+        /exited before startup identity was verified/,
         "a non-matching post-spawn exit propagates as a startup error",
       );
     } finally {
@@ -1358,7 +1744,11 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
     // Exactly one spawn — no inline recovery re-spawn.
     assert.strictEqual(piSpawnCaptures.length, 1, "no recovery spawn for a non-matching failure");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "keep-pi-id", "the resume attempt used the stored id");
+    assert.strictEqual(
+      piSpawnCaptures[0].sessionBinding.sessionFile,
+      realpathSync(`${PI_SESSION_DIR}/keep-pi-id.jsonl`),
+      "the resume attempt used the stored exact path",
+    );
 
     // No discard: stored id preserved.
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -1389,33 +1779,36 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
   }
 
   beforeEach(() => {
-    cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    setupTestFilesystem();
     piSpawnCaptures.length = 0;
     piSpawnOutcomes = [];
-    nextPiSessionId = "pi-generated-id";
+    nextPiSessionId = undefined;
+    nextPiSessionFile = undefined;
+    forceIdentityOverride = false;
     suppressGetStateResponse = false;
     getStateError = null;
     onGetState = null;
   });
 
   afterEach(() => {
-    cleanup();
+    teardownTestFilesystem();
     onGetState = null;
   });
 
   it("destroySession during in-flight startup supersedes it: no store entry, child reaped, no active session", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
 
-    // Park the startup inside capturePiSessionId: get_state is invoked but no
+    // Park the startup inside the identity assertion: get_state is invoked but no
     // reply is pushed, so getOrCreateSession is suspended awaiting the Pi-minted
     // id — the exact window BEFORE active.set(...) / store.setSession(...).
     suppressGetStateResponse = true;
     let capturedChild: ChildProcess | null = null;
+    let capturedResponseId: string | undefined;
     let signalCaptureStarted: (() => void) | null = null;
     const captureStarted = new Promise<void>((resolve) => { signalCaptureStarted = resolve; });
-    onGetState = (child) => {
+    onGetState = (child, responseId) => {
       capturedChild = child;
+      capturedResponseId = responseId;
       signalCaptureStarted?.();
     };
 
@@ -1439,8 +1832,15 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
     // Release the parked capture so the startup resumes and reaches the guard.
     assert.ok(capturedChild, "get_state was invoked during startup");
+    const oldBinding = piSpawnCaptures[0].sessionBinding;
     (capturedChild as ChildProcess).stdout!.push(
-      JSON.stringify({ type: "response", success: true, data: { sessionId: "pi-generated-id" } }) + "\n",
+      JSON.stringify({
+        type: "response",
+        id: capturedResponseId,
+        command: "get_state",
+        success: true,
+        data: { sessionId: oldBinding.sessionId, sessionFile: oldBinding.sessionFile },
+      }) + "\n",
     );
 
     const result = await settled;
@@ -1551,9 +1951,9 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     await destroyPromise;
     const newSession = await startupPromise;
 
-    assert.strictEqual(newSession.sessionId, "new-pi-id", "fresh post-clean startup owns the session");
+    assert.strictEqual(newSession.sessionId, piSpawnCaptures[0].sessionBinding.sessionId);
     assert.strictEqual(piSpawnCaptures.length, 1, "fresh Pi child spawns only after active teardown");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, undefined, "post-clean startup starts fresh");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, newSession.sessionId);
     assert.ok(!existsSync(lateOutboxFile), "late old outbox output is removed before resource reuse");
     assert.ok(!existsSync(lateMediaFile), "late old media is removed before resource reuse");
     assert.strictEqual(manager.getActive(chatId), newSession, "new session remains active");
@@ -1649,15 +2049,10 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
   it("destroySession supersedes an in-flight stale-resume recovery before it can discard newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("clean-resume", {
-      sessionId: "stored-pi-id",
-      chatId: "clean-resume",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("clean-resume", storedPiBinding("clean-resume", "stored-pi-id"));
 
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 1_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 1_000 },
     ];
     nextPiSessionId = "old-local-id";
 
@@ -1687,7 +2082,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
     nextPiSessionId = "new-pi-id";
     const newSession = await manager.getOrCreateSession("clean-resume", "pi");
-    assert.strictEqual(newSession.sessionId, "new-pi-id", "post-clean startup owns the fresh session");
+    assert.strictEqual(newSession.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
 
     const outboxSentinel = `${newSession.outboxPath}/owned-after-clean.txt`;
     writeFileSync(outboxSentinel, "new owner outbox file");
@@ -1704,8 +2099,8 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     assert.strictEqual((oldChild as ChildProcess).killed, true, "superseded resume child is terminated");
     assert.strictEqual(hasExited(oldChild as ChildProcess), true, "superseded resume child is reaped");
     assert.strictEqual(piSpawnCaptures.length, 2, "old resume + new post-clean startup, no stale-resume recovery spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "old startup attempted stored resume");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "new post-clean startup starts fresh");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.strictEqual(piSpawnCaptures[1].sessionBinding.sessionId, newSession.sessionId);
     assert.strictEqual(manager.getActive("clean-resume"), newSession, "new session remains active");
     assert.strictEqual(await activeGauge(), before + 1, "only the new session counts toward sessionsActive");
     assert.strictEqual((await discardedCount("pi")) - discardedBefore, 0, "superseded stale resume is not counted as recovery");
@@ -1714,22 +2109,20 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     assert.ok(existsSync(mediaSentinel), "new media survives superseded stale-resume cleanup");
 
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("clean-resume")?.sessionId, "new-pi-id", "new persisted session survives old recovery");
+    assert.strictEqual(storeAfter.getSession("clean-resume")?.sessionId, newSession.sessionId);
 
     await manager.closeAll();
   });
 
   it("destroySession during startup child termination prevents stale-resume discard of newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("clean-resume-terminate", {
-      sessionId: "stored-pi-id",
-      chatId: "clean-resume-terminate",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "clean-resume-terminate",
+      storedPiBinding("clean-resume-terminate", "stored-pi-id"),
+    );
 
     piSpawnOutcomes = [
-      { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 10_000 },
+      { spawnThenDelayedExitStderr: "exact-open-rejected", delayMs: 10_000 },
     ];
     nextPiSessionId = "old-local-id";
 
@@ -1782,7 +2175,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
     nextPiSessionId = "new-pi-id";
     const newSession = await manager.getOrCreateSession("clean-resume-terminate", "pi");
-    assert.strictEqual(newSession.sessionId, "new-pi-id", "post-clean startup owns the fresh session");
+    assert.strictEqual(newSession.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
 
     const outboxSentinel = `${newSession.outboxPath}/owned-after-termination-clean.txt`;
     writeFileSync(outboxSentinel, "new owner outbox file");
@@ -1800,8 +2193,8 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     assert.strictEqual((oldChild as ChildProcess).killed, true, "superseded resume child is terminated");
     assert.strictEqual(hasExited(oldChild as ChildProcess), true, "superseded resume child is reaped");
     assert.strictEqual(piSpawnCaptures.length, 2, "old resume + new post-clean startup, no stale-resume recovery spawn");
-    assert.strictEqual(piSpawnCaptures[0].resumeSessionId, "stored-pi-id", "old startup attempted stored resume");
-    assert.strictEqual(piSpawnCaptures[1].resumeSessionId, undefined, "new post-clean startup starts fresh");
+    assert.strictEqual(piSpawnCaptures[0].sessionBinding.sessionId, "stored-pi-id");
+    assert.strictEqual(piSpawnCaptures[1].sessionBinding.sessionId, newSession.sessionId);
     assert.strictEqual(manager.getActive("clean-resume-terminate"), newSession, "new session remains active");
     assert.strictEqual(await activeGauge(), before + 1, "only the new session counts toward sessionsActive");
     assert.strictEqual((await discardedCount("pi")) - discardedBefore, 0, "superseded stale resume is not counted as recovery");
@@ -1810,7 +2203,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
     assert.ok(existsSync(mediaSentinel), "new media survives superseded stale-resume cleanup");
 
     const storeAfter = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(storeAfter.getSession("clean-resume-terminate")?.sessionId, "new-pi-id", "new persisted session survives old recovery");
+    assert.strictEqual(storeAfter.getSession("clean-resume-terminate")?.sessionId, newSession.sessionId);
 
     await manager.closeAll();
   });
@@ -1824,11 +2217,12 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
   }
 
   beforeEach(() => {
-    cleanup();
-    mkdirSync(TEST_DIR, { recursive: true });
+    setupTestFilesystem();
     piSpawnCaptures.length = 0;
     piSpawnOutcomes = [];
-    nextPiSessionId = "pi-generated-id";
+    nextPiSessionId = undefined;
+    nextPiSessionFile = undefined;
+    forceIdentityOverride = false;
     suppressGetStateResponse = false;
     getStateError = null;
     onGetState = null;
@@ -1836,7 +2230,7 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
   });
 
   afterEach(() => {
-    cleanup();
+    teardownTestFilesystem();
     onGetState = null;
     try { rmSync(sessionMediaDir("supersede-res"), { recursive: true, force: true }); } catch { /* ignore */ }
   });
@@ -1851,11 +2245,13 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     // outbox/media paths.
     suppressGetStateResponse = true;
     let oldChild: ChildProcess | null = null;
+    let oldResponseId: string | undefined;
     let signalCaptureStarted: (() => void) | null = null;
     const captureStarted = new Promise<void>((resolve) => { signalCaptureStarted = resolve; });
-    onGetState = (child) => {
+    onGetState = (child, responseId) => {
       if (oldChild) return;
       oldChild = child;
+      oldResponseId = responseId;
       signalCaptureStarted?.();
     };
 
@@ -1888,7 +2284,7 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     onGetState = null;
     nextPiSessionId = "new-pi-id";
     const newSession = await manager.getOrCreateSession("supersede-res", "pi");
-    assert.strictEqual(newSession.sessionId, "new-pi-id", "fresh post-clean startup owns the session");
+    assert.strictEqual(newSession.sessionId, piSpawnCaptures[1].sessionBinding.sessionId);
     assert.strictEqual(newSession.outboxPath, outboxDir("supersede-res"), "new owner holds the per-chat outbox");
     assert.strictEqual(oldDone, false, "old startup is still unresolved when the new owner writes resources");
 
@@ -1902,8 +2298,18 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     // Release the old startup: it must be superseded and
     // must NOT touch the shared outbox/media the new owner now holds.
     assert.ok(oldChild, "old startup reached get_state capture");
+    const supersededBinding = piSpawnCaptures[0].sessionBinding;
     (oldChild as ChildProcess).stdout!.push(
-      JSON.stringify({ type: "response", success: true, data: { sessionId: "old-pi-id" } }) + "\n",
+      JSON.stringify({
+        type: "response",
+        id: oldResponseId,
+        command: "get_state",
+        success: true,
+        data: {
+          sessionId: supersededBinding.sessionId,
+          sessionFile: supersededBinding.sessionFile,
+        },
+      }) + "\n",
     );
     const result = await oldSettled;
     assert.strictEqual(result.ok, false, "the superseded old startup must not resolve a session");
@@ -1920,7 +2326,7 @@ describe("SessionManager superseded startup resource ownership (Task 3)", () => 
     assert.strictEqual(manager.getActiveCount(), 1, "only the new session remains active");
     assert.strictEqual(await activeGauge(), before + 1, "only the new session counts toward sessionsActive");
     const store = new SessionStore(TEST_STORE_PATH);
-    assert.strictEqual(store.getSession("supersede-res")?.sessionId, "new-pi-id", "the fresh id stays persisted");
+    assert.strictEqual(store.getSession("supersede-res")?.sessionId, newSession.sessionId);
 
     await manager.closeAll();
   });

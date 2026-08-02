@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { Readable, Writable, PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
@@ -27,9 +27,23 @@ import {
 } from "../pi-extensions/acknowledged-steer.js";
 import { resolveWorkspaceContract } from "../workspace-contract.js";
 import PQueue from "p-queue";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 
 const TEST_DIR = "/tmp/minime-test-session-manager";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
+
+function storedBinding(chatId: string, sessionId: string, agentId = "main") {
+  const workspaceRealpath = agentId === "agent-b" ? "/tmp/test-workspace-b" : "/tmp/test-workspace";
+  return {
+    bindingState: "bound" as const,
+    sessionId,
+    sessionFile: `${workspaceRealpath}/${sessionId}.jsonl`,
+    workspaceRealpath,
+    chatId,
+    agentId,
+    lastActivity: Date.now(),
+  };
+}
 
 function cleanup() {
   if (existsSync(TEST_DIR)) {
@@ -283,6 +297,60 @@ describe("SessionManager", () => {
     assert.strictEqual(manager.getActiveCount(), 0);
   });
 
+  it("performs the legacy exact-path cutover during startup", async () => {
+    const { SessionManager } = await import("../session-manager.js");
+    const { SessionStore } = await import("../session-store.js");
+    const workspace = `${TEST_DIR}/migration-workspace`;
+    const sessionDirectory = `${TEST_DIR}/migration-sessions`;
+    const sessionId = "startup-migration-id";
+    const sessionFile = `${sessionDirectory}/2026-08-02_${sessionId}.jsonl`;
+    mkdirSync(workspace, { recursive: true, mode: 0o700 });
+    mkdirSync(sessionDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(TEST_DIR, 0o700);
+    chmodSync(workspace, 0o700);
+    chmodSync(sessionDirectory, 0o700);
+    writeFileSync(sessionFile, `${JSON.stringify({
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: sessionId,
+      timestamp: "2026-08-02T00:00:00.000Z",
+      cwd: realpathSync(workspace),
+    })}\n`, { mode: 0o600 });
+    chmodSync(sessionFile, 0o600);
+    writeFileSync(TEST_STORE_PATH, JSON.stringify({
+      "legacy-chat": {
+        sessionId,
+        chatId: "legacy-chat",
+        agentId: "main",
+        lastActivity: 1,
+      },
+    }), { mode: 0o600 });
+    chmodSync(TEST_STORE_PATH, 0o600);
+    const config = {
+      ...testConfig,
+      agents: {
+        ...testConfig.agents,
+        main: { ...testConfig.agents.main, workspaceCwd: workspace },
+      },
+    };
+    const priorSessionDirectory = process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_SESSION_DIR = sessionDirectory;
+    try {
+      const manager = new SessionManager(() => config, TEST_STORE_PATH);
+      assert.strictEqual(manager.getActiveCount(), 0);
+      const migrated = new SessionStore(TEST_STORE_PATH).getSession("legacy-chat");
+      assert.strictEqual(migrated?.bindingState, "bound");
+      assert.strictEqual(migrated?.sessionId, sessionId);
+      assert.strictEqual(migrated?.sessionFile, realpathSync(sessionFile));
+    } finally {
+      if (priorSessionDirectory === undefined) {
+        delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_SESSION_DIR = priorSessionDirectory;
+      }
+    }
+  });
+
   it("closeAll works on empty manager", async () => {
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
@@ -334,12 +402,7 @@ describe("SessionManager", () => {
 
     // Pre-populate store with a session using "main" agent
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-race", {
-      sessionId: "old-session-id",
-      chatId: "chat-race",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-race", storedBinding("chat-race", "old-session-id"));
 
     // Stale leftover from the prior agent — written directly, not tracked as in-flight.
     // Simulates both aged orphans and just-crashed-process leftovers.
@@ -367,12 +430,7 @@ describe("SessionManager", () => {
     const { ensureSessionMediaDir } = await import("../media-store.js");
 
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-resume", {
-      sessionId: "resume-session-id",
-      chatId: "chat-resume",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-resume", storedBinding("chat-resume", "resume-session-id"));
 
     // A file from the prior turn of the SAME logical session — legitimate context.
     const dir = ensureSessionMediaDir("chat-resume");
@@ -392,12 +450,7 @@ describe("SessionManager", () => {
 
     // Pre-populate store with a session
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-reconnect", {
-      sessionId: "reconnect-session-id",
-      chatId: "chat-reconnect",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-reconnect", storedBinding("chat-reconnect", "reconnect-session-id"));
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
     await manager.closeSession("chat-reconnect");
@@ -417,19 +470,9 @@ describe("SessionManager", () => {
 
     // Pre-populate store with a session
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-destroy", {
-      sessionId: "destroy-session-id",
-      chatId: "chat-destroy",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-destroy", storedBinding("chat-destroy", "destroy-session-id"));
     // Also store another session that should NOT be affected
-    store.setSession("chat-keep", {
-      sessionId: "keep-session-id",
-      chatId: "chat-keep",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-keep", storedBinding("chat-keep", "keep-session-id"));
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
 
@@ -450,12 +493,7 @@ describe("SessionManager", () => {
     const { SessionStore } = await import("../session-store.js");
 
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-race", {
-      sessionId: "race-sid",
-      chatId: "chat-race",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-race", storedBinding("chat-race", "race-sid"));
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
 
@@ -607,18 +645,8 @@ describe("SessionManager", () => {
     // Pre-populate store with two sessions
     const store = new SessionStore(TEST_STORE_PATH);
     const now = Date.now();
-    store.setSession("chat-close", {
-      sessionId: "close-sid",
-      chatId: "chat-close",
-      agentId: "main",
-      lastActivity: now,
-    });
-    store.setSession("chat-destroy", {
-      sessionId: "destroy-sid",
-      chatId: "chat-destroy",
-      agentId: "main",
-      lastActivity: now,
-    });
+    store.setSession("chat-close", { ...storedBinding("chat-close", "close-sid"), lastActivity: now });
+    store.setSession("chat-destroy", { ...storedBinding("chat-destroy", "destroy-sid"), lastActivity: now });
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
 
@@ -660,12 +688,7 @@ describe("SessionManager agentId mismatch detection", () => {
 
     // Pre-populate store with a session using "main" agent
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-1", {
-      sessionId: "existing-session-id",
-      chatId: "chat-1",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-1", storedBinding("chat-1", "existing-session-id"));
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
     const result = manager.resolveStoredSession("chat-1", "main");
@@ -679,25 +702,15 @@ describe("SessionManager agentId mismatch detection", () => {
 
     // Pre-populate store with a session using "main" agent
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-1", {
-      sessionId: "old-session-id",
-      chatId: "chat-1",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-1", storedBinding("chat-1", "old-session-id"));
     // Also store a second session that should NOT be affected
-    store.setSession("chat-2", {
-      sessionId: "other-session-id",
-      chatId: "chat-2",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
+    store.setSession("chat-2", storedBinding("chat-2", "other-session-id"));
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
     const result = manager.resolveStoredSession("chat-1", "agent-b");
 
     assert.strictEqual(result.resume, false, "should not resume mismatched session");
-    assert.notStrictEqual(result.sessionId, "old-session-id", "should generate a fresh sessionId");
+    assert.ok(!("sessionId" in result), "no provisional replacement id is generated");
 
     // Verify store: stale session deleted, other session intact
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -712,17 +725,15 @@ describe("SessionManager agentId mismatch detection", () => {
     // Pre-populate store with a session referencing a non-existent agent
     const store = new SessionStore(TEST_STORE_PATH);
     store.setSession("chat-1", {
-      sessionId: "orphan-session-id",
-      chatId: "chat-1",
+      ...storedBinding("chat-1", "orphan-session-id"),
       agentId: "deleted-agent",
-      lastActivity: Date.now(),
     });
 
     const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
     const result = manager.resolveStoredSession("chat-1", "main");
 
     assert.strictEqual(result.resume, false, "should not resume session with deleted agent");
-    assert.notStrictEqual(result.sessionId, "orphan-session-id", "should generate a fresh sessionId");
+    assert.ok(!("sessionId" in result), "no provisional replacement id is generated");
 
     // Verify store cleanup
     const storeAfter = new SessionStore(TEST_STORE_PATH);
@@ -735,24 +746,17 @@ describe("SessionManager agentId mismatch detection", () => {
 
     const result = manager.resolveStoredSession("new-chat", "main");
     assert.strictEqual(result.resume, false, "should not resume non-existent session");
-    assert.ok(result.sessionId, "should generate a sessionId");
+    assert.ok(!("sessionId" in result), "fresh identity is minted only by Pi pre-seeding");
   });
 
-  it("creates fresh session when stored sessionId is empty", async () => {
-    const { SessionManager } = await import("../session-manager.js");
+  it("rejects an empty stored sessionId", async () => {
     const { SessionStore } = await import("../session-store.js");
 
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("chat-1", {
-      sessionId: "",
-      chatId: "chat-1",
-      agentId: "main",
-      lastActivity: Date.now(),
-    });
-
-    const manager = new SessionManager(() => testConfig, TEST_STORE_PATH);
-    const result = manager.resolveStoredSession("chat-1", "main");
-    assert.strictEqual(result.resume, false, "should not resume empty sessionId");
+    assert.throws(
+      () => store.setSession("chat-1", { ...storedBinding("chat-1", "valid"), sessionId: "" }),
+      /sessionId must be a bounded non-empty string/,
+    );
   });
 });
 
