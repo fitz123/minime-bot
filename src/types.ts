@@ -81,8 +81,24 @@ export interface CronJob {
   engine?: "pi";
 }
 
-export interface SessionState {
-  sessionId: string;
+export const MAX_SESSION_ID_LENGTH = 256;
+export const MAX_SESSION_RECOVERY_REASON_LENGTH = 256;
+
+export type SessionRecoveryReason =
+  | "legacy-unresolved"
+  | "missing"
+  | "unsafe"
+  | "unreadable"
+  | "invalid"
+  | "exact-open-rejected";
+
+export interface PendingSessionRecoveryNotice {
+  failedSessionId: string;
+  replacementSessionId: string;
+  reason: SessionRecoveryReason;
+}
+
+interface SessionStateBase {
   chatId: string;
   agentId: string;
   /** Runtime provider used when this session state was last persisted. Optional for legacy stores. */
@@ -93,6 +109,35 @@ export interface SessionState {
   thinking?: PiThinkingLevel;
   lastActivity: number;
 }
+
+export interface BoundSessionState extends SessionStateBase {
+  bindingState: "bound";
+  sessionId: string;
+  sessionFile: string;
+  workspaceRealpath: string;
+  pendingRecoveryNotice?: PendingSessionRecoveryNotice;
+  failedSessionId?: never;
+  legacyFailure?: never;
+}
+
+export type LegacyCutoverFailure =
+  | "missing"
+  | "ambiguous"
+  | "invalid"
+  | "unsafe"
+  | "agent-unavailable";
+
+export interface UnresolvedLegacySessionState extends SessionStateBase {
+  bindingState: "legacy-unresolved";
+  failedSessionId: string;
+  legacyFailure: LegacyCutoverFailure;
+  sessionId?: never;
+  sessionFile?: never;
+  workspaceRealpath?: never;
+  pendingRecoveryNotice?: never;
+}
+
+export type SessionState = BoundSessionState | UnresolvedLegacySessionState;
 
 export interface SessionDefaults {
   idleTimeoutMs: number;

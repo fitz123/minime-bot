@@ -115,6 +115,9 @@ function piStartupStderr(child: ChildProcess): string {
 export interface ActiveSession {
   child: ChildProcess;
   sessionId: string;
+  /** Exact durable transcript binding; populated by the exact-path lifecycle. */
+  sessionFile?: string;
+  workspaceRealpath?: string;
   agentId: string;
   /** Provider is retained temporarily for status/reporting while runtime is Pi-only. */
   provider: "pi";
@@ -257,8 +260,9 @@ export class SessionManager {
   ) {
     this.loadConfig = loadConfig;
     // Validate config at boot — fail fast if config is broken
-    loadConfig();
+    const startupConfig = loadConfig();
     this.store = new SessionStore(storePath);
+    this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
     this.startupTimeoutMs = options?.startupTimeoutMs ?? STARTUP_TIMEOUT_MS;
   }
@@ -280,14 +284,28 @@ export class SessionManager {
 
   /** Build a SessionState snapshot for persisting to the store. */
   private toSessionState(chatId: string, session: ActiveSession): SessionState {
-    return {
-      sessionId: session.sessionId,
+    const common = {
       chatId,
       agentId: session.agentId,
       provider: session.provider,
       model: session.model,
       thinking: session.thinking,
       lastActivity: session.lastActivity,
+    };
+    if (session.sessionFile && session.workspaceRealpath) {
+      return {
+        bindingState: "bound",
+        sessionId: session.sessionId,
+        sessionFile: session.sessionFile,
+        workspaceRealpath: session.workspaceRealpath,
+        ...common,
+      };
+    }
+    return {
+      bindingState: "legacy-unresolved",
+      failedSessionId: session.sessionId,
+      legacyFailure: "missing",
+      ...common,
     };
   }
 
@@ -1282,7 +1300,14 @@ export class SessionManager {
    */
   resolveStoredSession(chatId: string, agentId: string, config?: BotConfig): { resume: boolean; sessionId: string } {
     const stored = this.store.getSession(chatId);
-    if (!stored || stored.sessionId === "") {
+    if (!stored) {
+      return { resume: false, sessionId: randomUUID() };
+    }
+
+    // Task 3 replaces this transitional fresh result with the fenced one-time
+    // rotation path. The failed legacy ID remains durable and is never passed
+    // to Pi as a runtime binding.
+    if (stored.bindingState === "legacy-unresolved") {
       return { resume: false, sessionId: randomUUID() };
     }
 

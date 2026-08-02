@@ -46,6 +46,14 @@ export type InteractiveTranscriptInspection =
   | { valid: true; binding: InteractiveSessionBinding }
   | { valid: false; reason: InteractiveTranscriptFailure };
 
+export type LegacyInteractiveTranscriptInspection =
+  | { valid: true; binding: InteractiveSessionBinding }
+  | {
+    valid: false;
+    reason: InteractiveTranscriptFailure;
+    observedSessionId?: string;
+  };
+
 export interface InteractiveSessionLocationOptions {
   /** Mirrors Pi's highest-precedence --session-dir input. */
   sessionDirectory?: string;
@@ -214,12 +222,12 @@ function readBoundedHeader(
 }
 
 /** Validate one exact transcript without searching for a substitute. */
-export function inspectInteractiveSessionBinding(
+function inspectInteractiveSessionCandidate(
   location: InteractiveSessionLocation,
   sessionFile: string,
-  expectedSessionId: string,
+  expectedSessionId: string | undefined,
   options: InteractiveSessionInspectionOptions = {},
-): InteractiveTranscriptInspection {
+): LegacyInteractiveTranscriptInspection {
   try {
     assertCanonicalWorkspace(location.workspaceRealpath);
     if (!isAbsolute(sessionFile) || normalize(sessionFile) !== sessionFile) {
@@ -253,15 +261,23 @@ export function inspectInteractiveSessionBinding(
     if (
       header?.type !== "session"
       || header.version !== CURRENT_SESSION_VERSION
-      || header.id !== expectedSessionId
+      || typeof header.id !== "string"
+      || header.id.length === 0
+      || (expectedSessionId !== undefined && header.id !== expectedSessionId)
       || header.cwd !== location.workspaceRealpath
     ) {
-      return { valid: false, reason: "invalid" };
+      return {
+        valid: false,
+        reason: "invalid",
+        ...(typeof header?.id === "string" && header.id.length > 0
+          ? { observedSessionId: header.id }
+          : {}),
+      };
     }
     return {
       valid: true,
       binding: {
-        sessionId: expectedSessionId,
+        sessionId: header.id,
         sessionFile: canonicalFile,
         sessionDirectory,
         workspaceRealpath: location.workspaceRealpath,
@@ -274,6 +290,37 @@ export function inspectInteractiveSessionBinding(
     }
     return { valid: false, reason: "unreadable" };
   }
+}
+
+/** Validate one exact transcript against an already-known durable ID. */
+export function inspectInteractiveSessionBinding(
+  location: InteractiveSessionLocation,
+  sessionFile: string,
+  expectedSessionId: string,
+  options: InteractiveSessionInspectionOptions = {},
+): InteractiveTranscriptInspection {
+  const inspection = inspectInteractiveSessionCandidate(
+    location,
+    sessionFile,
+    expectedSessionId,
+    options,
+  );
+  return inspection.valid
+    ? inspection
+    : { valid: false, reason: inspection.reason };
+}
+
+/**
+ * Read one bounded, direct local candidate for the one-time legacy cutover.
+ * Unlike runtime validation, migration may learn the Pi-authored ID from a
+ * verified header so each candidate needs to be inspected only once.
+ */
+export function inspectLegacyInteractiveSessionCandidate(
+  location: InteractiveSessionLocation,
+  sessionFile: string,
+  options: InteractiveSessionInspectionOptions = {},
+): LegacyInteractiveTranscriptInspection {
+  return inspectInteractiveSessionCandidate(location, sessionFile, undefined, options);
 }
 
 /**
@@ -300,6 +347,33 @@ export function listInteractiveSessionCandidates(
   }
   return entries
     .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".jsonl"))
+    .map((entry) => join(sessionDirectory, entry.name));
+}
+
+/**
+ * Return every direct JSONL-named entry without following it. Legacy cutover
+ * uses this wider evidence list so a matching symlink or non-file is classified
+ * as unsafe instead of disappearing as a false "missing" result.
+ */
+export function listInteractiveSessionEvidence(
+  location: InteractiveSessionLocation,
+  maxCandidates: number = MAX_INTERACTIVE_SESSION_CANDIDATES,
+  options: Pick<InteractiveSessionInspectionOptions, "expectedUid"> = {},
+): string[] {
+  if (!Number.isSafeInteger(maxCandidates) || maxCandidates < 1) {
+    throw new Error("Pi transcript candidate bound must be a positive safe integer");
+  }
+  const sessionDirectory = privateSessionDirectory(
+    location.sessionDirectory,
+    false,
+    expectedUid(options),
+  );
+  const entries = readdirSync(sessionDirectory, { withFileTypes: true });
+  if (entries.length > maxCandidates) {
+    throw new Error(`Pi session directory exceeds the ${maxCandidates}-entry inspection bound`);
+  }
+  return entries
+    .filter((entry) => entry.name.endsWith(".jsonl"))
     .map((entry) => join(sessionDirectory, entry.name));
 }
 

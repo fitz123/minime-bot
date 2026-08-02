@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { dirname } from "node:path";
-import type { AgentConfig, BotConfig, StreamLine } from "../types.js";
+import type { AgentConfig, BotConfig, BoundSessionState, StreamLine } from "../types.js";
 import type { ActiveSession } from "../session-manager.js";
 // Real (un-mocked) modules — the SAME singletons session-manager imports, so a
 // spy on log.warn and a read of piSessionResumeDiscarded observe its behavior.
@@ -443,6 +443,27 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   };
 }
 
+function storedPiBinding(
+  chatId: string,
+  sessionId: string,
+  overrides: Partial<BoundSessionState> = {},
+): BoundSessionState {
+  const workspaceRealpath = "/tmp/test-workspace-pi";
+  return {
+    bindingState: "bound",
+    sessionId,
+    sessionFile: `${workspaceRealpath}/${sessionId}.jsonl`,
+    workspaceRealpath,
+    chatId,
+    agentId: "pi",
+    provider: "pi",
+    model: "openai-codex/gpt-5.5",
+    thinking: "xhigh",
+    lastActivity: Date.now(),
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -634,15 +655,7 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
   it("resumes a stored Pi session by spawning with the stored id as --session", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-resume", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-resume",
-      agentId: "pi",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-resume", storedPiBinding("pi-resume", "stored-pi-id"));
     // On resume, Pi re-confirms the same id through get_state.
     nextPiSessionId = "stored-pi-id";
 
@@ -662,15 +675,10 @@ describe("SessionManager Pi session-id capture + resume", () => {
 
   it("resumes stored Pi sessions with the current configured model after a model change", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-model-change", {
-      sessionId: "stored-model-change-id",
-      chatId: "pi-model-change",
-      agentId: "pi",
-      provider: "pi",
-      model: "openai-codex/gpt-5.5",
-      thinking: "xhigh",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "pi-model-change",
+      storedPiBinding("pi-model-change", "stored-model-change-id"),
+    );
     nextPiSessionId = "stored-model-change-id";
 
     const updatedConfig = makeConfig({
@@ -851,12 +859,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
   it("missing-session signal: discards once, warns once, increments metric, then starts fresh", async () => {
     const extraExtensions = ["/approved/recovery-a.ts", "/approved/recovery-b.ts"];
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-stale", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-stale",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-stale", storedPiBinding("pi-stale", "stored-pi-id"));
 
     // The resume spawn fails with Pi's "No session found" signal; the inline
     // fresh re-spawn then succeeds and get_state mints a new id.
@@ -919,12 +922,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("resume-recovery preserves the current turn's in-flight media while discarding the stored id", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-inflight", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-inflight",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-inflight", storedPiBinding("pi-inflight", "stored-pi-id"));
 
     // The triggering turn already staged a media file under this chat's dir and
     // it is tracked as in-flight (allocateMediaPath registers it). The fresh Pi
@@ -966,12 +964,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("both spawns fail: discards once, warns once, then throws — no loop", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-doomed", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-doomed",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-doomed", storedPiBinding("pi-doomed", "stored-pi-id"));
 
     // Resume fails with the signal; the inline fresh re-spawn ALSO fails. The
     // second failure must propagate (no third spawn, no recursion).
@@ -1016,12 +1009,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("preserves an accumulated crash count across a resume-recovery discard", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-flap", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-flap",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-flap", storedPiBinding("pi-flap", "stored-pi-id"));
 
     // Resume fails with the signal; the inline fresh re-spawn then succeeds.
     piSpawnOutcomes = [{ failStderr: "No session found matching stored-pi-id" }];
@@ -1056,12 +1044,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("non-matching startup failure: no discard, stored id + media preserved, normal backoff", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-keep", {
-      sessionId: "keep-pi-id",
-      chatId: "pi-keep",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-keep", storedPiBinding("pi-keep", "keep-pi-id"));
 
     // A media file from a prior turn — a non-recovery failure must preserve it so
     // a later successful resume can still reference it.
@@ -1120,12 +1103,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("real pi timing (spawn then exit 1 with the signal): recovery still fires", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-real", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-real",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-real", storedPiBinding("pi-real", "stored-pi-id"));
 
     // The resume spawn execs then exits 1 with the signal (real timing); the
     // inline fresh re-spawn then succeeds and get_state mints a new id.
@@ -1168,12 +1146,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("un-reaped stale resume window: waits for exitCode to settle, then recovers fresh", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-unreaped", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-unreaped",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-unreaped", storedPiBinding("pi-unreaped", "stored-pi-id"));
 
     // The resume child has already buffered Pi's stale-session stderr, but
     // get_state closes stdout with no id while exitCode is still null. It exits
@@ -1224,12 +1197,10 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("delayed stale resume stderr is recovered instead of becoming an active local-id session", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-delayed-stderr", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-delayed-stderr",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "pi-delayed-stderr",
+      storedPiBinding("pi-delayed-stderr", "stored-pi-id"),
+    );
 
     // stdout closes with no id before the stderr listener has buffered Pi's
     // stale-session message. Startup must briefly wait before deciding whether
@@ -1263,12 +1234,10 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("exit-before-stderr stale resume signal is still recovered fresh", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-exit-before-stderr", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-exit-before-stderr",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "pi-exit-before-stderr",
+      storedPiBinding("pi-exit-before-stderr", "stored-pi-id"),
+    );
 
     // Node can observe process exit before the stderr data listener has appended
     // the stale-session message. The settle wait must not treat exit alone as
@@ -1299,12 +1268,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("slow stale resume signal is still recovered instead of becoming an active local-id session", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-slow-stale", {
-      sessionId: "stored-pi-id",
-      chatId: "pi-slow-stale",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-slow-stale", storedPiBinding("pi-slow-stale", "stored-pi-id"));
 
     // The stale-resume signal is already buffered, but the child would not report
     // exit until after the bounded settle wait. The signal is still decisive: the
@@ -1331,12 +1295,7 @@ describe("SessionManager Pi graceful resume-recovery (Task 4)", () => {
 
   it("real pi timing (spawn then exit 1 with a non-matching error): no discard, crash count increments", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("pi-real-keep", {
-      sessionId: "keep-pi-id",
-      chatId: "pi-real-keep",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("pi-real-keep", storedPiBinding("pi-real-keep", "keep-pi-id"));
 
     // Execs then exits 1, but NOT with the "No session found" signal → no recovery.
     piSpawnOutcomes = [{ spawnThenExitStderr: "codex: authentication token expired" }];
@@ -1649,12 +1608,7 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
   it("destroySession supersedes an in-flight stale-resume recovery before it can discard newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("clean-resume", {
-      sessionId: "stored-pi-id",
-      chatId: "clean-resume",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession("clean-resume", storedPiBinding("clean-resume", "stored-pi-id"));
 
     piSpawnOutcomes = [
       { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 1_000 },
@@ -1721,12 +1675,10 @@ describe("SessionManager /clean in-flight startup race (Task 1)", () => {
 
   it("destroySession during startup child termination prevents stale-resume discard of newer state", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
-    store.setSession("clean-resume-terminate", {
-      sessionId: "stored-pi-id",
-      chatId: "clean-resume-terminate",
-      agentId: "pi",
-      lastActivity: Date.now(),
-    });
+    store.setSession(
+      "clean-resume-terminate",
+      storedPiBinding("clean-resume-terminate", "stored-pi-id"),
+    );
 
     piSpawnOutcomes = [
       { spawnThenDelayedExitStderr: "No session found matching stored-pi-id", delayMs: 10_000 },
