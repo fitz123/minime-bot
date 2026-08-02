@@ -382,6 +382,10 @@ describe("Knowledge Pi extension helpers", () => {
       "git pull --ff-only",
       "git rebase origin/main",
       "git cherry-pick HEAD^",
+      "git sparse-checkout init --cone",
+      "git sparse-checkout set src",
+      "git sparse-checkout add notes",
+      "git sparse-checkout reapply",
     ]) {
       assertBlocked(
         workspace,
@@ -403,6 +407,9 @@ describe("Knowledge Pi extension helpers", () => {
       ["git merge origin/main", notes],
       ["git -C notes merge origin/main", workspace],
       ["cd notes && git merge origin/main", workspace],
+      ["git sparse-checkout set src", notes],
+      ["git -C notes sparse-checkout reapply", workspace],
+      ["cd notes && git sparse-checkout init --cone", workspace],
     ] as const) {
       const decision = classifyKnowledgeIntegrityToolCall(
         { toolName: "bash", input: { command } },
@@ -474,6 +481,25 @@ describe("Knowledge Pi extension helpers", () => {
       "mv source.md artifacts",
       "node report.js artifacts/maintenance",
       "tar -xf payload.tar -Cartifacts/maintenance",
+    ]) {
+      assert.equal(
+        classifyKnowledgeIntegrityToolCall(
+          { toolName: "bash", input: { command } },
+          { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+        ),
+        undefined,
+        command,
+      );
+    }
+  });
+
+  it("allows sparse-checkout inspection and the disable recovery path", () => {
+    const workspace = createV2Workspace();
+
+    for (const command of [
+      "git sparse-checkout list",
+      "git sparse-checkout check-rules",
+      "git sparse-checkout disable",
     ]) {
       assert.equal(
         classifyKnowledgeIntegrityToolCall(

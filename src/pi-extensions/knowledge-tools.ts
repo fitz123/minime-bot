@@ -257,6 +257,7 @@ const WORKTREE_MUTATING_GIT_SUBCOMMANDS = new Set([
   "revert",
   "switch",
 ]);
+const SPARSE_CHECKOUT_MUTATING_ACTIONS = new Set(["add", "init", "reapply", "set"]);
 const SUDO_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-D",
@@ -1035,6 +1036,10 @@ function hasNestedGitBoundary(path: string, outerWorktreeRoot: string): boolean 
 }
 
 function gitSubcommandMutatesWorktree(subcommand: string, args: string[]): boolean {
+  if (subcommand === "sparse-checkout") {
+    const action = args.find((arg) => !arg.startsWith("-"));
+    return action ? SPARSE_CHECKOUT_MUTATING_ACTIONS.has(action) : false;
+  }
   if (subcommand === "clean") {
     return !args.some((arg) => arg === "--dry-run" || /^-[^-]*n/.test(arg));
   }

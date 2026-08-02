@@ -987,6 +987,50 @@ describe("knowledge sync Git convergence", () => {
     assert.ok(pushArgs?.includes("--recurse-submodules=no"));
   });
 
+  it("rejects fetched gitlink changes before advancing an initialized canonical submodule", () => {
+    const fixture = createSyncFixture();
+    const submoduleSource = join(fixture.root, "advancing-submodule-source");
+    mkdirSync(submoduleSource, { recursive: true });
+    git(submoduleSource, ["init", "--initial-branch=main"]);
+    configureIdentity(submoduleSource);
+    commitFiles(submoduleSource, "initial submodule content", {
+      "README.md": "# Initial submodule content\n",
+    });
+    git(fixture.workspace, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      submoduleSource,
+      "vendor/dependency",
+    ]);
+    git(fixture.workspace, ["commit", "-m", "track initialized submodule"]);
+    git(fixture.workspace, ["push", "origin", "main"]);
+    const localTip = localHead(fixture);
+    const peer = cloneRemote(fixture, "peer-advancing-submodule");
+    git(peer, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/dependency"]);
+    const advancedSubmoduleTip = commitFiles(submoduleSource, "advance submodule content", {
+      "README.md": "# Advanced submodule content\n",
+    });
+    const peerSubmodule = join(peer, "vendor", "dependency");
+    git(peerSubmodule, ["fetch", "origin"]);
+    git(peerSubmodule, ["checkout", advancedSubmoduleTip]);
+    git(peer, ["add", "vendor/dependency"]);
+    git(peer, ["commit", "-m", "advance tracked submodule"]);
+    git(peer, ["push", "origin", "main"]);
+    const remoteTip = remoteHead(fixture);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = executeKnowledgeSync({ agentWorkspaceRoot: fixture.workspace });
+
+      assert.equal(response.ok, false);
+      assert.equal(response.reason, "candidate-gitlink-change-unsupported");
+      assert.equal(localHead(fixture), localTip);
+      assert.equal(remoteHead(fixture), remoteTip);
+      assert.equal(git(fixture.workspace, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    }
+  });
+
   it("does not push an ahead commit that truncates structural-log history", () => {
     const fixture = createSyncFixture();
     const remoteTip = remoteHead(fixture);

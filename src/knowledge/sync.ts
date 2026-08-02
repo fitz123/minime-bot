@@ -2425,6 +2425,68 @@ function fastForwardCanonical(
   return undefined;
 }
 
+function validateNoCandidateGitlinkChanges(
+  workspaceRoot: string,
+  commit: string,
+  git: KnowledgeSyncGitRunner,
+): KnowledgeSyncFailure | undefined {
+  const changed = git(
+    [
+      "-c",
+      "submodule.recurse=false",
+      "diff",
+      "--raw",
+      "--no-abbrev",
+      "--no-renames",
+      "--no-ext-diff",
+      "--ignore-submodules=none",
+      "-z",
+      "HEAD",
+      commit,
+      "--",
+    ],
+    { cwd: workspaceRoot },
+  );
+  if (changed.status !== 0) {
+    return failure(
+      "error",
+      "candidate-gitlink-change-inspection-failed",
+      `knowledge sync could not inspect candidate gitlink changes: ${errorText(changed)}`,
+    );
+  }
+
+  const fields = changed.stdout.split("\0");
+  if (fields.at(-1) === "") {
+    fields.pop();
+  }
+  const gitlinkPaths: string[] = [];
+  for (let index = 0; index < fields.length; index += 2) {
+    const metadata = fields[index];
+    const relPath = fields[index + 1];
+    const match = /^:(\d{6}) (\d{6}) [0-9a-f]+ [0-9a-f]+ [A-Z]\d*$/u.exec(metadata ?? "");
+    if (!match || relPath === undefined) {
+      return failure(
+        "error",
+        "candidate-gitlink-change-inspection-failed",
+        "knowledge sync could not parse candidate gitlink changes.",
+      );
+    }
+    if (match[1] === "160000" || match[2] === "160000") {
+      gitlinkPaths.push(relPath);
+    }
+  }
+  if (gitlinkPaths.length === 0) {
+    return undefined;
+  }
+  gitlinkPaths.sort();
+  return failure(
+    "unsupported",
+    "candidate-gitlink-change-unsupported",
+    `knowledge sync cannot safely advance canonical main across gitlink changes while recursive submodule checkout is disabled: ${gitlinkPaths.join(", ")}. Reconcile these submodule pointers with an operator-reviewed Git workflow before retrying.`,
+    { conflictPaths: gitlinkPaths },
+  );
+}
+
 function convergeAttempt(
   workspaceRoot: string,
   tips: GitTips,
@@ -2452,6 +2514,10 @@ function convergeAttempt(
   );
   if (canonicalTransformationFailure) {
     return canonicalTransformationFailure;
+  }
+  const gitlinkFailure = validateNoCandidateGitlinkChanges(workspaceRoot, candidate.commit, git);
+  if (gitlinkFailure) {
+    return gitlinkFailure;
   }
   const fastForwardFailure = fastForwardCanonical(workspaceRoot, candidate.commit, git);
   if (fastForwardFailure) {
