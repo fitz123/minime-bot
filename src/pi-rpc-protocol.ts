@@ -33,6 +33,9 @@ import {
   parsePiAcknowledgedSteerResultNotice,
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
+import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
+
+export { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 
 export const PI_PROVIDER = "openai-codex";
 export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
@@ -129,7 +132,6 @@ export const PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = Object.freeze(
 export const PI_EXTENSIONS_DISABLED_ENV = "PI_EXTENSIONS_DISABLED";
 export const MINIME_BOT_PI_SESSION_ENV = "MINIME_BOT_PI_SESSION";
 export const MINIME_BOT_PI_SESSION_AGENT_ID_ENV = "MINIME_BOT_PI_SESSION_AGENT_ID";
-export const MINIME_OUTBOX_ENV = "MINIME_OUTBOX";
 
 export interface PiExtensionResolveOptions {
   /** Override the wrapper base dir (default: resolved workspace/package contract). */

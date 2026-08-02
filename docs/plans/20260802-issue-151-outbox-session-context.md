@@ -44,7 +44,7 @@ git diff --check
 **Goal:** Make file-delivery semantics available once in package-owned session context without embedding chat-specific values.
 **Serves:** The approved static assembler directive outcome and its compaction-safe, agent/chat-independent constraint.
 
-- [ ] Add a fixed `## File delivery` package directive that refers only to the package-owned environment variable and explains post-response delivery.
-- [ ] Append and manifest the directive through the existing package-directive mechanism with deterministic ordering and no absolute/per-chat path content.
-- [ ] Add focused assembler/protocol tests proving the directive appears exactly once, remains static across agents/chats/cache paths, and the environment-variable name cannot drift from the spawn contract.
-- [ ] Re-run all validation commands and verify existing outbox delivery tests remain unchanged and green.
+- [x] Add a fixed `## File delivery` package directive that refers only to the package-owned environment variable and explains post-response delivery.
+- [x] Append and manifest the directive through the existing package-directive mechanism with deterministic ordering and no absolute/per-chat path content.
+- [x] Add focused assembler/protocol tests proving the directive appears exactly once, remains static across agents/chats/cache paths, and the environment-variable name cannot drift from the spawn contract.
+- [x] Re-run all validation commands and verify existing outbox delivery tests remain unchanged and green.

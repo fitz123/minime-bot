@@ -19,6 +19,7 @@ import type { AgentConfig } from "./types.js";
 import { log } from "./logger.js";
 import { resolveKnowledgeLayout } from "./knowledge/layout.js";
 import { loadRawMergedConfig, resolveConfigWorkspaceRoot } from "./config.js";
+import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
 
 /**
@@ -48,6 +49,7 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
  *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
  *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
  *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
+ *   7. A fixed `## File delivery` directive (verbatim {@link FILE_DELIVERY_DIRECTIVE}).
  */
 
 /** Resolved artifact paths handed to the Pi spawn (paths, not inline content). */
@@ -169,6 +171,16 @@ const KNOWLEDGE_ACCESS_DIRECTIVE = [
   "- Put actionable work in Beads, not wiki pages.",
   "- If knowledge tools are unavailable, fall back to the visible index or direct reads and report the limitation.",
 ].join("\n");
+
+/**
+ * Static file-delivery guidance for interactive sessions. The child environment
+ * supplies the session-specific directory; keeping that value out of the bundle
+ * makes the assembled context identical across agents, chats, and cache paths.
+ */
+const FILE_DELIVERY_DIRECTIVE = [
+  `To share a file with the user, write or copy it to the directory specified by the \`${MINIME_OUTBOX_ENV}\` environment variable.`,
+  "Files placed there will be automatically sent to the user after your response completes.",
+].join(" ");
 
 /**
  * Read one already-resolved regular file through a stable descriptor. The
@@ -558,8 +570,8 @@ interface BundleResult {
    * escaping CLAUDE.md symlink also counts: a bare spawn could flat-load the same
    * outside-workspace target we refused to read.
    *
-   * False means the bundle is only the fixed memory directive over a CLAUDE.md
-   * that had no body and no imports (or no CLAUDE.md at all) — nothing worth
+   * False means the bundle contains only fixed package directives over a
+   * CLAUDE.md that had no body and no imports (or no CLAUDE.md at all) — nothing worth
    * forcing `--no-context-files` for, so the caller may prefer a bare spawn.
    */
   hasContent: boolean;
@@ -618,6 +630,12 @@ function assembleBundle(workspaceCwd: string, strict = false): BundleResult {
     "package-directive",
     "package:knowledge-access-v1",
     KNOWLEDGE_ACCESS_DIRECTIVE,
+  ));
+  parts.push(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`);
+  sources.push(contextSource(
+    "package-directive",
+    "package:file-delivery-v1",
+    FILE_DELIVERY_DIRECTIVE,
   ));
 
   // importLineCount > 0 (even with zero successfully-read sections) still counts:

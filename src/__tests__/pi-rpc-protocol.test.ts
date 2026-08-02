@@ -340,6 +340,11 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.strictEqual(readFileSync(personaPath, "utf8"), "PERSONA_TOKEN body");
     const bundle = readFileSync(bundlePath, "utf8");
     assert.ok(bundle.includes("PLATFORM_RULE_TOKEN") && bundle.includes("## Knowledge access"));
+    assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
+    assert.ok(
+      bundle.includes(`\`${MINIME_OUTBOX_ENV}\``),
+      "the static directive names the same package-owned key used by the spawn environment",
+    );
   });
 
   it("omits --system-prompt when the agent has no persona (rides Pi base), keeping the bundle + flag", () => {
