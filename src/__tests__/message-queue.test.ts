@@ -1556,7 +1556,7 @@ describe("MessageQueue mid-turn buffering", () => {
 // -------------------------------------------------------------------
 
 describe("MessageQueue shutdown barrier", () => {
-  it("cancels pending debounce work and rejects later messages", async () => {
+  it("flushes accepted debounce work and rejects later messages", async () => {
     const mock = createMockProcess();
     const queue = new MessageQueue(mock.processFn, { debounceMs: 20 });
     let pendingCleanup = 0;
@@ -1564,6 +1564,7 @@ describe("MessageQueue shutdown barrier", () => {
 
     queue.enqueue("pending", "main", "pending", mockPlatform(), () => { pendingCleanup++; });
     queue.beginShutdown();
+    queue.flushPending();
     queue.enqueue(
       "rejected",
       "main",
@@ -1574,8 +1575,9 @@ describe("MessageQueue shutdown barrier", () => {
     );
 
     await wait(40);
-    assert.equal(mock.calls.length, 0);
-    assert.equal(pendingCleanup, 0, "pending cleanup is retained until clearAll");
+    assert.equal(mock.calls.length, 1);
+    assert.equal(mock.calls[0].text, "pending");
+    assert.equal(pendingCleanup, 1, "accepted work is consumed during shutdown");
     assert.equal(rejectedCleanup, 2, "rejected shutdown work is cleaned immediately");
 
     queue.clearAll();

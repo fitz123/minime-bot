@@ -362,7 +362,7 @@ describe("media-root preflight", () => {
 });
 
 describe("bounded lifecycle integration", () => {
-  it("bounds a stalled transport drain without releasing ownership early", async () => {
+  it("forces ordered cleanup after a stalled transport drain", async () => {
     const pollingDrained = deferred();
     const teardown: string[] = [];
     const shutdown = shutdownServingRuntime({
@@ -389,11 +389,62 @@ describe("bounded lifecycle integration", () => {
         && error.name === "ServingRuntimeShutdownTimeoutError"
         && error.message === "Serving runtime shutdown timed out during transport drain",
     );
-    assert.deepEqual(teardown, ["session-admission-closed"]);
+    assert.deepEqual(teardown, [
+      "session-admission-closed",
+      "sessions-closed",
+      "metrics",
+      "claims",
+    ]);
 
     pollingDrained.resolve();
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
-    assert.deepEqual(teardown, ["session-admission-closed"]);
+    assert.deepEqual(teardown, [
+      "session-admission-closed",
+      "sessions-closed",
+      "metrics",
+      "claims",
+    ]);
+  });
+
+  it("bounds forced cleanup while still attempting metrics and claim release last", async () => {
+    const pollingDrained = deferred();
+    const sessionsClosed = deferred();
+    const teardown: string[] = [];
+    const shutdown = shutdownServingRuntime({
+      telegramPolling: pollingDrained.promise,
+      messageQueues: [],
+      sessionManager: {
+        beginShutdown: () => { teardown.push("session-admission-closed"); },
+        gracefulShutdown: async () => { teardown.push("sessions-drained"); },
+        closeAll: async () => {
+          teardown.push("sessions-closing");
+          await sessionsClosed.promise;
+        },
+      },
+      shutdownTimeoutMs: 10,
+      stopMetrics: async () => { teardown.push("metrics"); },
+      releaseRuntimeGuard: () => {
+        teardown.push("claims");
+        return true;
+      },
+      onTelegramStopError: () => assert.fail("Telegram stop should not fail"),
+      onDiscordStopError: () => assert.fail("Discord stop should not fail"),
+    });
+
+    await assert.rejects(
+      shutdown,
+      (error: unknown) => error instanceof AggregateError
+        && error.message === "Serving runtime shutdown failed and forced cleanup was incomplete",
+    );
+    assert.deepEqual(teardown, [
+      "session-admission-closed",
+      "sessions-closing",
+      "metrics",
+      "claims",
+    ]);
+
+    pollingDrained.resolve();
+    sessionsClosed.resolve();
   });
 
   it("cleans startup claims and exits nonzero when the configured metrics port is occupied", async () => {
@@ -502,6 +553,10 @@ describe("bounded lifecycle integration", () => {
           assert.ok(existsSync(servingOwner.lockPaths[0]));
           teardown.push("queue-timers-cancelled");
         },
+        flushPending: () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("queue-pending-flushed");
+        },
         waitForIdle: async () => {
           assert.ok(existsSync(servingOwner.lockPaths[0]));
           teardown.push("queues-draining");
@@ -550,8 +605,6 @@ describe("bounded lifecycle integration", () => {
       "telegram-abort",
       "telegram-stop",
       "discord-stop",
-      "queue-admission-closed",
-      "session-admission-closed",
     ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
     assert.equal(oldMetrics.listening, true);
@@ -562,8 +615,6 @@ describe("bounded lifecycle integration", () => {
       "telegram-abort",
       "telegram-stop",
       "discord-stop",
-      "queue-admission-closed",
-      "session-admission-closed",
       "polling-drained",
     ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
@@ -574,11 +625,10 @@ describe("bounded lifecycle integration", () => {
       "telegram-abort",
       "telegram-stop",
       "discord-stop",
-      "queue-admission-closed",
-      "session-admission-closed",
       "polling-drained",
       "discord-drained",
-      "queue-timers-cancelled",
+      "queue-admission-closed",
+      "queue-pending-flushed",
       "sessions-started",
     ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
@@ -590,15 +640,12 @@ describe("bounded lifecycle integration", () => {
       "telegram-abort",
       "telegram-stop",
       "discord-stop",
-      "queue-admission-closed",
-      "session-admission-closed",
       "polling-drained",
       "discord-drained",
-      "queue-timers-cancelled",
+      "queue-admission-closed",
+      "queue-pending-flushed",
       "sessions-started",
       "sessions-drained",
-      "media",
-      "sessions-closed",
       "queues-draining",
     ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
@@ -610,17 +657,17 @@ describe("bounded lifecycle integration", () => {
       "telegram-abort",
       "telegram-stop",
       "discord-stop",
-      "queue-admission-closed",
-      "session-admission-closed",
       "polling-drained",
       "discord-drained",
-      "queue-timers-cancelled",
+      "queue-admission-closed",
+      "queue-pending-flushed",
       "sessions-started",
       "sessions-drained",
-      "media",
-      "sessions-closed",
       "queues-draining",
       "queues-drained",
+      "session-admission-closed",
+      "media",
+      "sessions-closed",
       "metrics",
       "claims",
     ]);

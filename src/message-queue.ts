@@ -262,16 +262,20 @@ export class MessageQueue {
     }
 
     state.debounceTimer = setTimeout(() => {
-      const pending = this.flush(chatId);
-      this.activeFlushes.add(pending);
-      void pending.then(
-        () => { this.activeFlushes.delete(pending); },
-        (err) => {
-          this.activeFlushes.delete(pending);
-          log.error("message-queue", `Flush error for ${chatId}:`, err);
-        },
-      );
+      this.startFlush(chatId);
     }, this.debounceMs);
+  }
+
+  private startFlush(chatId: string): void {
+    const pending = this.flush(chatId);
+    this.activeFlushes.add(pending);
+    void pending.then(
+      () => { this.activeFlushes.delete(pending); },
+      (err) => {
+        this.activeFlushes.delete(pending);
+        log.error("message-queue", `Flush error for ${chatId}:`, err);
+      },
+    );
   }
 
   private async flush(chatId: string): Promise<void> {
@@ -582,6 +586,15 @@ export class MessageQueue {
   beginShutdown(): void {
     this.acceptingMessages = false;
     this.cancelAllDebounceTimers();
+  }
+
+  /** Start all accepted debounce work immediately during graceful shutdown. */
+  flushPending(): void {
+    for (const [chatId, state] of this.queues) {
+      if (state.pendingTexts.length > 0 && !state.busy) {
+        this.startFlush(chatId);
+      }
+    }
   }
 
   /** Wait for flushes that started before shutdown admission closed. */
