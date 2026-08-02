@@ -13,7 +13,10 @@ import type {
   ControlRequest,
 } from "./types.js";
 import { log } from "./logger.js";
-import { assemblePiContext } from "./pi-context-assembler.js";
+import {
+  assemblePiContext,
+  FILE_DELIVERY_CONTEXT,
+} from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -562,31 +565,39 @@ export function buildPiSpawnArgs(
   // layers, REPLACING the old `agent.systemPrompt → --append-system-prompt` branch:
   //   --system-prompt <persona>   REPLACES Pi's base prompt (omitted when no persona
   //                               resolves — the agent then rides Pi's base prompt).
-  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle.
-  //   --no-context-files          so Pi does NOT ALSO flat-load CLAUDE.md/AGENTS.md
-  //                               from cwd (avoids double context).
+  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle,
+  //                                    or inline file-delivery fallback text.
+  //   --no-context-files          when assembled workspace/persona layers replace
+  //                               native context (omitted for delivery-only bundles
+  //                               so Pi can still load an AGENTS.md from cwd).
   // At most ONE --system-prompt and ONE --append-system-prompt are emitted. The
   // assembler is fail-safe for source reads (bad source → warn+skip; empty
   // workspace without an interactive outbox → null → bare spawn), but artifact
   // writes can throw after source content has been classified. A throw must fail
   // closed with --no-context-files so Pi does not flat-load context files the
   // assembler could not safely deliver.
+  const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
     const context = assemblePiContext(agent, {
-      includeFileDelivery: Boolean(runtimeEnvOptions?.outboxPath?.trim()),
+      includeFileDelivery,
     });
     if (context) {
       if (context.systemPromptPath) {
         args.push("--system-prompt", context.systemPromptPath);
       }
       args.push("--append-system-prompt", context.appendSystemPromptPath);
-      args.push("--no-context-files");
+      if (context.suppressContextFiles !== false) {
+        args.push("--no-context-files");
+      }
     }
   } catch (err) {
     log.error(
       "pi-rpc",
       `Pi context assembly threw for agent "${agent.id}", suppressing flat context loading: ${(err as Error).message}`,
     );
+    if (includeFileDelivery) {
+      args.push("--append-system-prompt", FILE_DELIVERY_CONTEXT);
+    }
     args.push("--no-context-files");
   }
 

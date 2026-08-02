@@ -16,7 +16,10 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { _resetPiContextCache } from "../pi-context-assembler.js";
+import {
+  _resetPiContextCache,
+  FILE_DELIVERY_CONTEXT,
+} from "../pi-context-assembler.js";
 import {
   NewlineOnlyJsonlSplitter,
   MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
@@ -399,8 +402,8 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
-  it("delivers file guidance for an empty interactive pi workspace", () => {
-    const ws = makePiWorkspace({});
+  it("delivers file guidance without suppressing native AGENTS.md loading", () => {
+    const ws = makePiWorkspace({ files: { "AGENTS.md": "AGENTS_ONLY_TOKEN" } });
     const args = buildPiSpawnArgs(
       piAgent(ws),
       undefined,
@@ -411,7 +414,10 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(!args.includes("--system-prompt"));
     const bundleIdx = args.indexOf("--append-system-prompt");
     assert.notStrictEqual(bundleIdx, -1, "interactive file guidance is delivered");
-    assert.ok(args.includes("--no-context-files"));
+    assert.ok(
+      !args.includes("--no-context-files"),
+      "Pi must still load an AGENTS.md that the package assembler does not consume",
+    );
     const bundle = readFileSync(args[bundleIdx + 1], "utf8");
     assert.strictEqual(bundle.match(/^## File delivery$/gm)?.length, 1);
     assert.ok(bundle.includes(`\`${MINIME_OUTBOX_ENV}\``));
@@ -425,6 +431,24 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
 
     assert.ok(!args.includes("--system-prompt"));
     assert.ok(!args.includes("--append-system-prompt"));
+    assert.ok(args.includes("--no-context-files"));
+  });
+
+  it("falls back to inline file guidance when interactive context artifacts cannot be written", () => {
+    const ws = makePiWorkspace({ claudeMd: "# Pi Agent\n\nBODY" });
+    writeFileSync(join(ws, ".tmp"), "i am a file, not a dir", "utf8");
+
+    const args = buildPiSpawnArgs(
+      piAgent(ws, { id: "interactive-writefail" }),
+      undefined,
+      NO_EXTENSIONS,
+      { outboxPath: "/tmp/session-outbox" },
+    );
+
+    assert.ok(!args.includes("--system-prompt"));
+    const bundleIdx = args.indexOf("--append-system-prompt");
+    assert.notStrictEqual(bundleIdx, -1, "fallback guidance is delivered inline");
+    assert.strictEqual(args[bundleIdx + 1], FILE_DELIVERY_CONTEXT);
     assert.ok(args.includes("--no-context-files"));
   });
 

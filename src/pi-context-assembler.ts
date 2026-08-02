@@ -59,6 +59,8 @@ export interface PiContextArtifacts {
   systemPromptPath?: string;
   /** Context-bundle file for `--append-system-prompt`. Always present on success. */
   appendSystemPromptPath: string;
+  /** Disable Pi's native context loading when the assembled layers replace it. */
+  suppressContextFiles?: boolean;
   /** Redacted deterministic identity of the accepted sources and assembled bytes. */
   manifest: PiContextManifest;
 }
@@ -184,6 +186,9 @@ const FILE_DELIVERY_DIRECTIVE = [
   `To share a file with the user, write or copy it to the directory specified by the \`${MINIME_OUTBOX_ENV}\` environment variable.`,
   "Files placed there will be automatically sent to the user after your response completes.",
 ].join(" ");
+
+/** Complete static section, also usable as Pi's inline artifact-write fallback. */
+export const FILE_DELIVERY_CONTEXT = `## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`;
 
 /**
  * Read one already-resolved regular file through a stable descriptor. The
@@ -563,23 +568,16 @@ interface BundleResult {
   bundle: string;
   sources: PiContextSourceManifest[];
   /**
-   * True when delivering the bundle (with `--no-context-files`) beats a bare Pi
-   * spawn — i.e. at least one REAL source contributed (a CLAUDE.md body, an
-   * expanded import, or a rule) OR the CLAUDE.md carried `@`-import lines that we
-   * stripped. The import case matters even when EVERY import failed to read: a
-   * bare spawn would let Pi flat-load the original CLAUDE.md and surface the
-   * literal `@<path>` lines (exactly what this assembler exists to strip), so the
-   * stripped bundle is strictly better and we must suppress flat loading. An
-   * escaping CLAUDE.md symlink also counts: a bare spawn could flat-load the same
-   * outside-workspace target we refused to read.
-   *
-   * The interactive file-delivery directive also counts because it is the only
-   * way an empty-workspace session learns its outbox contract. False means the
-   * bundle contains only the fixed knowledge directive over a CLAUDE.md that had
-   * no body and no imports (or no CLAUDE.md at all) — nothing worth forcing
-   * `--no-context-files` for, so the caller may prefer a bare spawn.
+   * True when the bundle has enough content to emit an artifact: either assembled
+   * workspace content or the interactive file-delivery directive.
    */
   hasContent: boolean;
+  /**
+   * True when assembled workspace content must replace Pi's flat context files.
+   * Failed imports and escaping CLAUDE.md symlinks count because native loading
+   * would expose the unsanitized source that the assembler deliberately skipped.
+   */
+  suppressContextFiles: boolean;
 }
 
 /** Assemble the deterministic context bundle (order 1-7 above) from live files. */
@@ -641,7 +639,7 @@ function assembleBundle(
     KNOWLEDGE_ACCESS_DIRECTIVE,
   ));
   if (includeFileDelivery) {
-    parts.push(`## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`);
+    parts.push(FILE_DELIVERY_CONTEXT);
     sources.push(contextSource(
       "package-directive",
       "package:file-delivery-v1",
@@ -652,15 +650,20 @@ function assembleBundle(
   // importLineCount > 0 (even with zero successfully-read sections) still counts:
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
   // lines intact, so the stripped bundle + `--no-context-files` is strictly better.
-  const hasContent =
+  const suppressContextFiles =
     trimmedBody !== "" ||
     sections.length > 0 ||
     knowledgeSections.length > 0 ||
     rules.length > 0 ||
     importLineCount > 0 ||
-    escaped ||
-    includeFileDelivery;
-  return { bundle: `${parts.join("\n\n")}\n`, sources, hasContent };
+    escaped;
+  const hasContent = suppressContextFiles || includeFileDelivery;
+  return {
+    bundle: `${parts.join("\n\n")}\n`,
+    sources,
+    hasContent,
+    suppressContextFiles,
+  };
 }
 
 function sha256(value: string | Buffer): string {
@@ -844,6 +847,7 @@ interface CacheEntry {
   bundle: string;
   /** The resolved persona (the `--system-prompt` artifact body), or null when none. */
   persona: string | null;
+  suppressContextFiles: boolean;
   manifest: PiContextManifest;
 }
 
@@ -955,6 +959,7 @@ export function assemblePiContext(
 
   let bundle: string;
   let persona: string | null;
+  let suppressContextFiles: boolean;
   let manifest: PiContextManifest;
   if (cached && cached.signature === signature) {
     // Source manifest unchanged: reuse the assembled content (skip the expensive
@@ -963,6 +968,7 @@ export function assemblePiContext(
     // content here is guaranteed meaningful — no empty-workspace re-check needed.
     bundle = cached.bundle;
     persona = cached.persona;
+    suppressContextFiles = cached.suppressContextFiles;
     manifest = cached.manifest;
   } else {
     const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery);
@@ -975,6 +981,7 @@ export function assemblePiContext(
     }
     bundle = assembled.bundle;
     persona = resolvedPersona.persona;
+    suppressContextFiles = assembled.suppressContextFiles || persona !== null;
     manifest = buildContextManifest(
       bundle,
       persona,
@@ -1000,10 +1007,10 @@ export function assemblePiContext(
 
   const result: PiContextArtifacts =
     systemPromptPath !== undefined
-      ? { systemPromptPath, appendSystemPromptPath, manifest }
-      : { appendSystemPromptPath, manifest };
+      ? { systemPromptPath, appendSystemPromptPath, suppressContextFiles, manifest }
+      : { appendSystemPromptPath, suppressContextFiles, manifest };
   if (signature !== null) {
-    cache.set(cacheKey, { signature, bundle, persona, manifest });
+    cache.set(cacheKey, { signature, bundle, persona, suppressContextFiles, manifest });
   }
   return result;
 }
