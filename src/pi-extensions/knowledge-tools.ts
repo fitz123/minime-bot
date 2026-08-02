@@ -418,7 +418,9 @@ export function classifyKnowledgeIntegrityToolCall(
       if (!absTarget) {
         continue;
       }
-      const managedPath = managedKnowledgeAncestorRelPath(layout, absTarget);
+      const managedPath =
+        managedKnowledgeRelPath(layout, absTarget) ??
+        managedKnowledgeAncestorRelPath(layout, absTarget);
       if (managedPath) {
         return {
           block: true,

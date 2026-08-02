@@ -187,7 +187,7 @@ export const defaultKnowledgeSyncGitRunner: KnowledgeSyncGitRunner = (args, opti
     ? result.stderr.toString("utf8")
     : result.stderr ?? "";
   return {
-    status: result.status ?? 1,
+    status: executionError ? 1 : (result.status ?? 1),
     stdout: executionError ? "" : stdoutBytes.toString("utf8"),
     stdoutBytes: executionError ? Buffer.alloc(0) : stdoutBytes,
     stderr: executionError

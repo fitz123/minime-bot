@@ -412,6 +412,21 @@ describe("Knowledge Pi extension helpers", () => {
       assert.equal(decision.targetPath, workspace, command);
     }
 
+    const managedSubdirectory = join(workspace, "wiki", "pages", "project");
+    for (const command of [
+      "git --work-tree=. reset --hard HEAD",
+      "git --work-tree=. clean -fd",
+      "git --work-tree=. merge topic",
+    ]) {
+      const decision = classifyKnowledgeIntegrityToolCall(
+        { toolName: "bash", input: { command } },
+        { agentWorkspaceRoot: workspace, cwd: managedSubdirectory, env: {} },
+      );
+      assert.equal(decision?.block, true, command);
+      assert.match(decision?.targetPath ?? "", /^wiki\/pages\/project(?:\/|$)/, command);
+      assert.match(decision?.reason ?? "", /raw Git worktree mutations are blocked/, command);
+    }
+
     const nestedRepository = join(workspace, "nested-repository");
     mkdirSync(join(nestedRepository, ".git"), { recursive: true });
     for (const [command, cwd] of [
