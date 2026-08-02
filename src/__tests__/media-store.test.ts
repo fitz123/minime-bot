@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, chmodSync, mkdirSync, symlinkSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, realpathSync, symlinkSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import {
   MEDIA_BASE,
@@ -14,10 +14,61 @@ import {
   discardMediaPath,
   enforceMediaCap,
 } from "../media-store.js";
+import { preflightMediaRoot, StartupConflictError } from "../runtime-guard.js";
 
 function resetMediaBase(): void {
   rmSync(MEDIA_BASE, { recursive: true, force: true });
 }
+
+const quietPreflight = {
+  recordMetric: () => {},
+  writeLog: () => {},
+};
+
+describe("preflightMediaStore", () => {
+  beforeEach(resetMediaBase);
+  afterEach(resetMediaBase);
+
+  it("allows a missing root without creating it", () => {
+    assert.equal(preflightMediaRoot(MEDIA_BASE, quietPreflight), MEDIA_BASE);
+    assert.equal(existsSync(MEDIA_BASE), false);
+  });
+
+  it("accepts an owned readable directory", () => {
+    mkdirSync(MEDIA_BASE, { recursive: true, mode: 0o700 });
+    assert.equal(preflightMediaRoot(MEDIA_BASE, quietPreflight), realpathSync(MEDIA_BASE));
+  });
+
+  it("classifies a foreign owner without changing the directory", () => {
+    mkdirSync(MEDIA_BASE, { recursive: true, mode: 0o700 });
+    const mode = statSync(MEDIA_BASE).mode;
+    assert.throws(
+      () => preflightMediaRoot(MEDIA_BASE, {
+        ...quietPreflight,
+        expectedUid: statSync(MEDIA_BASE).uid + 1,
+      }),
+      (error: unknown) => error instanceof StartupConflictError && error.reason === "foreign_media_owner",
+    );
+    assert.equal(statSync(MEDIA_BASE).mode, mode);
+  });
+
+  it("classifies a symlink as unsafe without following or removing it", () => {
+    const target = `${MEDIA_BASE}-preflight-target`;
+    rmSync(target, { recursive: true, force: true });
+    mkdirSync(target, { mode: 0o700 });
+    symlinkSync(target, MEDIA_BASE);
+    try {
+      assert.throws(
+        () => preflightMediaRoot(MEDIA_BASE, quietPreflight),
+        (error: unknown) => error instanceof StartupConflictError && error.reason === "unsafe_media_root",
+      );
+      assert.ok(existsSync(target));
+    } finally {
+      rmSync(MEDIA_BASE, { force: true });
+      rmSync(target, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("sessionMediaDir", () => {
   it("returns deterministic path under MEDIA_BASE", () => {

@@ -1,12 +1,37 @@
 import { createServer, type Server } from "node:http";
 import client from "prom-client";
 import { log } from "./logger.js";
+import type { RuntimeIdentity, StartupConflictReason } from "./runtime-guard.js";
 
 // Use the default registry
 const register = client.register;
 
 // Expose Node.js process metrics (heap, CPU, event loop, GC)
 client.collectDefaultMetrics();
+
+// --- Runtime identity and startup ownership ---
+
+export const botInstanceInfo = new client.Gauge({
+  name: "minime_bot_instance_info",
+  help: "Serving Minime bot process identity",
+  labelNames: ["user", "home", "slot", "pid"] as const,
+});
+
+export const botStartupConflicts = new client.Counter({
+  name: "minime_bot_startup_conflicts_total",
+  help: "Total startup ownership conflicts by bounded reason",
+  labelNames: ["reason"] as const,
+});
+
+/** Publish exactly one identity series for the process that is about to bind metrics. */
+export function initializeInstanceIdentity(identity: RuntimeIdentity): void {
+  botInstanceInfo.reset();
+  botInstanceInfo.set(identity, 1);
+}
+
+export function recordStartupConflictMetric(reason: StartupConflictReason): void {
+  botStartupConflicts.inc({ reason });
+}
 
 // --- Token usage ---
 // Legacy bot_claude_* names are retained for dashboard continuity. These
@@ -380,10 +405,14 @@ export function recordFinalDeliveryFailure(): void {
 // --- HTTP server ---
 
 let metricsServer: Server | null = null;
-let metricsListenRetry: ReturnType<typeof setTimeout> | null = null;
 
-export interface MetricsServerOptions {
-  addressInUseRetryMs?: number;
+export class MetricsServerBindError extends Error {
+  readonly reason = "metrics_port_in_use" as const;
+
+  constructor() {
+    super("Metrics server address is in use");
+    this.name = "MetricsServerBindError";
+  }
 }
 
 /**
@@ -391,13 +420,11 @@ export interface MetricsServerOptions {
  * Serves /metrics in standard Prometheus text format.
  * Returns the server instance.
  */
-export function startMetricsServer(
+export async function startMetricsServer(
   port: number,
   host?: string,
-  options: MetricsServerOptions = {},
-): Server {
+): Promise<Server> {
   const listenHost = host ?? "127.0.0.1";
-  const addressInUseRetryMs = Math.max(1, options.addressInUseRetryMs ?? 1_000);
   const server = createServer(async (req, res) => {
     if (req.url === "/metrics" && req.method === "GET") {
       try {
@@ -415,40 +442,27 @@ export function startMetricsServer(
     }
   });
 
-  const listen = () => {
-    if (metricsServer !== server) return;
-    server.listen(port, listenHost);
-  };
-
-  server.on("listening", () => {
-    if (metricsServer !== server) {
-      server.close();
-      return;
-    }
-    log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
-  });
-
-  server.on("error", (err) => {
-    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE" && metricsServer === server) {
-      if (metricsListenRetry === null) {
-        log.warn(
-          "metrics",
-          `Metrics address ${listenHost}:${port} is still in use; retrying in ${addressInUseRetryMs}ms`,
-        );
-        metricsListenRetry = setTimeout(() => {
-          metricsListenRetry = null;
-          listen();
-        }, addressInUseRetryMs);
-        metricsListenRetry.unref();
-      }
-      return;
-    }
-    log.error("metrics", `Metrics server error: ${err.message}`);
-  });
-
   metricsServer = server;
-  listen();
-  return server;
+  return new Promise<Server>((resolve, reject) => {
+    const onListening = () => {
+      server.off("error", onBindError);
+      server.on("error", (error) => log.error("metrics", `Metrics server error: ${error.message}`));
+      log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
+      resolve(server);
+    };
+    const onBindError = (error: Error) => {
+      server.off("listening", onListening);
+      if (metricsServer === server) metricsServer = null;
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+        reject(new MetricsServerBindError());
+        return;
+      }
+      reject(error);
+    };
+    server.once("listening", onListening);
+    server.once("error", onBindError);
+    server.listen(port, listenHost);
+  });
 }
 
 /**
@@ -456,10 +470,6 @@ export function startMetricsServer(
  */
 export function stopMetricsServer(): Promise<void> {
   return new Promise((resolve) => {
-    if (metricsListenRetry !== null) {
-      clearTimeout(metricsListenRetry);
-      metricsListenRetry = null;
-    }
     const server = metricsServer;
     metricsServer = null;
     if (!server || !server.listening) {

@@ -8,7 +8,12 @@ import {
 } from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
-import { startMetricsServer, stopMetricsServer } from "./metrics.js";
+import {
+  initializeInstanceIdentity,
+  MetricsServerBindError,
+  startMetricsServer,
+  stopMetricsServer,
+} from "./metrics.js";
 import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
@@ -28,6 +33,27 @@ import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
 import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
+import { MEDIA_BASE } from "./media-store.js";
+import {
+  acquireRuntimeGuard,
+  preflightMediaRoot,
+  recordStartupConflict,
+  resolveRuntimeIdentity,
+  runtimeGuardResources,
+  type RuntimeGuard,
+  StartupConflictError,
+} from "./runtime-guard.js";
+
+let activeRuntimeGuard: RuntimeGuard | undefined;
+let removeRuntimeExitHook: (() => void) | undefined;
+
+function releaseRuntimeGuard(): boolean {
+  removeRuntimeExitHook?.();
+  removeRuntimeExitHook = undefined;
+  const released = activeRuntimeGuard?.release() ?? true;
+  activeRuntimeGuard = undefined;
+  return released;
+}
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -38,9 +64,24 @@ async function main(): Promise<void> {
   }
   log.info("main", `Config loaded: ${Object.keys(config.agents).length} agents, ${config.bindings.length} Telegram bindings${config.discord ? `, ${config.discord.bindings.length} Discord bindings` : ""}`);
 
+  const identity = resolveRuntimeIdentity();
+  initializeInstanceIdentity(identity);
+  const mediaRoot = preflightMediaRoot(MEDIA_BASE);
+  activeRuntimeGuard = acquireRuntimeGuard({
+    resources: runtimeGuardResources(mediaRoot, config.telegramToken),
+  });
+  removeRuntimeExitHook = activeRuntimeGuard.installProcessExitHook();
+
   // Start Prometheus metrics server if configured
   if (config.metricsPort !== undefined) {
-    startMetricsServer(config.metricsPort, config.metricsHost);
+    try {
+      await startMetricsServer(config.metricsPort, config.metricsHost);
+    } catch (error) {
+      if (error instanceof MetricsServerBindError) {
+        recordStartupConflict(error.reason);
+      }
+      throw error;
+    }
   }
 
   // Restore caches from disk (survives restarts)
@@ -97,6 +138,9 @@ async function main(): Promise<void> {
     }
     await stopMetricsServer();
     await sessionManager.closeAll();
+    if (!releaseRuntimeGuard()) {
+      log.warn("main", "Runtime ownership changed before release; leaving claims untouched");
+    }
     log.info("main", "All sessions closed. Exiting.");
     process.exit(requestedExitCode);
   };
@@ -171,7 +215,7 @@ async function main(): Promise<void> {
         });
         if (restartRequired) {
           log.error("main", `Telegram polling unavailable (${reason}) — exiting for restart`, error);
-          process.exit(1);
+          requestShutdown("Telegram polling failure", 1);
           return;
         }
 
@@ -292,12 +336,17 @@ async function main(): Promise<void> {
     discordBindingCount: config.discord?.bindings.length ?? 0,
   })) {
     log.error("main", "No bots started — exiting");
-    process.exit(1);
+    await shutdown("startup failure", 1);
+    return;
   }
   finishAgentPlatformStartup();
 }
 
-main().catch((err) => {
-  log.error("main", "Fatal error:", err);
+main().catch(async (err) => {
+  await stopMetricsServer();
+  releaseRuntimeGuard();
+  if (!(err instanceof StartupConflictError) && !(err instanceof MetricsServerBindError)) {
+    log.error("main", "Fatal error:", err);
+  }
   process.exit(1);
 });

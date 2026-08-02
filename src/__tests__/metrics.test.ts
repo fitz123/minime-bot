@@ -44,6 +44,11 @@ import {
   finalDeliveryFailures,
   recordDraftSchedulerEvent,
   recordFinalDeliveryFailure,
+  botInstanceInfo,
+  botStartupConflicts,
+  initializeInstanceIdentity,
+  recordStartupConflictMetric,
+  MetricsServerBindError,
   startMetricsServer,
   stopMetricsServer,
 } from "../metrics.js";
@@ -120,6 +125,34 @@ describe("recordResultMetrics", () => {
 
     const costVal = await costUsd.get();
     assert.strictEqual(costVal.values[0].value, 0.08);
+  });
+});
+
+describe("runtime ownership metrics", () => {
+  it("exports exactly one serving identity with the intended labels", async () => {
+    initializeInstanceIdentity({
+      user: "fixture-user",
+      home: "/fixture/home",
+      slot: "blue",
+      pid: "4321",
+    });
+
+    const metric = await botInstanceInfo.get();
+    assert.equal(metric.values.length, 1);
+    assert.equal(metric.values[0].value, 1);
+    assert.deepEqual(metric.values[0].labels, {
+      user: "fixture-user",
+      home: "/fixture/home",
+      slot: "blue",
+      pid: "4321",
+    });
+  });
+
+  it("records only a bounded startup-conflict reason", async () => {
+    recordStartupConflictMetric("instance_lock_held");
+    const metric = await botStartupConflicts.get();
+    assert.deepEqual(metric.values[0].labels, { reason: "instance_lock_held" });
+    assert.equal(metric.values[0].value, 1);
   });
 });
 
@@ -554,22 +587,13 @@ describe("metrics HTTP server", () => {
     server.close(() => resolve());
   });
 
-  const waitUntil = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
-    const deadline = Date.now() + timeoutMs;
-    while (!predicate()) {
-      if (Date.now() >= deadline) assert.fail("condition was not met before timeout");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  };
-
   afterEach(async () => {
     await stopMetricsServer();
   });
 
   it("serves /metrics endpoint with Prometheus text format", async () => {
     // Use port 0 to let the OS assign an available port
-    const server = startMetricsServer(0);
-    await new Promise((r) => setTimeout(r, 100));
+    const server = await startMetricsServer(0);
     const addr = server.address() as { port: number };
 
     // Record some data
@@ -587,8 +611,7 @@ describe("metrics HTTP server", () => {
   });
 
   it("returns 404 for non-metrics paths", async () => {
-    const server = startMetricsServer(0);
-    await new Promise((r) => setTimeout(r, 100));
+    const server = await startMetricsServer(0);
     const addr = server.address() as { port: number };
 
     const res = await fetch(`http://localhost:${addr.port}/other`);
@@ -596,15 +619,13 @@ describe("metrics HTTP server", () => {
   });
 
   it("defaults host to 127.0.0.1 when not specified", async () => {
-    const server = startMetricsServer(0);
-    await new Promise((r) => setTimeout(r, 100));
+    const server = await startMetricsServer(0);
     const addr = server.address() as { address: string; port: number };
     assert.strictEqual(addr.address, "127.0.0.1");
   });
 
   it("binds to provided host (0.0.0.0 for Linux Docker scrape)", async () => {
-    const server = startMetricsServer(0, "0.0.0.0");
-    await new Promise((r) => setTimeout(r, 100));
+    const server = await startMetricsServer(0, "0.0.0.0");
     const addr = server.address() as { address: string; port: number };
     assert.strictEqual(addr.address, "0.0.0.0");
 
@@ -613,33 +634,26 @@ describe("metrics HTTP server", () => {
     assert.strictEqual(res.status, 200);
   });
 
-  it("retries EADDRINUSE until an overlapping process releases the port", async () => {
+  it("rejects EADDRINUSE immediately while the serving owner stays reachable", async () => {
     const oldServer = createServer();
     await listen(oldServer);
     const address = oldServer.address();
     assert.ok(address && typeof address === "object");
 
-    const server = startMetricsServer(address.port, undefined, { addressInUseRetryMs: 10 });
-    await new Promise<void>((resolve) => server.once("error", () => resolve()));
+    await assert.rejects(startMetricsServer(address.port), MetricsServerBindError);
+    assert.equal(oldServer.listening, true);
     await close(oldServer);
-    await waitUntil(() => server.listening);
-
-    const res = await fetch(`http://127.0.0.1:${address.port}/metrics`);
-    assert.strictEqual(res.status, 200);
   });
 
-  it("cancels a pending EADDRINUSE retry during shutdown", async () => {
+  it("can bind after an occupied-port failure once the owner releases it", async () => {
     const oldServer = createServer();
     await listen(oldServer);
     const address = oldServer.address();
     assert.ok(address && typeof address === "object");
 
-    const server = startMetricsServer(address.port, undefined, { addressInUseRetryMs: 20 });
-    await new Promise<void>((resolve) => server.once("error", () => resolve()));
-    await stopMetricsServer();
+    await assert.rejects(startMetricsServer(address.port), MetricsServerBindError);
     await close(oldServer);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    assert.equal(server.listening, false);
+    const server = await startMetricsServer(address.port);
+    assert.equal(server.listening, true);
   });
 });

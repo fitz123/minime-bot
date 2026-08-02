@@ -62,12 +62,12 @@ npm pack --dry-run --ignore-scripts
 - Modify: `src/__tests__/metrics.test.ts`
 - Modify: `src/__tests__/media-store.test.ts`
 
-- [ ] Implement injectable identity resolution, bounded startup-conflict types/recording, foreign/unsafe media-root preflight, deterministic owner-only resource locks, PID-start-aware stale recovery, ownership-checked release, and redaction-safe `MINIME_STARTUP_GUARD_CONFLICT` logging in `src/runtime-guard.ts`.
-- [ ] Register and initialize `minime_bot_instance_info` and `minime_bot_startup_conflicts_total` in `src/metrics.ts`; make metrics startup await `listening` and reject `EADDRINUSE` as `metrics_port_in_use` instead of retrying indefinitely.
-- [ ] Wire identity initialization, guard acquisition, media-root preflight, awaited metrics bind, graceful release, and fatal-start cleanup into `src/main.ts` before either transport starts; retain supervisor-compatible nonzero exit and existing shutdown semantics.
-- [ ] Add deterministic synthetic tests for identity labels and slot override/fallback, no secret/resource values in conflict output, active lock rejection, dead/PID-reused complete-lock recovery, crash immediately after empty-directory creation and crash-between-claim/publication grace handling, foreign/malformed/replaced/raced lock refusal, partial multi-lock rollback, idempotent inode/nonce-checked release, media-root missing/safe/foreign/symlink cases, successful metrics bind, occupied-port failure, and startup-failure cleanup.
-- [ ] Add a bounded lifecycle integration test proving an overlapping contender cannot disturb the serving owner, exits nonzero and releases partial claims, the old owner keeps its claims until polling/session/media/metrics teardown completes, and a supervisor-style retry can then bind and expose the replacement identity.
-- [ ] Run the Task 1 focused tests and lint; all must pass before Task 2.
+- [x] Implement injectable identity resolution, bounded startup-conflict types/recording, foreign/unsafe media-root preflight, deterministic owner-only resource locks, PID-start-aware stale recovery, ownership-checked release, and redaction-safe `MINIME_STARTUP_GUARD_CONFLICT` logging in `src/runtime-guard.ts`.
+- [x] Register and initialize `minime_bot_instance_info` and `minime_bot_startup_conflicts_total` in `src/metrics.ts`; make metrics startup await `listening` and reject `EADDRINUSE` as `metrics_port_in_use` instead of retrying indefinitely.
+- [x] Wire identity initialization, guard acquisition, media-root preflight, awaited metrics bind, graceful release, and fatal-start cleanup into `src/main.ts` before either transport starts; retain supervisor-compatible nonzero exit and existing shutdown semantics.
+- [x] Add deterministic synthetic tests for identity labels and slot override/fallback, no secret/resource values in conflict output, active lock rejection, dead/PID-reused complete-lock recovery, crash immediately after empty-directory creation and crash-between-claim/publication grace handling, foreign/malformed/replaced/raced lock refusal, partial multi-lock rollback, idempotent inode/nonce-checked release, media-root missing/safe/foreign/symlink cases, successful metrics bind, occupied-port failure, and startup-failure cleanup.
+- [x] Add a bounded lifecycle integration test proving an overlapping contender cannot disturb the serving owner, exits nonzero and releases partial claims, the old owner keeps its claims until polling/session/media/metrics teardown completes, and a supervisor-style retry can then bind and expose the replacement identity.
+- [x] Run the Task 1 focused tests and lint; all must pass before Task 2.
 
 ### Task 2: Instrument duplicate Telegram polling [HIGH]
 
